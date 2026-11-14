@@ -3960,3 +3960,57 @@ fn supervisor_kills_a_process_by_deleting_its_space_then_its_untyped() {
     assert_eq!(k.m.runnable(), [k.t]);
     k.ok(retype(UT, Untyped, 1 << 20, s(30)));
 }
+
+// What the mutation check of the last pass found without a test.
+
+#[test]
+fn capability_at_depth_64_is_moved_by_ipc() {
+    let mut k = K::with_ipc();
+    for slot in 30..92 {
+        k.weak(if slot == 30 { NT } else { slot - 1 }, slot, Rights::ALL);
+    }
+    // Slot 91 is at depth 64: it cannot be derived, and it can be moved.
+    let deep = |transfer| send(EP, msg(1, vec![transfer]));
+    k.no(deep(Transfer::Derive(s(91), Rights::NONE)), Error::Invalid);
+    k.no(deep(Transfer::Move(s(91))), Error::WouldWait);
+}
+
+#[test]
+fn notify_bind_checks_the_notify_before_the_endpoint() {
+    let mut k = K::with_ipc();
+    let no_manage = k.weak(EP, 30, caps_without(Rights::MANAGE));
+    k.no(bind(EP, s(no_manage)), Error::Invalid);
+    k.no(bind(NT, s(no_manage)), Error::Denied);
+}
+
+#[test]
+fn rights_of_a_listed_slot_are_judged_before_whether_it_is_listed_twice() {
+    let mut k = K::with_ipc();
+    let weak = k.weak(NT, 30, Rights::SEND.union(Rights::DERIVE));
+    let twice = |rights| {
+        let first = Transfer::Derive(s(weak), Rights::NONE);
+        send(EP, msg(1, vec![first, Transfer::Derive(s(weak), rights)]))
+    };
+    k.no(twice(Rights::ALL), Error::Denied);
+    k.no(twice(Rights::SEND), Error::Invalid);
+}
+
+#[test]
+fn cap_move_checks_the_source_before_the_destination() {
+    let mut k = K::with_ipc();
+    k.weak(RP, 30, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(RP)));
+    // Slot 30 is dead; slot 0 is no destination.
+    k.no(mv(s(30), s(0)), Error::Gone);
+    k.no(mv(s(RP), s(0)), Error::Invalid);
+}
+
+#[test]
+fn untyped_retype_checks_the_untyped_before_the_destination() {
+    let mut k = K::new();
+    k.make(Untyped, 31);
+    k.weak(31, 30, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(31)));
+    k.no(retype(s(30), Endpoint, 0, s(0)), Error::Gone);
+    k.no(retype(s(31), Endpoint, 0, s(0)), Error::Invalid);
+}
