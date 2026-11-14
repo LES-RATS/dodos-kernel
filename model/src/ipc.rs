@@ -1,0 +1,416 @@
+//! IPC, transfer of capabilities and notifications.
+
+use crate::{
+    Access, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Range, ReplyState, Slot,
+    Transfer, Wait, Window, live,
+};
+use dodos_abi::{Error, Header, Marks, ObjectKind, Received, Rights, SlotAddr};
+
+/// What `wait` and `poll` do when the word is zero.
+#[derive(Clone, Copy)]
+pub(crate) enum IfZero {
+    Wait,
+    WouldWait,
+}
+
+impl Message {
+    /// Order of checks, step 3, and Messages: at most 64 words and 4
+    /// capabilities.
+    fn check(&self) -> Result<(), Error> {
+        Header::new(self.label, self.words.len(), self.caps.len(), 0).map(drop)
+    }
+
+    /// IPC: `send`, and `grant` if the message lists capabilities.
+    fn rights(&self) -> Rights {
+        if self.caps.is_empty() {
+            Rights::SEND
+        } else {
+            Rights::SEND.union(Rights::GRANT)
+        }
+    }
+}
+
+/// Notifications: what `recv` returns for a pending word of the bound
+/// notify. The badge field holds the word.
+fn notification(word: u64) -> Delivery {
+    let header = Header::new(0, 0, 0, Header::FLAG_NOTIFICATION).expect("an empty message");
+    Delivery {
+        received: received(header, word),
+        words: Vec::new(),
+    }
+}
+
+/// Tasks and marks are not modelled: no mark, task 0.
+fn received(header: Header, badge: u64) -> Received {
+    Received {
+        header,
+        badge,
+        marks: Marks::NONE,
+        task: 0,
+    }
+}
+
+impl Model {
+    pub(crate) fn call(
+        &mut self,
+        thread: ObjId,
+        endpoint: SlotAddr,
+        message: Message,
+        range: Range,
+    ) -> Outcome {
+        let held = self.held(thread, endpoint, ObjectKind::Endpoint, message.rights())?;
+        let (endpoint, badge) = (held.object, held.badge);
+        let parcel = self.parcel(thread, &message, badge)?;
+        let window = self.window(thread, range)?;
+        message.check()?;
+        range.check()?;
+        match self.take_receiver(endpoint) {
+            // IPC: a thread waits to receive.
+            Some((server, reply, into)) => {
+                let delivery = self.serve(thread, parcel, window, reply, into);
+                self.wake(server, Ok(Output::Message(delivery)));
+            }
+            // IPC: the caller joins the queue of the endpoint.
+            None => {
+                live(&mut self.endpoints, endpoint).queue.push_back(thread);
+                live(&mut self.threads, thread).wait = Wait::Call {
+                    endpoint,
+                    parcel,
+                    window,
+                };
+            }
+        }
+        Ok(Output::Waits)
+    }
+
+    pub(crate) fn recv(
+        &mut self,
+        thread: ObjId,
+        endpoint: SlotAddr,
+        reply: SlotAddr,
+        range: Range,
+    ) -> Outcome {
+        let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
+        let reply = self.object(thread, reply, ObjectKind::Reply, Rights::RECV)?;
+        let window = self.window(thread, range)?;
+        range.check()?;
+        // IPC: the reply object must be idle.
+        if self.replies[&reply] != ReplyState::Idle {
+            return Err(Error::Busy);
+        }
+        self.receive(thread, endpoint, reply, window)
+    }
+
+    pub(crate) fn reply_recv(
+        &mut self,
+        thread: ObjId,
+        reply: SlotAddr,
+        message: Message,
+        endpoint: SlotAddr,
+        range: Range,
+    ) -> Outcome {
+        // IPC: `send` on the reply object, then as `recv` with it.
+        let rights = message.rights().union(Rights::RECV);
+        let reply = self.object(thread, reply, ObjectKind::Reply, rights)?;
+        let parcel = self.parcel(thread, &message, 0)?;
+        let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
+        let window = self.window(thread, range)?;
+        message.check()?;
+        range.check()?;
+        if let ReplyState::Attached(_) = self.replies[&reply] {
+            return Err(Error::Busy);
+        }
+        // IPC: if the reply object is not armed the reply is dropped
+        // without an error.
+        // CONTRACT-GAP (Transfer of capabilities): `reply_recv` has no
+        // result that tells the server that the capabilities of its reply
+        // were dropped. It is not told.
+        self.answer(reply, parcel);
+        self.receive(thread, endpoint, reply, window)
+    }
+
+    pub(crate) fn send(&mut self, thread: ObjId, target: SlotAddr, message: Message) -> Outcome {
+        let cap = self.cap(thread, target, Access::Read)?;
+        // IPC: `send` takes an endpoint or a reply object.
+        let kind = match self.objects[&self.caps[&cap].object].kind {
+            ObjectKind::Reply => ObjectKind::Reply,
+            _ => ObjectKind::Endpoint,
+        };
+        let held = self.is(cap, kind, message.rights())?;
+        let (target, badge) = (held.object, held.badge);
+        // IPC: a reply carries badge 0, the badge of every reply capability.
+        let parcel = self.parcel(thread, &message, badge)?;
+        message.check()?;
+        let flags = if kind == ObjectKind::Reply {
+            self.answer(target, parcel)
+        } else {
+            // The reply object of the receiver becomes idle: no caller
+            // waits for an answer.
+            self.take_receiver(target).map(|(server, _, into)| {
+                let (delivery, flags) = self.deliver(parcel, into, 0);
+                self.wake(server, Ok(Output::Message(delivery)));
+                flags
+            })
+        };
+        // IPC: `send` never queues. Transfer of capabilities: it returns
+        // the flag at once.
+        Ok(Output::Sent {
+            flags: flags.ok_or(Error::WouldWait)?,
+        })
+    }
+
+    pub(crate) fn signal(&mut self, thread: ObjId, notify: SlotAddr) -> Outcome {
+        let held = self.held(thread, notify, ObjectKind::Notify, Rights::SEND)?;
+        let (id, badge) = (held.object, held.badge);
+        // Notifications: the bits of the badge, or bit 0 without a badge.
+        let notify = live(&mut self.notifies, id);
+        notify.word |= if badge == 0 { 1 } else { badge };
+        let (word, bound) = (notify.word, notify.endpoint);
+        if let Some(&waiter) = notify.waiters.front() {
+            // Notifications: the first thread that waits gets the whole word.
+            self.unlink(waiter);
+            self.wake(waiter, Ok(Output::Word(word)));
+        } else if let Some((server, ..)) = bound.and_then(|bound| self.take_receiver(bound)) {
+            // Notifications: on a bound notify, the first thread that waits
+            // to receive on the endpoint, whose reply object becomes idle.
+            self.wake(server, Ok(Output::Message(notification(word))));
+        } else {
+            return Ok(Output::Done);
+        }
+        live(&mut self.notifies, id).word = 0;
+        Ok(Output::Done)
+    }
+
+    /// `wait` and `poll`.
+    pub(crate) fn wait(&mut self, thread: ObjId, notify: SlotAddr, if_zero: IfZero) -> Outcome {
+        let id = self.object(thread, notify, ObjectKind::Notify, Rights::RECV)?;
+        let notify = live(&mut self.notifies, id);
+        // Notifications: returns the word and clears it.
+        let word = std::mem::take(&mut notify.word);
+        if word != 0 {
+            return Ok(Output::Word(word));
+        }
+        if let IfZero::WouldWait = if_zero {
+            return Err(Error::WouldWait);
+        }
+        notify.waiters.push_back(thread);
+        live(&mut self.threads, thread).wait = Wait::Notify(id);
+        Ok(Output::Waits)
+    }
+
+    pub(crate) fn notify_bind(
+        &mut self,
+        thread: ObjId,
+        notify: SlotAddr,
+        endpoint: SlotAddr,
+    ) -> Outcome {
+        let notify = self.object(thread, notify, ObjectKind::Notify, Rights::RECV)?;
+        let endpoint = self.optional(thread, endpoint, ObjectKind::Endpoint, Rights::MANAGE)?;
+        let bound = self.notifies[&notify].endpoint;
+        match endpoint {
+            // Notifications: endpoint 0 removes the binding.
+            // CONTRACT-GAP (Notifications): the contract does not say what
+            // endpoint 0 does to a notify that is not bound. It succeeds.
+            None => {
+                if let Some(bound) = bound {
+                    live(&mut self.endpoints, bound).notify = None;
+                }
+            }
+            // Notifications: one notify per endpoint, one endpoint per
+            // notify.
+            // CONTRACT-GAP (Notifications): the contract does not say what
+            // binding does when the word is not zero and a thread already
+            // waits to receive. Nothing is delivered until the next
+            // `signal`.
+            Some(endpoint) => {
+                if bound.is_some() || self.endpoints[&endpoint].notify.is_some() {
+                    return Err(Error::Busy);
+                }
+                live(&mut self.endpoints, endpoint).notify = Some(notify);
+            }
+        }
+        live(&mut self.notifies, notify).endpoint = endpoint;
+        Ok(Output::Done)
+    }
+
+    /// Transfer of capabilities, checked when the call is made: each listed
+    /// slot, and `derive` on each capability to derive.
+    fn parcel(&self, thread: ObjId, message: &Message, badge: u64) -> Result<Parcel, Error> {
+        let mut caps = Vec::new();
+        for transfer in &message.caps {
+            caps.push(match *transfer {
+                Transfer::Move(slot) => (self.cap(thread, slot, Access::Write)?, None),
+                Transfer::Derive(slot, rights) => {
+                    let cap = self.cap(thread, slot, Access::Read)?;
+                    (cap, Some(self.caps[&cap].rights.derive(rights)?))
+                }
+            });
+        }
+        Ok(Parcel {
+            label: message.label,
+            words: message.words.clone(),
+            badge,
+            caps,
+        })
+    }
+
+    /// IPC, the state part of `recv` and `reply_recv`, in order: a pending
+    /// notification of the bound notify, the first caller in the queue,
+    /// otherwise the thread waits with the reply object attached.
+    fn receive(&mut self, thread: ObjId, endpoint: ObjId, reply: ObjId, window: Window) -> Outcome {
+        if let Some(notify) = self.endpoints[&endpoint].notify {
+            let word = std::mem::take(&mut live(&mut self.notifies, notify).word);
+            if word != 0 {
+                return Ok(Output::Message(notification(word)));
+            }
+        }
+        if let Some((caller, parcel, theirs)) = self.take_caller(endpoint) {
+            let delivery = self.serve(caller, parcel, theirs, reply, window);
+            return Ok(Output::Message(delivery));
+        }
+        live(&mut self.endpoints, endpoint).queue.push_back(thread);
+        *live(&mut self.replies, reply) = ReplyState::Attached(thread);
+        live(&mut self.threads, thread).wait = Wait::Recv {
+            endpoint,
+            reply,
+            window,
+        };
+        Ok(Output::Waits)
+    }
+
+    /// IPC: the message of a caller reaches a server. The reply object of
+    /// the server is armed with the caller, which waits for the reply.
+    fn serve(
+        &mut self,
+        caller: ObjId,
+        parcel: Parcel,
+        window: Window,
+        reply: ObjId,
+        into: Window,
+    ) -> Delivery {
+        // Transfer of capabilities: the reply will tell the caller if its
+        // capabilities were dropped.
+        let (delivery, flags) = self.deliver(parcel, into, 0);
+        *live(&mut self.replies, reply) = ReplyState::Armed {
+            caller,
+            window,
+            flags,
+        };
+        live(&mut self.threads, caller).wait = Wait::Reply(reply);
+        delivery
+    }
+
+    /// IPC: answers the caller that a reply object is armed with and makes
+    /// the object idle. `None` if it is not armed; otherwise the flags for
+    /// the thread that answers.
+    fn answer(&mut self, reply: ObjId, parcel: Parcel) -> Option<u32> {
+        let ReplyState::Armed {
+            caller,
+            window,
+            flags,
+        } = self.replies[&reply]
+        else {
+            return None;
+        };
+        self.unlink(caller);
+        // CONTRACT-GAP (Transfer of capabilities): one flag tells the
+        // caller two things, that the capabilities of its request were
+        // dropped and that those of the reply were. The header of the reply
+        // has the flag in both cases.
+        let (delivery, dropped) = self.deliver(parcel, window, flags);
+        self.wake(caller, Ok(Output::Message(delivery)));
+        Some(dropped)
+    }
+
+    /// Transfer of capabilities, checked at delivery: all or nothing.
+    /// Returns what the receiver gets, and `FLAG_CAPS_DROPPED` or 0.
+    fn deliver(&mut self, parcel: Parcel, window: Window, flags: u32) -> (Delivery, u32) {
+        let count = parcel.caps.len();
+        let index = |i: usize| window.first as usize + i;
+        let empty = |index: usize| {
+            let slots = self.cspaces.get(&window.cspace).map(|space| &space.slots);
+            // Slots and addresses: slot 0 is never used.
+            index != 0 && slots.and_then(|slots| slots.get(index)) == Some(&Slot::Empty)
+        };
+        // Every listed capability still exists, and the first slots of the
+        // receiver's range are empty, one per capability.
+        let fits = count <= window.count as usize
+            && parcel
+                .caps
+                .iter()
+                .all(|(cap, _)| self.caps.contains_key(cap))
+            && (0..count).all(|i| empty(index(i)));
+        if fits {
+            // CONTRACT-GAP (Transfer of capabilities): the contract does
+            // not say what listing one capability twice does. The list is
+            // applied in order: a capability moved twice ends in the later
+            // slot and leaves the earlier one empty.
+            for (i, &(cap, rights)) in parcel.caps.iter().enumerate() {
+                let place = (window.cspace, index(i) as u32);
+                match rights {
+                    None => self.place(cap, place),
+                    // A derived capability keeps its badge.
+                    Some(rights) => self.derive(cap, rights, self.caps[&cap].badge, place),
+                }
+            }
+        }
+        // The words are still delivered, with the flag and a count of 0.
+        let (caps, dropped) = if fits {
+            (count, 0)
+        } else {
+            (0, Header::FLAG_CAPS_DROPPED)
+        };
+        let header = Header::new(parcel.label, parcel.words.len(), caps, flags | dropped);
+        let delivery = Delivery {
+            received: received(
+                header.expect("checked when the call was made"),
+                parcel.badge,
+            ),
+            words: parcel.words,
+        };
+        (delivery, dropped)
+    }
+
+    /// The first thread in the queue of an endpoint, taken out of it, if it
+    /// waits to receive: the thread, its reply object, its receive range.
+    fn take_receiver(&mut self, endpoint: ObjId) -> Option<(ObjId, ObjId, Window)> {
+        let &thread = self.endpoints[&endpoint].queue.front()?;
+        let Wait::Recv { reply, window, .. } = self.threads[&thread].wait else {
+            return None;
+        };
+        self.unlink(thread);
+        Some((thread, reply, window))
+    }
+
+    /// The first thread in the queue of an endpoint, taken out of it, if it
+    /// waits to be received: the thread, its message, its receive range.
+    fn take_caller(&mut self, endpoint: ObjId) -> Option<(ObjId, Parcel, Window)> {
+        let &thread = self.endpoints[&endpoint].queue.front()?;
+        let Wait::Call { parcel, window, .. } = &self.threads[&thread].wait else {
+            return None;
+        };
+        let found = (thread, parcel.clone(), *window);
+        self.unlink(thread);
+        Some(found)
+    }
+
+    /// Takes a thread out of what it waits on and returns what that was. A
+    /// reply object attached to the thread or armed with it becomes idle.
+    pub(crate) fn unlink(&mut self, thread: ObjId) -> Wait {
+        let wait = std::mem::take(&mut live(&mut self.threads, thread).wait);
+        let other = |&queued: &ObjId| queued != thread;
+        match wait {
+            Wait::None => {}
+            Wait::Call { endpoint, .. } => live(&mut self.endpoints, endpoint).queue.retain(other),
+            Wait::Reply(reply) => *live(&mut self.replies, reply) = ReplyState::Idle,
+            Wait::Recv {
+                endpoint, reply, ..
+            } => {
+                live(&mut self.endpoints, endpoint).queue.retain(other);
+                *live(&mut self.replies, reply) = ReplyState::Idle;
+            }
+            Wait::Notify(notify) => live(&mut self.notifies, notify).waiters.retain(other),
+        }
+        wait
+    }
+}
