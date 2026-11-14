@@ -4283,3 +4283,204 @@ fn client_cancelled_in_a_call_calls_again_and_the_late_answer_is_dropped() {
 fn thread_cancel_is_not_one_of_the_calls_that_are_not_modelled() {
     let _ = K::new().go(Syscall::Other(Call::ThreadCancel));
 }
+
+// Wait numbers (D-109).
+
+fn cancel_up_to(thread: u32, number: u64) -> Syscall {
+    Syscall::ThreadCancel(s(thread), number)
+}
+
+fn wait_on(notify: u32, number: u64) -> Syscall {
+    Syscall::Wait(s(notify), number)
+}
+
+/// A call that can wait, with a wait number.
+fn numbered(mut call: Syscall, number: u64) -> Syscall {
+    match &mut call {
+        Syscall::Call { wait, .. }
+        | Syscall::Recv { wait, .. }
+        | Syscall::ReplyRecv { wait, .. }
+        | Syscall::Wait(_, wait) => *wait = number,
+        other => panic!("{other:?} does not wait"),
+    }
+    call
+}
+
+#[test]
+fn wait_whose_number_is_already_cancelled_returns_cancelled_at_once() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    // The cancel comes before the wait: it is remembered.
+    k.ok(cancel_up_to(40, 5));
+    for number in [1, 5] {
+        assert_eq!(k.on(waiter, wait_on(NT, number)), Err(Error::Cancelled));
+        assert!(k.can_run(waiter));
+    }
+    assert_eq!(k.on(waiter, wait_on(NT, 6)), WAITS);
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.woken(waiter), Some(Ok(Output::Word(1))));
+}
+
+#[test]
+fn cancel_that_comes_after_the_wait_is_over_ends_nothing_later() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    assert_eq!(k.on(waiter, wait_on(NT, 1)), WAITS);
+    k.ok(Syscall::Signal(s(NT)));
+    k.ok(cancel_up_to(40, 1));
+    assert_eq!(k.woken(waiter), Some(Ok(Output::Word(1))));
+    // The next wait has a greater number.
+    assert_eq!(k.on(waiter, wait_on(NT, 2)), WAITS);
+    assert_eq!(k.woken(waiter), None);
+    assert!(!k.can_run(waiter));
+}
+
+#[test]
+fn stale_smaller_number_does_not_end_a_wait_with_a_greater_one() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    assert_eq!(k.on(waiter, wait_on(NT, 7)), WAITS);
+    k.ok(cancel_up_to(40, 6));
+    assert_eq!(k.woken(waiter), None);
+    assert!(!k.can_run(waiter));
+    // A number equal to the wait's ends it.
+    k.ok(cancel_up_to(40, 7));
+    assert_eq!(k.woken(waiter), CANCELLED);
+    // A smaller number does not lower the word.
+    k.ok(cancel_up_to(40, 2));
+    assert_eq!(k.on(waiter, wait_on(NT, 7)), Err(Error::Cancelled));
+    assert_eq!(k.on(waiter, wait_on(NT, 8)), WAITS);
+}
+
+#[test]
+fn wait_number_0_is_never_cancelled_by_number_and_cancel_number_0_ends_any_wait() {
+    let mut k = K::with_ipc();
+    let (first, second) = (k.spawn(40), k.spawn(41));
+    k.ok(cancel_up_to(40, 9));
+    // A wait without a number waits whatever the word, and a number does
+    // not end it.
+    assert_eq!(k.on(first, wait_on(NT, 0)), WAITS);
+    k.ok(cancel_up_to(40, 9));
+    k.ok(cancel_up_to(40, 10));
+    assert_eq!(k.woken(first), None);
+    k.ok(cancel_up_to(40, 0));
+    assert_eq!(k.woken(first), CANCELLED);
+    // Number 0 ends a wait that has a number, and remembers nothing.
+    assert_eq!(k.on(second, wait_on(NT, 5)), WAITS);
+    k.ok(cancel_up_to(41, 0));
+    assert_eq!(k.woken(second), CANCELLED);
+    assert_eq!(k.on(second, wait_on(NT, 1)), WAITS);
+}
+
+#[test]
+fn call_that_ends_without_waiting_does_not_look_at_the_word() {
+    let mut k = K::with_ipc();
+    let (server, caller) = (k.spawn(40), k.spawn(41));
+    k.ok(cancel_up_to(40, 5));
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.on(server, wait_on(NT, 5)), Ok(Output::Word(1)));
+    assert_eq!(k.on(caller, call(EP, msg(3, vec![]), Range::NONE)), WAITS);
+    let received = k.on(server, numbered(recv(EP, RP, Range::NONE), 5));
+    assert_eq!(got(received).0, 3);
+    // Not even a call that fails.
+    k.no(numbered(recv(EP, RP, Range::NONE), 5), Error::Busy);
+}
+
+#[test]
+fn call_whose_number_is_cancelled_does_not_join_the_queue() {
+    let mut k = K::with_ipc();
+    let (client, server) = (k.spawn(40), k.spawn(41));
+    k.ok(cancel_up_to(40, 1));
+    let queued = numbered(call(EP, msg(1, vec![]), Range::NONE), 1);
+    assert_eq!(k.on(client, queued), Err(Error::Cancelled));
+    assert_eq!(k.m.census().callers, 0);
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+}
+
+#[test]
+fn call_delivered_at_once_whose_number_is_cancelled_has_sent_its_message() {
+    let mut k = K::with_ipc();
+    let (client, server) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(server, recv(EP, RP, range(50, 1))), WAITS);
+    k.ok(cancel_up_to(40, 1));
+    let sent = msg(1, vec![Transfer::Move(s(NT))]);
+    let delivered = numbered(call(EP, sent, Range::NONE), 1);
+    assert_eq!(k.on(client, delivered), Err(Error::Cancelled));
+    assert_eq!(got(k.woken(server).unwrap()), (1, 0, 1, 0));
+    assert_eq!(k.kind(50), Ok(Notify));
+    // The reply object it armed is idle again.
+    k.no(send(RP, msg(9, vec![])), Error::WouldWait);
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+}
+
+#[test]
+fn recv_whose_number_is_cancelled_leaves_its_reply_object_idle() {
+    let mut k = K::with_ipc();
+    let (server, other) = (k.spawn(40), k.spawn(41));
+    k.ok(cancel_up_to(40, 2));
+    let received = numbered(recv(EP, RP, Range::NONE), 2);
+    assert_eq!(k.on(server, received), Err(Error::Cancelled));
+    k.no(send(EP, msg(1, vec![])), Error::WouldWait);
+    assert_eq!(k.on(other, recv(EP, RP, Range::NONE)), WAITS);
+}
+
+#[test]
+fn reply_recv_whose_receive_is_cancelled_at_once_has_delivered_its_reply() {
+    let mut k = K::with_ipc();
+    let (client, server) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(client, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    assert_eq!(got(k.on(server, recv(EP, RP, Range::NONE))).0, 1);
+    k.ok(cancel_up_to(41, 4));
+    let answer = numbered(reply_recv(RP, msg(8, vec![]), EP), 4);
+    assert_eq!(k.on(server, answer), Err(Error::Cancelled));
+    assert_eq!(got(k.woken(client).unwrap()).0, 8);
+    // It does not wait to receive, and its reply object is idle.
+    k.no(send(EP, msg(2, vec![])), Error::WouldWait);
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+}
+
+#[test]
+fn thread_cancel_with_a_number_ends_each_of_the_four_waits() {
+    let mut k = K::with_ipc();
+    let threads: Vec<ObjId> = (40..44).map(|slot| k.spawn(slot)).collect();
+    k.make(Endpoint, 30);
+    k.make(Reply, 31);
+    let message = || msg(1, vec![]);
+    let waits = [
+        numbered(call(30, message(), Range::NONE), 3),
+        numbered(call(EP, message(), Range::NONE), 3),
+        numbered(recv(EP, 31, Range::NONE), 3),
+        wait_on(NT, 3),
+    ];
+    for (&thread, wait) in threads.iter().zip(waits) {
+        assert_eq!(k.on(thread, wait), WAITS);
+        // The second, once received, waits for the reply with its number.
+        if thread == threads[1] {
+            assert_eq!(got(k.go(recv(EP, RP, Range::NONE))).0, 1);
+        }
+    }
+    let census = k.m.census();
+    let waiting = [census.callers, census.served, census.receivers];
+    assert_eq!((waiting, census.waiters), ([1, 1, 1], 1));
+    for slot in 40..44 {
+        k.ok(cancel_up_to(slot, 2));
+    }
+    assert!(threads.iter().all(|&thread| k.woken(thread).is_none()));
+    for slot in 40..44 {
+        k.ok(cancel_up_to(slot, 3));
+    }
+    assert!(threads.iter().all(|&thread| k.woken(thread) == CANCELLED));
+}
+
+#[test]
+fn suspended_thread_whose_number_is_cancelled_stays_suspended() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    assert_eq!(k.on(waiter, wait_on(NT, 2)), WAITS);
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    k.ok(cancel_up_to(40, 2));
+    assert!(!k.can_run(waiter));
+    assert_eq!(k.woken(waiter), CANCELLED);
+    k.ok(Syscall::ThreadResume(s(40)));
+    assert!(k.can_run(waiter));
+}
