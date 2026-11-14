@@ -183,7 +183,11 @@ pub type Outcome = Result<Output, Error>;
 type Checked<T> = Result<T, Error>;
 
 /// A place for a capability: a capability space and an index in it.
-type Place = (ObjId, u32);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Place {
+    space: ObjId,
+    index: u32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Slot {
@@ -396,7 +400,7 @@ impl Model {
         let mut model = Self::default();
         let space = ObjId(model.next_id);
         let mut add = |kind, size, index, rights| {
-            let cap = model.create(kind, size, None, rights, (space, index));
+            let cap = model.create(kind, size, None, rights, Place { space, index });
             model.caps[&cap].object
         };
         let (all, segment) = (Rights::ALL, CSPACE_SEGMENT_SLOTS);
@@ -623,11 +627,14 @@ impl Model {
         if addr.index() == 0 || addr.index() as usize >= self.cspaces[&space].slots.len() {
             return Err(Error::Invalid);
         }
-        Ok((space, addr.index()))
+        Ok(Place {
+            space,
+            index: addr.index(),
+        })
     }
 
     /// Order of checks, step 4: `no_slot` if the destination is not empty.
-    fn vacant(&self, (space, index): Place) -> Result<(), Error> {
+    fn vacant(&self, Place { space, index }: Place) -> Result<(), Error> {
         match self.cspaces[&space].slots[index as usize] {
             Slot::Empty => Ok(()),
             Slot::Full(_) | Slot::Dead => Err(Error::NoSlot),

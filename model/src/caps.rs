@@ -125,7 +125,7 @@ impl Model {
             return Err(Error::Denied);
         }
         // Order of checks, step 3: the depth checks come last.
-        self.fits(place.0, parent, Placing::Derived)?;
+        self.fits(place.space, parent, Placing::Derived)?;
         self.vacant(place)?;
         let badge = if kept != 0 { kept } else { badge };
         self.derive(parent, rights, badge, place);
@@ -140,7 +140,7 @@ impl Model {
     ) -> Outcome {
         let cap = self.cap(thread, source, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
-        self.fits(place.0, cap, Placing::Moved)?;
+        self.fits(place.space, cap, Placing::Moved)?;
         self.vacant(place)?;
         self.place(cap, place);
         Ok(Output::Done)
@@ -158,7 +158,8 @@ impl Model {
             // Slots and addresses: `cap_delete` on a dead slot makes it
             // empty.
             Some(Slot::Dead) => {
-                *self.slot((space, slot.index())) = Slot::Empty;
+                let index = slot.index();
+                *self.slot(Place { space, index }) = Slot::Empty;
                 Ok(Output::Done)
             }
             // Removal ends: from the first step the capability is dying,
@@ -205,7 +206,7 @@ impl Model {
             return Err(Error::Invalid);
         }
         let (bytes, align) = footprint(kind, size, page)?;
-        self.fits(place.0, parent, Placing::Retyped(kind))?;
+        self.fits(place.space, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
         self.take(object, bytes, align)?;
         // Rules of `untyped_retype`: every right, but `exec` only if the
@@ -412,7 +413,7 @@ impl Model {
         *self.slot(place) = Slot::Full(cap);
     }
 
-    fn slot(&mut self, (space, index): Place) -> &mut Slot {
+    fn slot(&mut self, Place { space, index }: Place) -> &mut Slot {
         &mut live(&mut self.cspaces, space).slots[index as usize]
     }
 

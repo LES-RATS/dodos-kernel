@@ -1,6 +1,6 @@
 //! The invariants of the state.
 
-use crate::{CapId, Model, ObjId, Output, ReplyState, Slot, Thread, Wait, Window};
+use crate::{CapId, Model, ObjId, Output, Place, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
     CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS,
     ObjectKind, Rights, TREE_DEPTH,
@@ -198,7 +198,7 @@ impl Model {
             let exec = cap.rights.contains(Rights::EXEC);
             ensure(!(on_device && exec), "25: exec on device memory")?;
             ensure(id.0.max(cap.object.0) < self.next_id, "26: identity")?;
-            let (space, index) = cap.place;
+            let Place { space, index } = cap.place;
             let slots = self.cspaces.get(&space).map(|space| &space.slots);
             let slot = slots.and_then(|slots| slots.get(index as usize));
             ensure(slot == Some(&Slot::Full(id)), "6: slot of a capability")?;
@@ -213,7 +213,7 @@ impl Model {
     fn check_removal(&self) -> Check {
         let after = |id: &CapId| {
             let cap = &self.caps[id];
-            let holder = self.objects.get(&cap.place.0).map(|space| space.root);
+            let holder = self.objects.get(&cap.place.space).map(|space| space.root);
             let holder = holder.filter(|holder| holder != id);
             cap.parent.into_iter().chain(holder)
         };
@@ -248,7 +248,11 @@ impl Model {
             for (index, slot) in space.slots.iter().enumerate() {
                 let Slot::Full(cap) = *slot else { continue };
                 let held = self.caps.get(&cap).ok_or("6: capability of a full slot")?;
-                let here = held.place == (id, index as u32);
+                let here = held.place
+                    == Place {
+                        space: id,
+                        index: index as u32,
+                    };
                 ensure(here, "6: capability of a full slot")?;
                 let of = self.objects.get(&held.object);
                 let other_root = of.is_some_and(|of| of.root == cap) && cap != root;

@@ -2,8 +2,8 @@
 
 use crate::caps::Placing;
 use crate::{
-    CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Range, ReplyState, Slot,
-    Transfer, Wait, Window, live,
+    CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Place, Range, ReplyState,
+    Slot, Transfer, Wait, Window, live,
 };
 use dodos_abi::{Error, Header, Marks, ObjectKind, Received, Rights, SlotAddr, TREE_DEPTH};
 
@@ -419,7 +419,10 @@ impl Model {
                     && caps.iter().all(fits)
             });
         for (i, &listed) in listed.iter().flatten().enumerate() {
-            let place = (window.cspace, index(i) as u32);
+            let place = Place {
+                space: window.cspace,
+                index: index(i) as u32,
+            };
             match listed {
                 Listed::Move(cap) => self.place(cap, place),
                 // A derived capability keeps its badge.

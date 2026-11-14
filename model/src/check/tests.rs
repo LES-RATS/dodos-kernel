@@ -120,7 +120,7 @@ fn orphan(model: &mut Model, cap: CapId) {
 fn without_root(model: &mut Model, object: ObjId) {
     let root = model.objects[&object].root;
     orphan(model, root);
-    let (space, index) = model.caps.remove(&root).unwrap().place;
+    let Place { space, index } = model.caps.remove(&root).unwrap().place;
     live(&mut model.cspaces, space).slots[index as usize] = Slot::Empty;
 }
 
@@ -198,14 +198,32 @@ fn children_out_of_the_order_of_derivation_are_reported() {
 
 #[test]
 fn derivation_with_more_rights_than_its_parent_is_reported() {
-    let broken = spoiled(|m, at| m.derive(at.copy, Rights::ALL, 0, (at.space, 100)));
+    let broken = spoiled(|m, at| {
+        m.derive(
+            at.copy,
+            Rights::ALL,
+            0,
+            Place {
+                space: at.space,
+                index: 100,
+            },
+        )
+    });
     assert_eq!(broken, "3: rights of a derivation");
 }
 
 #[test]
 fn derivation_that_lost_the_badge_of_its_parent_is_reported() {
     let broken = spoiled(|m, at| {
-        m.derive(at.copy, Rights::NONE, 0, (at.space, 100));
+        m.derive(
+            at.copy,
+            Rights::NONE,
+            0,
+            Place {
+                space: at.space,
+                index: 100,
+            },
+        );
         live(&mut m.caps, at.copy).badge = 5;
     });
     assert_eq!(broken, "3: badge of a derivation");
@@ -231,7 +249,10 @@ fn dead_slot_0_is_reported() {
 fn full_slot_0_is_reported() {
     let broken = spoiled(|m, at| {
         live(&mut m.cspaces, at.space).slots[0] = Slot::Full(at.copy);
-        live(&mut m.caps, at.copy).place = (at.space, 0);
+        live(&mut m.caps, at.copy).place = Place {
+            space: at.space,
+            index: 0,
+        };
         live(&mut m.cspaces, at.space).slots[COPY as usize] = Slot::Empty;
     });
     assert_eq!(broken, "5: slot 0");
@@ -239,7 +260,12 @@ fn full_slot_0_is_reported() {
 
 #[test]
 fn capability_that_is_not_in_the_slot_it_names_is_reported() {
-    let broken = spoiled(|m, at| live(&mut m.caps, at.copy).place = (at.space, 100));
+    let broken = spoiled(|m, at| {
+        live(&mut m.caps, at.copy).place = Place {
+            space: at.space,
+            index: 100,
+        }
+    });
     assert_eq!(broken, "6: slot of a capability");
 }
 
@@ -461,7 +487,15 @@ fn chain_down_to(m: &mut Model, at: At, depth: usize) {
     let mut parent = at.later_copy;
     for index in 0..depth as u32 - 3 {
         let rights = m.caps[&parent].rights;
-        m.derive(parent, rights, 0, (at.space, 40 + index));
+        m.derive(
+            parent,
+            rights,
+            0,
+            Place {
+                space: at.space,
+                index: 40 + index,
+            },
+        );
         parent = *m.caps[&parent].children.last().unwrap();
     }
 }
@@ -489,12 +523,21 @@ fn capability_held_in_a_capability_space_that_descends_from_it_is_reported() {
             128,
             Some(at.untyped_cap),
             Rights::ALL,
-            (at.space, 40),
+            Place {
+                space: at.space,
+                index: 40,
+            },
         );
         let inner = m.caps[&inner].object;
         live(&mut m.cspaces, inner).slots = vec![Slot::Empty; 128];
         live(&mut m.untypeds, at.untyped).live += 2;
-        m.place(at.untyped_cap, (inner, 1));
+        m.place(
+            at.untyped_cap,
+            Place {
+                space: inner,
+                index: 1,
+            },
+        );
     });
     assert_eq!(broken, "21: removal that never ends");
 }
@@ -533,7 +576,15 @@ fn dying_space(m: &mut Model, at: At, next: usize) {
 fn capability_that_a_dying_space_did_not_hold_when_it_began_to_die_is_reported() {
     let broken = spoiled(|m, at| {
         dying_space(m, at, 1);
-        m.derive(at.copy, Rights::NONE, 0, (at.space, 100));
+        m.derive(
+            at.copy,
+            Rights::NONE,
+            0,
+            Place {
+                space: at.space,
+                index: 100,
+            },
+        );
     });
     assert_eq!(broken, "23: new capability in a dying space");
 }
@@ -599,7 +650,15 @@ fn root_capability_with_a_badge_is_reported() {
 #[test]
 fn badge_on_a_capability_that_is_not_for_an_endpoint_or_a_notify_is_reported() {
     let broken = spoiled(|m, at| {
-        m.derive(at.untyped_cap, Rights::NONE, 5, (at.space, 100));
+        m.derive(
+            at.untyped_cap,
+            Rights::NONE,
+            5,
+            Place {
+                space: at.space,
+                index: 100,
+            },
+        );
     });
     assert_eq!(broken, "3: badge on another kind");
 }
@@ -629,7 +688,16 @@ fn kernel_object_on_device_memory_is_reported() {
         let device = object(m, START_SLOT_FIRST + 1);
         let from = cap(m, START_SLOT_FIRST + 1);
         let rights = Rights::ALL.without(Rights::EXEC);
-        m.create(ObjectKind::Notify, 0, Some(from), rights, (at.space, 100));
+        m.create(
+            ObjectKind::Notify,
+            0,
+            Some(from),
+            rights,
+            Place {
+                space: at.space,
+                index: 100,
+            },
+        );
         live(&mut m.untypeds, device).live += 1;
     });
     assert_eq!(broken, "25: kind on device memory");
@@ -693,7 +761,10 @@ fn inner_space(m: &mut Model, at: At, index: u32) -> ObjId {
         128,
         Some(at.untyped_cap),
         Rights::ALL,
-        (at.space, index),
+        Place {
+            space: at.space,
+            index,
+        },
     );
     let inner = m.caps[&root].object;
     live(&mut m.cspaces, inner).slots = vec![Slot::Empty; 128];
@@ -707,7 +778,13 @@ fn untyped_capability_less_deep_than_the_space_that_holds_it_is_reported() {
     let broken = spoiled(|m, at| {
         let inner = inner_space(m, at, 40);
         let device = cap(m, START_SLOT_FIRST + 1);
-        m.place(device, (inner, 1));
+        m.place(
+            device,
+            Place {
+                space: inner,
+                index: 1,
+            },
+        );
     });
     assert_eq!(broken, "28: depth of what a space holds");
 }
@@ -717,7 +794,13 @@ fn root_capability_of_a_space_held_in_a_space_of_the_same_depth_is_reported() {
     let broken = spoiled(|m, at| {
         let (first, second) = (inner_space(m, at, 40), inner_space(m, at, 41));
         let root = m.objects[&second].root;
-        m.place(root, (first, 1));
+        m.place(
+            root,
+            Place {
+                space: first,
+                index: 1,
+            },
+        );
     });
     assert_eq!(broken, "28: depth of what a space holds");
 }
@@ -804,7 +887,10 @@ fn unknown_flag_kept_by_an_armed_reply_object_is_reported() {
 
 /// A child untyped of the first untyped, in a slot of the first space.
 fn child_untyped(m: &mut Model, at: At, index: u32) -> ObjId {
-    let place = (at.space, index);
+    let place = Place {
+        space: at.space,
+        index,
+    };
     let cap = m.create(
         ObjectKind::Untyped,
         4096,
@@ -820,7 +906,10 @@ fn child_untyped(m: &mut Model, at: At, index: u32) -> ObjId {
 fn object_whose_root_is_not_a_child_of_its_untyped_is_reported() {
     let broken = spoiled(|m, at| {
         let other = child_untyped(m, at, 100);
-        let place = (at.space, 101);
+        let place = Place {
+            space: at.space,
+            index: 101,
+        };
         let later = m.create(
             ObjectKind::Notify,
             0,
@@ -936,7 +1025,10 @@ fn child_untyped_of_device_memory_that_is_not_device_memory_is_reported() {
             4096,
             Some(from),
             rights,
-            (at.space, 100),
+            Place {
+                space: at.space,
+                index: 100,
+            },
         );
         let child = m.caps[&child].object;
         live(&mut m.untypeds, child).device = false;
