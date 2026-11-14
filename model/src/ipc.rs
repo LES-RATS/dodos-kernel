@@ -76,10 +76,14 @@ impl Model {
         let window = self.window(thread, range)?;
         message.check()?;
         range.check()?;
-        // The caller will wait on the reply object of the thread that waits
-        // to receive, or else on the endpoint.
         let receiver = self.receiver(endpoint);
-        self.accepts(receiver.map_or(endpoint, |(_, reply, _)| reply))?;
+        // CONTRACT-GAP (The derivation tree): the caller would wait on the
+        // reply object of the thread that waits to receive, which the call
+        // does not name. If that object is dying the call is `gone`, after
+        // `busy` among the checks of the state, and nothing is delivered.
+        if receiver.is_some_and(|(_, reply, _)| self.dying(reply)) {
+            return Err(Error::Gone);
+        }
         let parcel = Parcel::new(thread, message, badge);
         match receiver {
             // IPC: a thread waits to receive.
@@ -116,7 +120,6 @@ impl Model {
         if self.replies[&reply] != ReplyState::Idle {
             return Err(Error::Busy);
         }
-        self.receivable(endpoint, reply)?;
         self.receive(thread, endpoint, reply, window)
     }
 
@@ -139,7 +142,6 @@ impl Model {
         if let ReplyState::Attached(_) = self.replies[&reply] {
             return Err(Error::Busy);
         }
-        self.receivable(endpoint, reply)?;
         // IPC: if the reply object is not armed the reply is dropped
         // without an error. Transfer of capabilities: the server is not
         // told that the capabilities of its reply were dropped.
@@ -221,7 +223,6 @@ impl Model {
         if let IfZero::WouldWait = if_zero {
             return Err(Error::WouldWait);
         }
-        self.accepts(id)?;
         live(&mut self.notifies, id).waiters.push_back(thread);
         live(&mut self.threads, thread).wait = Wait::Notify(id);
         Ok(Output::Waits)
@@ -280,48 +281,15 @@ impl Model {
                     (cap, Some(rights))
                 }
             };
-            // Transfer of capabilities: a slot listed twice is `invalid`.
-            // CONTRACT-GAP (Order of checks): the contract does not place
-            // this `invalid`, nor the one of the depth. In a message both
-            // are checked with the slot, before the next one.
+            // Transfer of capabilities: a slot listed twice is `invalid`;
+            // this and the depth are checked with the slot, before the next
+            // listed slot.
             if caps.iter().any(|&(earlier, _)| earlier == cap) {
                 return Err(Error::Invalid);
             }
             caps.push((cap, rights));
         }
         Ok(caps)
-    }
-
-    /// The derivation tree: an object whose root capability is dying takes
-    /// no new waiting thread.
-    fn accepts(&self, object: ObjId) -> Result<(), Error> {
-        // CONTRACT-GAP (Order of checks): the contract does not place this
-        // `gone` among the checks of the state. It comes after `busy`, and
-        // the call that gets it has done nothing.
-        if self.caps[&self.objects[&object].root].dying {
-            return Err(Error::Gone);
-        }
-        Ok(())
-    }
-
-    /// The derivation tree: `gone` if receiving would make a thread wait on
-    /// an object whose root capability is dying: the first caller, on the
-    /// reply object, or else the receiver, on the reply object and on the
-    /// endpoint.
-    fn receivable(&self, endpoint: ObjId, reply: ObjId) -> Result<(), Error> {
-        let bound = self.endpoints[&endpoint].notify;
-        if bound.is_some_and(|notify| self.notifies[&notify].word != 0) {
-            return Ok(());
-        }
-        self.accepts(reply)?;
-        match self.endpoints[&endpoint]
-            .queue
-            .front()
-            .map(|first| &self.threads[first].wait)
-        {
-            Some(Wait::Call { .. }) => Ok(()),
-            _ => self.accepts(endpoint),
-        }
     }
 
     /// IPC, the state part of `recv` and `reply_recv`, in order: a pending
@@ -401,10 +369,9 @@ impl Model {
         };
         // The same checks as when the call was made, and the first slots of
         // the receiver's range are empty, one per capability.
-        // CONTRACT-GAP (The derivation tree): a capability moved by IPC
-        // into a capability space that descends from it is `invalid`, but
-        // the destination is known only at delivery, where no error can be
-        // returned. The capabilities are dropped.
+        // The derivation tree: a capability moved by IPC into a capability
+        // space older than itself is refused at delivery, which drops the
+        // capabilities.
         let movable = |&(cap, rights): &(CapId, Option<Rights>)| {
             rights.is_some() || self.movable(cap, window.cspace).is_ok()
         };

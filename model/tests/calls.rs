@@ -699,6 +699,19 @@ fn dying_capability_is_gone_for_every_call_but_cap_delete() {
 }
 
 #[test]
+fn copy_under_cap_delete_is_dying_and_its_object_is_not() {
+    let mut k = K::with_ipc();
+    k.weak(NT, 30, Rights::ALL);
+    for slot in 31..64 {
+        k.weak(30, slot, Rights::ALL);
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(k.kind(30), Err(Error::Gone));
+    k.ok(Syscall::Signal(s(31)));
+    assert_eq!(k.go(Syscall::Wait(s(NT))), Ok(Output::Word(1)));
+}
+
+#[test]
 fn capability_is_not_dying_after_cap_revoke_returns_again() {
     let mut k = K::with_ipc();
     for slot in 30..63 {
@@ -719,36 +732,48 @@ fn dying(k: &mut K, root: u32, first_copy: u32) -> u32 {
 }
 
 #[test]
-fn notify_whose_root_capability_is_dying_takes_no_new_waiting_thread() {
+fn every_call_on_a_dying_object_is_gone() {
     let mut k = K::with_ipc();
-    let copy = dying(&mut k, NT, 30);
-    k.no(Syscall::Wait(s(copy)), Error::Gone);
-    // What does not wait still works.
-    k.no(Syscall::Poll(s(copy)), Error::WouldWait);
-    k.ok(Syscall::Signal(s(copy)));
-    assert_eq!(k.go(Syscall::Wait(s(copy))), Ok(Output::Word(1)));
+    let notify = dying(&mut k, NT, 30);
+    k.no(Syscall::Wait(s(notify)), Error::Gone);
+    k.no(Syscall::Poll(s(notify)), Error::Gone);
+    k.no(Syscall::Signal(s(notify)), Error::Gone);
+    assert_eq!(k.kind(notify), Err(Error::Gone));
+    let endpoint = dying(&mut k, EP, 70);
+    k.no(call(endpoint, msg(1, vec![]), Range::NONE), Error::Gone);
+    k.no(recv(endpoint, RP, Range::NONE), Error::Gone);
+    k.no(send(endpoint, msg(1, vec![])), Error::Gone);
+    // `cap_delete` still takes the slot.
+    k.ok(Syscall::CapDelete(s(notify)));
+    assert_eq!(k.kind(notify), Err(Error::Invalid));
 }
 
 #[test]
-fn endpoint_whose_root_capability_is_dying_takes_no_new_waiting_thread() {
-    let mut k = K::with_ipc();
-    let copy = dying(&mut k, EP, 30);
-    k.no(call(copy, msg(1, vec![]), Range::NONE), Error::Gone);
-    k.no(recv(copy, RP, Range::NONE), Error::Gone);
-    k.no(reply_recv(RP, msg(1, vec![]), copy), Error::Gone);
-    k.no(send(copy, msg(1, vec![])), Error::WouldWait);
+fn object_is_dying_as_soon_as_a_removal_reaches_its_root_capability() {
+    let mut k = K::new();
+    k.make(Untyped, 30);
+    k.ok(retype(s(30), Notify, 0, s(31)));
+    for slot in 40..73 {
+        k.weak(31, slot, Rights::ALL);
+    }
+    // The first step removes copies of the notify capability only.
+    k.no(Syscall::CapRevoke(s(30)), Error::Again);
+    assert_eq!(k.kind(40), Err(Error::Gone));
+    assert_eq!(k.kind(31), Err(Error::Gone));
+    assert_eq!(k.kind(30), Ok(Untyped));
 }
 
 #[test]
-fn reply_object_whose_root_capability_is_dying_takes_no_new_waiting_thread() {
+fn recv_with_a_dying_reply_object_is_gone_and_the_caller_stays_queued() {
     let mut k = K::with_ipc();
     let caller = k.spawn(70);
     assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
     let copy = dying(&mut k, RP, 30);
-    // Neither the receiver nor the caller it would arm the object with.
     k.no(recv(EP, copy, Range::NONE), Error::Gone);
     k.no(reply_recv(copy, msg(1, vec![]), EP), Error::Gone);
     assert_eq!(k.woken(caller), None);
+    k.make(Reply, 80);
+    assert_eq!(got(k.go(recv(EP, 80, Range::NONE))), (1, 0, 0, 0));
 }
 
 #[test]
@@ -763,27 +788,6 @@ fn call_is_gone_when_the_reply_object_of_the_receiver_is_dying() {
     assert_eq!(
         k.go(send(EP, msg(2, vec![]))),
         Ok(Output::Sent { flags: 0 })
-    );
-}
-
-#[test]
-fn recv_takes_a_caller_from_an_endpoint_whose_root_capability_is_dying() {
-    let mut k = K::with_ipc();
-    let caller = k.spawn(70);
-    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
-    let copy = dying(&mut k, EP, 30);
-    assert_eq!(got(k.go(recv(copy, RP, Range::NONE))), (1, 0, 0, 0));
-}
-
-#[test]
-fn receiving_does_not_wait_when_a_notification_is_pending() {
-    let mut k = K::with_ipc();
-    k.ok(bind(NT, s(EP)));
-    k.ok(Syscall::Signal(s(NT)));
-    let copy = dying(&mut k, EP, 30);
-    assert_eq!(
-        got(k.go(recv(copy, RP, Range::NONE))).3,
-        Header::FLAG_NOTIFICATION
     );
 }
 
@@ -926,27 +930,63 @@ fn cspace_that_holds_its_own_root_capability_can_be_deleted() {
 }
 
 #[test]
-fn cap_move_into_a_capability_space_that_descends_from_the_capability_is_invalid() {
+fn untyped_capability_moves_only_into_a_capability_space_older_than_itself() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 16, s(30)));
-    k.ok(retype(s(30), CSpace, 128, s(31)));
-    k.go(grow_from(31, s(30))).unwrap();
-    k.no(mv(s(30), via(31, 5)), Error::Invalid);
-    k.no(mv(UT, via(31, 5)), Error::Invalid);
-    // A capability it does not descend from can go there, and so can a
-    // copy of the untyped capability.
-    k.ok(mv(DEV, via(31, 5)));
-    k.ok(derive(s(30), via(31, 6), Rights::ALL, 0));
-    k.ok(Syscall::CapDelete(s(30)));
-    assert_eq!(k.kind(31), Err(Error::Gone));
+    k.make(CSpace, 30);
+    k.go(grow(30)).unwrap();
+    k.no(mv(UT, via(30, 5)), Error::Invalid);
+    k.no(mv(DEV, via(30, 5)), Error::Invalid);
+    // An untyped capability made after the space, a child or a copy, can
+    // go there.
+    k.make(Untyped, 31);
+    k.weak(START_SLOT_FIRST, 32, Rights::ALL);
+    k.ok(mv(s(31), via(30, 5)));
+    k.ok(mv(s(32), via(30, 6)));
 }
 
 #[test]
-fn capability_moved_by_ipc_into_a_space_that_descends_from_it_is_dropped() {
+fn capability_of_another_kind_moves_into_any_capability_space() {
     let mut k = K::with_ipc();
-    k.ok(retype(UT, Untyped, 1 << 16, s(30)));
-    k.ok(retype(s(30), CSpace, 128, s(31)));
-    k.go(grow_from(31, s(30))).unwrap();
+    k.weak(START_SLOT_CSPACE, 31, Rights::ALL);
+    k.make(CSpace, 30);
+    k.go(grow(30)).unwrap();
+    // All three are older than the space; the second is not a root.
+    k.ok(mv(s(START_SLOT_DEBUG), via(30, 5)));
+    k.ok(mv(s(31), via(30, 6)));
+    k.ok(mv(s(EP), via(30, 7)));
+}
+
+#[test]
+fn root_capability_of_a_cspace_moves_only_into_a_capability_space_older_than_itself() {
+    let mut k = K::new();
+    for slot in [30, 31] {
+        k.make(CSpace, slot);
+        k.go(grow(slot)).unwrap();
+        k.weak(slot, slot + 2, Rights::ALL);
+    }
+    k.no(mv(s(30), via(33, 1)), Error::Invalid);
+    k.ok(mv(s(31), via(32, 1)));
+    // Deleting the older space destroys the younger one it holds.
+    k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(k.kind(33), Err(Error::Gone));
+}
+
+#[test]
+fn refused_move_is_invalid_before_no_slot() {
+    let mut k = K::new();
+    k.make(CSpace, 30);
+    k.go(grow(30)).unwrap();
+    k.make(Notify, 31);
+    k.ok(mv(s(31), via(30, 5)));
+    k.no(mv(UT, via(30, 5)), Error::Invalid);
+}
+
+#[test]
+fn capability_moved_by_ipc_into_a_capability_space_younger_than_itself_is_dropped() {
+    let mut k = K::with_ipc();
+    k.make(Untyped, 30);
+    k.make(CSpace, 31);
+    k.go(grow(31)).unwrap();
     caller_with(&mut k, vec![Transfer::Move(s(30))], Range::NONE);
     let range = Range {
         first: via(31, 5),
@@ -957,31 +997,17 @@ fn capability_moved_by_ipc_into_a_space_that_descends_from_it_is_dropped() {
 }
 
 #[test]
-fn cap_move_into_a_space_whose_root_is_held_in_a_space_that_descends_from_it_is_invalid() {
-    let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 16, s(30)));
-    k.ok(retype(s(30), CSpace, 128, s(31)));
-    k.go(grow_from(31, s(30))).unwrap();
-    k.make(CSpace, 32);
-    k.go(grow(32)).unwrap();
-    k.weak(32, 33, Rights::ALL);
-    k.ok(mv(s(32), via(31, 1)));
-    k.no(mv(s(30), via(33, 5)), Error::Invalid);
-}
-
-#[test]
-fn capability_spaces_cannot_hold_the_root_capability_of_each_other() {
-    let mut k = K::new();
-    for slot in [30, 31] {
-        k.make(CSpace, slot);
-        k.go(grow(slot)).unwrap();
-        k.weak(slot, slot + 2, Rights::ALL);
-    }
-    k.ok(mv(s(30), via(33, 1)));
-    k.no(mv(s(31), via(32, 1)), Error::Invalid);
-    k.ok(Syscall::CapDelete(via(33, 1)));
-    assert_eq!(k.kind(32), Err(Error::Gone));
-    assert_eq!(k.kind(31), Ok(CSpace));
+fn capability_derived_by_ipc_lands_in_any_capability_space() {
+    let mut k = K::with_ipc();
+    k.make(CSpace, 31);
+    k.go(grow(31)).unwrap();
+    caller_with(&mut k, vec![Transfer::Derive(UT, Rights::ALL)], Range::NONE);
+    let range = Range {
+        first: via(31, 5),
+        count: 1,
+    };
+    assert_eq!(got(k.go(recv(EP, RP, range))), (1, 0, 1, 0));
+    assert_eq!(k.inspect(via(31, 5)).unwrap().0, Untyped);
 }
 
 #[test]
@@ -1166,12 +1192,22 @@ fn memory_is_aligned_on_the_size_of_the_object() {
 }
 
 #[test]
-fn object_larger_than_4_kb_is_aligned_on_4_kb() {
+fn child_untyped_is_aligned_on_its_size() {
     let mut k = K::new();
     k.ok(retype(UT, Untyped, 1 << 16, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
     k.ok(retype(s(30), Untyped, 1 << 15, s(32)));
-    k.ok(retype(s(30), Untyped, 1 << 14, s(33)));
+    k.no(retype(s(30), Untyped, 4096, s(33)), Error::NoMemory);
+}
+
+#[test]
+fn kernel_object_larger_than_4_kb_is_aligned_on_4_kb() {
+    let mut k = K::new();
+    k.ok(retype(UT, Untyped, 1 << 14, s(30)));
+    k.ok(retype(s(30), Endpoint, 0, s(31)));
+    // A directory of 8 KB, at 4 KB: the last 4 KB are left.
+    k.ok(retype(s(30), CSpace, 513 * 128, s(32)));
+    k.ok(retype(s(30), ASpace, 0, s(33)));
 }
 
 #[test]

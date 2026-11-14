@@ -8,13 +8,12 @@ use dodos_abi::{
     CSPACE_SEGMENT_SLOTS, Error, ObjectKind, PageSize, REMOVAL_STEP, Rights, SLOT_BYTES, SlotAddr,
     TREE_DEPTH,
 };
-use std::collections::BTreeSet;
 
 /// Slots and addresses: one segment of a capability space.
 const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
 /// Slots and addresses: the directory of a capability space, per segment.
 const DIRECTORY_BYTES: u64 = 8;
-/// Rules of `untyped_retype`: the greatest alignment of an object.
+/// Rules of `untyped_retype`: the greatest alignment of a kernel object.
 const PAGE: u64 = 4096;
 
 /// What `cap_delete` and `cap_revoke` remove.
@@ -46,12 +45,13 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
         // one-core model are `unsupported`.
         _ => return Err(Error::Unsupported),
     };
-    // Rules of `untyped_retype`: aligned on the size of the object, or on
-    // 4 KB if the object is larger, and on the page size for a frame.
-    let align = if kind == ObjectKind::Frame {
-        page.bytes()
-    } else {
-        bytes.min(PAGE)
+    // Rules of `untyped_retype`: aligned on the size of a child untyped, on
+    // the page size for a frame, and for the other objects on their size,
+    // or on 4 KB if they are larger.
+    let align = match kind {
+        ObjectKind::Untyped => bytes,
+        ObjectKind::Frame => page.bytes(),
+        _ => bytes.min(PAGE),
     };
     if valid {
         Ok((bytes, align))
@@ -185,8 +185,8 @@ impl Model {
         let space = self.object(thread, cspace, ObjectKind::CSpace, Rights::MANAGE)?;
         let untyped = self.object(thread, untyped, ObjectKind::Untyped, Rights::WRITE)?;
         // Slots and addresses: only from the untyped it was created from.
-        // CONTRACT-GAP (Slots and addresses): the capability space given at
-        // start-up was created from no untyped. It never grows.
+        // The derivation tree: the start-up space, created from no untyped,
+        // never grows.
         if self.objects[&space].from != Some(untyped) {
             return Err(Error::Invalid);
         }
@@ -201,12 +201,10 @@ impl Model {
         Ok(Output::Slots(slots as u32))
     }
 
-    /// The derivation tree: the tree is at most 64 deep. `invalid` if a
-    /// child of `parent` would be deeper.
+    /// The derivation tree: the tree is at most 64 deep, and a start-up
+    /// capability is at depth 1. `invalid` if a child of `parent` would be
+    /// deeper; checked with the plain arguments.
     pub(crate) fn shallow(&self, parent: CapId) -> Result<(), Error> {
-        // CONTRACT-GAP (Order of checks): the contract does not place this
-        // `invalid`, nor the one of `movable`. Both are checked with the
-        // plain arguments. A capability given at start-up is at depth 1.
         let above = |cap: &CapId| self.caps[cap].parent;
         if std::iter::successors(Some(parent), above).count() >= TREE_DEPTH {
             return Err(Error::Invalid);
@@ -214,34 +212,17 @@ impl Model {
         Ok(())
     }
 
-    /// The derivation tree: a capability cannot be moved into a capability
-    /// space that descends from it (`invalid`).
+    /// The derivation tree: a capability space holds authority only over
+    /// what is younger than itself. An untyped capability, or the root
+    /// capability of another capability space, moves into a space only if
+    /// it was created after the root capability of that space (`invalid`,
+    /// checked with the plain arguments).
     pub(crate) fn movable(&self, cap: CapId, space: ObjId) -> Result<(), Error> {
-        // CONTRACT-GAP (The derivation tree): the rule of the contract does
-        // not stop every removal that would never end. A capability space
-        // that descends from nothing of `cap` can still wait for it: the
-        // root capability of space A in space B and that of B in A, or `cap`
-        // in a space whose root capability is held in a space that descends
-        // from `cap`. Here the move is `invalid` whenever the root
-        // capability of the destination must be removed before `cap`: `cap`
-        // is reached from it by going, any number of times, from a
-        // capability to its parent or to the root capability of the space
-        // that holds it. A capability space may hold its own root
-        // capability, as the one given at start-up does.
-        let mut later = vec![self.objects[&space].root];
-        let mut seen = BTreeSet::new();
-        while let Some(next) = later.pop() {
-            if !seen.insert(next) {
-                continue;
-            }
-            let holder = self.objects[&self.caps[&next].place.0].root;
-            let own = (holder != next).then_some(holder);
-            for after in self.caps[&next].parent.into_iter().chain(own) {
-                if after == cap {
-                    return Err(Error::Invalid);
-                }
-                later.push(after);
-            }
+        let kind = self.objects[&self.caps[&cap].object].kind;
+        let bound = kind == ObjectKind::Untyped
+            || self.rooted(cap).is_some_and(|_| kind == ObjectKind::CSpace);
+        if bound && cap < self.objects[&space].root {
+            return Err(Error::Invalid);
         }
         Ok(())
     }
@@ -423,9 +404,17 @@ impl Model {
     /// The derivation tree, the fixed order: the most recently derived child
     /// first, a capability only after all its descendants, and the root
     /// capability of a `cspace` only after the capabilities in it, in index
-    /// order.
-    fn next_removed(&self, mut cap: CapId) -> CapId {
+    /// order. Removal ends: the objects whose root capability the walk goes
+    /// through are dying.
+    fn next_removed(&mut self, mut cap: CapId) -> CapId {
         loop {
+            // CONTRACT-GAP (The derivation tree): the contract does not say
+            // which step is the first of the destruction of an object. It
+            // is the first step of a removal that reaches its root
+            // capability, even when that step removes a descendant.
+            if self.rooted(cap).is_some() {
+                live(&mut self.caps, cap).dying = true;
+            }
             let child = self.caps[&cap].children.last().copied();
             match child.or_else(|| self.swept(cap)) {
                 Some(next) => cap = next,
@@ -435,14 +424,10 @@ impl Model {
     }
 
     /// The first capability to remove from the capability space that `cap`
-    /// is the root capability of, if there is one.
+    /// is the root capability of, if there is one. The derivation tree: a
+    /// space may hold its own root capability, which is removed last.
     fn swept(&self, cap: CapId) -> Option<CapId> {
         let space = self.cspaces.get(&self.rooted(cap)?)?;
-        // CONTRACT-GAP (The derivation tree): the contract does not say
-        // what "every capability in it" is for a capability space that
-        // holds its own root capability, as the one given at start-up does.
-        // That capability is not removed first: it goes last, as the root
-        // capability.
         space.slots.iter().find_map(|slot| match *slot {
             Slot::Full(held) if held != cap => Some(held),
             _ => None,

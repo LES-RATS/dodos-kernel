@@ -36,8 +36,8 @@ pub const BOOT_DEVICE_BYTES: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjId(u32);
 
-/// Identity of a capability. It is never reused, and a capability is always
-/// younger than its parent.
+/// Identity of a capability, and its creation number (The derivation tree):
+/// it is never reused and only grows, so a greater one is younger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CapId(u32);
 
@@ -192,7 +192,9 @@ struct Cap {
     /// In the order of derivation, the most recent last.
     children: Vec<CapId>,
     place: Place,
-    /// The derivation tree: set by the first step of `cap_delete`.
+    /// The derivation tree: set by the first step of `cap_delete` on the
+    /// capability, and on a root capability by the first step of the
+    /// destruction of its object.
     dying: bool,
 }
 
@@ -479,14 +481,24 @@ impl Model {
 
     /// Order of checks, steps 1 and 2, the slot: `invalid` if empty or out
     /// of range, `gone` if dead. The derivation tree: `gone` if the
-    /// capability is dying.
+    /// capability is dying, or its object is.
     fn full(&self, cspace: ObjId, index: u32) -> Result<CapId, Error> {
         match self.cspaces[&cspace].slots.get(index as usize) {
-            Some(Slot::Full(cap)) if self.caps[cap].dying => Err(Error::Gone),
+            Some(&Slot::Full(cap))
+                if self.caps[&cap].dying || self.dying(self.caps[&cap].object) =>
+            {
+                Err(Error::Gone)
+            }
             Some(&Slot::Full(cap)) => Ok(cap),
             Some(Slot::Dead) => Err(Error::Gone),
             Some(Slot::Empty) | None => Err(Error::Invalid),
         }
+    }
+
+    /// The derivation tree: an object is dying from the first step of its
+    /// destruction, which makes its root capability dying.
+    fn dying(&self, object: ObjId) -> bool {
+        self.caps[&self.objects[&object].root].dying
     }
 
     /// Order of checks, steps 1 and 2: the slot of a capability argument.

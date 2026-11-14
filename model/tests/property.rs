@@ -3,6 +3,7 @@
 
 use dodos_abi::*;
 use dodos_model::*;
+use std::sync::OnceLock;
 
 const SEEDS: u64 = 24;
 const STEPS: usize = 5000;
@@ -141,15 +142,48 @@ impl Generator<'_> {
         }
     }
 
+    /// The untyped to take memory from: mostly the first one, so that a
+    /// capability space is often grown from the untyped it was created from.
+    fn memory(&mut self) -> SlotAddr {
+        if self.rng.chance(60) {
+            SlotAddr::own(START_SLOT_FIRST)
+        } else {
+            self.held(UNTYPED)
+        }
+    }
+
+    /// A slot of a class in another capability space, or in the caller's
+    /// own through its capability for it.
+    fn inside(&mut self, class: u32) -> SlotAddr {
+        let via = if self.rng.chance(10) {
+            START_SLOT_CSPACE
+        } else {
+            self.find(CSPACE, Wanted::Full).index()
+        };
+        SlotAddr::through(via, 18 + 8 * self.rng.below(8) as u32 + class)
+    }
+
+    /// The source of a move that the creation numbers can refuse: an
+    /// untyped capability or a cspace capability, here or in another space.
+    /// Seldom a start-up capability: once moved, the rest of the run finds
+    /// little to do.
+    fn bound(&mut self) -> SlotAddr {
+        let class = if self.rng.chance(50) { UNTYPED } else { CSPACE };
+        match self.rng.below(100) {
+            0..30 => self.inside(class),
+            30..33 => self.held(class),
+            _ => self.find(class, Wanted::Full),
+        }
+    }
+
     fn message(&mut self) -> Message {
         let mut caps = Vec::new();
         while self.rng.chance(25) {
             let class = self.rng.below(8) as u32;
-            let source = self.held(class);
-            caps.push(if self.rng.chance(50) {
-                Transfer::Move(source)
-            } else {
-                Transfer::Derive(source, self.rights())
+            caps.push(match self.rng.below(100) {
+                0..35 => Transfer::Move(self.bound()),
+                35..60 => Transfer::Move(self.held(class)),
+                _ => Transfer::Derive(self.held(class), self.rights()),
             });
         }
         let words = if self.rng.chance(1) {
@@ -166,7 +200,11 @@ impl Generator<'_> {
 
     fn range(&mut self) -> Range {
         Range {
-            first: self.free(SPARE),
+            first: if self.rng.chance(40) {
+                self.inside(SPARE)
+            } else {
+                self.free(SPARE)
+            },
             count: self.rng.below(6) as u32,
         }
     }
@@ -177,7 +215,7 @@ impl Generator<'_> {
         let near = if self.rng.chance(80) { class } else { SPARE };
         let answered = if self.rng.chance(50) { ENDPOINT } else { REPLY };
         let none = |rng: &mut Rng| rng.chance(60);
-        let call = match self.rng.below(30) {
+        let call = match self.rng.below(38) {
             0..3 => Syscall::CapDerive {
                 source: self.held(class),
                 destination: self.free(near),
@@ -203,7 +241,7 @@ impl Generator<'_> {
             7..12 => {
                 let (kind, class, size) = self.rng.pick(&KINDS);
                 Syscall::UntypedRetype {
-                    untyped: self.held(UNTYPED),
+                    untyped: self.memory(),
                     kind,
                     size: if self.rng.chance(95) {
                         size
@@ -214,11 +252,11 @@ impl Generator<'_> {
                     destination: self.free(class),
                 }
             }
-            12 => Syscall::CSpaceGrow {
-                cspace: self.held(CSPACE),
-                untyped: self.held(UNTYPED),
+            12 | 13 => Syscall::CSpaceGrow {
+                cspace: self.find(CSPACE, Wanted::Full),
+                untyped: self.memory(),
             },
-            13 | 14 => Syscall::ThreadConfigure {
+            14 => Syscall::ThreadConfigure {
                 thread: self.held(THREAD),
                 cspace: self.held(CSPACE),
                 aspace: if none(self.rng) {
@@ -257,6 +295,33 @@ impl Generator<'_> {
             26 => Syscall::Signal(self.held(NOTIFY)),
             27 => Syscall::Wait(self.held(NOTIFY)),
             28 => Syscall::Poll(self.held(NOTIFY)),
+            // The moves that the creation numbers can refuse, both ways.
+            29..32 => Syscall::CapMove {
+                source: self.bound(),
+                destination: if self.rng.chance(30) {
+                    self.free(near)
+                } else {
+                    self.inside(near)
+                },
+            },
+            // The same by IPC: a message that moves one, and a receiver whose
+            // range is in another capability space.
+            32..35 => Syscall::Send {
+                target: self.held(ENDPOINT),
+                message: Message {
+                    label: 0,
+                    words: Vec::new(),
+                    caps: vec![Transfer::Move(self.bound())],
+                },
+            },
+            35..37 => Syscall::Recv {
+                endpoint: self.held(ENDPOINT),
+                reply: self.held(REPLY),
+                range: Range {
+                    first: self.inside(SPARE),
+                    count: 1 + self.rng.below(4) as u32,
+                },
+            },
             _ if self.rng.chance(80) => Syscall::NotifyBind {
                 notify: self.held(NOTIFY),
                 endpoint: if self.rng.chance(20) {
@@ -316,6 +381,79 @@ struct Reached {
     notifications: u32,
     /// Threads woken with `gone`.
     woken_gone: u32,
+    /// `cap_move` of an untyped capability (first) or of a cspace
+    /// capability (second) through a cspace capability: those accepted, and
+    /// those refused only because of the creation numbers.
+    moved: [u32; 2],
+    refused: [u32; 2],
+    /// `send` that lists such a move and found a receiver: those delivered
+    /// with their capabilities, and those dropped only because of the
+    /// creation numbers.
+    sent: u32,
+    sent_refused: u32,
+}
+
+/// What `at_risk` found about a call before it was made.
+struct Risk {
+    /// 0 for an untyped capability, 1 for a cspace capability.
+    kind: usize,
+    /// The call succeeds when the capability is derived instead of moved: a
+    /// new capability is younger than every capability space.
+    fits_derived: bool,
+}
+
+/// Whether a call moves an untyped or a cspace capability, by `cap_move`
+/// through a cspace capability or by `send`. It asks copies of the state.
+fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
+    let on_copy = |call: Syscall| model.clone().apply(thread, call);
+    let kind = |slot: SlotAddr| match on_copy(Syscall::CapInspect(slot)) {
+        Ok(Output::Inspect {
+            kind: ObjectKind::Untyped,
+            ..
+        }) => Some(0),
+        Ok(Output::Inspect {
+            kind: ObjectKind::CSpace,
+            ..
+        }) => Some(1),
+        _ => None,
+    };
+    match call {
+        &Syscall::CapMove {
+            source,
+            destination,
+        } if source.via() | destination.via() != 0 => {
+            let derived = Syscall::CapDerive {
+                source,
+                destination,
+                rights: Rights::NONE,
+                badge: 0,
+            };
+            Some(Risk {
+                kind: kind(source)?,
+                fits_derived: on_copy(derived).is_ok(),
+            })
+        }
+        Syscall::Send { target, message } => {
+            let mut derived = message.clone();
+            let mut found = None;
+            for transfer in &mut derived.caps {
+                if let Transfer::Move(slot) = *transfer {
+                    found = found.or(kind(slot));
+                    *transfer = Transfer::Derive(slot, Rights::NONE);
+                }
+            }
+            let derived = Syscall::Send {
+                target: *target,
+                message: derived,
+            };
+            let fits_derived = on_copy(derived) == Ok(Output::Sent { flags: 0 });
+            Some(Risk {
+                kind: found?,
+                fits_derived,
+            })
+        }
+        _ => None,
+    }
 }
 
 impl Reached {
@@ -361,7 +499,18 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         while last && BLOCKING.contains(&name) && generator.rng.chance(98) {
             (name, call) = generator.call();
         }
+        let risk = at_risk(&model, thread, &call);
+        let moves = matches!(call, Syscall::CapMove { .. });
         let outcome = model.apply(thread, call);
+        match (risk, &outcome) {
+            (Some(risk), Ok(Output::Done)) => reached.moved[risk.kind] += 1,
+            (Some(risk), Err(Error::Invalid)) if moves && risk.fits_derived => {
+                reached.refused[risk.kind] += 1;
+            }
+            (Some(_), Ok(Output::Sent { flags: 0 })) => reached.sent += 1,
+            (Some(risk), Ok(Output::Sent { .. })) if risk.fits_derived => reached.sent_refused += 1,
+            _ => {}
+        }
         if let Err(broken) = model.check() {
             panic!("seed {seed}, step {step}, {}: {broken}", NAMES[name]);
         }
@@ -383,13 +532,23 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     model
 }
 
+/// Every seed, run once for the tests below. A run panics if an invariant
+/// fails.
+fn all_seeds() -> &'static Reached {
+    static REACHED: OnceLock<Reached> = OnceLock::new();
+    REACHED.get_or_init(|| {
+        let mut reached = Reached::default();
+        for seed in 0..SEEDS {
+            run(seed, &mut reached);
+        }
+        println!("{reached:#?}");
+        reached
+    })
+}
+
 #[test]
 fn invariants_hold_after_every_call_of_random_sequences() {
-    let mut reached = Reached::default();
-    for seed in 0..SEEDS {
-        run(seed, &mut reached);
-    }
-    println!("{reached:#?}");
+    let reached = all_seeds();
     // "other" stands for the calls that are not modelled: it never succeeds.
     for (name, &ok) in NAMES.iter().zip(&reached.ok) {
         assert_eq!(ok == 0, *name == "other", "{name}");
@@ -401,6 +560,29 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     assert!(reached.several_threads as usize > STEPS);
     assert!(reached.with_caps > 0 && reached.dropped > 0 && reached.notifications > 0);
     assert!(reached.woken_gone > 0);
+}
+
+/// The invariant "removal ends" is checked after every call above. It says
+/// something only if the moves that could break it are tried: here they are
+/// counted, accepted and refused, for both kinds and both ways of moving.
+#[test]
+fn moves_that_the_creation_numbers_rule_on_are_accepted_and_refused() {
+    let reached = all_seeds();
+    println!(
+        "cap_move: untyped {} accepted, {} refused; cspace {} accepted, {} refused",
+        reached.moved[0], reached.refused[0], reached.moved[1], reached.refused[1]
+    );
+    println!(
+        "send: {} delivered, {} refused",
+        reached.sent, reached.sent_refused
+    );
+    for count in reached.moved.into_iter().chain(reached.refused) {
+        assert!(count >= 50, "{reached:?}");
+    }
+    assert!(
+        reached.sent >= 10 && reached.sent_refused >= 5,
+        "{reached:?}"
+    );
 }
 
 #[test]
