@@ -5,7 +5,9 @@ use crate::{
     CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Place, Range, ReplyState,
     Slot, Transfer, Wait, Window, live,
 };
-use dodos_abi::{Error, Header, Marks, ObjectKind, Received, Rights, SlotAddr, TREE_DEPTH};
+use dodos_abi::{
+    Error, Header, Marks, ObjectKind, REG_WORDS, Received, Rights, SlotAddr, TREE_DEPTH,
+};
 
 /// What `wait` and `poll` do when the word is zero.
 #[derive(Clone, Copy)]
@@ -33,11 +35,22 @@ impl Listed {
 impl Message {
     /// Order of checks, step 2: the header is read right after the
     /// capability the call acts on. Beyond the limits (Messages: 64 words, 4
-    /// capabilities), or with a flag bit set by the sender, it is `invalid`
-    /// before any other capability argument is looked at.
-    fn check(&self) -> Result<(), Error> {
+    /// capabilities), with a flag bit other than `add_marks` set by the
+    /// sender, with an added-marks word that has a reserved bit, or that
+    /// needs a message page the thread does not have (D-110), it is
+    /// `invalid` before any other capability argument is looked at.
+    fn check(&self, page: bool) -> Result<(), Error> {
         let header = Header::new(self.label, self.words.len(), self.caps.len(), self.flags)?;
-        if header.flags() != 0 {
+        let add_marks = header.flags() == Header::FLAG_ADD_MARKS;
+        if header.flags() & !Header::FLAG_ADD_MARKS != 0 {
+            return Err(Error::Invalid);
+        }
+        if add_marks {
+            Marks::from_bits(self.marks)?;
+        }
+        // Bindings: a header needs a message page for more words than the
+        // registers hold, a capability, or the flag `add_marks`.
+        if !page && (self.words.len() > REG_WORDS || !self.caps.is_empty() || add_marks) {
             return Err(Error::Invalid);
         }
         Ok(())
@@ -103,7 +116,7 @@ impl Model {
     ) -> Outcome {
         let held = self.held(thread, endpoint, ObjectKind::Endpoint, message.rights())?;
         let (endpoint, badge) = (held.object, held.badge);
-        message.check()?;
+        message.check(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
         let receiver = self.receiver(endpoint);
@@ -112,7 +125,7 @@ impl Model {
             // IPC: a thread waits to receive.
             Some((server, reply, into)) => {
                 self.unlink(server);
-                let delivery = self.serve(thread, parcel, window, reply, into);
+                let delivery = self.serve(thread, parcel, window, (server, reply, into));
                 self.wake(server, Ok(Output::Message(delivery)));
             }
             // IPC: the caller joins the queue of the endpoint.
@@ -157,7 +170,7 @@ impl Model {
         // IPC: `send` on the reply object, then as `recv` with it.
         let rights = message.rights().union(Rights::RECV);
         let reply = self.object(thread, reply, ObjectKind::Reply, rights)?;
-        message.check()?;
+        message.check(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let window = self.window(thread, range)?;
@@ -183,7 +196,7 @@ impl Model {
         let held = self.is(cap, kind, message.rights())?;
         let (target, badge) = (held.object, held.badge);
         // IPC: a reply carries badge 0, the badge of every reply capability.
-        message.check()?;
+        message.check(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let parcel = Parcel::new(thread, message, badge);
         let flags = if kind == ObjectKind::Reply {
@@ -193,7 +206,7 @@ impl Model {
             // waits for an answer.
             self.receiver(target).map(|(server, _, into)| {
                 self.unlink(server);
-                let (delivery, flags) = self.deliver(parcel, into, 0);
+                let (delivery, flags) = self.deliver(parcel, server, into, 0);
                 self.wake(server, Ok(Output::Message(delivery)));
                 flags
             })
@@ -342,7 +355,7 @@ impl Model {
             }
         }
         if let Some((caller, parcel, theirs)) = self.take_caller(endpoint) {
-            let delivery = self.serve(caller, parcel, theirs, reply, window);
+            let delivery = self.serve(caller, parcel, theirs, (thread, reply, window));
             return Ok(Output::Message(delivery));
         }
         live(&mut self.endpoints, endpoint).queue.push_back(thread);
@@ -362,12 +375,11 @@ impl Model {
         caller: ObjId,
         parcel: Parcel,
         window: Window,
-        reply: ObjId,
-        into: Window,
+        (server, reply, into): (ObjId, ObjId, Window),
     ) -> Delivery {
         // Transfer of capabilities: the reply will tell the caller if its
         // capabilities were dropped.
-        let (delivery, flags) = self.deliver(parcel, into, 0);
+        let (delivery, flags) = self.deliver(parcel, server, into, 0);
         *live(&mut self.replies, reply) = ReplyState::Armed {
             caller,
             window,
@@ -392,14 +404,37 @@ impl Model {
         self.unlink(caller);
         // Transfer of capabilities: the flag in the header of a reply means
         // that the capabilities of the request or of the reply were dropped.
-        let (delivery, dropped) = self.deliver(parcel, window, flags);
+        let (delivery, dropped) = self.deliver(parcel, caller, window, flags);
         self.wake(caller, Ok(Output::Message(delivery)));
         Some(dropped)
     }
 
+    /// Bindings: whether a thread has a message page.
+    fn has_page(&self, thread: ObjId) -> bool {
+        self.threads[&thread].page.is_some()
+    }
+
     /// Transfer of capabilities, checked again at delivery: all or nothing.
     /// Returns what the receiver gets, and `FLAG_CAPS_DROPPED` or 0.
-    fn deliver(&mut self, parcel: Parcel, window: Window, flags: u32) -> (Delivery, u32) {
+    fn deliver(
+        &mut self,
+        mut parcel: Parcel,
+        receiver: ObjId,
+        window: Window,
+        flags: u32,
+    ) -> (Delivery, u32) {
+        // Transfer of capabilities: if the sender's message page was unbound
+        // while it waited, the list is lost, and the capabilities are
+        // dropped; the words that were in the page are delivered as 0
+        // (D-110).
+        let lost = !self.has_page(parcel.sender);
+        if lost {
+            parcel
+                .words
+                .iter_mut()
+                .skip(REG_WORDS)
+                .for_each(|word| *word = 0);
+        }
         let index = |i: usize| window.first as usize + i;
         let empty = |index: usize| {
             // Removal ends: a range in a dying or destroyed space takes
@@ -425,6 +460,7 @@ impl Model {
         let listed = self
             .listed(parcel.sender, &parcel.caps)
             .ok()
+            .filter(|caps| caps.is_empty() || !lost)
             .filter(|caps| {
                 caps.len() <= window.count as usize
                     && (0..caps.len()).all(|i| empty(index(i)))
@@ -450,6 +486,11 @@ impl Model {
             None => (0, Header::FLAG_CAPS_DROPPED),
         };
         let header = Header::new(parcel.label, parcel.words.len(), caps, flags | dropped);
+        // Bindings: a delivery to a thread without a message page writes the
+        // register words only; the header keeps the number of words sent.
+        if !self.has_page(receiver) {
+            parcel.words.truncate(REG_WORDS);
+        }
         let delivery = Delivery {
             received: received(
                 header.expect("checked when the call was made"),

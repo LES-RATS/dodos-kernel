@@ -2,14 +2,13 @@
 //!
 //! The contract is `architecture/kernel-interface.md` in the documentation
 //! repository. A comment that names a section names a section of its "Call
-//! reference, one core". The kernel is tested against this model call by
-//! call: [`Model::apply`] applies one call made by one thread, and
+//! reference". The kernel is tested against this model call by call:
+//! [`Model::apply`] applies one call made by one thread, and
 //! [`Model::check`] checks every invariant of the state.
 //!
-//! Not modelled: what address spaces, frames and scheduling contexts do once
-//! created, the contents of memory, tasks and marks, registers, and the
-//! scheduling policy ([`Model::runnable`] lists the threads that can run; the
-//! caller picks one).
+//! Not modelled: the contents of memory, and the hardware (translations are
+//! a map; the invalidations of the TLB and of the IOMMU are done before a
+//! call returns).
 //!
 //! `CONTRACT-GAP` marks a behaviour that the contract does not fix.
 
@@ -18,13 +17,14 @@
 mod caps;
 mod check;
 mod ipc;
+mod threads;
 
 pub use check::Census;
 
 use dodos_abi::{
-    CSPACE_SEGMENT_SLOTS, Call, Error, MAX_CAPS, ObjectKind, PageSize, Received, Rights,
-    START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_SCHED,
-    START_SLOT_THREAD, SlotAddr,
+    CSPACE_SEGMENT_SLOTS, Call, Error, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received,
+    Rights, START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST,
+    START_SLOT_MESSAGE_PAGE, START_SLOT_SCHED, START_SLOT_THREAD, SlotAddr,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
@@ -56,11 +56,14 @@ pub enum Transfer {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub label: u32,
-    /// The flag bits of the header. Order of checks: the kernel sets them,
-    /// and a sender that sets one gets `invalid`.
+    /// The flag bits of the header. Order of checks: a sender may set only
+    /// `Header::FLAG_ADD_MARKS`.
     pub flags: u32,
     pub words: Vec<u64>,
     pub caps: Vec<Transfer>,
+    /// The added-marks word of the message page, read only when the flag
+    /// `add_marks` is set (Tasks and marks).
+    pub marks: u64,
 }
 
 /// The receive range: where capabilities that arrive are placed.
@@ -78,7 +81,9 @@ impl Range {
 }
 
 /// A message as its receiver gets it. The capabilities are in the first
-/// `received.header.caps()` slots of its receive range.
+/// `received.header.caps()` slots of its receive range. Bindings: a
+/// receiver without a message page gets the register words only, and the
+/// header keeps the number of words sent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delivery {
     pub received: Received,
@@ -103,13 +108,15 @@ pub enum Syscall {
     CapDelete(SlotAddr),
     CapRevoke(SlotAddr),
     CapInspect(SlotAddr),
-    /// `size` is the size argument; for a frame it is the number of pages of
-    /// size `page`, which no other kind reads.
+    /// `size` is the size argument; for a frame it is the number of pages,
+    /// of the page size `page` and the memory type `memory`, raw words that
+    /// no other kind reads.
     UntypedRetype {
         untyped: SlotAddr,
         kind: ObjectKind,
         size: u64,
-        page: PageSize,
+        page: u64,
+        memory: u64,
         destination: SlotAddr,
     },
     CSpaceGrow {
@@ -121,6 +128,7 @@ pub enum Syscall {
         cspace: SlotAddr,
         aspace: SlotAddr,
         fault: SlotAddr,
+        page: SlotAddr,
     },
     ThreadResume(SlotAddr),
     ThreadSuspend(SlotAddr),
@@ -158,7 +166,7 @@ pub enum Syscall {
         notify: SlotAddr,
         endpoint: SlotAddr,
     },
-    /// A call outside the one-core reference: it returns `Unsupported`. A
+    /// A call that this model does not make: it returns `Unsupported`. A
     /// call that has a variant above is refused here with a panic.
     Other(Call),
 }
@@ -204,6 +212,15 @@ enum Slot {
     Dead,
 }
 
+/// Mapping records: what a frame capability holds besides its object.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Record {
+    #[default]
+    Empty,
+    /// Bindings: the message page of this thread.
+    Binding(ObjId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Cap {
     object: ObjId,
@@ -217,6 +234,8 @@ struct Cap {
     /// and on a root capability by the first step of a removal that reaches
     /// it.
     dying: bool,
+    /// Empty but on a frame capability.
+    record: Record,
 }
 
 /// What every object has. The state of an object that has one is in the map
@@ -235,9 +254,20 @@ struct Untyped {
     bytes: u64,
     device: bool,
     watermark: u64,
-    /// Objects, and segments of capability spaces, taken from it and not
-    /// yet destroyed.
+    /// Rules of `untyped_retype`: the memory from the watermark to the
+    /// clean mark is known to be zero. Device memory has none: it stays 0.
+    clean: u64,
+    /// Objects, segments of capability spaces and tables of address spaces
+    /// taken from it and not yet destroyed.
     live: u32,
+}
+
+/// Frames: fixed by `untyped_retype` and never changed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Frame {
+    page: PageSize,
+    pages: u64,
+    memory: MemoryType,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,6 +276,8 @@ struct CSpace {
     slots: Vec<Slot>,
     /// The derivation tree: `Some` once the space is dying.
     sweep: Option<Sweep>,
+    /// Bindings: the threads bound to the space, the most recent last.
+    threads: Vec<ObjId>,
 }
 
 /// The derivation tree: what a dying capability space keeps.
@@ -260,10 +292,22 @@ struct Sweep {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+struct ASpace {
+    /// A thread and its address space: the threads bound to it, the most
+    /// recent last.
+    threads: Vec<ObjId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Thread {
-    /// `None` until `thread_configure`. A capability space that no longer
-    /// exists is one that was destroyed.
+    /// Bindings, each a link both ways: the capability space, the address
+    /// space, the fault endpoint with the badge of the capability given to
+    /// `thread_configure`, and the frame capability whose record binds the
+    /// message page.
     cspace: Option<ObjId>,
+    aspace: Option<ObjId>,
+    fault: Option<(ObjId, u64)>,
+    page: Option<CapId>,
     suspended: bool,
     wait: Wait,
     /// Threads: the wait number of the call the thread waits in; 0 if it
@@ -322,6 +366,9 @@ struct Window {
 struct Endpoint {
     queue: VecDeque<ObjId>,
     notify: Option<ObjId>,
+    /// Bindings: the threads whose fault endpoint it is, the most recent
+    /// last.
+    threads: Vec<ObjId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -351,7 +398,9 @@ pub struct Model {
     caps: BTreeMap<CapId, Cap>,
     objects: BTreeMap<ObjId, Object>,
     untypeds: BTreeMap<ObjId, Untyped>,
+    frames: BTreeMap<ObjId, Frame>,
     cspaces: BTreeMap<ObjId, CSpace>,
+    aspaces: BTreeMap<ObjId, ASpace>,
     threads: BTreeMap<ObjId, Thread>,
     endpoints: BTreeMap<ObjId, Endpoint>,
     replies: BTreeMap<ObjId, ReplyState>,
@@ -359,10 +408,12 @@ pub struct Model {
     /// The derivation tree: the longest walk so far to the next capability
     /// to remove, in capabilities. The contract says: shorter than 192.
     longest_walk: usize,
+    /// Large pages: the page sizes the processor supports, bit `i` for
+    /// `PageSize` `i`.
+    page_sizes: u32,
 }
 
-/// Whether a call is one of the calls of the one-core reference, which
-/// `Syscall` gives a variant with arguments.
+/// Whether a call has a variant of its own in `Syscall`.
 fn modelled(call: Call) -> bool {
     use Call::{
         CSpaceGrow, CapDelete, CapDerive, CapInspect, CapMove, CapRevoke, NotifyBind, Poll, Recv,
@@ -408,11 +459,15 @@ impl Model {
     /// control capabilities for interrupts, I/O ports and IOMMU domains, and
     /// the frames of the boot image; and it leaves the size of the start-up
     /// space and the untyped ranges to the boot image. The model gives none
-    /// of the first, one segment, and the two untypeds below. Its capability space has one segment and holds itself,
-    /// an `aspace`, the thread, a `sched` and `debug` in their fixed slots,
-    /// then one ordinary untyped and one device untyped.
+    /// of the first, one segment, and the two untypeds below. Its capability
+    /// space has one segment and holds itself, an `aspace`, the thread, a
+    /// `sched` and `debug` in their fixed slots, then one ordinary untyped
+    /// and one device untyped.
     pub fn boot() -> (Self, ObjId) {
-        let mut model = Self::default();
+        let mut model = Self {
+            page_sizes: 0b111,
+            ..Self::default()
+        };
         let space = ObjId(model.next_id);
         let mut add = |kind, size, index, rights| {
             let cap = model.create(kind, size, None, rights, Place { space, index });
@@ -421,11 +476,11 @@ impl Model {
         let all = Rights::ALL;
         let segment = CSPACE_SEGMENT_SLOTS.into();
         add(ObjectKind::CSpace, segment, START_SLOT_CSPACE, all);
-        add(ObjectKind::ASpace, 0, START_SLOT_ASPACE, all);
+        let aspace = add(ObjectKind::ASpace, 0, START_SLOT_ASPACE, all);
         let thread = add(ObjectKind::Thread, 0, START_SLOT_THREAD, all);
         add(ObjectKind::Sched, 0, START_SLOT_SCHED, all);
         add(ObjectKind::Debug, 0, START_SLOT_DEBUG, all);
-        add(
+        let ordinary = add(
             ObjectKind::Untyped,
             BOOT_UNTYPED_BYTES,
             START_SLOT_FIRST,
@@ -440,9 +495,30 @@ impl Model {
             START_SLOT_FIRST + 1,
             no_exec,
         );
+        live(&mut model.untypeds, ordinary).clean = BOOT_UNTYPED_BYTES;
         live(&mut model.untypeds, device).device = true;
-        let first = live(&mut model.threads, thread);
-        (first.cspace, first.suspended) = (Some(space), false);
+        // Start-up state: the frame of the message page of the first thread,
+        // which holds its binding.
+        let page = model.create(
+            ObjectKind::Frame,
+            1,
+            None,
+            all,
+            Place {
+                space,
+                index: START_SLOT_MESSAGE_PAGE,
+            },
+        );
+        let frame = Frame {
+            page: PageSize::Size4K,
+            pages: 1,
+            memory: MemoryType::WriteBack,
+        };
+        model.frames.insert(model.caps[&page].object, frame);
+        model.bind_space(thread, Some(space));
+        model.bind_aspace(thread, Some(aspace));
+        model.bind_page(thread, Some(page));
+        live(&mut model.threads, thread).suspended = false;
         (model, thread)
     }
 
@@ -524,15 +600,28 @@ impl Model {
                 kind,
                 size,
                 page,
+                memory,
                 destination,
-            } => self.untyped_retype(thread, untyped, kind, size, page, destination),
+            } => {
+                let size = caps::SizeArgument { size, page, memory };
+                self.untyped_retype(thread, untyped, kind, size, destination)
+            }
             Syscall::CSpaceGrow { cspace, untyped } => self.cspace_grow(thread, cspace, untyped),
             Syscall::ThreadConfigure {
                 thread: target,
                 cspace,
                 aspace,
                 fault,
-            } => self.thread_configure(thread, target, cspace, aspace, fault),
+                page,
+            } => {
+                let bindings = threads::Bindings {
+                    cspace,
+                    aspace,
+                    fault,
+                    page,
+                };
+                self.thread_configure(thread, target, bindings)
+            }
             Syscall::ThreadResume(target) => self.thread_resume(thread, target),
             Syscall::ThreadSuspend(target) => self.thread_suspend(thread, target),
             Syscall::ThreadCancel(target, number) => self.thread_cancel(thread, target, number),
@@ -560,13 +649,12 @@ impl Model {
             Syscall::Wait(notify, _) => self.wait(thread, notify, ipc::IfZero::Wait),
             Syscall::Poll(notify) => self.wait(thread, notify, ipc::IfZero::WouldWait),
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
-            // Threads: `thread_read_regs`, `thread_write_regs` and `yield`
-            // are not part of the one-core reference: they return
-            // `unsupported` as soon as the capability space of the caller is
-            // found, before any argument is looked at. So do the calls of
-            // the groups not yet specified. Removal ends: a thread whose
-            // capability space is dying or destroyed gets `gone` from this
-            // call as from every other.
+            // The calls not yet made by this model, and those of the groups
+            // not yet specified (cores, debugging), return `unsupported` as
+            // soon as the capability space of the caller is found, before
+            // any argument is looked at. Removal ends: a thread whose
+            // capability space is dying or destroyed gets `gone` from these
+            // calls as from every other.
             Syscall::Other(call) => {
                 assert!(!modelled(call), "{call:?} has its own variant of `Syscall`");
                 self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
@@ -589,21 +677,19 @@ impl Model {
         right: Rights,
     ) -> Result<ObjId, Error> {
         let own = self.bound_space(thread)?;
-        // Removal ends: a thread whose capability space is dying gets `gone`
-        // from every call except `cap_delete`.
+        // Order of checks: a thread whose capability space is dying gets
+        // `gone` from every call except `cap_delete` on its own slots.
         if self.dying(own) {
             return Err(Error::Gone);
         }
         self.through(own, addr, right)
     }
 
-    /// The derivation tree: once its capability space is destroyed, a
-    /// thread gets `gone` from every call, `cap_delete` too.
+    /// Order of checks: a thread bound to no capability space gets `gone`
+    /// from every call, `cap_delete` too. The derivation tree: a thread
+    /// whose capability space is destroyed is bound to none (D-110).
     fn bound_space(&self, thread: ObjId) -> Result<ObjId, Error> {
-        let bound = self.threads[&thread].cspace;
-        bound
-            .filter(|own| self.cspaces.contains_key(own))
-            .ok_or(Error::Gone)
+        self.threads[&thread].cspace.ok_or(Error::Gone)
     }
 
     /// Slots and addresses: `own`, or the capability space that `via` names
@@ -680,6 +766,20 @@ impl Model {
         Ok(self.held(thread, at, kind, need)?.object)
     }
 
+    /// As `object`, for an argument that may be 0.
+    fn optional(
+        &self,
+        thread: ObjId,
+        at: SlotAddr,
+        kind: ObjectKind,
+        need: Rights,
+    ) -> Result<Option<ObjId>, Error> {
+        match at.is_none() {
+            true => Ok(None),
+            false => Ok(Some(self.object(thread, at, kind, need)?)),
+        }
+    }
+
     /// Order of checks, step 2: a slot in which the call places a
     /// capability. Slots and addresses: slot 0 or beyond the table is
     /// `invalid`.
@@ -734,89 +834,5 @@ impl Model {
     fn wake(&mut self, thread: ObjId, outcome: Outcome) {
         let woken = live(&mut self.threads, thread);
         (woken.outcome, woken.number) = (Some(outcome), 0);
-    }
-
-    // Threads.
-
-    fn thread_configure(
-        &mut self,
-        thread: ObjId,
-        target: SlotAddr,
-        cspace: SlotAddr,
-        aspace: SlotAddr,
-        fault: SlotAddr,
-    ) -> Outcome {
-        let manage = Rights::MANAGE;
-        let target = self.object(thread, target, ObjectKind::Thread, manage)?;
-        let space = self.object(thread, cspace, ObjectKind::CSpace, manage)?;
-        // CONTRACT-GAP (Threads): the contract does not say what becomes of
-        // a thread when its address space or its fault endpoint is
-        // destroyed. Both are checked here and not kept: nothing in the
-        // one-core model reads them.
-        // Threads: both may be 0.
-        if !aspace.is_none() {
-            self.object(thread, aspace, ObjectKind::ASpace, manage)?;
-        }
-        if !fault.is_none() {
-            self.object(thread, fault, ObjectKind::Endpoint, Rights::SEND)?;
-        }
-        let target = live(&mut self.threads, target);
-        // Threads: the thread must be suspended and must not wait.
-        if !target.suspended || target.wait != Wait::None {
-            return Err(Error::Busy);
-        }
-        target.cspace = Some(space);
-        Ok(Output::Done)
-    }
-
-    /// Threads: `busy` if the thread is bound to no capability space, or to
-    /// one that is destroyed; this `busy` comes before "already in the state
-    /// asked for", which succeeds. A thread bound to a dying space can be
-    /// resumed.
-    fn thread_resume(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
-        let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        self.bound_space(target).or(Err(Error::Busy))?;
-        live(&mut self.threads, target).suspended = false;
-        Ok(Output::Done)
-    }
-
-    /// Threads: suspending a suspended thread succeeds, a thread bound to no
-    /// space too, and suspending a thread that waits leaves its wait as it
-    /// is.
-    fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
-        let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        live(&mut self.threads, target).suspended = true;
-        Ok(Output::Done)
-    }
-
-    /// Threads: with a wait number other than 0, the word "cancelled up to"
-    /// of the thread becomes the greater of itself and the number; then the
-    /// wait of the thread is ended if its wait number is not 0 and not
-    /// greater than the word. With wait number 0 the word does not change
-    /// and the wait is ended whatever its number.
-    ///
-    /// A wait that is ended: the thread is taken out of its queue and its
-    /// call returns `cancelled`; a reply object attached to it or armed with
-    /// it becomes idle. Nothing of its message moves: the capabilities it
-    /// lists are transferred only at delivery. A suspended thread stays
-    /// suspended and finds `cancelled` when it runs again. The thread may be
-    /// bound to no capability space, or to one that is dying or destroyed:
-    /// only the capability space of the caller is looked at.
-    fn thread_cancel(&mut self, thread: ObjId, target: SlotAddr, number: u64) -> Outcome {
-        let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        let cancelled = live(&mut self.threads, target);
-        cancelled.cancelled_up_to = cancelled.cancelled_up_to.max(number);
-        let ended = match number {
-            0 => true,
-            _ => cancelled.number != 0 && cancelled.number <= cancelled.cancelled_up_to,
-        };
-        // Threads: a thread whose wait is already over, and that has not run
-        // since, does not wait: it keeps the result it has. The result says
-        // nothing about what the thread was doing.
-        if ended && cancelled.wait != Wait::None {
-            self.unlink(target);
-            self.wake(target, Err(Error::Cancelled));
-        }
-        Ok(Output::Done)
     }
 }

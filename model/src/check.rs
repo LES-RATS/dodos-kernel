@@ -1,9 +1,9 @@
 //! The invariants of the state.
 
-use crate::{CapId, Model, ObjId, Output, Place, ReplyState, Slot, Thread, Wait, Window};
+use crate::{CapId, Model, ObjId, Output, Place, Record, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
-    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS,
-    ObjectKind, Rights, TREE_DEPTH,
+    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FRAME_MAX_PAGES, Header, LONGEST_WALK, MAX_CAPS,
+    MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::mem::discriminant;
@@ -154,12 +154,10 @@ impl Model {
     ///     to a thread if and only if that thread waits to receive with it,
     ///     armed with a thread if and only if that thread waits for a reply
     ///     through it;
-    /// 16. a thread that waits has no outcome yet; a thread that is not
-    ///     suspended, that waits or that has an outcome is bound to a
-    ///     capability space; what a thread is bound to is a capability
-    ///     space, or is destroyed;
+    /// 16. a thread that waits has no outcome yet;
     /// 30. the outcome of a wait is `gone`, `cancelled`, a word that is not
-    ///     zero, or a message with as many words as its header states;
+    ///     zero, or a message with as many words as its header states, or
+    ///     with the register words only when it states more;
     /// 31. a thread has a wait number other than 0 only while it waits, and
     ///     that number is greater than its word "cancelled up to";
     /// 17. a notify names its endpoint if and only if the endpoint names it;
@@ -174,19 +172,31 @@ impl Model {
     ///     table; the flags that an armed reply object keeps are the flag
     ///     `caps_dropped` or none.
     ///
+    /// Bindings:
+    /// 32. a thread bound to a capability space, an address space or a
+    ///     fault endpoint is listed once by that live object, and an object
+    ///     lists only threads bound to it;
+    /// 33. the message page of a thread is a live capability for a frame of
+    ///     one 4 KB page of ordinary memory whose record names the thread,
+    ///     and a record that names a thread is that thread's message page.
+    ///
     /// Memory:
     /// 18. the watermark of an untyped is within it, is zero if and only if
     ///     nothing taken from it is live, and is a multiple of 8 bytes, the
-    ///     smallest size of an object;
+    ///     smallest size of an object; the clean mark of ordinary memory is
+    ///     between the watermark and the end, and device memory has none;
     /// 19. the live count of an untyped is the number of live objects and
-    ///     cspace segments taken from it.
+    ///     cspace segments taken from it;
+    /// 34. a frame has 1 to 512 pages, ordinary memory is write-back and
+    ///     device memory is not, and only a frame capability has a record.
     pub fn check(&self) -> Check {
         self.check_tree()?;
         self.check_removal()?;
         self.check_slots()?;
         self.check_objects()?;
         self.check_waits()?;
-        self.check_memory()
+        self.check_memory()?;
+        self.check_bindings()
     }
 
     fn check_tree(&self) -> Check {
@@ -333,6 +343,8 @@ impl Model {
                 ObjectKind::CSpace => self.cspaces.contains_key(&id),
                 ObjectKind::Thread => self.threads.contains_key(&id),
                 ObjectKind::Endpoint => self.endpoints.contains_key(&id),
+                ObjectKind::Frame => self.frames.contains_key(&id),
+                ObjectKind::ASpace => self.aspaces.contains_key(&id),
                 ObjectKind::Reply => self.replies.contains_key(&id),
                 ObjectKind::Notify => self.notifies.contains_key(&id),
                 _ => true,
@@ -362,6 +374,8 @@ impl Model {
         let of_its_kind = self.untypeds.keys().all(is(ObjectKind::Untyped))
             && self.cspaces.keys().all(is(ObjectKind::CSpace))
             && self.threads.keys().all(is(ObjectKind::Thread))
+            && self.frames.keys().all(is(ObjectKind::Frame))
+            && self.aspaces.keys().all(is(ObjectKind::ASpace))
             && self.endpoints.keys().all(is(ObjectKind::Endpoint))
             && self.replies.keys().all(is(ObjectKind::Reply))
             && self.notifies.keys().all(is(ObjectKind::Notify));
@@ -460,13 +474,12 @@ impl Model {
             let ready = thread.wait == Wait::None;
             let waited = ready || thread.outcome.is_none();
             ensure(waited, "16: outcome while waiting")?;
-            let idle = thread.suspended && ready && thread.outcome.is_none();
-            ensure(idle || thread.cspace.is_some(), "16: bound to nothing")?;
             let outcome = match &thread.outcome {
                 None | Some(Err(Error::Gone | Error::Cancelled)) => true,
                 Some(Ok(Output::Word(word))) => *word != 0,
                 Some(Ok(Output::Message(delivery))) => {
-                    delivery.words.len() == delivery.received.header.words()
+                    let (got, sent) = (delivery.words.len(), delivery.received.header.words());
+                    got == sent || got == REG_WORDS && sent > REG_WORDS
                 }
                 Some(_) => false,
             };
@@ -476,11 +489,6 @@ impl Model {
                 number => !ready && number > thread.cancelled_up_to,
             };
             ensure(number, "31: wait number of a thread")?;
-            let space = |id| self.cspaces.contains_key(id) || !self.objects.contains_key(id);
-            ensure(
-                thread.cspace.iter().all(space),
-                "16: capability space of a thread",
-            )?;
             let limits = match &thread.wait {
                 Wait::Call { parcel, window, .. } => {
                     let header = parcel.words.len() <= MAX_WORDS && parcel.caps.len() <= MAX_CAPS;
@@ -515,6 +523,81 @@ impl Model {
             )?;
             let zero = (untyped.watermark == 0) == (untyped.live == 0);
             ensure(zero, "18: watermark is zero when nothing is live")?;
+            let clean = match untyped.device {
+                true => untyped.clean == 0,
+                false => (untyped.watermark..=untyped.bytes).contains(&untyped.clean),
+            };
+            ensure(clean, "18: clean mark")?;
+        }
+        for (&id, frame) in &self.frames {
+            let pages = (1..=FRAME_MAX_PAGES).contains(&frame.pages);
+            let from = self.objects.get(&id).and_then(|object| object.from);
+            let device =
+                from.is_some_and(|from| self.untypeds.get(&from).is_some_and(|u| u.device));
+            let write_back = frame.memory == MemoryType::WriteBack;
+            ensure(pages && device != write_back, "34: frame")?;
+        }
+        for cap in self.caps.values() {
+            let frame = self.frames.contains_key(&cap.object);
+            ensure(
+                frame || cap.record == Record::Empty,
+                "34: record of another kind",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn check_bindings(&self) -> Check {
+        for (&id, thread) in &self.threads {
+            let once = |list: Option<&Vec<ObjId>>| {
+                list.is_some_and(|list| list.iter().filter(|&&t| t == id).count() == 1)
+            };
+            let space = thread
+                .cspace
+                .map(|s| self.cspaces.get(&s).map(|s| &s.threads));
+            ensure(space.is_none_or(once), "32: capability space of a thread")?;
+            let aspace = thread
+                .aspace
+                .map(|a| self.aspaces.get(&a).map(|a| &a.threads));
+            ensure(aspace.is_none_or(once), "32: address space of a thread")?;
+            let fault = thread
+                .fault
+                .map(|(e, _)| self.endpoints.get(&e).map(|e| &e.threads));
+            ensure(fault.is_none_or(once), "32: fault endpoint of a thread")?;
+            let page = thread.page.map(|page| {
+                let cap = self.caps.get(&page);
+                let frame = cap.and_then(|cap| self.frames.get(&cap.object));
+                let one = frame.is_some_and(|f| f.pages == 1 && f.page as u8 == 0);
+                one && frame.is_some_and(|f| f.memory == MemoryType::WriteBack)
+                    && cap.is_some_and(|cap| cap.record == Record::Binding(id))
+            });
+            ensure(page.is_none_or(|page| page), "33: message page of a thread")?;
+        }
+        let bound = |thread: &ObjId, wanted: fn(&Thread) -> Option<ObjId>, object: ObjId| {
+            self.threads
+                .get(thread)
+                .is_some_and(|t| wanted(t) == Some(object))
+        };
+        for (&id, space) in &self.cspaces {
+            let all = space.threads.iter().all(|t| bound(t, |t| t.cspace, id));
+            ensure(all, "32: thread listed by a capability space")?;
+        }
+        for (&id, aspace) in &self.aspaces {
+            let all = aspace.threads.iter().all(|t| bound(t, |t| t.aspace, id));
+            ensure(all, "32: thread listed by an address space")?;
+        }
+        for (&id, endpoint) in &self.endpoints {
+            let all = endpoint
+                .threads
+                .iter()
+                .all(|t| bound(t, |t| t.fault.map(|f| f.0), id));
+            ensure(all, "32: thread listed by a fault endpoint")?;
+        }
+        for (&id, cap) in &self.caps {
+            if let Record::Binding(thread) = cap.record {
+                let page = self.threads.get(&thread).and_then(|t| t.page);
+                ensure(page == Some(id), "33: record of a message page")?;
+            }
         }
         Ok(())
     }

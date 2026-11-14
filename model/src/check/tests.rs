@@ -32,7 +32,8 @@ fn state() -> Model {
                 untyped: own(START_SLOT_FIRST),
                 kind,
                 size: 0,
-                page: PageSize::Size4K,
+                page: 0,
+                memory: 0,
                 destination: own(slot),
             },
         );
@@ -44,6 +45,7 @@ fn state() -> Model {
                     cspace: own(START_SLOT_CSPACE),
                     aspace: SlotAddr::NONE,
                     fault: SlotAddr::NONE,
+                    page: SlotAddr::NONE,
                 },
             );
             on(boot, Syscall::ThreadResume(own(slot)));
@@ -477,9 +479,15 @@ fn live_count_that_is_not_the_number_of_live_objects_is_reported() {
 }
 
 #[test]
-fn thread_that_is_not_suspended_and_bound_to_nothing_is_reported() {
+fn thread_bound_to_a_space_that_does_not_list_it_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).threads.clear());
+    assert_eq!(broken, "32: capability space of a thread");
+}
+
+#[test]
+fn space_that_lists_a_thread_bound_elsewhere_is_reported() {
     let broken = spoiled(|m, at| live(&mut m.threads, at.ready).cspace = None);
-    assert_eq!(broken, "16: bound to nothing");
+    assert_eq!(broken, "32: thread listed by a capability space");
 }
 
 /// Copies of a copy that is at depth 3, each derived from the one before,
@@ -826,7 +834,7 @@ fn state_of_another_kind_than_its_object_is_reported() {
 #[test]
 fn thread_bound_to_an_object_that_is_not_a_capability_space_is_reported() {
     let broken = spoiled(|m, at| live(&mut m.threads, at.ready).cspace = Some(at.endpoint));
-    assert_eq!(broken, "16: capability space of a thread");
+    assert_eq!(broken, "32: capability space of a thread");
 }
 
 #[test]
@@ -964,6 +972,7 @@ fn capability_space_without_an_object_is_reported() {
             max: 128,
             slots: Vec::new(),
             sweep: None,
+            threads: Vec::new(),
         };
         m.cspaces.insert(ObjId(u32::MAX), space);
     });
@@ -1139,25 +1148,6 @@ fn receive_range_kept_by_an_armed_reply_object_beyond_the_table_is_reported() {
     assert_eq!(broken, "29: range or flags of a reply object");
 }
 
-#[test]
-fn thread_that_waits_while_bound_to_nothing_is_reported() {
-    let broken = spoiled(|m, at| {
-        let waiter = live(&mut m.threads, at.waiter);
-        (waiter.suspended, waiter.cspace) = (true, None);
-    });
-    assert_eq!(broken, "16: bound to nothing");
-}
-
-#[test]
-fn thread_with_an_outcome_while_bound_to_nothing_is_reported() {
-    let broken = spoiled(|m, at| {
-        let ready = live(&mut m.threads, at.ready);
-        (ready.suspended, ready.cspace) = (true, None);
-        ready.outcome = Some(Err(Error::Gone));
-    });
-    assert_eq!(broken, "16: bound to nothing");
-}
-
 /// Gives the first thread, which does not wait, the outcome of a wait.
 fn with_outcome(outcome: Outcome) -> &'static str {
     spoiled(|m, at| live(&mut m.threads, at.ready).outcome = Some(outcome))
@@ -1230,8 +1220,8 @@ fn census_counts_what_the_state_holds() {
     let mut model = state();
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
-        // Seven at start-up, five objects, two copies.
-        capabilities: 14,
+        // Eight at start-up, five objects, two copies.
+        capabilities: 15,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,
@@ -1353,6 +1343,7 @@ fn capability_space_state_of_an_object_of_another_kind_is_reported() {
             max: 128,
             slots: Vec::new(),
             sweep: None,
+            threads: Vec::new(),
         };
         m.cspaces.insert(at.endpoint, space);
     });
@@ -1364,4 +1355,95 @@ fn capability_whose_identity_was_not_given_out_is_reported() {
     // The most recent capability: every object is older.
     let broken = spoiled(|m, at| m.next_id = at.later_copy.0);
     assert_eq!(broken, "26: identity");
+}
+
+// The invariants of the D-110 changes.
+
+#[test]
+fn thread_listed_twice_by_its_space_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).threads.push(at.ready));
+    assert_eq!(broken, "32: capability space of a thread");
+}
+
+#[test]
+fn address_space_that_does_not_list_its_thread_is_reported() {
+    let broken = spoiled(|m, at| {
+        let aspace = live(&mut m.threads, at.ready).aspace.unwrap();
+        live(&mut m.aspaces, aspace).threads.clear();
+    });
+    assert_eq!(broken, "32: address space of a thread");
+}
+
+#[test]
+fn fault_endpoint_that_lists_a_thread_bound_elsewhere_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.endpoints, at.endpoint).threads.push(at.ready));
+    assert_eq!(broken, "32: thread listed by a fault endpoint");
+}
+
+#[test]
+fn message_page_whose_record_names_another_thread_is_reported() {
+    let broken = spoiled(|m, at| {
+        let page = m.threads[&at.ready].page.unwrap();
+        live(&mut m.caps, page).record = Record::Binding(at.waiter);
+    });
+    assert_eq!(broken, "33: message page of a thread");
+}
+
+#[test]
+fn record_that_names_a_thread_without_that_page_is_reported() {
+    let broken = spoiled(|m, at| {
+        let page = live(&mut m.threads, at.ready).page.take().unwrap();
+        live(&mut m.caps, page).record = Record::Binding(at.waiter);
+    });
+    assert_eq!(broken, "33: record of a message page");
+}
+
+#[test]
+fn message_page_of_two_pages_is_reported() {
+    let broken = spoiled(|m, at| {
+        let page = m.threads[&at.ready].page.unwrap();
+        live(&mut m.frames, m.caps[&page].object).pages = 2;
+    });
+    assert_eq!(broken, "33: message page of a thread");
+}
+
+#[test]
+fn frame_of_513_pages_or_of_the_wrong_memory_type_is_reported() {
+    let page = |m: &Model, at: At| m.caps[&m.threads[&at.ready].page.unwrap()].object;
+    let broken = spoiled(|m, at| {
+        let frame = page(m, at);
+        live(&mut m.frames, frame).pages = 513;
+    });
+    assert_eq!(broken, "34: frame");
+    let broken = spoiled(|m, at| {
+        let frame = page(m, at);
+        live(&mut m.frames, frame).memory = MemoryType::Uncached;
+    });
+    assert_eq!(broken, "34: frame");
+}
+
+#[test]
+fn record_on_a_capability_that_is_not_for_a_frame_is_reported() {
+    let broken =
+        spoiled(|m, at| live(&mut m.caps, at.endpoint_cap).record = Record::Binding(at.ready));
+    assert_eq!(broken, "34: record of another kind");
+}
+
+#[test]
+fn clean_mark_below_the_watermark_or_on_device_memory_is_reported() {
+    let broken = spoiled(|m, at| {
+        let untyped = live(&mut m.untypeds, at.untyped);
+        untyped.clean = untyped.watermark - 8;
+    });
+    assert_eq!(broken, "18: clean mark");
+    let broken = spoiled(|m, at| {
+        let untyped = live(&mut m.untypeds, at.untyped);
+        untyped.clean = untyped.bytes + 8;
+    });
+    assert_eq!(broken, "18: clean mark");
+    let broken = spoiled(|m, _| {
+        let device = m.untypeds.values_mut().find(|u| u.device).unwrap();
+        device.clean = 8;
+    });
+    assert_eq!(broken, "18: clean mark");
 }

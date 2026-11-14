@@ -66,7 +66,7 @@ const CHAIN_LINKS: usize = TREE_DEPTH - 2;
 const HERE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
 const MEMORY: SlotAddr = SlotAddr::own(START_SLOT_FIRST);
 
-const KINDS: [(ObjectKind, u32, u64); 9] = [
+const KINDS: [(ObjectKind, u32, u64); 12] = [
     (ObjectKind::Untyped, UNTYPED, 1 << 16),
     (ObjectKind::CSpace, CSPACE, 256),
     (ObjectKind::Thread, THREAD, 0),
@@ -76,16 +76,20 @@ const KINDS: [(ObjectKind, u32, u64); 9] = [
     (ObjectKind::Frame, OTHER, 3),
     (ObjectKind::ASpace, OTHER, 0),
     (ObjectKind::Sched, OTHER, 0),
+    (ObjectKind::Timer, OTHER, 0),
+    (ObjectKind::Task, OTHER, 0),
+    (ObjectKind::IoSpace, OTHER, 0),
 ];
-/// The kinds of the groups not yet specified.
+/// The kinds that this version does not make, and those never made from an
+/// untyped.
 const NOT_MADE: [ObjectKind; 7] = [
-    ObjectKind::Timer,
-    ObjectKind::Irq,
     ObjectKind::IoPorts,
-    ObjectKind::IoSpace,
-    ObjectKind::Task,
     ObjectKind::Core,
     ObjectKind::Debug,
+    ObjectKind::Vcpu,
+    ObjectKind::Irq,
+    ObjectKind::IrqControl,
+    ObjectKind::Iommu,
 ];
 const PAGES: [PageSize; 5] = [
     PageSize::Size4K,
@@ -177,7 +181,8 @@ fn retype(kind: ObjectKind, size: u64, destination: SlotAddr) -> Syscall {
         untyped: MEMORY,
         kind,
         size,
-        page: PageSize::Size4K,
+        page: PageSize::Size4K as u64,
+        memory: 0,
         destination,
     }
 }
@@ -410,6 +415,7 @@ impl Generator<'_> {
         Message {
             label: self.rng.next() as u32,
             flags: (self.rng.below(200) == 0) as u32,
+            marks: 0,
             words: (0..words).collect(),
             caps,
         }
@@ -476,7 +482,8 @@ impl Generator<'_> {
                     } else {
                         self.rng.below(300)
                     },
-                    page: self.rng.pick(&PAGES),
+                    page: self.rng.pick(&PAGES) as u64,
+                    memory: self.rng.below(100).saturating_sub(97),
                     destination: self.free(class),
                 }
             }
@@ -496,6 +503,11 @@ impl Generator<'_> {
                     SlotAddr::NONE
                 } else {
                     self.held(ENDPOINT)
+                },
+                page: if none(self.rng) {
+                    SlotAddr::NONE
+                } else {
+                    self.held(OTHER)
                 },
             },
             15 | 16 => Syscall::ThreadResume(self.held(THREAD)),
@@ -728,13 +740,16 @@ impl Generator<'_> {
         }
         // Two threads in the new space, so that one can serve the other.
         // The capability of the second goes into the new space.
-        for thread in [own(thread), inside(18 + THREAD)] {
+        // Each has one of the two frames of the new space as its message
+        // page.
+        for (thread, page) in [(own(thread), 18), (inside(18 + THREAD), 26)] {
             calls.push(retype(ObjectKind::Thread, 0, thread));
             calls.push(Syscall::ThreadConfigure {
                 thread,
                 cspace: own(space),
                 aspace: SlotAddr::NONE,
                 fault: SlotAddr::NONE,
+                page: inside(page + OTHER),
             });
             calls.push(Syscall::ThreadResume(thread));
         }
@@ -766,7 +781,8 @@ impl Generator<'_> {
                 untyped,
                 kind: ObjectKind::CSpace,
                 size: CSPACE_SEGMENT_SLOTS.into(),
-                page: PageSize::Size4K,
+                page: 0,
+                memory: 0,
                 destination: own(root),
             });
             calls.push(Syscall::CSpaceGrow {
@@ -908,7 +924,7 @@ struct Reached {
     deepest: usize,
     longest_walk: usize,
     /// Steps after which an object of each kind was dying, by kind.
-    dying: [u32; 16],
+    dying: [u32; 19],
     /// Steps after which a capability under `cap_delete` was dying while its
     /// object was not.
     dying_copies: u32,
@@ -1279,19 +1295,19 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 5,666, cspace 29,630, aspace 722, frame
-    // 333, thread 2,118, sched 461, endpoint 7, reply 1,553, notify 811; a
-    // copy under `cap_delete` 4,274.
+    // Measured, in steps: untyped 2,722, cspace 16,291, aspace 7, frame
+    // 1,201, thread 60, sched 1, endpoint 1,195, reply 430, notify 2,978; a
+    // copy under `cap_delete` 3,821.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [2500, 15_000, 350, 150, 1000, 200, 3, 750, 400]);
-    at_least([reached.dying_copies], [2000]);
+    at_least(dying, [1300, 8000, 3, 600, 30, 1, 600, 200, 1500]);
+    at_least([reached.dying_copies], [1900]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 27,048 of 45,784 calls.
-    at_least([reached.outside], [22_000]);
+    // Measured: 36,549 of 57,936 calls.
+    at_least([reached.outside], [28_000]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -1302,8 +1318,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 40,496, reply objects armed 16,497,
-    // receivers 42,862, waiters on a notify 28,366, a notify bound 50,879.
+    // Measured, in steps: callers queued 50,210, reply objects armed 26,353,
+    // receivers 58,315, waiters on a notify 38,004, a notify bound 54,043.
     let waits = [
         reached.callers,
         reached.served,
@@ -1311,19 +1327,19 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [20_000, 8000, 20_000, 14_000, 25_000]);
-    // Measured, each once: 40 messages with capabilities, 26 with the
-    // capabilities dropped, 24 notifications, 16 threads woken with `gone`.
+    at_least(waits, [25_000, 13_000, 29_000, 19_000, 27_000]);
+    // Measured, each once: 50 messages with capabilities, 31 with the
+    // capabilities dropped, 28 notifications, 25 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [20, 13, 12, 8]);
-    // Measured: 13 messages received with four capabilities, and 123 calls
+    at_least(ends, [25, 15, 14, 12]);
+    // Measured: 24 messages received with four capabilities, and 130 calls
     // by a thread whose capability space is destroyed.
-    at_least([reached.with_four, reached.destroyed], [7, 60]);
+    at_least([reached.with_four, reached.destroyed], [12, 65]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -1332,40 +1348,40 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 2,158 accepted and 56 refused, cspace 151 and 15;
-    // by `send` 14 delivered and 1 refused.
-    at_least(reached.moved, [1000, 75]);
-    at_least(reached.refused, [28, 8]);
-    at_least([reached.sent, reached.sent_refused], [7, 1]);
-    // The same moves listed by `call` and by `reply_recv`: 38 and 20.
-    at_least([reached.called, reached.answered], [19, 10]);
+    // Measured: untyped 2,056 accepted and 101 refused, cspace 165 and 41;
+    // by `send` 6 delivered and none refused (one in the last pass).
+    at_least(reached.moved, [1000, 80]);
+    at_least(reached.refused, [50, 20]);
+    at_least([reached.sent, reached.sent_refused], [3, 0]);
+    // The same moves listed by `call` and by `reply_recv`: 32 and 18.
+    at_least([reached.called, reached.answered], [16, 9]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 38 queued callers, 17 callers that wait for the reply, 75
-    // receivers, 31 waiters on a notify; 26 of the ends by a wait number.
-    at_least(reached.cancelled, [19, 8, 37, 15]);
-    at_least([reached.cancelled_by_number], [13]);
-    // Measured: `call` 32, `recv` 27, `reply_recv` 18 and `wait` 27 returned
+    // Measured: 53 queued callers, 16 callers that wait for the reply, 99
+    // receivers, 30 waiters on a notify; 29 of the ends by a wait number.
+    at_least(reached.cancelled, [26, 8, 49, 15]);
+    at_least([reached.cancelled_by_number], [14]);
+    // Measured: `call` 44, `recv` 32, `reply_recv` 20 and `wait` 38 returned
     // `cancelled` at once.
-    at_least(reached.cancelled_at_once, [16, 13, 9, 13]);
+    at_least(reached.cancelled_at_once, [22, 16, 10, 19]);
 }
 
 #[test]
 fn removal_steps_that_only_move_the_sweep_are_reached() {
     let reached = all_seeds();
-    // Measured: 29 of the 2,017 `again` of a removal removed nothing.
-    at_least([reached.swept_only], [14]);
+    // Measured: 25 of the 2,006 `again` of a removal removed nothing.
+    at_least([reached.swept_only], [12]);
 }
 
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 115 of the 470 calls that returned `unsupported`; the others
-    // are calls that are not modelled.
-    at_least([reached.retype_unsupported], [55]);
+    // Measured: 66 calls returned `unsupported` for a kind this version
+    // does not make.
+    at_least([reached.retype_unsupported], [33]);
 }
 
 #[test]

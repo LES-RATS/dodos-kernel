@@ -27,7 +27,26 @@ fn retype(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAddr)
         untyped,
         kind,
         size,
-        page: PageSize::Size4K,
+        page: PageSize::Size4K as u64,
+        // Frames: write-back on ordinary memory, uncached on device memory.
+        memory: (untyped == DEV) as u64,
+        destination,
+    }
+}
+
+fn frame(
+    untyped: SlotAddr,
+    page: PageSize,
+    pages: u64,
+    memory: MemoryType,
+    destination: SlotAddr,
+) -> Syscall {
+    Syscall::UntypedRetype {
+        untyped,
+        kind: Frame,
+        size: pages,
+        page: page as u64,
+        memory: memory as u64,
         destination,
     }
 }
@@ -65,7 +84,16 @@ fn configure(thread: u32, cspace: SlotAddr, aspace: SlotAddr, fault: SlotAddr) -
         cspace,
         aspace,
         fault,
+        page: SlotAddr::NONE,
     }
+}
+
+/// The same configuration, with a message page.
+fn with_page(mut configure: Syscall, slot: u32) -> Syscall {
+    if let Syscall::ThreadConfigure { page, .. } = &mut configure {
+        *page = s(slot);
+    }
+    configure
 }
 
 /// A message whose only word is its label.
@@ -75,6 +103,7 @@ fn msg(label: u32, caps: Vec<Transfer>) -> Message {
         flags: 0,
         words: vec![label.into()],
         caps,
+        marks: 0,
     }
 }
 
@@ -152,12 +181,14 @@ const WAITS: Outcome = Ok(Output::Waits);
 struct K {
     m: Model,
     t: ObjId,
+    /// The next slot, counting down, where `spawn` places a message page.
+    spare: u32,
 }
 
 impl K {
     fn new() -> Self {
         let (m, t) = Model::boot();
-        Self { m, t }
+        Self { m, t, spare: 127 }
     }
 
     fn on(&mut self, thread: ObjId, call: Syscall) -> Outcome {
@@ -216,9 +247,20 @@ impl K {
     }
 
     /// A new thread that runs in the capability space of the first thread.
+    /// A frame for a message page, in a slot that the tests leave free.
+    fn page(&mut self) -> u32 {
+        let page = self.spare;
+        self.spare -= 1;
+        self.make(Frame, page);
+        page
+    }
+
+    /// It has a message page of its own.
     fn spawn(&mut self, slot: u32) -> ObjId {
         self.make(Thread, slot);
-        self.ok(configure(slot, SPACE, SlotAddr::NONE, SlotAddr::NONE));
+        let page = self.page();
+        let none = SlotAddr::NONE;
+        self.ok(with_page(configure(slot, SPACE, none, none), page));
         self.ok(Syscall::ThreadResume(s(slot)));
         self.m.object_at(self.t, s(slot)).unwrap()
     }
@@ -537,8 +579,8 @@ fn plain_arguments_are_checked_before_the_state() {
 #[test]
 fn no_slot_is_reported_before_no_memory() {
     let mut k = K::new();
-    k.no(retype(UT, Frame, 1 << 40, UT), Error::NoSlot);
-    k.no(retype(UT, Frame, 1 << 40, s(30)), Error::NoMemory);
+    k.no(retype(UT, Untyped, 1 << 40, UT), Error::NoSlot);
+    k.no(retype(UT, Untyped, 1 << 40, s(30)), Error::NoMemory);
 }
 
 // The derivation tree.
@@ -905,7 +947,11 @@ fn space_with_a_thread(k: &mut K) -> ObjId {
         k.ok(derive(via(30, index), s(40 + index), Rights::ALL, 0));
     }
     k.make(Thread, 31);
-    k.ok(configure(31, s(30), SlotAddr::NONE, SlotAddr::NONE));
+    let page = k.page();
+    k.ok(with_page(
+        configure(31, s(30), SlotAddr::NONE, SlotAddr::NONE),
+        page,
+    ));
     k.ok(Syscall::ThreadResume(s(31)));
     k.m.object_at(k.t, s(31)).unwrap()
 }
@@ -1333,18 +1379,40 @@ fn frame_takes_a_page_size_and_a_number_of_pages() {
     let mut k = K::new();
     k.ok(retype(UT, Untyped, 1 << 22, s(30)));
     k.no(retype(s(30), Frame, 0, s(31)), Error::Invalid);
-    let large = |size, destination| Syscall::UntypedRetype {
-        untyped: s(30),
-        kind: Frame,
-        size,
-        page: PageSize::Size2M,
-        destination,
-    };
+    let wb = MemoryType::WriteBack;
+    let large = |size, destination| frame(s(30), PageSize::Size2M, size, wb, destination);
     k.ok(large(2, s(31)));
     k.no(retype(s(30), Frame, 1, s(32)), Error::NoMemory);
-    k.no(large(1 << 40, s(32)), Error::NoMemory);
-    // A size that does not fit in 64 bits.
+    k.no(large(512, s(32)), Error::NoMemory);
+    // Frames: at most 512 pages (D-110).
+    k.no(large(513, s(32)), Error::Invalid);
     k.no(large(u64::MAX, s(32)), Error::Invalid);
+}
+
+#[test]
+fn frame_size_argument_is_judged_page_size_then_memory_type_then_pages() {
+    let mut k = K::new();
+    let raw = |untyped, page, memory, size| Syscall::UntypedRetype {
+        untyped,
+        kind: Frame,
+        size,
+        page,
+        memory,
+        destination: s(30),
+    };
+    // The page size value first, then the memory type, then the pages.
+    k.no(raw(UT, 3, 1, 0), Error::Invalid);
+    k.no(raw(UT, 0, 1, 1), Error::Invalid);
+    k.no(raw(UT, 0, 3, 1), Error::Invalid);
+    k.no(raw(UT, 0, 0, 0), Error::Invalid);
+    k.no(raw(UT, 0, 0, 513), Error::Invalid);
+    k.ok(raw(UT, 0, 0, 512));
+    k.ok(Syscall::CapDelete(s(30)));
+    // Device memory is uncached or write-combining, never write-back.
+    k.no(raw(DEV, 0, 0, 1), Error::Invalid);
+    k.ok(raw(DEV, 0, 2, 1));
+    k.ok(Syscall::CapDelete(s(30)));
+    k.ok(raw(DEV, 0, 1, 1));
 }
 
 #[test]
@@ -1371,18 +1439,30 @@ fn size_argument_is_zero_for_the_other_kinds() {
 }
 
 #[test]
-fn kinds_of_the_groups_not_yet_specified_are_unsupported() {
+fn kinds_that_this_version_does_not_make_are_unsupported() {
     let mut k = K::new();
-    for kind in [
-        ObjectKind::Timer,
-        ObjectKind::Task,
-        ObjectKind::Irq,
-        ObjectKind::IoPorts,
-        ObjectKind::IoSpace,
-        ObjectKind::Core,
-        ObjectKind::Debug,
-    ] {
+    use ObjectKind::{Core, Debug, IoPorts, Vcpu};
+    for kind in [IoPorts, Core, Debug, Vcpu] {
         k.no(retype(UT, kind, 0, s(30)), Error::Unsupported);
+    }
+}
+
+#[test]
+fn kinds_never_made_from_an_untyped_are_invalid() {
+    let mut k = K::new();
+    use ObjectKind::{Iommu, Irq, IrqControl};
+    for kind in [Irq, IrqControl, Iommu] {
+        k.no(retype(UT, kind, 0, s(30)), Error::Invalid);
+    }
+}
+
+#[test]
+fn timers_tasks_and_iospaces_are_made_from_an_untyped() {
+    let mut k = K::new();
+    use ObjectKind::{IoSpace, Task, Timer};
+    for (kind, slot) in [(Timer, 30), (Task, 31), (IoSpace, 32)] {
+        k.ok(retype(UT, kind, 0, s(slot)));
+        assert_eq!(k.kind(slot), Ok(kind));
     }
 }
 
@@ -1394,7 +1474,13 @@ fn device_memory_becomes_only_a_frame_or_a_child_untyped() {
     k.ok(retype(DEV, Frame, 1, s(30)));
     k.ok(retype(DEV, Untyped, 4096, s(31)));
     k.no(retype(s(31), Endpoint, 0, s(32)), Error::Invalid);
-    k.ok(retype(s(31), Frame, 1, s(32)));
+    k.ok(frame(
+        s(31),
+        PageSize::Size4K,
+        1,
+        MemoryType::Uncached,
+        s(32),
+    ));
 }
 
 #[test]
@@ -2614,7 +2700,8 @@ fn large_frame_is_aligned_on_its_page_size() {
         untyped: s(30),
         kind: Frame,
         size: 1,
-        page: PageSize::Size2M,
+        page: PageSize::Size2M as u64,
+        memory: 0,
         destination: s(32),
     };
     k.ok(large);
@@ -2792,13 +2879,18 @@ fn segment_is_aligned_on_8_kb() {
 fn untyped_retype_judges_the_kind_before_the_size() {
     let mut k = K::new();
     // Device memory: `invalid` for every kind but a frame and an untyped.
-    k.no(retype(DEV, ObjectKind::Timer, 0, s(30)), Error::Invalid);
+    k.no(retype(DEV, ObjectKind::IoPorts, 0, s(30)), Error::Invalid);
+    k.no(retype(DEV, ObjectKind::Irq, 0, s(30)), Error::Invalid);
     k.no(retype(DEV, Endpoint, 1, s(30)), Error::Invalid);
-    // A kind outside the model, then the size.
-    k.no(retype(UT, ObjectKind::Timer, 5, s(30)), Error::Unsupported);
+    // A kind this version does not make, then the size.
+    k.no(
+        retype(UT, ObjectKind::IoPorts, 5, s(30)),
+        Error::Unsupported,
+    );
+    k.no(retype(UT, ObjectKind::Irq, 5, s(30)), Error::Invalid);
     k.no(retype(UT, Endpoint, 5, s(30)), Error::Invalid);
     // All of it after the destination.
-    k.no(retype(UT, ObjectKind::Timer, 5, s(0)), Error::Invalid);
+    k.no(retype(UT, ObjectKind::IoPorts, 5, s(0)), Error::Invalid);
 }
 
 #[test]
@@ -2935,7 +3027,8 @@ fn frame_of_1_gb_pages_is_aligned_on_1_gb() {
         untyped: UT,
         kind: Frame,
         size,
-        page: PageSize::Size1G,
+        page: PageSize::Size1G as u64,
+        memory: 0,
         destination: s(slot),
     };
     k.no(huge(0, 30), Error::Invalid);
@@ -3385,7 +3478,7 @@ fn kind_that_is_not_made_is_unsupported_before_the_depths_and_the_state() {
     }
     // From an untyped capability at depth 64, into a slot that is full.
     k.no(
-        retype(s(92), ObjectKind::Timer, 0, s(30)),
+        retype(s(92), ObjectKind::IoPorts, 0, s(30)),
         Error::Unsupported,
     );
     k.no(retype(s(92), Endpoint, 0, s(30)), Error::Invalid);
@@ -4008,7 +4101,11 @@ fn supervisor_kills_a_process_by_deleting_its_space_then_its_untyped() {
     k.ok(retype(s(30), Untyped, 1 << 16, via(31, 16)));
     k.ok(derive(s(EP), via(31, 3), Rights::ALL, 0));
     k.ok(retype(s(30), Thread, 0, s(32)));
-    k.ok(configure(32, s(31), SlotAddr::NONE, SlotAddr::NONE));
+    k.ok(retype(s(30), Frame, 1, s(33)));
+    k.ok(with_page(
+        configure(32, s(31), SlotAddr::NONE, SlotAddr::NONE),
+        33,
+    ));
     k.ok(Syscall::ThreadResume(s(32)));
     let process = k.m.object_at(k.t, s(32)).unwrap();
     // It fills its space with 200 copies, and goes on deriving and sending.
@@ -4810,4 +4907,420 @@ fn rights_word_of_a_listed_slot_is_judged_with_its_slot() {
     );
     let whole = Transfer::Derive(s(NT), Rights::ALL.bits());
     k.no(listing(vec![whole]), Error::WouldWait);
+}
+
+// The D-110 changes to the groups of the decided subsections.
+
+fn configured(k: &mut K, thread: u32, page: SlotAddr) -> Outcome {
+    let none = SlotAddr::NONE;
+    let mut call = configure(thread, SPACE, none, none);
+    if let Syscall::ThreadConfigure { page: given, .. } = &mut call {
+        *given = page;
+    }
+    k.go(call)
+}
+
+/// A thread in `slot` of the first space, bound to it, with the frame in
+/// `page` as its message page if `page` is not 0, and running.
+fn runs_with_page(k: &mut K, slot: u32, page: u32) -> ObjId {
+    k.make(Thread, slot);
+    let page = if page == 0 { SlotAddr::NONE } else { s(page) };
+    assert_eq!(configured(k, slot, page), DONE);
+    k.ok(Syscall::ThreadResume(s(slot)));
+    k.m.object_at(k.t, s(slot)).unwrap()
+}
+
+/// A message of `words` words, 1 to `words`.
+fn long(words: u64) -> Message {
+    Message {
+        label: 1,
+        words: (1..=words).collect(),
+        ..Message::default()
+    }
+}
+
+#[test]
+fn message_page_is_a_frame_of_one_4_kb_page_of_ordinary_memory() {
+    let mut k = K::new();
+    k.make(Thread, 30);
+    let wb = MemoryType::WriteBack;
+    k.ok(frame(UT, PageSize::Size4K, 2, wb, s(31)));
+    k.ok(frame(UT, PageSize::Size2M, 1, wb, s(32)));
+    k.ok(frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, s(33)));
+    k.make(Endpoint, 34);
+    for slot in [31, 32, 33, 34] {
+        assert_eq!(
+            configured(&mut k, 30, s(slot)),
+            Err(Error::Invalid),
+            "{slot}"
+        );
+    }
+    k.make(Frame, 35);
+    assert_eq!(configured(&mut k, 30, s(35)), DONE);
+}
+
+#[test]
+fn message_page_needs_read_and_write_judged_after_its_size() {
+    let mut k = K::new();
+    k.make(Thread, 30);
+    k.make(Frame, 31);
+    let read = k.weak(31, 32, Rights::READ);
+    let write = k.weak(31, 33, Rights::WRITE);
+    assert_eq!(configured(&mut k, 30, s(read)), Err(Error::Denied));
+    assert_eq!(configured(&mut k, 30, s(write)), Err(Error::Denied));
+    // A frame of two pages without the rights: its size first.
+    k.ok(frame(UT, PageSize::Size4K, 2, MemoryType::WriteBack, s(34)));
+    let small = k.weak(34, 35, Rights::READ);
+    assert_eq!(configured(&mut k, 30, s(small)), Err(Error::Invalid));
+}
+
+#[test]
+fn message_page_bound_to_another_thread_is_busy_and_to_the_same_one_accepted() {
+    let mut k = K::new();
+    k.make(Thread, 30);
+    k.make(Thread, 31);
+    k.make(Frame, 32);
+    assert_eq!(configured(&mut k, 30, s(32)), DONE);
+    assert_eq!(configured(&mut k, 31, s(32)), Err(Error::Busy));
+    assert_eq!(configured(&mut k, 30, s(32)), DONE);
+    // A copy of the bound capability has an empty record.
+    let copy = k.weak(32, 33, Rights::ALL);
+    assert_eq!(configured(&mut k, 31, s(copy)), DONE);
+}
+
+#[test]
+fn thread_that_runs_is_busy_before_its_message_page_is_looked_at() {
+    let mut k = K::new();
+    k.make(Frame, 32);
+    k.make(Thread, 30);
+    assert_eq!(configured(&mut k, 30, s(32)), DONE);
+    runs_with_page(&mut k, 31, 0);
+    // The frame is bound to thread 30, and thread 31 runs: `busy` either
+    // way; a frame of the wrong size is `invalid` first.
+    assert_eq!(configured(&mut k, 31, s(32)), Err(Error::Busy));
+    k.ok(frame(UT, PageSize::Size4K, 2, MemoryType::WriteBack, s(33)));
+    assert_eq!(configured(&mut k, 31, s(33)), Err(Error::Invalid));
+}
+
+#[test]
+fn message_page_binding_moves_with_its_capability() {
+    let mut k = K::new();
+    k.make(Thread, 30);
+    k.make(Thread, 31);
+    k.make(Frame, 32);
+    assert_eq!(configured(&mut k, 30, s(32)), DONE);
+    k.ok(mv(s(32), s(40)));
+    assert_eq!(configured(&mut k, 31, s(40)), Err(Error::Busy));
+    assert_eq!(configured(&mut k, 30, s(40)), DONE);
+}
+
+#[test]
+fn page_0_unbinds_the_message_page_and_another_page_frees_the_old_one() {
+    let mut k = K::new();
+    k.make(Thread, 30);
+    k.make(Thread, 31);
+    k.make(Frame, 32);
+    k.make(Frame, 33);
+    assert_eq!(configured(&mut k, 30, s(32)), DONE);
+    assert_eq!(configured(&mut k, 30, s(33)), DONE);
+    assert_eq!(configured(&mut k, 31, s(32)), DONE);
+    assert_eq!(configured(&mut k, 31, s(33)), Err(Error::Busy));
+    assert_eq!(configured(&mut k, 30, SlotAddr::NONE), DONE);
+    assert_eq!(configured(&mut k, 31, s(33)), DONE);
+}
+
+#[test]
+fn removing_the_frame_capability_unbinds_the_message_page_in_the_same_step() {
+    let mut k = K::with_ipc();
+    k.make(Frame, 31);
+    let copy = k.weak(31, 32, Rights::ALL);
+    let thread = runs_with_page(&mut k, 30, copy);
+    assert_eq!(k.on(thread, send(EP, long(7))), Err(Error::WouldWait));
+    // Revoking the parent removes the copy that binds the page.
+    k.ok(Syscall::CapRevoke(s(31)));
+    assert_eq!(k.on(thread, send(EP, long(7))), Err(Error::Invalid));
+    assert_eq!(k.on(thread, send(EP, long(6))), Err(Error::WouldWait));
+}
+
+#[test]
+fn add_marks_is_the_only_flag_a_sender_may_set() {
+    let mut k = K::with_ipc();
+    let marked = |flags| Message {
+        flags,
+        marks: Marks::UNTRUSTED.bits(),
+        ..msg(1, vec![])
+    };
+    let add = Header::FLAG_ADD_MARKS;
+    k.no(send(EP, marked(add)), Error::WouldWait);
+    for flag in [DROPPED, Header::FLAG_NOTIFICATION, 1 << 3] {
+        k.no(send(EP, marked(add | flag)), Error::Invalid);
+    }
+}
+
+#[test]
+fn added_marks_word_with_a_reserved_bit_is_invalid_only_with_the_flag() {
+    let mut k = K::with_ipc();
+    let word = |flags| Message {
+        flags,
+        marks: 1 << 2,
+        ..msg(1, vec![])
+    };
+    k.no(send(EP, word(Header::FLAG_ADD_MARKS)), Error::Invalid);
+    k.no(send(EP, word(0)), Error::WouldWait);
+}
+
+#[test]
+fn header_that_needs_a_message_page_is_invalid_for_a_thread_without_one() {
+    let mut k = K::with_ipc();
+    let thread = runs_with_page(&mut k, 30, 0);
+    assert_eq!(k.on(thread, send(EP, long(6))), Err(Error::WouldWait));
+    assert_eq!(k.on(thread, send(EP, long(7))), Err(Error::Invalid));
+    let one = msg(1, vec![Transfer::Derive(s(NT), Rights::ALL.bits())]);
+    assert_eq!(k.on(thread, send(EP, one)), Err(Error::Invalid));
+    let marked = Message {
+        flags: Header::FLAG_ADD_MARKS,
+        ..msg(1, vec![])
+    };
+    assert_eq!(k.on(thread, send(EP, marked)), Err(Error::Invalid));
+}
+
+#[test]
+fn need_of_a_message_page_is_judged_with_the_header_before_the_listed_slots() {
+    let mut k = K::with_ipc();
+    k.weak(NT, 31, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(NT)));
+    let thread = runs_with_page(&mut k, 30, 0);
+    let dead = msg(1, vec![Transfer::Move(s(31))]);
+    assert_eq!(
+        k.on(thread, call(EP, dead.clone(), range(0, 9))),
+        Err(Error::Invalid)
+    );
+    // With a page, the dead slot is judged next.
+    k.ok(Syscall::ThreadSuspend(s(30)));
+    k.make(Frame, 32);
+    assert_eq!(configured(&mut k, 30, s(32)), DONE);
+    k.ok(Syscall::ThreadResume(s(30)));
+    assert_eq!(k.on(thread, call(EP, dead, range(0, 9))), Err(Error::Gone));
+}
+
+#[test]
+fn receiver_without_a_message_page_gets_the_register_words_only() {
+    let mut k = K::with_ipc();
+    let receiver = runs_with_page(&mut k, 30, 0);
+    assert_eq!(k.on(receiver, recv(EP, RP, Range::NONE)), WAITS);
+    assert_eq!(k.go(send(EP, long(10))), Ok(Output::Sent { flags: 0 }));
+    let Some(Ok(Output::Message(delivery))) = k.woken(receiver) else {
+        panic!("not a message");
+    };
+    assert_eq!(delivery.words, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(delivery.received.header.words(), 10);
+}
+
+#[test]
+fn caller_whose_message_page_is_unbound_while_it_waits_loses_its_list_and_page_words() {
+    let mut k = K::with_ipc();
+    k.make(Frame, 31);
+    let caller = runs_with_page(&mut k, 30, 31);
+    let message = Message {
+        caps: vec![Transfer::Derive(s(NT), Rights::ALL.bits())],
+        ..long(8)
+    };
+    assert_eq!(k.on(caller, call(EP, message, Range::NONE)), WAITS);
+    k.ok(Syscall::CapDelete(s(31)));
+    let Ok(Output::Message(delivery)) = k.go(recv(EP, RP, range(100, 1))) else {
+        panic!("not a message");
+    };
+    assert_eq!(delivery.words, [1, 2, 3, 4, 5, 6, 0, 0]);
+    let header = delivery.received.header;
+    assert_eq!((header.caps(), header.flags()), (0, DROPPED));
+    assert_eq!(k.kind(100), Err(Error::Invalid));
+}
+
+/// A child untyped of 1 MB in `slot`, whose memory is dirty: an object was
+/// made from it and destroyed.
+fn dirty(k: &mut K, slot: u32) {
+    k.ok(retype(UT, Untyped, 1 << 20, s(slot)));
+    k.ok(retype(s(slot), Endpoint, 0, s(slot + 1)));
+    k.ok(Syscall::CapDelete(s(slot + 1)));
+}
+
+fn pages(untyped: u32, count: u64, slot: u32) -> Syscall {
+    let wb = MemoryType::WriteBack;
+    frame(s(untyped), PageSize::Size4K, count, wb, s(slot))
+}
+
+#[test]
+fn creation_from_dirty_memory_clears_64_kb_per_call_and_makes_nothing_until_the_end() {
+    let mut k = K::new();
+    dirty(&mut k, 30);
+    // 128 KB: two calls.
+    k.no(pages(30, 32, 32), Error::Again);
+    assert_eq!(k.kind(32), Err(Error::Invalid));
+    k.ok(pages(30, 32, 32));
+    // 192 KB: three.
+    k.no(pages(30, 48, 33), Error::Again);
+    k.no(pages(30, 48, 33), Error::Again);
+    k.ok(pages(30, 48, 33));
+    // An endpoint after it: one call.
+    k.ok(retype(s(30), Endpoint, 0, s(34)));
+}
+
+#[test]
+fn work_of_a_clearing_step_does_not_depend_on_the_arguments() {
+    let mut k = K::new();
+    dirty(&mut k, 30);
+    k.no(pages(30, 32, 32), Error::Again);
+    // The first 64 KB are clear: an endpoint is made at once, at the
+    // watermark, and the frame then starts at 4 KB and ends at 132 KB.
+    k.ok(retype(s(30), Endpoint, 0, s(33)));
+    k.no(pages(30, 32, 32), Error::Again);
+    k.ok(pages(30, 32, 32));
+}
+
+#[test]
+fn every_check_comes_before_the_clearing() {
+    let mut k = K::new();
+    dirty(&mut k, 30);
+    k.no(pages(30, 32, 30), Error::NoSlot);
+    k.no(pages(30, 512, 32), Error::NoMemory);
+    // Nothing was cleared: 128 KB still take two calls.
+    k.no(pages(30, 32, 32), Error::Again);
+    k.ok(pages(30, 32, 32));
+}
+
+#[test]
+fn child_untyped_is_not_cleared_and_keeps_what_its_parent_had_cleared() {
+    let mut k = K::new();
+    dirty(&mut k, 30);
+    // The parent clears its first 64 KB, then gives its first 128 KB to a
+    // child at once.
+    k.no(pages(30, 32, 32), Error::Again);
+    k.ok(retype(s(30), Untyped, 1 << 17, s(33)));
+    // The child knows its first 64 KB are clear: 128 KB in one call.
+    k.ok(pages(33, 32, 34));
+    // The parent's clean mark moved with its watermark: the next 64 KB in
+    // one call.
+    k.ok(pages(30, 16, 35));
+}
+
+#[test]
+fn memory_is_dirty_again_once_the_watermark_returns_to_the_start() {
+    let mut k = K::new();
+    k.ok(retype(UT, Untyped, 1 << 20, s(30)));
+    k.ok(pages(30, 32, 32));
+    k.ok(Syscall::CapDelete(s(32)));
+    k.no(pages(30, 32, 32), Error::Again);
+    k.ok(pages(30, 32, 32));
+}
+
+#[test]
+fn device_memory_is_never_cleared() {
+    let mut k = K::new();
+    let uncached = MemoryType::Uncached;
+    k.ok(frame(DEV, PageSize::Size4K, 256, uncached, s(30)));
+    k.ok(Syscall::CapDelete(s(30)));
+    k.ok(frame(DEV, PageSize::Size4K, 256, uncached, s(30)));
+}
+
+#[test]
+fn cspace_grow_clears_its_segment_within_the_call() {
+    let mut k = K::new();
+    dirty(&mut k, 30);
+    k.ok(retype(s(30), CSpace, 256, s(32)));
+    for slots in [128, 256] {
+        assert_eq!(k.go(grow_from(32, s(30))), Ok(Output::Slots(slots)));
+    }
+}
+
+/// An empty capability space in slot 30, and `count` suspended threads in
+/// the slots from 40 bound to it, the first one first.
+fn space_with_threads(k: &mut K, count: u32) {
+    k.make(CSpace, 30);
+    k.go(grow(30)).unwrap();
+    for slot in 40..40 + count {
+        k.make(Thread, slot);
+        k.ok(configure(slot, s(30), SlotAddr::NONE, SlotAddr::NONE));
+    }
+}
+
+#[test]
+fn destroying_a_cspace_unbinds_its_threads_one_unit_each_most_recent_first() {
+    let mut k = K::new();
+    space_with_threads(&mut k, 33);
+    // 32 units: the threads of slots 72 down to 41.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.no(Syscall::ThreadResume(s(72)), Error::Busy);
+    k.no(Syscall::ThreadResume(s(41)), Error::Busy);
+    // The first thread is still bound, to a dying space: it can be resumed.
+    k.ok(Syscall::ThreadResume(s(40)));
+    k.ok(Syscall::CapDelete(s(30)));
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    k.no(Syscall::ThreadResume(s(40)), Error::Busy);
+}
+
+#[test]
+fn thread_whose_space_is_destroyed_is_bound_again_by_thread_configure() {
+    let mut k = K::new();
+    space_with_threads(&mut k, 1);
+    k.ok(Syscall::CapDelete(s(30)));
+    k.no(Syscall::ThreadResume(s(40)), Error::Busy);
+    k.ok(configure(40, SPACE, SlotAddr::NONE, SlotAddr::NONE));
+    k.ok(Syscall::ThreadResume(s(40)));
+    let thread = k.m.object_at(k.t, s(40)).unwrap();
+    assert_eq!(
+        k.on(thread, Syscall::CapInspect(s(40))),
+        Ok(Output::Inspect {
+            kind: Thread,
+            rights: Rights::ALL,
+            badge: 0,
+        })
+    );
+}
+
+#[test]
+fn destroying_an_endpoint_unbinds_the_threads_whose_fault_endpoint_it_is() {
+    let mut k = K::with_ipc();
+    for slot in 40..73 {
+        k.make(Thread, slot);
+        k.ok(configure(slot, SPACE, SlotAddr::NONE, s(EP)));
+    }
+    k.no(Syscall::CapDelete(s(EP)), Error::Again);
+    k.ok(Syscall::CapDelete(s(EP)));
+}
+
+#[test]
+fn destroying_an_aspace_unbinds_its_threads() {
+    let mut k = K::new();
+    k.make(ASpace, 31);
+    for slot in 40..73 {
+        k.make(Thread, slot);
+        k.ok(configure(slot, SPACE, s(31), SlotAddr::NONE));
+    }
+    k.no(Syscall::CapDelete(s(31)), Error::Again);
+    k.ok(Syscall::CapDelete(s(31)));
+}
+
+#[test]
+fn removal_of_a_frame_capability_and_its_binding_is_one_unit() {
+    let mut k = K::new();
+    k.make(Frame, 30);
+    // 31 copies, the last one bound: 32 units with the root.
+    for slot in 40..71 {
+        k.weak(30, slot, Rights::ALL);
+    }
+    k.make(Thread, 31);
+    assert_eq!(configured(&mut k, 31, s(70)), DONE);
+    k.ok(Syscall::CapDelete(s(30)));
+    k.make(Frame, 32);
+    assert_eq!(configured(&mut k, 31, s(32)), DONE);
+}
+
+#[test]
+fn child_untyped_of_dirty_memory_is_made_in_one_call() {
+    let mut k = K::new();
+    dirty(&mut k, 30);
+    k.ok(retype(s(30), Untyped, 1 << 19, s(32)));
+    // Its own memory is dirty: 128 KB from it take two calls.
+    k.no(pages(32, 32, 33), Error::Again);
+    k.ok(pages(32, 32, 33));
 }

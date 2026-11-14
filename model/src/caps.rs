@@ -1,20 +1,48 @@
 //! Capabilities and objects: the derivation tree, removal, object creation.
 
 use crate::{
-    CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place, ReplyState,
-    Slot, Sweep, Thread, Untyped, live,
+    ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
+    Place, Record, ReplyState, Slot, Sweep, Thread, Untyped, live,
 };
 use dodos_abi::{
-    ASPACE_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, ENDPOINT_BYTES,
-    Error, LONGEST_WALK, NOTIFY_BYTES, ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP,
-    REPLY_BYTES, Rights, SCHED_BYTES, SLOT_BYTES, SlotAddr, THREAD_BYTES, TREE_DEPTH,
-    UNTYPED_MIN_BYTES,
+    ASPACE_BYTES, CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
+    ENDPOINT_BYTES, Error, FRAME_MAX_PAGES, IOSPACE_BYTES, LONGEST_WALK, MemoryType, NOTIFY_BYTES,
+    ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP, REPLY_BYTES, Rights, SCHED_BYTES,
+    SLOT_BYTES, SlotAddr, TASK_BYTES, THREAD_BYTES, TIMER_BYTES, TREE_DEPTH, UNTYPED_MIN_BYTES,
 };
 
-/// Slots and addresses: one segment of a capability space.
+/// Slots and addresses: one segment of a capability space, 8 KB.
 const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
 /// Rules of `untyped_retype`: the greatest alignment of a kernel object.
 const PAGE: u64 = PageSize::Size4K.bytes();
+
+/// The size argument of `untyped_retype`, as the caller gives it. For a
+/// frame: the number of pages, and the raw words of the page size and of
+/// the memory type.
+#[derive(Clone, Copy)]
+pub(crate) struct SizeArgument {
+    pub(crate) size: u64,
+    pub(crate) page: u64,
+    pub(crate) memory: u64,
+}
+
+/// Where `Model::take` placed an object, and where the clean mark of the
+/// untyped stood before.
+pub(crate) struct Taken {
+    at: u64,
+    clean: u64,
+}
+
+/// Rules of `untyped_retype`: whether a creation clears its memory in steps
+/// that return `again`, or within the call (the tables of an address space
+/// and the segments of a capability space, at most 24 KB). A child untyped
+/// is not cleared.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Clearing {
+    InSteps,
+    WithinCall,
+    None,
+}
 
 /// How a capability comes to a slot, for `Model::fits`.
 #[derive(Clone, Copy)]
@@ -44,18 +72,45 @@ enum Removal {
 }
 
 /// Capabilities and objects, with the table of Object sizes: the bytes and
-/// the alignment of a new object, from the size argument of `untyped_retype`.
-fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), Error> {
+/// the alignment of a new object, from its size argument. The kind is judged
+/// before the size: device memory first (`invalid` but for a frame or a
+/// child untyped), then a kind that this version does not make
+/// (`unsupported`) or that is never made from an untyped (`invalid`, D-110).
+/// For a frame the size argument is judged in this order: the page size
+/// value, whether the processor supports it, the memory type, the number of
+/// pages.
+fn footprint(
+    kind: ObjectKind,
+    arg: SizeArgument,
+    device: bool,
+    supported: u32,
+) -> Result<(u64, u64, Option<Frame>), Error> {
+    let size = arg.size;
+    if device && kind != ObjectKind::Frame && kind != ObjectKind::Untyped {
+        return Err(Error::Invalid);
+    }
     let segments = size / u64::from(CSPACE_SEGMENT_SLOTS);
+    let fixed = |bytes: usize| (bytes as u64, size == 0);
     let (bytes, valid) = match kind {
         ObjectKind::Untyped => (size, size.is_power_of_two() && size >= UNTYPED_MIN_BYTES),
-        // Rules of `untyped_retype`: a frame takes exactly its number of
-        // pages times its page size. Capabilities and objects: a size that
-        // does not fit in 64 bits is `invalid`.
-        ObjectKind::Frame => (
-            size.checked_mul(page.bytes()).ok_or(Error::Invalid)?,
-            size > 0,
-        ),
+        ObjectKind::Frame => {
+            let page = PageSize::from_raw(arg.page).ok_or(Error::Invalid)?;
+            if supported & 1 << page as u32 == 0 {
+                return Err(Error::Unsupported);
+            }
+            let memory = MemoryType::for_memory(arg.memory, device)?;
+            if size == 0 || size > FRAME_MAX_PAGES {
+                return Err(Error::Invalid);
+            }
+            // Rules of `untyped_retype`: a frame takes exactly its number of
+            // pages times its page size, aligned on its page size.
+            let frame = Frame {
+                page,
+                pages: size,
+                memory,
+            };
+            return Ok((size * page.bytes(), page.bytes(), Some(frame)));
+        }
         // Slots and addresses: a non-zero multiple of 128, at most 2^20, and
         // a directory rounded up to a power of two.
         ObjectKind::CSpace => (
@@ -64,28 +119,31 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
                 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into())
                 && size <= CSPACE_MAX_SLOTS.into(),
         ),
-        ObjectKind::ASpace => (ASPACE_BYTES as u64, size == 0),
+        ObjectKind::ASpace => fixed(ASPACE_BYTES),
+        ObjectKind::IoSpace => fixed(IOSPACE_BYTES),
         // Rules of `untyped_retype`: a thread in the one-core reference is
         // 1 KB.
-        ObjectKind::Thread => (THREAD_BYTES as u64, size == 0),
-        ObjectKind::Sched => (SCHED_BYTES as u64, size == 0),
-        ObjectKind::Endpoint => (ENDPOINT_BYTES as u64, size == 0),
-        ObjectKind::Reply => (REPLY_BYTES as u64, size == 0),
-        ObjectKind::Notify => (NOTIFY_BYTES as u64, size == 0),
-        // Order of checks, step 3: a kind that this version does not make,
-        // the kinds of the groups not yet specified, is `unsupported`, after
-        // the rule on device memory and before the size argument.
-        _ => return Err(Error::Unsupported),
+        ObjectKind::Thread => fixed(THREAD_BYTES),
+        ObjectKind::Sched => fixed(SCHED_BYTES),
+        ObjectKind::Endpoint => fixed(ENDPOINT_BYTES),
+        ObjectKind::Reply => fixed(REPLY_BYTES),
+        ObjectKind::Notify => fixed(NOTIFY_BYTES),
+        ObjectKind::Timer => fixed(TIMER_BYTES),
+        ObjectKind::Task => fixed(TASK_BYTES),
+        ObjectKind::Irq | ObjectKind::IrqControl | ObjectKind::Iommu => {
+            return Err(Error::Invalid);
+        }
+        ObjectKind::IoPorts | ObjectKind::Core | ObjectKind::Debug | ObjectKind::Vcpu => {
+            return Err(Error::Unsupported);
+        }
     };
-    // Rules of `untyped_retype`: aligned on the size of a child untyped, on
-    // the page size for a frame, and for the other objects on their size,
-    // or on 4 KB if they are larger.
+    // Rules of `untyped_retype`: aligned on the size of a child untyped, and
+    // for the other objects on their size, or on 4 KB if they are larger.
     let align = match kind {
         ObjectKind::Untyped => bytes,
-        ObjectKind::Frame => page.bytes(),
         _ => bytes.min(PAGE),
     };
-    valid.then_some((bytes, align)).ok_or(Error::Invalid)
+    valid.then_some((bytes, align, None)).ok_or(Error::Invalid)
 }
 
 impl Model {
@@ -192,24 +250,26 @@ impl Model {
         thread: ObjId,
         untyped: SlotAddr,
         kind: ObjectKind,
-        size: u64,
-        page: PageSize,
+        size: SizeArgument,
         destination: SlotAddr,
     ) -> Outcome {
         let parent = self.cap(thread, untyped, Rights::READ)?;
         let &Cap { object, rights, .. } = self.is(parent, ObjectKind::Untyped, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
         // Order of checks, step 3: the kind is judged before the size
-        // argument. Capabilities and objects: device memory can only become
-        // a frame or a child untyped.
+        // argument.
         let device = self.untypeds[&object].device;
-        if device && kind != ObjectKind::Frame && kind != ObjectKind::Untyped {
-            return Err(Error::Invalid);
-        }
-        let (bytes, align) = footprint(kind, size, page)?;
+        let (bytes, align, frame) = footprint(kind, size, device, self.page_sizes)?;
         self.fits(place.space, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
-        self.take(object, bytes, align)?;
+        // Rules of `untyped_retype`: the kernel clears every object it
+        // creates, but a child untyped (D-110). A call that has not reached
+        // the end of the new object returns `again` and makes nothing.
+        let clearing = match kind {
+            ObjectKind::Untyped => Clearing::None,
+            _ => Clearing::InSteps,
+        };
+        let start = self.take(object, bytes, align, clearing)?;
         // Rules of `untyped_retype`: every right, but `exec` only if the
         // untyped capability has it, and never on device memory: the
         // start-up capabilities for device memory have no `exec`.
@@ -218,7 +278,16 @@ impl Model {
         } else {
             Rights::ALL.without(Rights::EXEC)
         };
-        self.create(kind, size, Some(parent), new, place);
+        let cap = self.create(kind, size.size, Some(parent), new, place);
+        let id = self.caps[&cap].object;
+        if let Some(frame) = frame {
+            self.frames.insert(id, frame);
+        }
+        // A child untyped: its clean mark starts at the end of the part of
+        // its range that the parent's clean mark covered.
+        if let Some(child) = self.untypeds.get_mut(&id) {
+            child.clean = start.clean.saturating_sub(start.at).min(bytes);
+        }
         Ok(Output::Done)
     }
 
@@ -242,8 +311,9 @@ impl Model {
         if slots.len() >= *max as usize {
             return Err(Error::NoSlot);
         }
-        // Rules of `untyped_retype`: a segment is 4 KB, aligned on its size.
-        self.take(untyped, SEGMENT_BYTES, SEGMENT_BYTES)?;
+        // Rules of `untyped_retype`: a segment is 8 KB, aligned on its
+        // size, and cleared within the call.
+        self.take(untyped, SEGMENT_BYTES, SEGMENT_BYTES, Clearing::WithinCall)?;
         let space = live(&mut self.cspaces, space);
         let slots = space.slots.len() + CSPACE_SEGMENT_SLOTS as usize;
         space.slots.resize(slots, Slot::Empty);
@@ -282,26 +352,59 @@ impl Model {
     }
 
     /// Rules of `untyped_retype`: memory is taken at a watermark that only
-    /// moves up, aligned.
-    fn take(&mut self, untyped: ObjId, bytes: u64, align: u64) -> Result<(), Error> {
+    /// moves up, aligned. `no_memory` if it does not fit; then the memory
+    /// from the watermark to the end of the new object must be clear: the
+    /// call clears from the clean mark, at most 64 KB, and returns `again`
+    /// while the end is not reached. Device memory is never cleared.
+    ///
+    /// CONTRACT-GAP (rules of `untyped_retype`): "clears from the clean
+    /// mark, at most 64 KB" does not say whether the step that reaches the
+    /// end clears exactly to the end or a whole 64 KB; the clean mark after
+    /// the creation depends on it. Here a step clears up to the end of the
+    /// new object, and never past it.
+    pub(crate) fn take(
+        &mut self,
+        untyped: ObjId,
+        bytes: u64,
+        align: u64,
+        clearing: Clearing,
+    ) -> Result<Taken, Error> {
         let untyped = live(&mut self.untypeds, untyped);
         let start = untyped.watermark.checked_next_multiple_of(align);
         let end = start.and_then(|start| start.checked_add(bytes));
-        untyped.watermark = end
-            .filter(|&end| end <= untyped.bytes)
-            .ok_or(Error::NoMemory)?;
+        let (start, end) = match (start, end) {
+            (Some(start), Some(end)) if end <= untyped.bytes => (start, end),
+            _ => return Err(Error::NoMemory),
+        };
+        let clean = untyped.clean;
+        if !untyped.device && clearing != Clearing::None && untyped.clean < end {
+            let reached = match clearing {
+                Clearing::InSteps => (untyped.clean + CLEAR_STEP_BYTES).min(end),
+                _ => end,
+            };
+            untyped.clean = reached;
+            if reached < end {
+                return Err(Error::Again);
+            }
+        }
+        untyped.watermark = end;
+        // When the watermark moves past the clean mark, the clean mark moves
+        // with it.
+        if !untyped.device {
+            untyped.clean = untyped.clean.max(end);
+        }
         untyped.live += 1;
-        Ok(())
+        Ok(Taken { at: start, clean })
     }
 
     /// Rules of `untyped_retype`: when the last object made from the untyped
-    /// is destroyed the watermark returns to the start; this is the only
-    /// moment the memory becomes usable again.
+    /// is destroyed the watermark returns to the start, and so does the
+    /// clean mark; this is the only moment the memory becomes usable again.
     fn release(&mut self, untyped: ObjId) {
         let untyped = live(&mut self.untypeds, untyped);
         untyped.live -= 1;
         if untyped.live == 0 {
-            untyped.watermark = 0;
+            (untyped.watermark, untyped.clean) = (0, 0);
         }
     }
 
@@ -325,6 +428,7 @@ impl Model {
                     bytes: size,
                     device: from.is_some_and(|from| self.untypeds[&from].device),
                     watermark: 0,
+                    clean: 0,
                     live: 0,
                 };
                 self.untypeds.insert(id, untyped);
@@ -337,8 +441,12 @@ impl Model {
                     max: size as u32,
                     slots: vec![Slot::Empty; slots],
                     sweep: None,
+                    threads: Vec::new(),
                 };
                 self.cspaces.insert(id, space);
+            }
+            ObjectKind::ASpace => {
+                self.aspaces.insert(id, ASpace::default());
             }
             ObjectKind::Thread => {
                 // Threads: a new thread is suspended and bound to nothing.
@@ -384,6 +492,7 @@ impl Model {
             children: Vec::new(),
             place,
             dying: false,
+            record: Record::Empty,
         };
         self.caps.insert(id, cap);
         if let Some(parent) = parent {
@@ -418,7 +527,8 @@ impl Model {
     }
 
     /// The derivation tree: removal in bounded steps. Per call, at most 32
-    /// capabilities are removed or threads woken, and at most 128 slots of
+    /// units of work are done (a capability removed, a thread woken, or a
+    /// link of a destroyed object undone, D-110), and at most 128 slots of
     /// dying capability spaces are examined; `again` while work remains.
     /// `cap_revoke` on the root capability of a space starts below it, and
     /// so does not sweep the space.
@@ -443,6 +553,12 @@ impl Model {
                 // wait on the same object are served first in, first out.
                 self.unlink(waiter);
                 self.wake(waiter, Err(Error::Gone));
+                continue;
+            }
+            // What else destruction undoes (D-110): after the waiting threads
+            // are woken, and for a `cspace` after its sweep, each link to the
+            // object is undone before the root capability is removed.
+            if self.rooted(next).is_some_and(|object| self.undo(object)) {
                 continue;
             }
             // Slots and addresses: `cap_delete` acts on the slot it names,
@@ -568,10 +684,36 @@ impl Model {
         }
     }
 
+    /// What else destruction undoes (D-110): undoes one link to an object
+    /// whose root capability is the next to remove, most recently made
+    /// first, and says whether there was one.
+    fn undo(&mut self, object: ObjId) -> bool {
+        let last = |list: &Vec<ObjId>| list.last().copied();
+        let unbound = match self.objects[&object].kind {
+            // The threads bound to a `cspace`, an `aspace` or an endpoint (as
+            // their fault endpoint) are unbound.
+            ObjectKind::CSpace => last(&self.cspaces[&object].threads).map(|thread| {
+                self.bind_space(thread, None);
+            }),
+            ObjectKind::ASpace => last(&self.aspaces[&object].threads).map(|thread| {
+                self.bind_aspace(thread, None);
+            }),
+            ObjectKind::Endpoint => last(&self.endpoints[&object].threads).map(|thread| {
+                self.bind_fault(thread, None);
+            }),
+            _ => None,
+        };
+        unbound.is_some()
+    }
+
     /// Removes a capability that has no descendant, and leaves `left` in
     /// its slot. The derivation tree: the object is destroyed with its root
-    /// capability.
+    /// capability. Removing a frame capability with a full record undoes
+    /// the binding it holds, in the same unit (D-110).
     fn remove_cap(&mut self, id: CapId, left: Slot) {
+        if let Record::Binding(thread) = self.caps[&id].record {
+            self.bind_page(thread, None);
+        }
         let cap = self.caps.remove(&id).expect("names a live entry");
         if let Some(parent) = cap.parent {
             live(&mut self.caps, parent)
@@ -604,9 +746,16 @@ impl Model {
             ObjectKind::Thread => {
                 // Threads: a waiting thread leaves its queue when it is
                 // destroyed. IPC: when a caller disappears the reply object
-                // becomes idle.
+                // becomes idle. Bindings: each of its bindings is undone.
                 self.unlink(id);
+                self.unbind_all(id);
                 self.threads.remove(&id);
+            }
+            ObjectKind::Frame => {
+                self.frames.remove(&id);
+            }
+            ObjectKind::ASpace => {
+                self.aspaces.remove(&id);
             }
             ObjectKind::Endpoint => {
                 let endpoint = self.endpoints.remove(&id).expect("names a live entry");
