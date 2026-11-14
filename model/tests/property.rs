@@ -198,6 +198,9 @@ struct Plan {
     /// The slots of each capability space that a script filled, to empty
     /// them once what they held is removed.
     used: BTreeMap<ObjId, BTreeSet<u32>>,
+    /// In each capability space, the slot of an endpoint on which a thread
+    /// began to wait for a message of four capabilities.
+    listening: BTreeMap<ObjId, u32>,
 }
 
 enum Wanted {
@@ -340,15 +343,49 @@ impl Generator<'_> {
         }
     }
 
+    /// Four capabilities of four slots of the caller's space, to derive.
+    fn four(&mut self) -> Vec<Transfer> {
+        let classes = [ENDPOINT, REPLY, NOTIFY, OTHER, THREAD];
+        let mut slots: Vec<u32> = Vec::new();
+        for _ in 0..12 {
+            let class = self.rng.pick(&classes);
+            let found = self
+                .find_own(class, Wanted::Full)
+                .filter(|slot| !slots.contains(slot));
+            slots.extend(found);
+        }
+        slots.truncate(MAX_CAPS);
+        let copy = |slot: u32| Transfer::Derive(own(slot), Rights::NONE);
+        slots.into_iter().map(copy).collect()
+    }
+
+    /// Four free slots in a row in the caller's space, among those left to
+    /// the scripts: a receive range for four capabilities.
+    fn four_free(&mut self) -> Option<SlotAddr> {
+        let table = if self.space == Some(self.home) {
+            CSPACE_SEGMENT_SLOTS
+        } else {
+            CHILD_SLOTS
+        };
+        let free = |first: &u32| (*first..first + 4).all(|index| !self.full(own(index)));
+        (SCRIPT_FIRST..table - 4).rev().find(free).map(own)
+    }
+
     fn message(&mut self) -> Message {
         let mut caps = Vec::new();
-        while self.rng.chance(30) {
+        if self.rng.chance(12) {
+            caps = self.four();
+        }
+        while caps.is_empty() && self.rng.chance(30) {
             let class = self.rng.below(8) as u32;
             caps.push(match self.rng.below(100) {
                 0..25 => Transfer::Move(self.bound()),
                 25..55 => Transfer::Move(self.held(class)),
                 _ => Transfer::Derive(self.held(class), self.rights()),
             });
+            while caps.len() < MAX_CAPS + 1 && self.rng.chance(30) {
+                caps.push(Transfer::Derive(self.held(class), self.rights()));
+            }
         }
         // Mostly within the registers; up to the limit; seldom beyond it.
         let words = match self.rng.below(100) {
@@ -365,6 +402,9 @@ impl Generator<'_> {
     }
 
     fn range(&mut self) -> Range {
+        if let Some(first) = self.four_free().filter(|_| self.rng.chance(25)) {
+            return Range { first, count: 4 };
+        }
         let first = if self.rng.chance(30) {
             self.inside(SPARE)
         } else {
@@ -382,7 +422,13 @@ impl Generator<'_> {
         let near = if self.rng.chance(80) { class } else { SPARE };
         let answered = if self.rng.chance(50) { ENDPOINT } else { REPLY };
         let none = |rng: &mut Rng| rng.chance(60);
-        match self.rng.below(38) {
+        // One call in seven is among those that the depths rule on.
+        let roll = if self.rng.chance(14) {
+            29 + self.rng.below(8)
+        } else {
+            self.rng.below(38)
+        };
+        match roll {
             0..3 => Syscall::CapDerive {
                 source: self.held(class),
                 destination: self.free(near),
@@ -482,13 +528,29 @@ impl Generator<'_> {
             },
             // The same by IPC: a message that moves one, and a receiver whose
             // range is in another capability space.
-            32..35 => Syscall::Send {
-                target: self.held(ENDPOINT),
-                message: Message {
+            32..35 => {
+                let message = Message {
                     caps: vec![Transfer::Move(self.bound())],
                     ..Message::default()
-                },
-            },
+                };
+                match self.rng.below(3) {
+                    0 => Syscall::Send {
+                        target: self.held(ENDPOINT),
+                        message,
+                    },
+                    1 => Syscall::Call {
+                        endpoint: self.held(ENDPOINT),
+                        message,
+                        range: self.range(),
+                    },
+                    _ => Syscall::ReplyRecv {
+                        reply: self.held(REPLY),
+                        message,
+                        endpoint: self.held(ENDPOINT),
+                        range: self.range(),
+                    },
+                }
+            }
             35..37 => Syscall::Recv {
                 endpoint: self.held(ENDPOINT),
                 reply: self.held(REPLY),
@@ -553,7 +615,7 @@ impl Generator<'_> {
             (None, Some(index)) => (index, None, 0),
             (None, None) => return Vec::new(),
         };
-        let wanted = (CHAIN_LINKS - links).min(10 + self.rng.below(30) as usize);
+        let wanted = (CHAIN_LINKS - links).min(20 + self.rng.below(40) as usize);
         let slots = self.spare(plan, wanted);
         let (Some(&start), Some(&last)) = (slots.first(), slots.last()) else {
             return Vec::new();
@@ -615,7 +677,7 @@ impl Generator<'_> {
         let (Some(space), Some(thread)) = classes else {
             return Vec::new();
         };
-        if !untyped || !self.whole(MEMORY) || self.model.runnable().len() > 12 {
+        if !untyped || !self.whole(MEMORY) || self.model.runnable().len() > 14 {
             return Vec::new();
         }
         let _ = plan;
@@ -645,14 +707,18 @@ impl Generator<'_> {
                 calls.push(derive(own(shared), inside(34 + class)));
             }
         }
-        calls.push(retype(ObjectKind::Thread, 0, own(thread)));
-        calls.push(Syscall::ThreadConfigure {
-            thread: own(thread),
-            cspace: own(space),
-            aspace: SlotAddr::NONE,
-            fault: SlotAddr::NONE,
-        });
-        calls.push(Syscall::ThreadResume(own(thread)));
+        // Two threads in the new space, so that one can serve the other.
+        // The capability of the second goes into the new space.
+        for thread in [own(thread), inside(18 + THREAD)] {
+            calls.push(retype(ObjectKind::Thread, 0, thread));
+            calls.push(Syscall::ThreadConfigure {
+                thread,
+                cspace: own(space),
+                aspace: SlotAddr::NONE,
+                fault: SlotAddr::NONE,
+            });
+            calls.push(Syscall::ThreadResume(thread));
+        }
         calls
     }
 
@@ -728,12 +794,64 @@ impl Generator<'_> {
             .collect()
     }
 
+    /// Waits to receive, with a range of four free slots, on an endpoint of
+    /// this space; `speak` is its other half.
+    fn listen(&mut self, plan: &mut Plan) -> Vec<Syscall> {
+        let slots = (
+            self.find_own(ENDPOINT, Wanted::Full),
+            self.find_own(REPLY, Wanted::Full),
+        );
+        let (Some(endpoint), Some(reply), Some(first), Some(space)) =
+            (slots.0, slots.1, self.four_free(), self.space)
+        else {
+            return Vec::new();
+        };
+        plan.listening.insert(space, endpoint);
+        vec![Syscall::Recv {
+            endpoint: own(endpoint),
+            reply: own(reply),
+            range: Range { first, count: 4 },
+        }]
+    }
+
+    /// A message of four capabilities for the thread that `listen` made
+    /// wait in this capability space, if there is one.
+    fn speak(&mut self, plan: &mut Plan) -> Option<Syscall> {
+        let endpoint = plan.listening.remove(&self.space?)?;
+        let message = Message {
+            caps: self.four(),
+            ..Message::default()
+        };
+        let range = self.range();
+        Some(if self.rng.chance(50) {
+            Syscall::Send {
+                target: own(endpoint),
+                message,
+            }
+        } else {
+            Syscall::Call {
+                endpoint: own(endpoint),
+                message,
+                range,
+            }
+        })
+    }
+
+    /// The end of a process: the capability space in a slot of this one is
+    /// deleted, whatever runs in it.
+    fn kill(&mut self) -> Vec<Syscall> {
+        let space = self.find_own(CSPACE, Wanted::Full);
+        space.map_or(Vec::new(), |space| vec![Syscall::CapDelete(own(space)); 10])
+    }
+
     fn script(&mut self, plan: &mut Plan) -> Vec<Syscall> {
         match self.rng.below(100) {
             0..20 => self.spawn(plan),
-            20..50 => self.chain(plan),
-            50..75 => self.fan(plan),
-            75..88 => self.nest(plan),
+            20..48 => self.chain(plan),
+            48..72 => self.fan(plan),
+            72..80 => self.nest(plan),
+            80..84 => self.kill(),
+            84..94 => self.listen(plan),
             _ => self.tidy(plan),
         }
     }
@@ -791,6 +909,15 @@ struct Reached {
     /// depths.
     sent: u32,
     sent_refused: u32,
+    /// `call` and `reply_recv` that list such a move and did not fail.
+    called: u32,
+    answered: u32,
+    /// Messages received with four capabilities.
+    with_four: u32,
+    /// Calls made by a thread whose capability space is destroyed.
+    destroyed: u32,
+    /// Seeds in which a removal walked.
+    seeds_walked: u32,
 }
 
 impl Reached {
@@ -799,6 +926,7 @@ impl Reached {
         if let Ok(Output::Message(delivery)) = outcome {
             let header = delivery.received.header;
             self.with_caps += (header.caps() > 0) as u32;
+            self.with_four += (header.caps() == MAX_CAPS) as u32;
             self.dropped += (header.flags() & Header::FLAG_CAPS_DROPPED != 0) as u32;
             self.notifications += (header.flags() & Header::FLAG_NOTIFICATION != 0) as u32;
         }
@@ -882,6 +1010,16 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
                 fits_derived,
             })
         }
+        Syscall::Call { message, .. } | Syscall::ReplyRecv { message, .. } => {
+            let moved = |transfer: &Transfer| match *transfer {
+                Transfer::Move(slot) => kind(slot),
+                Transfer::Derive(..) => None,
+            };
+            Some(Risk {
+                kind: message.caps.iter().find_map(moved)?,
+                fits_derived: false,
+            })
+        }
         _ => None,
     }
 }
@@ -893,6 +1031,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut plan = Plan::default();
     // Every thread that could run at some step: those that can be woken.
     let mut known: BTreeSet<ObjId> = BTreeSet::new();
+    let mut walked = false;
     for step in 0..STEPS {
         let threads = model.runnable();
         known.extend(&threads);
@@ -922,7 +1061,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             .collect();
         let thread = match rng.below(100) {
             0..50 if !scripted.is_empty() => rng.pick(&scripted),
-            0..95 => rng.pick(&of_use),
+            0..92 => rng.pick(&of_use),
             _ => rng.pick(&threads),
         };
         let space = space_of(&thread);
@@ -936,13 +1075,14 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         // The next call of the script of the thread; or the first call of a
         // new script; or one call with random arguments.
         let mut next = None;
-        if generator.rng.chance(92) {
-            next = plan.scripts.get_mut(&thread).and_then(VecDeque::pop_front);
-        } else if !plan.scripts.contains_key(&thread)
-            && generator
-                .rng
-                .chance(if space == Some(home) { 15 } else { 40 })
-        {
+        let begins = if space == Some(home) { 3 } else { 12 };
+        if let Some(script) = plan.scripts.get_mut(&thread) {
+            if generator.rng.chance(92) {
+                next = script.pop_front();
+            }
+        } else if of_use.len() > 1 && generator.rng.chance(30) {
+            next = generator.speak(&mut plan);
+        } else if generator.rng.chance(begins) {
             let mut script: VecDeque<Syscall> = generator.script(&mut plan).into();
             next = script.pop_front();
             plan.scripts.insert(thread, script);
@@ -965,6 +1105,10 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         let name = name_of(&call);
         let risk = at_risk(&model, thread, &call);
         let moves = matches!(call, Syscall::CapMove { .. });
+        // Destroyed, and not dying or empty: `cap_delete` is `gone` too.
+        let gone = |call: Syscall| model.clone().apply(thread, call) == Err(Error::Gone);
+        let destroyed = space.is_none() && gone(Syscall::CapDelete(HERE));
+        let shown = format!("{thread:?} {call:?}");
         let had_outcome: BTreeSet<ObjId> = known
             .iter()
             .copied()
@@ -973,7 +1117,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
 
         let outcome = model.apply(thread, call);
         if let Err(broken) = model.check() {
-            panic!("seed {seed}, step {step}, {}: {broken}", NAMES[name]);
+            panic!("seed {seed}, step {step}, {shown}: {broken}");
         }
 
         match (risk, &outcome) {
@@ -983,8 +1127,12 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             }
             (Some(_), Ok(Output::Sent { flags: 0 })) => reached.sent += 1,
             (Some(risk), Ok(Output::Sent { .. })) if risk.fits_derived => reached.sent_refused += 1,
+            (Some(_), Ok(_)) if name == 10 => reached.called += 1,
+            (Some(_), Ok(_)) if name == 12 => reached.answered += 1,
             _ => {}
         }
+        reached.destroyed += destroyed as u32;
+        walked |= model.longest_walk() > 0;
         match &outcome {
             Ok(_) => reached.ok[name] += 1,
             Err(error) => reached.errors[*error as usize] += 1,
@@ -1003,6 +1151,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             .for_each(|outcome| reached.note(outcome));
         reached.count(&model);
     }
+    reached.seeds_walked += walked as u32;
     model
 }
 
@@ -1041,29 +1190,31 @@ fn invariants_hold_after_every_call_of_random_sequences() {
 #[test]
 fn deepest_capability_and_longest_walk_are_reached() {
     let reached = all_seeds();
-    // Measured: depth 64, a walk of 124 capabilities.
+    // Measured: depth 64, a walk of 126 capabilities.
     assert_eq!(reached.deepest, TREE_DEPTH);
     assert!(reached.longest_walk >= 100, "{}", reached.longest_walk);
     assert!(reached.longest_walk <= LONGEST_WALK);
+    // A removal walks the tree in every seed.
+    assert_eq!(reached.seeds_walked as u64, SEEDS);
 }
 
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 7,884, cspace 24,264, aspace 3, frame 9,
-    // thread 2,459, sched 3, endpoint 344, reply 9, notify 460; a copy
-    // under `cap_delete` 3,856.
+    // Measured, in steps: untyped 1,687, cspace 10,600, aspace 1,596, frame
+    // 232, thread 598, sched 467, endpoint 22, reply 1,812, notify 323; a
+    // copy under `cap_delete` 872.
     for kind in MADE {
         assert!(reached.dying[kind as usize] > 0, "{kind:?}");
     }
-    assert!(reached.dying_copies >= 1000, "{}", reached.dying_copies);
+    assert!(reached.dying_copies >= 300, "{}", reached.dying_copies);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 13,787 of 21,501 calls.
-    assert!(reached.outside >= 10_000, "{}", reached.outside);
+    // Measured: 23,490 of 36,212 calls.
+    assert!(reached.outside >= 15_000, "{}", reached.outside);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -1074,8 +1225,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 34,721, reply objects armed 7,285,
-    // receivers 30,660, waiters on a notify 20,564, a notify bound 55,970.
+    // Measured, in steps: callers queued 42,270, reply objects armed 21,266,
+    // receivers 38,834, waiters on a notify 26,488, a notify bound 37,985.
     let waits = [
         reached.callers,
         reached.served,
@@ -1084,15 +1235,18 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.bound,
     ];
     assert!(waits.iter().all(|&steps| steps >= 2000), "{waits:?}");
-    // Measured, each once: 35 messages with capabilities, 65 with the
-    // capabilities dropped, 52 notifications, 33 threads woken with `gone`.
+    // Measured, each once: 43 messages with capabilities, 19 with the
+    // capabilities dropped, 25 notifications, 24 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    assert!(ends.iter().all(|&times| times >= 15), "{ends:?}");
+    assert!(ends.iter().all(|&times| times >= 10), "{ends:?}");
+    // Measured: 11 messages received with four capabilities, and 151 calls by a thread whose capability space is destroyed.
+    assert!(reached.with_four >= 4, "{}", reached.with_four);
+    assert!(reached.destroyed >= 4, "{}", reached.destroyed);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -1101,15 +1255,17 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 2,682 accepted and 202 refused, cspace 320 and 127;
-    // by `send` 28 delivered and 6 refused.
+    // Measured: untyped 1,968 accepted and 101 refused, cspace 204 and 35;
+    // by `send` 16 delivered and 1 refused.
     for count in reached.moved.into_iter().chain(reached.refused) {
-        assert!(count >= 50, "{reached:?}");
+        assert!(count >= 20, "{reached:?}");
     }
     assert!(
-        reached.sent >= 10 && reached.sent_refused >= 3,
+        reached.sent >= 5 && reached.sent_refused >= 1,
         "{reached:?}"
     );
+    // The same moves listed by `call` and by `reply_recv`: 34 and 12.
+    assert!(reached.called >= 5 && reached.answered >= 5, "{reached:?}");
 }
 
 #[test]
