@@ -45,10 +45,19 @@
 //! badges, reply objects); no code is copied or translated from any kernel.
 
 #![forbid(unsafe_code)]
+
 mod calls;
 mod invariants;
 mod state;
+#[cfg(test)]
+mod tests;
 
 pub use calls::{Args, Outcome, Transfer};
 pub use invariants::check_invariants;
-pub use state::*;
+pub use state::{
+    BOOT_CSPACE_SLOTS, BOOT_DEVICE_BASE, BOOT_DEVICE_BYTES, BOOT_MEMORY_BASE, BOOT_MEMORY_BYTES,
+    BOOT_SLOT_CSPACE, BOOT_SLOT_DEVICE, BOOT_SLOT_THREAD, BOOT_SLOT_UNTYPED, BOOT_THREAD, Cap,
+    CapId, Endpoint, Inbox, Incoming, Notify, Object, REVOKE_STEP, Reply, ResolvedTransfer,
+    SLOT_BYTES, SMALL_BYTES, SlotIdx, SlotState, State, THREAD_BYTES, Thread, ThreadId,
+    ThreadState, TransferMode,
+};
