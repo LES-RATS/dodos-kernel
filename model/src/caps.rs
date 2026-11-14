@@ -1,23 +1,20 @@
 //! Capabilities and objects: the derivation tree, removal, object creation.
 
 use crate::{
-    Access, CSpace, Cap, CapId, Endpoint, LONGEST_WALK, Model, Notify, ObjId, Object, Outcome,
-    Output, Place, ReplyState, Slot, Sweep, Thread, Untyped, live,
+    Access, CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place,
+    ReplyState, Slot, Sweep, Thread, Untyped, live,
 };
 use dodos_abi::{
-    CSPACE_SEGMENT_SLOTS, Error, ObjectKind, PageSize, REMOVAL_STEP, Rights, SLOT_BYTES, SlotAddr,
-    TREE_DEPTH,
+    ASPACE_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, ENDPOINT_BYTES,
+    Error, LONGEST_WALK, NOTIFY_BYTES, ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP,
+    REPLY_BYTES, Rights, SCHED_BYTES, SLOT_BYTES, SlotAddr, THREAD_BYTES, TREE_DEPTH,
 };
 
 /// Slots and addresses: one segment of a capability space.
 const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
-/// Slots and addresses: the directory of a capability space, per segment.
-const DIRECTORY_BYTES: u64 = 8;
-/// The derivation tree: the slots of dying capability spaces that one call
-/// of `cap_delete` or `cap_revoke` examines at most (provisional).
-const REMOVAL_SLOTS: usize = 128;
-/// Rules of `untyped_retype`: the greatest alignment of a kernel object.
-const PAGE: u64 = 4096;
+/// Rules of `untyped_retype`: the smallest untyped, and the greatest
+/// alignment of a kernel object.
+const PAGE: u64 = PageSize::Size4K.bytes();
 
 /// How a capability comes to a slot, for `Model::fits`.
 #[derive(Clone, Copy)]
@@ -51,15 +48,19 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
         // Slots and addresses: a non-zero multiple of 128, at most 2^20, and
         // a directory rounded up to a power of two.
         ObjectKind::CSpace => (
-            (segments * DIRECTORY_BYTES).next_power_of_two(),
-            size > 0 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into()) && size <= 1 << 20,
+            (segments * CSPACE_DIRECTORY_BYTES as u64).next_power_of_two(),
+            size > 0
+                && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into())
+                && size <= CSPACE_MAX_SLOTS.into(),
         ),
-        ObjectKind::ASpace => (PAGE, size == 0),
+        ObjectKind::ASpace => (ASPACE_BYTES as u64, size == 0),
         // Rules of `untyped_retype`: a thread in the one-core reference is
         // 1 KB.
-        ObjectKind::Thread => (1024, size == 0),
-        ObjectKind::Sched => (128, size == 0),
-        ObjectKind::Endpoint | ObjectKind::Reply | ObjectKind::Notify => (64, size == 0),
+        ObjectKind::Thread => (THREAD_BYTES as u64, size == 0),
+        ObjectKind::Sched => (SCHED_BYTES as u64, size == 0),
+        ObjectKind::Endpoint => (ENDPOINT_BYTES as u64, size == 0),
+        ObjectKind::Reply => (REPLY_BYTES as u64, size == 0),
+        ObjectKind::Notify => (NOTIFY_BYTES as u64, size == 0),
         // Order of checks, step 3: a kind that this version does not make,
         // the kinds of the groups not yet specified, is `unsupported`, after
         // the rule on device memory and before the size argument.
@@ -93,8 +94,12 @@ impl Model {
             return Err(Error::Denied);
         }
         let place = self.destination(thread, destination)?;
-        // Capabilities and objects: the new rights are a subset of the
-        // source's, checked with the plain arguments. Order of checks, step
+        // Capabilities and objects: a rights word with a bit that names no
+        // right is `invalid`, judged before the subset. The model takes
+        // `Rights`, which has no such bit: whoever decodes the raw word
+        // answers `invalid` before calling the model.
+        // The new rights are a subset of the source's, checked with the
+        // plain arguments. Order of checks, step
         // 3: in the order of the table, the rights before the badge.
         if !held.contains(rights) {
             return Err(Error::Denied);
@@ -457,9 +462,9 @@ impl Model {
     /// not counted in the 32 of a step.
     fn next_removed(&mut self, mut cap: CapId, slots: &mut usize) -> Option<CapId> {
         for walk in 1.. {
-            // The derivation tree: the walk is shorter than 192. Twice that
-            // is a walk that does not end: a fault of the model, not a
-            // state to report.
+            // The derivation tree: the walk is shorter than 192. Twice the
+            // longest is a walk that does not end: a fault of the model, not
+            // a state to report.
             assert!(
                 walk <= 2 * LONGEST_WALK,
                 "the walk of a removal does not end"

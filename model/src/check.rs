@@ -1,8 +1,9 @@
 //! The invariants of the state.
 
-use crate::{CapId, LONGEST_WALK, Model, ObjId, Output, ReplyState, Slot, Thread, Wait, Window};
+use crate::{CapId, Model, ObjId, Output, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
-    CSPACE_SEGMENT_SLOTS, Error, Header, MAX_CAPS, MAX_WORDS, ObjectKind, Rights, TREE_DEPTH,
+    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS,
+    ObjectKind, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::iter::successors;
@@ -84,8 +85,8 @@ impl Model {
     /// 21. removal ends: no capability has to be removed before itself, when
     ///     a capability goes before its parent and before the root capability
     ///     of the capability space that holds it, unless it is that one;
-    /// 24. the walk to the next capability to remove was never longer than
-    ///     192 capabilities;
+    /// 24. the walk to the next capability to remove was always shorter than
+    ///     192 capabilities: at most `LONGEST_WALK`;
     /// 28. a capability space holds only what is deeper than itself: an
     ///     untyped capability it holds is not less deep than its root
     ///     capability, and the root capability of another space is deeper.
@@ -112,7 +113,8 @@ impl Model {
     ///     capability is a child of a capability for that untyped; a start-up
     ///     object was taken from none and its root capability has no parent;
     /// 25. device memory holds only frames and child untypeds, which are
-    ///     device memory too, and no capability for any of them has `exec`;
+    ///     device memory too, and no capability for a device untyped has
+    ///     `exec` (so, with 3, none for what is made from it either);
     /// 26. every identity was given out before the next one to give; an
     ///     object is younger than the untyped it was taken from and older
     ///     than its root capability.
@@ -192,7 +194,7 @@ impl Model {
             let badged = matches!(object.kind, ObjectKind::Endpoint | ObjectKind::Notify);
             ensure(badged || cap.badge == 0, "3: badge on another kind")?;
             let device = |id: &ObjId| self.untypeds.get(id).is_some_and(|untyped| untyped.device);
-            let on_device = device(&cap.object) || object.from.is_some_and(|from| device(&from));
+            let on_device = device(&cap.object);
             let exec = cap.rights.contains(Rights::EXEC);
             ensure(!(on_device && exec), "25: exec on device memory")?;
             ensure(id.0.max(cap.object.0) < self.next_id, "26: identity")?;
@@ -269,7 +271,7 @@ impl Model {
             let whole = slots.is_multiple_of(CSPACE_SEGMENT_SLOTS as usize);
             ensure(whole && slots <= space.max as usize, "7: segments")?;
             let max = space.max != 0 && space.max.is_multiple_of(CSPACE_SEGMENT_SLOTS);
-            ensure(max && space.max <= 1 << 20, "7: maximum")?;
+            ensure(max && space.max <= CSPACE_MAX_SLOTS, "7: maximum")?;
             let grows = object.from.is_some() || slots == space.max as usize;
             ensure(grows, "7: size of the start-up space")?;
         }

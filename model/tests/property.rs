@@ -1044,7 +1044,7 @@ fn deepest_capability_and_longest_walk_are_reached() {
     // Measured: depth 64, a walk of 124 capabilities.
     assert_eq!(reached.deepest, TREE_DEPTH);
     assert!(reached.longest_walk >= 100, "{}", reached.longest_walk);
-    assert!(reached.longest_walk < LONGEST_WALK);
+    assert!(reached.longest_walk <= LONGEST_WALK);
 }
 
 #[test]

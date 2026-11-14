@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 
 /// Bytes of the ordinary untyped, in slot `START_SLOT_FIRST`.
-pub const BOOT_UNTYPED_BYTES: u64 = 64 << 20;
+pub const BOOT_UNTYPED_BYTES: u64 = 4 << 30;
 /// Bytes of the device untyped, in slot `START_SLOT_FIRST + 1`.
 pub const BOOT_DEVICE_BYTES: u64 = 1 << 20;
 
@@ -347,13 +347,9 @@ pub struct Model {
     replies: BTreeMap<ObjId, ReplyState>,
     notifies: BTreeMap<ObjId, Notify>,
     /// The derivation tree: the longest walk so far to the next capability
-    /// to remove, in capabilities. The contract bounds it by 192.
+    /// to remove, in capabilities. The contract says: shorter than 192.
     longest_walk: usize,
 }
-
-/// The derivation tree: the bound of the contract on the walk to the next
-/// capability to remove, 128 restricted capabilities then 64 ordinary ones.
-pub const LONGEST_WALK: usize = 3 * dodos_abi::TREE_DEPTH;
 
 /// Whether a call is one of the calls of the one-core reference, which
 /// `Syscall` gives a variant with arguments.
@@ -452,8 +448,8 @@ impl Model {
     }
 
     /// The derivation tree: the longest walk so far to the next capability
-    /// to remove, in capabilities; at most `LONGEST_WALK`. The kernel can be
-    /// measured against it.
+    /// to remove, in capabilities; at most `dodos_abi::LONGEST_WALK`. The
+    /// kernel can be measured against it.
     pub fn longest_walk(&self) -> usize {
         self.longest_walk
     }
@@ -523,7 +519,9 @@ impl Model {
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
             // Threads: `thread_read_regs` and `thread_write_regs` are not
             // part of the one-core reference and are `unsupported` in it, as
-            // the calls of the groups not yet specified.
+            // the calls of the groups not yet specified. Removal ends: a
+            // thread whose capability space is dying or destroyed gets
+            // `gone` from this call as from every other.
             Syscall::Other(call) => {
                 assert!(!modelled(call), "{call:?} has its own variant of `Syscall`");
                 self.space(thread, SlotAddr::NONE, Access::Read)?;
@@ -709,9 +707,10 @@ impl Model {
         Ok(Output::Done)
     }
 
-    /// Threads: resuming a thread that is not suspended succeeds; `busy` if
-    /// the thread is bound to no capability space, or to one that is
-    /// destroyed.
+    /// Threads: `busy` if the thread is bound to no capability space, or to
+    /// one that is destroyed; this `busy` comes before "already in the state
+    /// asked for", which succeeds. A thread bound to a dying space can be
+    /// resumed.
     fn thread_resume(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         self.own(target).or(Err(Error::Busy))?;
@@ -719,8 +718,9 @@ impl Model {
         Ok(Output::Done)
     }
 
-    /// Threads: suspending a suspended thread succeeds, and suspending a
-    /// thread that waits leaves its wait as it is.
+    /// Threads: suspending a suspended thread succeeds, a thread bound to no
+    /// space too, and suspending a thread that waits leaves its wait as it
+    /// is.
     fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         live(&mut self.threads, target).suspended = true;

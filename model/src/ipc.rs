@@ -27,7 +27,9 @@ impl Message {
         Ok(())
     }
 
-    /// IPC: `send`, and `grant` if the message lists capabilities.
+    /// IPC: `send`, and `grant` if the message lists capabilities, on an
+    /// endpoint as on a reply object. Order of checks, step 2: judged first,
+    /// with the number of capabilities that the header states.
     fn rights(&self) -> Rights {
         if self.caps.is_empty() {
             Rights::SEND
@@ -52,9 +54,9 @@ fn notification(word: u64) -> Delivery {
 
 /// What the kernel sets on a received message.
 fn received(header: Header, badge: u64) -> Received {
-    // CONTRACT-GAP (Messages): the receiver gets the marks and the
-    // identifier of the sender's task, which the one-core reference does
-    // not have. Here the marks are none and the task is 0.
+    // Messages: the receiver gets the marks and the identifier of the
+    // sender's task. Tasks are not modelled: the marks are none and the
+    // task is 0, and the oracle says nothing on what a kernel stamps.
     Received {
         header,
         badge,
@@ -451,6 +453,10 @@ impl Model {
 
     /// Takes a thread out of what it waits on and returns what that was. A
     /// reply object attached to the thread or armed with it becomes idle.
+    ///
+    /// IPC: the queues are doubly linked through the thread objects, so in a
+    /// kernel this is one step. The scan of the queue here is a property of
+    /// the model, whose queues are vectors.
     pub(crate) fn unlink(&mut self, thread: ObjId) -> Wait {
         let wait = std::mem::take(&mut live(&mut self.threads, thread).wait);
         let other = |&queued: &ObjId| queued != thread;

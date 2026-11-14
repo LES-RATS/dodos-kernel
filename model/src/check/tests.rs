@@ -2,7 +2,7 @@
 //! valid state, breaks one thing, and returns what `check` reports.
 
 use crate::*;
-use dodos_abi::{Header, MAX_CAPS, MAX_WORDS, TREE_DEPTH};
+use dodos_abi::{Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, TREE_DEPTH};
 
 const EP: u32 = 20;
 const RP: u32 = 21;
@@ -124,29 +124,33 @@ fn without_root(model: &mut Model, object: ObjId) {
     live(&mut model.cspaces, space).slots[index as usize] = Slot::Empty;
 }
 
-fn spoiled(spoil: impl FnOnce(&mut Model, At)) -> &'static str {
-    let mut model = state();
-    assert_eq!(model.check(), Ok(()));
-    let space = object(&model, START_SLOT_CSPACE);
-    let at = At {
+fn places(model: &Model) -> At {
+    let space = object(model, START_SLOT_CSPACE);
+    At {
         space,
-        untyped: object(&model, START_SLOT_FIRST),
-        endpoint: object(&model, EP),
-        reply: object(&model, RP),
-        notify: object(&model, NT),
-        ready: object(&model, START_SLOT_THREAD),
-        waiter: object(&model, WAITER),
-        untyped_cap: cap(&model, START_SLOT_FIRST),
-        endpoint_cap: cap(&model, EP),
-        notify_cap: cap(&model, NT),
-        copy: cap(&model, COPY),
-        later_copy: cap(&model, COPY + 1),
+        untyped: object(model, START_SLOT_FIRST),
+        endpoint: object(model, EP),
+        reply: object(model, RP),
+        notify: object(model, NT),
+        ready: object(model, START_SLOT_THREAD),
+        waiter: object(model, WAITER),
+        untyped_cap: cap(model, START_SLOT_FIRST),
+        endpoint_cap: cap(model, EP),
+        notify_cap: cap(model, NT),
+        copy: cap(model, COPY),
+        later_copy: cap(model, COPY + 1),
         nowhere: Window {
             cspace: space,
             first: 0,
             count: 0,
         },
-    };
+    }
+}
+
+fn spoiled(spoil: impl FnOnce(&mut Model, At)) -> &'static str {
+    let mut model = state();
+    assert_eq!(model.check(), Ok(()));
+    let at = places(&model);
     spoil(&mut model, at);
     model.check().expect_err("the state is spoiled")
 }
@@ -451,17 +455,30 @@ fn thread_that_is_not_suspended_and_bound_to_nothing_is_reported() {
     assert_eq!(broken, "16: bound to nothing");
 }
 
+/// Copies of a copy that is at depth 3, each derived from the one before,
+/// down to the depth given.
+fn chain_down_to(m: &mut Model, at: At, depth: usize) {
+    let mut parent = at.later_copy;
+    for index in 0..depth as u32 - 3 {
+        let rights = m.caps[&parent].rights;
+        m.derive(parent, rights, 0, (at.space, 40 + index));
+        parent = *m.caps[&parent].children.last().unwrap();
+    }
+}
+
 #[test]
-fn tree_deeper_than_64_is_reported() {
-    let broken = spoiled(|m, at| {
-        let mut parent = at.later_copy;
-        for index in 0..TREE_DEPTH as u32 {
-            let rights = m.caps[&parent].rights;
-            m.derive(parent, rights, 0, (at.space, 40 + index));
-            parent = *m.caps[&parent].children.last().unwrap();
-        }
-    });
+fn tree_of_depth_65_is_reported() {
+    let broken = spoiled(|m, at| chain_down_to(m, at, TREE_DEPTH + 1));
     assert_eq!(broken, "20: depth of the tree");
+}
+
+#[test]
+fn tree_of_depth_64_is_accepted() {
+    let mut model = state();
+    let at = places(&model);
+    chain_down_to(&mut model, at, TREE_DEPTH);
+    assert_eq!(model.check(), Ok(()));
+    assert_eq!(model.census().deepest, TREE_DEPTH);
 }
 
 #[test]
@@ -652,7 +669,7 @@ fn watermark_above_zero_while_nothing_is_live_is_reported() {
 
 #[test]
 fn walk_of_a_removal_longer_than_192_capabilities_is_reported() {
-    let broken = spoiled(|m, _| m.longest_walk = 193);
+    let broken = spoiled(|m, _| m.longest_walk = LONGEST_WALK + 1);
     assert_eq!(broken, "24: walk of a removal");
 }
 
@@ -1143,4 +1160,87 @@ fn census_counts_what_the_state_holds() {
         (census.dying, census.dying_copies),
         (vec![ObjectKind::Endpoint], 0)
     );
+}
+
+// The conditions that the fourth review found unguarded.
+
+#[test]
+fn child_that_does_not_exist_is_reported() {
+    let broken = spoiled(|m, at| {
+        live(&mut m.caps, at.later_copy)
+            .children
+            .push(CapId(u32::MAX))
+    });
+    assert_eq!(broken, "2: children name it");
+}
+
+#[test]
+fn full_slot_whose_capability_does_not_exist_is_reported() {
+    let broken =
+        spoiled(|m, at| live(&mut m.cspaces, at.space).slots[100] = Slot::Full(CapId(u32::MAX)));
+    assert_eq!(broken, "6: capability of a full slot");
+}
+
+#[test]
+fn untyped_state_without_an_object_is_reported() {
+    let broken = spoiled(|m, at| {
+        let untyped = m.untypeds[&at.untyped].clone();
+        m.untypeds.insert(
+            ObjId(u32::MAX),
+            Untyped {
+                live: 0,
+                watermark: 0,
+                ..untyped
+            },
+        );
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn thread_state_without_an_object_is_reported() {
+    let broken = spoiled(|m, _| {
+        let thread = Thread {
+            suspended: true,
+            ..Thread::default()
+        };
+        m.threads.insert(ObjId(u32::MAX), thread);
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn endpoint_state_without_an_object_is_reported() {
+    let broken = spoiled(|m, _| {
+        m.endpoints.insert(ObjId(u32::MAX), Endpoint::default());
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn notify_state_without_an_object_is_reported() {
+    let broken = spoiled(|m, _| {
+        m.notifies.insert(ObjId(u32::MAX), Notify::default());
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn capability_space_state_of_an_object_of_another_kind_is_reported() {
+    let broken = spoiled(|m, at| {
+        let space = CSpace {
+            max: 128,
+            slots: Vec::new(),
+            sweep: None,
+        };
+        m.cspaces.insert(at.endpoint, space);
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn capability_whose_identity_was_not_given_out_is_reported() {
+    // The most recent capability: every object is older.
+    let broken = spoiled(|m, at| m.next_id = at.later_copy.0);
+    assert_eq!(broken, "26: identity");
 }

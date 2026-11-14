@@ -1327,7 +1327,9 @@ fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_20() {
 fn size_argument_is_zero_for_the_other_kinds() {
     let mut k = K::new();
     for kind in [ASpace, Thread, ObjectKind::Sched, Endpoint, Reply, Notify] {
-        k.no(retype(UT, kind, 1, s(30)), Error::Invalid);
+        for size in [1, 7, 4096, u64::MAX] {
+            k.no(retype(UT, kind, size, s(30)), Error::Invalid);
+        }
         k.ok(retype(UT, kind, 0, s(30)));
         assert_eq!(k.kind(30), Ok(kind));
         k.ok(Syscall::CapDelete(s(30)));
@@ -2671,10 +2673,14 @@ fn arguments_of_reply_recv_are_checked_in_the_order_of_the_table() {
         endpoint: s(endpoint),
         range: Range { first, count },
     };
-    // The endpoint, the range, the number of its slots, then the state: the
-    // reply object is attached to another thread.
-    k.no(with(no_recv, via(read_only, 40), 5), Error::Denied);
-    k.no(with(EP, via(read_only, 40), 1), Error::Denied);
+    k.weak(NT, 33, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(NT)));
+    // The endpoint (here a dead slot, then one without `recv`), the range,
+    // the number of its slots, then the state: the reply object is attached
+    // to another thread.
+    k.no(with(33, via(read_only, 40), 5), Error::Gone);
+    k.no(with(no_recv, s(40), 5), Error::Denied);
+    k.no(with(EP, via(read_only, 40), 5), Error::Denied);
     k.no(with(EP, s(40), 5), Error::Invalid);
     k.no(with(EP, s(40), 1), Error::Busy);
 }
@@ -2864,18 +2870,23 @@ fn root_capability_of_a_space_moved_by_ipc_follows_the_depth_rule() {
 }
 
 #[test]
-fn frame_of_1_gb_pages_takes_the_number_of_pages_too() {
+fn frame_of_1_gb_pages_is_aligned_on_1_gb() {
     let mut k = K::new();
-    let huge = |size| Syscall::UntypedRetype {
+    let huge = |size, slot| Syscall::UntypedRetype {
         untyped: UT,
         kind: Frame,
         size,
         page: PageSize::Size1G,
-        destination: s(30),
+        destination: s(slot),
     };
-    k.no(huge(1), Error::NoMemory);
-    k.no(huge(0), Error::Invalid);
-    k.no(huge(1 << 34), Error::Invalid);
+    k.no(huge(0, 30), Error::Invalid);
+    k.no(huge(1 << 34, 30), Error::Invalid);
+    // The first untyped has 4 GB: an endpoint at 0, one page at 1 GB, two
+    // at 2 GB, and nothing is left.
+    k.make(Endpoint, 30);
+    k.ok(huge(1, 31));
+    k.ok(huge(2, 32));
+    k.no(retype(UT, Endpoint, 0, s(33)), Error::NoMemory);
 }
 
 #[test]
@@ -2952,7 +2963,7 @@ fn longest_walk_that_the_depth_rule_allows_is_within_the_bound() {
     // ordinary capabilities. The contract says: shorter than 192.
     k.no(Syscall::CapDelete(SPACE), Error::Again);
     assert_eq!(k.m.longest_walk(), 1 + 1 + 63 + 62 + 64);
-    assert!(k.m.longest_walk() < LONGEST_WALK);
+    assert_eq!(LONGEST_WALK, 191);
 }
 
 // The third reviews of the model: the rules that no test defended.
@@ -3462,27 +3473,31 @@ fn slot_through_a_capability_for_a_dying_space_is_gone() {
     k.no(Syscall::Signal(via(40, 5)), Error::Gone);
     k.no(retype(UT, Notify, 0, via(40, 6)), Error::Gone);
     k.no(Syscall::CapDelete(via(40, 5)), Error::Gone);
+    // A dying space does not grow.
+    k.no(grow(40), Error::Gone);
 }
 
 #[test]
-fn removal_does_not_end_while_another_thread_keeps_deriving() {
+fn removal_does_not_end_while_another_thread_derives_33_capabilities_per_step() {
     // The limit that the contract accepts, for `cap_revoke` and for
     // `cap_delete`: what is below and not yet reached still works. Slot 30
     // is a copy of the endpoint capability, slot 31 a copy of that copy.
+    // The test stops after 20 rounds; the removal would never end.
     for removal in [Syscall::CapRevoke(s(EP)), Syscall::CapDelete(s(30))] {
         let mut k = K::with_ipc();
         let other = k.spawn(29);
         k.weak(EP, 30, Rights::ALL);
         k.weak(30, 31, Rights::ALL);
-        for round in 0..4 {
-            for slot in 40..80 {
+        for round in 0..20 {
+            for slot in 40..73 {
                 let copy = derive(s(31), s(slot), Rights::ALL, 0);
                 assert_eq!(k.on(other, copy), DONE, "round {round}");
             }
-            // The 32 most recent copies go; the other thread empties the
-            // slots and starts again.
+            // The 32 most recent copies go, one is left; the other thread
+            // empties the slots and starts again.
             k.no(removal.clone(), Error::Again);
-            for slot in 40..80 {
+            assert_eq!(k.kind(40), Ok(Endpoint));
+            for slot in 40..73 {
                 assert_eq!(k.on(other, Syscall::CapDelete(s(slot))), DONE);
             }
         }
@@ -3518,4 +3533,430 @@ fn one_call_wakes_a_thread_of_a_reply_object_at_each_of_its_32_steps() {
 #[should_panic(expected = "has its own variant")]
 fn call_of_the_one_core_reference_is_not_given_as_another_call() {
     let _ = K::new().go(Syscall::Other(Call::CapInspect));
+}
+
+// The fourth reviews of the model.
+
+#[test]
+fn numbers_of_the_contract_are_those_of_the_interface() {
+    assert_eq!((MAX_WORDS, MAX_CAPS, REG_WORDS), (64, 4, 6));
+    assert_eq!((TREE_DEPTH, LONGEST_WALK), (64, 191));
+    assert_eq!((REMOVAL_STEP, REMOVAL_SLOTS), (32, 128));
+    assert_eq!((CSPACE_SEGMENT_SLOTS, CSPACE_MAX_SLOTS), (128, 1 << 20));
+    assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (32, 8));
+    assert_eq!((ENDPOINT_BYTES, REPLY_BYTES, NOTIFY_BYTES), (64, 64, 64));
+    assert_eq!((SCHED_BYTES, THREAD_BYTES, ASPACE_BYTES), (128, 1024, 4096));
+    let fixed = [
+        START_SLOT_CSPACE,
+        START_SLOT_ASPACE,
+        START_SLOT_THREAD,
+        START_SLOT_SCHED,
+        START_SLOT_DEBUG,
+        START_SLOT_FIRST,
+    ];
+    assert_eq!(fixed, [1, 2, 3, 4, 5, 16]);
+}
+
+#[test]
+fn numbers_of_the_errors_are_those_of_the_interface() {
+    let errors = [
+        Error::Ok,
+        Error::Gone,
+        Error::Again,
+        Error::Denied,
+        Error::Invalid,
+        Error::NoMemory,
+        Error::NoSlot,
+        Error::Busy,
+        Error::Budget,
+        Error::WouldWait,
+        Error::Unsupported,
+    ];
+    for (number, error) in errors.into_iter().enumerate() {
+        assert_eq!(error as usize, number);
+    }
+}
+
+#[test]
+fn bits_of_the_rights_are_those_of_the_interface() {
+    let rights = [
+        Rights::READ,
+        Rights::WRITE,
+        Rights::EXEC,
+        Rights::SEND,
+        Rights::RECV,
+        Rights::GRANT,
+        Rights::DERIVE,
+        Rights::MANAGE,
+    ];
+    for (bit, right) in rights.into_iter().enumerate() {
+        assert_eq!(right.bits(), 1 << bit);
+    }
+    assert_eq!(Rights::ALL.bits(), 0xff);
+}
+
+#[test]
+fn start_up_untypeds_have_the_sizes_that_the_model_states() {
+    let mut k = K::new();
+    assert_eq!((BOOT_UNTYPED_BYTES, BOOT_DEVICE_BYTES), (4 << 30, 1 << 20));
+    k.ok(retype(UT, Untyped, 4 << 30, s(30)));
+    k.no(retype(UT, Untyped, 4096, s(31)), Error::NoMemory);
+    k.ok(retype(DEV, Untyped, 1 << 20, s(32)));
+    k.no(retype(DEV, Untyped, 4096, s(33)), Error::NoMemory);
+}
+
+#[test]
+fn poll_returns_the_word_and_clears_it() {
+    let mut k = K::with_ipc();
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.go(Syscall::Poll(s(NT))), Ok(Output::Word(1)));
+    k.no(Syscall::Poll(s(NT)), Error::WouldWait);
+}
+
+#[test]
+fn receivers_are_served_first_in_first_out() {
+    let mut k = K::with_ipc();
+    let (first, second) = (k.spawn(40), k.spawn(41));
+    k.make(Reply, 30);
+    assert_eq!(k.on(first, recv(EP, RP, Range::NONE)), WAITS);
+    assert_eq!(k.on(second, recv(EP, 30, Range::NONE)), WAITS);
+    k.go(send(EP, msg(5, vec![]))).unwrap();
+    assert_eq!(got(k.woken(first).unwrap()), (5, 0, 0, 0));
+    assert_eq!(k.woken(second), None);
+    k.go(send(EP, msg(6, vec![]))).unwrap();
+    assert_eq!(got(k.woken(second).unwrap()), (6, 0, 0, 0));
+}
+
+#[test]
+fn two_slots_for_one_object_are_listed_in_one_message() {
+    let mut k = K::with_ipc();
+    k.weak(NT, 30, Rights::ALL);
+    let caps = vec![Transfer::Move(s(NT)), Transfer::Derive(s(30), Rights::SEND)];
+    caller_with(&mut k, caps, Range::NONE);
+    assert_eq!(got(k.go(recv(EP, RP, range(50, 2)))), (1, 0, 2, 0));
+    assert_eq!(k.inspect(s(51)), Ok((Notify, Rights::SEND, 0)));
+}
+
+#[test]
+fn slot_listed_twice_is_invalid_wherever_it_is_in_the_list() {
+    let mut k = K::with_ipc();
+    k.make(Notify, 30);
+    let copy = |slot| Transfer::Derive(s(slot), Rights::NONE);
+    k.no(
+        send(EP, msg(1, vec![copy(NT), copy(30), copy(NT)])),
+        Error::Invalid,
+    );
+    k.no(send(EP, msg(1, vec![copy(NT), copy(30)])), Error::WouldWait);
+}
+
+#[test]
+fn depth_of_a_capability_to_derive_is_judged_before_the_next_listed_slot() {
+    let mut k = K::with_ipc();
+    for slot in 30..92 {
+        k.weak(if slot == 30 { NT } else { slot - 1 }, slot, Rights::ALL);
+    }
+    k.weak(RP, 100, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(RP)));
+    // Slot 91 is at depth 64, slot 100 is dead.
+    let deep = Transfer::Derive(s(91), Rights::NONE);
+    let dead = Transfer::Move(s(100));
+    k.no(send(EP, msg(1, vec![deep, dead])), Error::Invalid);
+    k.no(send(EP, msg(1, vec![dead, deep])), Error::Gone);
+}
+
+#[test]
+fn recv_checks_the_reply_object_before_the_range() {
+    let mut k = K::with_ipc();
+    let read_only = k.weak(START_SLOT_CSPACE, 31, Rights::READ);
+    k.weak(RP, 30, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(RP)));
+    let denied = Range {
+        first: via(read_only, 40),
+        count: 1,
+    };
+    k.no(recv(EP, 30, denied), Error::Gone);
+    k.no(recv(EP, RP, denied), Error::Denied);
+}
+
+#[test]
+fn notify_bind_with_endpoint_0_needs_recv_on_the_notify_only() {
+    let mut k = K::with_ipc();
+    let recv_only = k.weak(NT, 30, Rights::RECV);
+    k.ok(bind(NT, s(EP)));
+    k.ok(bind(recv_only, SlotAddr::NONE));
+    k.ok(bind(NT, s(EP)));
+}
+
+#[test]
+fn removing_a_binding_leaves_the_word_pending() {
+    let mut k = K::with_ipc();
+    k.ok(bind(NT, s(EP)));
+    k.ok(Syscall::Signal(s(NT)));
+    k.ok(bind(NT, SlotAddr::NONE));
+    assert_eq!(k.go(Syscall::Poll(s(NT))), Ok(Output::Word(1)));
+}
+
+#[test]
+fn cap_delete_on_an_empty_slot_of_an_own_dying_space_is_invalid() {
+    let mut k = K::new();
+    let inside = space_with_a_thread(&mut k);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(
+        k.on(inside, Syscall::CapDelete(s(100))),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        k.on(inside, Syscall::CapDelete(s(128))),
+        Err(Error::Invalid)
+    );
+    assert_eq!(k.on(inside, Syscall::CapDelete(s(0))), Err(Error::Invalid));
+}
+
+#[test]
+fn sched_is_aligned_on_128_bytes() {
+    let mut k = K::new();
+    k.make(Untyped, 30);
+    // An endpoint at 0, then 31 scheduling contexts from 128: nothing left.
+    k.ok(retype(s(30), Endpoint, 0, s(40)));
+    for slot in 41..72 {
+        k.ok(retype(s(30), ObjectKind::Sched, 0, s(slot)));
+    }
+    k.no(retype(s(30), Endpoint, 0, s(72)), Error::NoMemory);
+}
+
+#[test]
+fn thread_suspend_succeeds_on_a_thread_bound_to_no_capability_space() {
+    let mut k = K::new();
+    k.make(Thread, 30);
+    k.ok(Syscall::ThreadSuspend(s(30)));
+    k.no(Syscall::ThreadResume(s(30)), Error::Busy);
+}
+
+#[test]
+fn thread_resume_is_busy_for_a_thread_that_runs_in_a_destroyed_space() {
+    let mut k = K::new();
+    k.make(CSpace, 30);
+    k.make(Thread, 31);
+    k.ok(configure(31, s(30), SlotAddr::NONE, SlotAddr::NONE));
+    k.ok(Syscall::ThreadResume(s(31)));
+    k.ok(Syscall::CapDelete(s(30)));
+    // Already in the state asked for, and `busy` comes first.
+    let other = k.m.object_at(k.t, s(31)).unwrap();
+    assert!(k.can_run(other));
+    k.no(Syscall::ThreadResume(s(31)), Error::Busy);
+}
+
+#[test]
+fn signal_on_a_notify_bound_to_a_dying_endpoint_still_wakes_its_receiver() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(70);
+    k.ok(bind(NT, s(EP)));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    dying(&mut k, EP, 30);
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(got(k.woken(server).unwrap()).3, Header::FLAG_NOTIFICATION);
+}
+
+#[test]
+fn binding_to_a_dying_endpoint_is_removed_and_the_word_goes_elsewhere() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(70);
+    k.make(Endpoint, 80);
+    k.make(Reply, 81);
+    k.ok(bind(NT, s(EP)));
+    dying(&mut k, EP, 30);
+    k.ok(Syscall::Signal(s(NT)));
+    k.ok(bind(NT, SlotAddr::NONE));
+    assert_eq!(k.on(server, recv(80, 81, Range::NONE)), WAITS);
+    k.ok(bind(NT, s(80)));
+    assert_eq!(
+        got(k.woken(server).unwrap()),
+        (0, 1, 0, Header::FLAG_NOTIFICATION)
+    );
+}
+
+#[test]
+fn thread_whose_capability_is_being_deleted_still_receives_and_arms_its_reply_object() {
+    let mut k = K::with_ipc();
+    let (server, caller) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    for slot in 50..83 {
+        k.weak(40, slot, Rights::ALL);
+    }
+    k.no(Syscall::CapDelete(s(40)), Error::Again);
+    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    assert_eq!(got(k.woken(server).unwrap()), (1, 0, 0, 0));
+    // The thread is destroyed; its caller waits on, and is answered through
+    // the reply object.
+    k.ok(Syscall::CapDelete(s(40)));
+    assert!(!k.can_run(server) && k.woken(caller).is_none());
+    assert_eq!(
+        k.go(send(RP, msg(9, vec![]))),
+        Ok(Output::Sent { flags: 0 })
+    );
+    assert_eq!(got(k.woken(caller).unwrap()), (9, 0, 0, 0));
+}
+
+#[test]
+fn copy_of_a_dying_object_is_deleted_and_not_revoked() {
+    let mut k = K::with_ipc();
+    let copy = dying(&mut k, EP, 30);
+    k.no(Syscall::CapRevoke(s(copy)), Error::Gone);
+    k.ok(Syscall::CapDelete(s(copy)));
+    assert_eq!(k.kind(copy), Err(Error::Invalid));
+}
+
+#[test]
+fn device_memory_refuses_a_kind_that_is_not_made_as_invalid_whatever_the_size() {
+    let mut k = K::new();
+    k.no(retype(DEV, ObjectKind::Timer, 5, s(30)), Error::Invalid);
+    k.no(retype(DEV, ObjectKind::Timer, 0, s(30)), Error::Invalid);
+}
+
+#[test]
+fn reply_recv_with_an_attached_reply_object_leaves_a_pending_notification() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(40);
+    k.make(Endpoint, 30);
+    assert_eq!(k.on(server, recv(30, RP, Range::NONE)), WAITS);
+    k.ok(bind(NT, s(EP)));
+    k.ok(Syscall::Signal(s(NT)));
+    k.no(reply_recv(RP, msg(1, vec![]), EP), Error::Busy);
+    assert_eq!(k.go(Syscall::Poll(s(NT))), Ok(Output::Word(1)));
+}
+
+#[test]
+fn thread_configure_is_busy_in_every_wait() {
+    let mut k = K::with_ipc();
+    let (caller, server) = (k.spawn(40), k.spawn(41));
+    k.make(Endpoint, 30);
+    k.make(Reply, 31);
+    let none = SlotAddr::NONE;
+    for slot in [40, 41] {
+        k.ok(Syscall::ThreadSuspend(s(slot)));
+        k.ok(Syscall::ThreadResume(s(slot)));
+    }
+    // Waiting to be received, waiting to receive, then waiting for a reply.
+    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    assert_eq!(k.on(server, recv(30, 31, Range::NONE)), WAITS);
+    for slot in [40, 41] {
+        k.ok(Syscall::ThreadSuspend(s(slot)));
+        k.no(configure(slot, SPACE, none, none), Error::Busy);
+    }
+    got(k.go(recv(EP, RP, Range::NONE)));
+    k.no(configure(40, SPACE, none, none), Error::Busy);
+    // Answered while suspended, it waits no more.
+    k.go(send(RP, msg(9, vec![]))).unwrap();
+    k.ok(configure(40, SPACE, none, none));
+}
+
+#[test]
+fn thread_that_waits_on_the_notify_is_served_before_a_receiver_of_the_endpoint() {
+    let mut k = K::with_ipc();
+    let (server, waiter) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(waiter, Syscall::Wait(s(NT))), WAITS);
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    // A thread waits on the notify: its word is zero, binding delivers
+    // nothing, and the next signal is for that thread.
+    k.ok(bind(NT, s(EP)));
+    assert_eq!((k.woken(waiter), k.woken(server)), (None, None));
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.woken(waiter), Some(Ok(Output::Word(1))));
+    assert_eq!(k.woken(server), None);
+}
+
+#[test]
+fn revoke_of_a_capability_crosses_the_sweep_of_a_space_that_holds_its_copies() {
+    let mut k = K::with_ipc();
+    k.make(CSpace, 30);
+    k.go(grow(30)).unwrap();
+    for index in 1..=40 {
+        k.ok(derive(s(EP), via(30, index), Rights::ALL, 0));
+    }
+    // The sweep removes 32 copies; the revocation removes the other 8,
+    // ahead of the sweep; the sweep then finds only dead slots.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.ok(Syscall::CapRevoke(s(EP)));
+    k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(k.kind(EP), Ok(Endpoint));
+}
+
+#[test]
+fn two_sweeps_and_the_removal_of_the_capability_they_hold_copies_of_all_end() {
+    let mut k = K::with_ipc();
+    for space in [30, 31] {
+        k.make(CSpace, space);
+        k.go(grow(space)).unwrap();
+        for index in 1..=40 {
+            k.ok(derive(s(EP), via(space, index), Rights::ALL, 0));
+        }
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.no(Syscall::CapDelete(s(31)), Error::Again);
+    k.ok(Syscall::CapDelete(s(EP)));
+    k.ok(Syscall::CapDelete(s(31)));
+    k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(
+        (k.kind(30), k.kind(31), k.kind(EP)),
+        (
+            Err(Error::Invalid),
+            Err(Error::Invalid),
+            Err(Error::Invalid)
+        )
+    );
+}
+
+#[test]
+fn removal_begun_inside_a_dying_space_is_finished_by_the_sweep() {
+    let mut k = K::new();
+    let inside = space_with_a_thread(&mut k);
+    for index in 60..93 {
+        k.ok(derive(via(30, 20), via(30, index), Rights::ALL, 0));
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    // The thread begins to delete the notify of slot 20, ahead of the sweep.
+    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), Err(Error::Again));
+    k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(k.kind(60), Err(Error::Gone));
+    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), Err(Error::Gone));
+}
+
+#[test]
+fn supervisor_kills_a_process_by_deleting_its_space_then_its_untyped() {
+    let mut k = K::with_ipc();
+    // The process: its untyped in slot 30, its space in slot 31 with two
+    // segments, its thread in slot 32. In its space: memory of its own in
+    // slot 16, an endpoint of its supervisor in slot 3.
+    k.ok(retype(UT, Untyped, 1 << 20, s(30)));
+    k.ok(retype(s(30), CSpace, 256, s(31)));
+    k.go(grow_from(31, s(30))).unwrap();
+    k.go(grow_from(31, s(30))).unwrap();
+    k.ok(retype(s(30), Untyped, 1 << 16, via(31, 16)));
+    k.ok(derive(s(EP), via(31, 3), Rights::ALL, 0));
+    k.ok(retype(s(30), Thread, 0, s(32)));
+    k.ok(configure(32, s(31), SlotAddr::NONE, SlotAddr::NONE));
+    k.ok(Syscall::ThreadResume(s(32)));
+    let process = k.m.object_at(k.t, s(32)).unwrap();
+    // It fills its space with 200 copies, and goes on deriving and sending.
+    for slot in 20..220 {
+        assert_eq!(k.on(process, derive(s(16), s(slot), Rights::ALL, 0)), DONE);
+    }
+    let copy = derive(s(16), s(230), Rights::ALL, 0);
+    let sent = send(3, msg(1, vec![Transfer::Derive(s(16), Rights::ALL)]));
+    assert_eq!(k.on(process, sent.clone()), Err(Error::WouldWait));
+    // From the first step of the removal of its space it gets `gone`.
+    let mut calls = 1;
+    while k.go(Syscall::CapDelete(s(31))) != DONE {
+        assert_eq!(k.on(process, copy.clone()), Err(Error::Gone));
+        assert_eq!(k.on(process, sent.clone()), Err(Error::Gone));
+        calls += 1;
+    }
+    // 203 capabilities at 32 per call are seven calls; the 255 slots of the
+    // table, at 128 per call, end one call early and make it eight.
+    assert_eq!(calls, 8);
+    assert_eq!(k.on(process, copy), Err(Error::Gone));
+    // Then its untyped, and with it its thread.
+    k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(k.m.runnable(), [k.t]);
+    k.ok(retype(UT, Untyped, 1 << 20, s(30)));
 }

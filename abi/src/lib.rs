@@ -25,9 +25,39 @@ pub const CSPACE_SEGMENT_SLOTS: u32 = 128;
 /// Capabilities removed or threads woken by one call of `cap_delete` or
 /// `cap_revoke` before it returns `Again`.
 pub const REMOVAL_STEP: usize = 32;
+/// Slots of dying capability spaces examined by one call of `cap_delete` or
+/// `cap_revoke` before it returns `Again` (The derivation tree, provisional).
+pub const REMOVAL_SLOTS: usize = 128;
 
 /// Greatest depth of the derivation tree.
 pub const TREE_DEPTH: usize = 64;
+/// Greatest length, in capabilities, of the walk that finds the next
+/// capability to remove (The derivation tree, the "Why" of the depth rule).
+/// On untyped capabilities and roots of spaces the depth never shrinks and
+/// stays equal at most once per level: two per level. Then on ordinary
+/// capabilities, one per level. The untyped at the last level cannot be on
+/// such a walk: nothing can be derived from it, so the walk would end there.
+pub const LONGEST_WALK: usize = 2 * TREE_DEPTH - 1 + TREE_DEPTH;
+
+/// Greatest maximum number of slots of a capability space (Slots and
+/// addresses, provisional).
+pub const CSPACE_MAX_SLOTS: u32 = 1 << 20;
+/// Bytes of the directory of a capability space for each segment of its
+/// maximum, before the directory is rounded up to a power of two (Slots and
+/// addresses).
+pub const CSPACE_DIRECTORY_BYTES: usize = 8;
+
+/// Bytes of an `endpoint`, of a `reply` and of a `notify` (Object sizes).
+pub const ENDPOINT_BYTES: usize = 64;
+pub const REPLY_BYTES: usize = 64;
+pub const NOTIFY_BYTES: usize = 64;
+/// Bytes of a `sched` (Object sizes).
+pub const SCHED_BYTES: usize = 128;
+/// Bytes of a `thread` in the one-core reference, without the vector state
+/// area (Capabilities and objects, rules of `untyped_retype`).
+pub const THREAD_BYTES: usize = 1024;
+/// Bytes of the root table of an `aspace` (Object sizes).
+pub const ASPACE_BYTES: usize = 4096;
 
 /// Fixed slots of the first process. Slot 0 of every capability space is
 /// never used; the other start-up capabilities begin at `START_SLOT_FIRST`.
@@ -93,7 +123,8 @@ pub enum Error {
     Invalid = 4,
     /// The supplied untyped memory is exhausted.
     NoMemory = 5,
-    /// No free capability slot.
+    /// The destination slot is not empty, or the capability space is at its
+    /// maximum.
     NoSlot = 6,
     /// The object is in a state that forbids the call.
     Busy = 7,
@@ -308,7 +339,10 @@ impl Header {
         ))
     }
 
-    /// Checks a raw word received from an untrusted caller.
+    /// Checks the limits of a raw word: the number of words and of
+    /// capabilities. It accepts every flag, since the kernel sets flags on
+    /// the receiver's side; a header given by a sender must also have no
+    /// flag set (`flags() == 0`), which the caller of this function checks.
     pub const fn from_raw(raw: u64) -> Result<Self, Error> {
         let h = Self(raw);
         if h.words() > MAX_WORDS || h.caps() > MAX_CAPS {
