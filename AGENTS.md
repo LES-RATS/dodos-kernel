@@ -22,6 +22,9 @@ bounded loops, no recursion, sizes asserted at compile time. One exception:
 
 - English for code, comments and commits.
 - A test comes with the code it guards, and fails without it.
+- Update `plan/progress.md` in the documentation repository in the same
+  change as the work: the colour of the box, the "Now" table, the date. Moving
+  a box is part of "done".
 - Every system call has a bounded duration; no kernel heap; no blocking in the
   kernel.
 
