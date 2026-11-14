@@ -20,6 +20,59 @@ pub const MAX_WORDS: usize = 64;
 pub const MAX_CAPS: usize = 4;
 /// Bytes of one capability slot.
 pub const SLOT_BYTES: usize = 32;
+/// Slots added by one `cspace_grow`: one 4 KB segment.
+pub const CSPACE_SEGMENT_SLOTS: u32 = 128;
+/// Capabilities removed or threads woken by one call of `cap_delete` or
+/// `cap_revoke` before it returns `Again`.
+pub const REMOVAL_STEP: usize = 32;
+
+/// Fixed slots of the first process. Slot 0 of every capability space is
+/// never used; the other start-up capabilities begin at `START_SLOT_FIRST`.
+pub const START_SLOT_CSPACE: u32 = 1;
+pub const START_SLOT_ASPACE: u32 = 2;
+pub const START_SLOT_THREAD: u32 = 3;
+pub const START_SLOT_SCHED: u32 = 4;
+pub const START_SLOT_DEBUG: u32 = 5;
+pub const START_SLOT_FIRST: u32 = 16;
+
+/// Address of a capability slot: an index, reached directly in the caller's
+/// own capability space (`via` = 0) or through one `cspace` capability held
+/// at index `via` of the caller's own space. Address 0 is "no capability".
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotAddr(u64);
+
+impl SlotAddr {
+    pub const NONE: Self = Self(0);
+
+    pub const fn own(index: u32) -> Self {
+        Self(index as u64)
+    }
+
+    pub const fn through(via: u32, index: u32) -> Self {
+        Self((via as u64) << 32 | index as u64)
+    }
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn index(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub const fn via(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+}
 
 /// Result of a system call. The set is fixed; every caller handles `Gone` and
 /// `Again`.
@@ -109,6 +162,15 @@ impl Marks {
     pub const NONE: Self = Self(0);
     pub const PRIVATE: Self = Self(1 << 0);
     pub const UNTRUSTED: Self = Self(1 << 1);
+    const KNOWN: u64 = 0b11;
+
+    /// `Invalid` if a reserved bit is set.
+    pub const fn from_bits(bits: u64) -> Result<Self, Error> {
+        if bits & !Self::KNOWN != 0 {
+            return Err(Error::Invalid);
+        }
+        Ok(Self(bits))
+    }
 
     pub const fn bits(self) -> u64 {
         self.0
@@ -171,6 +233,7 @@ pub enum Call {
     CapDelete,
     CapRevoke,
     CapInspect,
+    CSpaceGrow,
     UntypedRetype,
     ASpaceMap,
     ASpaceUnmap,
@@ -182,6 +245,7 @@ pub enum Call {
     Signal,
     Wait,
     Poll,
+    NotifyBind,
     ThreadConfigure,
     ThreadReadRegs,
     ThreadWriteRegs,
@@ -221,6 +285,9 @@ impl Header {
     /// Set by the kernel on the receiver's side when a capability transfer
     /// was dropped for lack of slots.
     pub const FLAG_CAPS_DROPPED: u32 = 1 << 0;
+    /// Set by the kernel when `recv` returns a notification of the bound
+    /// `notify` instead of a message; the badge field then holds the word.
+    pub const FLAG_NOTIFICATION: u32 = 1 << 1;
     const FLAG_BITS: u32 = 22;
 
     /// `Invalid` if the message is larger than the interface allows.
@@ -356,6 +423,24 @@ mod tests {
         let m = Marks::NONE.union(Marks::UNTRUSTED);
         assert!(m.union(Marks::PRIVATE).contains(m));
         assert!(!m.contains(Marks::PRIVATE));
+    }
+
+    #[test]
+    fn marks_reject_reserved_bits() {
+        assert_eq!(
+            Marks::from_bits(0b11),
+            Ok(Marks::PRIVATE.union(Marks::UNTRUSTED))
+        );
+        assert_eq!(Marks::from_bits(1 << 2), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn slot_address_splits_into_via_and_index() {
+        let a = SlotAddr::through(7, 9);
+        assert_eq!((a.via(), a.index()), (7, 9));
+        assert_eq!(SlotAddr::own(9).via(), 0);
+        assert!(SlotAddr::NONE.is_none());
+        assert!(!SlotAddr::own(START_SLOT_CSPACE).is_none());
     }
 
     #[test]
