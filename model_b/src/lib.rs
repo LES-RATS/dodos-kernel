@@ -46,7 +46,9 @@
 
 #![forbid(unsafe_code)]
 mod calls;
+mod invariants;
 mod state;
 
 pub use calls::{Args, Outcome, Transfer};
+pub use invariants::check_invariants;
 pub use state::*;
