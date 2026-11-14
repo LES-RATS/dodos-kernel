@@ -470,8 +470,8 @@ impl Model {
         Some(found)
     }
 
-    /// Takes a thread out of what it waits on and returns what that was. A
-    /// reply object attached to the thread or armed with it becomes idle.
+    /// Takes a thread out of what it waits on. A reply object attached to
+    /// the thread or armed with it becomes idle.
     ///
     /// IPC: the queues are doubly linked through the thread objects, so in a
     /// kernel this is one step. The scan of the queue here is a property of
