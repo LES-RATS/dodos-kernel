@@ -1,7 +1,9 @@
 //! The invariants of the state.
 
-use crate::{CapId, Model, ObjId, Object, ReplyState, Slot, Thread, Wait};
-use dodos_abi::{CSPACE_SEGMENT_SLOTS, ObjectKind};
+use crate::{CapId, Model, ObjId, ReplyState, Slot, Thread, Wait};
+use dodos_abi::{CSPACE_SEGMENT_SLOTS, ObjectKind, TREE_DEPTH};
+use std::collections::BTreeMap;
+use std::iter::successors;
 use std::mem::discriminant;
 
 /// `Err` names the invariant that fails, by its number in `Model::check`.
@@ -23,12 +25,16 @@ impl Model {
     ///    its badge if it has one (a root capability is a child of an untyped
     ///    capability and has every right, whatever the rights of that one);
     /// 4. a capability is the root capability of its object, or was derived
-    ///    from a capability for the same object.
+    ///    from a capability for the same object;
+    /// 20. the tree is at most `TREE_DEPTH` deep;
+    /// 21. removal ends: no capability has to be removed before itself, when
+    ///     a capability goes before its parent and before the root capability
+    ///     of the capability space that holds it, unless it is that one.
     ///
     /// Slots:
     /// 5. slot 0 of every capability space is empty;
-    /// 6. every full slot names a live capability that names that slot, and
-    ///    every capability that names a slot is in it;
+    /// 6. every capability is in a slot: the slot it names is full and names
+    ///    it, and every full slot names a live capability that names it;
     /// 7. a capability space has a whole number of segments, at most its
     ///    maximum.
     ///
@@ -52,7 +58,8 @@ impl Model {
     ///     to a thread if and only if that thread waits to receive with it,
     ///     armed with a thread if and only if that thread waits for a reply
     ///     through it;
-    /// 16. a thread that waits has no outcome yet;
+    /// 16. a thread that waits has no outcome yet, and a thread that is not
+    ///     suspended is bound to a capability space;
     /// 17. a notify names its endpoint if and only if the endpoint names it.
     ///
     /// Memory:
@@ -62,6 +69,7 @@ impl Model {
     ///     cspace segments taken from it.
     pub fn check(&self) -> Check {
         self.check_tree()?;
+        self.check_removal()?;
         self.check_slots()?;
         self.check_objects()?;
         self.check_waits()?;
@@ -90,13 +98,43 @@ impl Model {
             ensure(cap.children.iter().all(named), "2: children name it")?;
             ensure(cap.children.is_sorted(), "2: order of derivation")?;
             ensure(object.root == id || derived, "4: root or derivation")?;
-            if let Some((space, index)) = cap.place {
-                let slots = self.cspaces.get(&space).map(|space| &space.slots);
-                let slot = slots.and_then(|slots| slots.get(index as usize));
-                ensure(slot == Some(&Slot::Full(id)), "6: slot of a capability")?;
-            }
+            let (space, index) = cap.place;
+            let slots = self.cspaces.get(&space).map(|space| &space.slots);
+            let slot = slots.and_then(|slots| slots.get(index as usize));
+            ensure(slot == Some(&Slot::Full(id)), "6: slot of a capability")?;
+            let depth = successors(Some(id), |cap| self.caps.get(cap)?.parent).count();
+            ensure(depth <= TREE_DEPTH, "20: depth of the tree")?;
         }
         Ok(())
+    }
+
+    /// Invariant 21: takes away, again and again, a capability that nothing
+    /// left has to go before. What cannot be taken away is in a cycle.
+    fn check_removal(&self) -> Check {
+        let after = |id: &CapId| {
+            let cap = &self.caps[id];
+            let holder = self.objects.get(&cap.place.0).map(|space| space.root);
+            let holder = holder.filter(|holder| holder != id);
+            cap.parent.into_iter().chain(holder)
+        };
+        let mut before: BTreeMap<CapId, usize> = BTreeMap::new();
+        for later in self.caps.keys().flat_map(after) {
+            *before.entry(later).or_default() += 1;
+        }
+        let first = |id: &&CapId| !before.contains_key(id);
+        let mut free: Vec<CapId> = self.caps.keys().filter(first).copied().collect();
+        let mut left = self.caps.len();
+        while let Some(id) = free.pop() {
+            left -= 1;
+            for later in after(&id).filter(|later| self.caps.contains_key(later)) {
+                let count = before.entry(later).or_default();
+                *count -= 1;
+                if *count == 0 {
+                    free.push(later);
+                }
+            }
+        }
+        ensure(left == 0, "21: removal that never ends")
     }
 
     fn check_slots(&self) -> Check {
@@ -105,7 +143,7 @@ impl Model {
             ensure(first.is_none_or(|slot| *slot == Slot::Empty), "5: slot 0")?;
             for (index, slot) in space.slots.iter().enumerate() {
                 if let Slot::Full(cap) = slot {
-                    let place = self.caps.get(cap).and_then(|cap| cap.place);
+                    let place = self.caps.get(cap).map(|cap| cap.place);
                     let here = place == Some((id, index as u32));
                     ensure(here, "6: capability of a full slot")?;
                 }
@@ -222,20 +260,27 @@ impl Model {
             };
             ensure(agrees, "15: reply object of a thread")?;
             let ready = thread.wait == Wait::None;
-            ensure(
-                ready || thread.outcome.is_none(),
-                "16: outcome while waiting",
-            )?;
+            let waited = ready || thread.outcome.is_none();
+            ensure(waited, "16: outcome while waiting")?;
+            let bound = thread.suspended || thread.cspace.is_some();
+            ensure(bound, "16: running while bound to nothing")?;
         }
         Ok(())
     }
 
     fn check_memory(&self) -> Check {
         for (&id, untyped) in &self.untypeds {
-            let taken = |from: &&Object| from.from == Some(id);
-            let segments = self.cspaces.values().flat_map(|space| &space.segments);
-            let live = self.objects.values().filter(taken).count()
-                + segments.filter(|&&from| from == id).count();
+            // An object counts once, and once more for each segment of a
+            // capability space.
+            let segments = |object: &ObjId| match self.cspaces.get(object) {
+                Some(space) => space.slots.len() / CSPACE_SEGMENT_SLOTS as usize,
+                None => 0,
+            };
+            let taken = self
+                .objects
+                .iter()
+                .filter(|(_, object)| object.from == Some(id));
+            let live: usize = taken.map(|(object, _)| 1 + segments(object)).sum();
             ensure(untyped.live as usize == live, "19: live count")?;
             ensure(untyped.watermark <= untyped.bytes, "18: watermark within")?;
             let zero = (untyped.watermark == 0) == (untyped.live == 0);

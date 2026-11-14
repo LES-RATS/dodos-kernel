@@ -27,8 +27,6 @@ use dodos_abi::{
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 
-/// Maximum number of slots of the first capability space.
-pub const BOOT_CSPACE_MAX: u32 = 8 * CSPACE_SEGMENT_SLOTS;
 /// Bytes of the ordinary untyped, in slot `START_SLOT_FIRST`.
 pub const BOOT_UNTYPED_BYTES: u64 = 64 << 20;
 /// Bytes of the device untyped, in slot `START_SLOT_FIRST + 1`.
@@ -193,8 +191,9 @@ struct Cap {
     parent: Option<CapId>,
     /// In the order of derivation, the most recent last.
     children: Vec<CapId>,
-    /// `None` only in the case described at `Model::swept`.
-    place: Option<Place>,
+    place: Place,
+    /// The derivation tree: set by the first step of `cap_delete`.
+    dying: bool,
 }
 
 /// What every object has. The state of an object that has one is in the map
@@ -213,7 +212,8 @@ struct Untyped {
     bytes: u64,
     device: bool,
     watermark: u64,
-    /// Objects and cspace segments taken from it and not yet destroyed.
+    /// Objects, and segments of capability spaces, taken from it and not
+    /// yet destroyed.
     live: u32,
 }
 
@@ -221,13 +221,12 @@ struct Untyped {
 struct CSpace {
     max: u32,
     slots: Vec<Slot>,
-    /// The untyped each segment added by `cspace_grow` came from.
-    segments: Vec<ObjId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct Thread {
-    /// A capability space that no longer exists is one that was destroyed.
+    /// `None` until `thread_configure`. A capability space that no longer
+    /// exists is one that was destroyed.
     cspace: Option<ObjId>,
     suspended: bool,
     wait: Wait,
@@ -258,14 +257,15 @@ enum Wait {
     Notify(ObjId),
 }
 
-/// A message on its way: what was checked when the call was made.
+/// A message on its way. Transfer of capabilities: the kernel remembers the
+/// slots that the sender listed, not what they held.
 #[derive(Clone, Debug, PartialEq)]
 struct Parcel {
     label: u32,
     words: Vec<u64>,
     badge: u64,
-    /// Each capability with the rights to derive, or `None` to move it.
-    caps: Vec<(CapId, Option<Rights>)>,
+    sender: ObjId,
+    caps: Vec<Transfer>,
 }
 
 /// A receive range, resolved when the call was made.
@@ -337,28 +337,31 @@ impl Model {
     /// then one ordinary untyped and one device untyped.
     pub fn boot() -> (Self, ObjId) {
         let mut model = Self::default();
-        let space_cap = model.create(
-            ObjectKind::CSpace,
-            BOOT_CSPACE_MAX.into(),
-            None,
-            Rights::ALL,
-        );
-        let space = model.caps[&space_cap].object;
-        live(&mut model.cspaces, space).slots = vec![Slot::Empty; CSPACE_SEGMENT_SLOTS as usize];
-        model.place(space_cap, (space, START_SLOT_CSPACE));
-        let mut add = |kind, size, index| {
-            let cap = model.create(kind, size, None, Rights::ALL);
-            model.place(cap, (space, index));
-            (cap, model.caps[&cap].object)
+        let space = ObjId(model.next_id);
+        let mut add = |kind, size, index, rights| {
+            let cap = model.create(kind, size, None, rights, (space, index));
+            model.caps[&cap].object
         };
-        add(ObjectKind::ASpace, 0, START_SLOT_ASPACE);
-        let (_, thread) = add(ObjectKind::Thread, 0, START_SLOT_THREAD);
-        add(ObjectKind::Sched, 0, START_SLOT_SCHED);
-        add(ObjectKind::Debug, 0, START_SLOT_DEBUG);
-        add(ObjectKind::Untyped, BOOT_UNTYPED_BYTES, START_SLOT_FIRST);
-        let (cap, device) = add(ObjectKind::Untyped, BOOT_DEVICE_BYTES, START_SLOT_FIRST + 1);
-        // Capabilities and objects: never `exec` on device memory.
-        live(&mut model.caps, cap).rights = caps::NO_EXEC;
+        let (all, segment) = (Rights::ALL, CSPACE_SEGMENT_SLOTS);
+        add(ObjectKind::CSpace, segment.into(), START_SLOT_CSPACE, all);
+        add(ObjectKind::ASpace, 0, START_SLOT_ASPACE, all);
+        let thread = add(ObjectKind::Thread, 0, START_SLOT_THREAD, all);
+        add(ObjectKind::Sched, 0, START_SLOT_SCHED, all);
+        add(ObjectKind::Debug, 0, START_SLOT_DEBUG, all);
+        add(
+            ObjectKind::Untyped,
+            BOOT_UNTYPED_BYTES,
+            START_SLOT_FIRST,
+            all,
+        );
+        // Rules of `untyped_retype`: never `exec` on device memory.
+        let no_exec = all.without(Rights::EXEC);
+        let device = add(
+            ObjectKind::Untyped,
+            BOOT_DEVICE_BYTES,
+            START_SLOT_FIRST + 1,
+            no_exec,
+        );
         live(&mut model.untypeds, device).device = true;
         let first = live(&mut model.threads, thread);
         (first.cspace, first.suspended) = (Some(space), false);
@@ -382,8 +385,7 @@ impl Model {
     /// The object that a slot address names for `thread`, if any: a way to
     /// find the identity of a thread that a call created.
     pub fn object_at(&self, thread: ObjId, slot: SlotAddr) -> Option<ObjId> {
-        let own = self.threads.get(&thread)?.cspace?;
-        self.cspaces.get(&own)?;
+        self.threads.get(&thread)?;
         let cap = self.cap(thread, slot, Access::Read).ok()?;
         Some(self.caps[&cap].object)
     }
@@ -392,12 +394,6 @@ impl Model {
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
         live(&mut self.threads, thread).outcome = None;
-        // The derivation tree: a thread whose capability space is destroyed
-        // gets `gone` from every call.
-        let own = self.threads[&thread].cspace;
-        if own.is_some_and(|space| !self.cspaces.contains_key(&space)) {
-            return Err(Error::Gone);
-        }
         match call {
             Syscall::CapDerive {
                 source,
@@ -449,7 +445,10 @@ impl Model {
             Syscall::Wait(notify) => self.wait(thread, notify, ipc::IfZero::Wait),
             Syscall::Poll(notify) => self.wait(thread, notify, ipc::IfZero::WouldWait),
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
-            Syscall::Other(_) => Err(Error::Unsupported),
+            Syscall::Other(_) => {
+                self.space(thread, SlotAddr::NONE, Access::Read)?;
+                Err(Error::Unsupported)
+            }
         }
     }
 
@@ -460,9 +459,13 @@ impl Model {
     /// Slots and addresses: the capability space that an address is in.
     /// Through a `cspace` capability, `access` says which right is needed.
     fn space(&self, thread: ObjId, addr: SlotAddr, access: Access) -> Result<ObjId, Error> {
-        // CONTRACT-GAP (Threads): a thread can be resumed while it is bound
-        // to no capability space. Every slot is then out of range.
-        let own = self.threads[&thread].cspace.ok_or(Error::Invalid)?;
+        // The derivation tree: a thread whose capability space is destroyed
+        // gets `gone` from every call. (Threads: a thread that runs is bound
+        // to a capability space.)
+        let bound = self.threads[&thread].cspace;
+        let own = bound
+            .filter(|own| self.cspaces.contains_key(own))
+            .ok_or(Error::Gone)?;
         if addr.via() == 0 {
             return Ok(own);
         }
@@ -475,9 +478,11 @@ impl Model {
     }
 
     /// Order of checks, steps 1 and 2, the slot: `invalid` if empty or out
-    /// of range, `gone` if dead.
+    /// of range, `gone` if dead. The derivation tree: `gone` if the
+    /// capability is dying.
     fn full(&self, cspace: ObjId, index: u32) -> Result<CapId, Error> {
         match self.cspaces[&cspace].slots.get(index as usize) {
+            Some(Slot::Full(cap)) if self.caps[cap].dying => Err(Error::Gone),
             Some(&Slot::Full(cap)) => Ok(cap),
             Some(Slot::Dead) => Err(Error::Gone),
             Some(Slot::Empty) | None => Err(Error::Invalid),
@@ -540,12 +545,10 @@ impl Model {
     }
 
     /// Order of checks, step 2: a slot in which the call places a
-    /// capability.
+    /// capability. Slots and addresses: slot 0 or beyond the table is
+    /// `invalid`.
     fn destination(&self, thread: ObjId, addr: SlotAddr) -> Result<Place, Error> {
         let space = self.space(thread, addr, Access::Write)?;
-        // CONTRACT-GAP (Order of checks): the contract gives no error for a
-        // destination that is slot 0 or out of range. It is `invalid`, as
-        // for a capability argument.
         if addr.index() == 0 || addr.index() as usize >= self.cspaces[&space].slots.len() {
             return Err(Error::Invalid);
         }
@@ -563,12 +566,16 @@ impl Model {
     /// Order of checks, step 2, and Transfer of capabilities: the receive
     /// range, resolved when the call is made. Whether its slots exist and are empty is checked at delivery.
     fn window(&self, thread: ObjId, range: Range) -> Result<Window, Error> {
-        // CONTRACT-GAP (Transfer of capabilities): the contract does not say
-        // whether the address of an empty range is looked at. It is checked
-        // like any other.
+        // Transfer of capabilities: the address of an empty range is not
+        // looked at.
+        let first = if range.count == 0 {
+            SlotAddr::NONE
+        } else {
+            range.first
+        };
         Ok(Window {
-            cspace: self.space(thread, range.first, Access::Write)?,
-            first: range.first.index(),
+            cspace: self.space(thread, first, Access::Write)?,
+            first: first.index(),
             count: range.count,
         })
     }
@@ -605,22 +612,22 @@ impl Model {
         Ok(Output::Done)
     }
 
-    /// Threads: resuming a thread that is not suspended succeeds.
+    /// Threads: resuming a thread that is not suspended succeeds; `busy` if
+    /// the thread is bound to no capability space.
     fn thread_resume(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
-        *self.suspension(thread, target)? = false;
+        let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
+        let target = live(&mut self.threads, target);
+        target.cspace.ok_or(Error::Busy)?;
+        target.suspended = false;
         Ok(Output::Done)
     }
 
     /// Threads: suspending a suspended thread succeeds, and suspending a
     /// thread that waits leaves its wait as it is.
     fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
-        *self.suspension(thread, target)? = true;
-        Ok(Output::Done)
-    }
-
-    fn suspension(&mut self, thread: ObjId, target: SlotAddr) -> Result<&mut bool, Error> {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        Ok(&mut live(&mut self.threads, target).suspended)
+        live(&mut self.threads, target).suspended = true;
+        Ok(Output::Done)
     }
 }
 

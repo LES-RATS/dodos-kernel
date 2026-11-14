@@ -2,6 +2,7 @@
 //! valid state, breaks one thing, and returns what `check` reports.
 
 use crate::*;
+use dodos_abi::TREE_DEPTH;
 
 const EP: u32 = 20;
 const RP: u32 = 21;
@@ -119,7 +120,7 @@ fn orphan(model: &mut Model, cap: CapId) {
 fn without_root(model: &mut Model, object: ObjId) {
     let root = model.objects[&object].root;
     orphan(model, root);
-    let (space, index) = model.caps.remove(&root).unwrap().place.unwrap();
+    let (space, index) = model.caps.remove(&root).unwrap().place;
     live(&mut model.cspaces, space).slots[index as usize] = Slot::Empty;
 }
 
@@ -223,7 +224,7 @@ fn dead_slot_0_is_reported() {
 fn full_slot_0_is_reported() {
     let broken = spoiled(|m, at| {
         live(&mut m.cspaces, at.space).slots[0] = Slot::Full(at.copy);
-        live(&mut m.caps, at.copy).place = Some((at.space, 0));
+        live(&mut m.caps, at.copy).place = (at.space, 0);
         live(&mut m.cspaces, at.space).slots[COPY as usize] = Slot::Empty;
     });
     assert_eq!(broken, "5: slot 0");
@@ -231,7 +232,7 @@ fn full_slot_0_is_reported() {
 
 #[test]
 fn capability_that_is_not_in_the_slot_it_names_is_reported() {
-    let broken = spoiled(|m, at| live(&mut m.caps, at.copy).place = Some((at.space, 100)));
+    let broken = spoiled(|m, at| live(&mut m.caps, at.copy).place = (at.space, 100));
     assert_eq!(broken, "6: slot of a capability");
 }
 
@@ -439,4 +440,41 @@ fn watermark_at_zero_while_something_is_live_is_reported() {
 fn live_count_that_is_not_the_number_of_live_objects_is_reported() {
     let broken = spoiled(|m, at| live(&mut m.untypeds, at.untyped).live += 1);
     assert_eq!(broken, "19: live count");
+}
+
+#[test]
+fn thread_that_is_not_suspended_and_bound_to_nothing_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.ready).cspace = None);
+    assert_eq!(broken, "16: running while bound to nothing");
+}
+
+#[test]
+fn tree_deeper_than_64_is_reported() {
+    let broken = spoiled(|m, at| {
+        let mut parent = at.later_copy;
+        for index in 0..TREE_DEPTH as u32 {
+            let rights = m.caps[&parent].rights;
+            m.derive(parent, rights, 0, (at.space, 40 + index));
+            parent = *m.caps[&parent].children.last().unwrap();
+        }
+    });
+    assert_eq!(broken, "20: depth of the tree");
+}
+
+#[test]
+fn capability_held_in_a_capability_space_that_descends_from_it_is_reported() {
+    let broken = spoiled(|m, at| {
+        let inner = m.create(
+            ObjectKind::CSpace,
+            128,
+            Some(at.untyped_cap),
+            Rights::ALL,
+            (at.space, 40),
+        );
+        let inner = m.caps[&inner].object;
+        live(&mut m.cspaces, inner).slots = vec![Slot::Empty; 128];
+        live(&mut m.untypeds, at.untyped).live += 2;
+        m.place(at.untyped_cap, (inner, 1));
+    });
+    assert_eq!(broken, "21: removal that never ends");
 }
