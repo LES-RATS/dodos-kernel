@@ -1,7 +1,7 @@
 //! The invariants of the state.
 
 use crate::{CapId, Model, ObjId, ReplyState, Slot, Thread, Wait};
-use dodos_abi::{CSPACE_SEGMENT_SLOTS, ObjectKind, TREE_DEPTH};
+use dodos_abi::{CSPACE_SEGMENT_SLOTS, ObjectKind, Rights, TREE_DEPTH};
 use std::collections::BTreeMap;
 use std::iter::successors;
 use std::mem::discriminant;
@@ -22,14 +22,17 @@ impl Model {
     /// 2. a capability's children exist, name it as their parent, and are in
     ///    the order of derivation;
     /// 3. a capability derived from another has a subset of its rights, and
-    ///    its badge if it has one (a root capability is a child of an untyped
-    ///    capability and has every right, whatever the rights of that one);
+    ///    its badge if it has one; a root capability has every right, but
+    ///    for `exec`, and no badge; only an endpoint or a notify capability
+    ///    has a badge;
     /// 4. a capability is the root capability of its object, or was derived
     ///    from a capability for the same object;
     /// 20. the tree is at most `TREE_DEPTH` deep;
     /// 21. removal ends: no capability has to be removed before itself, when
     ///     a capability goes before its parent and before the root capability
-    ///     of the capability space that holds it, unless it is that one.
+    ///     of the capability space that holds it, unless it is that one;
+    /// 24. the walk to the next capability to remove was never longer than
+    ///     192 capabilities.
     ///
     /// Slots:
     /// 5. slot 0 of every capability space is empty;
@@ -45,7 +48,11 @@ impl Model {
     /// 10. an object has state of its kind, and no state is left without its
     ///     object;
     /// 11. an object taken from an untyped names a live untyped, and its root
-    ///     capability is a child of a capability for that untyped.
+    ///     capability is a child of a capability for that untyped; a start-up
+    ///     object was taken from none and its root capability has no parent;
+    /// 25. device memory holds only frames and child untypeds, which are
+    ///     device memory too, and no capability for any of them has `exec`;
+    /// 26. every identity was given out before the next one to give.
     ///
     /// Waiting:
     /// 12. every thread in the queue of an endpoint waits on that endpoint,
@@ -103,6 +110,15 @@ impl Model {
             ensure(cap.children.iter().all(named), "2: children name it")?;
             ensure(cap.children.is_sorted(), "2: order of derivation")?;
             ensure(object.root == id || derived, "4: root or derivation")?;
+            let every = cap.rights.contains(Rights::ALL.without(Rights::EXEC));
+            ensure(derived || every && cap.badge == 0, "3: root capability")?;
+            let badged = matches!(object.kind, ObjectKind::Endpoint | ObjectKind::Notify);
+            ensure(badged || cap.badge == 0, "3: badge on another kind")?;
+            let device = |id: &ObjId| self.untypeds.get(id).is_some_and(|untyped| untyped.device);
+            let on_device = device(&cap.object) || object.from.is_some_and(|from| device(&from));
+            let exec = cap.rights.contains(Rights::EXEC);
+            ensure(!(on_device && exec), "25: exec on device memory")?;
+            ensure(id.0.max(cap.object.0) < self.next_id, "26: identity")?;
             let (space, index) = cap.place;
             let slots = self.cspaces.get(&space).map(|space| &space.slots);
             let slot = slots.and_then(|slots| slots.get(index as usize));
@@ -139,7 +155,8 @@ impl Model {
                 }
             }
         }
-        ensure(left == 0, "21: removal that never ends")
+        ensure(left == 0, "21: removal that never ends")?;
+        ensure(self.longest_walk <= 3 * TREE_DEPTH, "24: walk of a removal")
     }
 
     fn check_slots(&self) -> Check {
@@ -163,7 +180,7 @@ impl Model {
             ensure(shrinks, "23: new capability in a dying space")?;
             let slots = space.slots.len();
             let whole = slots.is_multiple_of(CSPACE_SEGMENT_SLOTS as usize);
-            ensure(whole && slots <= space.max as usize, "7: segments")?;
+            ensure(whole && slots as u64 <= space.max, "7: segments")?;
         }
         Ok(())
     }
@@ -190,6 +207,12 @@ impl Model {
                 let parent = root.parent.and_then(|parent| self.caps.get(&parent));
                 let child = parent.is_some_and(|parent| parent.object == from);
                 ensure(child, "11: root capability is a child of the untyped's")?;
+                let plain = matches!(object.kind, ObjectKind::Frame | ObjectKind::Untyped);
+                let device = self.untypeds[&from].device;
+                let inherits = self.untypeds.get(&id).is_none_or(|child| child.device);
+                ensure(!device || plain && inherits, "25: kind on device memory")?;
+            } else {
+                ensure(root.parent.is_none(), "11: parent of a start-up capability")?;
             }
         }
         let untypeds = self.untypeds.keys().chain(self.cspaces.keys());

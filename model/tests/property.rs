@@ -163,7 +163,7 @@ impl Generator<'_> {
         SlotAddr::through(via, 18 + 8 * self.rng.below(8) as u32 + class)
     }
 
-    /// The source of a move that the creation numbers can refuse: an
+    /// The source of a move that the depths can refuse: an
     /// untyped capability or a cspace capability, here or in another space.
     /// Seldom a start-up capability: once moved, the rest of the run finds
     /// little to do.
@@ -295,7 +295,15 @@ impl Generator<'_> {
             26 => Syscall::Signal(self.held(NOTIFY)),
             27 => Syscall::Wait(self.held(NOTIFY)),
             28 => Syscall::Poll(self.held(NOTIFY)),
-            // The moves that the creation numbers can refuse, both ways.
+            // The moves that the depths can refuse, both ways.
+            // A start-up untyped, the least deep, into another space.
+            29 if self.rng.chance(40) => Syscall::CapMove {
+                source: SlotAddr::own(START_SLOT_FIRST + self.rng.chance(30) as u32),
+                destination: {
+                    let via = self.find(CSPACE, Wanted::Full).index();
+                    SlotAddr::through(via, 18 + 8 * self.rng.below(8) as u32)
+                },
+            },
             29..32 => Syscall::CapMove {
                 source: self.bound(),
                 destination: if self.rng.chance(30) {
@@ -383,12 +391,12 @@ struct Reached {
     woken_gone: u32,
     /// `cap_move` of an untyped capability (first) or of a cspace
     /// capability (second) through a cspace capability: those accepted, and
-    /// those refused only because of the creation numbers.
+    /// those refused only because of the depths.
     moved: [u32; 2],
     refused: [u32; 2],
     /// `send` that lists such a move and found a receiver: those delivered
     /// with their capabilities, and those dropped only because of the
-    /// creation numbers.
+    /// depths.
     sent: u32,
     sent_refused: u32,
 }
@@ -397,8 +405,8 @@ struct Reached {
 struct Risk {
     /// 0 for an untyped capability, 1 for a cspace capability.
     kind: usize,
-    /// The call succeeds when the capability is derived instead of moved: a
-    /// new capability is younger than every capability space.
+    /// The call succeeds with a capability that every space can hold in
+    /// its place: a copy of the thread capability in its start-up slot.
     fits_derived: bool,
 }
 
@@ -423,7 +431,7 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
             destination,
         } if source.via() | destination.via() != 0 => {
             let derived = Syscall::CapDerive {
-                source,
+                source: SlotAddr::own(START_SLOT_THREAD),
                 destination,
                 rights: Rights::NONE,
                 badge: 0,
@@ -439,7 +447,7 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
             for transfer in &mut derived.caps {
                 if let Transfer::Move(slot) = *transfer {
                     found = found.or(kind(slot));
-                    *transfer = Transfer::Derive(slot, Rights::NONE);
+                    *transfer = Transfer::Derive(SlotAddr::own(START_SLOT_THREAD), Rights::NONE);
                 }
             }
             let derived = Syscall::Send {
@@ -567,7 +575,7 @@ fn invariants_hold_after_every_call_of_random_sequences() {
 /// something only if the moves that could break it are tried: here they are
 /// counted, accepted and refused, for both kinds and both ways of moving.
 #[test]
-fn moves_that_the_creation_numbers_rule_on_are_accepted_and_refused() {
+fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
     println!(
         "cap_move: untyped {} accepted, {} refused; cspace {} accepted, {} refused",

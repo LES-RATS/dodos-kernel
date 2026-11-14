@@ -194,13 +194,16 @@ fn children_out_of_the_order_of_derivation_are_reported() {
 
 #[test]
 fn derivation_with_more_rights_than_its_parent_is_reported() {
-    let broken = spoiled(|m, at| live(&mut m.caps, at.endpoint_cap).rights = Rights::NONE);
+    let broken = spoiled(|m, at| m.derive(at.copy, Rights::ALL, 0, (at.space, 100)));
     assert_eq!(broken, "3: rights of a derivation");
 }
 
 #[test]
 fn derivation_that_lost_the_badge_of_its_parent_is_reported() {
-    let broken = spoiled(|m, at| live(&mut m.caps, at.endpoint_cap).badge = 5);
+    let broken = spoiled(|m, at| {
+        m.derive(at.copy, Rights::NONE, 0, (at.space, 100));
+        live(&mut m.caps, at.copy).badge = 5;
+    });
     assert_eq!(broken, "3: badge of a derivation");
 }
 
@@ -304,8 +307,16 @@ fn object_taken_from_an_untyped_that_does_not_exist_is_reported() {
 #[test]
 fn object_whose_root_is_not_a_child_of_its_untyped_is_reported() {
     let broken = spoiled(|m, at| {
-        let device = object(m, START_SLOT_FIRST + 1);
-        live(&mut m.objects, at.reply).from = Some(device);
+        let place = (at.space, 100);
+        let other = m.create(
+            ObjectKind::Untyped,
+            4096,
+            Some(at.untyped_cap),
+            Rights::ALL,
+            place,
+        );
+        let other = m.caps[&other].object;
+        live(&mut m.objects, at.reply).from = Some(other);
     });
     assert_eq!(broken, "11: root capability is a child of the untyped's");
 }
@@ -509,4 +520,105 @@ fn capability_created_in_a_capability_space_after_it_began_to_die_is_reported() 
         m.derive(at.copy, Rights::NONE, 0, (at.space, 100));
     });
     assert_eq!(broken, "23: new capability in a dying space");
+}
+
+#[test]
+fn root_capability_without_every_right_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.caps, at.endpoint_cap).rights = Rights::NONE);
+    assert_eq!(broken, "3: root capability");
+}
+
+#[test]
+fn root_capability_with_a_badge_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.caps, at.endpoint_cap).badge = 5);
+    assert_eq!(broken, "3: root capability");
+}
+
+#[test]
+fn badge_on_a_capability_that_is_not_for_an_endpoint_or_a_notify_is_reported() {
+    let broken = spoiled(|m, at| {
+        m.derive(at.untyped_cap, Rights::NONE, 5, (at.space, 100));
+    });
+    assert_eq!(broken, "3: badge on another kind");
+}
+
+#[test]
+fn start_up_capability_with_a_parent_is_reported() {
+    let broken = spoiled(|m, at| {
+        let device = cap(m, START_SLOT_FIRST + 1);
+        live(&mut m.caps, device).parent = Some(at.untyped_cap);
+        live(&mut m.caps, at.untyped_cap).children.insert(0, device);
+    });
+    assert_eq!(broken, "11: parent of a start-up capability");
+}
+
+#[test]
+fn exec_on_device_memory_is_reported() {
+    let broken = spoiled(|m, _| {
+        let device = cap(m, START_SLOT_FIRST + 1);
+        live(&mut m.caps, device).rights = Rights::ALL;
+    });
+    assert_eq!(broken, "25: exec on device memory");
+}
+
+#[test]
+fn kernel_object_on_device_memory_is_reported() {
+    let broken = spoiled(|m, at| {
+        let device = object(m, START_SLOT_FIRST + 1);
+        let from = cap(m, START_SLOT_FIRST + 1);
+        let rights = Rights::ALL.without(Rights::EXEC);
+        m.create(ObjectKind::Notify, 0, Some(from), rights, (at.space, 100));
+        live(&mut m.untypeds, device).live += 1;
+    });
+    assert_eq!(broken, "25: kind on device memory");
+}
+
+#[test]
+fn identity_that_was_not_given_out_is_reported() {
+    let broken = spoiled(|m, _| m.next_id = 3);
+    assert_eq!(broken, "26: identity");
+}
+
+#[test]
+fn caller_of_a_dying_reply_object_is_reported() {
+    let broken = spoiled(|m, at| {
+        let caller = object(m, CALLER);
+        live(&mut m.endpoints, at.endpoint).queue.clear();
+        live(&mut m.threads, caller).wait = Wait::Reply(at.reply);
+        *live(&mut m.replies, at.reply) = ReplyState::Armed {
+            caller,
+            window: at.nowhere,
+            flags: 0,
+        };
+        let root = m.objects[&at.reply].root;
+        live(&mut m.caps, root).dying = Some(m.next_id);
+    });
+    assert_eq!(broken, "22: thread of a dying reply object");
+}
+
+#[test]
+fn watermark_above_zero_while_nothing_is_live_is_reported() {
+    let broken = spoiled(|m, _| {
+        let device = object(m, START_SLOT_FIRST + 1);
+        live(&mut m.untypeds, device).watermark = 1;
+    });
+    assert_eq!(broken, "18: watermark is zero when nothing is live");
+}
+
+#[test]
+fn walk_of_a_removal_longer_than_192_capabilities_is_reported() {
+    let broken = spoiled(|m, _| m.longest_walk = 193);
+    assert_eq!(broken, "24: walk of a removal");
+}
+
+#[test]
+fn walk_of_a_removal_is_measured() {
+    let mut model = state();
+    let boot = object(&model, START_SLOT_THREAD);
+    assert_eq!(model.longest_walk, 0);
+    // From the endpoint capability to its most recent copy.
+    model
+        .apply(boot, Syscall::CapDelete(SlotAddr::own(EP)))
+        .unwrap();
+    assert_eq!(model.longest_walk, 2);
 }

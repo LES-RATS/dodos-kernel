@@ -1,10 +1,11 @@
 //! IPC, transfer of capabilities and notifications.
 
+use crate::caps::Placing;
 use crate::{
     Access, CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Range, ReplyState,
     Slot, Transfer, Wait, Window, live,
 };
-use dodos_abi::{Error, Header, Marks, ObjectKind, Received, Rights, SlotAddr};
+use dodos_abi::{Error, Header, Marks, ObjectKind, Received, Rights, SlotAddr, TREE_DEPTH};
 
 /// What `wait` and `poll` do when the word is zero.
 #[derive(Clone, Copy)]
@@ -14,8 +15,9 @@ pub(crate) enum IfZero {
 }
 
 impl Message {
-    /// Order of checks, step 3, and Messages: at most 64 words and 4
-    /// capabilities.
+    /// Messages: at most 64 words and 4 capabilities. Transfer of
+    /// capabilities: checked before the listed slots, because the header
+    /// says how many there are.
     fn check(&self) -> Result<(), Error> {
         Header::new(self.label, self.words.len(), self.caps.len(), 0).map(drop)
     }
@@ -72,10 +74,9 @@ impl Model {
     ) -> Outcome {
         let held = self.held(thread, endpoint, ObjectKind::Endpoint, message.rights())?;
         let (endpoint, badge) = (held.object, held.badge);
+        message.check()?;
         self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
-        message.check()?;
-        range.check()?;
         let receiver = self.receiver(endpoint);
         let parcel = Parcel::new(thread, message, badge);
         match receiver {
@@ -108,7 +109,6 @@ impl Model {
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let reply = self.object(thread, reply, ObjectKind::Reply, Rights::RECV)?;
         let window = self.window(thread, range)?;
-        range.check()?;
         // IPC: the reply object must be idle.
         if self.replies[&reply] != ReplyState::Idle {
             return Err(Error::Busy);
@@ -127,11 +127,10 @@ impl Model {
         // IPC: `send` on the reply object, then as `recv` with it.
         let rights = message.rights().union(Rights::RECV);
         let reply = self.object(thread, reply, ObjectKind::Reply, rights)?;
+        message.check()?;
         self.listed(thread, &message.caps)?;
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let window = self.window(thread, range)?;
-        message.check()?;
-        range.check()?;
         if let ReplyState::Attached(_) = self.replies[&reply] {
             return Err(Error::Busy);
         }
@@ -152,8 +151,8 @@ impl Model {
         let held = self.is(cap, kind, message.rights())?;
         let (target, badge) = (held.object, held.badge);
         // IPC: a reply carries badge 0, the badge of every reply capability.
-        self.listed(thread, &message.caps)?;
         message.check()?;
+        self.listed(thread, &message.caps)?;
         let parcel = Parcel::new(thread, message, badge);
         let flags = if kind == ObjectKind::Reply {
             self.answer(target, parcel)
@@ -228,7 +227,10 @@ impl Model {
         endpoint: SlotAddr,
     ) -> Outcome {
         let notify = self.object(thread, notify, ObjectKind::Notify, Rights::RECV)?;
-        let endpoint = self.optional(thread, endpoint, ObjectKind::Endpoint, Rights::MANAGE)?;
+        let endpoint = match endpoint.is_none() {
+            true => None,
+            false => Some(self.object(thread, endpoint, ObjectKind::Endpoint, Rights::MANAGE)?),
+        };
         let bound = self.notifies[&notify].endpoint;
         match endpoint {
             // Notifications: endpoint 0 removes the binding, and succeeds
@@ -270,7 +272,9 @@ impl Model {
                 Transfer::Derive(slot, rights) => {
                     let cap = self.cap(sender, slot, Access::Read)?;
                     let rights = self.caps[&cap].rights.derive(rights)?;
-                    self.shallow(cap)?;
+                    if self.depth(cap) >= TREE_DEPTH {
+                        return Err(Error::Invalid);
+                    }
                     (cap, Some(rights))
                 }
             };
@@ -356,24 +360,26 @@ impl Model {
     fn deliver(&mut self, parcel: Parcel, window: Window, flags: u32) -> (Delivery, u32) {
         let index = |i: usize| window.first as usize + i;
         let empty = |index: usize| {
-            // CONTRACT-GAP (Transfer of capabilities): the contract says
-            // that a dying capability space only shrinks, but not what a
-            // delivery does to a receiver whose range is in one. Its slots
-            // take nothing: the capabilities are dropped.
+            // Removal ends: a range in a dying or destroyed space takes
+            // nothing.
             let space = self
                 .cspaces
                 .get(&window.cspace)
                 .filter(|_| !self.dying(window.cspace));
-            // Slots and addresses: slot 0 is never used.
-            index != 0 && space.and_then(|space| space.slots.get(index)) == Some(&Slot::Empty)
+            space.and_then(|space| space.slots.get(index)) == Some(&Slot::Empty)
         };
         // The same checks as when the call was made, and the first slots of
         // the receiver's range are empty, one per capability.
-        // The derivation tree: a capability moved by IPC into a capability
-        // space older than itself is refused at delivery, which drops the
+        // The derivation tree: a capability moved or derived by IPC into a
+        // space that cannot hold it is refused at delivery, which drops the
         // capabilities.
-        let movable = |&(cap, rights): &(CapId, Option<Rights>)| {
-            rights.is_some() || self.movable(cap, window.cspace).is_ok()
+        let fits = |&(cap, rights): &(CapId, Option<Rights>)| {
+            let placing = if rights.is_some() {
+                Placing::Derived
+            } else {
+                Placing::Moved
+            };
+            self.fits(window.cspace, cap, placing).is_ok()
         };
         let listed = self
             .listed(parcel.sender, &parcel.caps)
@@ -381,7 +387,7 @@ impl Model {
             .filter(|caps| {
                 caps.len() <= window.count as usize
                     && (0..caps.len()).all(|i| empty(index(i)))
-                    && caps.iter().all(movable)
+                    && caps.iter().all(fits)
             });
         for (i, &(cap, rights)) in listed.iter().flatten().enumerate() {
             let place = (window.cspace, index(i) as u32);

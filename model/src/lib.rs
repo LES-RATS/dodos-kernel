@@ -36,8 +36,8 @@ pub const BOOT_DEVICE_BYTES: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjId(u32);
 
-/// Identity of a capability, and its creation number (The derivation tree):
-/// it is never reused and only grows, so a greater one is younger.
+/// Identity of a capability. It is never reused and only grows, so a
+/// capability is younger than its parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CapId(u32);
 
@@ -173,6 +173,9 @@ pub enum Output {
 /// The error code and the results of a call. `Err(Error::Ok)` never occurs.
 pub type Outcome = Result<Output, Error>;
 
+/// What a check gives when it passes.
+type Checked<T> = Result<T, Error>;
+
 /// A place for a capability: a capability space and an index in it.
 type Place = (ObjId, u32);
 
@@ -192,10 +195,9 @@ struct Cap {
     /// In the order of derivation, the most recent last.
     children: Vec<CapId>,
     place: Place,
-    /// The derivation tree, Removal ends: set by the first step of
-    /// `cap_delete` on the capability, and on a root capability by the first
-    /// step of a removal that reaches it. It holds the creation number that
-    /// the next capability would have got then.
+    /// Removal ends: set by the first step of `cap_delete` on the capability,
+    /// and on a root capability by the first step of a removal that reaches
+    /// it, to the identity that the next capability would have got then.
     dying: Option<u32>,
 }
 
@@ -222,11 +224,11 @@ struct Untyped {
 
 #[derive(Clone, Debug, PartialEq)]
 struct CSpace {
-    max: u32,
+    max: u64,
     slots: Vec<Slot>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Thread {
     /// `None` until `thread_configure`. A capability space that no longer
     /// exists is one that was destroyed.
@@ -325,6 +327,9 @@ pub struct Model {
     endpoints: BTreeMap<ObjId, Endpoint>,
     replies: BTreeMap<ObjId, ReplyState>,
     notifies: BTreeMap<ObjId, Notify>,
+    /// The derivation tree: the longest walk so far to the next capability
+    /// to remove, in capabilities. The contract bounds it by 192.
+    longest_walk: usize,
 }
 
 /// The entry `id` of one of the maps of the state, to change it. Every
@@ -471,13 +476,9 @@ impl Model {
         self.through(own, addr, access)
     }
 
-    /// The derivation tree: a thread whose capability space is destroyed
-    /// gets `gone` from every call. (Threads: a thread that runs is bound
-    /// to a capability space.)
+    /// The derivation tree: once its capability space is destroyed, a
+    /// thread gets `gone` from every call, `cap_delete` too.
     fn own(&self, thread: ObjId) -> Result<ObjId, Error> {
-        // CONTRACT-GAP (The derivation tree): the contract excepts
-        // `cap_delete` for a destroyed capability space as for a dying one,
-        // but no slot is left to name. `cap_delete` is `gone` too.
         let bound = self.threads[&thread].cspace;
         bound
             .filter(|own| self.cspaces.contains_key(own))
@@ -538,40 +539,20 @@ impl Model {
     }
 
     /// Order of checks, steps 1 and 2: the three checks of a capability
-    /// argument, in order.
-    fn held(
-        &self,
-        thread: ObjId,
-        addr: SlotAddr,
-        kind: ObjectKind,
-        rights: Rights,
-    ) -> Result<&Cap, Error> {
-        self.is(self.cap(thread, addr, Access::Read)?, kind, rights)
+    /// argument, in order. `need` is the rights that the call needs.
+    fn held(&self, thread: ObjId, at: SlotAddr, kind: ObjectKind, need: Rights) -> Checked<&Cap> {
+        self.is(self.cap(thread, at, Access::Read)?, kind, need)
     }
 
     /// As `held`, for a call that needs only the object.
     fn object(
         &self,
         thread: ObjId,
-        addr: SlotAddr,
+        at: SlotAddr,
         kind: ObjectKind,
-        rights: Rights,
-    ) -> Result<ObjId, Error> {
-        Ok(self.held(thread, addr, kind, rights)?.object)
-    }
-
-    /// As `held`, for an argument that may be 0, "no capability".
-    fn optional(
-        &self,
-        thread: ObjId,
-        addr: SlotAddr,
-        kind: ObjectKind,
-        rights: Rights,
-    ) -> Result<Option<ObjId>, Error> {
-        if addr.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(self.object(thread, addr, kind, rights)?))
+        need: Rights,
+    ) -> Checked<ObjId> {
+        Ok(self.held(thread, at, kind, need)?.object)
     }
 
     /// Order of checks, step 2: a slot in which the call places a
@@ -594,19 +575,26 @@ impl Model {
     }
 
     /// Order of checks, step 2, and Transfer of capabilities: the receive
-    /// range, resolved when the call is made. Whether its slots exist and are empty is checked at delivery.
-    fn window(&self, thread: ObjId, range: Range) -> Result<Window, Error> {
-        // Transfer of capabilities: the address of an empty range is not
-        // looked at.
-        let first = if range.count == 0 {
-            SlotAddr::NONE
-        } else {
-            range.first
-        };
+    /// range, resolved when the call is made. Whether its slots are empty
+    /// is checked at delivery.
+    fn window(&self, thread: ObjId, mut range: Range) -> Result<Window, Error> {
+        // Transfer of capabilities: an empty range has no address.
+        if range.count == 0 {
+            range.first = SlotAddr::NONE;
+        }
+        let (first, count) = (range.first.index(), range.count);
+        let cspace = self.space(thread, range.first, Access::Write)?;
+        // Transfer of capabilities: slot 0 or beyond the table is `invalid`.
+        let end = u64::from(first) + u64::from(count);
+        let beyond = first == 0 || end > self.cspaces[&cspace].slots.len() as u64;
+        // Order of checks, step 3: a receive range has at most 4 slots.
+        if count != 0 && beyond || count as usize > MAX_CAPS {
+            return Err(Error::Invalid);
+        }
         Ok(Window {
-            cspace: self.space(thread, first, Access::Write)?,
-            first: first.index(),
-            count: range.count,
+            cspace,
+            first,
+            count,
         })
     }
 
@@ -631,11 +619,16 @@ impl Model {
         let space = self.object(thread, cspace, ObjectKind::CSpace, manage)?;
         // The address space and the fault endpoint are checked and not kept:
         // nothing in the one-core model reads them.
-        self.optional(thread, aspace, ObjectKind::ASpace, manage)?;
-        self.optional(thread, fault, ObjectKind::Endpoint, Rights::SEND)?;
+        // Threads: both may be 0.
+        if !aspace.is_none() {
+            self.object(thread, aspace, ObjectKind::ASpace, manage)?;
+        }
+        if !fault.is_none() {
+            self.object(thread, fault, ObjectKind::Endpoint, Rights::SEND)?;
+        }
         let target = live(&mut self.threads, target);
-        // Threads: the thread must be suspended.
-        if !target.suspended {
+        // Threads: the thread must be suspended and must not wait.
+        if !target.suspended || target.wait != Wait::None {
             return Err(Error::Busy);
         }
         target.cspace = Some(space);
@@ -643,12 +636,12 @@ impl Model {
     }
 
     /// Threads: resuming a thread that is not suspended succeeds; `busy` if
-    /// the thread is bound to no capability space.
+    /// the thread is bound to no capability space, or to one that is
+    /// destroyed.
     fn thread_resume(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        let target = live(&mut self.threads, target);
-        target.cspace.ok_or(Error::Busy)?;
-        target.suspended = false;
+        self.own(target).or(Err(Error::Busy))?;
+        live(&mut self.threads, target).suspended = false;
         Ok(Output::Done)
     }
 
@@ -658,16 +651,5 @@ impl Model {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         live(&mut self.threads, target).suspended = true;
         Ok(Output::Done)
-    }
-}
-
-impl Range {
-    /// Order of checks, step 3, and Transfer of capabilities: a receive
-    /// range has at most 4 slots.
-    fn check(self) -> Result<(), Error> {
-        if self.count as usize > MAX_CAPS {
-            return Err(Error::Invalid);
-        }
-        Ok(())
     }
 }

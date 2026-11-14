@@ -2,7 +2,7 @@
 
 use crate::{
     Access, CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place,
-    ReplyState, Slot, Thread, Untyped, Wait, live,
+    ReplyState, Slot, Thread, Untyped, live,
 };
 use dodos_abi::{
     CSPACE_SEGMENT_SLOTS, Error, ObjectKind, PageSize, REMOVAL_STEP, Rights, SLOT_BYTES, SlotAddr,
@@ -15,6 +15,16 @@ const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
 const DIRECTORY_BYTES: u64 = 8;
 /// Rules of `untyped_retype`: the greatest alignment of a kernel object.
 const PAGE: u64 = 4096;
+
+/// How a capability comes to a slot, for `Model::fits`.
+#[derive(Clone, Copy)]
+pub(crate) enum Placing {
+    Moved,
+    /// A new capability derived from the one named.
+    Derived,
+    /// The root capability of a new object, made from the untyped named.
+    Retyped(ObjectKind),
+}
 
 /// What `cap_delete` and `cap_revoke` remove.
 #[derive(Clone, Copy, PartialEq)]
@@ -29,12 +39,17 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
     let segments = size / u64::from(CSPACE_SEGMENT_SLOTS);
     let (bytes, valid) = match kind {
         ObjectKind::Untyped => (size, size.is_power_of_two() && size >= PAGE),
-        ObjectKind::Frame => (size.saturating_mul(page.bytes()), size > 0),
-        // Slots and addresses: a non-zero multiple of 128, and a directory
-        // rounded up to a power of two. An index has 32 bits.
+        // Capabilities and objects: a size that does not fit in 64 bits is
+        // `invalid`.
+        ObjectKind::Frame => (
+            size.checked_mul(page.bytes()).ok_or(Error::Invalid)?,
+            size > 0,
+        ),
+        // Slots and addresses: a non-zero multiple of 128, at most 2^32, and
+        // a directory rounded up to a power of two.
         ObjectKind::CSpace => (
             (segments * DIRECTORY_BYTES).next_power_of_two(),
-            size > 0 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into()) && size <= u32::MAX.into(),
+            size > 0 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into()) && size <= 1 << 32,
         ),
         ObjectKind::ASpace => (PAGE, size == 0),
         ObjectKind::Thread => (1024, size == 0),
@@ -53,11 +68,7 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
         ObjectKind::Frame => page.bytes(),
         _ => bytes.min(PAGE),
     };
-    if valid {
-        Ok((bytes, align))
-    } else {
-        Err(Error::Invalid)
-    }
+    valid.then_some((bytes, align)).ok_or(Error::Invalid)
 }
 
 impl Model {
@@ -71,11 +82,17 @@ impl Model {
     ) -> Outcome {
         let parent = self.cap(thread, source, Access::Read)?;
         let source = &self.caps[&parent];
-        let (object, kept) = (source.object, source.badge);
-        // Capabilities and objects: `derive` on the source, and the new
-        // rights are a subset of the source's.
-        let rights = source.rights.derive(rights)?;
+        let (object, held, kept) = (source.object, source.rights, source.badge);
+        // Capabilities and objects: `derive` on the source.
+        if !held.contains(Rights::DERIVE) {
+            return Err(Error::Denied);
+        }
         let place = self.destination(thread, destination)?;
+        // Capabilities and objects: the new rights are a subset of the
+        // source's, checked with the plain arguments.
+        if !held.contains(rights) {
+            return Err(Error::Denied);
+        }
         // Capabilities and objects: a badge only on an endpoint or a notify.
         let kind = self.objects[&object].kind;
         if badge != 0 && kind != ObjectKind::Endpoint && kind != ObjectKind::Notify {
@@ -86,7 +103,7 @@ impl Model {
         if badge != 0 && kept != 0 && badge != kept {
             return Err(Error::Denied);
         }
-        self.shallow(parent)?;
+        self.fits(place.0, parent, Placing::Derived)?;
         self.vacant(place)?;
         let badge = if kept != 0 { kept } else { badge };
         self.derive(parent, rights, badge, place);
@@ -101,7 +118,7 @@ impl Model {
     ) -> Outcome {
         let cap = self.cap(thread, source, Access::Write)?;
         let place = self.destination(thread, destination)?;
-        self.movable(cap, place.0)?;
+        self.fits(place.0, cap, Placing::Moved)?;
         self.vacant(place)?;
         self.place(cap, place);
         Ok(Output::Done)
@@ -162,7 +179,7 @@ impl Model {
         if device && kind != ObjectKind::Frame && kind != ObjectKind::Untyped {
             return Err(Error::Invalid);
         }
-        self.shallow(parent)?;
+        self.fits(place.0, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
         self.take(object, bytes, align)?;
         // Rules of `untyped_retype`: every right, but `exec` only if the
@@ -187,14 +204,15 @@ impl Model {
     ) -> Outcome {
         let space = self.object(thread, cspace, ObjectKind::CSpace, Rights::MANAGE)?;
         let untyped = self.object(thread, untyped, ObjectKind::Untyped, Rights::WRITE)?;
-        // Slots and addresses: only from the untyped it was created from.
+        // Slots and addresses: only from the untyped it was created from;
+        // any capability for that untyped object is accepted.
         // The derivation tree: the start-up space, created from no untyped,
         // never grows.
         if self.objects[&space].from != Some(untyped) {
             return Err(Error::Invalid);
         }
         let CSpace { max, slots } = &self.cspaces[&space];
-        if slots.len() >= *max as usize {
+        if slots.len() as u64 >= *max {
             return Err(Error::NoSlot);
         }
         self.take(untyped, SEGMENT_BYTES, SEGMENT_BYTES)?;
@@ -204,30 +222,34 @@ impl Model {
         Ok(Output::Slots(slots as u32))
     }
 
-    /// The derivation tree: the tree is at most 64 deep, and a start-up
-    /// capability is at depth 1. `invalid` if a child of `parent` would be
-    /// deeper; checked with the plain arguments.
-    pub(crate) fn shallow(&self, parent: CapId) -> Result<(), Error> {
-        let above = |cap: &CapId| self.caps[cap].parent;
-        if std::iter::successors(Some(parent), above).count() >= TREE_DEPTH {
-            return Err(Error::Invalid);
-        }
-        Ok(())
+    /// The derivation tree: a start-up capability is at depth 1.
+    pub(crate) fn depth(&self, cap: CapId) -> usize {
+        std::iter::successors(Some(cap), |cap| self.caps[cap].parent).count()
     }
 
-    /// The derivation tree: a capability space holds authority only over
-    /// what is younger than itself. An untyped capability, or the root
-    /// capability of another capability space, moves into a space only if
-    /// it was created after the root capability of that space (`invalid`,
-    /// checked with the plain arguments).
-    pub(crate) fn movable(&self, cap: CapId, space: ObjId) -> Result<(), Error> {
-        let kind = self.objects[&self.caps[&cap].object].kind;
-        let bound = kind == ObjectKind::Untyped
-            || self.rooted(cap).is_some_and(|_| kind == ObjectKind::CSpace);
-        if bound && cap < self.objects[&space].root {
-            return Err(Error::Invalid);
-        }
-        Ok(())
+    /// The derivation tree, checked with the plain arguments each time a
+    /// capability is placed in a slot of `space`: the tree is at most 64
+    /// deep, and a capability space holds only what is deeper than itself.
+    /// The root capability of another space must be deeper than the root
+    /// capability of `space`, and an untyped capability not less deep.
+    pub(crate) fn fits(&self, space: ObjId, source: CapId, placing: Placing) -> Result<(), Error> {
+        let own = self.objects[&space].root;
+        let kind = self.objects[&self.caps[&source].object].kind;
+        // A space may hold its own root capability; a copy is not a root.
+        let moved_root = self.rooted(source).is_some() && source != own;
+        let (kind, root, depth) = match placing {
+            Placing::Moved => (kind, moved_root, self.depth(source)),
+            Placing::Derived => (kind, false, self.depth(source) + 1),
+            Placing::Retyped(kind) => (kind, true, self.depth(source) + 1),
+        };
+        let deep_enough = match kind {
+            ObjectKind::Untyped => depth >= self.depth(own),
+            ObjectKind::CSpace if root => depth > self.depth(own),
+            _ => true,
+        };
+        (deep_enough && depth <= TREE_DEPTH)
+            .then_some(())
+            .ok_or(Error::Invalid)
     }
 
     /// Rules of `untyped_retype`: memory is taken at a watermark that only
@@ -282,7 +304,7 @@ impl Model {
                 // The one given at start-up has all its slots.
                 let slots = if parent.is_none() { size as usize } else { 0 };
                 let space = CSpace {
-                    max: size as u32,
+                    max: size,
                     slots: vec![Slot::Empty; slots],
                 };
                 self.cspaces.insert(id, space);
@@ -290,10 +312,8 @@ impl Model {
             ObjectKind::Thread => {
                 // Threads: a new thread is suspended and bound to nothing.
                 let thread = Thread {
-                    cspace: None,
                     suspended: true,
-                    wait: Wait::None,
-                    outcome: None,
+                    ..Thread::default()
                 };
                 self.threads.insert(id, thread);
             }
@@ -367,7 +387,9 @@ impl Model {
     }
 
     /// The derivation tree: removal in bounded steps. Each capability
-    /// removed and each thread woken is one step.
+    /// removed and each thread woken is one step. `cap_revoke` on the root
+    /// capability of a space starts below it, and so does not sweep the
+    /// space.
     fn remove(&mut self, target: CapId, removal: Removal) -> Outcome {
         let mut steps = REMOVAL_STEP;
         loop {
@@ -411,8 +433,10 @@ impl Model {
     /// removal that reaches its root capability, even when that step only
     /// removes a copy; and the step that marks a reply object wakes, with
     /// `gone`, the thread attached to it or the caller it is armed with.
+    /// That wake is not counted in the 32 of a step.
     fn next_removed(&mut self, mut cap: CapId) -> CapId {
-        loop {
+        for walk in 1.. {
+            self.longest_walk = self.longest_walk.max(walk);
             if let Some(object) = self.rooted(cap) {
                 let now = self.next_id;
                 live(&mut self.caps, cap).dying.get_or_insert(now);
@@ -429,9 +453,10 @@ impl Model {
             let child = self.caps[&cap].children.last().copied();
             match child.or_else(|| self.swept(cap)) {
                 Some(next) => cap = next,
-                None => return cap,
+                None => break,
             }
         }
+        cap
     }
 
     /// The first capability to remove from the capability space that `cap`
