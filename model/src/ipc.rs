@@ -476,7 +476,7 @@ impl Model {
     /// IPC: the queues are doubly linked through the thread objects, so in a
     /// kernel this is one step. The scan of the queue here is a property of
     /// the model, whose queues are vectors.
-    pub(crate) fn unlink(&mut self, thread: ObjId) -> Wait {
+    pub(crate) fn unlink(&mut self, thread: ObjId) {
         let wait = std::mem::take(&mut live(&mut self.threads, thread).wait);
         let other = |&queued: &ObjId| queued != thread;
         match wait {
@@ -491,6 +491,5 @@ impl Model {
             }
             Wait::Notify(notify) => live(&mut self.notifies, notify).waiters.retain(other),
         }
-        wait
     }
 }
