@@ -26,6 +26,9 @@ pub const CSPACE_SEGMENT_SLOTS: u32 = 128;
 /// `cap_revoke` before it returns `Again`.
 pub const REMOVAL_STEP: usize = 32;
 
+/// Greatest depth of the derivation tree.
+pub const TREE_DEPTH: usize = 64;
+
 /// Fixed slots of the first process. Slot 0 of every capability space is
 /// never used; the other start-up capabilities begin at `START_SLOT_FIRST`.
 pub const START_SLOT_CSPACE: u32 = 1;
@@ -132,6 +135,11 @@ impl Rights {
         } else {
             None
         }
+    }
+
+    /// These rights without those of `other`.
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
     }
 
     pub const fn union(self, other: Self) -> Self {
@@ -423,6 +431,13 @@ mod tests {
         let m = Marks::NONE.union(Marks::UNTRUSTED);
         assert!(m.union(Marks::PRIVATE).contains(m));
         assert!(!m.contains(Marks::PRIVATE));
+    }
+
+    #[test]
+    fn without_removes_only_the_named_rights() {
+        let rw = Rights::READ.union(Rights::WRITE);
+        assert_eq!(rw.without(Rights::WRITE), Rights::READ);
+        assert_eq!(rw.without(Rights::EXEC), rw);
     }
 
     #[test]
