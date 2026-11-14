@@ -212,12 +212,30 @@ fn scheduling_values_have_their_numbers() {
 }
 
 #[test]
+fn bandwidth_is_the_rounded_up_quotient_of_128_bits() {
+    // xorshift64*, fixed seed: many budgets and periods against the
+    // definition computed in 128 bits.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..100_000 {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let r = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        let period = 1 + (r >> 16) % (1 << 40);
+        let budget = (r ^ r >> 7) % (period + 1);
+        let wanted = ((u128::from(budget) << 32).div_ceil(u128::from(period))) as u64;
+        assert_eq!(bandwidth(budget, period), wanted, "{budget} {period}");
+    }
+}
+
+#[test]
 fn bandwidth_is_rounded_up_and_a_whole_core_for_a_full_budget() {
     assert_eq!(bandwidth(0, 0), 0);
     assert_eq!(bandwidth(10_000_000, 10_000_000), ADMISSION_WHOLE_CORE);
     assert_eq!(bandwidth(1, 3), 1_431_655_766);
     assert_eq!(bandwidth(1, 1 << 32), 1);
     assert_eq!(bandwidth(1, (1 << 32) + 1), 1);
+    assert_eq!(bandwidth((1 << 47) - 1, (1 << 48) - 1), 1 << 31);
 }
 
 #[test]

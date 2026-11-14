@@ -560,13 +560,27 @@ pub const SCHED_STATE_HOME: u64 = 1 << 2;
 pub const SCHED_STATE_LENT: u64 = 1 << 3;
 
 /// Admission: the bandwidth of a context, ⌈budget × 2^32 / period⌉, and 0
-/// for a period of 0 (a context that is not configured).
+/// for a period of 0 (a context that is not configured). The period is
+/// below 2^48 (a valid one is at most 2^36), and the budget at most the
+/// period.
+///
+/// It is a long division by 64-bit words, 16 bits at a time after the
+/// whole part, rather than one division of 128 bits, which Kani cannot
+/// prove in reasonable time.
 pub const fn bandwidth(budget: u64, period: u64) -> u64 {
     if period == 0 {
         return 0;
     }
-    let scaled = (budget as u128) << 32;
-    scaled.div_ceil(period as u128) as u64
+    assert!(period < 1 << 48 && budget <= period);
+    let whole = budget / period;
+    let high = (budget % period) << 16;
+    let low = (high % period) << 16;
+    let quotient = whole << 32 | (high / period) << 16 | (low / period);
+    if low.is_multiple_of(period) {
+        quotient
+    } else {
+        quotient + 1
+    }
 }
 
 /// Timers: the firing instant of a timer. With `x` the smaller of deadline +
