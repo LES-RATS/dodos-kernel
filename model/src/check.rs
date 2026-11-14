@@ -38,10 +38,34 @@ pub struct Census {
 }
 
 impl Model {
+    /// The depth of every capability, from the parents down: a capability
+    /// without a parent is at depth 1. The invariants do not use
+    /// `Model::depth`, which the calls use: a fault in one does not hide in
+    /// the other. A parent is older than its child (invariant 1), so it
+    /// comes first; one that is missing counts for nothing here and is
+    /// reported by invariant 1.
+    fn depths(&self) -> BTreeMap<CapId, usize> {
+        let mut depths = BTreeMap::new();
+        for (&id, cap) in &self.caps {
+            let above = cap.parent.and_then(|parent| depths.get(&parent));
+            let depth = above.map_or(1, |above| above + 1);
+            depths.insert(id, depth);
+        }
+        depths
+    }
+
+    /// Whether the root capability of an object is marked dying, read from
+    /// the capability itself and not through `Model::dying`.
+    fn marked(&self, object: ObjId) -> bool {
+        let root = self.objects.get(&object).map(|object| object.root);
+        let root = root.and_then(|root| self.caps.get(&root));
+        root.is_some_and(|root| root.dying)
+    }
+
     /// Counts what the state holds.
     pub fn census(&self) -> Census {
-        let dying = self.objects.iter().filter(|(id, _)| self.dying(**id));
-        let copy = |cap: &&crate::Cap| cap.dying && !self.dying(cap.object);
+        let dying = self.objects.iter().filter(|(id, _)| self.marked(**id));
+        let copy = |cap: &&crate::Cap| cap.dying && !self.marked(cap.object);
         let waits = |wanted: fn(&Wait) -> bool| {
             self.threads
                 .values()
@@ -49,12 +73,7 @@ impl Model {
                 .count()
         };
         Census {
-            deepest: self
-                .caps
-                .keys()
-                .map(|&cap| self.depth(cap))
-                .max()
-                .unwrap_or(0),
+            deepest: self.depths().into_values().max().unwrap_or(0),
             dying: dying.map(|(_, object)| object.kind).collect(),
             dying_copies: self.caps.values().filter(copy).count(),
             callers: waits(|wait| matches!(wait, Wait::Call { .. })),
@@ -166,6 +185,7 @@ impl Model {
     }
 
     fn check_tree(&self) -> Check {
+        let depths = self.depths();
         for (&id, cap) in &self.caps {
             let object = self
                 .objects
@@ -204,7 +224,7 @@ impl Model {
             let slots = self.cspaces.get(&space).map(|space| &space.slots);
             let slot = slots.and_then(|slots| slots.get(index as usize));
             ensure(slot == Some(&Slot::Full(id)), "6: slot of a capability")?;
-            ensure(self.depth(id) <= TREE_DEPTH, "20: depth of the tree")?;
+            ensure(depths[&id] <= TREE_DEPTH, "20: depth of the tree")?;
         }
         Ok(())
     }
@@ -245,7 +265,9 @@ impl Model {
     }
 
     fn check_slots(&self) -> Check {
-        let depth = |cap: CapId| self.depth(cap);
+        let depths = self.depths();
+        // A capability that is missing is reported by invariant 6 or 9.
+        let depth = |cap: CapId| depths.get(&cap).copied().unwrap_or(0);
         for (&id, space) in &self.cspaces {
             let first = space.slots.first();
             ensure(first.is_none_or(|slot| *slot == Slot::Empty), "5: slot 0")?;
@@ -274,7 +296,7 @@ impl Model {
                 ensure(kept, "23: new capability in a dying space")?;
             }
             ensure(
-                self.dying(id) == sweep.is_some(),
+                self.marked(id) == sweep.is_some(),
                 "27: sweep of a dying space",
             )?;
             let slots = space.slots.len();
@@ -402,7 +424,7 @@ impl Model {
             window.count as usize <= MAX_CAPS && (window.count == 0 || in_table)
         };
         for (&id, state) in &self.replies {
-            let idle = *state == ReplyState::Idle || !self.dying(id);
+            let idle = *state == ReplyState::Idle || !self.marked(id);
             ensure(idle, "22: thread of a dying reply object")?;
             if let ReplyState::Armed { window, flags, .. } = state {
                 let known = flags & !Header::FLAG_CAPS_DROPPED == 0;
