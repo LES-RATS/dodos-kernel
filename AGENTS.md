@@ -11,6 +11,10 @@ The contract is `architecture/kernel-interface.md` in the documentation
 repository. The order is never reversed: specification, model, oracle,
 implementation.
 
+Skills are in `.agents/skills/`. `zig-0-17` lists the breaking changes of
+Zig 0.17 (for example `@cImport` no longer exists); it is copied from
+github.com/zigcc/skills at commit 2f9bf9d (MIT). Read it before writing Zig.
+
 ## Always
 
 - English for code, comments and commits.
