@@ -57,8 +57,9 @@ const SPARE: u32 = 7;
 
 /// The slots from here on are left to the scripts.
 const SCRIPT_FIRST: u32 = 82;
-/// The slots of a capability space that a script makes: two segments.
-const CHILD_SLOTS: u32 = 2 * CSPACE_SEGMENT_SLOTS;
+/// The slots of a capability space that a script makes: four segments, so
+/// that the removal of one has steps that only move the sweep.
+const CHILD_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
 /// The links of a chain of copies that starts at depth 2 and ends at 64.
 const CHAIN_LINKS: usize = TREE_DEPTH - 2;
 
@@ -315,7 +316,7 @@ impl Generator<'_> {
     /// A wait number: mostly none, else a small one, so that the numbers
     /// of the waits and those of `thread_cancel` meet.
     fn number(&mut self) -> u64 {
-        if self.rng.chance(60) {
+        if self.rng.chance(50) {
             0
         } else {
             1 + self.rng.below(8)
@@ -439,7 +440,7 @@ impl Generator<'_> {
         let roll = if self.rng.chance(14) {
             29 + self.rng.below(8)
         } else {
-            self.rng.below(38)
+            self.rng.below(40)
         };
         match roll {
             0..3 => Syscall::CapDerive {
@@ -570,7 +571,7 @@ impl Generator<'_> {
                     },
                 }
             }
-            35..37 => Syscall::Recv {
+            35 | 36 => Syscall::Recv {
                 endpoint: self.held(ENDPOINT),
                 reply: self.held(REPLY),
                 range: Range {
@@ -579,6 +580,7 @@ impl Generator<'_> {
                 },
                 wait: self.number(),
             },
+            38 | 39 => Syscall::ThreadCancel(self.held(THREAD), self.number()),
             _ if self.rng.chance(80) => Syscall::NotifyBind {
                 notify: self.held(NOTIFY),
                 endpoint: if self.rng.chance(20) {
@@ -706,13 +708,10 @@ impl Generator<'_> {
             cspace: own(space),
             untyped: MEMORY,
         };
-        let mut calls = vec![
-            retype(ObjectKind::CSpace, CHILD_SLOTS.into(), own(space)),
-            grown.clone(),
-            grown,
-            derive(MEMORY, inside(START_SLOT_FIRST)),
-            derive(own(space), inside(START_SLOT_CSPACE)),
-        ];
+        let mut calls = vec![retype(ObjectKind::CSpace, CHILD_SLOTS.into(), own(space))];
+        calls.extend(vec![grown; (CHILD_SLOTS / CSPACE_SEGMENT_SLOTS) as usize]);
+        calls.push(derive(MEMORY, inside(START_SLOT_FIRST)));
+        calls.push(derive(own(space), inside(START_SLOT_CSPACE)));
         for (kind, class) in [
             (ObjectKind::Endpoint, ENDPOINT),
             (ObjectKind::Reply, REPLY),
@@ -941,6 +940,18 @@ struct Reached {
     /// `thread_cancel` that ended a wait: of a queued caller, of a caller
     /// that waits for the reply, of a receiver, of a waiter on a notify.
     cancelled: [u32; 4],
+    /// `thread_cancel` with a wait number other than 0 that ended a wait.
+    cancelled_by_number: u32,
+    /// `call`, `recv`, `reply_recv` and `wait` that returned `cancelled` at
+    /// once: their wait number was already cancelled.
+    cancelled_at_once: [u32; 4],
+    /// `untyped_retype` that returned `unsupported`: a kind not made.
+    retype_unsupported: u32,
+    /// `cap_delete` and `cap_revoke` that returned `again`, and those of
+    /// them that removed no capability: the step ended on the slot budget
+    /// alone.
+    again: u32,
+    swept_only: u32,
     /// Seeds in which a removal walked.
     seeds_walked: u32,
 }
@@ -1150,11 +1161,24 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             ]
         };
         let waited = waits(&model);
+        let capabilities = model.census().capabilities;
+        let numbered = matches!(call, Syscall::ThreadCancel(_, number) if number != 0);
         let outcome = model.apply(thread, call);
         if name == 19 {
-            for (kind, (before, after)) in waited.into_iter().zip(waits(&model)).enumerate() {
+            let after = waits(&model);
+            for (kind, (before, after)) in waited.into_iter().zip(after).enumerate() {
                 reached.cancelled[kind] += (after < before) as u32;
             }
+            reached.cancelled_by_number += (numbered && after != waited) as u32;
+        }
+        if outcome == Err(Error::Cancelled) {
+            let blocking = BLOCKING.iter().position(|&blocking| blocking == name);
+            reached.cancelled_at_once[blocking.expect("a call that waits")] += 1;
+        }
+        reached.retype_unsupported += (name == 5 && outcome == Err(Error::Unsupported)) as u32;
+        if (name == 2 || name == 3) && outcome == Err(Error::Again) {
+            reached.again += 1;
+            reached.swept_only += (model.census().capabilities == capabilities) as u32;
         }
         if let Err(broken) = model.check() {
             panic!("seed {seed}, step {step}, {shown}: {broken}");
@@ -1227,14 +1251,24 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     assert!(reached.several_threads as usize > STEPS);
 }
 
-// The coverage of the 24 seeds. The floors are well under what was measured
-// (in the comments), so that a change of the generator that loses a kind of
-// state fails here.
+// The coverage of the 24 seeds. The floors are about half of what was
+// measured (in the comments), so that a change of the generator that loses a
+// kind of state fails here.
+
+/// Asserts that each count is at least its floor.
+#[track_caller]
+fn at_least<const N: usize>(counts: [u32; N], floors: [u32; N]) {
+    let low = counts
+        .iter()
+        .zip(&floors)
+        .any(|(count, floor)| count < floor);
+    assert!(!low, "{counts:?} under {floors:?}");
+}
 
 #[test]
 fn deepest_capability_and_longest_walk_are_reached() {
     let reached = all_seeds();
-    // Measured: depth 64, a walk of 122 capabilities.
+    // Measured: depth 64, a walk of 124 capabilities.
     assert_eq!(reached.deepest, TREE_DEPTH);
     assert!(reached.longest_walk >= 100, "{}", reached.longest_walk);
     assert!(reached.longest_walk <= LONGEST_WALK);
@@ -1245,20 +1279,19 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 2,232, cspace 13,567, aspace 2,301, frame
-    // 667, thread 19, sched 1,596, endpoint 436, reply 634, notify 711; a
-    // copy under `cap_delete` 2,991.
-    for kind in MADE {
-        assert!(reached.dying[kind as usize] > 0, "{kind:?}");
-    }
-    assert!(reached.dying_copies >= 300, "{}", reached.dying_copies);
+    // Measured, in steps: untyped 5,666, cspace 29,630, aspace 722, frame
+    // 333, thread 2,118, sched 461, endpoint 7, reply 1,553, notify 811; a
+    // copy under `cap_delete` 4,274.
+    let dying = MADE.map(|kind| reached.dying[kind as usize]);
+    at_least(dying, [2500, 15_000, 350, 150, 1000, 200, 3, 750, 400]);
+    at_least([reached.dying_copies], [2000]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 20,926 of 32,745 calls.
-    assert!(reached.outside >= 15_000, "{}", reached.outside);
+    // Measured: 27,048 of 45,784 calls.
+    at_least([reached.outside], [22_000]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -1269,8 +1302,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 33,450, reply objects armed 12,963,
-    // receivers 38,311, waiters on a notify 24,389, a notify bound 34,530.
+    // Measured, in steps: callers queued 40,496, reply objects armed 16,497,
+    // receivers 42,862, waiters on a notify 28,366, a notify bound 50,879.
     let waits = [
         reached.callers,
         reached.served,
@@ -1278,19 +1311,19 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    assert!(waits.iter().all(|&steps| steps >= 2000), "{waits:?}");
-    // Measured, each once: 34 messages with capabilities, 28 with the
-    // capabilities dropped, 33 notifications, 24 threads woken with `gone`.
+    at_least(waits, [20_000, 8000, 20_000, 14_000, 25_000]);
+    // Measured, each once: 40 messages with capabilities, 26 with the
+    // capabilities dropped, 24 notifications, 16 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    assert!(ends.iter().all(|&times| times >= 10), "{ends:?}");
-    // Measured: 11 messages received with four capabilities, and 123 calls by a thread whose capability space is destroyed.
-    assert!(reached.with_four >= 4, "{}", reached.with_four);
-    assert!(reached.destroyed >= 4, "{}", reached.destroyed);
+    at_least(ends, [20, 13, 12, 8]);
+    // Measured: 13 messages received with four capabilities, and 123 calls
+    // by a thread whose capability space is destroyed.
+    at_least([reached.with_four, reached.destroyed], [7, 60]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -1299,27 +1332,40 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 1,754 accepted and 104 refused, cspace 195 and 21;
-    // by `send` 10 delivered and 2 refused.
-    for count in reached.moved.into_iter().chain(reached.refused) {
-        assert!(count >= 10, "{reached:?}");
-    }
-    assert!(
-        reached.sent >= 5 && reached.sent_refused >= 1,
-        "{reached:?}"
-    );
-    // The same moves listed by `call` and by `reply_recv`: 31 and 16.
-    assert!(reached.called >= 5 && reached.answered >= 5, "{reached:?}");
+    // Measured: untyped 2,158 accepted and 56 refused, cspace 151 and 15;
+    // by `send` 14 delivered and 1 refused.
+    at_least(reached.moved, [1000, 75]);
+    at_least(reached.refused, [28, 8]);
+    at_least([reached.sent, reached.sent_refused], [7, 1]);
+    // The same moves listed by `call` and by `reply_recv`: 38 and 20.
+    at_least([reached.called, reached.answered], [19, 10]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 22 queued callers, 8 callers that wait for the reply, 26
-    // receivers, 12 waiters on a notify.
-    for (kind, count) in reached.cancelled.into_iter().enumerate() {
-        assert!(count >= 3, "kind {kind}: {reached:?}");
-    }
+    // Measured: 38 queued callers, 17 callers that wait for the reply, 75
+    // receivers, 31 waiters on a notify; 26 of the ends by a wait number.
+    at_least(reached.cancelled, [19, 8, 37, 15]);
+    at_least([reached.cancelled_by_number], [13]);
+    // Measured: `call` 32, `recv` 27, `reply_recv` 18 and `wait` 27 returned
+    // `cancelled` at once.
+    at_least(reached.cancelled_at_once, [16, 13, 9, 13]);
+}
+
+#[test]
+fn removal_steps_that_only_move_the_sweep_are_reached() {
+    let reached = all_seeds();
+    // Measured: 29 of the 2,017 `again` of a removal removed nothing.
+    at_least([reached.swept_only], [14]);
+}
+
+#[test]
+fn untyped_retype_of_a_kind_not_made_is_reached() {
+    let reached = all_seeds();
+    // Measured: 115 of the 470 calls that returned `unsupported`; the others
+    // are calls that are not modelled.
+    at_least([reached.retype_unsupported], [55]);
 }
 
 #[test]
