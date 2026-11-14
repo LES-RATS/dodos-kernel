@@ -37,6 +37,10 @@ pub struct Census {
     pub waiters: usize,
     /// Notifies bound to an endpoint.
     pub bound: usize,
+    /// Frame capabilities whose record holds a mapping.
+    pub mappings: usize,
+    /// Devices attached to an iospace.
+    pub devices: usize,
 }
 
 impl Model {
@@ -88,6 +92,12 @@ impl Model {
                 .values()
                 .filter(|notify| notify.endpoint.is_some())
                 .count(),
+            mappings: self
+                .caps
+                .values()
+                .filter(|cap| matches!(cap.record, Record::Mapping(_)))
+                .count(),
+            devices: self.iospaces.values().map(Vec::len).sum(),
         }
     }
 
@@ -346,6 +356,10 @@ impl Model {
                 ObjectKind::Endpoint => self.endpoints.contains_key(&id),
                 ObjectKind::Frame => self.frames.contains_key(&id),
                 ObjectKind::ASpace => self.aspaces.contains_key(&id),
+                ObjectKind::IoSpace => {
+                    self.aspaces.contains_key(&id) && self.iospaces.contains_key(&id)
+                }
+                ObjectKind::Iommu => self.iommus.contains_key(&id),
                 ObjectKind::Reply => self.replies.contains_key(&id),
                 ObjectKind::Notify => self.notifies.contains_key(&id),
                 _ => true,
@@ -376,7 +390,12 @@ impl Model {
             && self.cspaces.keys().all(is(ObjectKind::CSpace))
             && self.threads.keys().all(is(ObjectKind::Thread))
             && self.frames.keys().all(is(ObjectKind::Frame))
-            && self.aspaces.keys().all(is(ObjectKind::ASpace))
+            && self
+                .aspaces
+                .keys()
+                .all(|id| is(ObjectKind::ASpace)(id) || is(ObjectKind::IoSpace)(id))
+            && self.iospaces.keys().all(is(ObjectKind::IoSpace))
+            && self.iommus.keys().all(is(ObjectKind::Iommu))
             && self.endpoints.keys().all(is(ObjectKind::Endpoint))
             && self.replies.keys().all(is(ObjectKind::Reply))
             && self.notifies.keys().all(is(ObjectKind::Notify));

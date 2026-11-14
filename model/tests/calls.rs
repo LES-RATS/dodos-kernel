@@ -1786,7 +1786,8 @@ fn calls_outside_the_one_core_model_are_unsupported() {
         Call::ThreadReadRegs,
         Call::ThreadWriteRegs,
         Call::Yield,
-        Call::ASpaceMap,
+        Call::CoreStart,
+        Call::DebugWrite,
     ] {
         k.no(Syscall::Other(call), Error::Unsupported);
     }
@@ -3135,13 +3136,10 @@ fn destroying_an_object_wakes_its_waiters_first_in_first_out() {
 #[test]
 fn longest_walk_that_the_depth_rule_allows_is_within_the_bound() {
     let mut k = K::new();
-    // The start-up space holds the first untyped before anything else.
-    for (from, to) in [
-        (START_SLOT_ASPACE, 110),
-        (START_SLOT_THREAD, 111),
-        (START_SLOT_SCHED, 112),
-    ] {
-        k.ok(mv(s(from), s(to)));
+    // The start-up space holds the first untyped before anything else: the
+    // capabilities of its slots 2 to 19 move to slots from 300.
+    for from in (2..12).chain(16..20) {
+        k.ok(mv(SlotAddr::own(from), SlotAddr::own(300 + from)));
     }
     // A space at each depth from 2 to 64, its root capability in slot 38 +
     // depth here. Each holds, in its slot 2, a copy of the untyped at its
@@ -3159,7 +3157,7 @@ fn longest_walk_that_the_depth_rule_allows_is_within_the_bound() {
     }
     // The deepest space holds, in its slot 1, a capability at depth 1 and
     // then a copy of it at each depth down to 64.
-    k.ok(mv(s(START_SLOT_DEBUG), via(102, 1)));
+    k.ok(mv(SlotAddr::own(300 + START_SLOT_DEBUG), via(102, 1)));
     k.ok(derive(via(102, 1), via(102, 3), Rights::ALL, 0));
     for index in 3..65 {
         k.ok(derive(via(102, index), via(102, index + 1), Rights::ALL, 0));

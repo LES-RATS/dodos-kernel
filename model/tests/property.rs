@@ -42,7 +42,7 @@ impl Rng {
 }
 
 // The bias towards valid arguments: the generator keeps each kind of object
-// in its own class of slots, in every capability space. Slot `34 + 8 * n + c`
+// in its own class of slots, in every capability space. Slot `34 + 9 * n + c`
 // is of class `c`; class 7 is left for moves and receive ranges. Every space
 // that a script makes is laid out as the start-up space: a capability for the
 // space itself in slot 1, an untyped in slot 20.
@@ -54,9 +54,12 @@ const REPLY: u32 = 4;
 const NOTIFY: u32 = 5;
 const OTHER: u32 = 6;
 const SPARE: u32 = 7;
+const SPACE: u32 = 8;
+/// The classes of slots.
+const CLASSES: u64 = 9;
 
 /// The slots from here on are left to the scripts.
-const SCRIPT_FIRST: u32 = 98;
+const SCRIPT_FIRST: u32 = 110;
 /// The slots of a capability space that a script makes: four segments, so
 /// that the removal of one has steps that only move the sweep.
 const CHILD_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
@@ -65,6 +68,8 @@ const HOME_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
 /// The ordinary untyped of `Machine::example`, and its device untyped in
 /// the next slot.
 const UNTYPED_SLOT: u32 = 20;
+/// The `iommu` capability of `Machine::example`.
+const IOMMU_SLOT: u32 = 18;
 /// The links of a chain of copies that starts at depth 2 and ends at 64.
 const CHAIN_LINKS: usize = TREE_DEPTH - 2;
 
@@ -79,11 +84,11 @@ const KINDS: [(ObjectKind, u32, u64); 12] = [
     (ObjectKind::Reply, REPLY, 0),
     (ObjectKind::Notify, NOTIFY, 0),
     (ObjectKind::Frame, OTHER, 3),
-    (ObjectKind::ASpace, OTHER, 0),
+    (ObjectKind::ASpace, SPACE, 0),
     (ObjectKind::Sched, OTHER, 0),
     (ObjectKind::Timer, OTHER, 0),
     (ObjectKind::Task, OTHER, 0),
-    (ObjectKind::IoSpace, OTHER, 0),
+    (ObjectKind::IoSpace, SPACE, 0),
 ];
 /// The kinds that this version does not make, and those never made from an
 /// untyped.
@@ -118,7 +123,7 @@ const MADE: [ObjectKind; 9] = [
 ];
 
 /// The calls, numbered as `name_of` numbers them.
-const NAMES: [&str; 20] = [
+const NAMES: [&str; 26] = [
     "cap_derive",
     "cap_move",
     "cap_delete",
@@ -139,6 +144,12 @@ const NAMES: [&str; 20] = [
     "notify_bind",
     "other",
     "thread_cancel",
+    "aspace_map",
+    "iospace_map",
+    "aspace_unmap",
+    "iospace_unmap",
+    "aspace_protect",
+    "iospace_attach",
 ];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
@@ -165,6 +176,12 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::NotifyBind { .. } => 17,
         Syscall::Other(_) => 18,
         Syscall::ThreadCancel(..) => 19,
+        Syscall::ASpaceMap(_) => 20,
+        Syscall::IoSpaceMap(_) => 21,
+        Syscall::ASpaceUnmap(_) => 22,
+        Syscall::IoSpaceUnmap(_) => 23,
+        Syscall::ASpaceProtect { .. } => 24,
+        Syscall::IoSpaceAttach { .. } => 25,
     }
 }
 
@@ -259,7 +276,7 @@ impl Generator<'_> {
     }
 
     fn class_slot(&mut self, class: u32) -> u32 {
-        34 + 8 * self.rng.below(8) as u32 + class
+        34 + CLASSES as u32 * self.rng.below(8) as u32 + class
     }
 
     /// A slot of a class, in the caller's capability space or through
@@ -441,9 +458,45 @@ impl Generator<'_> {
         }
     }
 
+    /// The rights word of a mapping: mostly a valid one.
+    fn mapping_rights(&mut self) -> u32 {
+        let (r, w, x) = (Rights::READ, Rights::WRITE, Rights::EXEC);
+        match self.rng.below(10) {
+            0..4 => r.union(w).bits(),
+            4..6 => r.bits(),
+            6..8 => r.union(x).bits(),
+            8 => w.bits(),
+            _ => self.rng.below(16) as u32,
+        }
+    }
+
+    /// The arguments of a mapping: a space and a frame of their classes,
+    /// mostly the untyped in slot 20, and a range near the bottom of the
+    /// user range, so that mappings meet.
+    fn map(&mut self) -> Map {
+        let page = if self.rng.chance(90) {
+            1 << 12
+        } else {
+            1 << 21
+        };
+        Map {
+            space: self.held(SPACE),
+            frame: self.held(OTHER),
+            untyped: match self.rng.below(10) {
+                0..7 => MEMORY,
+                7 => SlotAddr::NONE,
+                _ => self.held(UNTYPED),
+            },
+            address: (1 << 30) + page * self.rng.below(16) + (self.rng.chance(2) as u64) * 4096,
+            first: self.rng.chance(15) as u64,
+            count: 1 + self.rng.below(3),
+            rights: self.mapping_rights(),
+        }
+    }
+
     /// One call with random arguments.
     fn call(&mut self) -> Syscall {
-        let class = self.rng.below(8) as u32;
+        let class = self.rng.below(CLASSES) as u32;
         let near = if self.rng.chance(80) { class } else { SPARE };
         let answered = if self.rng.chance(50) { ENDPOINT } else { REPLY };
         let none = |rng: &mut Rng| rng.chance(60);
@@ -451,7 +504,7 @@ impl Generator<'_> {
         let roll = if self.rng.chance(14) {
             29 + self.rng.below(8)
         } else {
-            self.rng.below(40)
+            self.rng.below(48)
         };
         match roll {
             0..3 => Syscall::CapDerive {
@@ -598,6 +651,32 @@ impl Generator<'_> {
                 wait: self.number(),
             },
             38 | 39 => Syscall::ThreadCancel(self.held(THREAD), self.number()),
+            40 | 41 => Syscall::ASpaceMap(self.map()),
+            42 => Syscall::IoSpaceMap(self.map()),
+            43 if self.rng.chance(50) => Syscall::ASpaceUnmap(self.held(OTHER)),
+            43 => Syscall::IoSpaceUnmap(self.held(OTHER)),
+            44 => Syscall::ASpaceProtect {
+                aspace: self.held(SPACE),
+                frame: self.held(OTHER),
+                rights: self.mapping_rights(),
+            },
+            45 | 46 => Syscall::IoSpaceAttach {
+                iommu: if self.rng.chance(90) {
+                    own(IOMMU_SLOT)
+                } else {
+                    self.held(OTHER)
+                },
+                iospace: if self.rng.chance(30) {
+                    SlotAddr::NONE
+                } else {
+                    self.held(SPACE)
+                },
+                device: match self.rng.below(100) {
+                    0..90 => 0x10 + self.rng.below(20),
+                    90..96 => 0xf8,
+                    _ => self.rng.below(1 << 17),
+                },
+            },
             _ if self.rng.chance(80) => Syscall::NotifyBind {
                 notify: self.held(NOTIFY),
                 endpoint: if self.rng.chance(20) {
@@ -737,17 +816,17 @@ impl Generator<'_> {
         ] {
             let size = (kind == ObjectKind::Frame) as u64;
             calls.push(retype(kind, size, inside(34 + class)));
-            calls.push(retype(kind, size, inside(42 + class)));
+            calls.push(retype(kind, size, inside(43 + class)));
             // A capability of this space, shared with the new one.
             if let Some(shared) = self.find_own(class, Wanted::Full) {
-                calls.push(derive(own(shared), inside(50 + class)));
+                calls.push(derive(own(shared), inside(52 + class)));
             }
         }
         // Two threads in the new space, so that one can serve the other.
         // The capability of the second goes into the new space.
         // Each has one of the two frames of the new space as its message
         // page.
-        for (thread, page) in [(own(thread), 34), (inside(34 + THREAD), 42)] {
+        for (thread, page) in [(own(thread), 34), (inside(34 + THREAD), 43)] {
             calls.push(retype(ObjectKind::Thread, 0, thread));
             calls.push(Syscall::ThreadConfigure {
                 thread,
@@ -886,14 +965,115 @@ impl Generator<'_> {
         space.map_or(Vec::new(), |space| vec![Syscall::CapDelete(own(space)); 10])
     }
 
+    /// An address space and an iospace from the untyped in slot 20, frames
+    /// mapped into both, devices attached, rights changed; then the frames,
+    /// the spaces or the mappings removed, in a random order.
+    fn spaces(&mut self, plan: &mut Plan) -> Vec<Syscall> {
+        if !self.whole(MEMORY) {
+            return Vec::new();
+        }
+        // The slots are taken at once: `spare` sees only what is full now.
+        let slots = self.spare(plan, 8 + 33);
+        let [aspace, iospace, frames @ ..] = slots.as_slice() else {
+            return Vec::new();
+        };
+        if frames.len() < 6 + 33 {
+            return Vec::new();
+        }
+        let (frames, copies) = frames.split_at(6);
+        let mut calls = vec![
+            retype(ObjectKind::ASpace, 0, own(*aspace)),
+            retype(ObjectKind::IoSpace, 0, own(*iospace)),
+        ];
+        calls.extend(
+            frames
+                .iter()
+                .map(|&frame| retype(ObjectKind::Frame, 2, own(frame))),
+        );
+        let (r, w, x) = (Rights::READ, Rights::WRITE, Rights::EXEC);
+        let base = (1 << 30) + (self.rng.below(4) << 39);
+        for (n, &frame) in frames.iter().enumerate() {
+            let far = if self.rng.chance(30) { 1 << 30 } else { 0 };
+            let rights = self.rng.pick(&[r, r.union(w), r.union(x)]);
+            calls.push(Syscall::ASpaceMap(Map {
+                space: own(*aspace),
+                frame: own(frame),
+                untyped: MEMORY,
+                address: base + far + 0x2000 * n as u64,
+                first: 0,
+                count: 1 + self.rng.below(2),
+                rights: rights.bits(),
+            }));
+        }
+        calls.push(Syscall::ASpaceProtect {
+            aspace: own(*aspace),
+            frame: own(frames[0]),
+            rights: r.bits(),
+        });
+        // Now and then 33 copies of a frame, each mapped, so that the
+        // destruction of the aspace takes more than one call.
+        if self.rng.chance(30) {
+            for (n, &copy) in copies.iter().enumerate() {
+                calls.push(derive(own(frames[4]), own(copy)));
+                calls.push(Syscall::ASpaceMap(Map {
+                    space: own(*aspace),
+                    frame: own(copy),
+                    untyped: MEMORY,
+                    address: (1 << 31) + 0x1000 * n as u64,
+                    first: 0,
+                    count: 1,
+                    rights: r.bits(),
+                }));
+            }
+            calls.extend(vec![Syscall::CapDelete(own(*aspace)); 3]);
+        }
+        for n in 0..1 + self.rng.below(3) {
+            calls.push(Syscall::IoSpaceAttach {
+                iommu: own(IOMMU_SLOT),
+                iospace: own(*iospace),
+                device: 0x20 + n,
+            });
+        }
+        // A copy of a mapped frame, mapped into the iospace.
+        let copy = frames[5];
+        calls.push(Syscall::CapDelete(own(copy)));
+        calls.push(derive(own(frames[1]), own(copy)));
+        calls.push(Syscall::IoSpaceMap(Map {
+            space: own(*iospace),
+            frame: own(copy),
+            untyped: MEMORY,
+            address: 0x1_0000,
+            first: 0,
+            count: 2,
+            rights: w.bits(),
+        }));
+        let mut ends = vec![
+            vec![Syscall::CapDelete(own(*aspace)); 2],
+            vec![Syscall::CapDelete(own(*iospace)); 2],
+            vec![Syscall::CapRevoke(own(frames[1])); 2],
+            vec![Syscall::ASpaceUnmap(own(frames[2]))],
+            vec![Syscall::IoSpaceUnmap(own(copy))],
+            frames
+                .iter()
+                .map(|&frame| Syscall::CapDelete(own(frame)))
+                .collect(),
+        ];
+        while !ends.is_empty() {
+            let at = self.rng.below(ends.len() as u64) as usize;
+            calls.extend(ends.swap_remove(at));
+        }
+        calls
+    }
+
     fn script(&mut self, plan: &mut Plan) -> Vec<Syscall> {
         match self.rng.below(100) {
-            0..20 => self.spawn(plan),
-            20..48 => self.chain(plan),
-            48..72 => self.fan(plan),
-            72..80 => self.nest(plan),
-            80..84 => self.kill(),
-            84..94 => self.listen(plan),
+            0..18 => self.spawn(plan),
+            18..44 => self.chain(plan),
+            44..66 => self.fan(plan),
+            66..74 => self.nest(plan),
+            74..78 => self.kill(),
+            78..86 => self.listen(plan),
+            86..94 => self.spaces(plan),
             _ => self.tidy(plan),
         }
     }
@@ -903,7 +1083,7 @@ impl Generator<'_> {
 #[derive(Debug, Default, PartialEq)]
 struct Reached {
     /// Calls that did not fail, by their place in `NAMES`.
-    ok: [u32; 20],
+    ok: [u32; 26],
     /// Calls that returned each error, by its code.
     errors: [u32; 12],
     /// Times nothing of use could run, and the run went on from the
@@ -975,6 +1155,13 @@ struct Reached {
     swept_only: u32,
     /// Seeds in which a removal walked.
     seeds_walked: u32,
+    /// Steps after which a frame capability held a mapping, and a device
+    /// was attached; removals that undid a mapping, and that detached a
+    /// device.
+    mapped: u32,
+    attached: u32,
+    unmapped_by_removal: u32,
+    detached_by_removal: u32,
 }
 
 impl Reached {
@@ -1004,6 +1191,8 @@ impl Reached {
         self.receivers += (census.receivers > 0) as u32;
         self.waiters += (census.waiters > 0) as u32;
         self.bound += (census.bound > 0) as u32;
+        self.mapped += (census.mappings > 0) as u32;
+        self.attached += (census.devices > 0) as u32;
     }
 }
 
@@ -1182,7 +1371,8 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             ]
         };
         let waited = waits(&model);
-        let capabilities = model.census().capabilities;
+        let before = model.census();
+        let capabilities = before.capabilities;
         let numbered = matches!(call, Syscall::ThreadCancel(_, number) if number != 0);
         let outcome = model.apply(thread, call);
         if name == 19 {
@@ -1197,6 +1387,11 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             reached.cancelled_at_once[blocking.expect("a call that waits")] += 1;
         }
         reached.retype_unsupported += (name == 5 && outcome == Err(Error::Unsupported)) as u32;
+        if name == 2 || name == 3 {
+            let after = model.census();
+            reached.unmapped_by_removal += (after.mappings < before.mappings) as u32;
+            reached.detached_by_removal += (after.devices < before.devices) as u32;
+        }
         if (name == 2 || name == 3) && outcome == Err(Error::Again) {
             reached.again += 1;
             reached.swept_only += (model.census().capabilities == capabilities) as u32;
@@ -1300,19 +1495,19 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 2,347, cspace 26,509, aspace 30, frame
-    // 217, thread 1,655, sched 12, endpoint 11, reply 122, notify 268; a
-    // copy under `cap_delete` 5,902.
+    // Measured, in steps: untyped 43, cspace 14,305, aspace 32, frame 6,790,
+    // thread 42, sched 117, endpoint 3,643, reply 714, notify 597; a copy
+    // under `cap_delete` 940.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [1150, 13_000, 15, 100, 800, 6, 5, 60, 130]);
-    at_least([reached.dying_copies], [2900]);
+    at_least(dying, [21, 7000, 16, 3000, 21, 58, 1800, 350, 290]);
+    at_least([reached.dying_copies], [470]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 40,682 of 61,126 calls.
-    at_least([reached.outside], [30_000]);
+    // Measured: 38,996 of 59,606 calls.
+    at_least([reached.outside], [29_000]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -1323,8 +1518,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 59,529, reply objects armed 22,377,
-    // receivers 64,667, waiters on a notify 50,758, a notify bound 59,352.
+    // Measured, in steps: callers queued 58,316, reply objects armed 28,255,
+    // receivers 62,304, waiters on a notify 49,840, a notify bound 68,486.
     let waits = [
         reached.callers,
         reached.served,
@@ -1332,19 +1527,19 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [29_000, 11_000, 32_000, 25_000, 29_000]);
-    // Measured, each once: 58 messages with capabilities, 26 with the
-    // capabilities dropped, 38 notifications, 20 threads woken with `gone`.
+    at_least(waits, [29_000, 14_000, 31_000, 24_000, 34_000]);
+    // Measured, each once: 54 messages with capabilities, 22 with the
+    // capabilities dropped, 36 notifications, 20 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [29, 13, 19, 10]);
-    // Measured: 22 messages received with four capabilities, and 175 calls
+    at_least(ends, [27, 11, 18, 10]);
+    // Measured: 28 messages received with four capabilities, and 57 calls
     // by a thread whose capability space is destroyed.
-    at_least([reached.with_four, reached.destroyed], [11, 85]);
+    at_least([reached.with_four, reached.destroyed], [14, 28]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -1353,40 +1548,54 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 3,413 accepted and 111 refused, cspace 187 and 35;
-    // by `send` 8 delivered and none refused (one in pass 10).
-    at_least(reached.moved, [1700, 90]);
-    at_least(reached.refused, [55, 17]);
-    at_least([reached.sent, reached.sent_refused], [4, 0]);
-    // The same moves listed by `call` and by `reply_recv`: 40 and 23.
-    at_least([reached.called, reached.answered], [20, 11]);
+    // Measured: untyped 3,559 accepted and 75 refused, cspace 138 and 16;
+    // by `send` 7 delivered and none refused (one in pass 10).
+    at_least(reached.moved, [1700, 69]);
+    at_least(reached.refused, [37, 8]);
+    at_least([reached.sent, reached.sent_refused], [3, 0]);
+    // The same moves listed by `call` and by `reply_recv`: 25 and 23.
+    at_least([reached.called, reached.answered], [12, 11]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 64 queued callers, 19 callers that wait for the reply, 88
-    // receivers, 42 waiters on a notify; 21 of the ends by a wait number.
-    at_least(reached.cancelled, [32, 9, 44, 21]);
-    at_least([reached.cancelled_by_number], [10]);
-    // Measured: `call` 41, `recv` 37, `reply_recv` 17 and `wait` 17 returned
+    // Measured: 54 queued callers, 12 callers that wait for the reply, 59
+    // receivers, 27 waiters on a notify; 27 of the ends by a wait number.
+    at_least(reached.cancelled, [27, 6, 29, 13]);
+    at_least([reached.cancelled_by_number], [13]);
+    // Measured: `call` 23, `recv` 22, `reply_recv` 19 and `wait` 16 returned
     // `cancelled` at once.
-    at_least(reached.cancelled_at_once, [20, 18, 8, 8]);
+    at_least(reached.cancelled_at_once, [11, 11, 9, 8]);
 }
 
 #[test]
 fn removal_steps_that_only_move_the_sweep_are_reached() {
     let reached = all_seeds();
-    // Measured: 39 of the 3,141 `again` of a removal removed nothing.
+    // Measured: 39 `again` of a removal removed nothing.
     at_least([reached.swept_only], [19]);
 }
 
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 53 calls returned `unsupported` for a kind this version
+    // Measured: 42 calls returned `unsupported` for a kind this version
     // does not make.
-    at_least([reached.retype_unsupported], [26]);
+    at_least([reached.retype_unsupported], [21]);
+}
+
+#[test]
+fn mappings_and_devices_are_reached_and_undone_by_removals() {
+    let reached = all_seeds();
+    // Measured: a mapping held after 119,452 steps, a device attached after
+    // 42,814; 391 removals undid a mapping and 39 detached a device.
+    let counts = [
+        reached.mapped,
+        reached.attached,
+        reached.unmapped_by_removal,
+        reached.detached_by_removal,
+    ];
+    at_least(counts, [59_000, 21_000, 195, 19]);
 }
 
 #[test]

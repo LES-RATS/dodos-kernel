@@ -4,7 +4,7 @@
 
 use crate::caps::Clearing;
 use crate::memory::{USER_END, hooked};
-use crate::{Frame, Mapping, Model, ObjId, Place, live};
+use crate::{Frame, Iommu, Mapping, Model, ObjId, Place, live};
 use dodos_abi::x86_64::{REG_RDI, REG_RIP};
 use dodos_abi::{
     CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, FIRST_SERVICE_MIN_ADDR, FRAME_MAX_PAGES, MemoryType,
@@ -445,8 +445,13 @@ impl Model {
             let core = add(self, ObjectKind::Core, 0, next(), all);
             self.cores.insert(core, node as u32);
         }
-        for _ in &machine.iommus {
-            add(self, ObjectKind::Iommu, 0, next(), all);
+        for unit in 0..machine.iommus.len() {
+            let iommu = add(self, ObjectKind::Iommu, 0, next(), all);
+            let state = Iommu {
+                unit,
+                ..Iommu::default()
+            };
+            self.iommus.insert(iommu, state);
         }
         // The untypeds: the image untyped, the ordinary ones, the device
         // ones without `exec`. The clean mark of each is at its start.

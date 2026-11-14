@@ -1,8 +1,8 @@
 //! The invariants of mapping records, address spaces and their tables.
 
 use super::{Check, ensure};
-use crate::{Mapping, Model, Record};
-use dodos_abi::PageSize;
+use crate::{Mapping, Model, ObjId, Record};
+use dodos_abi::{IOSPACE_MAX_DEVICES, PageSize, Rights};
 use std::collections::{BTreeMap, BTreeSet};
 
 impl Model {
@@ -16,8 +16,17 @@ impl Model {
     /// 36. a space lists, once each, exactly the capabilities whose records
     ///     name it;
     /// 37. the tables a space holds are at least those its translations
-    ///     hook: one per 512 GB that holds a page, one per 1 GB that holds a
-    ///     page smaller than 1 GB, one per 2 MB that holds a 4 KB page.
+    ///     hook: with four levels one per 512 GB that holds a page, one per
+    ///     1 GB that holds a page smaller than 1 GB, one per 2 MB that holds
+    ///     a 4 KB page; an iospace of 39 bits has three levels;
+    /// 38. the rights of a mapping in an aspace include `read` and not both
+    ///     `write` and `exec`; in an iospace they are `read` or `write` or
+    ///     both, inside its address width, of a page size every unit
+    ///     supports;
+    /// 39. a device attached through an `iommu` is in the list of the
+    ///     iospace it names, and that list holds only such devices, at most
+    ///     16, all of one unit and none the kernel uses; a unit gives no more
+    ///     domain numbers than it has.
     pub(super) fn check_spaces(&self) -> Check {
         let mut named: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (&id, cap) in &self.caps {
@@ -53,9 +62,23 @@ impl Model {
                     && first
                         .checked_add(count)
                         .is_some_and(|end| end <= frame.pages);
+                let io = self.iospaces.contains_key(&id);
+                let limit = match io {
+                    true => 1u128 << self.machine.io_width,
+                    false => crate::memory::USER_END as u128,
+                };
                 let end = (count as u128) * (size as u128) + address as u128;
-                let below = end <= crate::memory::USER_END as u128 && address.is_multiple_of(size);
+                let below = end <= limit && address.is_multiple_of(size);
                 ensure(inside && below, "35: pages of a record")?;
+                let (r, w, x) = (Rights::READ, Rights::WRITE, Rights::EXEC);
+                let valid = match io {
+                    true => {
+                        let sizes = self.machine.io_page_sizes & 1 << frame.page as u32 != 0;
+                        rights != Rights::NONE && r.union(w).contains(rights) && sizes
+                    }
+                    false => rights.contains(r) && !rights.contains(w.union(x)),
+                };
+                ensure(valid, "38: rights of a mapping")?;
                 for n in 0..count {
                     let at = address + n * size;
                     expected.insert(at, (*cap, first + n, frame.page, rights));
@@ -72,9 +95,12 @@ impl Model {
                 ensure(at >= end, "35: translations that overlap")?;
                 end = at + t.size.bytes();
             }
+            let four = !self.iospaces.contains_key(&id) || self.machine.io_width >= 48;
             let mut per = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
             for (&at, t) in &space.translations {
-                per[0].insert(at >> 39);
+                if four {
+                    per[0].insert(at >> 39);
+                }
                 if t.size != PageSize::Size1G {
                     per[1].insert(at >> 30);
                 }
@@ -88,6 +114,40 @@ impl Model {
         ensure(
             named.is_empty(),
             "36: record of a space that does not exist",
-        )
+        )?;
+        self.check_devices()
+    }
+
+    fn check_devices(&self) -> Check {
+        for (&id, devices) in &self.iospaces {
+            let attached = |&(iommu, device): &(ObjId, u16)| {
+                self.iommus
+                    .get(&iommu)
+                    .is_some_and(|unit| unit.attached.get(&device) == Some(&id))
+            };
+            ensure(devices.iter().all(attached), "39: device of an iospace")?;
+            let one_unit = devices.iter().all(|&(iommu, _)| iommu == devices[0].0);
+            let kernel = devices.iter().any(|&(iommu, device)| {
+                let unit = self.iommus.get(&iommu).map(|unit| unit.unit);
+                unit.is_some_and(|unit| self.machine.kernel_devices.contains(&(unit, device)))
+            });
+            let few = devices.len() <= IOSPACE_MAX_DEVICES;
+            ensure(one_unit && few && !kernel, "39: devices of an iospace")?;
+        }
+        for (&id, unit) in &self.iommus {
+            let listed = |(&device, iospace): (&u16, &ObjId)| {
+                self.iospaces
+                    .get(iospace)
+                    .is_some_and(|devices| devices.contains(&(id, device)))
+            };
+            ensure(unit.attached.iter().all(listed), "39: device of a unit")?;
+            let domains: BTreeSet<_> = unit.attached.values().collect();
+            let limit = self.machine.iommus.get(unit.unit).map_or(0, |u| u.domains);
+            ensure(
+                domains.len() as u32 <= limit,
+                "39: domain numbers of a unit",
+            )?;
+        }
+        Ok(())
     }
 }

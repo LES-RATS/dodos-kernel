@@ -1,0 +1,725 @@
+//! Memory and devices: one test per rule of the contract, on the start-up
+//! space of `Machine::example` (its untypeds in slots 19 to 21, its IOMMU
+//! unit in slot 18).
+
+use dodos_abi::ObjectKind::{ASpace, Endpoint, Frame, IoSpace, Thread, Untyped};
+use dodos_abi::*;
+use dodos_model::*;
+
+const IMAGE: u32 = 19;
+const UT: u32 = 20;
+const DEV: u32 = 21;
+const IOMMU: u32 = 18;
+const START: u32 = START_SLOT_ASPACE;
+const MB: u64 = 1 << 20;
+/// An address of the user range where the first process maps nothing.
+const AT: u64 = 1 << 30;
+const R: Rights = Rights::READ;
+const W: Rights = Rights::WRITE;
+const X: Rights = Rights::EXEC;
+const DONE: Outcome = Ok(Output::Done);
+
+fn s(index: u32) -> SlotAddr {
+    SlotAddr::own(index)
+}
+
+fn rw() -> Rights {
+    R.union(W)
+}
+
+struct K {
+    m: Model,
+    t: ObjId,
+}
+
+impl K {
+    fn new() -> Self {
+        Self::on(&Machine::example())
+    }
+
+    fn on(machine: &Machine) -> Self {
+        let (m, t) = Model::boot(machine).unwrap();
+        Self { m, t }
+    }
+
+    fn go(&mut self, call: Syscall) -> Outcome {
+        let outcome = self.m.apply(self.t, call);
+        assert_eq!(self.m.check(), Ok(()));
+        outcome
+    }
+
+    #[track_caller]
+    fn ok(&mut self, call: Syscall) {
+        assert_eq!(self.go(call), DONE);
+    }
+
+    #[track_caller]
+    fn no(&mut self, call: Syscall, error: Error) {
+        assert_eq!(self.go(call), Err(error));
+    }
+
+    /// Repeats a call while it returns `again`; at most `calls` times.
+    #[track_caller]
+    fn done(&mut self, call: Syscall, calls: u32) -> u32 {
+        for made in 1..=calls {
+            match self.go(call.clone()) {
+                DONE => return made,
+                Err(Error::Again) => {}
+                other => panic!("{call:?}: {other:?}"),
+            }
+        }
+        panic!("{call:?} does not end in {calls} calls");
+    }
+
+    fn retype(&mut self, untyped: u32, kind: ObjectKind, size: u64, slot: u32) {
+        let call = Syscall::UntypedRetype {
+            untyped: s(untyped),
+            kind,
+            size,
+            page: 0,
+            memory: 0,
+            destination: s(slot),
+        };
+        self.done(call, 2);
+    }
+
+    /// A frame of `pages` pages of `page` size from `untyped`.
+    fn frame(&mut self, untyped: u32, page: PageSize, pages: u64, memory: MemoryType, slot: u32) {
+        let call = Syscall::UntypedRetype {
+            untyped: s(untyped),
+            kind: Frame,
+            size: pages,
+            page: page as u64,
+            memory: memory as u64,
+            destination: s(slot),
+        };
+        self.done(call, 40_000);
+    }
+
+    fn small(&mut self, pages: u64, slot: u32) {
+        self.frame(UT, PageSize::Size4K, pages, MemoryType::WriteBack, slot);
+    }
+
+    fn derive(&mut self, from: u32, to: u32, rights: Rights) {
+        self.ok(Syscall::CapDerive {
+            source: s(from),
+            destination: s(to),
+            rights: rights.bits(),
+            badge: 0,
+        });
+    }
+
+    fn at(&self, address: u64) -> Option<Rights> {
+        self.m.translated(self.t, address)
+    }
+}
+
+fn map(
+    space: u32,
+    frame: u32,
+    untyped: u32,
+    address: u64,
+    first: u64,
+    count: u64,
+    rights: Rights,
+) -> Syscall {
+    Syscall::ASpaceMap(Map {
+        space: s(space),
+        frame: s(frame),
+        untyped: s(untyped),
+        address,
+        first,
+        count,
+        rights: rights.bits(),
+    })
+}
+
+fn iomap(space: u32, frame: u32, address: u64, count: u64, rights: Rights) -> Syscall {
+    Syscall::IoSpaceMap(Map {
+        space: s(space),
+        frame: s(frame),
+        untyped: s(UT),
+        address,
+        first: 0,
+        count,
+        rights: rights.bits(),
+    })
+}
+
+fn protect(space: u32, frame: u32, rights: Rights) -> Syscall {
+    Syscall::ASpaceProtect {
+        aspace: s(space),
+        frame: s(frame),
+        rights: rights.bits(),
+    }
+}
+
+fn attach(iospace: u32, device: u64) -> Syscall {
+    Syscall::IoSpaceAttach {
+        iommu: s(IOMMU),
+        iospace: s(iospace),
+        device,
+    }
+}
+
+/// An address space in slot 30 made from the ordinary untyped, and a
+/// suspended thread bound to it, by which `translated` reads it.
+fn with_aspace() -> (K, ObjId) {
+    let mut k = K::new();
+    k.retype(UT, ASpace, 0, 30);
+    k.retype(UT, Thread, 0, 31);
+    k.ok(Syscall::ThreadConfigure {
+        thread: s(31),
+        cspace: s(START_SLOT_CSPACE),
+        aspace: s(30),
+        fault: SlotAddr::NONE,
+        page: SlotAddr::NONE,
+    });
+    let viewer = k.m.object_at(k.t, s(31)).unwrap();
+    (k, viewer)
+}
+
+fn seen(k: &K, viewer: ObjId, address: u64) -> Option<Rights> {
+    k.m.translated(viewer, address)
+}
+
+// Calls on address spaces: aspace_map.
+
+#[test]
+fn aspace_map_maps_pages_first_to_first_plus_count_minus_1_from_the_address() {
+    let (mut k, v) = with_aspace();
+    k.small(4, 40);
+    k.ok(map(30, 40, UT, AT, 1, 2, rw()));
+    assert_eq!(seen(&k, v, AT - 1), None);
+    assert_eq!(seen(&k, v, AT), Some(rw()));
+    assert_eq!(seen(&k, v, AT + 0x1fff), Some(rw()));
+    assert_eq!(seen(&k, v, AT + 0x2000), None);
+}
+
+#[test]
+fn aspace_map_needs_write_on_the_aspace_and_a_live_aspace() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.derive(30, 32, R);
+    k.no(map(32, 40, 0, AT, 0, 1, R), Error::Denied);
+    k.no(map(40, 40, 0, AT, 0, 1, R), Error::Invalid);
+    k.no(map(33, 40, 0, AT, 0, 1, R), Error::Invalid);
+}
+
+#[test]
+fn aspace_map_checks_the_frame_slot_and_kind_without_its_rights() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.derive(40, 41, Rights::NONE);
+    k.retype(UT, Endpoint, 0, 42);
+    // The frame before the untyped: a wrong kind is `invalid` even with an
+    // untyped that is not the aspace's.
+    k.no(map(30, 42, IMAGE, AT, 0, 1, R), Error::Invalid);
+    // A frame without rights passes its slot check; the rights asked for
+    // are judged with the plain arguments, after the untyped.
+    k.no(map(30, 41, IMAGE, AT, 0, 1, R), Error::Invalid);
+    k.no(map(30, 41, UT, AT, 0, 1, R), Error::Denied);
+}
+
+#[test]
+fn untyped_of_aspace_map_is_its_own_or_0() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.small(1, 41);
+    // A copy of the untyped the aspace was made from is accepted.
+    k.derive(UT, 32, Rights::ALL);
+    k.ok(map(30, 40, 32, AT, 0, 1, R));
+    k.derive(UT, 33, R);
+    k.no(map(30, 41, 33, AT + 0x1000, 0, 1, R), Error::Denied);
+    k.no(map(30, 41, IMAGE, AT + 0x1000, 0, 1, R), Error::Invalid);
+    // Judged right after its three checks, before the plain arguments.
+    k.no(map(30, 41, IMAGE, AT + 1, 0, 9, X), Error::Invalid);
+}
+
+#[test]
+fn start_up_aspace_takes_no_untyped_and_uses_its_reserve() {
+    let mut k = K::new();
+    k.small(1, 40);
+    k.no(map(START, 40, UT, AT, 0, 1, R), Error::Invalid);
+    // The reserve of 4 tables: a new 512 GB region needs three.
+    k.ok(map(START, 40, 0, 1 << 39, 0, 1, R));
+    assert_eq!(k.at(1 << 39), Some(R));
+    // Another region needs three more: no memory, and nothing is taken.
+    k.small(1, 41);
+    k.no(map(START, 41, 0, 2 << 39, 0, 1, R), Error::NoMemory);
+    // One more 2 MB region in the first: one table, from the reserve.
+    k.ok(map(START, 41, 0, (1 << 39) + (2 << 20), 0, 1, R));
+}
+
+#[test]
+fn plain_arguments_of_aspace_map_are_judged_in_order() {
+    let (mut k, _) = with_aspace();
+    k.frame(UT, PageSize::Size2M, 2, MemoryType::WriteBack, 40);
+    let page = 2 * MB;
+    // The address is a multiple of the frame's page size.
+    k.no(map(30, 40, UT, AT + 0x1000, 0, 1, R), Error::Invalid);
+    // The first page is in the frame.
+    k.no(map(30, 40, UT, AT, 2, 1, R), Error::Invalid);
+    // The page count is at least 1 and stays in the frame.
+    k.no(map(30, 40, UT, AT, 0, 0, R), Error::Invalid);
+    k.no(map(30, 40, UT, AT, 1, 2, R), Error::Invalid);
+    // The range lies inside the user range.
+    let end = 255 << 39;
+    k.no(map(30, 40, UT, end - page, 0, 2, R), Error::Invalid);
+    k.ok(map(30, 40, UT, end - 2 * page, 0, 2, R));
+    // The range before the rights: a bad range with rights the frame has
+    // not.
+    k.ok(Syscall::ASpaceUnmap(s(40)));
+    k.derive(40, 41, R);
+    k.no(map(30, 41, UT, AT + 1, 0, 1, rw()), Error::Invalid);
+}
+
+#[test]
+fn rights_of_a_mapping_are_read_and_write_or_execute_within_the_frame_s() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    for word in [
+        W,
+        W.union(X),
+        R.union(W).union(X),
+        Rights::SEND,
+        Rights::NONE,
+    ] {
+        k.no(map(30, 40, UT, AT, 0, 1, word), Error::Invalid);
+    }
+    k.derive(40, 41, R.union(X));
+    k.no(map(30, 41, UT, AT, 0, 1, rw()), Error::Denied);
+    k.ok(map(30, 41, UT, AT, 0, 1, R.union(X)));
+    assert_eq!(k.m.translated(k.t, AT), None);
+}
+
+#[test]
+fn plain_arguments_come_before_the_state() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.no(map(30, 40, UT, AT + 1, 0, 1, R), Error::Invalid);
+    k.no(map(30, 40, UT, AT, 0, 1, R), Error::Busy);
+}
+
+#[test]
+fn full_record_is_busy_even_for_this_aspace() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.no(map(30, 40, UT, AT + 0x1000, 0, 1, R), Error::Busy);
+    // The binding of a message page is a full record too.
+    k.no(
+        map(30, START_SLOT_MESSAGE_PAGE, UT, AT + 0x1000, 0, 1, R),
+        Error::Busy,
+    );
+}
+
+#[test]
+fn translated_address_of_any_page_size_is_busy() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.small(1, 41);
+    k.frame(UT, PageSize::Size2M, 1, MemoryType::WriteBack, 42);
+    k.frame(UT, PageSize::Size2M, 1, MemoryType::WriteBack, 43);
+    k.ok(map(30, 40, UT, AT + 0x5000, 0, 1, R));
+    // A 2 MB page over a 4 KB one.
+    k.no(map(30, 42, UT, AT, 0, 1, R), Error::Busy);
+    k.ok(map(30, 42, UT, AT + 2 * MB, 0, 1, R));
+    // A 4 KB page inside a 2 MB one, and the same page twice.
+    k.no(map(30, 41, UT, AT + 2 * MB + 0x3000, 0, 1, R), Error::Busy);
+    k.no(map(30, 43, UT, AT + 2 * MB, 0, 1, R), Error::Busy);
+}
+
+#[test]
+fn tables_come_from_the_free_list_then_from_the_untyped() {
+    let (mut k, _) = with_aspace();
+    // An untyped of 16 KB that the aspace is not made from cannot help;
+    // with its own untyped exhausted, mapping needs the free list.
+    k.small(1, 40);
+    k.small(1, 41);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    // Unmapped: its three tables go to the free list.
+    k.ok(Syscall::ASpaceUnmap(s(40)));
+    // Untyped 0 supplies none, but the free list does.
+    k.ok(map(30, 41, 0, 3 << 39, 0, 1, R));
+    k.no(map(30, 40, 0, AT, 0, 1, R), Error::NoMemory);
+}
+
+#[test]
+fn tables_beyond_what_the_untyped_holds_are_no_memory_and_nothing_is_taken() {
+    let mut k = K::new();
+    // A child untyped of 16 KB: the aspace takes 8 KB, two tables are left.
+    k.retype(UT, Untyped, 1 << 14, 32);
+    k.retype(32, ASpace, 0, 30);
+    k.small(1, 40);
+    k.no(map(30, 40, 32, AT, 0, 1, R), Error::NoMemory);
+    // Nothing was taken: an endpoint and a thread of 1 KB still fit, and
+    // two lower tables would have.
+    k.retype(32, Endpoint, 0, 33);
+    k.retype(32, Thread, 0, 34);
+}
+
+#[test]
+fn tables_count_as_live_pieces_until_the_aspace_is_destroyed() {
+    let mut k = K::new();
+    k.retype(UT, Untyped, 1 << 15, 32);
+    k.retype(32, ASpace, 0, 30);
+    k.small(1, 40);
+    k.ok(map(30, 40, 32, AT, 0, 1, R));
+    k.ok(Syscall::ASpaceUnmap(s(40)));
+    // 8 KB of aspace, 12 KB of tables on its free list: 12 KB left.
+    k.retype(32, Untyped, 1 << 12, 33);
+    k.ok(Syscall::CapDelete(s(33)));
+    k.no(
+        Syscall::UntypedRetype {
+            untyped: s(32),
+            kind: Untyped,
+            size: 1 << 14,
+            page: 0,
+            memory: 0,
+            destination: s(33),
+        },
+        Error::NoMemory,
+    );
+    // The aspace destroyed, the whole untyped is free again.
+    k.ok(Syscall::CapDelete(s(30)));
+    k.retype(32, Untyped, 1 << 15, 33);
+}
+
+#[test]
+fn large_pages_map_with_the_frame_s_page_size() {
+    let (mut k, v) = with_aspace();
+    k.frame(UT, PageSize::Size2M, 1, MemoryType::WriteBack, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    assert_eq!(seen(&k, v, AT + 2 * MB - 1), Some(R));
+    assert_eq!(seen(&k, v, AT + 2 * MB), None);
+}
+
+#[test]
+fn device_frame_maps_into_an_aspace_without_exec() {
+    let (mut k, v) = with_aspace();
+    k.frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, 40);
+    k.no(map(30, 40, UT, AT, 0, 1, R.union(X)), Error::Denied);
+    k.ok(map(30, 40, UT, AT, 0, 1, rw()));
+    assert_eq!(seen(&k, v, AT), Some(rw()));
+}
+
+// aspace_unmap and aspace_protect.
+
+#[test]
+fn aspace_unmap_needs_no_right_and_succeeds_on_an_empty_record() {
+    let (mut k, v) = with_aspace();
+    k.small(1, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.derive(40, 41, Rights::NONE);
+    k.ok(Syscall::ASpaceUnmap(s(41)));
+    assert_eq!(seen(&k, v, AT), Some(R));
+    k.ok(Syscall::CapMove {
+        source: s(40),
+        destination: s(42),
+    });
+    k.ok(Syscall::ASpaceUnmap(s(42)));
+    assert_eq!(seen(&k, v, AT), None);
+    k.ok(Syscall::ASpaceUnmap(s(42)));
+}
+
+#[test]
+fn aspace_unmap_is_busy_on_an_iospace_mapping_or_a_binding() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    k.small(1, 40);
+    k.ok(iomap(30, 40, 0, 1, rw()));
+    k.no(Syscall::ASpaceUnmap(s(40)), Error::Busy);
+    k.no(
+        Syscall::ASpaceUnmap(s(START_SLOT_MESSAGE_PAGE)),
+        Error::Busy,
+    );
+    k.no(
+        Syscall::IoSpaceUnmap(s(START_SLOT_MESSAGE_PAGE_MAP)),
+        Error::Busy,
+    );
+    k.ok(Syscall::IoSpaceUnmap(s(40)));
+}
+
+#[test]
+fn aspace_unmap_checks_the_frame_slot_and_kind() {
+    let mut k = K::new();
+    k.retype(UT, Endpoint, 0, 40);
+    k.no(Syscall::ASpaceUnmap(s(40)), Error::Invalid);
+    k.no(Syscall::ASpaceUnmap(s(41)), Error::Invalid);
+}
+
+#[test]
+fn record_that_names_a_dying_aspace_is_unmapped_as_usual() {
+    let (mut k, _) = with_aspace();
+    // 33 frames mapped: destroying the aspace takes two calls.
+    for n in 0..33 {
+        k.small(1, 40 + n);
+        k.ok(map(30, 40 + n, UT, AT + 0x1000 * u64::from(n), 0, 1, R));
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    // The most recently mapped records are emptied first: the first one is
+    // still full, and is unmapped by the call.
+    k.ok(Syscall::ASpaceUnmap(s(40)));
+    k.no(map(30, 40, UT, AT, 0, 1, R), Error::Gone);
+    k.ok(Syscall::CapDelete(s(30)));
+}
+
+#[test]
+fn destroying_an_aspace_empties_its_records_most_recent_first_then_unbinds_its_threads() {
+    let (mut k, _) = with_aspace();
+    for n in 0..32 {
+        k.small(1, 40 + n);
+        k.ok(map(30, 40 + n, UT, AT + 0x1000 * u64::from(n), 0, 1, R));
+    }
+    // 32 records, one thread, the root: the first call empties the records
+    // of slots 71 down to 40, the second unbinds the thread.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.retype(UT, ASpace, 0, 32);
+    k.ok(map(32, 40, UT, AT, 0, 1, R));
+    k.ok(Syscall::CapDelete(s(30)));
+}
+
+#[test]
+fn aspace_protect_replaces_the_rights_of_the_whole_mapping() {
+    let (mut k, v) = with_aspace();
+    k.small(2, 40);
+    k.ok(map(30, 40, UT, AT, 0, 2, rw()));
+    k.ok(protect(30, 40, R));
+    assert_eq!(seen(&k, v, AT + 0x1000), Some(R));
+    // It can also add rights, and the same rights change nothing.
+    k.ok(protect(30, 40, R.union(X)));
+    k.ok(protect(30, 40, R.union(X)));
+    assert_eq!(seen(&k, v, AT), Some(R.union(X)));
+}
+
+#[test]
+fn aspace_protect_checks_the_aspace_the_frame_the_rights_then_the_record() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.small(1, 41);
+    k.retype(UT, ASpace, 0, 32);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.derive(30, 33, R);
+    k.no(protect(33, 40, R), Error::Denied);
+    k.no(protect(30, 32, R), Error::Invalid);
+    k.no(protect(30, 40, W), Error::Invalid);
+    // A record in another space, empty, or a binding.
+    k.no(protect(32, 40, R), Error::Busy);
+    k.no(protect(30, 41, R), Error::Busy);
+    k.no(protect(30, START_SLOT_MESSAGE_PAGE, R), Error::Busy);
+    // The rights before the record.
+    k.derive(41, 42, R);
+    k.no(protect(30, 42, rw()), Error::Denied);
+}
+
+// Mapping records.
+
+#[test]
+fn derived_frame_capability_has_an_empty_record_and_maps_the_same_pages_again() {
+    let (mut k, v) = with_aspace();
+    k.small(1, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, rw()));
+    k.derive(40, 41, R.union(X));
+    k.ok(map(30, 41, UT, AT + MB, 0, 1, R.union(X)));
+    assert_eq!(seen(&k, v, AT), Some(rw()));
+    assert_eq!(seen(&k, v, AT + MB), Some(R.union(X)));
+}
+
+#[test]
+fn removing_a_frame_capability_undoes_its_mapping_and_revoke_keeps_its_own() {
+    let (mut k, v) = with_aspace();
+    k.small(1, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.derive(40, 41, Rights::ALL);
+    k.ok(map(30, 41, UT, AT + MB, 0, 1, R));
+    k.ok(Syscall::CapRevoke(s(40)));
+    assert_eq!(seen(&k, v, AT + MB), None);
+    assert_eq!(seen(&k, v, AT), Some(R));
+    k.ok(Syscall::CapDelete(s(40)));
+    assert_eq!(seen(&k, v, AT), None);
+}
+
+#[test]
+fn cap_inspect_says_nothing_of_the_record() {
+    let (mut k, _) = with_aspace();
+    k.small(1, 40);
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    let inspected = Output::Inspect {
+        kind: Frame,
+        rights: Rights::ALL,
+        badge: 0,
+    };
+    assert_eq!(k.go(Syscall::CapInspect(s(40))), Ok(inspected));
+}
+
+// IOMMU.
+
+#[test]
+fn iospace_map_judges_the_page_size_first_then_the_width_and_the_rights() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    k.frame(UT, PageSize::Size1G, 1, MemoryType::WriteBack, 40);
+    // The units do not support 1 GB pages: `unsupported`, before an address
+    // that is not even aligned.
+    k.no(iomap(30, 40, 1, 1, R), Error::Unsupported);
+    k.small(1, 41);
+    k.no(iomap(30, 41, 1 << 48, 1, R), Error::Invalid);
+    for rights in [Rights::NONE, X, R.union(X)] {
+        k.no(iomap(30, 41, 0, 1, rights), Error::Invalid);
+    }
+    k.derive(41, 42, R);
+    k.no(iomap(30, 42, 0, 1, W), Error::Denied);
+    // Write only, and device memory, are accepted.
+    k.ok(iomap(30, 41, (1 << 48) - 0x1000, 1, W));
+    k.frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, 43);
+    k.ok(iomap(30, 43, 0, 1, rw()));
+}
+
+#[test]
+fn iospace_of_39_bits_has_three_levels_of_tables() {
+    let mut machine = Machine::example();
+    machine.io_width = 39;
+    let mut k = K::on(&machine);
+    k.retype(UT, Untyped, 1 << 14, 32);
+    k.retype(32, IoSpace, 0, 30);
+    k.small(1, 40);
+    // Two tables suffice: there is no level above 512 GB.
+    k.ok(Syscall::IoSpaceMap(Map {
+        space: s(30),
+        frame: s(40),
+        untyped: s(32),
+        address: 0,
+        first: 0,
+        count: 1,
+        rights: R.bits(),
+    }));
+    k.no(iomap(30, 40, 1 << 39, 1, R), Error::Invalid);
+}
+
+#[test]
+fn iospace_attach_judges_the_state_in_the_order_of_the_contract() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    k.retype(UT, IoSpace, 0, 31);
+    // Higher bits than 16 are `invalid`; a device the kernel uses `busy`.
+    k.no(attach(30, 1 << 16), Error::Invalid);
+    k.no(attach(30, 0xf8), Error::Busy);
+    k.ok(attach(30, 0x10));
+    // Attached to another iospace; to this one again.
+    k.no(attach(31, 0x10), Error::Busy);
+    k.ok(attach(30, 0x10));
+    // 16 devices at most.
+    for device in 0x11..0x20 {
+        k.ok(attach(30, device));
+    }
+    k.no(attach(30, 0x20), Error::Busy);
+    // Detaching frees the place; detaching what is not attached succeeds.
+    k.ok(attach(0, 0x10));
+    k.ok(attach(0, 0x10));
+    k.ok(attach(30, 0x20));
+}
+
+#[test]
+fn iospace_attach_needs_manage_on_the_iommu_and_on_the_iospace() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    k.derive(IOMMU, 32, R);
+    k.derive(30, 33, R);
+    let weak = |iommu, iospace| Syscall::IoSpaceAttach {
+        iommu: s(iommu),
+        iospace: s(iospace),
+        device: 0x10,
+    };
+    k.no(weak(32, 30), Error::Denied);
+    k.no(weak(IOMMU, 33), Error::Denied);
+    k.no(weak(30, 30), Error::Invalid);
+}
+
+#[test]
+fn unit_without_a_free_domain_number_is_busy() {
+    let mut machine = Machine::example();
+    machine.iommus[0].domains = 1;
+    let mut k = K::on(&machine);
+    k.retype(UT, IoSpace, 0, 30);
+    k.retype(UT, IoSpace, 0, 31);
+    k.ok(attach(30, 0x10));
+    // The second device of the same iospace needs no new number.
+    k.ok(attach(30, 0x11));
+    k.no(attach(31, 0x12), Error::Busy);
+    // The number is freed with the last device.
+    k.ok(attach(0, 0x10));
+    k.ok(attach(0, 0x11));
+    k.ok(attach(31, 0x12));
+}
+
+#[test]
+fn iospace_serves_devices_of_one_unit() {
+    let mut machine = Machine::example();
+    machine.iommus.push(IommuUnit {
+        segment: 1,
+        domains: 4,
+    });
+    let mut k = K::on(&machine);
+    // The second unit's capability is in slot 19, the untypeds follow.
+    k.retype(UT + 1, IoSpace, 0, 30);
+    k.ok(attach(30, 0x10));
+    let other = Syscall::IoSpaceAttach {
+        iommu: s(IOMMU + 1),
+        iospace: s(30),
+        device: 0x10,
+    };
+    k.no(other, Error::Busy);
+}
+
+#[test]
+fn destroying_an_iospace_detaches_its_devices_then_empties_its_records() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    k.retype(UT, IoSpace, 0, 31);
+    for device in 0x10..0x20 {
+        k.ok(attach(30, device));
+    }
+    for n in 0..17 {
+        k.small(1, 40 + n);
+        k.ok(iomap(30, 40 + n, 0x1000 * u64::from(n), 1, R));
+    }
+    // 16 devices and 16 records in the first call; the device of slot 0x10
+    // was attached first and is detached in it.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.ok(attach(31, 0x10));
+    // The first record is still full.
+    k.no(iomap(31, 40, 0, 1, R), Error::Busy);
+    k.ok(Syscall::CapDelete(s(30)));
+    k.ok(iomap(31, 40, 0, 1, R));
+}
+
+#[test]
+fn dying_iospace_is_gone_for_map_and_attach_and_its_devices_detach() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    k.ok(attach(30, 0x10));
+    for n in 0..40 {
+        k.small(1, 40 + n);
+        k.ok(iomap(30, 40 + n, 0x1000 * u64::from(n), 1, R));
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.no(iomap(30, 40, 0, 1, R), Error::Gone);
+    k.no(attach(30, 0x11), Error::Gone);
+    k.ok(attach(0, 0x10));
+}
+
+#[test]
+fn destroying_the_iommu_object_sweeps_its_identifiers_128_per_call() {
+    let mut k = K::new();
+    k.retype(UT, IoSpace, 0, 30);
+    for device in [0x10, 0x2000, 0xffff] {
+        k.ok(attach(30, device));
+    }
+    // 65,536 identifiers at 128 per call: 512 calls.
+    assert_eq!(k.done(Syscall::CapDelete(s(IOMMU)), 600), 512);
+    // The devices left the iospace: it can be destroyed in one call with
+    // nothing to detach.
+    k.ok(Syscall::CapDelete(s(30)));
+}

@@ -162,9 +162,39 @@ pub enum Syscall {
         notify: SlotAddr,
         endpoint: SlotAddr,
     },
+    /// `aspace_map`, and `iospace_map` with an `iospace` and a device
+    /// address. `rights` is the word as the caller gives it.
+    ASpaceMap(Map),
+    IoSpaceMap(Map),
+    ASpaceUnmap(SlotAddr),
+    IoSpaceUnmap(SlotAddr),
+    ASpaceProtect {
+        aspace: SlotAddr,
+        frame: SlotAddr,
+        rights: u32,
+    },
+    /// The iommu, the iospace (0 to detach), and the device identifier.
+    IoSpaceAttach {
+        iommu: SlotAddr,
+        iospace: SlotAddr,
+        device: u64,
+    },
     /// A call that this model does not make: it returns `Unsupported`. A
     /// call that has a variant above is refused here with a panic.
     Other(Call),
+}
+
+/// The arguments of `aspace_map` and `iospace_map`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Map {
+    pub space: SlotAddr,
+    pub frame: SlotAddr,
+    /// 0, or the untyped the space was created from.
+    pub untyped: SlotAddr,
+    pub address: u64,
+    pub first: u64,
+    pub count: u64,
+    pub rights: u32,
 }
 
 /// The results of a call that did not fail.
@@ -325,6 +355,17 @@ struct ASpace {
     tables: u64,
 }
 
+/// IOMMU: one unit, made by the kernel at start.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Iommu {
+    /// Its index among the units of the machine.
+    unit: usize,
+    /// The devices attached through it, and the iospace of each.
+    attached: BTreeMap<u16, ObjId>,
+    /// Once it is destroyed: the next identifier its sweep examines.
+    sweep: Option<u32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Thread {
     /// Bindings, each a link both ways: the capability space, the address
@@ -443,38 +484,49 @@ pub struct Model {
     page_sizes: u32,
     /// The `core` objects, with their node index.
     cores: BTreeMap<ObjId, u32>,
+    /// IOMMU: the devices each `iospace` serves, the most recently attached
+    /// last, each by its `iommu` and its identifier.
+    iospaces: BTreeMap<ObjId, Vec<(ObjId, u16)>>,
+    iommus: BTreeMap<ObjId, Iommu>,
     /// What the start-up state was built from.
     machine: Machine,
 }
 
-/// Whether a call has a variant of its own in `Syscall`.
-fn modelled(call: Call) -> bool {
+/// Whether a call is one that `Syscall::Other` stands for: the calls of the
+/// groups not yet specified (cores, debugging), and those this model does
+/// not make yet.
+fn other(call: Call) -> bool {
     use Call::{
-        CSpaceGrow, CapDelete, CapDerive, CapInspect, CapMove, CapRevoke, NotifyBind, Poll, Recv,
-        ReplyRecv, Send, Signal, ThreadCancel, ThreadConfigure, ThreadResume, ThreadSuspend,
-        UntypedRetype, Wait,
+        CoreStart, CoreStatus, CoreStop, DebugWrite, IrqAck, IrqBind, IrqClaim, SchedBind,
+        SchedConfigure, SchedRead, SchedSetCores, SchedUnbind, TaskAttach, TaskExempt, TaskMark,
+        TaskRead, TaskRevoke, ThreadReadRegs, ThreadWriteRegs, TimerCancel, TimerSet, TraceEmit,
+        Yield,
     };
     matches!(
         call,
-        CapDerive
-            | CapMove
-            | CapDelete
-            | CapRevoke
-            | CapInspect
-            | UntypedRetype
-            | CSpaceGrow
-            | ThreadConfigure
-            | ThreadResume
-            | ThreadSuspend
-            | ThreadCancel
-            | Call::Call
-            | Recv
-            | ReplyRecv
-            | Send
-            | Signal
-            | Wait
-            | Poll
-            | NotifyBind
+        CoreStart
+            | CoreStop
+            | CoreStatus
+            | DebugWrite
+            | TraceEmit
+            | ThreadReadRegs
+            | ThreadWriteRegs
+            | Yield
+            | SchedConfigure
+            | SchedBind
+            | SchedUnbind
+            | SchedSetCores
+            | SchedRead
+            | TimerSet
+            | TimerCancel
+            | IrqClaim
+            | IrqBind
+            | IrqAck
+            | TaskExempt
+            | TaskAttach
+            | TaskMark
+            | TaskRevoke
+            | TaskRead
     )
 }
 
@@ -620,6 +672,20 @@ impl Model {
             Syscall::Wait(notify, _) => self.wait(thread, notify, ipc::IfZero::Wait),
             Syscall::Poll(notify) => self.wait(thread, notify, ipc::IfZero::WouldWait),
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
+            Syscall::ASpaceMap(map) => self.aspace_map(thread, map, ObjectKind::ASpace),
+            Syscall::IoSpaceMap(map) => self.aspace_map(thread, map, ObjectKind::IoSpace),
+            Syscall::ASpaceUnmap(frame) => self.unmap(thread, frame, ObjectKind::ASpace),
+            Syscall::IoSpaceUnmap(frame) => self.unmap(thread, frame, ObjectKind::IoSpace),
+            Syscall::ASpaceProtect {
+                aspace,
+                frame,
+                rights,
+            } => self.aspace_protect(thread, aspace, frame, rights),
+            Syscall::IoSpaceAttach {
+                iommu,
+                iospace,
+                device,
+            } => self.iospace_attach(thread, iommu, iospace, device),
             // The calls not yet made by this model, and those of the groups
             // not yet specified (cores, debugging), return `unsupported` as
             // soon as the capability space of the caller is found, before
@@ -627,7 +693,7 @@ impl Model {
             // capability space is dying or destroyed gets `gone` from these
             // calls as from every other.
             Syscall::Other(call) => {
-                assert!(!modelled(call), "{call:?} has its own variant of `Syscall`");
+                assert!(other(call), "{call:?} has its own variant of `Syscall`");
                 self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
                 Err(Error::Unsupported)
             }

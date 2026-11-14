@@ -14,3 +14,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [workspace.lints.clippy]
 wildcard_imports = "warn"
 fn_params_excessive_bools = "warn"
+
+# The random tests of the model check every invariant after millions of
+# calls: optimized, `verify` runs them in seconds instead of minutes.
+[profile.dev.package.dodos-model]
+opt-level = 2

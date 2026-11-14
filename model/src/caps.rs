@@ -1,5 +1,6 @@
 //! Capabilities and objects: the derivation tree, removal, object creation.
 
+use crate::memory::DEVICE_IDS;
 use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
     Place, Record, ReplyState, Slot, Sweep, Thread, Untyped, live,
@@ -62,6 +63,16 @@ enum Swept {
     /// No slot is left to examine, or the capability is no root of a space.
     Empty,
     /// The slots that the call may still examine ran out.
+    OutOfBudget,
+}
+
+/// What `Model::undo` did with one unit of a removal step.
+enum Undone {
+    /// It undid one link to the object.
+    Unit,
+    /// Nothing is left to undo.
+    Nothing,
+    /// The identifiers that the call may still examine ran out.
     OutOfBudget,
 }
 
@@ -449,6 +460,12 @@ impl Model {
             ObjectKind::ASpace => {
                 self.aspaces.insert(id, ASpace::default());
             }
+            // IOMMU: an iospace has tables and records as an aspace has,
+            // and the devices it serves.
+            ObjectKind::IoSpace => {
+                self.aspaces.insert(id, ASpace::default());
+                self.iospaces.insert(id, Vec::new());
+            }
             ObjectKind::Thread => {
                 // Threads: a new thread is suspended and bound to nothing.
                 // Register calls: the block of a new thread is all zeros, except
@@ -564,8 +581,12 @@ impl Model {
             // What else destruction undoes (D-110): after the waiting threads
             // are woken, and for a `cspace` after its sweep, each link to the
             // object is undone before the root capability is removed.
-            if self.rooted(next).is_some_and(|object| self.undo(object)) {
-                continue;
+            if let Some(object) = self.rooted(next) {
+                match self.undo(object, &mut slots) {
+                    Undone::Unit => continue,
+                    Undone::OutOfBudget => return Err(Error::Again),
+                    Undone::Nothing => {}
+                }
             }
             // Slots and addresses: `cap_delete` acts on the slot it names,
             // which becomes empty; a capability removed by someone else
@@ -693,14 +714,14 @@ impl Model {
     /// What else destruction undoes (D-110): undoes one link to an object
     /// whose root capability is the next to remove, most recently made
     /// first, and says whether there was one.
-    fn undo(&mut self, object: ObjId) -> bool {
+    fn undo(&mut self, object: ObjId, slots: &mut usize) -> Undone {
         let last = |list: &Vec<ObjId>| list.last().copied();
         match self.objects[&object].kind {
             // The threads bound to a `cspace`, an `aspace` or an endpoint (as
             // their fault endpoint) are unbound.
             ObjectKind::CSpace => match last(&self.cspaces[&object].threads) {
                 Some(thread) => self.bind_space(thread, None),
-                None => return false,
+                None => return Undone::Nothing,
             },
             // Destruction of an address space: first the record of each
             // capability in its list is emptied, most recently mapped first,
@@ -710,16 +731,48 @@ impl Model {
                 match (aspace.records.last().copied(), last(&aspace.threads)) {
                     (Some(cap), _) => self.empty_mapping(cap),
                     (None, Some(thread)) => self.bind_aspace(thread, None),
-                    (None, None) => return false,
+                    (None, None) => return Undone::Nothing,
                 }
             }
             ObjectKind::Endpoint => match last(&self.endpoints[&object].threads) {
                 Some(thread) => self.bind_fault(thread, None),
-                None => return false,
+                None => return Undone::Nothing,
             },
-            _ => return false,
+            // IOMMU: the destruction of an iospace first detaches each of its
+            // devices, most recently attached first, then empties each record
+            // of its list, most recently mapped first.
+            ObjectKind::IoSpace => {
+                let device = self.iospaces[&object].last().copied();
+                match (device, self.aspaces[&object].records.last().copied()) {
+                    (Some((iommu, device)), _) => self.detach(iommu, device),
+                    (None, Some(cap)) => self.empty_mapping(cap),
+                    (None, None) => return Undone::Nothing,
+                }
+            }
+            // Destroying an `iommu` object detaches the devices attached
+            // through it, in increasing order of identifier, examining at
+            // most 128 identifiers per step (the budgets of a sweep). An
+            // identifier counts as examined when the sweep moves past it.
+            ObjectKind::Iommu => loop {
+                let unit = live(&mut self.iommus, object);
+                let next = unit.sweep.get_or_insert(0);
+                if *next == DEVICE_IDS {
+                    return Undone::Nothing;
+                }
+                let Some(left) = slots.checked_sub(1) else {
+                    return Undone::OutOfBudget;
+                };
+                *slots = left;
+                let device = *next as u16;
+                *next += 1;
+                if unit.attached.contains_key(&device) {
+                    self.detach(object, device);
+                    break;
+                }
+            },
+            _ => return Undone::Nothing,
         }
-        true
+        Undone::Unit
     }
 
     /// Removes a capability that has no descendant, and leaves `left` in
@@ -772,8 +825,22 @@ impl Model {
             ObjectKind::Frame => {
                 self.frames.remove(&id);
             }
-            ObjectKind::ASpace => {
-                self.aspaces.remove(&id);
+            // Destruction of an address space: its own memory and all its
+            // tables, hooked or free, stop counting as live pieces of the
+            // untyped, in the same step.
+            ObjectKind::ASpace | ObjectKind::IoSpace => {
+                let space = self.aspaces.remove(&id).expect("names a live entry");
+                self.iospaces.remove(&id);
+                for untyped in object
+                    .from
+                    .iter()
+                    .flat_map(|from| [*from].repeat(space.tables as usize))
+                {
+                    self.release(untyped);
+                }
+            }
+            ObjectKind::Iommu => {
+                self.iommus.remove(&id);
             }
             ObjectKind::Endpoint => {
                 let endpoint = self.endpoints.remove(&id).expect("names a live entry");

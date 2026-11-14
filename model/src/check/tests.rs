@@ -1235,6 +1235,8 @@ fn census_counts_what_the_state_holds() {
         deepest: 3,
         callers: 1,
         waiters: 1,
+        // Two segments, the start-up page, the message page.
+        mappings: 4,
         ..Census::default()
     };
     assert_eq!(model.census(), census);
@@ -1535,4 +1537,81 @@ fn space_with_as_many_tables_as_its_translations_hook_is_accepted() {
     let space = start_aspace(&model, at);
     live(&mut model.aspaces, space).tables = 4;
     assert_eq!(model.check(), Ok(()));
+}
+
+#[test]
+fn mapping_without_read_in_an_aspace_is_reported() {
+    let broken = spoiled(|m, at| {
+        let space = start_aspace(m, at);
+        let cap = m.aspaces[&space].records[0];
+        if let Record::Mapping(mapping) = &mut live(&mut m.caps, cap).record {
+            mapping.rights = Rights::WRITE;
+        }
+        for t in live(&mut m.aspaces, space).translations.values_mut() {
+            if t.cap == cap {
+                t.rights = Rights::WRITE;
+            }
+        }
+    });
+    assert_eq!(broken, "38: rights of a mapping");
+}
+
+/// An iospace made from the untyped, with device 0x10 of the IOMMU unit
+/// attached.
+fn with_device(m: &mut Model) -> (ObjId, ObjId) {
+    let boot = object(m, START_SLOT_THREAD);
+    let own = SlotAddr::own;
+    let retype = Syscall::UntypedRetype {
+        untyped: own(UNTYPED),
+        kind: ObjectKind::IoSpace,
+        size: 0,
+        page: 0,
+        memory: 0,
+        destination: own(60),
+    };
+    m.apply(boot, retype).unwrap();
+    let attach = Syscall::IoSpaceAttach {
+        iommu: own(18),
+        iospace: own(60),
+        device: 0x10,
+    };
+    m.apply(boot, attach).unwrap();
+    (object(m, 60), object(m, 18))
+}
+
+#[test]
+fn device_listed_by_an_iospace_but_not_attached_is_reported() {
+    let broken = spoiled(|m, _| {
+        let (_, iommu) = with_device(m);
+        live(&mut m.iommus, iommu).attached.clear();
+    });
+    assert_eq!(broken, "39: device of an iospace");
+}
+
+#[test]
+fn device_attached_but_not_listed_by_its_iospace_is_reported() {
+    let broken = spoiled(|m, _| {
+        let (iospace, _) = with_device(m);
+        live(&mut m.iospaces, iospace).clear();
+    });
+    assert_eq!(broken, "39: device of a unit");
+}
+
+#[test]
+fn device_the_kernel_uses_attached_to_an_iospace_is_reported() {
+    let broken = spoiled(|m, _| {
+        let (iospace, iommu) = with_device(m);
+        live(&mut m.iospaces, iospace).push((iommu, 0xf8));
+        live(&mut m.iommus, iommu).attached.insert(0xf8, iospace);
+    });
+    assert_eq!(broken, "39: devices of an iospace");
+}
+
+#[test]
+fn unit_with_more_domains_than_it_has_is_reported() {
+    let broken = spoiled(|m, _| {
+        with_device(m);
+        m.machine.iommus[0].domains = 0;
+    });
+    assert_eq!(broken, "39: domain numbers of a unit");
 }
