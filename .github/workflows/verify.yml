@@ -13,3 +13,29 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - run: nix develop -c ./verify
+  # Kani is not packaged in nixpkgs, so this job is the one exception to
+  # "the same command locally and in CI".
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: "0.68.0"
+          args: "-p dodos-abi"
+  # Miri and the sanitizer need a nightly compiler, which Nix does not pin
+  # here. dodos-model has no unsafe code and long random tests: it is left out.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install nightly --profile minimal --component miri
+      - run: cargo +nightly miri test --workspace --exclude dodos-model
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --lib --tests --workspace --exclude dodos-model
+        env:
+          RUSTFLAGS: -Zsanitizer=address

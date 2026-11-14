@@ -17,6 +17,8 @@ github.com/zigcc/skills at commit 2f9bf9d (MIT). Read it before writing Zig.
 `zig-tiger-style` (same source) is the Zig style of the kernel: assertions,
 bounded loops, no recursion, sizes asserted at compile time. One exception:
 `usize` is the right type for addresses and sizes of memory.
+`rust-1-100` lists what changed in Rust 1.97 to 1.100. `dodos-rust` holds
+the Rust rules of the project and is the same file in the system repository.
 
 ## Always
 
@@ -28,18 +30,14 @@ bounded loops, no recursion, sizes asserted at compile time. One exception:
 - Every system call has a bounded duration; no kernel heap; no blocking in the
   kernel.
 
-## Rust style
+## Rust
 
-- Propagate errors with `?`; no hand-written `match` that only returns the
-  error.
+The rules are in the skill `dodos-rust` (style, tests, lints, what CI runs);
+read it before writing Rust. Two more hold in this repository:
+
 - Each branch that applies a rule of the contract names the section of
   `kernel-interface.md` it applies.
-- One test per behaviour, named after the behaviour.
-- An enum instead of a `bool` parameter; no glob import (`use x::*`) outside
-  tests; no `Rc` or `Arc` unless ownership is really shared. (These three are
-  taken from the Google Rust style guide.)
-- Every crate has `[lints] workspace = true`: the workspace lints check the
-  rules above that a tool can check.
+- A pure function of `abi/` has a Kani proof (`#[cfg(kani)]`).
 
 ## Ask first
 
