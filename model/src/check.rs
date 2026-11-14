@@ -6,7 +6,6 @@ use dodos_abi::{
     ObjectKind, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
-use std::iter::successors;
 use std::mem::discriminant;
 
 /// `Err` names the invariant that fails, by its number in `Model::check`.
@@ -41,7 +40,6 @@ pub struct Census {
 impl Model {
     /// Counts what the state holds.
     pub fn census(&self) -> Census {
-        let depth = |cap: &CapId| successors(Some(*cap), |cap| self.caps[cap].parent).count();
         let root = |object: &ObjId| self.caps[&self.objects[object].root].dying;
         let dying = self.objects.iter().filter(|(id, _)| root(id));
         let copy = |cap: &&crate::Cap| cap.dying && !root(&cap.object);
@@ -52,7 +50,12 @@ impl Model {
                 .count()
         };
         Census {
-            deepest: self.caps.keys().map(depth).max().unwrap_or(0),
+            deepest: self
+                .caps
+                .keys()
+                .map(|&cap| self.depth(cap))
+                .max()
+                .unwrap_or(0),
             dying: dying.map(|(_, object)| object.kind).collect(),
             dying_copies: self.caps.values().filter(copy).count(),
             callers: waits(|wait| matches!(wait, Wait::Call { .. })),
@@ -202,8 +205,7 @@ impl Model {
             let slots = self.cspaces.get(&space).map(|space| &space.slots);
             let slot = slots.and_then(|slots| slots.get(index as usize));
             ensure(slot == Some(&Slot::Full(id)), "6: slot of a capability")?;
-            let depth = successors(Some(id), |cap| self.caps.get(cap)?.parent).count();
-            ensure(depth <= TREE_DEPTH, "20: depth of the tree")?;
+            ensure(self.depth(id) <= TREE_DEPTH, "20: depth of the tree")?;
         }
         Ok(())
     }
@@ -239,7 +241,7 @@ impl Model {
     }
 
     fn check_slots(&self) -> Check {
-        let depth = |cap: CapId| successors(Some(cap), |cap| self.caps.get(cap)?.parent).count();
+        let depth = |cap: CapId| self.depth(cap);
         for (&id, space) in &self.cspaces {
             let first = space.slots.first();
             ensure(first.is_none_or(|slot| *slot == Slot::Empty), "5: slot 0")?;

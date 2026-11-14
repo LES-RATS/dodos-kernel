@@ -251,9 +251,10 @@ impl Model {
         Ok(Output::Slots(slots as u32))
     }
 
-    /// The derivation tree: a start-up capability is at depth 1.
+    /// The derivation tree: a start-up capability is at depth 1. The walk
+    /// stops at a parent that does not exist, which `check` reports.
     pub(crate) fn depth(&self, cap: CapId) -> usize {
-        std::iter::successors(Some(cap), |cap| self.caps[cap].parent).count()
+        std::iter::successors(Some(cap), |cap| self.caps.get(cap)?.parent).count()
     }
 
     /// The derivation tree, checked with the plain arguments each time a
