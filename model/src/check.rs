@@ -60,7 +60,12 @@ impl Model {
     ///     through it;
     /// 16. a thread that waits has no outcome yet, and a thread that is not
     ///     suspended is bound to a capability space;
-    /// 17. a notify names its endpoint if and only if the endpoint names it.
+    /// 17. a notify names its endpoint if and only if the endpoint names it;
+    /// 22. no thread waits with a dying reply object, to receive or for an
+    ///     answer: a reply object whose root capability is dying is idle;
+    /// 23. a dying capability space only shrinks, so no thread in it or
+    ///     outside it was the cause of a new capability there: every
+    ///     capability it holds was created before it began to die.
     ///
     /// Memory:
     /// 18. the watermark of an untyped is within it, and is zero if and only
@@ -148,6 +153,14 @@ impl Model {
                     ensure(here, "6: capability of a full slot")?;
                 }
             }
+            let dying = self
+                .objects
+                .get(&id)
+                .and_then(|space| self.caps.get(&space.root)?.dying);
+            let older =
+                |slot: &Slot| !matches!(*slot, Slot::Full(CapId(cap)) if Some(cap) >= dying);
+            let shrinks = dying.is_none() || space.slots.iter().all(older);
+            ensure(shrinks, "23: new capability in a dying space")?;
             let slots = space.slots.len();
             let whole = slots.is_multiple_of(CSPACE_SEGMENT_SLOTS as usize);
             ensure(whole && slots <= space.max as usize, "7: segments")?;
@@ -240,6 +253,12 @@ impl Model {
         ensure(waiting == entries, "14: a waiting thread not queued")?;
 
         for (&id, state) in &self.replies {
+            let dying = self
+                .objects
+                .get(&id)
+                .and_then(|reply| self.caps.get(&reply.root)?.dying);
+            let idle = dying.is_none() || *state == ReplyState::Idle;
+            ensure(idle, "22: thread of a dying reply object")?;
             let agrees = match *state {
                 ReplyState::Idle => true,
                 ReplyState::Attached(thread) => {

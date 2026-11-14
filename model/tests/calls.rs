@@ -777,18 +777,25 @@ fn recv_with_a_dying_reply_object_is_gone_and_the_caller_stays_queued() {
 }
 
 #[test]
-fn call_is_gone_when_the_reply_object_of_the_receiver_is_dying() {
+fn marking_a_reply_object_as_dying_wakes_the_receiver_attached_to_it() {
     let mut k = K::with_ipc();
     let server = k.spawn(70);
     assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
     dying(&mut k, RP, 30);
-    k.no(call(EP, msg(1, vec![]), Range::NONE), Error::Gone);
+    assert_eq!(k.woken(server), Some(Err(Error::Gone)));
+    // So a call meets no receiver, and joins the queue.
+    assert_eq!(k.on(server, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
     assert_eq!(k.woken(server), None);
-    // `send` makes nobody wait.
-    assert_eq!(
-        k.go(send(EP, msg(2, vec![]))),
-        Ok(Output::Sent { flags: 0 })
-    );
+}
+
+#[test]
+fn marking_a_reply_object_as_dying_wakes_the_caller_it_is_armed_with() {
+    let mut k = K::with_ipc();
+    let caller = k.spawn(70);
+    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    got(k.go(recv(EP, RP, Range::NONE)));
+    dying(&mut k, RP, 30);
+    assert_eq!(k.woken(caller), Some(Err(Error::Gone)));
 }
 
 #[test]
@@ -859,24 +866,66 @@ fn waking_a_thread_counts_as_one_step_of_removal() {
     k.ok(Syscall::CapDelete(s(NT)));
 }
 
-#[test]
-fn destroying_a_cspace_removes_its_capabilities_in_index_order() {
-    let mut k = K::with_ipc();
+/// A capability space in slot 30 that holds 20 notifies, each with a copy
+/// in slots 41 to 60 of the first space, and a thread that runs in it.
+fn space_with_a_thread(k: &mut K) -> ObjId {
     k.make(CSpace, 30);
     k.go(grow(30)).unwrap();
-    for index in 1..=33 {
-        k.ok(derive(s(EP), via(30, index), Rights::ALL, 0));
+    for index in 1..=20 {
+        k.ok(retype(UT, Notify, 0, via(30, index)));
+        k.ok(derive(via(30, index), s(40 + index), Rights::ALL, 0));
     }
-    // A thread in that capability space sees what is left of it.
     k.make(Thread, 31);
     k.ok(configure(31, s(30), SlotAddr::NONE, SlotAddr::NONE));
     k.ok(Syscall::ThreadResume(s(31)));
-    let inside = k.m.object_at(k.t, s(31)).unwrap();
+    k.m.object_at(k.t, s(31)).unwrap()
+}
+
+#[test]
+fn destroying_a_cspace_removes_its_capabilities_in_index_order() {
+    let mut k = K::new();
+    space_with_a_thread(&mut k);
+    // 32 steps: the copy, then the notify, of the first 16 slots.
     k.no(Syscall::CapDelete(s(30)), Error::Again);
-    assert_eq!(k.on(inside, Syscall::CapInspect(s(32))), Err(Error::Gone));
-    assert!(k.on(inside, Syscall::CapInspect(s(33))).is_ok());
+    assert_eq!(k.kind(56), Err(Error::Gone));
+    assert_eq!(k.kind(57), Ok(Notify));
     k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(k.kind(57), Err(Error::Gone));
     assert_eq!(k.kind(30), Err(Error::Invalid));
+}
+
+#[test]
+fn thread_whose_capability_space_is_dying_gets_gone_from_every_call_but_cap_delete() {
+    let mut k = K::new();
+    let inside = space_with_a_thread(&mut k);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(k.on(inside, Syscall::CapInspect(s(20))), Err(Error::Gone));
+    assert_eq!(k.on(inside, Syscall::Signal(s(20))), Err(Error::Gone));
+    assert_eq!(
+        k.on(inside, derive(s(20), s(30), Rights::ALL, 0)),
+        Err(Error::Gone)
+    );
+    assert_eq!(k.on(inside, Syscall::Other(Call::Yield)), Err(Error::Gone));
+    // `cap_delete` works, on a full slot and on a dead one.
+    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), DONE);
+    assert_eq!(k.on(inside, Syscall::CapDelete(s(1))), DONE);
+    assert_eq!(k.kind(60), Err(Error::Gone));
+}
+
+#[test]
+fn delivery_into_a_dying_capability_space_drops_the_capabilities() {
+    let mut k = K::with_ipc();
+    space_with_a_thread(&mut k);
+    let server = k.spawn(70);
+    let range = Range {
+        first: via(30, 25),
+        count: 1,
+    };
+    assert_eq!(k.on(server, recv(EP, RP, range)), WAITS);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    let sent = k.go(send(EP, msg(5, vec![Transfer::Derive(s(NT), Rights::ALL)])));
+    assert_eq!(sent, Ok(Output::Sent { flags: DROPPED }));
+    assert_eq!(got(k.woken(server).unwrap()), (5, 0, 0, DROPPED));
 }
 
 #[test]
@@ -903,6 +952,7 @@ fn thread_whose_capability_space_is_destroyed_gets_gone_from_every_call() {
     assert!(k.can_run(other));
     assert_eq!(k.on(other, Syscall::CapInspect(s(1))), Err(Error::Gone));
     assert_eq!(k.on(other, Syscall::Other(Call::Yield)), Err(Error::Gone));
+    assert_eq!(k.on(other, Syscall::CapDelete(s(1))), Err(Error::Gone));
 }
 
 #[test]

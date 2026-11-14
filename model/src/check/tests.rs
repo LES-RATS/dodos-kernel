@@ -478,3 +478,35 @@ fn capability_held_in_a_capability_space_that_descends_from_it_is_reported() {
     });
     assert_eq!(broken, "21: removal that never ends");
 }
+
+#[test]
+fn thread_attached_to_a_dying_reply_object_is_reported() {
+    let broken = spoiled(|m, at| {
+        live(&mut m.endpoints, at.endpoint).queue.clear();
+        live(&mut m.notifies, at.notify).waiters.clear();
+        live(&mut m.endpoints, at.endpoint)
+            .queue
+            .push_back(at.waiter);
+        live(&mut m.threads, at.waiter).wait = Wait::Recv {
+            endpoint: at.endpoint,
+            reply: at.reply,
+            window: at.nowhere,
+        };
+        let caller = object(m, CALLER);
+        live(&mut m.threads, caller).wait = Wait::None;
+        *live(&mut m.replies, at.reply) = ReplyState::Attached(at.waiter);
+        let root = m.objects[&at.reply].root;
+        live(&mut m.caps, root).dying = Some(m.next_id);
+    });
+    assert_eq!(broken, "22: thread of a dying reply object");
+}
+
+#[test]
+fn capability_created_in_a_capability_space_after_it_began_to_die_is_reported() {
+    let broken = spoiled(|m, at| {
+        let root = m.objects[&at.space].root;
+        live(&mut m.caps, root).dying = Some(m.next_id);
+        m.derive(at.copy, Rights::NONE, 0, (at.space, 100));
+    });
+    assert_eq!(broken, "23: new capability in a dying space");
+}

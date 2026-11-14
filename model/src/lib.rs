@@ -192,10 +192,11 @@ struct Cap {
     /// In the order of derivation, the most recent last.
     children: Vec<CapId>,
     place: Place,
-    /// The derivation tree: set by the first step of `cap_delete` on the
-    /// capability, and on a root capability by the first step of the
-    /// destruction of its object.
-    dying: bool,
+    /// The derivation tree, Removal ends: set by the first step of
+    /// `cap_delete` on the capability, and on a root capability by the first
+    /// step of a removal that reaches it. It holds the creation number that
+    /// the next capability would have got then.
+    dying: Option<u32>,
 }
 
 /// What every object has. The state of an object that has one is in the map
@@ -461,13 +462,31 @@ impl Model {
     /// Slots and addresses: the capability space that an address is in.
     /// Through a `cspace` capability, `access` says which right is needed.
     fn space(&self, thread: ObjId, addr: SlotAddr, access: Access) -> Result<ObjId, Error> {
-        // The derivation tree: a thread whose capability space is destroyed
-        // gets `gone` from every call. (Threads: a thread that runs is bound
-        // to a capability space.)
+        let own = self.own(thread)?;
+        // Removal ends: a thread whose capability space is dying gets `gone`
+        // from every call except `cap_delete`.
+        if self.dying(own) {
+            return Err(Error::Gone);
+        }
+        self.through(own, addr, access)
+    }
+
+    /// The derivation tree: a thread whose capability space is destroyed
+    /// gets `gone` from every call. (Threads: a thread that runs is bound
+    /// to a capability space.)
+    fn own(&self, thread: ObjId) -> Result<ObjId, Error> {
+        // CONTRACT-GAP (The derivation tree): the contract excepts
+        // `cap_delete` for a destroyed capability space as for a dying one,
+        // but no slot is left to name. `cap_delete` is `gone` too.
         let bound = self.threads[&thread].cspace;
-        let own = bound
+        bound
             .filter(|own| self.cspaces.contains_key(own))
-            .ok_or(Error::Gone)?;
+            .ok_or(Error::Gone)
+    }
+
+    /// Slots and addresses: `own`, or the capability space that `via` names
+    /// in it.
+    fn through(&self, own: ObjId, addr: SlotAddr, access: Access) -> Result<ObjId, Error> {
         if addr.via() == 0 {
             return Ok(own);
         }
@@ -480,25 +499,24 @@ impl Model {
     }
 
     /// Order of checks, steps 1 and 2, the slot: `invalid` if empty or out
-    /// of range, `gone` if dead. The derivation tree: `gone` if the
-    /// capability is dying, or its object is.
+    /// of range, `gone` if dead. Removal ends: `gone` if the capability is
+    /// dying, or its object is.
     fn full(&self, cspace: ObjId, index: u32) -> Result<CapId, Error> {
         match self.cspaces[&cspace].slots.get(index as usize) {
-            Some(&Slot::Full(cap))
-                if self.caps[&cap].dying || self.dying(self.caps[&cap].object) =>
-            {
-                Err(Error::Gone)
+            Some(&Slot::Full(cap)) => {
+                let held = &self.caps[&cap];
+                let dying = held.dying.is_some() || self.dying(held.object);
+                if dying { Err(Error::Gone) } else { Ok(cap) }
             }
-            Some(&Slot::Full(cap)) => Ok(cap),
             Some(Slot::Dead) => Err(Error::Gone),
             Some(Slot::Empty) | None => Err(Error::Invalid),
         }
     }
 
-    /// The derivation tree: an object is dying from the first step of its
-    /// destruction, which makes its root capability dying.
+    /// Removal ends: an object is dying from the first step of a removal
+    /// that reaches its root capability.
     fn dying(&self, object: ObjId) -> bool {
-        self.caps[&self.objects[&object].root].dying
+        self.caps[&self.objects[&object].root].dying.is_some()
     }
 
     /// Order of checks, steps 1 and 2: the slot of a capability argument.

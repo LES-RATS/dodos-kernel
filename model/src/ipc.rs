@@ -77,13 +77,6 @@ impl Model {
         message.check()?;
         range.check()?;
         let receiver = self.receiver(endpoint);
-        // CONTRACT-GAP (The derivation tree): the caller would wait on the
-        // reply object of the thread that waits to receive, which the call
-        // does not name. If that object is dying the call is `gone`, after
-        // `busy` among the checks of the state, and nothing is delivered.
-        if receiver.is_some_and(|(_, reply, _)| self.dying(reply)) {
-            return Err(Error::Gone);
-        }
         let parcel = Parcel::new(thread, message, badge);
         match receiver {
             // IPC: a thread waits to receive.
@@ -363,9 +356,16 @@ impl Model {
     fn deliver(&mut self, parcel: Parcel, window: Window, flags: u32) -> (Delivery, u32) {
         let index = |i: usize| window.first as usize + i;
         let empty = |index: usize| {
-            let slots = self.cspaces.get(&window.cspace).map(|space| &space.slots);
+            // CONTRACT-GAP (Transfer of capabilities): the contract says
+            // that a dying capability space only shrinks, but not what a
+            // delivery does to a receiver whose range is in one. Its slots
+            // take nothing: the capabilities are dropped.
+            let space = self
+                .cspaces
+                .get(&window.cspace)
+                .filter(|_| !self.dying(window.cspace));
             // Slots and addresses: slot 0 is never used.
-            index != 0 && slots.and_then(|slots| slots.get(index)) == Some(&Slot::Empty)
+            index != 0 && space.and_then(|space| space.slots.get(index)) == Some(&Slot::Empty)
         };
         // The same checks as when the call was made, and the first slots of
         // the receiver's range are empty, one per capability.

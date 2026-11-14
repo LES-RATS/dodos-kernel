@@ -108,7 +108,9 @@ impl Model {
     }
 
     pub(crate) fn cap_delete(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
-        let space = self.space(thread, slot, Access::Write)?;
+        // Removal ends: the one call left to a thread whose capability space
+        // is dying.
+        let space = self.through(self.own(thread)?, slot, Access::Write)?;
         match self.cspaces[&space].slots.get(slot.index() as usize) {
             // Slots and addresses: `cap_delete` on a dead slot makes it
             // empty.
@@ -116,10 +118,11 @@ impl Model {
                 *self.slot((space, slot.index())) = Slot::Empty;
                 Ok(Output::Done)
             }
-            // The derivation tree: from the first step the capability is
-            // dying, and only `cap_delete` can still use it.
+            // Removal ends: from the first step the capability is dying,
+            // and only `cap_delete` can still use it.
             Some(&Slot::Full(cap)) => {
-                live(&mut self.caps, cap).dying = true;
+                let now = self.next_id;
+                live(&mut self.caps, cap).dying.get_or_insert(now);
                 self.remove(cap, Removal::DescendantsThenSelf)
             }
             Some(Slot::Empty) | None => Err(Error::Invalid),
@@ -329,7 +332,7 @@ impl Model {
             parent,
             children: Vec::new(),
             place,
-            dying: false,
+            dying: None,
         };
         self.caps.insert(id, cap);
         if let Some(parent) = parent {
@@ -404,16 +407,24 @@ impl Model {
     /// The derivation tree, the fixed order: the most recently derived child
     /// first, a capability only after all its descendants, and the root
     /// capability of a `cspace` only after the capabilities in it, in index
-    /// order. Removal ends: the objects whose root capability the walk goes
-    /// through are dying.
+    /// order. Removal ends: an object is dying from the first step of a
+    /// removal that reaches its root capability, even when that step only
+    /// removes a copy; and the step that marks a reply object wakes, with
+    /// `gone`, the thread attached to it or the caller it is armed with.
     fn next_removed(&mut self, mut cap: CapId) -> CapId {
         loop {
-            // CONTRACT-GAP (The derivation tree): the contract does not say
-            // which step is the first of the destruction of an object. It
-            // is the first step of a removal that reaches its root
-            // capability, even when that step removes a descendant.
-            if self.rooted(cap).is_some() {
-                live(&mut self.caps, cap).dying = true;
+            if let Some(object) = self.rooted(cap) {
+                let now = self.next_id;
+                live(&mut self.caps, cap).dying.get_or_insert(now);
+                let waiter = match self.replies.get(&object) {
+                    Some(&ReplyState::Attached(thread)) => Some(thread),
+                    Some(&ReplyState::Armed { caller, .. }) => Some(caller),
+                    Some(ReplyState::Idle) | None => None,
+                };
+                if let Some(waiter) = waiter {
+                    self.unlink(waiter);
+                    self.wake(waiter, Err(Error::Gone));
+                }
             }
             let child = self.caps[&cap].children.last().copied();
             match child.or_else(|| self.swept(cap)) {
@@ -440,18 +451,13 @@ impl Model {
         (self.objects[&object].root == cap).then_some(object)
     }
 
-    /// The first thread that waits on the object that `cap` is the root
+    /// The first thread in a queue of the object that `cap` is the root
     /// capability of.
     fn waiter(&self, cap: CapId) -> Option<ObjId> {
         let object = self.rooted(cap)?;
         match self.objects[&object].kind {
             ObjectKind::Endpoint => self.endpoints[&object].queue.front().copied(),
             ObjectKind::Notify => self.notifies[&object].waiters.front().copied(),
-            ObjectKind::Reply => match self.replies[&object] {
-                ReplyState::Idle => None,
-                ReplyState::Attached(thread) => Some(thread),
-                ReplyState::Armed { caller, .. } => Some(caller),
-            },
             _ => None,
         }
     }
