@@ -4079,8 +4079,12 @@ fn thread_cancel_of_a_waiter_on_a_notify_leaves_the_word_and_the_binding() {
     let (first, second) = (k.spawn(40), k.spawn(41));
     assert_eq!(k.on(first, Syscall::Wait(s(NT))), WAITS);
     assert_eq!(k.on(second, Syscall::Wait(s(NT))), WAITS);
+    // A word that is pending on another notify.
+    k.make(Notify, 30);
+    k.ok(Syscall::Signal(s(30)));
     k.ok(cancel(40));
     assert_eq!(k.woken(first), CANCELLED);
+    assert_eq!(k.go(Syscall::Poll(s(30))), Ok(Output::Word(1)));
     k.no(bind(NT, s(EP)), Error::Busy);
     // The next signal goes to the waiter that is left, then stays pending.
     k.ok(Syscall::Signal(s(NT)));
@@ -4201,4 +4205,10 @@ fn client_cancelled_in_a_call_calls_again_and_the_late_answer_is_dropped() {
         Ok(Output::Sent { flags: 0 })
     );
     assert_eq!(got(k.woken(client).unwrap()).0, 8);
+}
+
+#[test]
+#[should_panic(expected = "has its own variant")]
+fn thread_cancel_is_not_one_of_the_calls_that_are_not_modelled() {
+    let _ = K::new().go(Syscall::Other(Call::ThreadCancel));
 }
