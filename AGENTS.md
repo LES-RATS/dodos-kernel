@@ -28,6 +28,17 @@ bounded loops, no recursion, sizes asserted at compile time. One exception:
 - Every system call has a bounded duration; no kernel heap; no blocking in the
   kernel.
 
+## Rust style
+
+- Propagate errors with `?`; no hand-written `match` that only returns the
+  error.
+- Each branch that applies a rule of the contract names the section of
+  `kernel-interface.md` it applies.
+- One test per behaviour, named after the behaviour.
+- An enum instead of a `bool` parameter; no glob import (`use x::*`) outside
+  tests; no `Rc` or `Arc` unless ownership is really shared. (These three are
+  taken from the Google Rust style guide.)
+
 ## Ask first
 
 - Any change to `abi/`, to the model or to a test: these are the contract and
