@@ -1168,8 +1168,12 @@ fn outcome_of_a_wait_that_says_the_thread_waits_is_reported() {
 }
 
 #[test]
-fn outcome_of_a_wait_with_another_error_than_gone_is_reported() {
+fn outcome_of_a_wait_with_another_error_than_gone_or_cancelled_is_reported() {
     assert_eq!(with_outcome(Err(Error::Busy)), "30: outcome of a wait");
+    assert_eq!(
+        with_outcome(Err(Error::Unsupported)),
+        "30: outcome of a wait"
+    );
 }
 
 #[test]

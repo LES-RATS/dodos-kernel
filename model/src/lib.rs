@@ -120,6 +120,7 @@ pub enum Syscall {
     },
     ThreadResume(SlotAddr),
     ThreadSuspend(SlotAddr),
+    ThreadCancel(SlotAddr),
     Call {
         endpoint: SlotAddr,
         message: Message,
@@ -350,7 +351,8 @@ pub struct Model {
 fn modelled(call: Call) -> bool {
     use Call::{
         CSpaceGrow, CapDelete, CapDerive, CapInspect, CapMove, CapRevoke, NotifyBind, Poll, Recv,
-        ReplyRecv, Send, Signal, ThreadConfigure, ThreadResume, ThreadSuspend, UntypedRetype, Wait,
+        ReplyRecv, Send, Signal, ThreadCancel, ThreadConfigure, ThreadResume, ThreadSuspend,
+        UntypedRetype, Wait,
     };
     matches!(
         call,
@@ -364,6 +366,7 @@ fn modelled(call: Call) -> bool {
             | ThreadConfigure
             | ThreadResume
             | ThreadSuspend
+            | ThreadCancel
             | Call::Call
             | Recv
             | ReplyRecv
@@ -491,6 +494,7 @@ impl Model {
             } => self.thread_configure(thread, target, cspace, aspace, fault),
             Syscall::ThreadResume(target) => self.thread_resume(thread, target),
             Syscall::ThreadSuspend(target) => self.thread_suspend(thread, target),
+            Syscall::ThreadCancel(target) => self.thread_cancel(thread, target),
             Syscall::Call {
                 endpoint,
                 message,
@@ -732,6 +736,24 @@ impl Model {
     fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         live(&mut self.threads, target).suspended = true;
+        Ok(Output::Done)
+    }
+
+    /// Threads: a thread that waits is taken out of its queue and its call
+    /// returns `cancelled`; a reply object attached to it or armed with it
+    /// becomes idle. Nothing of its message moves: the capabilities it
+    /// lists are transferred only at delivery. A suspended thread stays
+    /// suspended and finds `cancelled` when it runs again.
+    fn thread_cancel(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
+        let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
+        // Threads: if the thread does not wait the call succeeds and changes
+        // nothing; nothing is remembered for its next wait. A thread whose
+        // wait is over, and that has not run since, does not wait: it keeps
+        // the outcome of that wait.
+        if self.threads[&target].wait != Wait::None {
+            self.unlink(target);
+            self.wake(target, Err(Error::Cancelled));
+        }
         Ok(Output::Done)
     }
 }

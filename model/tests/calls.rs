@@ -3571,6 +3571,7 @@ fn numbers_of_the_errors_are_those_of_the_interface() {
         Error::Budget,
         Error::WouldWait,
         Error::Unsupported,
+        Error::Cancelled,
     ];
     for (number, error) in errors.into_iter().enumerate() {
         assert_eq!(error as usize, number);
@@ -4013,4 +4014,191 @@ fn untyped_retype_checks_the_untyped_before_the_destination() {
     k.ok(Syscall::CapRevoke(s(31)));
     k.no(retype(s(30), Endpoint, 0, s(0)), Error::Gone);
     k.no(retype(s(31), Endpoint, 0, s(0)), Error::Invalid);
+}
+
+// `thread_cancel`.
+
+const CANCELLED: Option<Outcome> = Some(Err(Error::Cancelled));
+
+fn cancel(thread: u32) -> Syscall {
+    Syscall::ThreadCancel(s(thread))
+}
+
+#[test]
+fn thread_cancel_takes_a_queued_caller_out_of_the_queue() {
+    let mut k = K::with_ipc();
+    let (first, second) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(first, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    assert_eq!(k.on(second, call(EP, msg(2, vec![]), Range::NONE)), WAITS);
+    k.ok(cancel(40));
+    assert_eq!(k.woken(first), CANCELLED);
+    assert!(k.can_run(first));
+    assert_eq!(k.woken(second), None);
+    assert_eq!(got(k.go(recv(EP, RP, Range::NONE))).0, 2);
+}
+
+#[test]
+fn send_on_the_reply_object_of_a_cancelled_caller_is_would_wait() {
+    let mut k = K::with_ipc();
+    let caller = caller_with(&mut k, vec![], Range::NONE);
+    got(k.go(recv(EP, RP, Range::NONE)));
+    k.ok(cancel(40));
+    assert_eq!(k.woken(caller), CANCELLED);
+    k.no(send(RP, msg(9, vec![])), Error::WouldWait);
+    assert_eq!(k.woken(caller), CANCELLED);
+}
+
+#[test]
+fn reply_recv_on_the_reply_object_of_a_cancelled_caller_drops_the_reply() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(41);
+    let caller = caller_with(&mut k, vec![], Range::NONE);
+    got(k.on(server, recv(EP, RP, Range::NONE)));
+    k.ok(cancel(40));
+    assert_eq!(k.on(server, reply_recv(RP, msg(9, vec![]), EP)), WAITS);
+    assert_eq!(k.woken(caller), CANCELLED);
+}
+
+#[test]
+fn thread_cancel_of_a_receiver_makes_its_reply_object_idle() {
+    let mut k = K::with_ipc();
+    let (server, other) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    k.no(recv(EP, RP, Range::NONE), Error::Busy);
+    k.ok(cancel(40));
+    assert_eq!(k.woken(server), CANCELLED);
+    // No thread waits to receive, and the reply object can be used again.
+    k.no(send(EP, msg(1, vec![])), Error::WouldWait);
+    assert_eq!(k.on(other, recv(EP, RP, Range::NONE)), WAITS);
+}
+
+#[test]
+fn thread_cancel_of_a_waiter_on_a_notify_leaves_the_word_and_the_binding() {
+    let mut k = K::with_ipc();
+    k.ok(bind(NT, s(EP)));
+    let (first, second) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(first, Syscall::Wait(s(NT))), WAITS);
+    assert_eq!(k.on(second, Syscall::Wait(s(NT))), WAITS);
+    k.ok(cancel(40));
+    assert_eq!(k.woken(first), CANCELLED);
+    k.no(bind(NT, s(EP)), Error::Busy);
+    // The next signal goes to the waiter that is left, then stays pending.
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.woken(second), Some(Ok(Output::Word(1))));
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.go(Syscall::Poll(s(NT))), Ok(Output::Word(1)));
+}
+
+#[test]
+fn thread_cancel_of_a_caller_moves_none_of_the_capabilities_it_listed() {
+    let mut k = K::with_ipc();
+    k.make(Notify, 30);
+    let listed = vec![Transfer::Move(s(NT)), Transfer::Derive(s(30), Rights::ALL)];
+    let caller = caller_with(&mut k, listed, range(50, 2));
+    let before = k.m.census();
+    k.ok(cancel(40));
+    assert_eq!(k.woken(caller), CANCELLED);
+    assert_eq!(k.kind(NT), Ok(Notify));
+    assert_eq!(k.kind(50), Err(Error::Invalid));
+    // No copy of slot 30 was made: nothing is left to revoke.
+    k.ok(Syscall::CapRevoke(s(30)));
+    assert_eq!(before.callers, 1);
+    assert_eq!(k.m.census().callers, 0);
+}
+
+#[test]
+fn thread_cancel_of_a_thread_that_does_not_wait_changes_nothing_and_is_not_remembered() {
+    let mut k = K::with_ipc();
+    let other = k.spawn(40);
+    let before = k.m.clone();
+    k.ok(cancel(40));
+    assert_eq!(k.m, before);
+    assert_eq!(k.on(other, Syscall::Wait(s(NT))), WAITS);
+    assert_eq!(k.woken(other), None);
+    assert!(!k.can_run(other));
+}
+
+#[test]
+fn suspended_thread_that_is_cancelled_stays_suspended_and_finds_cancelled() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    assert_eq!(k.on(waiter, Syscall::Wait(s(NT))), WAITS);
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    k.ok(cancel(40));
+    assert!(!k.can_run(waiter));
+    assert_eq!(k.woken(waiter), CANCELLED);
+    k.ok(Syscall::ThreadResume(s(40)));
+    assert!(k.can_run(waiter));
+    assert_eq!(k.woken(waiter), CANCELLED);
+}
+
+#[test]
+fn thread_cancel_needs_manage_on_a_thread() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(30);
+    assert_eq!(k.on(waiter, Syscall::Wait(s(NT))), WAITS);
+    let no_manage = k.weak(30, 40, caps_without(Rights::MANAGE));
+    k.no(cancel(no_manage), Error::Denied);
+    k.no(cancel(EP), Error::Invalid);
+    k.no(cancel(41), Error::Invalid);
+    assert_eq!(k.woken(waiter), None);
+}
+
+#[test]
+fn thread_that_cancels_itself_does_not_wait_and_nothing_changes() {
+    let mut k = K::new();
+    let before = k.m.clone();
+    k.ok(cancel(START_SLOT_THREAD));
+    assert_eq!(k.m, before);
+}
+
+#[test]
+fn thread_cancel_by_a_thread_whose_capability_space_is_dying_is_gone() {
+    let mut k = K::new();
+    let inside = space_with_a_thread(&mut k);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(k.on(inside, cancel(20)), Err(Error::Gone));
+}
+
+#[test]
+fn thread_cancel_leaves_the_outcome_of_a_wait_that_is_already_over() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    assert_eq!(k.on(waiter, Syscall::Wait(s(NT))), WAITS);
+    k.ok(Syscall::Signal(s(NT)));
+    k.ok(cancel(40));
+    assert_eq!(k.woken(waiter), Some(Ok(Output::Word(1))));
+}
+
+#[test]
+fn outcome_of_a_cancelled_wait_is_cleared_by_the_next_call_of_the_thread() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    assert_eq!(k.on(waiter, Syscall::Wait(s(NT))), WAITS);
+    k.ok(cancel(40));
+    assert_eq!(k.on(waiter, Syscall::Poll(s(NT))), Err(Error::WouldWait));
+    assert_eq!(k.woken(waiter), None);
+}
+
+/// The intended use: a limit on a wait is built outside the kernel.
+#[test]
+fn client_cancelled_in_a_call_calls_again_and_the_late_answer_is_dropped() {
+    let mut k = K::with_ipc();
+    let (client, server) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(client, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    assert_eq!(got(k.on(server, recv(EP, RP, Range::NONE))).0, 1);
+    // The server does not answer; a second thread cancels the client.
+    k.ok(cancel(40));
+    assert_eq!(k.woken(client), CANCELLED);
+    assert_eq!(k.on(client, call(EP, msg(2, vec![]), Range::NONE)), WAITS);
+    // The late answer to the first call is dropped: the client still waits
+    // to be received, and the server receives its second call.
+    let late = k.on(server, reply_recv(RP, msg(9, vec![]), EP));
+    assert_eq!(got(late).0, 2);
+    assert_eq!(k.woken(client), None);
+    assert_eq!(
+        k.on(server, send(RP, msg(8, vec![]))),
+        Ok(Output::Sent { flags: 0 })
+    );
+    assert_eq!(got(k.woken(client).unwrap()).0, 8);
 }

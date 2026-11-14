@@ -136,8 +136,8 @@ impl Model {
     ///     suspended, that waits or that has an outcome is bound to a
     ///     capability space; what a thread is bound to is a capability
     ///     space, or is destroyed;
-    /// 30. the outcome of a wait is `gone`, a word that is not zero, or a
-    ///     message with as many words as its header states;
+    /// 30. the outcome of a wait is `gone`, `cancelled`, a word that is not
+    ///     zero, or a message with as many words as its header states;
     /// 17. a notify names its endpoint if and only if the endpoint names it;
     /// 22. no thread waits with a dying reply object, to receive or for an
     ///     answer: a reply object whose root capability is dying is idle;
@@ -436,7 +436,7 @@ impl Model {
             let idle = thread.suspended && ready && thread.outcome.is_none();
             ensure(idle || thread.cspace.is_some(), "16: bound to nothing")?;
             let outcome = match &thread.outcome {
-                None | Some(Err(Error::Gone)) => true,
+                None | Some(Err(Error::Gone | Error::Cancelled)) => true,
                 Some(Ok(Output::Word(word))) => *word != 0,
                 Some(Ok(Output::Message(delivery))) => {
                     delivery.words.len() == delivery.received.header.words()

@@ -134,6 +134,9 @@ pub enum Error {
     WouldWait = 9,
     /// Not available on this architecture or kernel version.
     Unsupported = 10,
+    /// The wait was ended by `thread_cancel` (Call reference, one core:
+    /// Errors, and Threads).
+    Cancelled = 11,
 }
 
 /// Rights carried by a capability. Deriving can only remove rights.
@@ -312,6 +315,10 @@ pub enum Call {
     CoreStatus,
     DebugWrite,
     TraceEmit,
+    /// Call reference, one core, Threads: ends the wait of a thread with
+    /// `cancelled`. It belongs to the group of the threads; it is last here
+    /// so that the calls that were there before keep their place.
+    ThreadCancel,
 }
 
 /// Header word of a message: label (bits 0-31, opaque to the kernel), number
@@ -484,6 +491,13 @@ mod tests {
         assert_eq!(Error::Gone as u64, 1);
         assert_eq!(Error::Again as u64, 2);
         assert_eq!(Error::Unsupported as u64, 10);
+        assert_eq!(Error::Cancelled as u64, 11);
+    }
+
+    #[test]
+    fn thread_cancel_comes_after_the_calls_that_were_there_before() {
+        assert_eq!(Call::TraceEmit as u32, 44);
+        assert_eq!(Call::ThreadCancel as u32, 45);
     }
 
     #[test]

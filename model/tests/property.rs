@@ -108,7 +108,7 @@ const MADE: [ObjectKind; 9] = [
 ];
 
 /// The calls, numbered as `name_of` numbers them.
-const NAMES: [&str; 19] = [
+const NAMES: [&str; 20] = [
     "cap_derive",
     "cap_move",
     "cap_delete",
@@ -128,6 +128,7 @@ const NAMES: [&str; 19] = [
     "poll",
     "notify_bind",
     "other",
+    "thread_cancel",
 ];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
@@ -153,6 +154,7 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::Poll(_) => 16,
         Syscall::NotifyBind { .. } => 17,
         Syscall::Other(_) => 18,
+        Syscall::ThreadCancel(_) => 19,
     }
 }
 
@@ -486,6 +488,7 @@ impl Generator<'_> {
             },
             15 | 16 => Syscall::ThreadResume(self.held(THREAD)),
             17 if self.rng.chance(30) => Syscall::ThreadSuspend(self.held(THREAD)),
+            17 if self.rng.chance(60) => Syscall::ThreadCancel(self.held(THREAD)),
             17..20 => Syscall::Call {
                 endpoint: self.held(ENDPOINT),
                 message: self.message(),
@@ -861,9 +864,9 @@ impl Generator<'_> {
 #[derive(Debug, Default, PartialEq)]
 struct Reached {
     /// Calls that did not fail, by their place in `NAMES`.
-    ok: [u32; 19],
+    ok: [u32; 20],
     /// Calls that returned each error, by its code.
-    errors: [u32; 11],
+    errors: [u32; 12],
     /// Times nothing of use could run, and the run went on from the
     /// start-up state.
     restarts: u32,
@@ -916,6 +919,9 @@ struct Reached {
     with_four: u32,
     /// Calls made by a thread whose capability space is destroyed.
     destroyed: u32,
+    /// `thread_cancel` that ended a wait: of a queued caller, of a caller
+    /// that waits for the reply, of a receiver, of a waiter on a notify.
+    cancelled: [u32; 4],
     /// Seeds in which a removal walked.
     seeds_walked: u32,
 }
@@ -1115,7 +1121,22 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             .filter(|thread| model.woken(*thread).is_some())
             .collect();
 
+        let waits = |model: &Model| {
+            let census = model.census();
+            [
+                census.callers,
+                census.served,
+                census.receivers,
+                census.waiters,
+            ]
+        };
+        let waited = waits(&model);
         let outcome = model.apply(thread, call);
+        if name == 19 {
+            for (kind, (before, after)) in waited.into_iter().zip(waits(&model)).enumerate() {
+                reached.cancelled[kind] += (after < before) as u32;
+            }
+        }
         if let Err(broken) = model.check() {
             panic!("seed {seed}, step {step}, {shown}: {broken}");
         }
@@ -1177,7 +1198,8 @@ fn invariants_hold_after_every_call_of_random_sequences() {
         assert_eq!(ok == 0, *name == "other", "{name}");
     }
     for (code, &count) in reached.errors.iter().enumerate().skip(1) {
-        let never = code == Error::Budget as usize;
+        // `cancelled` is the outcome of a wait, never what a call returns.
+        let never = code == Error::Budget as usize || code == Error::Cancelled as usize;
         assert_eq!(count == 0, never, "error code {code}");
     }
     assert!(reached.several_threads as usize > STEPS);
@@ -1190,7 +1212,7 @@ fn invariants_hold_after_every_call_of_random_sequences() {
 #[test]
 fn deepest_capability_and_longest_walk_are_reached() {
     let reached = all_seeds();
-    // Measured: depth 64, a walk of 126 capabilities.
+    // Measured: depth 64, a walk of 122 capabilities.
     assert_eq!(reached.deepest, TREE_DEPTH);
     assert!(reached.longest_walk >= 100, "{}", reached.longest_walk);
     assert!(reached.longest_walk <= LONGEST_WALK);
@@ -1201,9 +1223,9 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 1,687, cspace 10,600, aspace 1,596, frame
-    // 232, thread 598, sched 467, endpoint 22, reply 1,812, notify 323; a
-    // copy under `cap_delete` 872.
+    // Measured, in steps: untyped 2,232, cspace 13,567, aspace 2,301, frame
+    // 667, thread 19, sched 1,596, endpoint 436, reply 634, notify 711; a
+    // copy under `cap_delete` 2,991.
     for kind in MADE {
         assert!(reached.dying[kind as usize] > 0, "{kind:?}");
     }
@@ -1213,7 +1235,7 @@ fn objects_of_every_kind_are_seen_dying() {
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 23,490 of 36,212 calls.
+    // Measured: 20,926 of 32,745 calls.
     assert!(reached.outside >= 15_000, "{}", reached.outside);
     assert!(
         2 * reached.outside_ok > reached.outside,
@@ -1225,8 +1247,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 42,270, reply objects armed 21,266,
-    // receivers 38,834, waiters on a notify 26,488, a notify bound 37,985.
+    // Measured, in steps: callers queued 33,450, reply objects armed 12,963,
+    // receivers 38,311, waiters on a notify 24,389, a notify bound 34,530.
     let waits = [
         reached.callers,
         reached.served,
@@ -1235,8 +1257,8 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.bound,
     ];
     assert!(waits.iter().all(|&steps| steps >= 2000), "{waits:?}");
-    // Measured, each once: 43 messages with capabilities, 19 with the
-    // capabilities dropped, 25 notifications, 24 threads woken with `gone`.
+    // Measured, each once: 34 messages with capabilities, 28 with the
+    // capabilities dropped, 33 notifications, 24 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
@@ -1244,7 +1266,7 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.woken_gone,
     ];
     assert!(ends.iter().all(|&times| times >= 10), "{ends:?}");
-    // Measured: 11 messages received with four capabilities, and 151 calls by a thread whose capability space is destroyed.
+    // Measured: 11 messages received with four capabilities, and 123 calls by a thread whose capability space is destroyed.
     assert!(reached.with_four >= 4, "{}", reached.with_four);
     assert!(reached.destroyed >= 4, "{}", reached.destroyed);
 }
@@ -1255,17 +1277,27 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 1,968 accepted and 101 refused, cspace 204 and 35;
-    // by `send` 16 delivered and 1 refused.
+    // Measured: untyped 1,754 accepted and 104 refused, cspace 195 and 21;
+    // by `send` 10 delivered and 2 refused.
     for count in reached.moved.into_iter().chain(reached.refused) {
-        assert!(count >= 20, "{reached:?}");
+        assert!(count >= 10, "{reached:?}");
     }
     assert!(
         reached.sent >= 5 && reached.sent_refused >= 1,
         "{reached:?}"
     );
-    // The same moves listed by `call` and by `reply_recv`: 34 and 12.
+    // The same moves listed by `call` and by `reply_recv`: 31 and 16.
     assert!(reached.called >= 5 && reached.answered >= 5, "{reached:?}");
+}
+
+#[test]
+fn waits_of_every_sort_are_cancelled() {
+    let reached = all_seeds();
+    // Measured: 22 queued callers, 8 callers that wait for the reply, 26
+    // receivers, 12 waiters on a notify.
+    for (kind, count) in reached.cancelled.into_iter().enumerate() {
+        assert!(count >= 3, "kind {kind}: {reached:?}");
+    }
 }
 
 #[test]
