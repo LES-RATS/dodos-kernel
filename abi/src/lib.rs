@@ -47,17 +47,27 @@ pub const CSPACE_MAX_SLOTS: u32 = 1 << 20;
 /// addresses).
 pub const CSPACE_DIRECTORY_BYTES: usize = 8;
 
-/// Bytes of an `endpoint`, of a `reply` and of a `notify` (Object sizes).
+/// Bytes of the smallest `untyped` (Capabilities and objects,
+/// `untyped_retype`: a power of two, at least 4 KB).
+pub const UNTYPED_MIN_BYTES: u64 = 4096;
+/// Bytes of an `endpoint`, of a `reply`, of a `notify`, of a `timer` and of
+/// an `irq` (Object sizes).
 pub const ENDPOINT_BYTES: usize = 64;
 pub const REPLY_BYTES: usize = 64;
 pub const NOTIFY_BYTES: usize = 64;
+pub const TIMER_BYTES: usize = 64;
+pub const IRQ_BYTES: usize = 64;
+/// Bytes of a `task` (Object sizes).
+pub const TASK_BYTES: usize = 256;
 /// Bytes of a `sched` (Object sizes).
 pub const SCHED_BYTES: usize = 128;
 /// Bytes of a `thread` in the one-core reference, without the vector state
 /// area (Capabilities and objects, rules of `untyped_retype`).
 pub const THREAD_BYTES: usize = 1024;
-/// Bytes of the root table of an `aspace` (Object sizes).
+/// Bytes of the root table of an `aspace` and of an `iospace` (Object
+/// sizes).
 pub const ASPACE_BYTES: usize = 4096;
+pub const IOSPACE_BYTES: usize = 4096;
 
 /// Fixed slots of the first process. Slot 0 of every capability space is
 /// never used; the other start-up capabilities begin at `START_SLOT_FIRST`.
@@ -498,6 +508,141 @@ mod tests {
     fn thread_cancel_comes_after_the_calls_that_were_there_before() {
         assert_eq!(Call::TraceEmit as u32, 44);
         assert_eq!(Call::ThreadCancel as u32, 45);
+    }
+
+    #[test]
+    fn calls_keep_their_place() {
+        use self::Call as C;
+        use C::*;
+        let calls = [
+            CapDerive,
+            CapMove,
+            CapDelete,
+            CapRevoke,
+            CapInspect,
+            CSpaceGrow,
+            UntypedRetype,
+            ASpaceMap,
+            ASpaceUnmap,
+            ASpaceProtect,
+            C::Call,
+            ReplyRecv,
+            Recv,
+            Send,
+            Signal,
+            Wait,
+            Poll,
+            NotifyBind,
+            ThreadConfigure,
+            ThreadReadRegs,
+            ThreadWriteRegs,
+            ThreadResume,
+            ThreadSuspend,
+            Yield,
+            SchedConfigure,
+            SchedBind,
+            SchedUnbind,
+            SchedSetCores,
+            TimerSet,
+            TimerCancel,
+            IrqBind,
+            IrqAck,
+            IoSpaceMap,
+            IoSpaceUnmap,
+            IoSpaceAttach,
+            TaskCreate,
+            TaskAttach,
+            TaskMark,
+            TaskRevoke,
+            TaskRead,
+            CoreStart,
+            CoreStop,
+            CoreStatus,
+            DebugWrite,
+            TraceEmit,
+            ThreadCancel,
+        ];
+        for (number, call) in calls.into_iter().enumerate() {
+            assert_eq!(call as usize, number, "{call:?}");
+        }
+    }
+
+    #[test]
+    fn object_kinds_and_page_sizes_have_their_numbers() {
+        use ObjectKind::*;
+        let kinds = [
+            Untyped, CSpace, ASpace, Frame, Thread, Sched, Endpoint, Reply, Notify, Timer, Irq,
+            IoPorts, IoSpace, Task, Core, Debug,
+        ];
+        for (number, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(kind as usize, number, "{kind:?}");
+        }
+        let pages = [PageSize::Size4K, PageSize::Size2M, PageSize::Size1G];
+        for (number, page) in pages.into_iter().enumerate() {
+            assert_eq!(page as usize, number, "{page:?}");
+            assert_eq!(page.bytes(), 1 << (12 + 9 * number));
+        }
+    }
+
+    #[test]
+    fn header_flags_have_their_bits() {
+        assert_eq!(Header::FLAG_CAPS_DROPPED, 1);
+        assert_eq!(Header::FLAG_NOTIFICATION, 2);
+        assert_eq!(Header::FLAG_BITS, 22);
+        let top = Header::new(0, 0, 0, (1 << 22) - 1).unwrap();
+        assert_eq!(top.flags(), (1 << 22) - 1);
+        assert_eq!(top.raw() >> 63, 1);
+    }
+
+    #[test]
+    fn start_up_page_has_its_magic_and_kinds() {
+        assert_eq!(START_MAGIC, 0x0074_7353_4f64_6f44);
+        use StartKind::*;
+        let kinds = [
+            ObjectSizes,
+            Untyped,
+            Cores,
+            AcpiRoot,
+            UefiMemoryMap,
+            Framebuffer,
+            EntropySeed,
+            BootTimes,
+            CrashRecord,
+        ];
+        for (number, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(kind as usize, number, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn fields_of_the_shared_layouts_have_their_offsets() {
+        use core::mem::offset_of;
+        let received = [
+            offset_of!(Received, header),
+            offset_of!(Received, badge),
+            offset_of!(Received, marks),
+            offset_of!(Received, task),
+        ];
+        assert_eq!(received, [0, 8, 16, 24]);
+        let header = [
+            offset_of!(StartHeader, magic),
+            offset_of!(StartHeader, version),
+            offset_of!(StartHeader, entries),
+        ];
+        assert_eq!(header, [0, 8, 12]);
+        let entry = [
+            offset_of!(StartEntry, kind),
+            offset_of!(StartEntry, reserved),
+            offset_of!(StartEntry, offset),
+            offset_of!(StartEntry, len),
+        ];
+        assert_eq!(entry, [0, 4, 8, 16]);
+        let aligns = [
+            align_of::<Received>(),
+            align_of::<StartHeader>(),
+            align_of::<StartEntry>(),
+        ];
+        assert_eq!(aligns, [8, 8, 8]);
     }
 
     #[test]
