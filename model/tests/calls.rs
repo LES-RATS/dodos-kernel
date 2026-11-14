@@ -473,7 +473,7 @@ fn capability_space_given_at_start_up_never_grows() {
 #[test]
 fn cspace_grow_is_no_memory_when_the_untyped_is_exhausted() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(31)));
+    k.ok(retype(UT, Untyped, 16384, s(31)));
     k.ok(retype(s(31), CSpace, 384, s(30)));
     let from_child = grow_from(30, s(31));
     assert_eq!(k.go(from_child.clone()), Ok(Output::Slots(128)));
@@ -483,7 +483,7 @@ fn cspace_grow_is_no_memory_when_the_untyped_is_exhausted() {
 #[test]
 fn segments_go_back_to_the_untyped_when_the_cspace_is_destroyed() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(31)));
+    k.ok(retype(UT, Untyped, 16384, s(31)));
     k.ok(retype(s(31), CSpace, 128, s(30)));
     let from_child = grow_from(30, s(31));
     k.go(from_child).unwrap();
@@ -665,7 +665,7 @@ fn cap_delete_removes_the_descendants_instead_of_handing_them_up() {
 #[test]
 fn object_lives_as_long_as_its_root_capability_wherever_it_is_moved() {
     let mut k = K::new();
-    k.make(Untyped, 30);
+    k.ok(retype(UT, Untyped, 8192, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.weak(31, 32, Rights::ALL);
     k.ok(mv(s(31), s(33)));
@@ -1443,7 +1443,7 @@ fn new_capability_is_a_child_of_the_untyped_capability() {
 #[test]
 fn untyped_retype_is_no_memory_when_the_untyped_is_exhausted() {
     let mut k = K::new();
-    k.make(Untyped, 30);
+    k.ok(retype(UT, Untyped, 8192, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.no(retype(s(30), Endpoint, 0, s(32)), Error::NoMemory);
 }
@@ -1451,9 +1451,12 @@ fn untyped_retype_is_no_memory_when_the_untyped_is_exhausted() {
 #[test]
 fn memory_is_aligned_on_the_size_of_the_object() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(30)));
+    k.ok(retype(UT, Untyped, 16384, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
+    // An address space of 8 KB is aligned on 4 KB: at 4 KB, which leaves
+    // room for a directory of 4 KB at 12 KB, and nothing after it.
     k.ok(retype(s(30), ASpace, 0, s(32)));
+    k.ok(retype(s(30), CSpace, 512 * 128, s(34)));
     k.no(retype(s(30), Endpoint, 0, s(33)), Error::NoMemory);
 }
 
@@ -1469,11 +1472,15 @@ fn child_untyped_is_aligned_on_its_size() {
 #[test]
 fn kernel_object_larger_than_4_kb_is_aligned_on_4_kb() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 14, s(30)));
+    k.ok(retype(UT, Untyped, 1 << 15, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
-    // A directory of 8 KB, at 4 KB: the last 4 KB are left.
+    // A directory of 8 KB, at 4 KB, then an address space of 8 KB at 12 KB:
+    // 12 KB are left.
     k.ok(retype(s(30), CSpace, 513 * 128, s(32)));
     k.ok(retype(s(30), ASpace, 0, s(33)));
+    k.ok(retype(s(30), CSpace, 512 * 128, s(34)));
+    k.ok(retype(s(30), CSpace, 513 * 128, s(35)));
+    k.no(retype(s(30), Endpoint, 0, s(36)), Error::NoMemory);
 }
 
 #[test]
@@ -1497,7 +1504,7 @@ fn frame_is_aligned_on_its_page_size() {
 #[test]
 fn watermark_returns_to_zero_only_when_the_last_object_is_destroyed() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(30)));
+    k.ok(retype(UT, Untyped, 16384, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.ok(retype(s(30), ASpace, 0, s(32)));
     k.ok(Syscall::CapDelete(s(31)));
@@ -2757,7 +2764,7 @@ fn state_is_checked_after_every_argument() {
 #[test]
 fn cspace_grow_checks_the_untyped_then_the_maximum_then_the_memory() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(31)));
+    k.ok(retype(UT, Untyped, 16384, s(31)));
     k.ok(retype(s(31), CSpace, 128, s(30)));
     k.go(grow_from(30, s(31))).unwrap();
     // At its maximum, and its untyped is exhausted.
@@ -2769,14 +2776,14 @@ fn cspace_grow_checks_the_untyped_then_the_maximum_then_the_memory() {
 }
 
 #[test]
-fn segment_is_aligned_on_4_kb() {
+fn segment_is_aligned_on_8_kb() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 14, s(31)));
-    // The directory at 0, the segment at 4 KB, the endpoint at 8 KB, the
-    // address space at 12 KB: nothing is left.
+    k.ok(retype(UT, Untyped, 1 << 15, s(31)));
+    // The directory at 0, the segment of 8 KB at 8 KB, two address spaces
+    // at 16 KB and 24 KB: nothing is left.
     k.ok(retype(s(31), CSpace, 128, s(30)));
     k.go(grow_from(30, s(31))).unwrap();
-    k.ok(retype(s(31), Endpoint, 0, s(32)));
+    k.ok(retype(s(31), ASpace, 0, s(32)));
     k.ok(retype(s(31), ASpace, 0, s(33)));
     k.no(retype(s(31), Endpoint, 0, s(34)), Error::NoMemory);
 }
@@ -3604,11 +3611,11 @@ fn numbers_of_the_contract_are_those_of_the_interface() {
     assert_eq!((TREE_DEPTH, LONGEST_WALK), (64, 191));
     assert_eq!((REMOVAL_STEP, REMOVAL_SLOTS), (32, 128));
     assert_eq!((CSPACE_SEGMENT_SLOTS, CSPACE_MAX_SLOTS), (128, 1 << 20));
-    assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (32, 8));
+    assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (64, 8));
     assert_eq!((ENDPOINT_BYTES, REPLY_BYTES, NOTIFY_BYTES), (64, 64, 64));
-    assert_eq!((SCHED_BYTES, THREAD_BYTES, ASPACE_BYTES), (128, 1024, 4096));
+    assert_eq!((SCHED_BYTES, THREAD_BYTES, ASPACE_BYTES), (128, 1024, 8192));
     assert_eq!((TIMER_BYTES, IRQ_BYTES, TASK_BYTES), (64, 64, 256));
-    assert_eq!((IOSPACE_BYTES, UNTYPED_MIN_BYTES), (4096, 4096));
+    assert_eq!((IOSPACE_BYTES, UNTYPED_MIN_BYTES), (8192, 4096));
     let fixed = [
         START_SLOT_CSPACE,
         START_SLOT_ASPACE,
