@@ -14,6 +14,22 @@ pub(crate) enum IfZero {
     WouldWait,
 }
 
+/// A capability of the list of a message, once its slot is checked.
+#[derive(Clone, Copy)]
+enum Listed {
+    Move(CapId),
+    /// With the rights of the capability to derive.
+    Derive(CapId, Rights),
+}
+
+impl Listed {
+    fn cap(self) -> CapId {
+        match self {
+            Listed::Move(cap) | Listed::Derive(cap, _) => cap,
+        }
+    }
+}
+
 impl Message {
     /// Order of checks, step 2: the header is read right after the
     /// capability the call acts on. Beyond the limits (Messages: 64 words, 4
@@ -275,31 +291,30 @@ impl Model {
 
     /// Transfer of capabilities: the checks of the list of a message, made
     /// when the call is made and again at delivery, against what the slots
-    /// of the sender hold then. Each capability comes with the rights to
-    /// derive, or `None` to move it.
-    fn listed(
-        &self,
-        sender: ObjId,
-        transfers: &[Transfer],
-    ) -> Result<Vec<(CapId, Option<Rights>)>, Error> {
-        let mut caps = Vec::new();
+    /// of the sender hold then.
+    fn listed(&self, sender: ObjId, transfers: &[Transfer]) -> Result<Vec<Listed>, Error> {
+        let mut caps: Vec<Listed> = Vec::new();
         for transfer in transfers {
-            let (cap, rights) = match *transfer {
-                Transfer::Move(slot) => (self.cap(sender, slot, Access::Write)?, None),
+            let listed = match *transfer {
+                Transfer::Move(slot) => Listed::Move(self.cap(sender, slot, Access::Write)?),
                 Transfer::Derive(slot, rights) => {
                     let cap = self.cap(sender, slot, Access::Read)?;
-                    (cap, Some(self.caps[&cap].rights.derive(rights)?))
+                    Listed::Derive(cap, self.caps[&cap].rights.derive(rights)?)
                 }
             };
             // Transfer of capabilities: a slot listed twice is `invalid`;
             // this, then the depth of a capability to derive, are checked
             // with the slot, after its three checks and before the next
             // listed slot.
-            let twice = caps.iter().any(|&(earlier, _)| earlier == cap);
-            if twice || rights.is_some() && self.depth(cap) >= TREE_DEPTH {
+            let twice = caps.iter().any(|earlier| earlier.cap() == listed.cap());
+            let too_deep = match listed {
+                Listed::Move(_) => false,
+                Listed::Derive(cap, _) => self.depth(cap) >= TREE_DEPTH,
+            };
+            if twice || too_deep {
                 return Err(Error::Invalid);
             }
-            caps.push((cap, rights));
+            caps.push(listed);
         }
         Ok(caps)
     }
@@ -388,13 +403,12 @@ impl Model {
         // The derivation tree: a capability moved or derived by IPC into a
         // space that cannot hold it is refused at delivery, which drops the
         // capabilities.
-        let fits = |&(cap, rights): &(CapId, Option<Rights>)| {
-            let placing = if rights.is_some() {
-                Placing::Derived
-            } else {
-                Placing::Moved
+        let fits = |listed: &Listed| {
+            let placing = match listed {
+                Listed::Move(_) => Placing::Moved,
+                Listed::Derive(..) => Placing::Derived,
             };
-            self.fits(window.cspace, cap, placing).is_ok()
+            self.fits(window.cspace, listed.cap(), placing).is_ok()
         };
         let listed = self
             .listed(parcel.sender, &parcel.caps)
@@ -404,12 +418,14 @@ impl Model {
                     && (0..caps.len()).all(|i| empty(index(i)))
                     && caps.iter().all(fits)
             });
-        for (i, &(cap, rights)) in listed.iter().flatten().enumerate() {
+        for (i, &listed) in listed.iter().flatten().enumerate() {
             let place = (window.cspace, index(i) as u32);
-            match rights {
-                None => self.place(cap, place),
+            match listed {
+                Listed::Move(cap) => self.place(cap, place),
                 // A derived capability keeps its badge.
-                Some(rights) => self.derive(cap, rights, self.caps[&cap].badge, place),
+                Listed::Derive(cap, rights) => {
+                    self.derive(cap, rights, self.caps[&cap].badge, place);
+                }
             }
         }
         // If not, the words are still delivered, with the flag and a count
