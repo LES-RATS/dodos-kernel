@@ -363,6 +363,8 @@ fn reading_a_slot_through_a_cspace_capability_needs_read() {
     k.ok(retype(UT, Endpoint, 0, via(30, 5)));
     k.weak(30, 31, Rights::WRITE);
     assert_eq!(k.inspect(via(31, 5)), Err(Error::Denied));
+    assert_eq!(k.m.object_at(k.t, via(31, 5)), None);
+    assert!(k.m.object_at(k.t, via(30, 5)).is_some());
     k.no(derive(via(31, 5), s(40), Rights::ALL, 0), Error::Denied);
     k.no(Syscall::Signal(via(31, 5)), Error::Denied);
     k.ok(mv(via(31, 5), s(40)));
@@ -381,6 +383,10 @@ fn changing_a_slot_through_a_cspace_capability_needs_write() {
     k.no(mv(via(31, 5), s(40)), Error::Denied);
     k.no(Syscall::CapDelete(via(31, 5)), Error::Denied);
     k.no(Syscall::CapRevoke(via(31, 5)), Error::Denied);
+    // `derive` is not `write`.
+    k.weak(30, 32, Rights::READ.union(Rights::DERIVE));
+    k.no(Syscall::CapDelete(via(32, 5)), Error::Denied);
+    k.no(Syscall::CapRevoke(via(32, 5)), Error::Denied);
     assert_eq!(k.inspect(via(31, 5)).unwrap().0, Endpoint);
 }
 
@@ -3601,6 +3607,8 @@ fn numbers_of_the_contract_are_those_of_the_interface() {
     assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (32, 8));
     assert_eq!((ENDPOINT_BYTES, REPLY_BYTES, NOTIFY_BYTES), (64, 64, 64));
     assert_eq!((SCHED_BYTES, THREAD_BYTES, ASPACE_BYTES), (128, 1024, 4096));
+    assert_eq!((TIMER_BYTES, IRQ_BYTES, TASK_BYTES), (64, 64, 256));
+    assert_eq!((IOSPACE_BYTES, UNTYPED_MIN_BYTES), (4096, 4096));
     let fixed = [
         START_SLOT_CSPACE,
         START_SLOT_ASPACE,
@@ -4147,12 +4155,10 @@ fn thread_cancel_of_a_waiter_on_a_notify_leaves_the_word_and_the_binding() {
     let (first, second) = (k.spawn(40), k.spawn(41));
     assert_eq!(k.on(first, Syscall::Wait(s(NT), 0)), WAITS);
     assert_eq!(k.on(second, Syscall::Wait(s(NT), 0)), WAITS);
-    // A word that is pending on another notify.
-    k.make(Notify, 30);
-    k.ok(Syscall::Signal(s(30)));
     k.ok(cancel(40));
     assert_eq!(k.woken(first), CANCELLED);
-    assert_eq!(k.go(Syscall::Poll(s(30))), Ok(Output::Word(1)));
+    // The word of the notify is still 0.
+    k.no(Syscall::Poll(s(NT)), Error::WouldWait);
     k.no(bind(NT, s(EP)), Error::Busy);
     // The next signal goes to the waiter that is left, then stays pending.
     k.ok(Syscall::Signal(s(NT)));
@@ -4483,4 +4489,318 @@ fn suspended_thread_whose_number_is_cancelled_stays_suspended() {
     assert_eq!(k.woken(waiter), CANCELLED);
     k.ok(Syscall::ThreadResume(s(40)));
     assert!(k.can_run(waiter));
+}
+
+// The fifth reviews of the model.
+
+#[test]
+fn suspended_thread_cancelled_in_each_ipc_wait_stays_suspended() {
+    let mut k = K::with_ipc();
+    let (queued, served, server) = (k.spawn(40), k.spawn(41), k.spawn(42));
+    k.make(Endpoint, 30);
+    k.make(Reply, 31);
+    assert_eq!(k.on(queued, call(30, msg(1, vec![]), Range::NONE)), WAITS);
+    assert_eq!(k.on(served, call(EP, msg(2, vec![]), Range::NONE)), WAITS);
+    got(k.go(recv(EP, RP, Range::NONE)));
+    assert_eq!(k.on(server, recv(EP, 31, Range::NONE)), WAITS);
+    for slot in 40..43 {
+        k.ok(Syscall::ThreadSuspend(s(slot)));
+        k.ok(cancel(slot));
+    }
+    for thread in [queued, served, server] {
+        assert!(!k.can_run(thread));
+        assert_eq!(k.woken(thread), CANCELLED);
+    }
+    k.no(send(RP, msg(9, vec![])), Error::WouldWait);
+    k.no(send(EP, msg(9, vec![])), Error::WouldWait);
+}
+
+#[test]
+fn thread_cancel_leaves_a_message_or_gone_that_already_ended_the_wait() {
+    let mut k = K::with_ipc();
+    let (caller, waiter) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    got(k.go(recv(EP, RP, Range::NONE)));
+    k.go(send(RP, msg(9, vec![]))).unwrap();
+    k.make(Notify, 30);
+    assert_eq!(k.on(waiter, wait_on(30, 0)), WAITS);
+    k.ok(Syscall::CapDelete(s(30)));
+    k.ok(cancel(40));
+    k.ok(cancel_up_to(41, 1));
+    assert_eq!(got(k.woken(caller).unwrap()).0, 9);
+    assert_eq!(k.woken(waiter), Some(Err(Error::Gone)));
+}
+
+#[test]
+fn thread_cancel_ends_the_wait_of_a_thread_bound_to_a_dying_or_destroyed_space() {
+    let mut k = K::with_ipc();
+    space_with_a_thread(&mut k);
+    k.make(Thread, 32);
+    k.ok(configure(32, s(30), SlotAddr::NONE, SlotAddr::NONE));
+    k.ok(Syscall::ThreadResume(s(32)));
+    let threads = [31, 32].map(|slot| k.m.object_at(k.t, s(slot)).unwrap());
+    // Both wait on the notify of the first thread, through a copy in slot
+    // 21 of their space, which the sweep reaches after 40 capabilities.
+    k.ok(derive(s(NT), via(30, 21), Rights::ALL, 0));
+    for thread in threads {
+        assert_eq!(k.on(thread, wait_on(21, 0)), WAITS);
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.ok(cancel(31));
+    assert_eq!(k.woken(threads[0]), CANCELLED);
+    k.finish(Syscall::CapDelete(s(30)), 4);
+    assert_eq!(k.woken(threads[1]), None);
+    k.ok(cancel_up_to(32, 0));
+    assert_eq!(k.woken(threads[1]), CANCELLED);
+    // A thread bound to no space.
+    k.make(Thread, 33);
+    k.ok(cancel(33));
+    k.ok(cancel_up_to(33, 4));
+}
+
+#[test]
+fn thread_cancel_by_a_thread_whose_capability_space_is_destroyed_is_gone() {
+    let mut k = K::new();
+    let inside = space_with_a_thread(&mut k);
+    k.finish(Syscall::CapDelete(s(30)), 4);
+    assert_eq!(k.on(inside, cancel(20)), Err(Error::Gone));
+}
+
+#[test]
+fn thread_cancel_on_a_dying_thread_or_through_a_dying_copy_is_gone() {
+    let mut k = K::with_ipc();
+    // A thread whose root capability is under `cap_delete`.
+    k.make(Thread, 30);
+    let copy = dying(&mut k, 30, 40);
+    k.no(cancel(copy), Error::Gone);
+    k.no(cancel(30), Error::Gone);
+    // A copy under `cap_delete` of a thread that lives.
+    let waiter = k.spawn(31);
+    assert_eq!(k.on(waiter, wait_on(NT, 0)), WAITS);
+    k.weak(31, 32, Rights::ALL);
+    dying(&mut k, 32, 80);
+    k.no(cancel(32), Error::Gone);
+    assert_eq!(k.woken(waiter), None);
+    k.ok(cancel(31));
+    assert_eq!(k.woken(waiter), CANCELLED);
+}
+
+#[test]
+fn thread_cancel_takes_a_waiter_out_of_the_queue_of_a_dying_notify() {
+    let mut k = K::with_ipc();
+    let threads: Vec<ObjId> = (40..74).map(|slot| k.spawn(slot)).collect();
+    for &thread in &threads {
+        assert_eq!(k.on(thread, wait_on(NT, 0)), WAITS);
+    }
+    // 32 are woken; two wait on the dying notify.
+    k.no(Syscall::CapDelete(s(NT)), Error::Again);
+    k.ok(cancel(72));
+    assert_eq!(k.woken(threads[32]), CANCELLED);
+    k.ok(Syscall::CapDelete(s(NT)));
+    assert_eq!(k.woken(threads[32]), CANCELLED);
+    assert_eq!(k.woken(threads[33]), Some(Err(Error::Gone)));
+}
+
+#[test]
+fn thread_configure_is_busy_until_the_wait_is_cancelled_and_keeps_the_outcome() {
+    let mut k = K::with_ipc();
+    let waiter = k.spawn(40);
+    let none = SlotAddr::NONE;
+    assert_eq!(k.on(waiter, wait_on(NT, 0)), WAITS);
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    k.no(configure(40, SPACE, none, none), Error::Busy);
+    k.ok(cancel(40));
+    k.ok(configure(40, SPACE, none, none));
+    assert_eq!(k.woken(waiter), CANCELLED);
+}
+
+#[test]
+fn reply_recv_to_a_cancelled_caller_moves_none_of_the_capabilities_of_the_reply() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(41);
+    caller_with(&mut k, vec![], Range::NONE);
+    got(k.on(server, recv(EP, RP, Range::NONE)));
+    k.ok(cancel(40));
+    let answer = reply_recv(RP, msg(9, vec![Transfer::Move(s(NT))]), EP);
+    assert_eq!(k.on(server, answer), WAITS);
+    assert_eq!(k.kind(NT), Ok(Notify));
+}
+
+#[test]
+fn signal_after_the_receiver_of_a_bound_endpoint_is_cancelled_stays_pending() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(40);
+    k.ok(bind(NT, s(EP)));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    k.ok(cancel(40));
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(k.woken(server), CANCELLED);
+    assert_eq!(k.go(Syscall::Poll(s(NT))), Ok(Output::Word(1)));
+}
+
+#[test]
+fn wake_of_a_reply_object_does_not_count_as_an_examined_slot() {
+    let mut k = K::with_ipc();
+    k.ok(retype(UT, CSpace, 256, s(30)));
+    k.go(grow(30)).unwrap();
+    k.go(grow(30)).unwrap();
+    // A reply object in slot 127 with a receiver, a notify in slot 129.
+    k.ok(retype(UT, Reply, 0, via(30, 127)));
+    let server = k.spawn(70);
+    let waits = Syscall::Recv {
+        endpoint: s(EP),
+        reply: via(30, 127),
+        range: Range::NONE,
+        wait: 0,
+    };
+    assert_eq!(k.on(server, waits), WAITS);
+    k.ok(retype(UT, Notify, 0, via(30, 129)));
+    k.weak(30, 31, Rights::ALL);
+    k.ok(derive(via(30, 129), s(50), Rights::ALL, 0));
+    // Slots 1 to 128 are the 128 the call examines: the notify is found
+    // without examining a slot, and removed in the same call.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(k.woken(server), Some(Err(Error::Gone)));
+    assert_eq!(k.kind(50), Err(Error::Gone));
+    k.ok(Syscall::CapDelete(s(30)));
+}
+
+#[test]
+fn late_answer_through_a_reply_object_received_on_again_reaches_the_next_call() {
+    let mut k = K::with_ipc();
+    let (client, server) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    assert_eq!(k.on(client, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    k.ok(cancel(40));
+    // The server gives the reply object to `recv` again before it answers.
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    assert_eq!(k.on(client, call(EP, msg(2, vec![]), Range::NONE)), WAITS);
+    assert_eq!(got(k.woken(server).unwrap()).0, 2);
+    // Its answer to the first request goes to the second call.
+    let late = k.on(server, send(RP, msg(9, vec![])));
+    assert_eq!(late, Ok(Output::Sent { flags: 0 }));
+    assert_eq!(got(k.woken(client).unwrap()).0, 9);
+}
+
+/// Removal ends: "a call makes at most 32 walks, so it wakes at most 64
+/// threads". A walk that marks a reply object ends at that object or at a
+/// copy of it, never at an object with a queue: here one call wakes the
+/// receiver of the reply object, then 31 callers, 32 threads in all.
+#[test]
+fn one_call_of_a_removal_wakes_a_reply_object_s_thread_and_then_31_callers() {
+    let mut k = K::with_ipc();
+    k.make(CSpace, 30);
+    k.go(grow(30)).unwrap();
+    k.ok(retype(UT, Reply, 0, via(30, 1)));
+    k.ok(retype(UT, Endpoint, 0, via(30, 2)));
+    let server = k.spawn(39);
+    let waits = Syscall::Recv {
+        endpoint: s(EP),
+        reply: via(30, 1),
+        range: Range::NONE,
+        wait: 0,
+    };
+    assert_eq!(k.on(server, waits), WAITS);
+    let callers: Vec<ObjId> = (40..80).map(|slot| k.spawn(slot)).collect();
+    for &caller in &callers {
+        let queued = Syscall::Call {
+            endpoint: via(30, 2),
+            message: msg(1, vec![]),
+            range: Range::NONE,
+            wait: 0,
+        };
+        assert_eq!(k.on(caller, queued), WAITS);
+    }
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    let woken = callers.iter().filter(|&&caller| k.woken(caller).is_some());
+    assert_eq!(k.woken(server), Some(Err(Error::Gone)));
+    assert_eq!(woken.count(), 31);
+}
+
+#[test]
+fn recv_with_a_busy_reply_object_leaves_a_pending_notification() {
+    let mut k = K::with_ipc();
+    let (server, caller) = (k.spawn(40), k.spawn(41));
+    k.make(Endpoint, 30);
+    k.ok(bind(NT, s(EP)));
+    // Attached to a thread that waits to receive, then armed with a caller.
+    assert_eq!(k.on(server, recv(30, RP, Range::NONE)), WAITS);
+    k.ok(Syscall::Signal(s(NT)));
+    k.no(recv(EP, RP, Range::NONE), Error::Busy);
+    assert_eq!(k.on(caller, call(30, msg(1, vec![]), Range::NONE)), WAITS);
+    k.no(recv(EP, RP, Range::NONE), Error::Busy);
+    assert_eq!(k.go(Syscall::Poll(s(NT))), Ok(Output::Word(1)));
+}
+
+#[test]
+fn notification_has_label_0_no_words_no_marks_and_task_0() {
+    let mut k = K::with_ipc();
+    k.ok(bind(NT, s(EP)));
+    k.ok(Syscall::Signal(s(NT)));
+    let header = Header::new(0, 0, 0, Header::FLAG_NOTIFICATION).unwrap();
+    let received = Received {
+        header,
+        badge: 1,
+        marks: Marks::NONE,
+        task: 0,
+    };
+    let words = Vec::new();
+    let delivery = Delivery { received, words };
+    assert_eq!(
+        k.go(recv(EP, RP, Range::NONE)),
+        Ok(Output::Message(delivery))
+    );
+}
+
+#[test]
+fn rights_word_with_a_bit_that_names_no_right_is_invalid_after_its_slot() {
+    let mut k = K::with_ipc();
+    let unknown = Rights::ALL.bits() | 1 << 8;
+    let raw = |source, destination, rights| Syscall::CapDerive {
+        source,
+        destination,
+        rights,
+        badge: 0,
+    };
+    k.no(raw(s(EP), s(30), unknown), Error::Invalid);
+    k.no(raw(s(EP), s(30), 1 << 31), Error::Invalid);
+    // A source without `derive` is `denied` whatever the word.
+    let no_derive = k.weak(EP, 31, caps_without(Rights::DERIVE));
+    k.no(raw(s(no_derive), s(30), unknown), Error::Denied);
+    // The destination comes first: through a cspace capability without
+    // `write`.
+    let read_only = k.weak(START_SLOT_CSPACE, 32, Rights::READ);
+    k.no(raw(s(EP), via(read_only, 30), unknown), Error::Denied);
+    // The bit before the subset, and before the state.
+    let weak = k.weak(EP, 33, Rights::SEND.union(Rights::DERIVE));
+    k.no(raw(s(weak), s(30), unknown), Error::Invalid);
+    k.no(
+        raw(s(weak), s(30), Rights::SEND.bits() | 1 << 8),
+        Error::Invalid,
+    );
+    k.no(raw(s(EP), s(NT), unknown), Error::Invalid);
+    k.ok(raw(s(EP), s(30), Rights::ALL.bits()));
+}
+
+#[test]
+fn rights_word_of_a_listed_slot_is_judged_with_its_slot() {
+    let mut k = K::with_ipc();
+    let unknown = Rights::ALL.bits() | 1 << 8;
+    let no_derive = k.weak(NT, 30, caps_without(Rights::DERIVE));
+    k.weak(RP, 31, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(RP)));
+    let weak = k.weak(NT, 32, Rights::SEND.union(Rights::DERIVE));
+    let listing = |caps| send(EP, msg(1, caps));
+    let (bad, dead) = (Transfer::Derive(s(NT), unknown), Transfer::Move(s(31)));
+    let no_derive = Transfer::Derive(s(no_derive), unknown);
+    k.no(listing(vec![no_derive]), Error::Denied);
+    k.no(listing(vec![bad]), Error::Invalid);
+    k.no(listing(vec![bad, dead]), Error::Invalid);
+    k.no(listing(vec![dead, bad]), Error::Gone);
+    k.no(
+        listing(vec![Transfer::Derive(s(weak), unknown)]),
+        Error::Invalid,
+    );
+    let whole = Transfer::Derive(s(NT), Rights::ALL.bits());
+    k.no(listing(vec![whole]), Error::WouldWait);
 }
