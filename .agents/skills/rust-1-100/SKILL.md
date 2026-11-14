@@ -29,7 +29,7 @@ available).
 ## Breaking, or newly refused
 
 - 1.100: `box` patterns are no longer accepted. Closures capture variables used in `if let` more precisely, which can give new borrow errors. Some `Box` impls are generic over the allocator, which can give new inference errors. On x86 the "Rust" ABI now passes values in SSE registers when they are always available: never assume the Rust ABI in assembly, use `extern "C"` or `extern "custom"`.
-- 1.100: enabling SSE or AVX on a soft-float x86 target is an error. The kernel target is soft-float; vector state belongs to user threads only.
+- 1.100: enabling SSE or AVX on a soft-float x86 target is an error. Bare-metal targets such as `x86_64-unknown-none` are soft-float (from memory, to check when the target is chosen).
 - 1.100: `repr(align)` fields in a `repr(packed)` type are a deny-by-default lint.
 - 1.99: `std::i32::MAX` and the other legacy integer modules are fully deprecated: write `i32::MAX`. `#[no_mangle]` on a generic item is a hard error. References to extern statics are no longer promoted.
 - 1.99: Cargo disables incremental compilation when `CI` is set.
