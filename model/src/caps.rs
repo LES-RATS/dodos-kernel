@@ -26,6 +26,16 @@ pub(crate) enum Placing {
     Retyped(ObjectKind),
 }
 
+/// What the sweep of a dying capability space found, for `Model::swept`.
+enum Swept {
+    /// A capability still in a slot: it is removed next.
+    Holds(CapId),
+    /// No slot is left to examine, or the capability is no root of a space.
+    Empty,
+    /// The slots that the call may still examine ran out.
+    OutOfBudget,
+}
+
 /// What `cap_delete` and `cap_revoke` remove.
 #[derive(Clone, Copy, PartialEq)]
 enum Removal {
@@ -498,9 +508,10 @@ impl Model {
             }
             match self.caps[&cap].children.last() {
                 Some(&child) => cap = child,
-                None => match self.swept(cap, slots)? {
-                    Some(held) => cap = held,
-                    None => break,
+                None => match self.swept(cap, slots) {
+                    Swept::Holds(held) => cap = held,
+                    Swept::Empty => break,
+                    Swept::OutOfBudget => return None,
                 },
             }
         }
@@ -508,18 +519,17 @@ impl Model {
     }
 
     /// The first capability left in the capability space that `cap` is the
-    /// root capability of, if `cap` is one: `Some(None)` when there is none,
-    /// and `None` when the slots that the call may still examine run out.
+    /// root capability of, if `cap` is one.
     ///
     /// The derivation tree: the dying space keeps the index where the sweep
     /// stands, and a slot examined once is not examined again. A space may
     /// hold its own root capability, which is removed last.
-    fn swept(&mut self, cap: CapId, slots: &mut usize) -> Option<Option<CapId>> {
+    fn swept(&mut self, cap: CapId, slots: &mut usize) -> Swept {
         let space = self
             .rooted(cap)
             .and_then(|space| self.cspaces.get_mut(&space));
         let Some(space) = space else {
-            return Some(None);
+            return Swept::Empty;
         };
         let sweep = space.sweep.as_mut().expect("the walk marked the space");
         // The derivation tree: a slot counts as examined when the sweep
@@ -527,14 +537,17 @@ impl Model {
         // is being removed. A step may end on the slot budget alone.
         while let Some(&slot) = space.slots.get(sweep.next) {
             match slot {
-                Slot::Full(held) if held != cap => return Some(Some(held)),
+                Slot::Full(held) if held != cap => return Swept::Holds(held),
                 Slot::Full(_) | Slot::Empty | Slot::Dead => {
-                    *slots = slots.checked_sub(1)?;
+                    let Some(left) = slots.checked_sub(1) else {
+                        return Swept::OutOfBudget;
+                    };
+                    *slots = left;
                     sweep.next += 1;
                 }
             }
         }
-        Some(None)
+        Swept::Empty
     }
 
     /// The object that `cap` is the root capability of, if it is one.
