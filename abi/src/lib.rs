@@ -393,6 +393,53 @@ pub enum StartKind {
     CrashRecord = 8,
 }
 
+/// Proofs checked by Kani for every input, not for chosen examples.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn header_new_refuses_or_reads_back() {
+        let (label, words, caps, flags): (u32, usize, usize, u32) =
+            (kani::any(), kani::any(), kani::any(), kani::any());
+        match Header::new(label, words, caps, flags) {
+            Ok(h) => {
+                assert!(h.label() == label && h.words() == words);
+                assert!(h.caps() == caps && h.flags() == flags);
+                assert!(Header::from_raw(h.raw()) == Ok(h));
+            }
+            Err(_) => assert!(words > MAX_WORDS || caps > MAX_CAPS || flags >> 22 != 0),
+        }
+    }
+
+    #[kani::proof]
+    fn header_from_raw_never_exceeds_the_limits() {
+        let raw: u64 = kani::any();
+        if let Ok(h) = Header::from_raw(raw) {
+            assert!(h.words() <= MAX_WORDS && h.caps() <= MAX_CAPS && h.raw() == raw);
+        }
+    }
+
+    #[kani::proof]
+    fn derive_never_adds_a_right() {
+        let (have, wanted): (u32, u32) = (kani::any(), kani::any());
+        if let (Some(have), Some(wanted)) = (Rights::from_bits(have), Rights::from_bits(wanted)) {
+            if let Ok(got) = have.derive(wanted) {
+                assert!(got == wanted && have.contains(got) && have.contains(Rights::DERIVE));
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn slot_address_reads_back() {
+        let (via, index): (u32, u32) = (kani::any(), kani::any());
+        let a = SlotAddr::through(via, index);
+        assert!(a.via() == via && a.index() == index);
+        assert!(SlotAddr::from_raw(a.raw()) == a);
+        assert!(a.is_none() == (via == 0 && index == 0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

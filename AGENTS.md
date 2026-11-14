@@ -17,6 +17,8 @@ github.com/zigcc/skills at commit 2f9bf9d (MIT). Read it before writing Zig.
 `zig-tiger-style` (same source) is the Zig style of the kernel: assertions,
 bounded loops, no recursion, sizes asserted at compile time. One exception:
 `usize` is the right type for addresses and sizes of memory.
+`rust-1-100` lists what changed in Rust 1.97 to 1.100; read it before
+writing Rust.
 
 ## Always
 
@@ -34,7 +36,10 @@ bounded loops, no recursion, sizes asserted at compile time. One exception:
   error.
 - Each branch that applies a rule of the contract names the section of
   `kernel-interface.md` it applies.
-- One test per behaviour, named after the behaviour.
+- One test per behaviour, named after the behaviour. A bug fix comes with a
+  regression test named after its issue.
+- A pure function of `abi/` has a Kani proof (`#[cfg(kani)]`), checked in CI
+  for every input.
 - An enum instead of a `bool` parameter; no glob import (`use x::*`) outside
   tests; no `Rc` or `Arc` unless ownership is really shared. (These three are
   taken from the Google Rust style guide.)
