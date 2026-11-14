@@ -2,7 +2,7 @@
 //! valid state, breaks one thing, and returns what `check` reports.
 
 use crate::*;
-use dodos_abi::{Header, TREE_DEPTH};
+use dodos_abi::{Header, MAX_CAPS, MAX_WORDS, TREE_DEPTH};
 
 const EP: u32 = 20;
 const RP: u32 = 21;
@@ -305,20 +305,12 @@ fn object_taken_from_an_untyped_that_does_not_exist_is_reported() {
 }
 
 #[test]
-fn object_whose_root_is_not_a_child_of_its_untyped_is_reported() {
+fn object_older_than_the_untyped_it_was_taken_from_is_reported() {
     let broken = spoiled(|m, at| {
-        let place = (at.space, 100);
-        let other = m.create(
-            ObjectKind::Untyped,
-            4096,
-            Some(at.untyped_cap),
-            Rights::ALL,
-            place,
-        );
-        let other = m.caps[&other].object;
+        let other = child_untyped(m, at, 100);
         live(&mut m.objects, at.reply).from = Some(other);
     });
-    assert_eq!(broken, "11: root capability is a child of the untyped's");
+    assert_eq!(broken, "26: object older than its untyped");
 }
 
 #[test]
@@ -456,7 +448,7 @@ fn live_count_that_is_not_the_number_of_live_objects_is_reported() {
 #[test]
 fn thread_that_is_not_suspended_and_bound_to_nothing_is_reported() {
     let broken = spoiled(|m, at| live(&mut m.threads, at.ready).cspace = None);
-    assert_eq!(broken, "16: running while bound to nothing");
+    assert_eq!(broken, "16: bound to nothing");
 }
 
 #[test]
@@ -563,17 +555,16 @@ fn sweep_that_stands_at_slot_0_is_reported() {
 #[test]
 fn sweep_that_stands_beyond_the_table_is_reported() {
     let broken = spoiled(|m, at| {
-        let caps: Vec<CapId> = m.caps.keys().copied().collect();
-        for cap in caps {
-            let root = m.objects[&at.space].root;
-            if cap != root {
-                let (_, index) = m.caps[&cap].place;
-                live(&mut m.cspaces, at.space).slots[index as usize] = Slot::Dead;
-            }
-        }
-        dying_space(m, at, 129);
+        let inner = inner_space(m, at, 40);
+        let root = m.objects[&inner].root;
+        live(&mut m.caps, root).dying = true;
+        let sweep = Sweep {
+            next: 129,
+            held: Vec::new(),
+        };
+        live(&mut m.cspaces, inner).sweep = Some(sweep);
     });
-    assert_eq!(broken, "6: slot of a capability");
+    assert_eq!(broken, "27: index of the sweep");
 }
 
 #[test]
@@ -654,7 +645,7 @@ fn caller_of_a_dying_reply_object_is_reported() {
 fn watermark_above_zero_while_nothing_is_live_is_reported() {
     let broken = spoiled(|m, _| {
         let device = object(m, START_SLOT_FIRST + 1);
-        live(&mut m.untypeds, device).watermark = 1;
+        live(&mut m.untypeds, device).watermark = 8;
     });
     assert_eq!(broken, "18: watermark is zero when nothing is live");
 }
@@ -789,4 +780,367 @@ fn unknown_flag_kept_by_an_armed_reply_object_is_reported() {
         };
     });
     assert_eq!(broken, "29: range or flags of a reply object");
+}
+
+// One test for each condition of an invariant that the tests above leave
+// unguarded.
+
+/// A child untyped of the first untyped, in a slot of the first space.
+fn child_untyped(m: &mut Model, at: At, index: u32) -> ObjId {
+    let place = (at.space, index);
+    let cap = m.create(
+        ObjectKind::Untyped,
+        4096,
+        Some(at.untyped_cap),
+        Rights::ALL,
+        place,
+    );
+    live(&mut m.untypeds, at.untyped).live += 1;
+    m.caps[&cap].object
+}
+
+#[test]
+fn object_whose_root_is_not_a_child_of_its_untyped_is_reported() {
+    let broken = spoiled(|m, at| {
+        let other = child_untyped(m, at, 100);
+        let place = (at.space, 101);
+        let later = m.create(
+            ObjectKind::Notify,
+            0,
+            Some(at.untyped_cap),
+            Rights::ALL,
+            place,
+        );
+        let later = m.caps[&later].object;
+        live(&mut m.objects, later).from = Some(other);
+    });
+    assert_eq!(broken, "11: root capability is a child of the untyped's");
+}
+
+#[test]
+fn child_listed_twice_by_its_parent_is_reported() {
+    let broken = spoiled(|m, at| {
+        live(&mut m.caps, at.endpoint_cap)
+            .children
+            .insert(0, at.copy)
+    });
+    assert_eq!(broken, "1: parent lists its child once");
+}
+
+#[test]
+fn maximum_of_no_slot_is_reported() {
+    let broken = spoiled(|m, at| {
+        let inner = inner_space(m, at, 40);
+        let space = live(&mut m.cspaces, inner);
+        (space.max, space.slots) = (0, Vec::new());
+        live(&mut m.untypeds, at.untyped).live -= 1;
+    });
+    assert_eq!(broken, "7: maximum");
+}
+
+#[test]
+fn maximum_above_2_to_the_20_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).max = (1 << 20) + 128);
+    assert_eq!(broken, "7: maximum");
+}
+
+#[test]
+fn start_up_space_without_all_its_slots_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).max = 256);
+    assert_eq!(broken, "7: size of the start-up space");
+}
+
+#[test]
+fn capability_space_without_an_object_is_reported() {
+    let broken = spoiled(|m, _| {
+        let space = CSpace {
+            max: 128,
+            slots: Vec::new(),
+            sweep: None,
+        };
+        m.cspaces.insert(ObjId(u32::MAX), space);
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn untyped_without_its_state_is_reported() {
+    let broken = spoiled(|m, _| {
+        let device = object(m, START_SLOT_FIRST + 1);
+        m.untypeds.remove(&device);
+    });
+    assert_eq!(broken, "10: state of an object");
+}
+
+#[test]
+fn capability_space_without_its_state_is_reported() {
+    let broken = spoiled(|m, at| {
+        let inner = inner_space(m, at, 40);
+        m.cspaces.remove(&inner);
+    });
+    assert_eq!(broken, "10: state of an object");
+}
+
+#[test]
+fn thread_without_its_state_is_reported() {
+    let broken = spoiled(|m, _| {
+        let caller = object(m, CALLER);
+        m.threads.remove(&caller);
+    });
+    assert_eq!(broken, "10: state of an object");
+}
+
+#[test]
+fn endpoint_without_its_state_is_reported() {
+    let broken = spoiled(|m, at| {
+        m.endpoints.remove(&at.endpoint);
+    });
+    assert_eq!(broken, "10: state of an object");
+}
+
+#[test]
+fn notify_without_its_state_is_reported() {
+    let broken = spoiled(|m, at| {
+        m.notifies.remove(&at.notify);
+    });
+    assert_eq!(broken, "10: state of an object");
+}
+
+#[test]
+fn child_untyped_of_device_memory_that_is_not_device_memory_is_reported() {
+    let broken = spoiled(|m, at| {
+        let (device, from) = (
+            object(m, START_SLOT_FIRST + 1),
+            cap(m, START_SLOT_FIRST + 1),
+        );
+        let rights = Rights::ALL.without(Rights::EXEC);
+        let child = m.create(
+            ObjectKind::Untyped,
+            4096,
+            Some(from),
+            rights,
+            (at.space, 100),
+        );
+        let child = m.caps[&child].object;
+        live(&mut m.untypeds, child).device = false;
+        live(&mut m.untypeds, device).live += 1;
+    });
+    assert_eq!(broken, "25: kind on device memory");
+}
+
+#[test]
+fn object_whose_identity_was_not_given_out_is_reported() {
+    let broken = spoiled(|m, _| {
+        // The debug object, under an identity that is still to give.
+        let debug = cap(m, START_SLOT_DEBUG);
+        let old = m.caps[&debug].object;
+        let object = m.objects.remove(&old).unwrap();
+        let new = ObjId(m.next_id + 5);
+        m.objects.insert(new, object);
+        live(&mut m.caps, debug).object = new;
+    });
+    assert_eq!(broken, "26: identity");
+}
+
+#[test]
+fn root_capability_older_than_its_object_is_reported() {
+    let broken = spoiled(|m, at| {
+        // The debug capability becomes the root capability of the reply
+        // object, which is younger.
+        without_root(m, at.reply);
+        let debug = cap(m, START_SLOT_DEBUG);
+        let old = m.caps[&debug].object;
+        m.objects.remove(&old);
+        live(&mut m.caps, debug).object = at.reply;
+        live(&mut m.objects, at.reply).root = debug;
+    });
+    assert_eq!(broken, "26: root capability older than its object");
+}
+
+/// Changes the wait of the thread that waits in the queue of the endpoint.
+fn with_caller(change: impl FnOnce(&mut Parcel, &mut Window)) -> &'static str {
+    spoiled(|m, _| {
+        let caller = object(m, CALLER);
+        if let Wait::Call { parcel, window, .. } = &mut live(&mut m.threads, caller).wait {
+            change(parcel, window);
+        }
+    })
+}
+
+#[test]
+fn message_of_more_than_64_words_that_waits_is_reported() {
+    let broken = with_caller(|parcel, _| parcel.words = vec![0; MAX_WORDS + 1]);
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn message_of_more_than_4_capabilities_that_waits_is_reported() {
+    let listed = Transfer::Move(SlotAddr::own(EP));
+    let broken = with_caller(|parcel, _| parcel.caps = vec![listed; MAX_CAPS + 1]);
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn receive_range_with_slot_0_that_waits_is_reported() {
+    let broken = with_caller(|_, window| (window.first, window.count) = (0, 1));
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn receive_range_of_a_receiver_beyond_the_table_is_reported() {
+    let broken = spoiled(|m, at| {
+        let caller = object(m, CALLER);
+        live(&mut m.endpoints, at.endpoint).queue.clear();
+        live(&mut m.threads, caller).wait = Wait::None;
+        live(&mut m.notifies, at.notify).waiters.clear();
+        live(&mut m.endpoints, at.endpoint)
+            .queue
+            .push_back(at.waiter);
+        *live(&mut m.replies, at.reply) = ReplyState::Attached(at.waiter);
+        live(&mut m.threads, at.waiter).wait = Wait::Recv {
+            endpoint: at.endpoint,
+            reply: at.reply,
+            window: Window {
+                first: 127,
+                count: 2,
+                ..at.nowhere
+            },
+        };
+    });
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn receive_range_kept_by_an_armed_reply_object_beyond_the_table_is_reported() {
+    let broken = spoiled(|m, at| {
+        let caller = object(m, CALLER);
+        live(&mut m.endpoints, at.endpoint).queue.clear();
+        live(&mut m.threads, caller).wait = Wait::Reply(at.reply);
+        *live(&mut m.replies, at.reply) = ReplyState::Armed {
+            caller,
+            window: Window {
+                first: 127,
+                count: 2,
+                ..at.nowhere
+            },
+            flags: 0,
+        };
+    });
+    assert_eq!(broken, "29: range or flags of a reply object");
+}
+
+#[test]
+fn thread_that_waits_while_bound_to_nothing_is_reported() {
+    let broken = spoiled(|m, at| {
+        let waiter = live(&mut m.threads, at.waiter);
+        (waiter.suspended, waiter.cspace) = (true, None);
+    });
+    assert_eq!(broken, "16: bound to nothing");
+}
+
+#[test]
+fn thread_with_an_outcome_while_bound_to_nothing_is_reported() {
+    let broken = spoiled(|m, at| {
+        let ready = live(&mut m.threads, at.ready);
+        (ready.suspended, ready.cspace) = (true, None);
+        ready.outcome = Some(Err(Error::Gone));
+    });
+    assert_eq!(broken, "16: bound to nothing");
+}
+
+/// Gives the first thread, which does not wait, the outcome of a wait.
+fn with_outcome(outcome: Outcome) -> &'static str {
+    spoiled(|m, at| live(&mut m.threads, at.ready).outcome = Some(outcome))
+}
+
+#[test]
+fn outcome_of_a_wait_that_says_the_thread_waits_is_reported() {
+    assert_eq!(with_outcome(Ok(Output::Waits)), "30: outcome of a wait");
+}
+
+#[test]
+fn outcome_of_a_wait_with_another_error_than_gone_is_reported() {
+    assert_eq!(with_outcome(Err(Error::Busy)), "30: outcome of a wait");
+}
+
+#[test]
+fn outcome_of_a_wait_with_a_word_of_zero_is_reported() {
+    assert_eq!(with_outcome(Ok(Output::Word(0))), "30: outcome of a wait");
+}
+
+#[test]
+fn outcome_of_a_wait_whose_words_differ_from_its_header_is_reported() {
+    let header = Header::new(0, 2, 0, 0).unwrap();
+    let delivery = Delivery {
+        received: Received {
+            header,
+            badge: 0,
+            marks: dodos_abi::Marks::NONE,
+            task: 0,
+        },
+        words: vec![1],
+    };
+    let broken = with_outcome(Ok(Output::Message(delivery)));
+    assert_eq!(broken, "30: outcome of a wait");
+}
+
+#[test]
+fn watermark_that_is_not_a_multiple_of_8_bytes_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.untypeds, at.untyped).watermark += 1);
+    assert_eq!(broken, "18: watermark on 8 bytes");
+}
+
+#[test]
+fn census_counts_what_the_state_holds() {
+    let mut model = state();
+    let boot = object(&model, START_SLOT_THREAD);
+    let census = Census {
+        // The untyped, the endpoint, a copy of its capability.
+        deepest: 3,
+        callers: 1,
+        waiters: 1,
+        ..Census::default()
+    };
+    assert_eq!(model.census(), census);
+    let own = SlotAddr::own;
+    let mut on = |call: Syscall| model.apply(boot, call);
+    // The first thread receives the call and binds the notify.
+    let served = Syscall::Recv {
+        endpoint: own(EP),
+        reply: own(RP),
+        range: Range::NONE,
+    };
+    on(served).unwrap();
+    let bound = Syscall::NotifyBind {
+        notify: own(NT),
+        endpoint: own(EP),
+    };
+    on(bound).unwrap();
+    // A copy of the endpoint capability in slot 40, 33 copies of that copy
+    // and 33 more copies of the endpoint capability.
+    let copies = (41..74)
+        .map(|slot| (40, slot))
+        .chain((80..113).map(|slot| (EP, slot)));
+    for (source, destination) in [(EP, 40)].into_iter().chain(copies) {
+        let copy = Syscall::CapDerive {
+            source: own(source),
+            destination: own(destination),
+            rights: Rights::ALL,
+            badge: 0,
+        };
+        on(copy).unwrap();
+    }
+    assert_eq!(on(Syscall::CapDelete(own(40))), Err(Error::Again));
+    let census = model.census();
+    assert_eq!((census.callers, census.served, census.bound), (0, 1, 1));
+    assert_eq!((census.deepest, census.dying_copies), (4, 1));
+    assert_eq!(census.dying, []);
+    // Deleting the endpoint capability itself makes the object dying.
+    let deleted = model.apply(boot, Syscall::CapDelete(own(EP)));
+    assert_eq!(deleted, Err(Error::Again));
+    let census = model.census();
+    assert_eq!(
+        (census.dying, census.dying_copies),
+        (vec![ObjectKind::Endpoint], 0)
+    );
 }

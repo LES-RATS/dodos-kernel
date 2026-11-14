@@ -50,8 +50,11 @@ fn notification(word: u64) -> Delivery {
     }
 }
 
-/// Tasks and marks are not modelled: no mark, task 0.
+/// What the kernel sets on a received message.
 fn received(header: Header, badge: u64) -> Received {
+    // CONTRACT-GAP (Messages): the receiver gets the marks and the
+    // identifier of the sender's task, which the one-core reference does
+    // not have. Here the marks are none and the task is 0.
     Received {
         header,
         badge,
@@ -117,7 +120,8 @@ impl Model {
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let reply = self.object(thread, reply, ObjectKind::Reply, Rights::RECV)?;
         let window = self.window(thread, range)?;
-        // IPC: the reply object must be idle.
+        // IPC: the reply object must be idle, `busy` before anything is
+        // received: a pending notification stays pending.
         if self.replies[&reply] != ReplyState::Idle {
             return Err(Error::Busy);
         }
@@ -282,17 +286,15 @@ impl Model {
                 Transfer::Move(slot) => (self.cap(sender, slot, Access::Write)?, None),
                 Transfer::Derive(slot, rights) => {
                     let cap = self.cap(sender, slot, Access::Read)?;
-                    let rights = self.caps[&cap].rights.derive(rights)?;
-                    if self.depth(cap) >= TREE_DEPTH {
-                        return Err(Error::Invalid);
-                    }
-                    (cap, Some(rights))
+                    (cap, Some(self.caps[&cap].rights.derive(rights)?))
                 }
             };
             // Transfer of capabilities: a slot listed twice is `invalid`;
-            // this and the depth are checked with the slot, before the next
+            // this, then the depth of a capability to derive, are checked
+            // with the slot, after its three checks and before the next
             // listed slot.
-            if caps.iter().any(|&(earlier, _)| earlier == cap) {
+            let twice = caps.iter().any(|&(earlier, _)| earlier == cap);
+            if twice || rights.is_some() && self.depth(cap) >= TREE_DEPTH {
                 return Err(Error::Invalid);
             }
             caps.push((cap, rights));

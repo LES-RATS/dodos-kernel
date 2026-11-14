@@ -1,8 +1,8 @@
 //! Capabilities and objects: the derivation tree, removal, object creation.
 
 use crate::{
-    Access, CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place,
-    ReplyState, Slot, Sweep, Thread, Untyped, live,
+    Access, CSpace, Cap, CapId, Endpoint, LONGEST_WALK, Model, Notify, ObjId, Object, Outcome,
+    Output, Place, ReplyState, Slot, Sweep, Thread, Untyped, live,
 };
 use dodos_abi::{
     CSPACE_SEGMENT_SLOTS, Error, ObjectKind, PageSize, REMOVAL_STEP, Rights, SLOT_BYTES, SlotAddr,
@@ -55,16 +55,14 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
             size > 0 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into()) && size <= 1 << 20,
         ),
         ObjectKind::ASpace => (PAGE, size == 0),
-        // CONTRACT-GAP (Object sizes): a thread is "1 KB, plus the vector
-        // state area, whose size depends on the processor". Here it is 1 KB.
+        // Rules of `untyped_retype`: a thread in the one-core reference is
+        // 1 KB.
         ObjectKind::Thread => (1024, size == 0),
         ObjectKind::Sched => (128, size == 0),
         ObjectKind::Endpoint | ObjectKind::Reply | ObjectKind::Notify => (64, size == 0),
-        // CONTRACT-GAP (Capabilities and objects): the contract does not
-        // list the kinds that `untyped_retype` makes, nor place
-        // `unsupported` in the order of checks. The kinds outside the
-        // one-core model are `unsupported`, judged with the kind: after the
-        // rule of device memory, before the size argument.
+        // Order of checks, step 3: a kind that this version does not make,
+        // the kinds of the groups not yet specified, is `unsupported`, after
+        // the rule on device memory and before the size argument.
         _ => return Err(Error::Unsupported),
     };
     // Rules of `untyped_retype`: aligned on the size of a child untyped, on
@@ -111,10 +109,7 @@ impl Model {
         if badge != 0 && kept != 0 && badge != kept {
             return Err(Error::Denied);
         }
-        // CONTRACT-GAP (Order of checks): the depths are "checked with the
-        // plain arguments", which are judged in the order of the table, but
-        // they are no argument of the table. They come last, here and in
-        // `untyped_retype`.
+        // Order of checks, step 3: the depth checks come last.
         self.fits(place.0, parent, Placing::Derived)?;
         self.vacant(place)?;
         let badge = if kept != 0 { kept } else { badge };
@@ -199,8 +194,8 @@ impl Model {
         self.vacant(place)?;
         self.take(object, bytes, align)?;
         // Rules of `untyped_retype`: every right, but `exec` only if the
-        // untyped capability has it. Never on device memory: the start-up
-        // capability for device memory has no `exec`.
+        // untyped capability has it, and never on device memory: the
+        // start-up capabilities for device memory have no `exec`.
         let no_exec = Rights::EXEC.without(rights);
         self.create(
             kind,
@@ -462,19 +457,29 @@ impl Model {
     /// not counted in the 32 of a step.
     fn next_removed(&mut self, mut cap: CapId, slots: &mut usize) -> Option<CapId> {
         for walk in 1.. {
+            // The derivation tree: the walk is shorter than 192. Twice that
+            // is a walk that does not end: a fault of the model, not a
+            // state to report.
+            assert!(
+                walk <= 2 * LONGEST_WALK,
+                "the walk of a removal does not end"
+            );
             self.longest_walk = self.longest_walk.max(walk);
             if let Some(object) = self.rooted(cap) {
                 live(&mut self.caps, cap).dying = true;
                 if let Some(space) = self.cspaces.get_mut(&object) {
-                    // CONTRACT-GAP (The derivation tree): the contract does
-                    // not say where the sweep starts. Slot 0 is never used
-                    // and is not examined: the sweep starts at slot 1.
-                    let held = space.slots.iter().filter_map(|slot| match *slot {
-                        Slot::Full(held) => Some(held),
-                        Slot::Empty | Slot::Dead => None,
+                    // The derivation tree: the sweep of a space starts at
+                    // slot 1.
+                    space.sweep.get_or_insert_with(|| {
+                        let held = space.slots.iter().filter_map(|slot| match *slot {
+                            Slot::Full(held) => Some(held),
+                            Slot::Empty | Slot::Dead => None,
+                        });
+                        Sweep {
+                            next: 1,
+                            held: held.collect(),
+                        }
                     });
-                    let held = held.collect();
-                    space.sweep.get_or_insert(Sweep { next: 1, held });
                 }
                 let waiter = match self.replies.get(&object) {
                     Some(&ReplyState::Attached(thread)) => Some(thread),
@@ -512,11 +517,9 @@ impl Model {
             return Some(None);
         };
         let sweep = space.sweep.as_mut().expect("the walk marked the space");
-        // CONTRACT-GAP (The derivation tree): the contract does not say when
-        // a slot counts as examined. It is counted when the sweep moves past
-        // it: an empty or dead slot, or the root capability of the space
-        // itself. A full slot is not counted while its capability is being
-        // removed, and is counted once that left it dead.
+        // The derivation tree: a slot counts as examined when the sweep
+        // moves past it, so a full slot is not counted while its capability
+        // is being removed. A step may end on the slot budget alone.
         while let Some(&slot) = space.slots.get(sweep.next) {
             match slot {
                 Slot::Full(held) if held != cap => return Some(Some(held)),

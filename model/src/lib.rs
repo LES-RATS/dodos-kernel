@@ -19,6 +19,8 @@ mod caps;
 mod check;
 mod ipc;
 
+pub use check::Census;
+
 use dodos_abi::{
     CSPACE_SEGMENT_SLOTS, Call, Error, MAX_CAPS, ObjectKind, PageSize, Received, Rights,
     START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_SCHED,
@@ -145,7 +147,8 @@ pub enum Syscall {
         notify: SlotAddr,
         endpoint: SlotAddr,
     },
-    /// A call outside the one-core model: it returns `Unsupported`.
+    /// A call outside the one-core reference: it returns `Unsupported`. A
+    /// call that has a variant above is refused here with a panic.
     Other(Call),
 }
 
@@ -352,6 +355,36 @@ pub struct Model {
 /// capability to remove, 128 restricted capabilities then 64 ordinary ones.
 pub const LONGEST_WALK: usize = 3 * dodos_abi::TREE_DEPTH;
 
+/// Whether a call is one of the calls of the one-core reference, which
+/// `Syscall` gives a variant with arguments.
+fn modelled(call: Call) -> bool {
+    use Call::{
+        CSpaceGrow, CapDelete, CapDerive, CapInspect, CapMove, CapRevoke, NotifyBind, Poll, Recv,
+        ReplyRecv, Send, Signal, ThreadConfigure, ThreadResume, ThreadSuspend, UntypedRetype, Wait,
+    };
+    matches!(
+        call,
+        CapDerive
+            | CapMove
+            | CapDelete
+            | CapRevoke
+            | CapInspect
+            | UntypedRetype
+            | CSpaceGrow
+            | ThreadConfigure
+            | ThreadResume
+            | ThreadSuspend
+            | Call::Call
+            | Recv
+            | ReplyRecv
+            | Send
+            | Signal
+            | Wait
+            | Poll
+            | NotifyBind
+    )
+}
+
 /// The entry `id` of one of the maps of the state, to change it. Every
 /// identity the state holds names a live entry (`Model::check`).
 fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
@@ -360,7 +393,14 @@ fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
 
 impl Model {
     /// The state at start-up, and the first thread, which can run (Start-up
-    /// information). Its capability space has one segment and holds itself,
+    /// information).
+    ///
+    /// CONTRACT-GAP (Start-up information): that section is only proposed.
+    /// It also gives the first process a `core` capability per core, the
+    /// control capabilities for interrupts, I/O ports and IOMMU domains, and
+    /// the frames of the boot image; and it leaves the size of the start-up
+    /// space and the untyped ranges to the boot image. The model gives none
+    /// of the first, one segment, and the two untypeds below. Its capability space has one segment and holds itself,
     /// an `aspace`, the thread, a `sched` and `debug` in their fixed slots,
     /// then one ordinary untyped and one device untyped.
     pub fn boot() -> (Self, ObjId) {
@@ -382,10 +422,8 @@ impl Model {
             START_SLOT_FIRST,
             all,
         );
-        // CONTRACT-GAP (Start-up information): the contract gives the first
-        // process every untyped, and says "never `exec` on device memory"
-        // of new capabilities only. The start-up capability for device
-        // memory has no `exec` either: invariant 25 rests on it.
+        // Rules of `untyped_retype`: the start-up capabilities for device
+        // memory have no `exec`.
         let no_exec = all.without(Rights::EXEC);
         let device = add(
             ObjectKind::Untyped,
@@ -483,12 +521,11 @@ impl Model {
             Syscall::Wait(notify) => self.wait(thread, notify, ipc::IfZero::Wait),
             Syscall::Poll(notify) => self.wait(thread, notify, ipc::IfZero::WouldWait),
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
-            // CONTRACT-GAP (Threads): `thread_read_regs` and
-            // `thread_write_regs` have a row in the table of the one-core
-            // calls, with rights and a `busy` rule, and a sentence that
-            // puts the register block outside the one-core model. Here they
-            // are `unsupported`, as every call of another group.
-            Syscall::Other(_) => {
+            // Threads: `thread_read_regs` and `thread_write_regs` are not
+            // part of the one-core reference and are `unsupported` in it, as
+            // the calls of the groups not yet specified.
+            Syscall::Other(call) => {
+                assert!(!modelled(call), "{call:?} has its own variant of `Syscall`");
                 self.space(thread, SlotAddr::NONE, Access::Read)?;
                 Err(Error::Unsupported)
             }

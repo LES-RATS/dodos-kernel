@@ -1,8 +1,8 @@
 //! The invariants of the state.
 
-use crate::{CapId, LONGEST_WALK, Model, ObjId, ReplyState, Slot, Thread, Wait, Window};
+use crate::{CapId, LONGEST_WALK, Model, ObjId, Output, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
-    CSPACE_SEGMENT_SLOTS, Header, MAX_CAPS, MAX_WORDS, ObjectKind, Rights, TREE_DEPTH,
+    CSPACE_SEGMENT_SLOTS, Error, Header, MAX_CAPS, MAX_WORDS, ObjectKind, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::iter::successors;
@@ -15,7 +15,57 @@ fn ensure(holds: bool, invariant: &'static str) -> Check {
     if holds { Ok(()) } else { Err(invariant) }
 }
 
+/// What a state holds, for a test or a harness to measure what its sequences
+/// of calls reach. It is no part of the behaviour.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Census {
+    /// The depth of the deepest capability.
+    pub deepest: usize,
+    /// The kind of each object that is dying.
+    pub dying: Vec<ObjectKind>,
+    /// Capabilities under `cap_delete` whose object is not dying.
+    pub dying_copies: usize,
+    /// Threads waiting to be received, in the queue of an endpoint.
+    pub callers: usize,
+    /// Threads waiting for a reply, each through an armed reply object.
+    pub served: usize,
+    /// Threads waiting to receive, each with an attached reply object.
+    pub receivers: usize,
+    /// Threads waiting on a notify.
+    pub waiters: usize,
+    /// Notifies bound to an endpoint.
+    pub bound: usize,
+}
+
 impl Model {
+    /// Counts what the state holds.
+    pub fn census(&self) -> Census {
+        let depth = |cap: &CapId| successors(Some(*cap), |cap| self.caps[cap].parent).count();
+        let root = |object: &ObjId| self.caps[&self.objects[object].root].dying;
+        let dying = self.objects.iter().filter(|(id, _)| root(id));
+        let copy = |cap: &&crate::Cap| cap.dying && !root(&cap.object);
+        let waits = |wanted: fn(&Wait) -> bool| {
+            self.threads
+                .values()
+                .filter(|thread| wanted(&thread.wait))
+                .count()
+        };
+        Census {
+            deepest: self.caps.keys().map(depth).max().unwrap_or(0),
+            dying: dying.map(|(_, object)| object.kind).collect(),
+            dying_copies: self.caps.values().filter(copy).count(),
+            callers: waits(|wait| matches!(wait, Wait::Call { .. })),
+            served: waits(|wait| matches!(wait, Wait::Reply(_))),
+            receivers: waits(|wait| matches!(wait, Wait::Recv { .. })),
+            waiters: waits(|wait| matches!(wait, Wait::Notify(_))),
+            bound: self
+                .notifies
+                .values()
+                .filter(|notify| notify.endpoint.is_some())
+                .count(),
+        }
+    }
+
     /// Checks every invariant of the state and names the first that fails.
     ///
     /// The derivation tree:
@@ -46,7 +96,8 @@ impl Model {
     ///    it, and every full slot names a live capability that names it;
     /// 7. a capability space has a whole number of segments, at most its
     ///    maximum, which is a whole number of segments, at least one and at
-    ///    most 2^20 slots;
+    ///    most 2^20 slots; the start-up space, taken from no untyped, has
+    ///    all its slots;
     /// 27. a capability space keeps a sweep if and only if it is dying; the
     ///     sweep stands at slot 1 or after, within the table, and no slot
     ///     before it is full, but for the root capability of the space.
@@ -62,7 +113,9 @@ impl Model {
     ///     object was taken from none and its root capability has no parent;
     /// 25. device memory holds only frames and child untypeds, which are
     ///     device memory too, and no capability for any of them has `exec`;
-    /// 26. every identity was given out before the next one to give.
+    /// 26. every identity was given out before the next one to give; an
+    ///     object is younger than the untyped it was taken from and older
+    ///     than its root capability.
     ///
     /// Waiting:
     /// 12. every thread in the queue of an endpoint waits on that endpoint,
@@ -76,8 +129,11 @@ impl Model {
     ///     armed with a thread if and only if that thread waits for a reply
     ///     through it;
     /// 16. a thread that waits has no outcome yet; a thread that is not
-    ///     suspended is bound to a capability space; what a thread is bound
-    ///     to is a capability space, or is destroyed;
+    ///     suspended, that waits or that has an outcome is bound to a
+    ///     capability space; what a thread is bound to is a capability
+    ///     space, or is destroyed;
+    /// 30. the outcome of a wait is `gone`, a word that is not zero, or a
+    ///     message with as many words as its header states;
     /// 17. a notify names its endpoint if and only if the endpoint names it;
     /// 22. no thread waits with a dying reply object, to receive or for an
     ///     answer: a reply object whose root capability is dying is idle;
@@ -91,8 +147,9 @@ impl Model {
     ///     `caps_dropped` or none.
     ///
     /// Memory:
-    /// 18. the watermark of an untyped is within it, and is zero if and only
-    ///     if nothing taken from it is live;
+    /// 18. the watermark of an untyped is within it, is zero if and only if
+    ///     nothing taken from it is live, and is a multiple of 8 bytes, the
+    ///     smallest size of an object;
     /// 19. the live count of an untyped is the number of live objects and
     ///     cspace segments taken from it.
     pub fn check(&self) -> Check {
@@ -213,6 +270,8 @@ impl Model {
             ensure(whole && slots <= space.max as usize, "7: segments")?;
             let max = space.max != 0 && space.max.is_multiple_of(CSPACE_SEGMENT_SLOTS);
             ensure(max && space.max <= 1 << 20, "7: maximum")?;
+            let grows = object.from.is_some() || slots == space.max as usize;
+            ensure(grows, "7: size of the start-up space")?;
         }
         Ok(())
     }
@@ -224,6 +283,10 @@ impl Model {
                 .get(&object.root)
                 .ok_or("9: root capability exists")?;
             ensure(root.object == id, "9: root capability names its object")?;
+            ensure(
+                id.0 < object.root.0,
+                "26: root capability older than its object",
+            )?;
             let has_state = match object.kind {
                 ObjectKind::Untyped => self.untypeds.contains_key(&id),
                 ObjectKind::CSpace => self.cspaces.contains_key(&id),
@@ -236,6 +299,7 @@ impl Model {
             ensure(has_state, "10: state of an object")?;
             if let Some(from) = object.from {
                 ensure(self.untypeds.contains_key(&from), "11: untyped is live")?;
+                ensure(from < id, "26: object older than its untyped")?;
                 let parent = root.parent.and_then(|parent| self.caps.get(&parent));
                 let child = parent.is_some_and(|parent| parent.object == from);
                 ensure(child, "11: root capability is a child of the untyped's")?;
@@ -359,8 +423,17 @@ impl Model {
             let ready = thread.wait == Wait::None;
             let waited = ready || thread.outcome.is_none();
             ensure(waited, "16: outcome while waiting")?;
-            let bound = thread.suspended || thread.cspace.is_some();
-            ensure(bound, "16: running while bound to nothing")?;
+            let idle = thread.suspended && ready && thread.outcome.is_none();
+            ensure(idle || thread.cspace.is_some(), "16: bound to nothing")?;
+            let outcome = match &thread.outcome {
+                None | Some(Err(Error::Gone)) => true,
+                Some(Ok(Output::Word(word))) => *word != 0,
+                Some(Ok(Output::Message(delivery))) => {
+                    delivery.words.len() == delivery.received.header.words()
+                }
+                Some(_) => false,
+            };
+            ensure(outcome, "30: outcome of a wait")?;
             let space = |id| self.cspaces.contains_key(id) || !self.objects.contains_key(id);
             ensure(
                 thread.cspace.iter().all(space),
@@ -394,6 +467,10 @@ impl Model {
             let live: usize = taken.map(|(object, _)| 1 + segments(object)).sum();
             ensure(untyped.live as usize == live, "19: live count")?;
             ensure(untyped.watermark <= untyped.bytes, "18: watermark within")?;
+            ensure(
+                untyped.watermark.is_multiple_of(8),
+                "18: watermark on 8 bytes",
+            )?;
             let zero = (untyped.watermark == 0) == (untyped.live == 0);
             ensure(zero, "18: watermark is zero when nothing is live")?;
         }
