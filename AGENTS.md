@@ -14,6 +14,9 @@ implementation.
 Skills are in `.agents/skills/`. `zig-0-17` lists the breaking changes of
 Zig 0.17 (for example `@cImport` no longer exists); it is copied from
 github.com/zigcc/skills at commit 2f9bf9d (MIT). Read it before writing Zig.
+`zig-tiger-style` (same source) is the Zig style of the kernel: assertions,
+bounded loops, no recursion, sizes asserted at compile time. One exception:
+`usize` is the right type for addresses and sizes of memory.
 
 ## Always
 
