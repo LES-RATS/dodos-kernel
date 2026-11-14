@@ -1,0 +1,9 @@
+[package]
+name = "dodos-model-b"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Executable reference model B of the DodOS kernel, one core (comparison only)"
+
+[dependencies]
+dodos-abi = { path = "../abi" }
