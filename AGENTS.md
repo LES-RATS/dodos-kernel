@@ -38,6 +38,8 @@ bounded loops, no recursion, sizes asserted at compile time. One exception:
 - An enum instead of a `bool` parameter; no glob import (`use x::*`) outside
   tests; no `Rc` or `Arc` unless ownership is really shared. (These three are
   taken from the Google Rust style guide.)
+- Every crate has `[lints] workspace = true`: the workspace lints check the
+  rules above that a tool can check.
 
 ## Ask first
 

@@ -4,3 +4,6 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 description = "Types of the DodOS kernel interface, shared by the model, the kernel and user space"
+
+[lints]
+workspace = true

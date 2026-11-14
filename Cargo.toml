@@ -5,3 +5,9 @@ members = ["abi"]
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-only"
+
+# The style rules of AGENTS.md that a tool can check. A crate opts in with
+# `[lints] workspace = true`.
+[workspace.lints.clippy]
+wildcard_imports = "warn"
+fn_params_excessive_bools = "warn"
