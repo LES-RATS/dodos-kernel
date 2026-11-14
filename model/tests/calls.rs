@@ -181,6 +181,20 @@ impl K {
         assert_eq!(self.go(call), Err(error));
     }
 
+    /// The first thread repeats a removal while it returns `again`, at most
+    /// `calls` times in all, and this returns how many calls it took.
+    #[track_caller]
+    fn finish(&mut self, removal: Syscall, calls: u32) -> u32 {
+        for made in 1..=calls {
+            match self.go(removal.clone()) {
+                DONE => return made,
+                Err(Error::Again) => {}
+                other => panic!("{removal:?}: {other:?}"),
+            }
+        }
+        panic!("{removal:?} does not end in {calls} calls");
+    }
+
     /// A new object from the ordinary untyped, in a slot of the first thread.
     fn make(&mut self, kind: ObjectKind, slot: u32) {
         let size = match kind {
@@ -1151,7 +1165,7 @@ fn spaces_nest_no_deeper_than_the_tree() {
     }
     // Root capabilities at depths 3 to 64.
     assert_eq!(spaces, 62);
-    while k.go(Syscall::CapDelete(s(32))) != DONE {}
+    k.finish(Syscall::CapDelete(s(32)), 1000);
     assert_eq!(k.kind(31), Err(Error::Gone));
 }
 
@@ -1185,7 +1199,7 @@ fn three_layers_of_spaces_create_spaces_and_hand_memory_down() {
     }
     assert_eq!(k.on(inside, retype(s(10), Endpoint, 0, s(13))), DONE);
     // The first thread kept the parent, and takes everything back.
-    while k.go(Syscall::CapRevoke(s(30))) != DONE {}
+    k.finish(Syscall::CapRevoke(s(30)), 100);
     assert_eq!(k.m.runnable(), [k.t]);
     k.ok(retype(s(30), Untyped, 1 << 20, s(40)));
 }
@@ -2618,11 +2632,7 @@ fn calls_to_delete_a_space(k: &mut K, segments: u64) -> u32 {
         k.go(grow(30)).unwrap();
     }
     k.ok(retype(UT, Notify, 0, via(30, segments as u32 * 128 - 1)));
-    let mut calls = 1;
-    while k.go(Syscall::CapDelete(s(30))) != DONE {
-        calls += 1;
-    }
-    calls
+    k.finish(Syscall::CapDelete(s(30)), 1000)
 }
 
 #[test]
@@ -3994,12 +4004,16 @@ fn supervisor_kills_a_process_by_deleting_its_space_then_its_untyped() {
     let sent = send(3, msg(1, vec![Transfer::Derive(s(16), Rights::ALL.bits())]));
     assert_eq!(k.on(process, sent.clone()), Err(Error::WouldWait));
     // From the first step of the removal of its space it gets `gone`.
-    let mut calls = 1;
-    while k.go(Syscall::CapDelete(s(31))) != DONE {
-        assert_eq!(k.on(process, copy.clone()), Err(Error::Gone));
-        assert_eq!(k.on(process, sent.clone()), Err(Error::Gone));
-        calls += 1;
-    }
+    let calls = (1..=100)
+        .find(|_| {
+            if k.go(Syscall::CapDelete(s(31))) == DONE {
+                return true;
+            }
+            assert_eq!(k.on(process, copy.clone()), Err(Error::Gone));
+            assert_eq!(k.on(process, sent.clone()), Err(Error::Gone));
+            false
+        })
+        .expect("the removal ends");
     // 203 capabilities at 32 per call are seven calls; the 255 slots of the
     // table, at 128 per call, end one call early and make it eight.
     assert_eq!(calls, 8);
