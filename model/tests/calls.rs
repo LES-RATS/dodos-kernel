@@ -72,6 +72,7 @@ fn configure(thread: u32, cspace: SlotAddr, aspace: SlotAddr, fault: SlotAddr) -
 fn msg(label: u32, caps: Vec<Transfer>) -> Message {
     Message {
         label,
+        flags: 0,
         words: vec![label.into()],
         caps,
     }
@@ -913,6 +914,21 @@ fn thread_whose_capability_space_is_dying_gets_gone_from_every_call_but_cap_dele
 }
 
 #[test]
+fn thread_whose_capability_space_is_dying_deletes_its_own_slots_only() {
+    let mut k = K::with_ipc();
+    let inside = space_with_a_thread(&mut k);
+    // In its slot 25, a capability for the first space, which is not dying.
+    k.ok(derive(SPACE, via(30, 25), Rights::ALL, 0));
+    assert_eq!(k.on(inside, Syscall::CapDelete(via(25, NT))), DONE);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(
+        k.on(inside, Syscall::CapDelete(via(25, EP))),
+        Err(Error::Gone)
+    );
+    assert_eq!(k.kind(EP), Ok(Endpoint));
+}
+
+#[test]
 fn delivery_into_a_dying_capability_space_drops_the_capabilities() {
     let mut k = K::with_ipc();
     space_with_a_thread(&mut k);
@@ -1043,7 +1059,9 @@ fn root_capability_of_a_space_is_placed_only_in_a_space_less_deep() {
     k.no(mv(s(31), via(35, 1)), Error::Invalid);
     k.no(mv(s(30), via(39, 1)), Error::Invalid);
     k.ok(mv(s(34), via(35, 1)));
-    // Deleting the space destroys the deeper one it holds.
+    // Deleting the space destroys the deeper one it holds. Two tables to
+    // sweep: two calls.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
     k.ok(Syscall::CapDelete(s(30)));
     assert_eq!(k.kind(39), Err(Error::Gone));
 }
@@ -1291,14 +1309,13 @@ fn frame_takes_a_page_size_and_a_number_of_pages() {
 }
 
 #[test]
-fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_32() {
+fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_20() {
     let mut k = K::new();
-    for size in [0, 1, 127, 129, (1 << 32) + 128] {
+    for size in [0, 1, 127, 129, (1 << 20) + 128, 1 << 32] {
         k.no(retype(UT, CSpace, size, s(30)), Error::Invalid);
     }
-    // Accepted, but its directory is larger than the untyped.
-    k.no(retype(UT, CSpace, 1 << 32, s(30)), Error::NoMemory);
     k.ok(retype(UT, CSpace, 384, s(30)));
+    k.ok(retype(UT, CSpace, 1 << 20, s(31)));
 }
 
 #[test]
@@ -2200,6 +2217,8 @@ fn notify_bind_is_busy_when_either_side_is_already_bound() {
     k.ok(bind(NT, s(EP)));
     k.no(bind(NT, s(30)), Error::Busy);
     k.no(bind(31, s(EP)), Error::Busy);
+    // Also for the pair that is already bound.
+    k.no(bind(NT, s(EP)), Error::Busy);
     k.ok(bind(31, s(30)));
 }
 
@@ -2522,4 +2541,376 @@ fn binding_delivers_nothing_to_a_caller_in_the_queue() {
         got(k.go(recv(EP, RP, Range::NONE))).3,
         Header::FLAG_NOTIFICATION
     );
+}
+
+// Revision D-105 of the contract, and the second reviews of the model.
+
+/// A capability space in slot 30 with `segments` segments, and how many
+/// calls of `cap_delete` destroy it.
+fn calls_to_delete_a_space(k: &mut K, segments: u64) -> u32 {
+    k.ok(retype(UT, CSpace, 1 << 20, s(30)));
+    for _ in 0..segments {
+        k.go(grow(30)).unwrap();
+    }
+    k.ok(retype(UT, Notify, 0, via(30, segments as u32 * 128 - 1)));
+    let mut calls = 1;
+    while k.go(Syscall::CapDelete(s(30))) != DONE {
+        calls += 1;
+    }
+    calls
+}
+
+#[test]
+fn removal_examines_at_most_128_slots_of_dying_spaces_per_call() {
+    // 1,279 slots to examine after slot 0, one of them full: ten calls.
+    assert_eq!(calls_to_delete_a_space(&mut K::new(), 10), 10);
+    // 255 slots: 128, then 127.
+    assert_eq!(calls_to_delete_a_space(&mut K::new(), 2), 2);
+    // 16,383 slots: 128 calls, where 129 slots per call would take 127.
+    assert_eq!(calls_to_delete_a_space(&mut K::new(), 128), 128);
+}
+
+#[test]
+fn segments_that_were_never_added_are_not_examined() {
+    // A maximum of 2^20 slots, one segment: 127 slots to examine.
+    assert_eq!(calls_to_delete_a_space(&mut K::new(), 1), 1);
+}
+
+#[test]
+fn slot_examined_once_is_not_examined_again() {
+    let mut k = K::new();
+    k.ok(retype(UT, CSpace, 256, s(30)));
+    k.go(grow(30)).unwrap();
+    k.go(grow(30)).unwrap();
+    // Slots 200 to 239 hold a notify each: 199 empty slots before them.
+    for index in 200..240 {
+        k.ok(retype(UT, Notify, 0, via(30, index)));
+    }
+    // 128 slots; then 71 slots and 32 notifies; then 8 notifies, the rest
+    // of the table and the space.
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.ok(Syscall::CapDelete(s(30)));
+}
+
+#[test]
+fn header_with_a_flag_set_by_the_sender_is_invalid() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(40);
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    let mut flagged = msg(1, vec![]);
+    flagged.flags = Header::FLAG_CAPS_DROPPED;
+    k.no(send(EP, flagged.clone()), Error::Invalid);
+    k.no(call(EP, flagged.clone(), Range::NONE), Error::Invalid);
+    k.make(Reply, 30);
+    k.no(reply_recv(30, flagged, EP), Error::Invalid);
+    assert_eq!(k.woken(server), None);
+}
+
+#[test]
+fn header_is_read_right_after_the_capability_the_call_acts_on() {
+    let mut k = K::with_ipc();
+    k.weak(EP, 30, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(EP)));
+    let no_send = k.weak(RP, 31, caps_without(Rights::SEND));
+    let mut long = msg(1, vec![Transfer::Move(s(30))]);
+    long.words = vec![0; MAX_WORDS + 1];
+    // After the reply object, before the listed slot and the endpoint,
+    // which are both dead.
+    k.no(reply_recv(no_send, long.clone(), 30), Error::Denied);
+    k.no(reply_recv(RP, long.clone(), 30), Error::Invalid);
+    k.no(
+        reply_recv(RP, msg(1, vec![Transfer::Move(s(30))]), EP),
+        Error::Gone,
+    );
+    k.no(reply_recv(RP, msg(1, vec![]), 30), Error::Gone);
+    // The same in `call` and `send`.
+    k.no(call(EP, long.clone(), range(0, 1)), Error::Invalid);
+    k.no(send(EP, long), Error::Invalid);
+}
+
+#[test]
+fn arguments_of_reply_recv_are_checked_in_the_order_of_the_table() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(40);
+    k.make(Reply, 30);
+    assert_eq!(k.on(server, recv(EP, 30, Range::NONE)), WAITS);
+    let read_only = k.weak(START_SLOT_CSPACE, 31, Rights::READ);
+    let no_recv = k.weak(EP, 32, caps_without(Rights::RECV));
+    let with = |endpoint, first, count| Syscall::ReplyRecv {
+        reply: s(30),
+        message: msg(1, vec![]),
+        endpoint: s(endpoint),
+        range: Range { first, count },
+    };
+    // The endpoint, the range, the number of its slots, then the state: the
+    // reply object is attached to another thread.
+    k.no(with(no_recv, via(read_only, 40), 5), Error::Denied);
+    k.no(with(EP, via(read_only, 40), 1), Error::Denied);
+    k.no(with(EP, s(40), 5), Error::Invalid);
+    k.no(with(EP, s(40), 1), Error::Busy);
+}
+
+#[test]
+fn state_is_checked_after_every_argument() {
+    let mut k = K::with_ipc();
+    let caller = k.spawn(40);
+    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    got(k.go(recv(EP, RP, Range::NONE)));
+    // `recv`: the range before the armed reply object.
+    k.no(recv(EP, RP, range(40, 5)), Error::Invalid);
+    k.no(recv(EP, RP, range(40, 1)), Error::Busy);
+    // `thread_configure`: every capability before the thread that runs.
+    k.no(configure(40, SPACE, SlotAddr::NONE, s(NT)), Error::Invalid);
+    // `notify_bind`: the endpoint before the binding.
+    k.ok(bind(NT, s(EP)));
+    let no_manage = k.weak(EP, 30, caps_without(Rights::MANAGE));
+    k.no(bind(NT, s(no_manage)), Error::Denied);
+}
+
+#[test]
+fn cspace_grow_checks_the_untyped_then_the_maximum_then_the_memory() {
+    let mut k = K::new();
+    k.ok(retype(UT, Untyped, 8192, s(31)));
+    k.ok(retype(s(31), CSpace, 128, s(30)));
+    k.go(grow_from(30, s(31))).unwrap();
+    // At its maximum, and its untyped is exhausted.
+    k.no(grow_from(30, UT), Error::Invalid);
+    k.no(grow_from(30, s(31)), Error::NoSlot);
+    k.ok(retype(UT, Untyped, 4096, s(33)));
+    k.ok(retype(s(33), CSpace, 256, s(32)));
+    k.no(grow_from(32, s(33)), Error::NoMemory);
+}
+
+#[test]
+fn segment_is_aligned_on_4_kb() {
+    let mut k = K::new();
+    k.ok(retype(UT, Untyped, 1 << 14, s(31)));
+    k.ok(retype(s(31), CSpace, 128, s(30)));
+    k.go(grow_from(30, s(31))).unwrap();
+    k.ok(retype(s(31), ASpace, 0, s(32)));
+    k.ok(retype(s(31), ASpace, 0, s(33)));
+    k.no(retype(s(31), Endpoint, 0, s(34)), Error::NoMemory);
+}
+
+#[test]
+fn untyped_retype_judges_the_kind_before_the_size() {
+    let mut k = K::new();
+    // Device memory: `invalid` for every kind but a frame and an untyped.
+    k.no(retype(DEV, ObjectKind::Timer, 0, s(30)), Error::Invalid);
+    k.no(retype(DEV, Endpoint, 1, s(30)), Error::Invalid);
+    // A kind outside the model, then the size.
+    k.no(retype(UT, ObjectKind::Timer, 5, s(30)), Error::Unsupported);
+    k.no(retype(UT, Endpoint, 5, s(30)), Error::Invalid);
+    // All of it after the destination.
+    k.no(retype(UT, ObjectKind::Timer, 5, s(0)), Error::Invalid);
+}
+
+#[test]
+fn refused_derivation_or_creation_is_invalid_before_no_slot() {
+    let mut k = K::new();
+    deeper_space(&mut k);
+    k.ok(retype(UT, Notify, 0, via(34, 5)));
+    k.no(derive(UT, via(34, 5), Rights::ALL, 0), Error::Invalid);
+    k.no(retype(UT, Untyped, 4096, via(34, 5)), Error::Invalid);
+    k.no(retype(UT, Notify, 0, via(34, 5)), Error::NoSlot);
+}
+
+#[test]
+fn plain_arguments_of_cap_derive_are_judged_in_the_order_of_the_table() {
+    let mut k = K::with_ipc();
+    // The rights before the badge: an untyped takes no badge.
+    let weak = k.weak(START_SLOT_FIRST, 29, Rights::WRITE.union(Rights::DERIVE));
+    k.no(derive(s(weak), s(100), Rights::ALL, 7), Error::Denied);
+    k.no(derive(s(weak), s(100), Rights::WRITE, 7), Error::Invalid);
+    // The badge before the depth: slot 91 is at depth 64, with badge 7.
+    k.ok(derive(s(EP), s(30), Rights::ALL, 7));
+    for slot in 31..92 {
+        k.weak(slot - 1, slot, Rights::ALL);
+    }
+    k.no(derive(s(91), s(100), Rights::ALL, 8), Error::Denied);
+    k.no(derive(s(91), s(100), Rights::ALL, 7), Error::Invalid);
+}
+
+#[test]
+fn reply_lands_in_the_range_of_a_call_that_was_delivered_at_once() {
+    let mut k = K::with_ipc();
+    let (server, caller) = (k.spawn(40), k.spawn(41));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    assert_eq!(k.on(caller, call(EP, msg(1, vec![]), range(50, 1))), WAITS);
+    let answer = send(RP, msg(9, vec![Transfer::Move(s(NT))]));
+    assert_eq!(k.on(server, answer), Ok(Output::Sent { flags: 0 }));
+    assert_eq!(got(k.woken(caller).unwrap()), (9, 0, 1, 0));
+    assert_eq!(k.kind(50), Ok(Notify));
+}
+
+#[test]
+fn thread_bound_to_a_dying_space_can_be_resumed() {
+    let mut k = K::new();
+    let inside = space_with_a_thread(&mut k);
+    k.ok(Syscall::ThreadSuspend(s(31)));
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    k.ok(Syscall::ThreadResume(s(31)));
+    assert!(k.can_run(inside));
+}
+
+#[test]
+fn reply_recv_answers_and_returns_a_pending_notification_before_a_caller() {
+    let mut k = K::with_ipc();
+    let (first, second) = (k.spawn(40), k.spawn(41));
+    k.ok(bind(NT, s(EP)));
+    assert_eq!(k.on(first, call(EP, msg(1, vec![]), Range::NONE)), WAITS);
+    got(k.go(recv(EP, RP, Range::NONE)));
+    assert_eq!(k.on(second, call(EP, msg(2, vec![]), Range::NONE)), WAITS);
+    k.ok(Syscall::Signal(s(NT)));
+    let notification = got(k.go(reply_recv(RP, msg(8, vec![]), EP)));
+    assert_eq!(notification, (0, 1, 0, Header::FLAG_NOTIFICATION));
+    assert_eq!(got(k.woken(first).unwrap()), (8, 0, 0, 0));
+    assert_eq!(k.woken(second), None);
+}
+
+#[test]
+fn message_without_capabilities_reaches_a_dying_space_without_the_dropped_flag() {
+    let mut k = K::with_ipc();
+    space_with_a_thread(&mut k);
+    let server = k.spawn(70);
+    let range = Range {
+        first: via(30, 25),
+        count: 1,
+    };
+    assert_eq!(k.on(server, recv(EP, RP, range)), WAITS);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(
+        k.go(send(EP, msg(5, vec![]))),
+        Ok(Output::Sent { flags: 0 })
+    );
+    assert_eq!(got(k.woken(server).unwrap()), (5, 0, 0, 0));
+}
+
+#[test]
+fn capabilities_of_a_caller_whose_space_began_to_die_are_dropped_at_delivery() {
+    let mut k = K::with_ipc();
+    let inside = space_with_a_thread(&mut k);
+    k.ok(derive(s(EP), via(30, 25), Rights::ALL, 0));
+    let derived = msg(1, vec![Transfer::Derive(s(1), Rights::NONE)]);
+    assert_eq!(k.on(inside, call(25, derived, Range::NONE)), WAITS);
+    k.no(Syscall::CapDelete(s(30)), Error::Again);
+    assert_eq!(got(k.go(recv(EP, RP, range(100, 1)))), (1, 0, 0, DROPPED));
+}
+
+#[test]
+fn root_capability_of_a_space_moved_by_ipc_follows_the_depth_rule() {
+    let mut k = K::with_ipc();
+    let (first, second) = (k.spawn(70), k.spawn(71));
+    for slot in [30, 31] {
+        k.make(CSpace, slot);
+        k.go(grow(slot)).unwrap();
+    }
+    deeper_space(&mut k);
+    k.weak(31, 36, Rights::ALL);
+    k.weak(34, 39, Rights::ALL);
+    k.make(Reply, 80);
+    let into = |space, index| Range {
+        first: via(space, index),
+        count: 1,
+    };
+    // The same depth: refused. Deeper: accepted.
+    let same = msg(1, vec![Transfer::Move(s(30))]);
+    assert_eq!(k.on(first, call(EP, same, Range::NONE)), WAITS);
+    assert_eq!(got(k.go(recv(EP, RP, into(36, 5)))), (1, 0, 0, DROPPED));
+    let deeper = msg(2, vec![Transfer::Move(s(34))]);
+    assert_eq!(k.on(second, call(EP, deeper, Range::NONE)), WAITS);
+    assert_eq!(got(k.go(recv(EP, 80, into(36, 5)))), (2, 0, 1, 0));
+    assert_eq!(k.kind(34), Err(Error::Invalid));
+    // A copy of a space capability goes anywhere, a deeper space too.
+    let copy = msg(3, vec![Transfer::Derive(SPACE, Rights::NONE)]);
+    k.make(Endpoint, 81);
+    k.make(Reply, 82);
+    let third = k.spawn(72);
+    assert_eq!(k.on(third, call(81, copy, Range::NONE)), WAITS);
+    assert_eq!(got(k.go(recv(81, 82, into(39, 5)))), (3, 0, 1, 0));
+}
+
+#[test]
+fn frame_of_1_gb_pages_takes_the_number_of_pages_too() {
+    let mut k = K::new();
+    let huge = |size| Syscall::UntypedRetype {
+        untyped: UT,
+        kind: Frame,
+        size,
+        page: PageSize::Size1G,
+        destination: s(30),
+    };
+    k.no(huge(1), Error::NoMemory);
+    k.no(huge(0), Error::Invalid);
+    k.no(huge(1 << 34), Error::Invalid);
+}
+
+#[test]
+fn cap_move_from_a_dead_slot_is_gone() {
+    let mut k = K::with_ipc();
+    k.weak(EP, 30, Rights::ALL);
+    k.ok(Syscall::CapRevoke(s(EP)));
+    k.no(mv(s(30), s(31)), Error::Gone);
+}
+
+#[test]
+fn suspended_thread_that_waits_to_receive_still_gets_a_notification() {
+    let mut k = K::with_ipc();
+    let server = k.spawn(40);
+    k.ok(bind(NT, s(EP)));
+    assert_eq!(k.on(server, recv(EP, RP, Range::NONE)), WAITS);
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    k.ok(Syscall::Signal(s(NT)));
+    assert_eq!(got(k.woken(server).unwrap()).3, Header::FLAG_NOTIFICATION);
+    assert!(!k.can_run(server));
+}
+
+#[test]
+fn destroying_an_object_wakes_its_waiters_first_in_first_out() {
+    let mut k = K::with_ipc();
+    let threads: Vec<ObjId> = (40..73).map(|slot| k.spawn(slot)).collect();
+    for &thread in &threads {
+        assert_eq!(k.on(thread, Syscall::Wait(s(NT))), WAITS);
+    }
+    // 32 wakes in the first call: all but the last to come.
+    k.no(Syscall::CapDelete(s(NT)), Error::Again);
+    assert_eq!(k.woken(threads[31]), Some(Err(Error::Gone)));
+    assert_eq!(k.woken(threads[32]), None);
+}
+
+#[test]
+fn longest_walk_that_the_depth_rule_allows_is_within_the_bound() {
+    let mut k = K::new();
+    // A space at each depth from 2 to 64, its root capability in slot 38 +
+    // depth here. Each holds, in its slot 2, a copy of the untyped at its
+    // own depth; the root capability of the next space is the most recent
+    // child of that copy.
+    k.weak(START_SLOT_FIRST, 33, Rights::ALL);
+    k.ok(retype(UT, CSpace, 128, s(40)));
+    k.go(grow(40)).unwrap();
+    k.ok(mv(s(33), via(40, 2)));
+    for space in 41..=102 {
+        k.ok(derive(via(space - 1, 2), s(33), Rights::ALL, 0));
+        k.ok(retype(via(space - 1, 2), CSpace, 128, s(space)));
+        k.go(grow(space)).unwrap();
+        k.ok(mv(s(33), via(space, 2)));
+    }
+    // The deepest space holds, in its slot 1, a capability at depth 1 and
+    // then a copy of it at each depth down to 64.
+    k.ok(mv(s(START_SLOT_DEBUG), via(102, 1)));
+    k.ok(derive(via(102, 1), via(102, 3), Rights::ALL, 0));
+    for index in 3..65 {
+        k.ok(derive(via(102, index), via(102, index + 1), Rights::ALL, 0));
+    }
+    k.no(
+        derive(via(102, 65), via(102, 66), Rights::ALL, 0),
+        Error::Invalid,
+    );
+    // The walk: the untyped, 63 root capabilities, 62 copies of the
+    // untyped, then 64 ordinary capabilities.
+    while k.go(Syscall::CapDelete(UT)) != DONE {}
+    assert_eq!(k.m.longest_walk(), 1 + 63 + 62 + 64);
+    assert!(k.m.longest_walk() <= LONGEST_WALK);
+    assert_eq!(k.kind(40), Err(Error::Gone));
 }

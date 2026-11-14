@@ -2,7 +2,7 @@
 //! valid state, breaks one thing, and returns what `check` reports.
 
 use crate::*;
-use dodos_abi::TREE_DEPTH;
+use dodos_abi::{Header, TREE_DEPTH};
 
 const EP: u32 = 20;
 const RP: u32 = 21;
@@ -507,19 +507,73 @@ fn thread_attached_to_a_dying_reply_object_is_reported() {
         live(&mut m.threads, caller).wait = Wait::None;
         *live(&mut m.replies, at.reply) = ReplyState::Attached(at.waiter);
         let root = m.objects[&at.reply].root;
-        live(&mut m.caps, root).dying = Some(m.next_id);
+        live(&mut m.caps, root).dying = true;
     });
     assert_eq!(broken, "22: thread of a dying reply object");
 }
 
+/// Marks the first capability space as dying, with its sweep at `next`.
+fn dying_space(m: &mut Model, at: At, next: usize) {
+    let root = m.objects[&at.space].root;
+    live(&mut m.caps, root).dying = true;
+    let held = m.caps.keys().copied().collect();
+    live(&mut m.cspaces, at.space).sweep = Some(Sweep { next, held });
+}
+
 #[test]
-fn capability_created_in_a_capability_space_after_it_began_to_die_is_reported() {
+fn capability_that_a_dying_space_did_not_hold_when_it_began_to_die_is_reported() {
     let broken = spoiled(|m, at| {
-        let root = m.objects[&at.space].root;
-        live(&mut m.caps, root).dying = Some(m.next_id);
+        dying_space(m, at, 1);
         m.derive(at.copy, Rights::NONE, 0, (at.space, 100));
     });
     assert_eq!(broken, "23: new capability in a dying space");
+}
+
+#[test]
+fn dying_space_without_a_sweep_is_reported() {
+    let broken = spoiled(|m, at| {
+        let root = m.objects[&at.space].root;
+        live(&mut m.caps, root).dying = true;
+    });
+    assert_eq!(broken, "27: sweep of a dying space");
+}
+
+#[test]
+fn sweep_of_a_space_that_is_not_dying_is_reported() {
+    let broken = spoiled(|m, at| {
+        dying_space(m, at, 1);
+        let root = m.objects[&at.space].root;
+        live(&mut m.caps, root).dying = false;
+    });
+    assert_eq!(broken, "27: sweep of a dying space");
+}
+
+#[test]
+fn full_slot_behind_the_sweep_is_reported() {
+    let broken = spoiled(|m, at| dying_space(m, at, EP as usize + 1));
+    assert_eq!(broken, "27: full slot behind the sweep");
+}
+
+#[test]
+fn sweep_that_stands_at_slot_0_is_reported() {
+    let broken = spoiled(|m, at| dying_space(m, at, 0));
+    assert_eq!(broken, "27: index of the sweep");
+}
+
+#[test]
+fn sweep_that_stands_beyond_the_table_is_reported() {
+    let broken = spoiled(|m, at| {
+        let caps: Vec<CapId> = m.caps.keys().copied().collect();
+        for cap in caps {
+            let root = m.objects[&at.space].root;
+            if cap != root {
+                let (_, index) = m.caps[&cap].place;
+                live(&mut m.cspaces, at.space).slots[index as usize] = Slot::Dead;
+            }
+        }
+        dying_space(m, at, 129);
+    });
+    assert_eq!(broken, "6: slot of a capability");
 }
 
 #[test]
@@ -545,9 +599,9 @@ fn badge_on_a_capability_that_is_not_for_an_endpoint_or_a_notify_is_reported() {
 #[test]
 fn start_up_capability_with_a_parent_is_reported() {
     let broken = spoiled(|m, at| {
-        let device = cap(m, START_SLOT_FIRST + 1);
-        live(&mut m.caps, device).parent = Some(at.untyped_cap);
-        live(&mut m.caps, at.untyped_cap).children.insert(0, device);
+        let debug = cap(m, START_SLOT_DEBUG);
+        live(&mut m.caps, at.untyped_cap).parent = Some(debug);
+        live(&mut m.caps, debug).children.push(at.untyped_cap);
     });
     assert_eq!(broken, "11: parent of a start-up capability");
 }
@@ -591,7 +645,7 @@ fn caller_of_a_dying_reply_object_is_reported() {
             flags: 0,
         };
         let root = m.objects[&at.reply].root;
-        live(&mut m.caps, root).dying = Some(m.next_id);
+        live(&mut m.caps, root).dying = true;
     });
     assert_eq!(broken, "22: thread of a dying reply object");
 }
@@ -621,4 +675,118 @@ fn walk_of_a_removal_is_measured() {
         .apply(boot, Syscall::CapDelete(SlotAddr::own(EP)))
         .unwrap();
     assert_eq!(model.longest_walk, 2);
+}
+
+/// A capability space with one segment, made from the first untyped, whose
+/// root capability, at depth 2, is in a slot of the first space.
+fn inner_space(m: &mut Model, at: At, index: u32) -> ObjId {
+    let root = m.create(
+        ObjectKind::CSpace,
+        128,
+        Some(at.untyped_cap),
+        Rights::ALL,
+        (at.space, index),
+    );
+    let inner = m.caps[&root].object;
+    live(&mut m.cspaces, inner).slots = vec![Slot::Empty; 128];
+    let untyped = live(&mut m.untypeds, at.untyped);
+    untyped.live += 2;
+    inner
+}
+
+#[test]
+fn untyped_capability_less_deep_than_the_space_that_holds_it_is_reported() {
+    let broken = spoiled(|m, at| {
+        let inner = inner_space(m, at, 40);
+        let device = cap(m, START_SLOT_FIRST + 1);
+        m.place(device, (inner, 1));
+    });
+    assert_eq!(broken, "28: depth of what a space holds");
+}
+
+#[test]
+fn root_capability_of_a_space_held_in_a_space_of_the_same_depth_is_reported() {
+    let broken = spoiled(|m, at| {
+        let (first, second) = (inner_space(m, at, 40), inner_space(m, at, 41));
+        let root = m.objects[&second].root;
+        m.place(root, (first, 1));
+    });
+    assert_eq!(broken, "28: depth of what a space holds");
+}
+
+#[test]
+fn root_capability_whose_exec_differs_from_its_untyped_capability_is_reported() {
+    let broken = spoiled(|m, at| {
+        let root = m.objects[&at.reply].root;
+        live(&mut m.caps, root).rights = Rights::ALL.without(Rights::EXEC);
+    });
+    assert_eq!(broken, "3: exec of a root capability");
+}
+
+#[test]
+fn state_of_another_kind_than_its_object_is_reported() {
+    let broken = spoiled(|m, at| {
+        m.replies.insert(at.endpoint, ReplyState::Idle);
+    });
+    assert_eq!(broken, "10: state without an object");
+}
+
+#[test]
+fn thread_bound_to_an_object_that_is_not_a_capability_space_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.ready).cspace = Some(at.endpoint));
+    assert_eq!(broken, "16: capability space of a thread");
+}
+
+#[test]
+fn maximum_that_is_not_a_whole_number_of_segments_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).max = 200);
+    assert_eq!(broken, "7: maximum");
+}
+
+#[test]
+fn message_that_waits_with_another_thread_than_its_sender_is_reported() {
+    let broken = spoiled(|m, at| {
+        let caller = object(m, CALLER);
+        if let Wait::Call { parcel, .. } = &mut live(&mut m.threads, caller).wait {
+            parcel.sender = at.ready;
+        }
+    });
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn receive_range_of_more_than_4_slots_that_waits_is_reported() {
+    let broken = spoiled(|m, _| {
+        let caller = object(m, CALLER);
+        if let Wait::Call { window, .. } = &mut live(&mut m.threads, caller).wait {
+            (window.first, window.count) = (40, 5);
+        }
+    });
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn receive_range_beyond_the_table_that_waits_is_reported() {
+    let broken = spoiled(|m, _| {
+        let caller = object(m, CALLER);
+        if let Wait::Call { window, .. } = &mut live(&mut m.threads, caller).wait {
+            (window.first, window.count) = (127, 2);
+        }
+    });
+    assert_eq!(broken, "29: message or range of a waiting thread");
+}
+
+#[test]
+fn unknown_flag_kept_by_an_armed_reply_object_is_reported() {
+    let broken = spoiled(|m, at| {
+        let caller = object(m, CALLER);
+        live(&mut m.endpoints, at.endpoint).queue.clear();
+        live(&mut m.threads, caller).wait = Wait::Reply(at.reply);
+        *live(&mut m.replies, at.reply) = ReplyState::Armed {
+            caller,
+            window: at.nowhere,
+            flags: Header::FLAG_NOTIFICATION,
+        };
+    });
+    assert_eq!(broken, "29: range or flags of a reply object");
 }

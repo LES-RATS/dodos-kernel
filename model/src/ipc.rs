@@ -15,11 +15,16 @@ pub(crate) enum IfZero {
 }
 
 impl Message {
-    /// Messages: at most 64 words and 4 capabilities. Transfer of
-    /// capabilities: checked before the listed slots, because the header
-    /// says how many there are.
+    /// Order of checks, step 2: the header is read right after the
+    /// capability the call acts on. Beyond the limits (Messages: 64 words, 4
+    /// capabilities), or with a flag bit set by the sender, it is `invalid`
+    /// before any other capability argument is looked at.
     fn check(&self) -> Result<(), Error> {
-        Header::new(self.label, self.words.len(), self.caps.len(), 0).map(drop)
+        let header = Header::new(self.label, self.words.len(), self.caps.len(), self.flags)?;
+        if header.flags() != 0 {
+            return Err(Error::Invalid);
+        }
+        Ok(())
     }
 
     /// IPC: `send`, and `grant` if the message lists capabilities.
@@ -35,6 +40,9 @@ impl Message {
 /// Notifications: what `recv` returns for a pending word of the bound
 /// notify. The badge field holds the word.
 fn notification(word: u64) -> Delivery {
+    // CONTRACT-GAP (Notifications): the contract gives the flag and the
+    // badge field of this header, not the rest. The label is 0 and there
+    // are no words.
     let header = Header::new(0, 0, 0, Header::FLAG_NOTIFICATION).expect("an empty message");
     Delivery {
         received: received(header, word),
@@ -131,6 +139,8 @@ impl Model {
         self.listed(thread, &message.caps)?;
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let window = self.window(thread, range)?;
+        // IPC: the reply object may here be armed or idle; attached to
+        // another thread is `busy`.
         if let ReplyState::Attached(_) = self.replies[&reply] {
             return Err(Error::Busy);
         }
@@ -241,7 +251,8 @@ impl Model {
                 }
             }
             // Notifications: one notify per endpoint, one endpoint per
-            // notify.
+            // notify; `busy` otherwise, also for the pair that is already
+            // bound.
             Some(endpoint) => {
                 if bound.is_some() || self.endpoints[&endpoint].notify.is_some() {
                     return Err(Error::Busy);

@@ -2,7 +2,7 @@
 
 use crate::{
     Access, CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place,
-    ReplyState, Slot, Thread, Untyped, live,
+    ReplyState, Slot, Sweep, Thread, Untyped, live,
 };
 use dodos_abi::{
     CSPACE_SEGMENT_SLOTS, Error, ObjectKind, PageSize, REMOVAL_STEP, Rights, SLOT_BYTES, SlotAddr,
@@ -13,6 +13,9 @@ use dodos_abi::{
 const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
 /// Slots and addresses: the directory of a capability space, per segment.
 const DIRECTORY_BYTES: u64 = 8;
+/// The derivation tree: the slots of dying capability spaces that one call
+/// of `cap_delete` or `cap_revoke` examines at most (provisional).
+const REMOVAL_SLOTS: usize = 128;
 /// Rules of `untyped_retype`: the greatest alignment of a kernel object.
 const PAGE: u64 = 4096;
 
@@ -45,19 +48,23 @@ fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), 
             size.checked_mul(page.bytes()).ok_or(Error::Invalid)?,
             size > 0,
         ),
-        // Slots and addresses: a non-zero multiple of 128, at most 2^32, and
+        // Slots and addresses: a non-zero multiple of 128, at most 2^20, and
         // a directory rounded up to a power of two.
         ObjectKind::CSpace => (
             (segments * DIRECTORY_BYTES).next_power_of_two(),
-            size > 0 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into()) && size <= 1 << 32,
+            size > 0 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into()) && size <= 1 << 20,
         ),
         ObjectKind::ASpace => (PAGE, size == 0),
+        // CONTRACT-GAP (Object sizes): a thread is "1 KB, plus the vector
+        // state area, whose size depends on the processor". Here it is 1 KB.
         ObjectKind::Thread => (1024, size == 0),
         ObjectKind::Sched => (128, size == 0),
         ObjectKind::Endpoint | ObjectKind::Reply | ObjectKind::Notify => (64, size == 0),
         // CONTRACT-GAP (Capabilities and objects): the contract does not
-        // list the kinds that `untyped_retype` makes. The kinds outside the
-        // one-core model are `unsupported`.
+        // list the kinds that `untyped_retype` makes, nor place
+        // `unsupported` in the order of checks. The kinds outside the
+        // one-core model are `unsupported`, judged with the kind: after the
+        // rule of device memory, before the size argument.
         _ => return Err(Error::Unsupported),
     };
     // Rules of `untyped_retype`: aligned on the size of a child untyped, on
@@ -89,7 +96,8 @@ impl Model {
         }
         let place = self.destination(thread, destination)?;
         // Capabilities and objects: the new rights are a subset of the
-        // source's, checked with the plain arguments.
+        // source's, checked with the plain arguments. Order of checks, step
+        // 3: in the order of the table, the rights before the badge.
         if !held.contains(rights) {
             return Err(Error::Denied);
         }
@@ -103,6 +111,10 @@ impl Model {
         if badge != 0 && kept != 0 && badge != kept {
             return Err(Error::Denied);
         }
+        // CONTRACT-GAP (Order of checks): the depths are "checked with the
+        // plain arguments", which are judged in the order of the table, but
+        // they are no argument of the table. They come last, here and in
+        // `untyped_retype`.
         self.fits(place.0, parent, Placing::Derived)?;
         self.vacant(place)?;
         let badge = if kept != 0 { kept } else { badge };
@@ -126,8 +138,12 @@ impl Model {
 
     pub(crate) fn cap_delete(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
         // Removal ends: the one call left to a thread whose capability space
-        // is dying.
-        let space = self.through(self.own(thread)?, slot, Access::Write)?;
+        // is dying, on its own slots only.
+        let own = self.own(thread)?;
+        if self.dying(own) && slot.via() != 0 {
+            return Err(Error::Gone);
+        }
+        let space = self.through(own, slot, Access::Write)?;
         match self.cspaces[&space].slots.get(slot.index() as usize) {
             // Slots and addresses: `cap_delete` on a dead slot makes it
             // empty.
@@ -138,8 +154,7 @@ impl Model {
             // Removal ends: from the first step the capability is dying,
             // and only `cap_delete` can still use it.
             Some(&Slot::Full(cap)) => {
-                let now = self.next_id;
-                live(&mut self.caps, cap).dying.get_or_insert(now);
+                live(&mut self.caps, cap).dying = true;
                 self.remove(cap, Removal::DescendantsThenSelf)
             }
             Some(Slot::Empty) | None => Err(Error::Invalid),
@@ -172,13 +187,14 @@ impl Model {
         let parent = self.cap(thread, untyped, Access::Read)?;
         let &Cap { object, rights, .. } = self.is(parent, ObjectKind::Untyped, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
-        let (bytes, align) = footprint(kind, size, page)?;
-        // Capabilities and objects: device memory can only become a frame
-        // or a child untyped.
+        // Order of checks, step 3: the kind is judged before the size
+        // argument. Capabilities and objects: device memory can only become
+        // a frame or a child untyped.
         let device = self.untypeds[&object].device;
         if device && kind != ObjectKind::Frame && kind != ObjectKind::Untyped {
             return Err(Error::Invalid);
         }
+        let (bytes, align) = footprint(kind, size, page)?;
         self.fits(place.0, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
         self.take(object, bytes, align)?;
@@ -205,16 +221,18 @@ impl Model {
         let space = self.object(thread, cspace, ObjectKind::CSpace, Rights::MANAGE)?;
         let untyped = self.object(thread, untyped, ObjectKind::Untyped, Rights::WRITE)?;
         // Slots and addresses: only from the untyped it was created from;
-        // any capability for that untyped object is accepted.
+        // any capability for that untyped object is accepted. Errors:
+        // `no_slot` also means that the space is at its maximum.
         // The derivation tree: the start-up space, created from no untyped,
         // never grows.
         if self.objects[&space].from != Some(untyped) {
             return Err(Error::Invalid);
         }
-        let CSpace { max, slots } = &self.cspaces[&space];
-        if slots.len() as u64 >= *max {
+        let CSpace { max, slots, .. } = &self.cspaces[&space];
+        if slots.len() >= *max as usize {
             return Err(Error::NoSlot);
         }
+        // Rules of `untyped_retype`: a segment is 4 KB, aligned on its size.
         self.take(untyped, SEGMENT_BYTES, SEGMENT_BYTES)?;
         let space = live(&mut self.cspaces, space);
         let slots = space.slots.len() + CSPACE_SEGMENT_SLOTS as usize;
@@ -265,8 +283,9 @@ impl Model {
         Ok(())
     }
 
-    /// Rules of `untyped_retype`: the watermark returns to zero when the
-    /// last object taken from the untyped is destroyed.
+    /// Rules of `untyped_retype`: when the last object made from the untyped
+    /// is destroyed the watermark returns to the start; this is the only
+    /// moment the memory becomes usable again.
     fn release(&mut self, untyped: ObjId) {
         let untyped = live(&mut self.untypeds, untyped);
         untyped.live -= 1;
@@ -304,8 +323,9 @@ impl Model {
                 // The one given at start-up has all its slots.
                 let slots = if parent.is_none() { size as usize } else { 0 };
                 let space = CSpace {
-                    max: size,
+                    max: size as u32,
                     slots: vec![Slot::Empty; slots],
+                    sweep: None,
                 };
                 self.cspaces.insert(id, space);
             }
@@ -352,7 +372,7 @@ impl Model {
             parent,
             children: Vec::new(),
             place,
-            dying: None,
+            dying: false,
         };
         self.caps.insert(id, cap);
         if let Some(parent) = parent {
@@ -386,12 +406,13 @@ impl Model {
         &mut live(&mut self.cspaces, space).slots[index as usize]
     }
 
-    /// The derivation tree: removal in bounded steps. Each capability
-    /// removed and each thread woken is one step. `cap_revoke` on the root
-    /// capability of a space starts below it, and so does not sweep the
-    /// space.
+    /// The derivation tree: removal in bounded steps. Per call, at most 32
+    /// capabilities are removed or threads woken, and at most 128 slots of
+    /// dying capability spaces are examined; `again` while work remains.
+    /// `cap_revoke` on the root capability of a space starts below it, and
+    /// so does not sweep the space.
     fn remove(&mut self, target: CapId, removal: Removal) -> Outcome {
-        let mut steps = REMOVAL_STEP;
+        let (mut steps, mut slots) = (REMOVAL_STEP, REMOVAL_SLOTS);
         loop {
             let start = match removal {
                 Removal::DescendantsThenSelf => target,
@@ -404,16 +425,18 @@ impl Model {
                 return Err(Error::Again);
             }
             steps -= 1;
-            let next = self.next_removed(start);
+            let next = self.next_removed(start, &mut slots).ok_or(Error::Again)?;
             if let Some(waiter) = self.waiter(next) {
                 // The derivation tree: destroying an object wakes every
-                // thread that waits on it, with `gone`.
+                // thread that waits on it, with `gone`. IPC: threads that
+                // wait on the same object are served first in, first out.
                 self.unlink(waiter);
                 self.wake(waiter, Err(Error::Gone));
                 continue;
             }
-            // Slots and addresses: the slot named by `cap_delete` becomes
-            // empty; a capability removed by someone else leaves a dead slot.
+            // Slots and addresses: `cap_delete` acts on the slot it names,
+            // which becomes empty; a capability removed by someone else
+            // leaves a dead slot.
             let left = if next == target {
                 Slot::Empty
             } else {
@@ -429,17 +452,30 @@ impl Model {
     /// The derivation tree, the fixed order: the most recently derived child
     /// first, a capability only after all its descendants, and the root
     /// capability of a `cspace` only after the capabilities in it, in index
-    /// order. Removal ends: an object is dying from the first step of a
-    /// removal that reaches its root capability, even when that step only
-    /// removes a copy; and the step that marks a reply object wakes, with
-    /// `gone`, the thread attached to it or the caller it is armed with.
-    /// That wake is not counted in the 32 of a step.
-    fn next_removed(&mut self, mut cap: CapId) -> CapId {
+    /// order. `None` when the slots that the call may still examine run out
+    /// before the next capability to remove is found.
+    ///
+    /// Removal ends: an object is dying from the first step of a removal
+    /// that reaches its root capability, even when that step only removes a
+    /// copy; and the step that marks a reply object wakes, with `gone`, the
+    /// thread attached to it or the caller it is armed with. That wake is
+    /// not counted in the 32 of a step.
+    fn next_removed(&mut self, mut cap: CapId, slots: &mut usize) -> Option<CapId> {
         for walk in 1.. {
             self.longest_walk = self.longest_walk.max(walk);
             if let Some(object) = self.rooted(cap) {
-                let now = self.next_id;
-                live(&mut self.caps, cap).dying.get_or_insert(now);
+                live(&mut self.caps, cap).dying = true;
+                if let Some(space) = self.cspaces.get_mut(&object) {
+                    // CONTRACT-GAP (The derivation tree): the contract does
+                    // not say where the sweep starts. Slot 0 is never used
+                    // and is not examined: the sweep starts at slot 1.
+                    let held = space.slots.iter().filter_map(|slot| match *slot {
+                        Slot::Full(held) => Some(held),
+                        Slot::Empty | Slot::Dead => None,
+                    });
+                    let held = held.collect();
+                    space.sweep.get_or_insert(Sweep { next: 1, held });
+                }
                 let waiter = match self.replies.get(&object) {
                     Some(&ReplyState::Attached(thread)) => Some(thread),
                     Some(&ReplyState::Armed { caller, .. }) => Some(caller),
@@ -450,24 +486,47 @@ impl Model {
                     self.wake(waiter, Err(Error::Gone));
                 }
             }
-            let child = self.caps[&cap].children.last().copied();
-            match child.or_else(|| self.swept(cap)) {
-                Some(next) => cap = next,
-                None => break,
+            match self.caps[&cap].children.last() {
+                Some(&child) => cap = child,
+                None => match self.swept(cap, slots)? {
+                    Some(held) => cap = held,
+                    None => break,
+                },
             }
         }
-        cap
+        Some(cap)
     }
 
-    /// The first capability to remove from the capability space that `cap`
-    /// is the root capability of, if there is one. The derivation tree: a
-    /// space may hold its own root capability, which is removed last.
-    fn swept(&self, cap: CapId) -> Option<CapId> {
-        let space = self.cspaces.get(&self.rooted(cap)?)?;
-        space.slots.iter().find_map(|slot| match *slot {
-            Slot::Full(held) if held != cap => Some(held),
-            _ => None,
-        })
+    /// The first capability left in the capability space that `cap` is the
+    /// root capability of, if `cap` is one: `Some(None)` when there is none,
+    /// and `None` when the slots that the call may still examine run out.
+    ///
+    /// The derivation tree: the dying space keeps the index where the sweep
+    /// stands, and a slot examined once is not examined again. A space may
+    /// hold its own root capability, which is removed last.
+    fn swept(&mut self, cap: CapId, slots: &mut usize) -> Option<Option<CapId>> {
+        let space = self
+            .rooted(cap)
+            .and_then(|space| self.cspaces.get_mut(&space));
+        let Some(space) = space else {
+            return Some(None);
+        };
+        let sweep = space.sweep.as_mut().expect("the walk marked the space");
+        // CONTRACT-GAP (The derivation tree): the contract does not say when
+        // a slot counts as examined. It is counted when the sweep moves past
+        // it: an empty or dead slot, or the root capability of the space
+        // itself. A full slot is not counted while its capability is being
+        // removed, and is counted once that left it dead.
+        while let Some(&slot) = space.slots.get(sweep.next) {
+            match slot {
+                Slot::Full(held) if held != cap => return Some(Some(held)),
+                Slot::Full(_) | Slot::Empty | Slot::Dead => {
+                    *slots = slots.checked_sub(1)?;
+                    sweep.next += 1;
+                }
+            }
+        }
+        Some(None)
     }
 
     /// The object that `cap` is the root capability of, if it is one.

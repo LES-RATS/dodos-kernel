@@ -52,6 +52,9 @@ pub enum Transfer {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub label: u32,
+    /// The flag bits of the header. Order of checks: the kernel sets them,
+    /// and a sender that sets one gets `invalid`.
+    pub flags: u32,
     pub words: Vec<u64>,
     pub caps: Vec<Transfer>,
 }
@@ -197,8 +200,8 @@ struct Cap {
     place: Place,
     /// Removal ends: set by the first step of `cap_delete` on the capability,
     /// and on a root capability by the first step of a removal that reaches
-    /// it, to the identity that the next capability would have got then.
-    dying: Option<u32>,
+    /// it.
+    dying: bool,
 }
 
 /// What every object has. The state of an object that has one is in the map
@@ -224,8 +227,21 @@ struct Untyped {
 
 #[derive(Clone, Debug, PartialEq)]
 struct CSpace {
-    max: u64,
+    max: u32,
     slots: Vec<Slot>,
+    /// The derivation tree: `Some` once the space is dying.
+    sweep: Option<Sweep>,
+}
+
+/// The derivation tree: what a dying capability space keeps.
+#[derive(Clone, Debug, PartialEq)]
+struct Sweep {
+    /// The index where the sweep stands: the slots before it were examined
+    /// and are not examined again.
+    next: usize,
+    /// The capabilities it held when it began to die. Removal ends: a dying
+    /// space only shrinks, so it never holds another.
+    held: Vec<CapId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -332,6 +348,10 @@ pub struct Model {
     longest_walk: usize,
 }
 
+/// The derivation tree: the bound of the contract on the walk to the next
+/// capability to remove, 128 restricted capabilities then 64 ordinary ones.
+pub const LONGEST_WALK: usize = 3 * dodos_abi::TREE_DEPTH;
+
 /// The entry `id` of one of the maps of the state, to change it. Every
 /// identity the state holds names a live entry (`Model::check`).
 fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
@@ -362,7 +382,10 @@ impl Model {
             START_SLOT_FIRST,
             all,
         );
-        // Rules of `untyped_retype`: never `exec` on device memory.
+        // CONTRACT-GAP (Start-up information): the contract gives the first
+        // process every untyped, and says "never `exec` on device memory"
+        // of new capabilities only. The start-up capability for device
+        // memory has no `exec` either: invariant 25 rests on it.
         let no_exec = all.without(Rights::EXEC);
         let device = add(
             ObjectKind::Untyped,
@@ -388,6 +411,13 @@ impl Model {
     /// until the thread makes its next call.
     pub fn woken(&self, thread: ObjId) -> Option<&Outcome> {
         self.threads.get(&thread)?.outcome.as_ref()
+    }
+
+    /// The derivation tree: the longest walk so far to the next capability
+    /// to remove, in capabilities; at most `LONGEST_WALK`. The kernel can be
+    /// measured against it.
+    pub fn longest_walk(&self) -> usize {
+        self.longest_walk
     }
 
     /// The object that a slot address names for `thread`, if any: a way to
@@ -453,6 +483,11 @@ impl Model {
             Syscall::Wait(notify) => self.wait(thread, notify, ipc::IfZero::Wait),
             Syscall::Poll(notify) => self.wait(thread, notify, ipc::IfZero::WouldWait),
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
+            // CONTRACT-GAP (Threads): `thread_read_regs` and
+            // `thread_write_regs` have a row in the table of the one-core
+            // calls, with rights and a `busy` rule, and a sentence that
+            // puts the register block outside the one-core model. Here they
+            // are `unsupported`, as every call of another group.
             Syscall::Other(_) => {
                 self.space(thread, SlotAddr::NONE, Access::Read)?;
                 Err(Error::Unsupported)
@@ -506,7 +541,7 @@ impl Model {
         match self.cspaces[&cspace].slots.get(index as usize) {
             Some(&Slot::Full(cap)) => {
                 let held = &self.caps[&cap];
-                let dying = held.dying.is_some() || self.dying(held.object);
+                let dying = held.dying || self.dying(held.object);
                 if dying { Err(Error::Gone) } else { Ok(cap) }
             }
             Some(Slot::Dead) => Err(Error::Gone),
@@ -517,7 +552,7 @@ impl Model {
     /// Removal ends: an object is dying from the first step of a removal
     /// that reaches its root capability.
     fn dying(&self, object: ObjId) -> bool {
-        self.caps[&self.objects[&object].root].dying.is_some()
+        self.caps[&self.objects[&object].root].dying
     }
 
     /// Order of checks, steps 1 and 2: the slot of a capability argument.
@@ -617,8 +652,10 @@ impl Model {
         let manage = Rights::MANAGE;
         let target = self.object(thread, target, ObjectKind::Thread, manage)?;
         let space = self.object(thread, cspace, ObjectKind::CSpace, manage)?;
-        // The address space and the fault endpoint are checked and not kept:
-        // nothing in the one-core model reads them.
+        // CONTRACT-GAP (Threads): the contract does not say what becomes of
+        // a thread when its address space or its fault endpoint is
+        // destroyed. Both are checked here and not kept: nothing in the
+        // one-core model reads them.
         // Threads: both may be 0.
         if !aspace.is_none() {
             self.object(thread, aspace, ObjectKind::ASpace, manage)?;

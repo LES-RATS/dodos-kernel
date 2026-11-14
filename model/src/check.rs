@@ -1,7 +1,9 @@
 //! The invariants of the state.
 
-use crate::{CapId, Model, ObjId, ReplyState, Slot, Thread, Wait};
-use dodos_abi::{CSPACE_SEGMENT_SLOTS, ObjectKind, Rights, TREE_DEPTH};
+use crate::{CapId, LONGEST_WALK, Model, ObjId, ReplyState, Slot, Thread, Wait, Window};
+use dodos_abi::{
+    CSPACE_SEGMENT_SLOTS, Header, MAX_CAPS, MAX_WORDS, ObjectKind, Rights, TREE_DEPTH,
+};
 use std::collections::BTreeMap;
 use std::iter::successors;
 use std::mem::discriminant;
@@ -22,9 +24,10 @@ impl Model {
     /// 2. a capability's children exist, name it as their parent, and are in
     ///    the order of derivation;
     /// 3. a capability derived from another has a subset of its rights, and
-    ///    its badge if it has one; a root capability has every right, but
-    ///    for `exec`, and no badge; only an endpoint or a notify capability
-    ///    has a badge;
+    ///    its badge if it has one; a root capability has every right, with
+    ///    `exec` if and only if the untyped capability it was made from has
+    ///    it, and no badge; only an endpoint or a notify capability has a
+    ///    badge;
     /// 4. a capability is the root capability of its object, or was derived
     ///    from a capability for the same object;
     /// 20. the tree is at most `TREE_DEPTH` deep;
@@ -32,21 +35,28 @@ impl Model {
     ///     a capability goes before its parent and before the root capability
     ///     of the capability space that holds it, unless it is that one;
     /// 24. the walk to the next capability to remove was never longer than
-    ///     192 capabilities.
+    ///     192 capabilities;
+    /// 28. a capability space holds only what is deeper than itself: an
+    ///     untyped capability it holds is not less deep than its root
+    ///     capability, and the root capability of another space is deeper.
     ///
     /// Slots:
     /// 5. slot 0 of every capability space is empty;
     /// 6. every capability is in a slot: the slot it names is full and names
     ///    it, and every full slot names a live capability that names it;
     /// 7. a capability space has a whole number of segments, at most its
-    ///    maximum.
+    ///    maximum, which is a whole number of segments, at least one and at
+    ///    most 2^20 slots;
+    /// 27. a capability space keeps a sweep if and only if it is dying; the
+    ///     sweep stands at slot 1 or after, within the table, and no slot
+    ///     before it is full, but for the root capability of the space.
     ///
     /// Objects:
     /// 8. every capability names a live object;
     /// 9. an object exists if and only if its root capability does: its root
     ///    capability is live and names it (with 4 and 8);
-    /// 10. an object has state of its kind, and no state is left without its
-    ///     object;
+    /// 10. an object has state of its kind, and every state is that of an
+    ///     object of its kind;
     /// 11. an object taken from an untyped names a live untyped, and its root
     ///     capability is a child of a capability for that untyped; a start-up
     ///     object was taken from none and its root capability has no parent;
@@ -65,14 +75,20 @@ impl Model {
     ///     to a thread if and only if that thread waits to receive with it,
     ///     armed with a thread if and only if that thread waits for a reply
     ///     through it;
-    /// 16. a thread that waits has no outcome yet, and a thread that is not
-    ///     suspended is bound to a capability space;
+    /// 16. a thread that waits has no outcome yet; a thread that is not
+    ///     suspended is bound to a capability space; what a thread is bound
+    ///     to is a capability space, or is destroyed;
     /// 17. a notify names its endpoint if and only if the endpoint names it;
     /// 22. no thread waits with a dying reply object, to receive or for an
     ///     answer: a reply object whose root capability is dying is idle;
     /// 23. a dying capability space only shrinks, so no thread in it or
     ///     outside it was the cause of a new capability there: every
-    ///     capability it holds was created before it began to die.
+    ///     capability it holds, it held when it began to die;
+    /// 29. a message that waits was sent by the thread that waits with it
+    ///     and is within the limits of the header; a receive range that
+    ///     waits has at most 4 slots, none of them slot 0 or beyond the
+    ///     table; the flags that an armed reply object keeps are the flag
+    ///     `caps_dropped` or none.
     ///
     /// Memory:
     /// 18. the watermark of an untyped is within it, and is zero if and only
@@ -112,6 +128,10 @@ impl Model {
             ensure(object.root == id || derived, "4: root or derivation")?;
             let every = cap.rights.contains(Rights::ALL.without(Rights::EXEC));
             ensure(derived || every && cap.badge == 0, "3: root capability")?;
+            let exec = |cap: &CapId| self.caps[cap].rights.contains(Rights::EXEC);
+            let made = cap.parent.filter(|_| !derived);
+            let same = made.is_none_or(|from| exec(&from) == exec(&id));
+            ensure(same, "3: exec of a root capability")?;
             let badged = matches!(object.kind, ObjectKind::Endpoint | ObjectKind::Notify);
             ensure(badged || cap.badge == 0, "3: badge on another kind")?;
             let device = |id: &ObjId| self.untypeds.get(id).is_some_and(|untyped| untyped.device);
@@ -156,31 +176,43 @@ impl Model {
             }
         }
         ensure(left == 0, "21: removal that never ends")?;
-        ensure(self.longest_walk <= 3 * TREE_DEPTH, "24: walk of a removal")
+        ensure(self.longest_walk <= LONGEST_WALK, "24: walk of a removal")
     }
 
     fn check_slots(&self) -> Check {
+        let depth = |cap: CapId| successors(Some(cap), |cap| self.caps.get(cap)?.parent).count();
         for (&id, space) in &self.cspaces {
             let first = space.slots.first();
             ensure(first.is_none_or(|slot| *slot == Slot::Empty), "5: slot 0")?;
+            let object = self.objects.get(&id).ok_or("10: state without an object")?;
+            let (root, sweep) = (object.root, space.sweep.as_ref());
             for (index, slot) in space.slots.iter().enumerate() {
-                if let Slot::Full(cap) = slot {
-                    let place = self.caps.get(cap).map(|cap| cap.place);
-                    let here = place == Some((id, index as u32));
-                    ensure(here, "6: capability of a full slot")?;
-                }
+                let Slot::Full(cap) = *slot else { continue };
+                let held = self.caps.get(&cap).ok_or("6: capability of a full slot")?;
+                let here = held.place == (id, index as u32);
+                ensure(here, "6: capability of a full slot")?;
+                let of = self.objects.get(&held.object);
+                let other_root = of.is_some_and(|of| of.root == cap) && cap != root;
+                let deep_enough = match of.map(|of| of.kind) {
+                    Some(ObjectKind::Untyped) => depth(cap) >= depth(root),
+                    Some(ObjectKind::CSpace) if other_root => depth(cap) > depth(root),
+                    _ => true,
+                };
+                ensure(deep_enough, "28: depth of what a space holds")?;
+                let swept = sweep.is_some_and(|sweep| index < sweep.next);
+                ensure(!swept || cap == root, "27: full slot behind the sweep")?;
+                let kept = sweep.is_none_or(|sweep| sweep.held.contains(&cap));
+                ensure(kept, "23: new capability in a dying space")?;
             }
-            let dying = self
-                .objects
-                .get(&id)
-                .and_then(|space| self.caps.get(&space.root)?.dying);
-            let older =
-                |slot: &Slot| !matches!(*slot, Slot::Full(CapId(cap)) if Some(cap) >= dying);
-            let shrinks = dying.is_none() || space.slots.iter().all(older);
-            ensure(shrinks, "23: new capability in a dying space")?;
+            let dying = self.caps.get(&root).is_some_and(|root| root.dying);
+            ensure(dying == sweep.is_some(), "27: sweep of a dying space")?;
             let slots = space.slots.len();
+            let within = |sweep: &crate::Sweep| (1..=slots.max(1)).contains(&sweep.next);
+            ensure(sweep.is_none_or(within), "27: index of the sweep")?;
             let whole = slots.is_multiple_of(CSPACE_SEGMENT_SLOTS as usize);
-            ensure(whole && slots as u64 <= space.max, "7: segments")?;
+            ensure(whole && slots <= space.max as usize, "7: segments")?;
+            let max = space.max != 0 && space.max.is_multiple_of(CSPACE_SEGMENT_SLOTS);
+            ensure(max && space.max <= 1 << 20, "7: maximum")?;
         }
         Ok(())
     }
@@ -215,14 +247,20 @@ impl Model {
                 ensure(root.parent.is_none(), "11: parent of a start-up capability")?;
             }
         }
-        let untypeds = self.untypeds.keys().chain(self.cspaces.keys());
-        let waited = self.endpoints.keys().chain(self.replies.keys());
-        let states = untypeds
-            .chain(waited)
-            .chain(self.threads.keys())
-            .chain(self.notifies.keys());
-        let mut owned = states.map(|id| self.objects.contains_key(id));
-        ensure(owned.all(|owned| owned), "10: state without an object")
+        let is = |kind: ObjectKind| {
+            move |id: &ObjId| {
+                self.objects
+                    .get(id)
+                    .is_some_and(|object| object.kind == kind)
+            }
+        };
+        let of_its_kind = self.untypeds.keys().all(is(ObjectKind::Untyped))
+            && self.cspaces.keys().all(is(ObjectKind::CSpace))
+            && self.threads.keys().all(is(ObjectKind::Thread))
+            && self.endpoints.keys().all(is(ObjectKind::Endpoint))
+            && self.replies.keys().all(is(ObjectKind::Reply))
+            && self.notifies.keys().all(is(ObjectKind::Notify));
+        ensure(of_its_kind, "10: state without an object")
     }
 
     fn check_waits(&self) -> Check {
@@ -275,13 +313,30 @@ impl Model {
         let waiting = self.threads.values().filter(in_queue).count();
         ensure(waiting == entries, "14: a waiting thread not queued")?;
 
+        // A range in a destroyed space is no longer within any table.
+        let within = |window: &Window| {
+            let slots = self
+                .cspaces
+                .get(&window.cspace)
+                .map(|space| space.slots.len());
+            let end = window.first as usize + window.count as usize;
+            let in_table = slots.is_none_or(|slots| window.first != 0 && end <= slots);
+            window.count as usize <= MAX_CAPS && (window.count == 0 || in_table)
+        };
         for (&id, state) in &self.replies {
-            let dying = self
+            let root = self
                 .objects
                 .get(&id)
-                .and_then(|reply| self.caps.get(&reply.root)?.dying);
-            let idle = dying.is_none() || *state == ReplyState::Idle;
+                .and_then(|reply| self.caps.get(&reply.root));
+            let idle = *state == ReplyState::Idle || !root.is_some_and(|root| root.dying);
             ensure(idle, "22: thread of a dying reply object")?;
+            if let ReplyState::Armed { window, flags, .. } = state {
+                let known = flags & !Header::FLAG_CAPS_DROPPED == 0;
+                ensure(
+                    known && within(window),
+                    "29: range or flags of a reply object",
+                )?;
+            }
             let agrees = match *state {
                 ReplyState::Idle => true,
                 ReplyState::Attached(thread) => {
@@ -306,6 +361,20 @@ impl Model {
             ensure(waited, "16: outcome while waiting")?;
             let bound = thread.suspended || thread.cspace.is_some();
             ensure(bound, "16: running while bound to nothing")?;
+            let space = |id| self.cspaces.contains_key(id) || !self.objects.contains_key(id);
+            ensure(
+                thread.cspace.iter().all(space),
+                "16: capability space of a thread",
+            )?;
+            let limits = match &thread.wait {
+                Wait::Call { parcel, window, .. } => {
+                    let header = parcel.words.len() <= MAX_WORDS && parcel.caps.len() <= MAX_CAPS;
+                    parcel.sender == id && header && within(window)
+                }
+                Wait::Recv { window, .. } => within(window),
+                _ => true,
+            };
+            ensure(limits, "29: message or range of a waiting thread")?;
         }
         Ok(())
     }
