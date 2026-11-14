@@ -553,9 +553,10 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     for (name, &ok) in NAMES.iter().zip(&reached.ok) {
         assert_eq!(ok == 0, *name == "other", "{name}");
     }
-    for code in Error::Gone as usize..=Error::Unsupported as usize {
+    let codes = Error::Gone as usize..=Error::Unsupported as usize;
+    for (code, &count) in codes.clone().zip(&reached.errors[codes]) {
         let never = code == Error::Budget as usize;
-        assert_eq!(reached.errors[code] == 0, never, "error code {code}");
+        assert_eq!(count == 0, never, "error code {code}");
     }
     assert!(reached.several_threads as usize > STEPS);
     assert!(reached.with_caps > 0 && reached.dropped > 0 && reached.notifications > 0);
