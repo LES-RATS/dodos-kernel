@@ -23,3 +23,19 @@ jobs:
         with:
           kani-version: "0.68.0"
           args: "-p dodos-abi"
+  # Miri and the sanitizer need a nightly compiler, which Nix does not pin
+  # here. dodos-model has no unsafe code and long random tests: it is left out.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install nightly --profile minimal --component miri
+      - run: cargo +nightly miri test --workspace --exclude dodos-model
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --lib --tests --workspace --exclude dodos-model
+        env:
+          RUSTFLAGS: -Zsanitizer=address
