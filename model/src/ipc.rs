@@ -2,8 +2,8 @@
 
 use crate::caps::Placing;
 use crate::{
-    Access, CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Range, ReplyState,
-    Slot, Transfer, Wait, Window, live,
+    CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Range, ReplyState, Slot,
+    Transfer, Wait, Window, live,
 };
 use dodos_abi::{Error, Header, Marks, ObjectKind, Received, Rights, SlotAddr, TREE_DEPTH};
 
@@ -174,7 +174,7 @@ impl Model {
     }
 
     pub(crate) fn send(&mut self, thread: ObjId, target: SlotAddr, message: Message) -> Outcome {
-        let cap = self.cap(thread, target, Access::Read)?;
+        let cap = self.cap(thread, target, Rights::READ)?;
         // IPC: `send` takes an endpoint or a reply object.
         let kind = match self.objects[&self.caps[&cap].object].kind {
             ObjectKind::Reply => ObjectKind::Reply,
@@ -296,9 +296,9 @@ impl Model {
         let mut caps: Vec<Listed> = Vec::new();
         for transfer in transfers {
             let listed = match *transfer {
-                Transfer::Move(slot) => Listed::Move(self.cap(sender, slot, Access::Write)?),
+                Transfer::Move(slot) => Listed::Move(self.cap(sender, slot, Rights::WRITE)?),
                 Transfer::Derive(slot, rights) => {
-                    let cap = self.cap(sender, slot, Access::Read)?;
+                    let cap = self.cap(sender, slot, Rights::READ)?;
                     Listed::Derive(cap, self.caps[&cap].rights.derive(rights)?)
                 }
             };

@@ -327,13 +327,6 @@ struct Notify {
     endpoint: Option<ObjId>,
 }
 
-/// The right needed to use a slot through a `cspace` capability.
-#[derive(Clone, Copy)]
-enum Access {
-    Read,
-    Write,
-}
-
 /// The whole state of the kernel of one core.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
@@ -458,7 +451,7 @@ impl Model {
     /// find the identity of a thread that a call created.
     pub fn object_at(&self, thread: ObjId, slot: SlotAddr) -> Option<ObjId> {
         self.threads.get(&thread)?;
-        let cap = self.cap(thread, slot, Access::Read).ok()?;
+        let cap = self.cap(thread, slot, Rights::READ).ok()?;
         Some(self.caps[&cap].object)
     }
 
@@ -524,7 +517,7 @@ impl Model {
             // `gone` from this call as from every other.
             Syscall::Other(call) => {
                 assert!(!modelled(call), "{call:?} has its own variant of `Syscall`");
-                self.space(thread, SlotAddr::NONE, Access::Read)?;
+                self.space(thread, SlotAddr::NONE, Rights::READ)?;
                 Err(Error::Unsupported)
             }
         }
@@ -535,15 +528,16 @@ impl Model {
     // plain arguments (step 3), then the state (step 4).
 
     /// Slots and addresses: the capability space that an address is in.
-    /// Through a `cspace` capability, `access` says which right is needed.
-    fn space(&self, thread: ObjId, addr: SlotAddr, access: Access) -> Result<ObjId, Error> {
+    /// Through a `cspace` capability, `right` is the right needed: `READ` to
+    /// look at a slot, `WRITE` to change it.
+    fn space(&self, thread: ObjId, addr: SlotAddr, right: Rights) -> Result<ObjId, Error> {
         let own = self.own(thread)?;
         // Removal ends: a thread whose capability space is dying gets `gone`
         // from every call except `cap_delete`.
         if self.dying(own) {
             return Err(Error::Gone);
         }
-        self.through(own, addr, access)
+        self.through(own, addr, right)
     }
 
     /// The derivation tree: once its capability space is destroyed, a
@@ -557,14 +551,10 @@ impl Model {
 
     /// Slots and addresses: `own`, or the capability space that `via` names
     /// in it.
-    fn through(&self, own: ObjId, addr: SlotAddr, access: Access) -> Result<ObjId, Error> {
+    fn through(&self, own: ObjId, addr: SlotAddr, right: Rights) -> Result<ObjId, Error> {
         if addr.via() == 0 {
             return Ok(own);
         }
-        let right = match access {
-            Access::Read => Rights::READ,
-            Access::Write => Rights::WRITE,
-        };
         let via = self.full(own, addr.via())?;
         Ok(self.is(via, ObjectKind::CSpace, right)?.object)
     }
@@ -591,8 +581,8 @@ impl Model {
     }
 
     /// Order of checks, steps 1 and 2: the slot of a capability argument.
-    fn cap(&self, thread: ObjId, addr: SlotAddr, access: Access) -> Result<CapId, Error> {
-        self.full(self.space(thread, addr, access)?, addr.index())
+    fn cap(&self, thread: ObjId, addr: SlotAddr, right: Rights) -> Result<CapId, Error> {
+        self.full(self.space(thread, addr, right)?, addr.index())
     }
 
     /// Order of checks, steps 1 and 2: the kind (`invalid`), then the rights
@@ -611,7 +601,7 @@ impl Model {
     /// Order of checks, steps 1 and 2: the three checks of a capability
     /// argument, in order. `need` is the rights that the call needs.
     fn held(&self, thread: ObjId, at: SlotAddr, kind: ObjectKind, need: Rights) -> Checked<&Cap> {
-        self.is(self.cap(thread, at, Access::Read)?, kind, need)
+        self.is(self.cap(thread, at, Rights::READ)?, kind, need)
     }
 
     /// As `held`, for a call that needs only the object.
@@ -629,7 +619,7 @@ impl Model {
     /// capability. Slots and addresses: slot 0 or beyond the table is
     /// `invalid`.
     fn destination(&self, thread: ObjId, addr: SlotAddr) -> Result<Place, Error> {
-        let space = self.space(thread, addr, Access::Write)?;
+        let space = self.space(thread, addr, Rights::WRITE)?;
         if addr.index() == 0 || addr.index() as usize >= self.cspaces[&space].slots.len() {
             return Err(Error::Invalid);
         }
@@ -653,7 +643,7 @@ impl Model {
             range.first = SlotAddr::NONE;
         }
         let (first, count) = (range.first.index(), range.count);
-        let cspace = self.space(thread, range.first, Access::Write)?;
+        let cspace = self.space(thread, range.first, Rights::WRITE)?;
         // Transfer of capabilities: slot 0 or beyond the table is `invalid`.
         let end = u64::from(first) + u64::from(count);
         let beyond = first == 0 || end > self.cspaces[&cspace].slots.len() as u64;

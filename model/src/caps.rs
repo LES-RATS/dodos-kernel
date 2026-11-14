@@ -1,8 +1,8 @@
 //! Capabilities and objects: the derivation tree, removal, object creation.
 
 use crate::{
-    Access, CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place,
-    ReplyState, Slot, Sweep, Thread, Untyped, live,
+    CSpace, Cap, CapId, Endpoint, Model, Notify, ObjId, Object, Outcome, Output, Place, ReplyState,
+    Slot, Sweep, Thread, Untyped, live,
 };
 use dodos_abi::{
     ASPACE_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, ENDPOINT_BYTES,
@@ -96,7 +96,7 @@ impl Model {
         rights: Rights,
         badge: u64,
     ) -> Outcome {
-        let parent = self.cap(thread, source, Access::Read)?;
+        let parent = self.cap(thread, source, Rights::READ)?;
         let source = &self.caps[&parent];
         let (object, held, kept) = (source.object, source.rights, source.badge);
         // Capabilities and objects: `derive` on the source.
@@ -138,7 +138,7 @@ impl Model {
         source: SlotAddr,
         destination: SlotAddr,
     ) -> Outcome {
-        let cap = self.cap(thread, source, Access::Write)?;
+        let cap = self.cap(thread, source, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
         self.fits(place.0, cap, Placing::Moved)?;
         self.vacant(place)?;
@@ -153,7 +153,7 @@ impl Model {
         if self.dying(own) && slot.via() != 0 {
             return Err(Error::Gone);
         }
-        let space = self.through(own, slot, Access::Write)?;
+        let space = self.through(own, slot, Rights::WRITE)?;
         match self.cspaces[&space].slots.get(slot.index() as usize) {
             // Slots and addresses: `cap_delete` on a dead slot makes it
             // empty.
@@ -172,12 +172,12 @@ impl Model {
     }
 
     pub(crate) fn cap_revoke(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
-        let cap = self.cap(thread, slot, Access::Write)?;
+        let cap = self.cap(thread, slot, Rights::WRITE)?;
         self.remove(cap, Removal::Descendants)
     }
 
     pub(crate) fn cap_inspect(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
-        let cap = &self.caps[&self.cap(thread, slot, Access::Read)?];
+        let cap = &self.caps[&self.cap(thread, slot, Rights::READ)?];
         Ok(Output::Inspect {
             kind: self.objects[&cap.object].kind,
             rights: cap.rights,
@@ -194,7 +194,7 @@ impl Model {
         page: PageSize,
         destination: SlotAddr,
     ) -> Outcome {
-        let parent = self.cap(thread, untyped, Access::Read)?;
+        let parent = self.cap(thread, untyped, Rights::READ)?;
         let &Cap { object, rights, .. } = self.is(parent, ObjectKind::Untyped, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
         // Order of checks, step 3: the kind is judged before the size
