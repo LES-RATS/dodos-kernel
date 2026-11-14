@@ -179,9 +179,6 @@ pub enum Output {
 /// The error code and the results of a call. `Err(Error::Ok)` never occurs.
 pub type Outcome = Result<Output, Error>;
 
-/// What a check gives when it passes.
-type Checked<T> = Result<T, Error>;
-
 /// A place for a capability: a capability space and an index in it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Place {
@@ -246,8 +243,8 @@ struct Sweep {
     /// The index where the sweep stands: the slots before it were examined
     /// and are not examined again.
     next: usize,
-    /// The capabilities it held when it began to die. Removal ends: a dying
-    /// space only shrinks, so it never holds another.
+    /// The capabilities the space held when it began to die. Removal ends:
+    /// a dying space only shrinks, so invariant 23 refuses any other.
     held: Vec<CapId>,
 }
 
@@ -403,8 +400,9 @@ impl Model {
             let cap = model.create(kind, size, None, rights, Place { space, index });
             model.caps[&cap].object
         };
-        let (all, segment) = (Rights::ALL, CSPACE_SEGMENT_SLOTS);
-        add(ObjectKind::CSpace, segment.into(), START_SLOT_CSPACE, all);
+        let all = Rights::ALL;
+        let segment = CSPACE_SEGMENT_SLOTS.into();
+        add(ObjectKind::CSpace, segment, START_SLOT_CSPACE, all);
         add(ObjectKind::ASpace, 0, START_SLOT_ASPACE, all);
         let thread = add(ObjectKind::Thread, 0, START_SLOT_THREAD, all);
         add(ObjectKind::Sched, 0, START_SLOT_SCHED, all);
@@ -611,7 +609,13 @@ impl Model {
 
     /// Order of checks, steps 1 and 2: the three checks of a capability
     /// argument, in order. `need` is the rights that the call needs.
-    fn held(&self, thread: ObjId, at: SlotAddr, kind: ObjectKind, need: Rights) -> Checked<&Cap> {
+    fn held(
+        &self,
+        thread: ObjId,
+        at: SlotAddr,
+        kind: ObjectKind,
+        need: Rights,
+    ) -> Result<&Cap, Error> {
         self.is(self.cap(thread, at, Rights::READ)?, kind, need)
     }
 
@@ -622,7 +626,7 @@ impl Model {
         at: SlotAddr,
         kind: ObjectKind,
         need: Rights,
-    ) -> Checked<ObjId> {
+    ) -> Result<ObjId, Error> {
         Ok(self.held(thread, at, kind, need)?.object)
     }
 

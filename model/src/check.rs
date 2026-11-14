@@ -209,8 +209,13 @@ impl Model {
         Ok(())
     }
 
-    /// Invariant 21: takes away, again and again, a capability that nothing
-    /// left has to go before. What cannot be taken away is in a cycle.
+    /// Invariant 21. A capability is removed after its children, and the
+    /// root capability of a capability space after what the space holds:
+    /// `after(a)` gives the capabilities that go after `a`, its parent and
+    /// the root of the space it is in. A removal ends if and only if these
+    /// edges make no cycle. So this takes away, again and again, a
+    /// capability that nothing left has to go before; what cannot be taken
+    /// away is in a cycle.
     fn check_removal(&self) -> Check {
         let after = |id: &CapId| {
             let cap = &self.caps[id];

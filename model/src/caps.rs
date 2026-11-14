@@ -212,14 +212,12 @@ impl Model {
         // Rules of `untyped_retype`: every right, but `exec` only if the
         // untyped capability has it, and never on device memory: the
         // start-up capabilities for device memory have no `exec`.
-        let no_exec = Rights::EXEC.without(rights);
-        self.create(
-            kind,
-            size,
-            Some(parent),
-            Rights::ALL.without(no_exec),
-            place,
-        );
+        let new = if rights.contains(Rights::EXEC) {
+            Rights::ALL
+        } else {
+            Rights::ALL.without(Rights::EXEC)
+        };
+        self.create(kind, size, Some(parent), new, place);
         Ok(Output::Done)
     }
 
