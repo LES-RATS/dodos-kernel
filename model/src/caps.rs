@@ -149,7 +149,7 @@ impl Model {
     pub(crate) fn cap_delete(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
         // Removal ends: the one call left to a thread whose capability space
         // is dying, on its own slots only.
-        let own = self.own(thread)?;
+        let own = self.bound_space(thread)?;
         if self.dying(own) && slot.via() != 0 {
             return Err(Error::Gone);
         }
