@@ -579,9 +579,11 @@ impl Model {
     }
 
     /// Removal ends: an object is dying from the first step of a removal
-    /// that reaches its root capability.
+    /// that reaches its root capability. An object that does not exist, or
+    /// has no root capability, is not: `check` reports it.
     fn dying(&self, object: ObjId) -> bool {
-        self.caps[&self.objects[&object].root].dying
+        let root = self.objects.get(&object).map(|object| object.root);
+        root.is_some_and(|root| self.caps.get(&root).is_some_and(|root| root.dying))
     }
 
     /// Order of checks, steps 1 and 2: the slot of a capability argument.

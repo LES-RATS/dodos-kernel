@@ -40,9 +40,8 @@ pub struct Census {
 impl Model {
     /// Counts what the state holds.
     pub fn census(&self) -> Census {
-        let root = |object: &ObjId| self.caps[&self.objects[object].root].dying;
-        let dying = self.objects.iter().filter(|(id, _)| root(id));
-        let copy = |cap: &&crate::Cap| cap.dying && !root(&cap.object);
+        let dying = self.objects.iter().filter(|(id, _)| self.dying(**id));
+        let copy = |cap: &&crate::Cap| cap.dying && !self.dying(cap.object);
         let waits = |wanted: fn(&Wait) -> bool| {
             self.threads
                 .values()
@@ -269,8 +268,10 @@ impl Model {
                 let kept = sweep.is_none_or(|sweep| sweep.held.contains(&cap));
                 ensure(kept, "23: new capability in a dying space")?;
             }
-            let dying = self.caps.get(&root).is_some_and(|root| root.dying);
-            ensure(dying == sweep.is_some(), "27: sweep of a dying space")?;
+            ensure(
+                self.dying(id) == sweep.is_some(),
+                "27: sweep of a dying space",
+            )?;
             let slots = space.slots.len();
             let within = |sweep: &crate::Sweep| (1..=slots.max(1)).contains(&sweep.next);
             ensure(sweep.is_none_or(within), "27: index of the sweep")?;
@@ -396,11 +397,7 @@ impl Model {
             window.count as usize <= MAX_CAPS && (window.count == 0 || in_table)
         };
         for (&id, state) in &self.replies {
-            let root = self
-                .objects
-                .get(&id)
-                .and_then(|reply| self.caps.get(&reply.root));
-            let idle = *state == ReplyState::Idle || !root.is_some_and(|root| root.dying);
+            let idle = *state == ReplyState::Idle || !self.dying(id);
             ensure(idle, "22: thread of a dying reply object")?;
             if let ReplyState::Armed { window, flags, .. } = state {
                 let known = flags & !Header::FLAG_CAPS_DROPPED == 0;
