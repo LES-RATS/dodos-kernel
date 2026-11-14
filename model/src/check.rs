@@ -185,8 +185,8 @@ impl Model {
     ///     nothing taken from it is live, and is a multiple of 8 bytes, the
     ///     smallest size of an object; the clean mark of ordinary memory is
     ///     between the watermark and the end, and device memory has none;
-    /// 19. the live count of an untyped is the number of live objects and
-    ///     cspace segments taken from it;
+    /// 19. the live count of an untyped is the number of live objects,
+    ///     cspace segments and tables of address spaces taken from it;
     /// 34. a frame has 1 to 512 pages, ordinary memory is write-back and
     ///     device memory is not, and only a frame capability has a record.
     pub fn check(&self) -> Check {
@@ -196,6 +196,7 @@ impl Model {
         self.check_objects()?;
         self.check_waits()?;
         self.check_memory()?;
+        self.check_spaces()?;
         self.check_bindings()
     }
 
@@ -508,7 +509,7 @@ impl Model {
             // capability space.
             let segments = |object: &ObjId| match self.cspaces.get(object) {
                 Some(space) => space.slots.len() / CSPACE_SEGMENT_SLOTS as usize,
-                None => 0,
+                None => self.aspaces.get(object).map_or(0, |a| a.tables as usize),
             };
             let taken = self
                 .objects
@@ -603,5 +604,6 @@ impl Model {
     }
 }
 
+mod memory;
 #[cfg(test)]
 mod tests;

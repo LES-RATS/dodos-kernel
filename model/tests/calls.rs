@@ -6,20 +6,43 @@ use dodos_abi::*;
 use dodos_model::*;
 
 const SPACE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
-const UT: SlotAddr = SlotAddr::own(START_SLOT_FIRST);
-const DEV: SlotAddr = SlotAddr::own(START_SLOT_FIRST + 1);
+const UT: SlotAddr = s(START_SLOT_FIRST);
+const DEV: SlotAddr = s(START_SLOT_FIRST + 1);
+/// The first slot beyond the table of the start-up space of the machine of
+/// the tests.
+const BEYOND: SlotAddr = SlotAddr::own(4224);
 const DROPPED: u32 = Header::FLAG_CAPS_DROPPED;
 // Slots that the tests use for the same thing.
 const EP: u32 = 20;
 const RP: u32 = 21;
 const NT: u32 = 22;
 
-fn s(index: u32) -> SlotAddr {
+/// The slot numbers of the tests, on the start-up space of
+/// `Machine::example`: 16 and 17 are its ordinary and its device untyped
+/// (slots 20 and 21), and the slots from 18 are 16 further, after the
+/// start-up capabilities. The fixed slots below 16 are themselves.
+const fn shifted(index: u32) -> u32 {
+    match index {
+        0..16 => index,
+        16 | 17 => index + 4,
+        _ => index + 16,
+    }
+}
+
+const fn s(index: u32) -> SlotAddr {
+    SlotAddr::own(shifted(index))
+}
+
+/// A slot of the caller's own space, for a thread whose space is not the
+/// first one: its index as it is.
+const fn o(index: u32) -> SlotAddr {
     SlotAddr::own(index)
 }
 
+/// A slot of another capability space, through the `cspace` capability in
+/// a slot of the first one.
 fn via(cspace: u32, index: u32) -> SlotAddr {
-    SlotAddr::through(cspace, index)
+    SlotAddr::through(shifted(cspace), index)
 }
 
 fn retype(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAddr) -> Syscall {
@@ -187,7 +210,7 @@ struct K {
 
 impl K {
     fn new() -> Self {
-        let (m, t) = Model::boot();
+        let (m, t) = Model::boot(&Machine::example()).unwrap();
         Self { m, t, spare: 127 }
     }
 
@@ -224,6 +247,21 @@ impl K {
             }
         }
         panic!("{removal:?} does not end in {calls} calls");
+    }
+
+    /// The first thread repeats a creation while it returns `again`, as it
+    /// clears memory 64 KB per call, at most 40,000 times. The invariants
+    /// are checked once, at the end.
+    #[track_caller]
+    fn made(&mut self, creation: Syscall) {
+        for _ in 0..40_000 {
+            match self.m.apply(self.t, creation.clone()) {
+                DONE => return assert_eq!(self.m.check(), Ok(())),
+                Err(Error::Again) => {}
+                other => panic!("{creation:?}: {other:?}"),
+            }
+        }
+        panic!("{creation:?} does not end");
     }
 
     /// A new object from the ordinary untyped, in a slot of the first thread.
@@ -300,7 +338,7 @@ impl K {
 #[test]
 fn boot_state_is_deterministic_and_holds_the_start_up_slots() {
     let mut k = K::new();
-    assert_eq!(Model::boot(), Model::boot());
+    assert_eq!(K::new().m, K::new().m);
     assert_eq!(k.m.check(), Ok(()));
     assert_eq!(k.m.runnable(), [k.t]);
     assert_eq!(k.m.object_at(k.t, s(START_SLOT_THREAD)), Some(k.t));
@@ -318,7 +356,8 @@ fn boot_state_is_deterministic_and_holds_the_start_up_slots() {
 #[test]
 fn deleting_the_first_capability_space_destroys_everything_in_it() {
     let mut k = K::new();
-    assert_eq!(k.go(Syscall::CapDelete(SPACE)), DONE);
+    // The sweep reaches the thread itself in slot 3 within the first call.
+    k.no(Syscall::CapDelete(SPACE), Error::Again);
     assert!(k.m.runnable().is_empty());
 }
 
@@ -336,8 +375,8 @@ fn slot_zero_is_never_used() {
 fn empty_or_out_of_range_slot_is_invalid() {
     let mut k = K::new();
     assert_eq!(k.kind(30), Err(Error::Invalid));
-    assert_eq!(k.kind(128), Err(Error::Invalid));
-    k.no(retype(UT, Endpoint, 0, s(128)), Error::Invalid);
+    assert_eq!(k.inspect(BEYOND), Err(Error::Invalid));
+    k.no(retype(UT, Endpoint, 0, BEYOND), Error::Invalid);
 }
 
 #[test]
@@ -615,7 +654,7 @@ fn cap_derive_takes_a_full_source_and_an_empty_destination() {
     let mut k = K::with_ipc();
     k.no(derive(s(30), s(31), Rights::ALL, 0), Error::Invalid);
     k.no(derive(s(EP), s(NT), Rights::ALL, 0), Error::NoSlot);
-    k.no(derive(s(EP), s(128), Rights::ALL, 0), Error::Invalid);
+    k.no(derive(s(EP), BEYOND, Rights::ALL, 0), Error::Invalid);
 }
 
 #[test]
@@ -974,15 +1013,15 @@ fn thread_whose_capability_space_is_dying_gets_gone_from_every_call_but_cap_dele
     let mut k = K::new();
     let inside = space_with_a_thread(&mut k);
     k.no(Syscall::CapDelete(s(30)), Error::Again);
-    assert_eq!(k.on(inside, Syscall::CapInspect(s(20))), Err(Error::Gone));
-    assert_eq!(k.on(inside, Syscall::Signal(s(20))), Err(Error::Gone));
+    assert_eq!(k.on(inside, Syscall::CapInspect(o(20))), Err(Error::Gone));
+    assert_eq!(k.on(inside, Syscall::Signal(o(20))), Err(Error::Gone));
     assert_eq!(
-        k.on(inside, derive(s(20), s(30), Rights::ALL, 0)),
+        k.on(inside, derive(o(20), o(30), Rights::ALL, 0)),
         Err(Error::Gone)
     );
     assert_eq!(k.on(inside, Syscall::Other(Call::Yield)), Err(Error::Gone));
     // `cap_delete` works, on a full slot and on a dead one.
-    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), DONE);
+    assert_eq!(k.on(inside, Syscall::CapDelete(o(20))), DONE);
     assert_eq!(k.on(inside, Syscall::CapDelete(s(1))), DONE);
     assert_eq!(k.kind(60), Err(Error::Gone));
 }
@@ -993,10 +1032,19 @@ fn thread_whose_capability_space_is_dying_deletes_its_own_slots_only() {
     let inside = space_with_a_thread(&mut k);
     // In its slot 25, a capability for the first space, which is not dying.
     k.ok(derive(SPACE, via(30, 25), Rights::ALL, 0));
-    assert_eq!(k.on(inside, Syscall::CapDelete(via(25, NT))), DONE);
+    assert_eq!(
+        k.on(
+            inside,
+            Syscall::CapDelete(SlotAddr::through(25, shifted(NT)))
+        ),
+        DONE
+    );
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     assert_eq!(
-        k.on(inside, Syscall::CapDelete(via(25, EP))),
+        k.on(
+            inside,
+            Syscall::CapDelete(SlotAddr::through(25, shifted(EP)))
+        ),
         Err(Error::Gone)
     );
     assert_eq!(k.kind(EP), Ok(Endpoint));
@@ -1381,7 +1429,7 @@ fn frame_takes_a_page_size_and_a_number_of_pages() {
     k.no(retype(s(30), Frame, 0, s(31)), Error::Invalid);
     let wb = MemoryType::WriteBack;
     let large = |size, destination| frame(s(30), PageSize::Size2M, size, wb, destination);
-    k.ok(large(2, s(31)));
+    k.made(large(2, s(31)));
     k.no(retype(s(30), Frame, 1, s(32)), Error::NoMemory);
     k.no(large(512, s(32)), Error::NoMemory);
     // Frames: at most 512 pages (D-110).
@@ -1406,7 +1454,7 @@ fn frame_size_argument_is_judged_page_size_then_memory_type_then_pages() {
     k.no(raw(UT, 0, 3, 1), Error::Invalid);
     k.no(raw(UT, 0, 0, 0), Error::Invalid);
     k.no(raw(UT, 0, 0, 513), Error::Invalid);
-    k.ok(raw(UT, 0, 0, 512));
+    k.made(raw(UT, 0, 0, 512));
     k.ok(Syscall::CapDelete(s(30)));
     // Device memory is uncached or write-combining, never write-back.
     k.no(raw(DEV, 0, 0, 1), Error::Invalid);
@@ -1422,7 +1470,7 @@ fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_20() {
         k.no(retype(UT, CSpace, size, s(30)), Error::Invalid);
     }
     k.ok(retype(UT, CSpace, 384, s(30)));
-    k.ok(retype(UT, CSpace, 1 << 20, s(31)));
+    k.made(retype(UT, CSpace, 1 << 20, s(31)));
 }
 
 #[test]
@@ -2168,7 +2216,11 @@ fn transfer_is_dropped_when_the_range_is_shorter_than_the_list() {
 #[test]
 fn receive_range_with_slot_0_or_a_slot_beyond_the_table_is_invalid() {
     let mut k = K::with_ipc();
-    for range in [range(0, 1), range(128, 1), range(126, 3)] {
+    let beyond = |first, count| Range {
+        first: SlotAddr::own(first),
+        count,
+    };
+    for range in [range(0, 1), beyond(4224, 1), beyond(4222, 3)] {
         k.no(recv(EP, RP, range), Error::Invalid);
         k.no(call(EP, msg(1, vec![]), range), Error::Invalid);
     }
@@ -2212,7 +2264,7 @@ fn reply_whose_capabilities_are_dropped_tells_both_sides() {
 #[test]
 fn slot_listed_twice_is_invalid() {
     let mut k = K::with_ipc();
-    let same = via(START_SLOT_CSPACE, NT);
+    let same = SlotAddr::through(START_SLOT_CSPACE, shifted(NT));
     let twice = msg(
         1,
         vec![
@@ -2704,7 +2756,7 @@ fn large_frame_is_aligned_on_its_page_size() {
         memory: 0,
         destination: s(32),
     };
-    k.ok(large);
+    k.made(large);
     k.no(retype(s(30), Frame, 1, s(33)), Error::NoMemory);
 }
 
@@ -2982,7 +3034,13 @@ fn capabilities_of_a_caller_whose_space_began_to_die_are_dropped_at_delivery() {
     let inside = space_with_a_thread(&mut k);
     k.ok(derive(s(EP), via(30, 25), Rights::ALL, 0));
     let derived = msg(1, vec![Transfer::Derive(s(1), Rights::NONE.bits())]);
-    assert_eq!(k.on(inside, call(25, derived, Range::NONE)), WAITS);
+    let called = Syscall::Call {
+        endpoint: o(25),
+        message: derived,
+        range: Range::NONE,
+        wait: 0,
+    };
+    assert_eq!(k.on(inside, called), WAITS);
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     assert_eq!(got(k.go(recv(EP, RP, range(100, 1)))), (1, 0, 0, DROPPED));
 }
@@ -3036,8 +3094,8 @@ fn frame_of_1_gb_pages_is_aligned_on_1_gb() {
     // The first untyped has 4 GB: an endpoint at 0, one page at 1 GB, two
     // at 2 GB, and nothing is left.
     k.make(Endpoint, 30);
-    k.ok(huge(1, 31));
-    k.ok(huge(2, 32));
+    k.made(huge(1, 31));
+    k.made(huge(2, 32));
     k.no(retype(UT, Endpoint, 0, s(33)), Error::NoMemory);
 }
 
@@ -3263,8 +3321,8 @@ fn thread_in_a_dying_space_repeats_a_cap_delete_that_returned_again() {
     }
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     // 33 copies and one in the first space: more than one call.
-    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), Err(Error::Again));
-    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), DONE);
+    assert_eq!(k.on(inside, Syscall::CapDelete(o(20))), Err(Error::Again));
+    assert_eq!(k.on(inside, Syscall::CapDelete(o(20))), DONE);
 }
 
 #[test]
@@ -3760,12 +3818,12 @@ fn bits_of_the_rights_are_those_of_the_interface() {
 }
 
 #[test]
-fn start_up_untypeds_have_the_sizes_that_the_model_states() {
+fn start_up_untypeds_of_the_machine_of_the_tests_have_their_sizes() {
     let mut k = K::new();
-    assert_eq!((BOOT_UNTYPED_BYTES, BOOT_DEVICE_BYTES), (4 << 30, 1 << 20));
+    // The share of node 0, 4 GB from 4 GB, and the device range of 2 MB.
     k.ok(retype(UT, Untyped, 4 << 30, s(30)));
     k.no(retype(UT, Untyped, 4096, s(31)), Error::NoMemory);
-    k.ok(retype(DEV, Untyped, 1 << 20, s(32)));
+    k.ok(retype(DEV, Untyped, 2 << 20, s(32)));
     k.no(retype(DEV, Untyped, 4096, s(33)), Error::NoMemory);
 }
 
@@ -4082,10 +4140,10 @@ fn removal_begun_inside_a_dying_space_is_finished_by_the_sweep() {
     }
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     // The thread begins to delete the notify of slot 20, ahead of the sweep.
-    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), Err(Error::Again));
+    assert_eq!(k.on(inside, Syscall::CapDelete(o(20))), Err(Error::Again));
     k.ok(Syscall::CapDelete(s(30)));
     assert_eq!(k.kind(60), Err(Error::Gone));
-    assert_eq!(k.on(inside, Syscall::CapDelete(s(20))), Err(Error::Gone));
+    assert_eq!(k.on(inside, Syscall::CapDelete(o(20))), Err(Error::Gone));
 }
 
 #[test]
@@ -4110,10 +4168,10 @@ fn supervisor_kills_a_process_by_deleting_its_space_then_its_untyped() {
     let process = k.m.object_at(k.t, s(32)).unwrap();
     // It fills its space with 200 copies, and goes on deriving and sending.
     for slot in 20..220 {
-        assert_eq!(k.on(process, derive(s(16), s(slot), Rights::ALL, 0)), DONE);
+        assert_eq!(k.on(process, derive(o(16), o(slot), Rights::ALL, 0)), DONE);
     }
-    let copy = derive(s(16), s(230), Rights::ALL, 0);
-    let sent = send(3, msg(1, vec![Transfer::Derive(s(16), Rights::ALL.bits())]));
+    let copy = derive(o(16), o(230), Rights::ALL, 0);
+    let sent = send(3, msg(1, vec![Transfer::Derive(o(16), Rights::ALL.bits())]));
     assert_eq!(k.on(process, sent.clone()), Err(Error::WouldWait));
     // From the first step of the removal of its space it gets `gone`.
     let calls = (1..=100)
@@ -4647,7 +4705,7 @@ fn thread_cancel_ends_the_wait_of_a_thread_bound_to_a_dying_or_destroyed_space()
     // 21 of their space, which the sweep reaches after 40 capabilities.
     k.ok(derive(s(NT), via(30, 21), Rights::ALL, 0));
     for thread in threads {
-        assert_eq!(k.on(thread, wait_on(21, 0)), WAITS);
+        assert_eq!(k.on(thread, Syscall::Wait(o(21), 0)), WAITS);
     }
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     k.ok(cancel(31));
@@ -4945,7 +5003,7 @@ fn message_page_is_a_frame_of_one_4_kb_page_of_ordinary_memory() {
     k.make(Thread, 30);
     let wb = MemoryType::WriteBack;
     k.ok(frame(UT, PageSize::Size4K, 2, wb, s(31)));
-    k.ok(frame(UT, PageSize::Size2M, 1, wb, s(32)));
+    k.made(frame(UT, PageSize::Size2M, 1, wb, s(32)));
     k.ok(frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, s(33)));
     k.make(Endpoint, 34);
     for slot in [31, 32, 33, 34] {
@@ -5207,7 +5265,7 @@ fn child_untyped_is_not_cleared_and_keeps_what_its_parent_had_cleared() {
 fn memory_is_dirty_again_once_the_watermark_returns_to_the_start() {
     let mut k = K::new();
     k.ok(retype(UT, Untyped, 1 << 20, s(30)));
-    k.ok(pages(30, 32, 32));
+    k.made(pages(30, 32, 32));
     k.ok(Syscall::CapDelete(s(32)));
     k.no(pages(30, 32, 32), Error::Again);
     k.ok(pages(30, 32, 32));

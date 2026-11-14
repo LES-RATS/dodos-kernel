@@ -4,6 +4,7 @@ use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
     Place, Record, ReplyState, Slot, Sweep, Thread, Untyped, live,
 };
+use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
     ASPACE_BYTES, CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
     ENDPOINT_BYTES, Error, FRAME_MAX_PAGES, IOSPACE_BYTES, LONGEST_WALK, MemoryType, NOTIFY_BYTES,
@@ -450,8 +451,13 @@ impl Model {
             }
             ObjectKind::Thread => {
                 // Threads: a new thread is suspended and bound to nothing.
+                // Register calls: the block of a new thread is all zeros, except
+                // the flags at their fixed value.
+                let mut regs = vec![0; REGS_WORDS];
+                regs[REG_RFLAGS] = RFLAGS_FIXED;
                 let thread = Thread {
                     suspended: true,
+                    regs,
                     ..Thread::default()
                 };
                 self.threads.insert(id, thread);
@@ -689,30 +695,42 @@ impl Model {
     /// first, and says whether there was one.
     fn undo(&mut self, object: ObjId) -> bool {
         let last = |list: &Vec<ObjId>| list.last().copied();
-        let unbound = match self.objects[&object].kind {
+        match self.objects[&object].kind {
             // The threads bound to a `cspace`, an `aspace` or an endpoint (as
             // their fault endpoint) are unbound.
-            ObjectKind::CSpace => last(&self.cspaces[&object].threads).map(|thread| {
-                self.bind_space(thread, None);
-            }),
-            ObjectKind::ASpace => last(&self.aspaces[&object].threads).map(|thread| {
-                self.bind_aspace(thread, None);
-            }),
-            ObjectKind::Endpoint => last(&self.endpoints[&object].threads).map(|thread| {
-                self.bind_fault(thread, None);
-            }),
-            _ => None,
-        };
-        unbound.is_some()
+            ObjectKind::CSpace => match last(&self.cspaces[&object].threads) {
+                Some(thread) => self.bind_space(thread, None),
+                None => return false,
+            },
+            // Destruction of an address space: first the record of each
+            // capability in its list is emptied, most recently mapped first,
+            // then each thread is unbound.
+            ObjectKind::ASpace => {
+                let aspace = &self.aspaces[&object];
+                match (aspace.records.last().copied(), last(&aspace.threads)) {
+                    (Some(cap), _) => self.empty_mapping(cap),
+                    (None, Some(thread)) => self.bind_aspace(thread, None),
+                    (None, None) => return false,
+                }
+            }
+            ObjectKind::Endpoint => match last(&self.endpoints[&object].threads) {
+                Some(thread) => self.bind_fault(thread, None),
+                None => return false,
+            },
+            _ => return false,
+        }
+        true
     }
 
     /// Removes a capability that has no descendant, and leaves `left` in
     /// its slot. The derivation tree: the object is destroyed with its root
     /// capability. Removing a frame capability with a full record undoes
-    /// the binding it holds, in the same unit (D-110).
+    /// the mapping or the binding it holds, in the same unit (D-110).
     fn remove_cap(&mut self, id: CapId, left: Slot) {
-        if let Record::Binding(thread) = self.caps[&id].record {
-            self.bind_page(thread, None);
+        match self.caps[&id].record {
+            Record::Binding(thread) => self.bind_page(thread, None),
+            Record::Mapping(_) => self.empty_mapping(id),
+            Record::Empty => {}
         }
         let cap = self.caps.remove(&id).expect("names a live entry");
         if let Some(parent) = cap.parent {

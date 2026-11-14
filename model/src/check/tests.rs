@@ -2,20 +2,26 @@
 //! valid state, breaks one thing, and returns what `check` reports.
 
 use crate::*;
-use dodos_abi::{Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, TREE_DEPTH};
+use dodos_abi::{
+    Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, START_SLOT_CSPACE, START_SLOT_DEBUG,
+    START_SLOT_THREAD, TREE_DEPTH,
+};
 
-const EP: u32 = 20;
-const RP: u32 = 21;
-const NT: u32 = 22;
-const WAITER: u32 = 23;
-const COPY: u32 = 24;
-const CALLER: u32 = 26;
+/// The ordinary and the device untyped of `Machine::example`.
+const UNTYPED: u32 = 20;
+const DEVICE: u32 = 21;
+const EP: u32 = 40;
+const RP: u32 = 41;
+const NT: u32 = 42;
+const WAITER: u32 = 43;
+const COPY: u32 = 44;
+const CALLER: u32 = 46;
 
 /// An endpoint, a reply object and a notify, a thread that waits on the
 /// notify, a thread in the queue of the endpoint, and two copies of the
 /// endpoint capability in `COPY` and after.
 fn state() -> Model {
-    let (mut model, boot) = Model::boot();
+    let (mut model, boot) = Model::boot(&Machine::example()).unwrap();
     let own = SlotAddr::own;
     let mut on = |thread: ObjId, call: Syscall| model.apply(thread, call).unwrap();
     let mut threads = Vec::new();
@@ -29,7 +35,7 @@ fn state() -> Model {
         on(
             boot,
             Syscall::UntypedRetype {
-                untyped: own(START_SLOT_FIRST),
+                untyped: own(UNTYPED),
                 kind,
                 size: 0,
                 page: 0,
@@ -131,13 +137,13 @@ fn places(model: &Model) -> At {
     let space = object(model, START_SLOT_CSPACE);
     At {
         space,
-        untyped: object(model, START_SLOT_FIRST),
+        untyped: object(model, UNTYPED),
         endpoint: object(model, EP),
         reply: object(model, RP),
         notify: object(model, NT),
         ready: object(model, START_SLOT_THREAD),
         waiter: object(model, WAITER),
-        untyped_cap: cap(model, START_SLOT_FIRST),
+        untyped_cap: cap(model, UNTYPED),
         endpoint_cap: cap(model, EP),
         notify_cap: cap(model, NT),
         copy: cap(model, COPY),
@@ -502,7 +508,7 @@ fn chain_down_to(m: &mut Model, at: At, depth: usize) {
             0,
             Place {
                 space: at.space,
-                index: 40 + index,
+                index: 60 + index,
             },
         );
         parent = *m.caps[&parent].children.last().unwrap();
@@ -534,7 +540,7 @@ fn capability_held_in_a_capability_space_that_descends_from_it_is_reported() {
             Rights::ALL,
             Place {
                 space: at.space,
-                index: 40,
+                index: 60,
             },
         );
         let inner = m.caps[&inner].object;
@@ -632,7 +638,7 @@ fn sweep_that_stands_at_slot_0_is_reported() {
 #[test]
 fn sweep_that_stands_beyond_the_table_is_reported() {
     let broken = spoiled(|m, at| {
-        let inner = inner_space(m, at, 40);
+        let inner = inner_space(m, at, 60);
         let root = m.objects[&inner].root;
         live(&mut m.caps, root).dying = true;
         let sweep = Sweep {
@@ -685,7 +691,7 @@ fn start_up_capability_with_a_parent_is_reported() {
 #[test]
 fn exec_on_device_memory_is_reported() {
     let broken = spoiled(|m, _| {
-        let device = cap(m, START_SLOT_FIRST + 1);
+        let device = cap(m, DEVICE);
         live(&mut m.caps, device).rights = Rights::ALL;
     });
     assert_eq!(broken, "25: exec on device memory");
@@ -694,8 +700,8 @@ fn exec_on_device_memory_is_reported() {
 #[test]
 fn kernel_object_on_device_memory_is_reported() {
     let broken = spoiled(|m, at| {
-        let device = object(m, START_SLOT_FIRST + 1);
-        let from = cap(m, START_SLOT_FIRST + 1);
+        let device = object(m, DEVICE);
+        let from = cap(m, DEVICE);
         let rights = Rights::ALL.without(Rights::EXEC);
         m.create(
             ObjectKind::Notify,
@@ -738,7 +744,7 @@ fn caller_of_a_dying_reply_object_is_reported() {
 #[test]
 fn watermark_above_zero_while_nothing_is_live_is_reported() {
     let broken = spoiled(|m, _| {
-        let device = object(m, START_SLOT_FIRST + 1);
+        let device = object(m, DEVICE);
         live(&mut m.untypeds, device).watermark = 8;
     });
     assert_eq!(broken, "18: watermark is zero when nothing is live");
@@ -785,8 +791,8 @@ fn inner_space(m: &mut Model, at: At, index: u32) -> ObjId {
 #[test]
 fn untyped_capability_less_deep_than_the_space_that_holds_it_is_reported() {
     let broken = spoiled(|m, at| {
-        let inner = inner_space(m, at, 40);
-        let device = cap(m, START_SLOT_FIRST + 1);
+        let inner = inner_space(m, at, 60);
+        let device = cap(m, DEVICE);
         m.place(
             device,
             Place {
@@ -801,7 +807,7 @@ fn untyped_capability_less_deep_than_the_space_that_holds_it_is_reported() {
 #[test]
 fn root_capability_of_a_space_held_in_a_space_of_the_same_depth_is_reported() {
     let broken = spoiled(|m, at| {
-        let (first, second) = (inner_space(m, at, 40), inner_space(m, at, 41));
+        let (first, second) = (inner_space(m, at, 60), inner_space(m, at, 61));
         let root = m.objects[&second].root;
         m.place(
             root,
@@ -839,7 +845,10 @@ fn thread_bound_to_an_object_that_is_not_a_capability_space_is_reported() {
 
 #[test]
 fn maximum_that_is_not_a_whole_number_of_segments_is_reported() {
-    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).max = 200);
+    let broken = spoiled(|m, at| {
+        let space = live(&mut m.cspaces, at.space);
+        space.max = space.slots.len() as u32 + 72;
+    });
     assert_eq!(broken, "7: maximum");
 }
 
@@ -870,7 +879,7 @@ fn receive_range_beyond_the_table_that_waits_is_reported() {
     let broken = spoiled(|m, _| {
         let caller = object(m, CALLER);
         if let Wait::Call { window, .. } = &mut live(&mut m.threads, caller).wait {
-            (window.first, window.count) = (127, 2);
+            (window.first, window.count) = (4223, 2);
         }
     });
     assert_eq!(broken, "29: message or range of a waiting thread");
@@ -945,7 +954,7 @@ fn child_listed_twice_by_its_parent_is_reported() {
 #[test]
 fn maximum_of_no_slot_is_reported() {
     let broken = spoiled(|m, at| {
-        let inner = inner_space(m, at, 40);
+        let inner = inner_space(m, at, 60);
         let space = live(&mut m.cspaces, inner);
         (space.max, space.slots) = (0, Vec::new());
         live(&mut m.untypeds, at.untyped).live -= 1;
@@ -961,7 +970,10 @@ fn maximum_above_2_to_the_20_is_reported() {
 
 #[test]
 fn start_up_space_without_all_its_slots_is_reported() {
-    let broken = spoiled(|m, at| live(&mut m.cspaces, at.space).max = 256);
+    let broken = spoiled(|m, at| {
+        let space = live(&mut m.cspaces, at.space);
+        space.max = space.slots.len() as u32 + 128;
+    });
     assert_eq!(broken, "7: size of the start-up space");
 }
 
@@ -982,7 +994,7 @@ fn capability_space_without_an_object_is_reported() {
 #[test]
 fn untyped_without_its_state_is_reported() {
     let broken = spoiled(|m, _| {
-        let device = object(m, START_SLOT_FIRST + 1);
+        let device = object(m, DEVICE);
         m.untypeds.remove(&device);
     });
     assert_eq!(broken, "10: state of an object");
@@ -991,7 +1003,7 @@ fn untyped_without_its_state_is_reported() {
 #[test]
 fn capability_space_without_its_state_is_reported() {
     let broken = spoiled(|m, at| {
-        let inner = inner_space(m, at, 40);
+        let inner = inner_space(m, at, 60);
         m.cspaces.remove(&inner);
     });
     assert_eq!(broken, "10: state of an object");
@@ -1025,10 +1037,7 @@ fn notify_without_its_state_is_reported() {
 #[test]
 fn child_untyped_of_device_memory_that_is_not_device_memory_is_reported() {
     let broken = spoiled(|m, at| {
-        let (device, from) = (
-            object(m, START_SLOT_FIRST + 1),
-            cap(m, START_SLOT_FIRST + 1),
-        );
+        let (device, from) = (object(m, DEVICE), cap(m, DEVICE));
         let rights = Rights::ALL.without(Rights::EXEC);
         let child = m.create(
             ObjectKind::Untyped,
@@ -1120,7 +1129,7 @@ fn receive_range_of_a_receiver_beyond_the_table_is_reported() {
             endpoint: at.endpoint,
             reply: at.reply,
             window: Window {
-                first: 127,
+                first: 4223,
                 count: 2,
                 ..at.nowhere
             },
@@ -1138,7 +1147,7 @@ fn receive_range_kept_by_an_armed_reply_object_beyond_the_table_is_reported() {
         *live(&mut m.replies, at.reply) = ReplyState::Armed {
             caller,
             window: Window {
-                first: 127,
+                first: 4223,
                 count: 2,
                 ..at.nowhere
             },
@@ -1220,8 +1229,8 @@ fn census_counts_what_the_state_holds() {
     let mut model = state();
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
-        // Eight at start-up, five objects, two copies.
-        capabilities: 15,
+        // Twenty at start-up, five objects, two copies.
+        capabilities: 27,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,
@@ -1244,12 +1253,12 @@ fn census_counts_what_the_state_holds() {
         endpoint: own(EP),
     };
     on(bound).unwrap();
-    // A copy of the endpoint capability in slot 40, 33 copies of that copy
+    // A copy of the endpoint capability in slot 60, 33 copies of that copy
     // and 33 more copies of the endpoint capability.
-    let copies = (41..74)
-        .map(|slot| (40, slot))
-        .chain((80..113).map(|slot| (EP, slot)));
-    for (source, destination) in [(EP, 40)].into_iter().chain(copies) {
+    let copies = (61..94)
+        .map(|slot| (60, slot))
+        .chain((100..133).map(|slot| (EP, slot)));
+    for (source, destination) in [(EP, 60)].into_iter().chain(copies) {
         let copy = Syscall::CapDerive {
             source: own(source),
             destination: own(destination),
@@ -1258,7 +1267,7 @@ fn census_counts_what_the_state_holds() {
         };
         on(copy).unwrap();
     }
-    assert_eq!(on(Syscall::CapDelete(own(40))), Err(Error::Again));
+    assert_eq!(on(Syscall::CapDelete(own(60))), Err(Error::Again));
     let census = model.census();
     assert_eq!((census.callers, census.served, census.bound), (0, 1, 1));
     assert_eq!((census.deepest, census.dying_copies), (4, 1));
@@ -1446,4 +1455,84 @@ fn clean_mark_below_the_watermark_or_on_device_memory_is_reported() {
         device.clean = 8;
     });
     assert_eq!(broken, "18: clean mark");
+}
+
+// The invariants of mapping records and address spaces.
+
+/// The address space of the first thread.
+fn start_aspace(m: &Model, at: At) -> ObjId {
+    m.threads[&at.ready].aspace.unwrap()
+}
+
+#[test]
+fn translation_that_no_record_made_is_reported() {
+    let broken = spoiled(|m, at| {
+        let space = start_aspace(m, at);
+        let aspace = live(&mut m.aspaces, space);
+        let (&at, &t) = aspace.translations.iter().next().unwrap();
+        aspace.translations.insert(at + (1 << 30), t);
+    });
+    assert_eq!(broken, "35: translations of the records");
+}
+
+#[test]
+fn record_whose_translation_is_missing_is_reported() {
+    let broken = spoiled(|m, at| {
+        let space = start_aspace(m, at);
+        let aspace = live(&mut m.aspaces, space);
+        let first = *aspace.translations.keys().next().unwrap();
+        aspace.translations.remove(&first);
+    });
+    assert_eq!(broken, "35: translations of the records");
+}
+
+#[test]
+fn translation_with_other_rights_than_its_record_is_reported() {
+    let broken = spoiled(|m, at| {
+        let space = start_aspace(m, at);
+        let aspace = live(&mut m.aspaces, space);
+        let t = aspace.translations.values_mut().next().unwrap();
+        t.rights = Rights::ALL;
+    });
+    assert_eq!(broken, "35: translations of the records");
+}
+
+#[test]
+fn record_beyond_its_frame_is_reported() {
+    let broken = spoiled(|m, at| {
+        let cap = m.aspaces[&start_aspace(m, at)].records[0];
+        if let Record::Mapping(mapping) = &mut live(&mut m.caps, cap).record {
+            mapping.first = mapping.count;
+        }
+    });
+    assert_eq!(broken, "35: pages of a record");
+}
+
+#[test]
+fn record_missing_from_the_list_of_its_space_is_reported() {
+    let broken = spoiled(|m, at| {
+        let space = start_aspace(m, at);
+        live(&mut m.aspaces, space).records.pop();
+    });
+    assert_eq!(broken, "36: list of the records of a space");
+}
+
+#[test]
+fn space_with_fewer_tables_than_its_translations_hook_is_reported() {
+    let broken = spoiled(|m, at| {
+        // The segments at 2 MB and the pages at 4 KB: one table under the
+        // root, one of the third level, two of the last; the reserve is 4.
+        let space = start_aspace(m, at);
+        live(&mut m.aspaces, space).tables = 3;
+    });
+    assert_eq!(broken, "37: tables of a space");
+}
+
+#[test]
+fn space_with_as_many_tables_as_its_translations_hook_is_accepted() {
+    let mut model = state();
+    let at = places(&model);
+    let space = start_aspace(&model, at);
+    live(&mut model.aspaces, space).tables = 4;
+    assert_eq!(model.check(), Ok(()));
 }

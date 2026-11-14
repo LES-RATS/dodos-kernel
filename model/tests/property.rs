@@ -42,10 +42,10 @@ impl Rng {
 }
 
 // The bias towards valid arguments: the generator keeps each kind of object
-// in its own class of slots, in every capability space. Slot `18 + 8 * n + c`
+// in its own class of slots, in every capability space. Slot `34 + 8 * n + c`
 // is of class `c`; class 7 is left for moves and receive ranges. Every space
 // that a script makes is laid out as the start-up space: a capability for the
-// space itself in slot 1, an untyped in slot 16.
+// space itself in slot 1, an untyped in slot 20.
 const UNTYPED: u32 = 0;
 const CSPACE: u32 = 1;
 const THREAD: u32 = 2;
@@ -56,15 +56,20 @@ const OTHER: u32 = 6;
 const SPARE: u32 = 7;
 
 /// The slots from here on are left to the scripts.
-const SCRIPT_FIRST: u32 = 82;
+const SCRIPT_FIRST: u32 = 98;
 /// The slots of a capability space that a script makes: four segments, so
 /// that the removal of one has steps that only move the sweep.
 const CHILD_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
+/// The slots of the start-up space that the scripts use.
+const HOME_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
+/// The ordinary untyped of `Machine::example`, and its device untyped in
+/// the next slot.
+const UNTYPED_SLOT: u32 = 20;
 /// The links of a chain of copies that starts at depth 2 and ends at 64.
 const CHAIN_LINKS: usize = TREE_DEPTH - 2;
 
 const HERE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
-const MEMORY: SlotAddr = SlotAddr::own(START_SLOT_FIRST);
+const MEMORY: SlotAddr = SlotAddr::own(UNTYPED_SLOT);
 
 const KINDS: [(ObjectKind, u32, u64); 12] = [
     (ObjectKind::Untyped, UNTYPED, 1 << 16),
@@ -254,7 +259,7 @@ impl Generator<'_> {
     }
 
     fn class_slot(&mut self, class: u32) -> u32 {
-        18 + 8 * self.rng.below(8) as u32 + class
+        34 + 8 * self.rng.below(8) as u32 + class
     }
 
     /// A slot of a class, in the caller's capability space or through
@@ -294,7 +299,7 @@ impl Generator<'_> {
     /// A capability of a class: often one of those in the fixed slots.
     fn held(&mut self, class: u32) -> SlotAddr {
         let fixed = match class {
-            UNTYPED => START_SLOT_FIRST + self.rng.chance(10) as u32,
+            UNTYPED => UNTYPED_SLOT + self.rng.chance(10) as u32,
             CSPACE => START_SLOT_CSPACE,
             _ => return self.find(class, Wanted::Full),
         };
@@ -382,7 +387,7 @@ impl Generator<'_> {
     /// the scripts: a receive range for four capabilities.
     fn four_free(&mut self) -> Option<SlotAddr> {
         let table = if self.space == Some(self.home) {
-            CSPACE_SEGMENT_SLOTS
+            HOME_SLOTS
         } else {
             CHILD_SLOTS
         };
@@ -541,7 +546,7 @@ impl Generator<'_> {
             28 => Syscall::Poll(self.held(NOTIFY)),
             // A start-up untyped, the least deep, into another space.
             29 if self.rng.chance(40) => Syscall::CapMove {
-                source: own(START_SLOT_FIRST + self.rng.chance(30) as u32),
+                source: own(UNTYPED_SLOT + self.rng.chance(30) as u32),
                 destination: {
                     let via = self.find(CSPACE, Wanted::Full).index();
                     SlotAddr::through(via, self.class_slot(UNTYPED))
@@ -614,7 +619,7 @@ impl Generator<'_> {
             return Vec::new();
         };
         let table = if space == self.home {
-            CSPACE_SEGMENT_SLOTS
+            HOME_SLOTS
         } else {
             CHILD_SLOTS
         };
@@ -722,7 +727,7 @@ impl Generator<'_> {
         };
         let mut calls = vec![retype(ObjectKind::CSpace, CHILD_SLOTS.into(), own(space))];
         calls.extend(vec![grown; (CHILD_SLOTS / CSPACE_SEGMENT_SLOTS) as usize]);
-        calls.push(derive(MEMORY, inside(START_SLOT_FIRST)));
+        calls.push(derive(MEMORY, inside(UNTYPED_SLOT)));
         calls.push(derive(own(space), inside(START_SLOT_CSPACE)));
         for (kind, class) in [
             (ObjectKind::Endpoint, ENDPOINT),
@@ -731,18 +736,18 @@ impl Generator<'_> {
             (ObjectKind::Frame, OTHER),
         ] {
             let size = (kind == ObjectKind::Frame) as u64;
-            calls.push(retype(kind, size, inside(18 + class)));
-            calls.push(retype(kind, size, inside(26 + class)));
+            calls.push(retype(kind, size, inside(34 + class)));
+            calls.push(retype(kind, size, inside(42 + class)));
             // A capability of this space, shared with the new one.
             if let Some(shared) = self.find_own(class, Wanted::Full) {
-                calls.push(derive(own(shared), inside(34 + class)));
+                calls.push(derive(own(shared), inside(50 + class)));
             }
         }
         // Two threads in the new space, so that one can serve the other.
         // The capability of the second goes into the new space.
         // Each has one of the two frames of the new space as its message
         // page.
-        for (thread, page) in [(own(thread), 18), (inside(18 + THREAD), 26)] {
+        for (thread, page) in [(own(thread), 34), (inside(34 + THREAD), 42)] {
             calls.push(retype(ObjectKind::Thread, 0, thread));
             calls.push(Syscall::ThreadConfigure {
                 thread,
@@ -1078,7 +1083,7 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
 
 fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let (mut model, first) = Model::boot();
+    let (mut model, first) = Model::boot(&Machine::example()).unwrap();
     let home = model.object_at(first, HERE).expect("the start-up space");
     let mut plan = Plan::default();
     // Every thread that could run at some step: those that can be woken.
@@ -1100,7 +1105,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         if of_use.is_empty() {
             // Nothing of use can run: go on from the start-up state.
             reached.restarts += 1;
-            (model, _) = Model::boot();
+            (model, _) = Model::boot(&Machine::example()).unwrap();
             (plan, known) = (Plan::default(), BTreeSet::new());
             continue;
         }
@@ -1295,19 +1300,19 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 2,722, cspace 16,291, aspace 7, frame
-    // 1,201, thread 60, sched 1, endpoint 1,195, reply 430, notify 2,978; a
-    // copy under `cap_delete` 3,821.
+    // Measured, in steps: untyped 2,347, cspace 26,509, aspace 30, frame
+    // 217, thread 1,655, sched 12, endpoint 11, reply 122, notify 268; a
+    // copy under `cap_delete` 5,902.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [1300, 8000, 3, 600, 30, 1, 600, 200, 1500]);
-    at_least([reached.dying_copies], [1900]);
+    at_least(dying, [1150, 13_000, 15, 100, 800, 6, 5, 60, 130]);
+    at_least([reached.dying_copies], [2900]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 36,549 of 57,936 calls.
-    at_least([reached.outside], [28_000]);
+    // Measured: 40,682 of 61,126 calls.
+    at_least([reached.outside], [30_000]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -1318,8 +1323,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 50,210, reply objects armed 26,353,
-    // receivers 58,315, waiters on a notify 38,004, a notify bound 54,043.
+    // Measured, in steps: callers queued 59,529, reply objects armed 22,377,
+    // receivers 64,667, waiters on a notify 50,758, a notify bound 59,352.
     let waits = [
         reached.callers,
         reached.served,
@@ -1327,19 +1332,19 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [25_000, 13_000, 29_000, 19_000, 27_000]);
-    // Measured, each once: 50 messages with capabilities, 31 with the
-    // capabilities dropped, 28 notifications, 25 threads woken with `gone`.
+    at_least(waits, [29_000, 11_000, 32_000, 25_000, 29_000]);
+    // Measured, each once: 58 messages with capabilities, 26 with the
+    // capabilities dropped, 38 notifications, 20 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [25, 15, 14, 12]);
-    // Measured: 24 messages received with four capabilities, and 130 calls
+    at_least(ends, [29, 13, 19, 10]);
+    // Measured: 22 messages received with four capabilities, and 175 calls
     // by a thread whose capability space is destroyed.
-    at_least([reached.with_four, reached.destroyed], [12, 65]);
+    at_least([reached.with_four, reached.destroyed], [11, 85]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -1348,40 +1353,40 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 2,056 accepted and 101 refused, cspace 165 and 41;
-    // by `send` 6 delivered and none refused (one in the last pass).
-    at_least(reached.moved, [1000, 80]);
-    at_least(reached.refused, [50, 20]);
-    at_least([reached.sent, reached.sent_refused], [3, 0]);
-    // The same moves listed by `call` and by `reply_recv`: 32 and 18.
-    at_least([reached.called, reached.answered], [16, 9]);
+    // Measured: untyped 3,413 accepted and 111 refused, cspace 187 and 35;
+    // by `send` 8 delivered and none refused (one in pass 10).
+    at_least(reached.moved, [1700, 90]);
+    at_least(reached.refused, [55, 17]);
+    at_least([reached.sent, reached.sent_refused], [4, 0]);
+    // The same moves listed by `call` and by `reply_recv`: 40 and 23.
+    at_least([reached.called, reached.answered], [20, 11]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 53 queued callers, 16 callers that wait for the reply, 99
-    // receivers, 30 waiters on a notify; 29 of the ends by a wait number.
-    at_least(reached.cancelled, [26, 8, 49, 15]);
-    at_least([reached.cancelled_by_number], [14]);
-    // Measured: `call` 44, `recv` 32, `reply_recv` 20 and `wait` 38 returned
+    // Measured: 64 queued callers, 19 callers that wait for the reply, 88
+    // receivers, 42 waiters on a notify; 21 of the ends by a wait number.
+    at_least(reached.cancelled, [32, 9, 44, 21]);
+    at_least([reached.cancelled_by_number], [10]);
+    // Measured: `call` 41, `recv` 37, `reply_recv` 17 and `wait` 17 returned
     // `cancelled` at once.
-    at_least(reached.cancelled_at_once, [22, 16, 10, 19]);
+    at_least(reached.cancelled_at_once, [20, 18, 8, 8]);
 }
 
 #[test]
 fn removal_steps_that_only_move_the_sweep_are_reached() {
     let reached = all_seeds();
-    // Measured: 25 of the 2,006 `again` of a removal removed nothing.
-    at_least([reached.swept_only], [12]);
+    // Measured: 39 of the 3,141 `again` of a removal removed nothing.
+    at_least([reached.swept_only], [19]);
 }
 
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 66 calls returned `unsupported` for a kind this version
+    // Measured: 53 calls returned `unsupported` for a kind this version
     // does not make.
-    at_least([reached.retype_unsupported], [33]);
+    at_least([reached.retype_unsupported], [26]);
 }
 
 #[test]

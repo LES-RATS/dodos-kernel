@@ -14,25 +14,21 @@
 
 #![forbid(unsafe_code)]
 
+mod boot;
 mod caps;
 mod check;
 mod ipc;
+mod memory;
 mod threads;
 
+pub use boot::{Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, Segment};
 pub use check::Census;
 
 use dodos_abi::{
-    CSPACE_SEGMENT_SLOTS, Call, Error, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received,
-    Rights, START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST,
-    START_SLOT_MESSAGE_PAGE, START_SLOT_SCHED, START_SLOT_THREAD, SlotAddr,
+    Call, Error, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights, SlotAddr,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
-
-/// Bytes of the ordinary untyped, in slot `START_SLOT_FIRST`.
-pub const BOOT_UNTYPED_BYTES: u64 = 4 << 30;
-/// Bytes of the device untyped, in slot `START_SLOT_FIRST + 1`.
-pub const BOOT_DEVICE_BYTES: u64 = 1 << 20;
 
 /// Identity of a kernel object. It is never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -217,8 +213,30 @@ enum Slot {
 enum Record {
     #[default]
     Empty,
+    /// A mapping: the pages first to first + count − 1 of the frame, at
+    /// consecutive addresses from `address`, in an `aspace` or an `iospace`.
+    Mapping(Mapping),
     /// Bindings: the message page of this thread.
     Binding(ObjId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Mapping {
+    space: ObjId,
+    address: u64,
+    first: u64,
+    count: u64,
+    rights: Rights,
+}
+
+/// One translation of a space: a page of the frame of the capability whose
+/// record made it, of the frame's page size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Translation {
+    cap: CapId,
+    page: u64,
+    size: PageSize,
+    rights: Rights,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -296,6 +314,15 @@ struct ASpace {
     /// A thread and its address space: the threads bound to it, the most
     /// recent last.
     threads: Vec<ObjId>,
+    /// Mapping records: every translation in the space, by the address of
+    /// its page.
+    translations: BTreeMap<u64, Translation>,
+    /// The capabilities whose records name the space, the most recently
+    /// mapped last.
+    records: Vec<CapId>,
+    /// Address spaces and their tables: the lower tables taken, hooked or on
+    /// the free list. The hooked ones follow from the translations.
+    tables: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -317,6 +344,9 @@ struct Thread {
     cancelled_up_to: u64,
     /// Outcome of the call the thread waited in, until its next call.
     outcome: Option<Outcome>,
+    /// Register calls: the register block, as the thread will see it when
+    /// it resumes.
+    regs: Vec<u64>,
 }
 
 /// IPC: the states of a thread. `None` is ready.
@@ -411,6 +441,10 @@ pub struct Model {
     /// Large pages: the page sizes the processor supports, bit `i` for
     /// `PageSize` `i`.
     page_sizes: u32,
+    /// The `core` objects, with their node index.
+    cores: BTreeMap<ObjId, u32>,
+    /// What the start-up state was built from.
+    machine: Machine,
 }
 
 /// Whether a call has a variant of its own in `Syscall`.
@@ -451,77 +485,6 @@ fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
 }
 
 impl Model {
-    /// The state at start-up, and the first thread, which can run (Start-up
-    /// information).
-    ///
-    /// CONTRACT-GAP (Start-up information): that section is only proposed.
-    /// It also gives the first process a `core` capability per core, the
-    /// control capabilities for interrupts, I/O ports and IOMMU domains, and
-    /// the frames of the boot image; and it leaves the size of the start-up
-    /// space and the untyped ranges to the boot image. The model gives none
-    /// of the first, one segment, and the two untypeds below. Its capability
-    /// space has one segment and holds itself, an `aspace`, the thread, a
-    /// `sched` and `debug` in their fixed slots, then one ordinary untyped
-    /// and one device untyped.
-    pub fn boot() -> (Self, ObjId) {
-        let mut model = Self {
-            page_sizes: 0b111,
-            ..Self::default()
-        };
-        let space = ObjId(model.next_id);
-        let mut add = |kind, size, index, rights| {
-            let cap = model.create(kind, size, None, rights, Place { space, index });
-            model.caps[&cap].object
-        };
-        let all = Rights::ALL;
-        let segment = CSPACE_SEGMENT_SLOTS.into();
-        add(ObjectKind::CSpace, segment, START_SLOT_CSPACE, all);
-        let aspace = add(ObjectKind::ASpace, 0, START_SLOT_ASPACE, all);
-        let thread = add(ObjectKind::Thread, 0, START_SLOT_THREAD, all);
-        add(ObjectKind::Sched, 0, START_SLOT_SCHED, all);
-        add(ObjectKind::Debug, 0, START_SLOT_DEBUG, all);
-        let ordinary = add(
-            ObjectKind::Untyped,
-            BOOT_UNTYPED_BYTES,
-            START_SLOT_FIRST,
-            all,
-        );
-        // Rules of `untyped_retype`: the start-up capabilities for device
-        // memory have no `exec`.
-        let no_exec = all.without(Rights::EXEC);
-        let device = add(
-            ObjectKind::Untyped,
-            BOOT_DEVICE_BYTES,
-            START_SLOT_FIRST + 1,
-            no_exec,
-        );
-        live(&mut model.untypeds, ordinary).clean = BOOT_UNTYPED_BYTES;
-        live(&mut model.untypeds, device).device = true;
-        // Start-up state: the frame of the message page of the first thread,
-        // which holds its binding.
-        let page = model.create(
-            ObjectKind::Frame,
-            1,
-            None,
-            all,
-            Place {
-                space,
-                index: START_SLOT_MESSAGE_PAGE,
-            },
-        );
-        let frame = Frame {
-            page: PageSize::Size4K,
-            pages: 1,
-            memory: MemoryType::WriteBack,
-        };
-        model.frames.insert(model.caps[&page].object, frame);
-        model.bind_space(thread, Some(space));
-        model.bind_aspace(thread, Some(aspace));
-        model.bind_page(thread, Some(page));
-        live(&mut model.threads, thread).suspended = false;
-        (model, thread)
-    }
-
     /// The threads that can run: not suspended and not waiting. A call can
     /// be applied for any of them.
     pub fn runnable(&self) -> Vec<ObjId> {
@@ -549,6 +512,14 @@ impl Model {
         self.threads.get(&thread)?;
         let cap = self.cap(thread, slot, Rights::READ).ok()?;
         Some(self.caps[&cap].object)
+    }
+
+    /// The rights of the translation that covers `address` in the address
+    /// space of `thread`, if any.
+    pub fn translated(&self, thread: ObjId, address: u64) -> Option<Rights> {
+        let aspace = &self.aspaces[&self.threads.get(&thread)?.aspace?];
+        let (&at, translation) = aspace.translations.range(..=address).next_back()?;
+        (address - at < translation.size.bytes()).then_some(translation.rights)
     }
 
     /// Applies one call made by `thread`, which must be able to run.
