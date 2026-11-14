@@ -2,7 +2,7 @@
 
 Verification, before every commit and identical in CI:
 
-    ./verify
+    nix develop -c ./verify
 
 This repository holds the kernel, its executable model, the oracle harness and
 the kernel interface in code (`abi/`). Nothing here knows Wasm or WIT.
