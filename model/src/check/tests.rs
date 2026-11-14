@@ -56,20 +56,21 @@ fn state() -> Model {
             Syscall::CapDerive {
                 source: own(EP),
                 destination: own(destination),
-                rights: Rights::SEND,
+                rights: Rights::SEND.bits(),
                 badge: 0,
             },
         );
     }
     let (waiter, caller) = (object(&model, WAITER), object(&model, CALLER));
     let mut on = |thread: ObjId, call: Syscall| model.apply(thread, call).unwrap();
-    on(waiter, Syscall::Wait(own(NT)));
+    on(waiter, Syscall::Wait(own(NT), 0));
     on(
         caller,
         Syscall::Call {
             endpoint: own(EP),
             message: Message::default(),
             range: Range::NONE,
+            wait: 0,
         },
     );
     assert_eq!(threads, [WAITER, CALLER]);
@@ -1198,6 +1199,27 @@ fn outcome_of_a_wait_whose_words_differ_from_its_header_is_reported() {
 }
 
 #[test]
+fn wait_number_of_a_thread_that_does_not_wait_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.ready).number = 1);
+    assert_eq!(broken, "31: wait number of a thread");
+}
+
+#[test]
+fn wait_number_already_cancelled_while_the_thread_waits_is_reported() {
+    let broken = spoiled(|m, at| {
+        let waiter = live(&mut m.threads, at.waiter);
+        (waiter.number, waiter.cancelled_up_to) = (3, 3);
+    });
+    assert_eq!(broken, "31: wait number of a thread");
+    // A greater number is the state of a thread that waits with it.
+    let mut model = state();
+    let at = places(&model);
+    let waiter = live(&mut model.threads, at.waiter);
+    (waiter.number, waiter.cancelled_up_to) = (4, 3);
+    assert_eq!(model.check(), Ok(()));
+}
+
+#[test]
 fn watermark_that_is_not_a_multiple_of_8_bytes_is_reported() {
     let broken = spoiled(|m, at| live(&mut m.untypeds, at.untyped).watermark += 1);
     assert_eq!(broken, "18: watermark on 8 bytes");
@@ -1208,6 +1230,8 @@ fn census_counts_what_the_state_holds() {
     let mut model = state();
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
+        // Seven at start-up, five objects, two copies.
+        capabilities: 14,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,
@@ -1222,6 +1246,7 @@ fn census_counts_what_the_state_holds() {
         endpoint: own(EP),
         reply: own(RP),
         range: Range::NONE,
+        wait: 0,
     };
     on(served).unwrap();
     let bound = Syscall::NotifyBind {
@@ -1238,7 +1263,7 @@ fn census_counts_what_the_state_holds() {
         let copy = Syscall::CapDerive {
             source: own(source),
             destination: own(destination),
-            rights: Rights::ALL,
+            rights: Rights::ALL.bits(),
             badge: 0,
         };
         on(copy).unwrap();

@@ -58,9 +58,9 @@ impl Message {
 /// Notifications: what `recv` returns for a pending word of the bound
 /// notify. The badge field holds the word.
 fn notification(word: u64) -> Delivery {
-    // CONTRACT-GAP (Notifications): the contract gives the flag and the
-    // badge field of this header, not the rest. The label is 0 and there
-    // are no words.
+    // Notifications: the flag `notification`, label 0, no words and no
+    // capabilities; the badge field holds the word, the marks are 0 and the
+    // task identifier is 0.
     let header = Header::new(0, 0, 0, Header::FLAG_NOTIFICATION).expect("an empty message");
     Delivery {
         received: received(header, word),
@@ -299,7 +299,19 @@ impl Model {
                 Transfer::Move(slot) => Listed::Move(self.cap(sender, slot, Rights::WRITE)?),
                 Transfer::Derive(slot, rights) => {
                     let cap = self.cap(sender, slot, Rights::READ)?;
-                    Listed::Derive(cap, self.caps[&cap].rights.derive(rights)?)
+                    let held = self.caps[&cap].rights;
+                    // The last of the three checks of the slot: `derive`.
+                    if !held.contains(Rights::DERIVE) {
+                        return Err(Error::Denied);
+                    }
+                    // Capabilities and objects: the rights word is a plain
+                    // argument, judged with its slot: a bit that names no
+                    // right is `invalid`, before the subset.
+                    let rights = Rights::from_bits(rights).ok_or(Error::Invalid)?;
+                    if !held.contains(rights) {
+                        return Err(Error::Denied);
+                    }
+                    Listed::Derive(cap, rights)
                 }
             };
             // Transfer of capabilities: a slot listed twice is `invalid`;

@@ -150,11 +150,11 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::ReplyRecv { .. } => 12,
         Syscall::Send { .. } => 13,
         Syscall::Signal(_) => 14,
-        Syscall::Wait(_) => 15,
+        Syscall::Wait(..) => 15,
         Syscall::Poll(_) => 16,
         Syscall::NotifyBind { .. } => 17,
         Syscall::Other(_) => 18,
-        Syscall::ThreadCancel(_) => 19,
+        Syscall::ThreadCancel(..) => 19,
     }
 }
 
@@ -166,7 +166,7 @@ fn derive(source: SlotAddr, destination: SlotAddr) -> Syscall {
     Syscall::CapDerive {
         source,
         destination,
-        rights: Rights::ALL,
+        rights: Rights::ALL.bits(),
         badge: 0,
     }
 }
@@ -303,11 +303,22 @@ impl Generator<'_> {
         self.find(class, Wanted::Free)
     }
 
-    fn rights(&mut self) -> Rights {
-        if self.rng.chance(75) {
-            Rights::ALL
+    /// A rights word: mostly every right, seldom a bit that names none.
+    fn rights(&mut self) -> u32 {
+        match self.rng.below(100) {
+            0..75 => Rights::ALL.bits(),
+            75..98 => self.rng.below(256) as u32,
+            _ => self.rng.below(1024) as u32,
+        }
+    }
+
+    /// A wait number: mostly none, else a small one, so that the numbers
+    /// of the waits and those of `thread_cancel` meet.
+    fn number(&mut self) -> u64 {
+        if self.rng.chance(60) {
+            0
         } else {
-            Rights::from_bits(self.rng.below(256) as u32).unwrap()
+            1 + self.rng.below(8)
         }
     }
 
@@ -357,7 +368,7 @@ impl Generator<'_> {
             slots.extend(found);
         }
         slots.truncate(MAX_CAPS);
-        let copy = |slot: u32| Transfer::Derive(own(slot), Rights::NONE);
+        let copy = |slot: u32| Transfer::Derive(own(slot), Rights::NONE.bits());
         slots.into_iter().map(copy).collect()
     }
 
@@ -488,29 +499,32 @@ impl Generator<'_> {
             },
             15 | 16 => Syscall::ThreadResume(self.held(THREAD)),
             17 if self.rng.chance(30) => Syscall::ThreadSuspend(self.held(THREAD)),
-            17 if self.rng.chance(60) => Syscall::ThreadCancel(self.held(THREAD)),
+            17 if self.rng.chance(60) => Syscall::ThreadCancel(self.held(THREAD), self.number()),
             17..20 => Syscall::Call {
                 endpoint: self.held(ENDPOINT),
                 message: self.message(),
                 range: self.range(),
+                wait: self.number(),
             },
             20 | 21 => Syscall::Recv {
                 endpoint: self.held(ENDPOINT),
                 reply: self.held(REPLY),
                 range: self.range(),
+                wait: self.number(),
             },
             22 | 23 => Syscall::ReplyRecv {
                 reply: self.held(REPLY),
                 message: self.message(),
                 endpoint: self.held(ENDPOINT),
                 range: self.range(),
+                wait: self.number(),
             },
             24 | 25 => Syscall::Send {
                 target: self.held(answered),
                 message: self.message(),
             },
             26 => Syscall::Signal(self.held(NOTIFY)),
-            27 => Syscall::Wait(self.held(NOTIFY)),
+            27 => Syscall::Wait(self.held(NOTIFY), self.number()),
             28 => Syscall::Poll(self.held(NOTIFY)),
             // A start-up untyped, the least deep, into another space.
             29 if self.rng.chance(40) => Syscall::CapMove {
@@ -545,12 +559,14 @@ impl Generator<'_> {
                         endpoint: self.held(ENDPOINT),
                         message,
                         range: self.range(),
+                        wait: self.number(),
                     },
                     _ => Syscall::ReplyRecv {
                         reply: self.held(REPLY),
                         message,
                         endpoint: self.held(ENDPOINT),
                         range: self.range(),
+                        wait: self.number(),
                     },
                 }
             }
@@ -561,6 +577,7 @@ impl Generator<'_> {
                     first: self.inside(SPARE),
                     count: 1 + self.rng.below(4) as u32,
                 },
+                wait: self.number(),
             },
             _ if self.rng.chance(80) => Syscall::NotifyBind {
                 notify: self.held(NOTIFY),
@@ -814,6 +831,7 @@ impl Generator<'_> {
             endpoint: own(endpoint),
             reply: own(reply),
             range: Range { first, count: 4 },
+            wait: 0,
         }]
     }
 
@@ -836,6 +854,7 @@ impl Generator<'_> {
                 endpoint: own(endpoint),
                 message,
                 range,
+                wait: 0,
             }
         })
     }
@@ -989,7 +1008,7 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
             let derived = Syscall::CapDerive {
                 source: ordinary,
                 destination,
-                rights: Rights::NONE,
+                rights: 0,
                 badge: 0,
             };
             Some(Risk {
@@ -1003,7 +1022,7 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
             for transfer in &mut derived.caps {
                 if let Transfer::Move(slot) = *transfer {
                     found = found.or(kind(slot));
-                    *transfer = Transfer::Derive(ordinary, Rights::NONE);
+                    *transfer = Transfer::Derive(ordinary, Rights::NONE.bits());
                 }
             }
             let derived = Syscall::Send {
@@ -1198,9 +1217,12 @@ fn invariants_hold_after_every_call_of_random_sequences() {
         assert_eq!(ok == 0, *name == "other", "{name}");
     }
     for (code, &count) in reached.errors.iter().enumerate().skip(1) {
-        // `cancelled` is the outcome of a wait, never what a call returns.
-        let never = code == Error::Budget as usize || code == Error::Cancelled as usize;
-        assert_eq!(count == 0, never, "error code {code}");
+        // `budget` belongs to the scheduling calls, which are not modelled.
+        assert_eq!(
+            count == 0,
+            code == Error::Budget as usize,
+            "error code {code}"
+        );
     }
     assert!(reached.several_threads as usize > STEPS);
 }

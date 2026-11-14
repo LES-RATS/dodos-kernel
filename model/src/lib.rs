@@ -47,7 +47,9 @@ struct CapId(u32);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Transfer {
     Move(SlotAddr),
-    Derive(SlotAddr, Rights),
+    /// With the rights word as the sender gives it: a bit that names no
+    /// right is `invalid`.
+    Derive(SlotAddr, u32),
 }
 
 /// A message as its sender gives it.
@@ -89,7 +91,9 @@ pub enum Syscall {
     CapDerive {
         source: SlotAddr,
         destination: SlotAddr,
-        rights: Rights,
+        /// The rights word as the caller gives it: a bit that names no right
+        /// is `invalid`.
+        rights: u32,
         badge: u64,
     },
     CapMove {
@@ -120,29 +124,35 @@ pub enum Syscall {
     },
     ThreadResume(SlotAddr),
     ThreadSuspend(SlotAddr),
-    ThreadCancel(SlotAddr),
+    /// The thread, and a wait number.
+    ThreadCancel(SlotAddr, u64),
+    /// `wait`, here and below, is the wait number of the call; 0 is none.
     Call {
         endpoint: SlotAddr,
         message: Message,
         range: Range,
+        wait: u64,
     },
     Recv {
         endpoint: SlotAddr,
         reply: SlotAddr,
         range: Range,
+        wait: u64,
     },
     ReplyRecv {
         reply: SlotAddr,
         message: Message,
         endpoint: SlotAddr,
         range: Range,
+        wait: u64,
     },
     Send {
         target: SlotAddr,
         message: Message,
     },
     Signal(SlotAddr),
-    Wait(SlotAddr),
+    /// The notify, and the wait number.
+    Wait(SlotAddr, u64),
     Poll(SlotAddr),
     NotifyBind {
         notify: SlotAddr,
@@ -256,6 +266,11 @@ struct Thread {
     cspace: Option<ObjId>,
     suspended: bool,
     wait: Wait,
+    /// Threads: the wait number of the call the thread waits in; 0 if it
+    /// gave none, or does not wait.
+    number: u64,
+    /// Threads: the word "cancelled up to", 0 when the thread is created.
+    cancelled_up_to: u64,
     /// Outcome of the call the thread waited in, until its next call.
     outcome: Option<Outcome>,
 }
@@ -464,6 +479,32 @@ impl Model {
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
         live(&mut self.threads, thread).outcome = None;
+        let number = match call {
+            Syscall::Call { wait, .. }
+            | Syscall::Recv { wait, .. }
+            | Syscall::ReplyRecv { wait, .. }
+            | Syscall::Wait(_, wait) => wait,
+            _ => 0,
+        };
+        let outcome = self.dispatch(thread, call)?;
+        // Threads: a call that is about to wait with a wait number that is
+        // not 0 and not greater than the word of the thread returns
+        // `cancelled` instead, with the effects of a wait ended at once: a
+        // `call` whose message was delivered has sent it, and the reply
+        // object it armed is idle again. A call that ends without waiting
+        // does not look at the word.
+        if outcome == Output::Waits {
+            let waiting = live(&mut self.threads, thread);
+            if number != 0 && number <= waiting.cancelled_up_to {
+                self.unlink(thread);
+                return Err(Error::Cancelled);
+            }
+            waiting.number = number;
+        }
+        Ok(outcome)
+    }
+
+    fn dispatch(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         match call {
             Syscall::CapDerive {
                 source,
@@ -494,33 +535,38 @@ impl Model {
             } => self.thread_configure(thread, target, cspace, aspace, fault),
             Syscall::ThreadResume(target) => self.thread_resume(thread, target),
             Syscall::ThreadSuspend(target) => self.thread_suspend(thread, target),
-            Syscall::ThreadCancel(target) => self.thread_cancel(thread, target),
+            Syscall::ThreadCancel(target, number) => self.thread_cancel(thread, target, number),
             Syscall::Call {
                 endpoint,
                 message,
                 range,
+                wait: _,
             } => self.call(thread, endpoint, message, range),
             Syscall::Recv {
                 endpoint,
                 reply,
                 range,
+                wait: _,
             } => self.recv(thread, endpoint, reply, range),
             Syscall::ReplyRecv {
                 reply,
                 message,
                 endpoint,
                 range,
+                wait: _,
             } => self.reply_recv(thread, reply, message, endpoint, range),
             Syscall::Send { target, message } => self.send(thread, target, message),
             Syscall::Signal(notify) => self.signal(thread, notify),
-            Syscall::Wait(notify) => self.wait(thread, notify, ipc::IfZero::Wait),
+            Syscall::Wait(notify, _) => self.wait(thread, notify, ipc::IfZero::Wait),
             Syscall::Poll(notify) => self.wait(thread, notify, ipc::IfZero::WouldWait),
             Syscall::NotifyBind { notify, endpoint } => self.notify_bind(thread, notify, endpoint),
-            // Threads: `thread_read_regs` and `thread_write_regs` are not
-            // part of the one-core reference and are `unsupported` in it, as
-            // the calls of the groups not yet specified. Removal ends: a
-            // thread whose capability space is dying or destroyed gets
-            // `gone` from this call as from every other.
+            // Threads: `thread_read_regs`, `thread_write_regs` and `yield`
+            // are not part of the one-core reference: they return
+            // `unsupported` as soon as the capability space of the caller is
+            // found, before any argument is looked at. So do the calls of
+            // the groups not yet specified. Removal ends: a thread whose
+            // capability space is dying or destroyed gets `gone` from this
+            // call as from every other.
             Syscall::Other(call) => {
                 assert!(!modelled(call), "{call:?} has its own variant of `Syscall`");
                 self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
@@ -681,9 +727,13 @@ impl Model {
     }
 
     /// Ends the wait of a thread that `unlink` took out of what it waited
-    /// on: `outcome` is the outcome of the call it waited in.
+    /// on: `outcome` is the outcome of the call it waited in. The wait
+    /// number goes with the wait. A caller that a server receives is taken
+    /// out of the queue and goes on waiting, for the reply, with the same
+    /// number: that is not the end of its wait.
     fn wake(&mut self, thread: ObjId, outcome: Outcome) {
-        live(&mut self.threads, thread).outcome = Some(outcome);
+        let woken = live(&mut self.threads, thread);
+        (woken.outcome, woken.number) = (Some(outcome), 0);
     }
 
     // Threads.
@@ -739,18 +789,31 @@ impl Model {
         Ok(Output::Done)
     }
 
-    /// Threads: a thread that waits is taken out of its queue and its call
-    /// returns `cancelled`; a reply object attached to it or armed with it
-    /// becomes idle. Nothing of its message moves: the capabilities it
+    /// Threads: with a wait number other than 0, the word "cancelled up to"
+    /// of the thread becomes the greater of itself and the number; then the
+    /// wait of the thread is ended if its wait number is not 0 and not
+    /// greater than the word. With wait number 0 the word does not change
+    /// and the wait is ended whatever its number.
+    ///
+    /// A wait that is ended: the thread is taken out of its queue and its
+    /// call returns `cancelled`; a reply object attached to it or armed with
+    /// it becomes idle. Nothing of its message moves: the capabilities it
     /// lists are transferred only at delivery. A suspended thread stays
-    /// suspended and finds `cancelled` when it runs again.
-    fn thread_cancel(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
+    /// suspended and finds `cancelled` when it runs again. The thread may be
+    /// bound to no capability space, or to one that is dying or destroyed:
+    /// only the capability space of the caller is looked at.
+    fn thread_cancel(&mut self, thread: ObjId, target: SlotAddr, number: u64) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        // Threads: if the thread does not wait the call succeeds and changes
-        // nothing; nothing is remembered for its next wait. A thread whose
-        // wait is over, and that has not run since, does not wait: it keeps
-        // the outcome of that wait.
-        if self.threads[&target].wait != Wait::None {
+        let cancelled = live(&mut self.threads, target);
+        cancelled.cancelled_up_to = cancelled.cancelled_up_to.max(number);
+        let ended = match number {
+            0 => true,
+            _ => cancelled.number != 0 && cancelled.number <= cancelled.cancelled_up_to,
+        };
+        // Threads: a thread whose wait is already over, and that has not run
+        // since, does not wait: it keeps the result it has. The result says
+        // nothing about what the thread was doing.
+        if ended && cancelled.wait != Wait::None {
             self.unlink(target);
             self.wake(target, Err(Error::Cancelled));
         }

@@ -8,12 +8,12 @@ use dodos_abi::{
     ASPACE_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, ENDPOINT_BYTES,
     Error, LONGEST_WALK, NOTIFY_BYTES, ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP,
     REPLY_BYTES, Rights, SCHED_BYTES, SLOT_BYTES, SlotAddr, THREAD_BYTES, TREE_DEPTH,
+    UNTYPED_MIN_BYTES,
 };
 
 /// Slots and addresses: one segment of a capability space.
 const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
-/// Rules of `untyped_retype`: the smallest untyped, and the greatest
-/// alignment of a kernel object.
+/// Rules of `untyped_retype`: the greatest alignment of a kernel object.
 const PAGE: u64 = PageSize::Size4K.bytes();
 
 /// How a capability comes to a slot, for `Model::fits`.
@@ -48,9 +48,10 @@ enum Removal {
 fn footprint(kind: ObjectKind, size: u64, page: PageSize) -> Result<(u64, u64), Error> {
     let segments = size / u64::from(CSPACE_SEGMENT_SLOTS);
     let (bytes, valid) = match kind {
-        ObjectKind::Untyped => (size, size.is_power_of_two() && size >= PAGE),
-        // Capabilities and objects: a size that does not fit in 64 bits is
-        // `invalid`.
+        ObjectKind::Untyped => (size, size.is_power_of_two() && size >= UNTYPED_MIN_BYTES),
+        // Rules of `untyped_retype`: a frame takes exactly its number of
+        // pages times its page size. Capabilities and objects: a size that
+        // does not fit in 64 bits is `invalid`.
         ObjectKind::Frame => (
             size.checked_mul(page.bytes()).ok_or(Error::Invalid)?,
             size > 0,
@@ -93,7 +94,7 @@ impl Model {
         thread: ObjId,
         source: SlotAddr,
         destination: SlotAddr,
-        rights: Rights,
+        rights: u32,
         badge: u64,
     ) -> Outcome {
         let parent = self.cap(thread, source, Rights::READ)?;
@@ -104,12 +105,12 @@ impl Model {
             return Err(Error::Denied);
         }
         let place = self.destination(thread, destination)?;
-        // Capabilities and objects: a rights word with a bit that names no
-        // right is `invalid`, judged before the subset. The model takes
-        // `Rights`, which has no such bit: whoever decodes the raw word
-        // answers `invalid` before calling the model.
-        // The new rights are a subset of the source's, checked with the
-        // plain arguments. Order of checks, step
+        // Capabilities and objects: the rights word is a plain argument,
+        // judged after the three checks of its slot and after the
+        // destination. A bit that names no right is `invalid`, before the
+        // subset.
+        let rights = Rights::from_bits(rights).ok_or(Error::Invalid)?;
+        // The new rights are a subset of the source's. Order of checks, step
         // 3: in the order of the table, the rights before the badge.
         if !held.contains(rights) {
             return Err(Error::Denied);

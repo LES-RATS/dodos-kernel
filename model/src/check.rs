@@ -19,6 +19,8 @@ fn ensure(holds: bool, invariant: &'static str) -> Check {
 /// of calls reach. It is no part of the behaviour.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Census {
+    /// Capabilities, in every slot.
+    pub capabilities: usize,
     /// The depth of the deepest capability.
     pub deepest: usize,
     /// The kind of each object that is dying.
@@ -73,6 +75,7 @@ impl Model {
                 .count()
         };
         Census {
+            capabilities: self.caps.len(),
             deepest: self.depths().into_values().max().unwrap_or(0),
             dying: dying.map(|(_, object)| object.kind).collect(),
             dying_copies: self.caps.values().filter(copy).count(),
@@ -157,6 +160,8 @@ impl Model {
     ///     space, or is destroyed;
     /// 30. the outcome of a wait is `gone`, `cancelled`, a word that is not
     ///     zero, or a message with as many words as its header states;
+    /// 31. a thread has a wait number other than 0 only while it waits, and
+    ///     that number is greater than its word "cancelled up to";
     /// 17. a notify names its endpoint if and only if the endpoint names it;
     /// 22. no thread waits with a dying reply object, to receive or for an
     ///     answer: a reply object whose root capability is dying is idle;
@@ -466,6 +471,11 @@ impl Model {
                 Some(_) => false,
             };
             ensure(outcome, "30: outcome of a wait")?;
+            let number = match thread.number {
+                0 => true,
+                number => !ready && number > thread.cancelled_up_to,
+            };
+            ensure(number, "31: wait number of a thread")?;
             let space = |id| self.cspaces.contains_key(id) || !self.objects.contains_key(id);
             ensure(
                 thread.cspace.iter().all(space),
