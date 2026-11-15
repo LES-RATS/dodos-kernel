@@ -912,3 +912,86 @@ fn the_only_running_node_cannot_stop_itself_beside_phantom_nodes() {
         assert_eq!(m.apply(t, other), Ok(Output::Done));
     }
 }
+
+/// Argon F3: the order of the checks of thread_set_features and sched_count,
+/// sched_count on a counted context, and thread_move with a context still
+/// lent (mutants 20, 21, 24, 26, 31).
+#[test]
+fn unlike_cores_rules_that_no_test_pinned() {
+    // #20: thread_set_features checks target capability before mask
+    let mut k = K::new();
+    k.no(features(999, 1u64 << 63), Error::Invalid);
+    k.ok(Syscall::CapDerive {
+        source: s(START_SLOT_THREAD),
+        destination: s(200),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
+    k.no(features(200, 1u64 << 63), Error::Denied);
+
+    // #21: thread_set_features checks Busy (running/waiting) before NoMemory (needed > area)
+    k.no(features(START_SLOT_THREAD, 1 << AMX), Error::Busy);
+
+    // #24: sched_count checks sched capability before core capability
+    k.ok(Syscall::CapDerive {
+        source: SCHED,
+        destination: s(201),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
+    k.no(
+        Syscall::SchedCount {
+            sched: s(201),
+            core: s(START_SLOT_CSPACE),
+            mode: SCHED_COUNT_ON,
+        },
+        Error::Denied,
+    );
+
+    // #26: sched_count(SCHED_COUNT_ON) on an already counted context preserves count and hw_class
+    k.ok(count(SCHED, SCHED_COUNT_ON));
+    k.m.advance(k.m.now() + 100);
+    assert_eq!(k.m.check(), Ok(()));
+    let (_, _, before) = read(&mut k.m, k.t, SCHED);
+    assert!(before >= 100);
+    k.ok(count(SCHED, SCHED_COUNT_ON));
+    let (_, _, after) = read(&mut k.m, k.t, SCHED);
+    assert_eq!(after, before);
+
+    // #31: thread_move rejects a suspended source thread whose context is still lent out
+    let mut m = S::new();
+    m.ok(0, retype(ObjectKind::Endpoint, 0, 150));
+    m.ok(0, retype(Thread, 0, 151));
+    m.ok(0, retype(Frame, 1, 152));
+    m.ok(
+        0,
+        Syscall::ThreadConfigure {
+            thread: s(151),
+            cspace: s(START_SLOT_CSPACE),
+            aspace: s(START_SLOT_ASPACE),
+            fault: SlotAddr::NONE,
+            page: s(152),
+        },
+    );
+    m.ok(0, Syscall::ThreadResume(s(151)));
+    let passive = m.sys.node(0).object_at(m.t[0], s(151)).unwrap();
+    let recv_ep = Syscall::Recv {
+        endpoint: s(150),
+        reply: s(99),
+        range: Range::NONE,
+        wait: 0,
+    };
+    assert_eq!(m.sys.apply(0, passive, recv_ep), WAITS);
+    m.ok(0, Syscall::ThreadResume(s(A)));
+    let src = m.sys.node(0).object_at(m.t[0], s(A)).unwrap();
+    let call_ep = Syscall::Call {
+        endpoint: s(150),
+        message: Message::default(),
+        range: Range::NONE,
+        wait: 1,
+    };
+    assert_eq!(m.sys.apply(0, src, call_ep), WAITS);
+    m.ok(0, Syscall::ThreadSuspend(s(A)));
+    m.ok(0, Syscall::ThreadCancel(s(A), 1));
+    assert_eq!(m.moving((0, 0, 0)), Err(Error::Busy));
+}

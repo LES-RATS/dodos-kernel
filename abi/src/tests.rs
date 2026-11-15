@@ -1671,3 +1671,82 @@ fn marks_and_task_flags_have_their_bits() {
     assert_eq!((Marks::PRIVATE.bits(), Marks::UNTRUSTED.bits()), (1, 2));
     assert_eq!((TaskFlags::AWARE, TaskFlags::REVOKED), (1, 2));
 }
+
+/// Argon F3: the values and rules of unlike cores, I/O ports, the debug
+/// area and the module frames that no test pinned (mutants 3, 4, 5, 13,
+/// 14, 18, 69, 70, 73, 101, 109, 118, 160, 168).
+#[test]
+fn values_of_unlike_cores_ports_debug_and_modules_that_no_test_pinned() {
+    use crate::{
+        DEBUG_AREA_MAGIC, FEATURE_USER_INTERRUPTS, FeatureList, FeatureMask, IoPortRange, Kind,
+        aarch64, ioport_check, kind_covers,
+    };
+
+    // #3, #4: Kind::baseline excludes bit 31 and bits not in list.state
+    let list = FeatureList {
+        state: 0b0011 | (1 << FEATURE_USER_INTERRUPTS),
+        with_length: 0,
+        large: 0,
+    };
+    let kind = Kind {
+        features: 0b0111 | (1 << FEATURE_USER_INTERRUPTS),
+        vector_bytes: 0,
+        baseline_bytes: 64,
+        feature_bytes: [0; 32],
+    };
+    assert_eq!(kind.baseline(list), 0b0011);
+
+    // #5: FeatureMask::vector_bytes reads all 16 bits (bits 32..47)
+    let m256 = FeatureMask::new(1 << aarch64::SVE, 256);
+    assert_eq!(m256.vector_bytes(), 256);
+
+    // #13, #14, #109: FeatureMask::fits checks vector_bytes when non-zero, allows 0, and ignores bit 31
+    let k32 = Kind {
+        features: 1 << aarch64::SVE,
+        vector_bytes: 32,
+        baseline_bytes: 64,
+        feature_bytes: [0; 32],
+    };
+    assert!(!FeatureMask::new(1 << aarch64::SVE, 64).fits(&k32));
+    assert!(FeatureMask::new(0, 0).fits(&k32));
+    assert!(FeatureMask::new(1 << FEATURE_USER_INTERRUPTS, 0).fits(&k32));
+
+    // #101: FeatureMask::check rejects bit 31 with Unsupported even if kind.features has bit 31 set
+    assert_eq!(
+        FeatureMask::new(1 << FEATURE_USER_INTERRUPTS, 0).check(list, &kind),
+        Err(crate::Error::Unsupported)
+    );
+
+    // #18: kind_covers checks instruction features in bits 32..63
+    let host_no_inst = Kind { features: 1, ..k32 };
+    let node_with_inst = Kind {
+        features: 1 | (1u64 << 32),
+        ..k32
+    };
+    assert!(!kind_covers(&host_no_inst, &node_with_inst));
+
+    // #69, #70, #73: IoPortRange::new boundary values and ioport_check width=8
+    assert!(IoPortRange::new(0x3F8, 0x3F8).is_some());
+    assert!(IoPortRange::new(0, 0xFFFF).is_some());
+    assert_eq!(
+        ioport_check(IoPortRange::ALL, 0x3F8, 8, None),
+        Err(crate::Error::Invalid)
+    );
+
+    // #118: module_frames allows up to geometry.entries (> 512) pages in one frame on 16 KB geometry
+    let geo16k = crate::Geometry {
+        page_shift: [14, 25, 36, 0],
+        entries: 2048,
+        levels: 3,
+        user_end: (1 << 46) - (1 << 36),
+    };
+    let frames: Vec<_> = crate::module_frames(1 << 14, None, 600 * (1 << 14), geo16k).collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].pages, 600);
+
+    // #160: aarch64::FEATURES includes SME in with_length
+    assert_ne!(aarch64::FEATURES.with_length & (1 << aarch64::SME), 0);
+
+    // #168: DEBUG_AREA_MAGIC is b"DoDb"
+    assert_eq!(DEBUG_AREA_MAGIC, 0x6244_6F44);
+}

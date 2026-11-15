@@ -796,3 +796,143 @@ fn iommu_with_no_device_attached_is_destroyed_in_one_step() {
     k.ok(Syscall::CapDelete(s(IOMMU)));
     assert_eq!(k.go(Syscall::CapInspect(s(IOMMU))), Err(Error::Invalid));
 }
+
+/// Argon F3 (mutants 129, 130, 131): on the 16 KB geometry the tables of a
+/// space follow its page and its E, and an iospace of 47 bits has three
+/// levels of 2,048 entries.
+#[test]
+fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
+    use dodos_model::{Map, SIXTEEN_KB};
+    // #129, #130, #131: tables() and io_levels() use geometry.page_shift[0] and geometry.entries on 16 KB geometry
+    let mut mach = Machine::example_on(SIXTEEN_KB);
+    mach.io_width = 47;
+    let (mut m, t) = Model::boot(&mach).unwrap();
+    let page = m.geometry().page();
+    let chunk = m.geometry().chunk();
+    let ut = SlotAddr::own(25);
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::UntypedRetype {
+                untyped: ut,
+                kind: ObjectKind::ASpace,
+                size: 0,
+                page: 0,
+                memory: 0,
+                destination: SlotAddr::own(100),
+            },
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::UntypedRetype {
+                untyped: ut,
+                kind: ObjectKind::Frame,
+                size: 2,
+                page: PageSize::Page as u64,
+                memory: 0,
+                destination: SlotAddr::own(101),
+            },
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::CapDerive {
+                source: SlotAddr::own(101),
+                destination: SlotAddr::own(102),
+                rights: Rights::READ.bits(),
+                badge: 0,
+            },
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::ASpaceMap(Map {
+                space: SlotAddr::own(100),
+                frame: SlotAddr::own(101),
+                untyped: ut,
+                address: chunk,
+                first: 0,
+                count: 1,
+                rights: Rights::READ.bits(),
+            }),
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::ASpaceMap(Map {
+                space: SlotAddr::own(100),
+                frame: SlotAddr::own(102),
+                untyped: SlotAddr::NONE,
+                address: chunk + (1 << 23),
+                first: 1,
+                count: 1,
+                rights: Rights::READ.bits(),
+            }),
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::CapDerive {
+                source: SlotAddr::own(101),
+                destination: SlotAddr::own(104),
+                rights: Rights::READ.bits(),
+                badge: 0,
+            },
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::UntypedRetype {
+                untyped: ut,
+                kind: ObjectKind::Untyped,
+                size: 4 * page,
+                page: 0,
+                memory: 0,
+                destination: SlotAddr::own(105),
+            },
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::UntypedRetype {
+                untyped: SlotAddr::own(105),
+                kind: ObjectKind::IoSpace,
+                size: 0,
+                page: 0,
+                memory: 0,
+                destination: SlotAddr::own(106),
+            },
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        m.apply(
+            t,
+            Syscall::IoSpaceMap(Map {
+                space: SlotAddr::own(106),
+                frame: SlotAddr::own(104),
+                untyped: SlotAddr::own(105),
+                address: chunk,
+                first: 0,
+                count: 1,
+                rights: Rights::READ.bits(),
+            }),
+        ),
+        Ok(Output::Done)
+    );
+}

@@ -685,3 +685,19 @@ fn the_geometry_of_the_tests_is_the_one_dodos_page_names() {
         _ => assert_eq!(page, 4 << 10),
     }
 }
+
+/// Argon F3: the boot test of a start-up page of exactly 63 pages (mutant 122).
+#[test]
+fn a_start_up_page_of_exactly_63_pages_is_accepted() {
+    // #119: when DODOS_PAGE=16k, Machine::example() uses 16 KB pages
+    if std::env::var("DODOS_PAGE").as_deref() == Ok("16k") {
+        assert_eq!(Machine::example().geometry.page(), 16_384);
+    }
+    // #122: start-up page of exactly 63 pages (START_PAGE_MAX_PAGES) is accepted
+    let page = Machine::example().geometry.page() as u32;
+    let fits63 = with(|m| m.files[0].name = 62 * page);
+    let (m, t) = boot(&fits63);
+    let at = |n: u64| 2 * page as u64 + n * page as u64;
+    assert!(m.translated(t, at(62)).is_some());
+    assert!(m.translated(t, at(63)).is_none());
+}

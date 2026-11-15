@@ -514,4 +514,129 @@ mod tests {
         let failures = m.ring(false).iter().filter(|e| e.code() == 6).count();
         assert_eq!((failures, m.suppressed()), (20, 0));
     }
+
+    /// Argon F3 (mutants 49, 50, 52): the sequence of a new crash area is
+    /// one more than the previous one's; a reader accepts only a record
+    /// committed with this boot's identifier; a record that is not a fence's
+    /// replaces a held one, a fence's does not.
+    #[test]
+    fn crash_area_sequence_commit_and_overwrite_follow_the_record_rules() {
+        let area = super::CrashArea::new(7, 41, 2);
+        assert_eq!(area.sequence, 42);
+        let mut area = super::CrashArea::new(7, 0, 2);
+        let record = |reason| super::Record {
+            commit: 0,
+            generation: 1,
+            reason,
+            instant: u64::from(reason),
+            member: 0,
+        };
+        area.areas[0].record = Some(super::Record {
+            commit: 6,
+            ..record(1)
+        });
+        assert_eq!(area.accepted(0), None);
+        area.write_record(0, record(1));
+        area.write_record(0, record(2));
+        assert_eq!(area.accepted(0).map(|r| r.reason), Some(2));
+        area.write_record(0, record(5));
+        assert_eq!(area.accepted(0).map(|r| r.reason), Some(2));
+    }
+
+    /// Argon F3 (mutants 79, 92): a thread whose capability space is dying
+    /// gets `gone` before any argument of a port call or of `entropy_read`
+    /// is looked at, and before the `unsupported` of an architecture
+    /// without ports.
+    #[test]
+    fn a_dying_space_is_gone_before_the_port_and_entropy_checks() {
+        use crate::boot::Arch;
+        use dodos_abi::{Error, ObjectKind, Rights, START_SLOT_ASPACE, START_SLOT_SCHED};
+        let mut machine = Machine::example();
+        machine.arch = Arch::Other;
+        let (mut m, boot) = Model::boot(&machine).unwrap();
+        let own = crate::SlotAddr::own;
+        let make = |kind, size, slot| crate::Syscall::UntypedRetype {
+            untyped: own(25),
+            kind,
+            size,
+            page: 0,
+            memory: 0,
+            destination: own(slot),
+        };
+        for (kind, size, slot) in [
+            (ObjectKind::CSpace, 256, 100),
+            (ObjectKind::Thread, 0, 101),
+            (ObjectKind::Sched, 0, 102),
+        ] {
+            assert_eq!(
+                m.apply(boot, make(kind, size, slot)),
+                Ok(crate::Output::Done)
+            );
+        }
+        let calls = [
+            // The start-up context fills the node's sum: lowered first.
+            crate::Syscall::SchedConfigure {
+                sched: own(START_SLOT_SCHED),
+                core: own(16),
+                budget: 5_000_000,
+                period: 10_000_000,
+                class: 1,
+            },
+            crate::Syscall::ThreadConfigure {
+                thread: own(101),
+                cspace: own(100),
+                aspace: own(START_SLOT_ASPACE),
+                fault: crate::SlotAddr::NONE,
+                page: crate::SlotAddr::NONE,
+            },
+            crate::Syscall::SchedConfigure {
+                sched: own(102),
+                core: own(16),
+                budget: 1_000_000,
+                period: 10_000_000,
+                class: 1,
+            },
+            crate::Syscall::SchedBind {
+                sched: own(102),
+                thread: own(101),
+            },
+            crate::Syscall::ThreadResume(own(101)),
+        ];
+        for call in calls {
+            assert_eq!(m.apply(boot, call), Ok(crate::Output::Done));
+        }
+        // A space with 40 capabilities in it takes two steps to remove:
+        // after the first it is dying.
+        let grow = crate::Syscall::CSpaceGrow {
+            cspace: own(100),
+            untyped: own(25),
+        };
+        assert!(m.apply(boot, grow).is_ok());
+        for index in 1..=40 {
+            let copy = crate::Syscall::CapDerive {
+                source: own(START_SLOT_ASPACE),
+                destination: crate::SlotAddr::through(100, index),
+                rights: Rights::READ.bits(),
+                badge: 0,
+            };
+            assert_eq!(m.apply(boot, copy), Ok(crate::Output::Done));
+        }
+        let child = m.object_at(boot, own(101)).unwrap();
+        let mut deleted = m.apply(boot, crate::Syscall::CapDelete(own(100)));
+        assert_eq!(deleted, Err(Error::Again));
+        let port = crate::Syscall::IoportIn {
+            ioports: own(7),
+            port: 0x80,
+            width: 1,
+        };
+        assert_eq!(m.apply(child, port), Err(Error::Gone));
+        let entropy = crate::Syscall::EntropyRead {
+            length: 100,
+            mix: [0; 4],
+        };
+        assert_eq!(m.apply(child, entropy), Err(Error::Gone));
+        while deleted == Err(Error::Again) {
+            deleted = m.apply(boot, crate::Syscall::CapDelete(own(100)));
+        }
+    }
 }

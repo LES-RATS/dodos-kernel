@@ -710,3 +710,156 @@ fn a_change_of_a_role_word_is_traced_by_the_node_that_made_it() {
         Some(0)
     );
 }
+
+/// Argon F3: the window of the rate limit at its boundary, the order of the
+/// checks of the debug, port and entropy calls, the refused console port, and
+/// the words entropy_read mixes (mutants 54, 59, 63, 66, 68, 80-87, 96-99, 107).
+#[test]
+fn debug_port_and_entropy_rules_that_no_test_pinned() {
+    use dodos_abi::x86_64::REG_DR3;
+
+    let mut k = K::new();
+
+    // #54: rate limit window rolls over at exactly at + TRACE_BURST_NS
+    let b = k.spawn();
+    let t0 = k.m.now();
+    for _ in 0..17 {
+        k.m.fault(b, FaultKind::Page, [14, 2, 0x1000]);
+        k.ok(Syscall::ThreadResume(s(101)));
+    }
+    assert_eq!(k.m.suppressed(), 1);
+    k.m.advance(t0 + TRACE_BURST_NS);
+    k.m.fault(b, FaultKind::Page, [14, 2, 0x1000]);
+    let ring = k.kernel();
+    assert_eq!(ring[ring.len() - 2].code(), 3);
+
+    // #59: debug_write checks debug capability before length > DEBUG_WRITE_MAX
+    k.ok(Syscall::CapDerive {
+        source: DEBUG,
+        destination: s(200),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
+    k.no(
+        Syscall::DebugWrite {
+            debug: s(200),
+            length: DEBUG_WRITE_MAX + 1,
+            words: vec![],
+        },
+        Error::Denied,
+    );
+
+    // #63: trace_emit requires WRITE on debug capability
+    k.no(
+        Syscall::TraceEmit {
+            debug: s(200),
+            words: [0; 3],
+        },
+        Error::Denied,
+    );
+
+    // #66, #68, #107: thread_write_regs checks REG_DR3 < user_end, and checks words (Invalid / Unsupported) before Busy
+    let mut bad_dr3 = block();
+    bad_dr3[REG_DR3] = Machine::example().geometry.user_end;
+    k.no(
+        Syscall::ThreadWriteRegs {
+            thread: s(START_SLOT_THREAD),
+            block: bad_dr3,
+        },
+        Error::Invalid,
+    );
+    let mut bad_uintr = block();
+    bad_uintr[REG_UINTR] = 1;
+    k.no(
+        Syscall::ThreadWriteRegs {
+            thread: s(START_SLOT_THREAD),
+            block: bad_uintr,
+        },
+        Error::Unsupported,
+    );
+
+    // #80, #81, #82: ioport_out requires WRITE; ioport checks Invalid before Busy (ports_refused); console_port is refused
+    k.ok(Syscall::CapDerive {
+        source: PORTS,
+        destination: s(201),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
+    k.no(port_out(s(201), 0x80, 1, 0), Error::Denied);
+    k.no(port_in(PORTS, 0x20, 3), Error::Invalid);
+    let mut mach_uart = Machine::example();
+    mach_uart.console_port = Some(0x3F8);
+    let mut ku = K::on(&mach_uart);
+    ku.no(port_in(PORTS, 0x3F8, 1), Error::Busy);
+    ku.no(port_in(PORTS, 0x3FF, 1), Error::Busy);
+    assert_eq!(ku.go(port_in(PORTS, 0x400, 1)), Ok(Output::Value(0)));
+
+    // #84, #85, #87: ioports_issue requires DERIVE (even with WRITE), checks destination before range, and checks fits before vacant
+    k.ok(Syscall::CapDerive {
+        source: PORTS,
+        destination: s(202),
+        rights: Rights::READ.union(Rights::WRITE).bits(),
+        badge: 0,
+    });
+    k.no(
+        Syscall::IoportsIssue {
+            ioports: s(202),
+            destination: s(203),
+            first: 0x80,
+            last: 0x80,
+        },
+        Error::Denied,
+    );
+    k.ok(Syscall::CapDerive {
+        source: s(START_SLOT_CSPACE),
+        destination: s(204),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
+    k.no(
+        Syscall::IoportsIssue {
+            ioports: PORTS,
+            destination: SlotAddr::through(204, 0),
+            first: 10,
+            last: 5,
+        },
+        Error::Denied,
+    );
+    let mut cur = PORTS;
+    for slot in 300..363 {
+        k.ok(Syscall::CapDerive {
+            source: cur,
+            destination: s(slot),
+            rights: Rights::READ.union(Rights::DERIVE).bits(),
+            badge: 0,
+        });
+        cur = s(slot);
+    }
+    k.no(
+        Syscall::IoportsIssue {
+            ioports: cur,
+            destination: s(START_SLOT_CSPACE),
+            first: 0x80,
+            last: 0x80,
+        },
+        Error::Invalid,
+    );
+
+    // #96, #97, #99: entropy_read mixes all 4 words and keeps all 8 * left bits in the last word
+    let mut k1 = K::new();
+    let mut k2 = K::new();
+    let Ok(Output::Bytes(w1)) = k1.go(Syscall::EntropyRead {
+        length: 13,
+        mix: [0, 0, 0, 1],
+    }) else {
+        panic!();
+    };
+    let Ok(Output::Bytes(w2)) = k2.go(Syscall::EntropyRead {
+        length: 13,
+        mix: [0, 0, 0, 2],
+    }) else {
+        panic!();
+    };
+    assert_ne!(w1, w2);
+    assert!(w1[1] >> 32 != 0 || w2[1] >> 32 != 0);
+}
