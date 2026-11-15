@@ -55,6 +55,10 @@ pub struct Census {
     /// slack.
     pub idle: bool,
     pub on_slack: bool,
+    /// Claimed irqs, fired ones, revoked tasks.
+    pub irqs: usize,
+    pub fired: usize,
+    pub revoked: usize,
 }
 
 impl Model {
@@ -132,6 +136,13 @@ impl Model {
             lost: self.threads.values().filter(|t| t.lost).count(),
             idle: self.running.is_none(),
             on_slack: self.running.is_some_and(|(_, ready)| !ready),
+            irqs: self.irqs.len(),
+            fired: self
+                .irqs
+                .values()
+                .filter(|i| i.state == crate::IrqState::Fired)
+                .count(),
+            revoked: self.tasks.values().filter(|t| t.revoked).count(),
         }
     }
 
@@ -178,8 +189,10 @@ impl Model {
     /// 10. an object has state of its kind, and every state is that of an
     ///     object of its kind;
     /// 11. an object taken from an untyped names a live untyped, and its root
-    ///     capability is a child of a capability for that untyped; a start-up
-    ///     object was taken from none and its root capability has no parent;
+    ///     capability is a child of a capability for that untyped; an irq was
+    ///     taken from none and its root capability is a child of an
+    ///     irq_control capability; another start-up object was taken from
+    ///     none and its root capability has no parent;
     /// 25. device memory holds only frames and child untypeds, which are
     ///     device memory too, and no capability for a device untyped has
     ///     `exec` (so, with 3, none for what is made from it either);
@@ -247,7 +260,9 @@ impl Model {
         self.check_memory()?;
         self.check_spaces()?;
         self.check_bindings()?;
-        self.check_sched()
+        self.check_sched()?;
+        self.check_tasks()?;
+        self.check_irqs()
     }
 
     fn check_tree(&self) -> Check {
@@ -400,6 +415,10 @@ impl Model {
                     self.aspaces.contains_key(&id) && self.iospaces.contains_key(&id)
                 }
                 ObjectKind::Iommu => self.iommus.contains_key(&id),
+                ObjectKind::Task => self.tasks.contains_key(&id),
+                ObjectKind::Irq => self.irqs.contains_key(&id),
+                ObjectKind::Sched => self.scheds.contains_key(&id),
+                ObjectKind::Timer => self.timers.contains_key(&id),
                 ObjectKind::Reply => self.replies.contains_key(&id),
                 ObjectKind::Notify => self.notifies.contains_key(&id),
                 _ => true,
@@ -415,6 +434,13 @@ impl Model {
                 let device = self.untypeds[&from].device;
                 let inherits = self.untypeds.get(&id).is_none_or(|child| child.device);
                 ensure(!device || plain && inherits, "25: kind on device memory")?;
+            } else if object.kind == ObjectKind::Irq {
+                // Interrupts: the root capability of an irq is a child of
+                // the irq_control capability used to claim it.
+                let parent = root.parent.and_then(|parent| self.caps.get(&parent));
+                let control = parent.and_then(|parent| self.objects.get(&parent.object));
+                let claimed = control.is_some_and(|c| c.kind == ObjectKind::IrqControl);
+                ensure(claimed, "11: parent of an irq")?;
             } else {
                 ensure(root.parent.is_none(), "11: parent of a start-up capability")?;
             }
@@ -436,6 +462,10 @@ impl Model {
                 .all(|id| is(ObjectKind::ASpace)(id) || is(ObjectKind::IoSpace)(id))
             && self.iospaces.keys().all(is(ObjectKind::IoSpace))
             && self.iommus.keys().all(is(ObjectKind::Iommu))
+            && self.tasks.keys().all(is(ObjectKind::Task))
+            && self.irqs.keys().all(is(ObjectKind::Irq))
+            && self.scheds.keys().all(is(ObjectKind::Sched))
+            && self.timers.keys().all(is(ObjectKind::Timer))
             && self.endpoints.keys().all(is(ObjectKind::Endpoint))
             && self.replies.keys().all(is(ObjectKind::Reply))
             && self.notifies.keys().all(is(ObjectKind::Notify));
@@ -674,5 +704,6 @@ impl Model {
 
 mod memory;
 mod sched;
+mod tasks;
 #[cfg(test)]
 mod tests;

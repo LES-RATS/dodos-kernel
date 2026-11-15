@@ -5,6 +5,7 @@
 use crate::caps::Clearing;
 use crate::memory::{USER_END, hooked};
 use crate::{Frame, Iommu, Mapping, Model, ObjId, Place, live};
+use dodos_abi::TaskId;
 use dodos_abi::x86_64::{REG_RDI, REG_RIP};
 use dodos_abi::{
     CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, FIRST_SERVICE_MIN_ADDR, FRAME_MAX_PAGES, MemoryType,
@@ -431,7 +432,11 @@ impl Model {
         add(self, ObjectKind::Debug, 0, START_SLOT_DEBUG, all);
         add(self, ObjectKind::IrqControl, 0, START_SLOT_IRQ_CONTROL, all);
         add(self, ObjectKind::IoPorts, 0, START_SLOT_IOPORTS, all);
-        add(self, ObjectKind::Task, 0, START_SLOT_TASK, all);
+        // The start-up task: identifier 1 of node 0, marks 0, mark-aware.
+        let task = add(self, ObjectKind::Task, 0, START_SLOT_TASK, all);
+        let start = live(&mut self.tasks, task);
+        (start.id, start.aware) = (TaskId::new(0, 1), true);
+        self.task_counter = 1;
         let mut index = START_SLOT_FIRST;
         let mut next = || {
             index += 1;
@@ -534,6 +539,8 @@ impl Model {
         self.bind_space(thread, Some(space));
         self.bind_aspace(thread, Some(aspace));
         self.bind_page(thread, Some(message_page));
+        live(&mut self.tasks, task).threads.push(thread);
+        live(&mut self.threads, thread).task = Some(task);
         // Registers: the entry point, and the address of the start-up page
         // in the first argument register; the others 0, the flags fixed.
         let first = live(&mut self.threads, thread);

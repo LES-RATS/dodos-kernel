@@ -19,15 +19,18 @@ mod caps;
 mod check;
 mod faults;
 mod ipc;
+mod irq;
 mod memory;
 mod sched;
+mod tasks;
 mod threads;
 
 pub use boot::{Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, Segment};
 pub use check::Census;
 
 use dodos_abi::{
-    Call, Error, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights, SlotAddr,
+    Call, Error, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights, SlotAddr,
+    TaskId,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
@@ -214,6 +217,32 @@ pub enum Syscall {
         tolerance: u64,
     },
     TimerCancel(SlotAddr),
+    /// The irq_control, the source word, the vector and the destination.
+    IrqClaim {
+        control: SlotAddr,
+        source: u64,
+        vector: u64,
+        destination: SlotAddr,
+    },
+    IrqBind {
+        irq: SlotAddr,
+        notify: SlotAddr,
+    },
+    IrqAck(SlotAddr),
+    TaskExempt {
+        task: SlotAddr,
+        aware: SlotAddr,
+    },
+    TaskAttach {
+        thread: SlotAddr,
+        task: SlotAddr,
+    },
+    TaskMark {
+        task: SlotAddr,
+        marks: u64,
+    },
+    TaskRevoke(SlotAddr),
+    TaskRead(SlotAddr),
     /// A call that this model does not make: it returns `Unsupported`. A
     /// call that has a variant above is refused here with a panic.
     Other(Call),
@@ -258,6 +287,15 @@ pub enum Output {
     },
     /// `timer_set`, `timer_cancel`: 1 if the timer was armed, 0 otherwise.
     WasArmed(u64),
+    /// `irq_claim`: the address and the data of an MSI.
+    Msi { address: u64, data: u64 },
+    /// `task_read`.
+    Task {
+        id: u64,
+        marks: u64,
+        flags: u64,
+        threads: u64,
+    },
     /// `send`: 0, or `Header::FLAG_CAPS_DROPPED`.
     Sent { flags: u32 },
     /// `recv`, `reply_recv`: a message or a notification. `call`: the reply.
@@ -441,6 +479,9 @@ struct Thread {
     home: Option<ObjId>,
     /// The budget follows the call: marked as having lost its context.
     lost: bool,
+    /// Tasks and marks: the task it is attached to, and its own marks word.
+    task: Option<ObjId>,
+    marks: u64,
 }
 
 /// IPC: the states of a thread. `None` is ready.
@@ -475,6 +516,9 @@ struct Parcel {
     badge: u64,
     sender: ObjId,
     caps: Vec<Transfer>,
+    /// Tasks and marks: the added-marks word, read when the call was made;
+    /// 0 without the flag `add_marks`.
+    marks: u64,
 }
 
 /// A receive range, resolved when the call was made.
@@ -516,6 +560,41 @@ struct Notify {
     /// Timers: the armed timers that signal it, the most recently armed
     /// last.
     timers: Vec<ObjId>,
+    /// Interrupts: the irqs bound to it, the most recently bound last.
+    irqs: Vec<ObjId>,
+}
+
+/// Interrupts: one entry of the interrupt table of the node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Irq {
+    vector: u8,
+    source: IrqSource,
+    state: IrqState,
+    /// An arrival of an edge source that was not signalled.
+    pending: bool,
+    /// The notify it is bound to, and the bits it sets.
+    notify: Option<(ObjId, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum IrqState {
+    /// Bound to no notify.
+    Idle,
+    /// Bound, and the next arrival is signalled.
+    Armed,
+    /// Bound and signalled, and no further signal until `irq_ack`.
+    Fired,
+}
+
+/// Tasks and marks: a task.
+#[derive(Clone, Debug, PartialEq)]
+struct Task {
+    id: TaskId,
+    marks: u64,
+    aware: bool,
+    revoked: bool,
+    /// The threads attached to it, the most recently attached last.
+    threads: Vec<ObjId>,
 }
 
 /// Scheduling contexts: the parameters and the state of a `sched`.
@@ -617,6 +696,11 @@ pub struct Model {
     admitted: u64,
     /// What runs next: the order of entry into the queues.
     entered: u64,
+    /// Interrupts: the claimed entries of the interrupt table.
+    irqs: BTreeMap<ObjId, Irq>,
+    tasks: BTreeMap<ObjId, Task>,
+    /// Tasks and marks: the counter of the identifiers of the node.
+    task_counter: u64,
     /// What the start-up state was built from.
     machine: Machine,
 }
@@ -625,25 +709,10 @@ pub struct Model {
 /// groups not yet specified (cores, debugging), and those this model does
 /// not make yet.
 fn other(call: Call) -> bool {
-    use Call::{
-        CoreStart, CoreStatus, CoreStop, DebugWrite, IrqAck, IrqBind, IrqClaim, TaskAttach,
-        TaskExempt, TaskMark, TaskRead, TaskRevoke, TraceEmit,
-    };
+    use Call::{CoreStart, CoreStatus, CoreStop, DebugWrite, TraceEmit};
     matches!(
         call,
-        CoreStart
-            | CoreStop
-            | CoreStatus
-            | DebugWrite
-            | TraceEmit
-            | IrqClaim
-            | IrqBind
-            | IrqAck
-            | TaskExempt
-            | TaskAttach
-            | TaskMark
-            | TaskRevoke
-            | TaskRead
+        CoreStart | CoreStop | CoreStatus | DebugWrite | TraceEmit
     )
 }
 
@@ -853,6 +922,22 @@ impl Model {
                 tolerance,
             } => self.timer_set(thread, timer, notify, (deadline, tolerance)),
             Syscall::TimerCancel(timer) => self.timer_cancel(thread, timer),
+            Syscall::IrqClaim {
+                control,
+                source,
+                vector,
+                destination,
+            } => self.irq_claim(thread, control, (source, vector), destination),
+            Syscall::IrqBind { irq, notify } => self.irq_bind(thread, irq, notify),
+            Syscall::IrqAck(irq) => self.irq_ack(thread, irq),
+            Syscall::TaskExempt { task, aware } => self.task_exempt(thread, task, aware),
+            Syscall::TaskAttach {
+                thread: target,
+                task,
+            } => self.task_attach(thread, target, task),
+            Syscall::TaskMark { task, marks } => self.task_mark(thread, task, marks),
+            Syscall::TaskRevoke(task) => self.task_revoke(thread, task),
+            Syscall::TaskRead(task) => self.task_read(thread, task),
             // The calls not yet made by this model, and those of the groups
             // not yet specified (cores, debugging), return `unsupported` as
             // soon as the capability space of the caller is found, before
@@ -889,11 +974,21 @@ impl Model {
         self.through(own, addr, right)
     }
 
-    /// Order of checks: a thread bound to no capability space gets `gone`
-    /// from every call, `cap_delete` too. The derivation tree: a thread
-    /// whose capability space is destroyed is bound to none (D-110).
+    /// Order of checks: a thread bound to no capability space, or attached
+    /// to a revoked task, gets `gone` from every call, `cap_delete` too. The
+    /// derivation tree: a thread whose capability space is destroyed is
+    /// bound to none (D-110).
+    ///
+    /// CONTRACT-GAP (Tasks and marks): a thread of a revoked task gets
+    /// `gone` "as for a thread whose capability space is dying", which may
+    /// still `cap_delete` its own slots; the Order of checks says every
+    /// call. The Order of checks is followed.
     fn bound_space(&self, thread: ObjId) -> Result<ObjId, Error> {
-        self.threads[&thread].cspace.ok_or(Error::Gone)
+        let bound = &self.threads[&thread];
+        if bound.task.is_some_and(|task| self.tasks[&task].revoked) {
+            return Err(Error::Gone);
+        }
+        bound.cspace.ok_or(Error::Gone)
     }
 
     /// Slots and addresses: `own`, or the capability space that `via` names

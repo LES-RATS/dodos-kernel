@@ -96,9 +96,10 @@ impl Model {
             }
         }
         // The choice: a holder that would run without an address space, or
-        // with a dying one, raises the fault *no address space* instead,
-        // and the choice is made again. Each round takes one thread out of
-        // what can run, so the loop ends.
+        // with a dying one, raises the fault *no address space* instead, and
+        // the choice is made again; so does a holder of a revoked task,
+        // after it is suspended. Each round takes one thread out of what can
+        // run, so the loop ends.
         for _ in 0..=self.threads.len() {
             self.no_context();
             self.requeue();
@@ -106,6 +107,14 @@ impl Model {
             let Some(holder) = self.running() else {
                 return;
             };
+            // Tasks and marks: a thread of a revoked task never runs again;
+            // when the choice would take it, it is suspended and the choice
+            // is made again.
+            let task = self.threads[&holder].task;
+            if task.is_some_and(|task| self.tasks[&task].revoked) {
+                live(&mut self.threads, holder).suspended = true;
+                continue;
+            }
             let aspace = self.threads[&holder].aspace;
             if aspace.is_some_and(|aspace| !self.dying(aspace)) {
                 return;

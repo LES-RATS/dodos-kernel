@@ -58,6 +58,7 @@ impl Model {
             badge,
             sender: thread,
             caps: Vec::new(),
+            marks: 0,
         };
         // An empty receive range names no slot; its space is not looked at.
         let window = Window {

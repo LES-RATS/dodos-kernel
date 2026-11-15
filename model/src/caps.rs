@@ -3,7 +3,7 @@
 use crate::memory::DEVICE_IDS;
 use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
-    Place, Record, ReplyState, Sched, Slot, Sweep, Thread, Untyped, live,
+    Place, Record, ReplyState, Sched, Slot, Sweep, Task, Thread, Untyped, live,
 };
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
@@ -502,6 +502,18 @@ impl Model {
             ObjectKind::Timer => {
                 self.timers.insert(id, None);
             }
+            // Tasks and marks: a new task has the next identifier, marks 0,
+            // is neither mark-aware nor revoked, and has no thread.
+            ObjectKind::Task => {
+                let task = Task {
+                    id: self.next_task(),
+                    marks: 0,
+                    aware: false,
+                    revoked: false,
+                    threads: Vec::new(),
+                };
+                self.tasks.insert(id, task);
+            }
             _ => {}
         }
         // The derivation tree: the capability that `untyped_retype` returns,
@@ -759,7 +771,10 @@ impl Model {
             // Destroying a context clears its lends from the top of the
             // chain down; destroying a notify disarms its armed timers.
             ObjectKind::Sched if self.clear_lend(object) => {}
-            ObjectKind::Notify if self.disarm_one(object) => {}
+            // Destroying a notify: its armed timers are disarmed, then its
+            // bound irqs unbound; destroying a task detaches its threads.
+            ObjectKind::Notify if self.disarm_one(object) || self.unbind_one_irq(object) => {}
+            ObjectKind::Task if self.detach_one(object) => {}
             // IOMMU: the destruction of an iospace first detaches each of its
             // devices, most recently attached first, then empties each record
             // of its list, most recently mapped first.
@@ -842,6 +857,7 @@ impl Model {
                 // becomes idle. Bindings: each of its bindings is undone.
                 self.unlink(id);
                 self.thread_unscheduled(id);
+                self.detach_task(id);
                 self.unbind_all(id);
                 self.threads.remove(&id);
             }
@@ -878,6 +894,10 @@ impl Model {
                 self.replies.remove(&id);
             }
             ObjectKind::Sched => self.sched_destroyed(id),
+            ObjectKind::Irq => self.irq_destroyed(id),
+            ObjectKind::Task => {
+                self.tasks.remove(&id);
+            }
             ObjectKind::Timer => self.timer_destroyed(id),
             ObjectKind::Notify => {
                 let notify = self.notifies.remove(&id).expect("names a live entry");

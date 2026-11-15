@@ -81,11 +81,9 @@ fn notification(word: u64) -> Delivery {
     }
 }
 
-/// What the kernel sets on a received message.
+/// What the kernel sets on a received message: the stamp comes from the
+/// delivery; a notification carries marks 0 and task 0.
 fn received(header: Header, badge: u64) -> Received {
-    // Messages: the receiver gets the marks and the identifier of the
-    // sender's task. Tasks are not modelled: the marks are none and the
-    // task is 0, and the oracle says nothing on what a kernel stamps.
     Received {
         header,
         badge,
@@ -96,12 +94,14 @@ fn received(header: Header, badge: u64) -> Received {
 
 impl Parcel {
     fn new(sender: ObjId, message: Message, badge: u64) -> Self {
+        let added = message.flags & Header::FLAG_ADD_MARKS != 0;
         Self {
             label: message.label,
             words: message.words,
             badge,
             sender,
             caps: message.caps,
+            marks: if added { message.marks } else { 0 },
         }
     }
 }
@@ -511,11 +511,30 @@ impl Model {
         if !self.has_page(receiver) {
             parcel.words.truncate(REG_WORDS);
         }
+        // Tasks and marks: the stamp, taken at delivery: the task of the
+        // sender and its effective marks with the marks it added. The
+        // receiver takes them unless it is attached to a mark-aware task;
+        // a sender that transferred a capability takes the receiver's marks
+        // as they were, unless it is attached to one.
+        let sender = parcel.sender;
+        let stamp = self.marks(sender).expect("a live sender").bits() | parcel.marks;
+        let task = self.threads[&sender]
+            .task
+            .map_or(0, |task| self.tasks[&task].id.raw());
+        let before = self.marks(receiver).expect("a live receiver").bits();
+        if !self.aware(receiver) {
+            self.mark(receiver, stamp);
+        }
+        if caps > 0 && !self.aware(sender) {
+            self.mark(sender, before);
+        }
+        let mut received = received(
+            header.expect("checked when the call was made"),
+            parcel.badge,
+        );
+        (received.marks, received.task) = (Marks::from_bits(stamp).expect("known marks"), task);
         let delivery = Delivery {
-            received: received(
-                header.expect("checked when the call was made"),
-                parcel.badge,
-            ),
+            received,
             words: parcel.words,
         };
         (delivery, dropped)
