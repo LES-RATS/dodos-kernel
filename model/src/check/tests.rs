@@ -3,7 +3,7 @@
 
 use crate::*;
 use dodos_abi::{
-    Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, START_SLOT_CSPACE, START_SLOT_DEBUG,
+    FAULT_WORDS, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, START_SLOT_CSPACE, START_SLOT_DEBUG,
     START_SLOT_THREAD, TREE_DEPTH,
 };
 
@@ -1614,4 +1614,36 @@ fn unit_with_more_domains_than_it_has_is_reported() {
         m.machine.iommus[0].domains = 0;
     });
     assert_eq!(broken, "39: domain numbers of a unit");
+}
+
+#[test]
+fn thread_that_waits_on_a_fault_but_not_as_a_caller_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.waiter).faulting = true);
+    assert_eq!(broken, "40: fault wait");
+}
+
+#[test]
+fn fault_message_with_capabilities_is_reported() {
+    let broken = spoiled(|m, _| {
+        let caller = object(m, CALLER);
+        let waiting = live(&mut m.threads, caller);
+        waiting.faulting = true;
+        if let Wait::Call { parcel, .. } = &mut waiting.wait {
+            (parcel.label, parcel.words) = (1, vec![0; FAULT_WORDS]);
+            parcel.caps = vec![Transfer::Move(SlotAddr::own(EP))];
+        }
+    });
+    assert_eq!(broken, "40: fault wait");
+}
+
+#[test]
+fn fault_message_that_waits_is_accepted() {
+    let mut model = state();
+    let caller = object(&model, CALLER);
+    let waiting = live(&mut model.threads, caller);
+    waiting.faulting = true;
+    if let Wait::Call { parcel, .. } = &mut waiting.wait {
+        (parcel.label, parcel.words) = (8, vec![0; FAULT_WORDS]);
+    }
+    assert_eq!(model.check(), Ok(()));
 }

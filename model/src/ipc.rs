@@ -119,9 +119,16 @@ impl Model {
         message.check(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
-        let receiver = self.receiver(endpoint);
         let parcel = Parcel::new(thread, message, badge);
-        match receiver {
+        self.enter(thread, endpoint, parcel, window);
+        Ok(Output::Waits)
+    }
+
+    /// IPC, the state part of `call`, also the delivery of a fault: the
+    /// message is delivered to a thread that waits to receive, or the caller
+    /// joins the queue of the endpoint.
+    pub(crate) fn enter(&mut self, thread: ObjId, endpoint: ObjId, parcel: Parcel, window: Window) {
+        match self.receiver(endpoint) {
             // IPC: a thread waits to receive.
             Some((server, reply, into)) => {
                 self.unlink(server);
@@ -138,7 +145,6 @@ impl Model {
                 };
             }
         }
-        Ok(Output::Waits)
     }
 
     pub(crate) fn recv(

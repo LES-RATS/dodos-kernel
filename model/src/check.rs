@@ -2,8 +2,8 @@
 
 use crate::{CapId, Model, ObjId, Output, Place, Record, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
-    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FRAME_MAX_PAGES, Header, LONGEST_WALK, MAX_CAPS,
-    MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
+    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FAULT_WORDS, FRAME_MAX_PAGES, Header,
+    LONGEST_WALK, MAX_CAPS, MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::mem::discriminant;
@@ -41,6 +41,8 @@ pub struct Census {
     pub mappings: usize,
     /// Devices attached to an iospace.
     pub devices: usize,
+    /// Threads that wait on a fault.
+    pub faulting: usize,
 }
 
 impl Model {
@@ -98,6 +100,7 @@ impl Model {
                 .filter(|cap| matches!(cap.record, Record::Mapping(_)))
                 .count(),
             devices: self.iospaces.values().map(Vec::len).sum(),
+            faulting: self.threads.values().filter(|t| t.faulting).count(),
         }
     }
 
@@ -176,6 +179,9 @@ impl Model {
     /// 23. a dying capability space only shrinks, so no thread in it or
     ///     outside it was the cause of a new capability there: every
     ///     capability it holds, it held when it began to die;
+    /// 40. a thread that waits on a fault waits as a caller, to be received
+    ///     or for the answer, and a fault message that waits has a label of
+    ///     a fault kind, five words and no capability;
     /// 29. a message that waits was sent by the thread that waits with it
     ///     and is within the limits of the header; a receive range that
     ///     waits has at most 4 slots, none of them slot 0 or beyond the
@@ -518,6 +524,15 @@ impl Model {
                 _ => true,
             };
             ensure(limits, "29: message or range of a waiting thread")?;
+            let fault = match &thread.wait {
+                Wait::Call { parcel, .. } => {
+                    let kind = (1..=8).contains(&parcel.label);
+                    kind && parcel.words.len() == FAULT_WORDS && parcel.caps.is_empty()
+                }
+                Wait::Reply(_) => true,
+                _ => false,
+            };
+            ensure(!thread.faulting || fault, "40: fault wait")?;
         }
         Ok(())
     }

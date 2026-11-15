@@ -1782,13 +1782,7 @@ fn suspended_thread_keeps_its_place_in_its_queue_and_still_gets_its_message() {
 #[test]
 fn calls_outside_the_one_core_model_are_unsupported() {
     let mut k = K::new();
-    for call in [
-        Call::ThreadReadRegs,
-        Call::ThreadWriteRegs,
-        Call::Yield,
-        Call::CoreStart,
-        Call::DebugWrite,
-    ] {
+    for call in [Call::Yield, Call::CoreStart, Call::DebugWrite] {
         k.no(Syscall::Other(call), Error::Unsupported);
     }
 }

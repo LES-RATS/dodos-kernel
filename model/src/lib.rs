@@ -17,6 +17,7 @@
 mod boot;
 mod caps;
 mod check;
+mod faults;
 mod ipc;
 mod memory;
 mod threads;
@@ -127,6 +128,12 @@ pub enum Syscall {
         page: SlotAddr,
     },
     ThreadResume(SlotAddr),
+    ThreadReadRegs(SlotAddr),
+    /// The thread, and the register block as the message words of the call.
+    ThreadWriteRegs {
+        thread: SlotAddr,
+        block: Vec<u64>,
+    },
     ThreadSuspend(SlotAddr),
     /// The thread, and a wait number.
     ThreadCancel(SlotAddr, u64),
@@ -212,6 +219,8 @@ pub enum Output {
     Slots(u32),
     /// `wait`, `poll`: the word of the notify.
     Word(u64),
+    /// `thread_read_regs`: the register block.
+    Regs(Vec<u64>),
     /// `send`: 0, or `Header::FLAG_CAPS_DROPPED`.
     Sent { flags: u32 },
     /// `recv`, `reply_recv`: a message or a notification. `call`: the reply.
@@ -388,6 +397,9 @@ struct Thread {
     /// Register calls: the register block, as the thread will see it when
     /// it resumes.
     regs: Vec<u64>,
+    /// Faults: the thread waits on a fault, as a caller of its fault
+    /// endpoint; the words of the fault are kept with its message.
+    faulting: bool,
 }
 
 /// IPC: the states of a thread. `None` is ready.
@@ -499,8 +511,7 @@ fn other(call: Call) -> bool {
     use Call::{
         CoreStart, CoreStatus, CoreStop, DebugWrite, IrqAck, IrqBind, IrqClaim, SchedBind,
         SchedConfigure, SchedRead, SchedSetCores, SchedUnbind, TaskAttach, TaskExempt, TaskMark,
-        TaskRead, TaskRevoke, ThreadReadRegs, ThreadWriteRegs, TimerCancel, TimerSet, TraceEmit,
-        Yield,
+        TaskRead, TaskRevoke, TimerCancel, TimerSet, TraceEmit, Yield,
     };
     matches!(
         call,
@@ -509,8 +520,6 @@ fn other(call: Call) -> bool {
             | CoreStatus
             | DebugWrite
             | TraceEmit
-            | ThreadReadRegs
-            | ThreadWriteRegs
             | Yield
             | SchedConfigure
             | SchedBind
@@ -646,6 +655,11 @@ impl Model {
                 self.thread_configure(thread, target, bindings)
             }
             Syscall::ThreadResume(target) => self.thread_resume(thread, target),
+            Syscall::ThreadReadRegs(target) => self.thread_read_regs(thread, target),
+            Syscall::ThreadWriteRegs {
+                thread: target,
+                block,
+            } => self.thread_write_regs(thread, target, block),
             Syscall::ThreadSuspend(target) => self.thread_suspend(thread, target),
             Syscall::ThreadCancel(target, number) => self.thread_cancel(thread, target, number),
             Syscall::Call {
@@ -868,8 +882,16 @@ impl Model {
     /// number goes with the wait. A caller that a server receives is taken
     /// out of the queue and goes on waiting, for the reply, with the same
     /// number: that is not the end of its wait.
+    ///
+    /// Faults: a thread that waits on a fault has no call to return to: an
+    /// answer has its effect on the thread, and a wait that ends without an
+    /// answer leaves it suspended with the fault dropped.
     fn wake(&mut self, thread: ObjId, outcome: Outcome) {
         let woken = live(&mut self.threads, thread);
-        (woken.outcome, woken.number) = (Some(outcome), 0);
+        woken.number = 0;
+        if std::mem::take(&mut woken.faulting) {
+            return self.answered(thread, outcome);
+        }
+        woken.outcome = Some(outcome);
     }
 }
