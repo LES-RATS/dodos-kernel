@@ -2,7 +2,8 @@
 name = "dodos-abi"
 version = "0.0.0"
 edition.workspace = true
-license.workspace = true
+# Apache-2.0, unlike the rest of the workspace: user space links this crate (D-119).
+license = "Apache-2.0"
 description = "Types of the DodOS kernel interface, shared by the model, the kernel and user space"
 
 [lints]
