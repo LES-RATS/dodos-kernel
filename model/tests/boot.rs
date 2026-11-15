@@ -396,18 +396,29 @@ fn member_words_say_live_with_generation_1() {
 fn unit_roles_go_to_the_nodes_of_the_best_fence_class() {
     // Core 1 is of fence class 2, the boot core of class 1: both unit roles
     // are held by node 1; reserve and plain roles are vacant.
-    let (m, _) = boot(&Machine::example());
+    let (sys, _) = System::boot(&Machine::example()).unwrap();
     for unit in 0..2 {
-        assert_eq!(m.role(unit).state(), RoleState::Held);
-        assert_eq!(m.role(unit).holder(), 1);
+        assert_eq!(sys.role(unit).state(), RoleState::Held);
+        assert_eq!(sys.role(unit).holder(), 1);
     }
     for role in 2..5 {
-        assert_eq!(m.role(role).state(), RoleState::Vacant);
+        assert_eq!(sys.role(role).state(), RoleState::Vacant);
     }
     // With equal classes, unit role j is held by node j mod n.
     let even = with(|m| m.cores[1].fence = 1);
-    let (m, _) = boot(&even);
-    assert_eq!((m.role(0).holder(), m.role(1).holder()), (0, 1));
+    let (sys, _) = System::boot(&even).unwrap();
+    assert_eq!((sys.role(0).holder(), sys.role(1).holder()), (0, 1));
+}
+
+#[test]
+fn node_0_alone_holds_every_unit_role() {
+    let (m, _) = boot(&Machine::example());
+    for unit in 0..2 {
+        assert_eq!(
+            (m.role(unit).state(), m.role(unit).holder()),
+            (RoleState::Held, 0)
+        );
+    }
 }
 
 #[test]

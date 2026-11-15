@@ -23,6 +23,79 @@ pub(crate) struct RoleRecord {
 pub(crate) enum GrantState {
     Live,
     Revoking,
+    /// Freed by step R3 of a reclaim, its grantee fenced: the frames stay
+    /// pinned until the grantee is dead (model choice: the entry stays
+    /// used, so that its anchor keeps its place).
+    Pinned,
+}
+
+/// What an observation records (Detection): a core's heartbeat, or the
+/// consumer index of a ring from the observing node to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Watched {
+    Heartbeat { core: usize, heartbeat: u64 },
+    Ring { consumed: u64 },
+}
+
+/// An observation of a node, written by the gate only, stamped with the
+/// clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Observation {
+    pub(crate) node: u16,
+    pub(crate) watched: Watched,
+    pub(crate) at: u64,
+}
+
+/// A node beacon, written only by the kernel that runs that node.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct NodeBeacon {
+    /// The code of a failure the node found in itself, with its
+    /// generation.
+    pub(crate) panic: Option<(u64, u32)>,
+    pub(crate) save_seal: bool,
+    /// For each node, the generation whose reclaim this node finished.
+    pub(crate) acked: Vec<u32>,
+    /// For each node, set before the first translation to its memory.
+    pub(crate) maps_of: Vec<bool>,
+    pub(crate) observations: Vec<Observation>,
+    /// The idle, slack, kernel and recovery time, as last published:
+    /// bookkeeping of time, equal in any two states.
+    pub(crate) counters: crate::Ephemeral<[u64; 4]>,
+}
+
+/// A core beacon, written only by that core.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CoreBeacon {
+    /// Written at every event, and the instant of the next timer when idle:
+    /// equal in any two states, as the time counters are.
+    pub(crate) heartbeat: crate::Ephemeral<u64>,
+    pub(crate) idle_until: crate::Ephemeral<u64>,
+    /// The node whose block it runs.
+    pub(crate) running: u16,
+    pub(crate) vmx: bool,
+    /// The fence epoch written by the park stub.
+    pub(crate) parked: u64,
+}
+
+/// The node field of a core beacon while the core switches between parked
+/// nodes, or runs none.
+pub(crate) const NO_NODE: u16 = 0xFFFF;
+
+/// The state of an IOMMU unit as its hardware holds it: the context entry
+/// of each device, naming the node (and generation) whose iospace it uses,
+/// and the node whose gate maps the unit's registers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct UnitState {
+    pub(crate) entries: BTreeMap<u16, (u16, u32)>,
+    pub(crate) mapped: Option<u16>,
+}
+
+/// The fence of a node, as every node reads it: the instant of its first
+/// action and of the confirmed stop.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct FenceRecord {
+    pub(crate) started: Option<u64>,
+    pub(crate) confirmed: Option<u64>,
 }
 
 /// A grant entry of the granting node: the grantee and its generation,
@@ -82,8 +155,10 @@ pub(crate) struct Table {
     /// The chunks whose word is *none*, fixed at machine start-up (8.2,
     /// invariant 5).
     pub(crate) none: BTreeSet<u64>,
-    /// The fence class of the core of each node.
+    /// The fence class of each physical core, by core number, and whether
+    /// firmware booted it.
     pub(crate) fence: Vec<u8>,
+    pub(crate) booted: Vec<bool>,
     // The living part.
     /// The ownership words, one per chunk, as raw words: a stray write is a
     /// word that fails its check.
@@ -100,8 +175,32 @@ pub(crate) struct Table {
     pub(crate) grants: Vec<BTreeMap<u16, GrantEntry>>,
     pub(crate) uses: Vec<BTreeMap<u16, UseEntry>>,
     pub(crate) serials: Vec<BTreeMap<u16, u32>>,
+    /// Cores: the beacons, the physical core each node is placed on, the
+    /// cores marked unusable, the fences, the last fence epoch, and the
+    /// rings between nodes as (produced, consumed).
+    pub(crate) beacons: Vec<NodeBeacon>,
+    pub(crate) core_beacons: Vec<CoreBeacon>,
+    pub(crate) placed: Vec<usize>,
+    pub(crate) unusable: Vec<bool>,
+    pub(crate) fences: Vec<FenceRecord>,
+    pub(crate) fence_epoch: u64,
+    pub(crate) rings: Vec<Vec<(u64, u64)>>,
+    /// The slot of a replacement kernel image holds an image.
+    pub(crate) replacement: bool,
+    /// The IOMMU units by their role, and each node's report of what it
+    /// attached: (unit, device).
+    pub(crate) units: BTreeMap<usize, UnitState>,
+    pub(crate) reports: Vec<Vec<(usize, u16)>>,
+    /// The admitted bandwidth of each node, as it publishes it, and the
+    /// physical cores the hardware reports off (ARM64 `AFFINITY_INFO`).
+    pub(crate) admitted: Vec<u64>,
+    pub(crate) off: Vec<bool>,
     /// The writes of the current event.
     pub(crate) writes: crate::Ephemeral<Vec<WordWrite>>,
+    /// The member and role words written in the current event, with their
+    /// writer: (node, before, after) and (role, writer, before, after).
+    pub(crate) member_writes: crate::Ephemeral<Vec<(u16, u16, Member, Member)>>,
+    pub(crate) role_writes: crate::Ephemeral<Vec<(usize, u16, RoleWord, RoleWord)>>,
 }
 
 impl Table {
@@ -111,6 +210,34 @@ impl Table {
 
     pub(crate) fn generation(&self, node: u16) -> u32 {
         self.member(node).generation()
+    }
+
+    /// The fence class of the core a node is placed on.
+    pub(crate) fn fence_of(&self, node: u16) -> u8 {
+        self.fence[self.placed[node as usize]]
+    }
+
+    /// Whether a node's member word lets it write: starting, live or
+    /// sealing.
+    pub(crate) fn writes(&self, node: u16) -> bool {
+        matches!(
+            self.member(node).state(),
+            MemberState::Starting | MemberState::Live | MemberState::Sealing
+        )
+    }
+
+    /// The gate writes a member word, by compare-and-swap.
+    pub(crate) fn write_member(&mut self, writer: u16, node: u16, to: Member) {
+        let before = self.members[node as usize];
+        self.members[node as usize] = to;
+        self.member_writes.push((node, writer, before, to));
+    }
+
+    /// The gate writes a role word.
+    pub(crate) fn write_role(&mut self, writer: u16, role: usize, to: RoleWord) {
+        let before = self.roles[role];
+        self.roles[role] = to;
+        self.role_writes.push((role, writer, before, to));
     }
 
     /// Whether a node's member word is dead.

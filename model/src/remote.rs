@@ -16,8 +16,20 @@ use dodos_abi::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct Packet {
     pub from: u16,
+    /// The generation of the sending node: a receiving node refuses a
+    /// message of a node that is no longer starting, live or sealing with
+    /// it (R0).
+    pub generation: u32,
     pub to: u16,
     pub body: Body,
+}
+
+/// A call on a `core` capability of another node that the caller's kernel
+/// carries there (rule 7): what it sets on that node.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Carried {
+    Idle(Vec<[u64; 4]>),
+    Perf((u64, u64, u64)),
 }
 
 /// What a message between kernels carries.
@@ -36,12 +48,20 @@ pub enum Body {
         caps: Vec<Transfer>,
     },
     /// The outcome of a request.
-    Answer { id: u64, outcome: Outcome },
+    Answer {
+        id: u64,
+        outcome: Outcome,
+    },
     /// `thread_cancel` of a thread whose wait a proxy holds.
-    Cancel { id: u64 },
+    Cancel {
+        id: u64,
+    },
     /// At a delivery: the receiving node asks the node of the sender to
     /// grant the capabilities its request listed.
-    TransferAsk { id: u64, request: u64 },
+    TransferAsk {
+        id: u64,
+        request: u64,
+    },
     /// The grants, or `None` if the capabilities are dropped.
     TransferGrant {
         id: u64,
@@ -49,17 +69,31 @@ pub enum Body {
     },
     /// The granting node asks the holder to remove its root remote
     /// capability of a revoking grant, one step per message.
-    Revoke { id: u64, grant: u16, serial: u32 },
+    Revoke {
+        id: u64,
+        grant: u16,
+        serial: u32,
+    },
     /// The holder's answer after each step.
-    RevokeStep { id: u64, done: bool },
+    RevokeStep {
+        id: u64,
+        done: bool,
+    },
     /// The holder removed its root remote capability of a grant.
-    Release { grant: u16, serial: u32 },
+    Release {
+        grant: u16,
+        serial: u32,
+    },
     /// The receiving node refused the grants of a transfer at delivery: no
     /// capability moves.
-    Refused { grants: Vec<(u16, u32)> },
+    Refused {
+        grants: Vec<(u16, u32)>,
+    },
     /// The receiving node took back the anchors of these grants, moved
     /// home by a transfer: the holder removes its remote capability.
-    Returned { grants: Vec<(u16, u32)> },
+    Returned {
+        grants: Vec<(u16, u32)>,
+    },
     /// `thread_move`: the state of a thread, for the destination thread and
     /// sched, named by the grants of the caller's remote capabilities.
     Move {
@@ -69,7 +103,37 @@ pub enum Body {
         state: Box<crate::moves::Moved>,
     },
     /// The destination node's answer to a move.
-    Moved { id: u64, outcome: Outcome },
+    Moved {
+        id: u64,
+        outcome: Outcome,
+    },
+    /// The sweep's ping to an idle successor: consumed, it moves the ring's
+    /// consumer index.
+    Ping,
+    /// Step 4 of a planned hand-over: the holder tells the target.
+    Handed {
+        role: u16,
+    },
+    /// A request to the holder of a unit's role, with the epoch read, and
+    /// its answer: done, or refused for another epoch.
+    UnitRequest {
+        id: u64,
+        role: u16,
+        op: crate::roles::UnitOp,
+        epoch: u32,
+    },
+    UnitAnswer {
+        id: u64,
+        done: bool,
+    },
+    /// A carried call and its end.
+    Carry {
+        id: u64,
+        what: Carried,
+    },
+    CarryDone {
+        id: u64,
+    },
 }
 
 /// One capability of a transfer as the receiving node gets it.
@@ -138,6 +202,17 @@ pub(crate) enum Request {
     },
     /// The removal step of `thread` waits for the holder of `grant`.
     Revoke { thread: ObjId, grant: u16 },
+    /// A request to the holder of a unit's role, waited for by `thread` if
+    /// any; the epoch and the holder it was last sent to.
+    Unit {
+        thread: Option<ObjId>,
+        role: usize,
+        op: crate::roles::UnitOp,
+        epoch: u32,
+        sent_to: Option<u16>,
+    },
+    /// A carried call of `thread` to node `peer`.
+    Carry { thread: ObjId, peer: u16 },
     /// `thread_move`: the caller and the thread wait for the answer (each
     /// `None` once destroyed); the context the thread gives up.
     Move {
@@ -222,11 +297,27 @@ fn rewritten(call: &Syscall, mut slots: impl Iterator<Item = SlotAddr>) -> Sysca
 impl Model {
     /// Messages between kernels: what this node sends.
     pub(crate) fn send_packet(&mut self, to: u16, body: Body) {
+        let generation = self.table.generation(self.node);
         self.outbox.push(Packet {
             from: self.node,
+            generation,
             to,
             body,
         });
+    }
+
+    /// A call on another node's `core` capability, carried there; the
+    /// caller waits for that node.
+    pub(crate) fn carried(&mut self, thread: ObjId, peer: u16, what: Carried) -> Outcome {
+        if !self.table.writes(peer) {
+            return Err(Error::Gone);
+        }
+        let id = self.new_request();
+        self.requests.insert(id, Request::Carry { thread, peer });
+        self.send_packet(peer, Body::Carry { id, what });
+        live(&mut self.threads, thread).wait = Wait::Node(id);
+        self.observe();
+        Ok(Output::Waits)
     }
 
     pub(crate) fn new_request(&mut self) -> u64 {
@@ -401,6 +492,13 @@ impl Model {
         *self.last_event = None;
         let entry = self.begin();
         let from = packet.from;
+        // R0: nothing new from a node that is no longer starting, live or
+        // sealing with the generation that sent it.
+        let current = self.table.writes(from) && self.table.generation(from) == packet.generation;
+        if !current {
+            self.end(entry);
+            return;
+        }
         match packet.body {
             Body::Request {
                 id,
@@ -426,6 +524,36 @@ impl Model {
                 state,
             } => self.receive_move(from, id, (thread, sched), *state),
             Body::Moved { id, outcome } => self.moved(id, outcome),
+            Body::Ping => {}
+            Body::Handed { .. } => {
+                self.roles_unit();
+            }
+            Body::UnitRequest {
+                id,
+                role,
+                op,
+                epoch,
+            } => self.serve_unit(from, id, role as usize, op, epoch),
+            Body::UnitAnswer { id, done } => self.answered_unit(id, done),
+            Body::Carry { id, what } => {
+                match what {
+                    Carried::Idle(table) => self.idle_table = table,
+                    Carried::Perf(request) => self.perf = Some(request),
+                }
+                self.send_packet(from, Body::CarryDone { id });
+            }
+            Body::CarryDone { id } => {
+                if let Some(Request::Carry { thread, .. }) = self.requests.remove(&id)
+                    && self
+                        .threads
+                        .get(&thread)
+                        .is_some_and(|t| t.wait == Wait::Node(id))
+                {
+                    live(&mut self.threads, thread).wait = Wait::None;
+                    live(&mut self.threads, thread).answered = true;
+                    self.wake(thread, Ok(Output::Done));
+                }
+            }
         }
         self.bury_stale();
         self.end(entry);

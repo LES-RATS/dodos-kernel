@@ -144,6 +144,15 @@ pub struct Machine {
     /// counter (x86-64: a fixed counter of the PMU); without one the count
     /// reads 0. The model's cores retire one instruction per nanosecond.
     pub counter: bool,
+    /// The slot of a replacement kernel image holds one, and whether that
+    /// image reads the format of a sealed block of this one.
+    pub replacement: bool,
+    pub replacement_reads_sealed: bool,
+    /// The performance-request register (x86-64 HWP): each field is 8
+    /// bits; `false` where the core has none. The performance capabilities
+    /// each core reports.
+    pub perf_request: bool,
+    pub perf_caps: u64,
     /// The class the processor gives the running code (Intel Thread
     /// Director), as the model's processor reads it when a counted context
     /// stops; `None` where there is no classification.
@@ -271,6 +280,10 @@ impl Machine {
             io_page_sizes: 0b001,
             core_events: false,
             counter: true,
+            replacement: false,
+            replacement_reads_sealed: true,
+            perf_request: true,
+            perf_caps: 0x0A_1E_28_30,
             classifier: None,
             kernel_devices: vec![(0, 0x00f8)],
             descriptor_size: 48,
@@ -391,6 +404,7 @@ fn blocks((mut at, end): (u64, u64)) -> Vec<(u64, u64)> {
 /// What the machine start-up computes once: the layout of the kept image
 /// and of the crash areas, the floors, the reserves, the ownership words,
 /// the device table and the roles.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Layout {
     /// Each module: its physical base, its virtual address if it is a
     /// segment, its length, and whether it is copied (a writable segment).
@@ -655,12 +669,13 @@ impl Machine {
     pub(crate) fn table(&self, layout: &Layout) -> Table {
         let n = self.nodes();
         let fence: Vec<u8> = self.core_list().iter().map(|core| core.fence).collect();
+        let booted: Vec<bool> = self.core_list().iter().map(|core| core.booted).collect();
         let best = fence.iter().copied().max().unwrap_or(0);
         let best_nodes: Vec<u16> = (0..n as u16)
             .filter(|&i| fence[i as usize] == best)
             .collect();
         let mut units = 0;
-        let roles = layout
+        let roles: Vec<RoleWord> = layout
             .roles
             .iter()
             .map(|record| match record.kind {
@@ -682,12 +697,55 @@ impl Machine {
             kept: self.kept_ranges(layout.image, layout.crash_len),
             none: layout.none.iter().copied().collect(),
             fence,
+            booted,
+            beacons: vec![
+                crate::table::NodeBeacon {
+                    acked: vec![0; n],
+                    maps_of: vec![false; n],
+                    ..Default::default()
+                };
+                n
+            ],
+            core_beacons: (0..n)
+                .map(|core| crate::table::CoreBeacon {
+                    running: core as u16,
+                    idle_until: crate::Ephemeral(u64::MAX),
+                    ..Default::default()
+                })
+                .collect(),
+            placed: (0..n).collect(),
+            unusable: vec![false; n],
+            fences: vec![Default::default(); n],
+            fence_epoch: 0,
+            rings: vec![vec![(0, 0); n]; n],
+            replacement: self.replacement,
+            units: layout
+                .roles
+                .iter()
+                .zip(&roles)
+                .enumerate()
+                .filter(|(_, (record, _))| {
+                    record.kind == RoleKind::Unit && record.governs == Governs::IommuUnit
+                })
+                .map(|(role, (_, word))| {
+                    let unit = crate::table::UnitState {
+                        entries: Default::default(),
+                        mapped: Some(word.holder()),
+                    };
+                    (role, unit)
+                })
+                .collect(),
+            reports: vec![Vec::new(); n],
+            admitted: vec![0; n],
+            off: vec![false; n],
+            member_writes: Default::default(),
+            role_writes: Default::default(),
             owners: layout.owners.clone(),
             maps: vec![0; layout.owners.len()],
             classes: Default::default(),
             devices: layout.devices.clone(),
             members: vec![live; n],
-            roles,
+            roles: roles.clone(),
             grants: vec![Default::default(); n],
             uses: vec![Default::default(); n],
             serials: vec![Default::default(); n],
@@ -701,9 +759,21 @@ impl Model {
     /// run: built from the machine and the boot image by the rules of
     /// Start-up state. The other nodes of the machine are phantoms: their
     /// member words say live, and nothing else of them is modelled here.
+    ///
+    /// Node 0 runs alone: it holds every unit role, as on a machine of one
+    /// core (model choice: a unit role held by a phantom would leave every
+    /// request to it unanswered).
     pub fn boot(machine: &Machine) -> Result<(Self, ObjId), Refusal> {
         let layout = machine.layout()?;
-        let table = machine.table(&layout);
+        let mut table = machine.table(&layout);
+        for (word, record) in table.roles.iter_mut().zip(&table.role_records) {
+            if record.kind == RoleKind::Unit {
+                *word = RoleWord::held(0, word.epoch());
+            }
+        }
+        for unit in table.units.values_mut() {
+            unit.mapped = Some(0);
+        }
         Self::start(machine, &layout, table, 0)
     }
 
@@ -811,6 +881,7 @@ impl Model {
         }
         let mailbox = add(self, ObjectKind::Endpoint, 0, START_SLOT_MAILBOX, all);
         self.mailbox = Some(mailbox);
+        self.start_space = Some(space);
         let mut index = START_SLOT_FIRST;
         let mut next = || {
             index += 1;

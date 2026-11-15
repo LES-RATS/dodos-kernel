@@ -820,3 +820,50 @@ fn a_move_whose_thread_is_destroyed_meanwhile_still_answers_the_caller() {
     let (_, state) = m.read(0, A + 2);
     assert_eq!(state & SCHED_STATE_CONFIGURED, 0);
 }
+
+#[test]
+fn thread_move_refuses_a_sched_of_a_third_node() {
+    let mut machine = Machine::example();
+    let mut third = machine.cores[1];
+    third.hw_id = 4;
+    machine.cores.push(third);
+    let (mut sys, t) = System::boot(&machine).unwrap();
+    let on = |sys: &mut System, node: u16, call: Syscall| {
+        let outcome = sys.apply(node, t[node as usize], call);
+        assert_eq!(sys.check(), Ok(()));
+        outcome
+    };
+    for node in 0..3 {
+        assert_eq!(on(&mut sys, node, retype(Reply, 0, 99)), DONE);
+    }
+    assert_eq!(on(&mut sys, 0, retype(Thread, 0, A)), DONE);
+    assert_eq!(on(&mut sys, 1, retype(Thread, 0, D)), DONE);
+    assert_eq!(on(&mut sys, 2, retype(Sched, 0, D)), DONE);
+    // Node 0 receives the thread of node 1, then the sched of node 2.
+    for (from, slot) in [(1u16, D), (2, D + 1)] {
+        assert_eq!(on(&mut sys, 0, recv(slot, 1)), WAITS);
+        let send = Syscall::Send {
+            target: core(0),
+            message: Message {
+                label: 1,
+                flags: 0,
+                words: vec![1],
+                caps: vec![Transfer::Derive(s(D), NOT_EXEC.bits())],
+                marks: 0,
+            },
+        };
+        assert_eq!(on(&mut sys, from, send), WAITS);
+        sys.settle(32);
+        assert_eq!(sys.check(), Ok(()));
+    }
+    let call = Syscall::ThreadMove {
+        thread: s(A),
+        destination: s(D),
+        sched: s(D + 1),
+        core: core(1),
+        budget: 0,
+        period: 0,
+        class: 0,
+    };
+    assert_eq!(on(&mut sys, 0, call), Err(Error::Invalid));
+}

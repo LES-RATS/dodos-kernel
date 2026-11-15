@@ -159,7 +159,7 @@ const MADE: [ObjectKind; 9] = [
 ];
 
 /// The calls, numbered as `name_of` numbers them.
-const NAMES: [&str; 50] = [
+const NAMES: [&str; 59] = [
     "cap_derive",
     "cap_move",
     "cap_delete",
@@ -210,11 +210,21 @@ const NAMES: [&str; 50] = [
     "memory_take",
     "memory_give",
     "memory_split",
+    "core_start",
+    "core_stop",
+    "core_status",
+    "core_idle",
+    "core_watch",
+    "core_place",
+    "core_perf",
+    "role_claim",
+    "role_hand",
 ];
 /// The calls that never succeed on one node: "other" stands for the calls
-/// that are not modelled, and `thread_move` needs a destination thread of
-/// another node (its successes are in `tests/nodes.rs`).
-const NEVER_ON_ONE_NODE: [&str; 2] = ["other", "thread_move"];
+/// that are not modelled, `thread_move` needs a destination thread of
+/// another node (its successes are in `tests/cores.rs`), and `core_start`
+/// a dead node (`tests/recovery.rs`).
+const NEVER_ON_ONE_NODE: [&str; 3] = ["other", "thread_move", "core_start"];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
 
@@ -270,6 +280,15 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::MemoryTake { .. } => 47,
         Syscall::MemoryGive { .. } => 48,
         Syscall::MemorySplit { .. } => 49,
+        Syscall::CoreStart { .. } => 50,
+        Syscall::CoreStop { .. } => 51,
+        Syscall::CoreStatus(_) => 52,
+        Syscall::CoreIdle { .. } => 53,
+        Syscall::CoreWatch { .. } => 54,
+        Syscall::CorePlace { .. } => 55,
+        Syscall::CorePerf { .. } => 56,
+        Syscall::RoleClaim(_) => 57,
+        Syscall::RoleHand { .. } => 58,
     }
 }
 
@@ -571,6 +590,71 @@ impl Generator<'_> {
         }
     }
 
+    /// A `role` capability of the start-up space: the unit roles, the
+    /// reserves and the plain roles of `Machine::example`.
+    fn role(&mut self) -> SlotAddr {
+        if self.rng.chance(95) {
+            own(common::ROLES + self.rng.below(5) as u32)
+        } else {
+            self.held(OTHER)
+        }
+    }
+
+    /// A call of the Cores group on the `core` capability of this node or
+    /// of the phantom node. Seldom a stop: it ends what the phantom node
+    /// can show.
+    fn core_call(&mut self) -> Syscall {
+        let core = match self.rng.below(10) {
+            0..6 => own(CORE_SLOT),
+            6..9 => own(CORE_SLOT + 1),
+            _ => self.held(OTHER),
+        };
+        match self.rng.below(20) {
+            0 => Syscall::CoreStart {
+                core,
+                mode: self.rng.below(3),
+                image: self.rng.below(3),
+                module: self.rng.below(3),
+            },
+            1 if self.rng.chance(10) => Syscall::CoreStop {
+                core,
+                mode: self.rng.below(4),
+            },
+            1 | 2 => Syscall::CoreStatus(core),
+            3..6 => Syscall::CoreIdle {
+                core,
+                words: match self.rng.below(4) {
+                    0 => Vec::new(),
+                    1 => vec![100, 200, 0, 0, 300, 400, 1, 0],
+                    2 => vec![100, 200, 0, 0, 50, 400, 1, 0],
+                    _ => vec![self.rng.below(5), 0, self.rng.below(4), self.rng.below(3)],
+                },
+            },
+            6..12 => Syscall::CoreWatch {
+                core,
+                index: self.rng.below(5),
+                notify: if self.rng.chance(30) {
+                    SlotAddr::NONE
+                } else {
+                    self.held(NOTIFY)
+                },
+            },
+            12..15 => Syscall::CorePlace {
+                core,
+                physical: self.rng.below(3),
+            },
+            _ => {
+                let lowest = self.rng.below(300);
+                Syscall::CorePerf {
+                    core,
+                    lowest,
+                    highest: lowest + self.rng.below(100),
+                    preference: self.rng.below(300),
+                }
+            }
+        }
+    }
+
     /// The memory_control of the node, mostly.
     fn control(&mut self) -> SlotAddr {
         if self.rng.chance(95) {
@@ -622,7 +706,7 @@ impl Generator<'_> {
         let roll = if self.rng.chance(14) {
             29 + self.rng.below(8)
         } else {
-            self.rng.below(70)
+            self.rng.below(74)
         };
         match roll {
             0..3 => Syscall::CapDerive {
@@ -941,6 +1025,17 @@ impl Generator<'_> {
                 period: 0,
                 class: 0,
             },
+            70 => self.core_call(),
+            71 => self.core_call(),
+            72 => Syscall::RoleClaim(self.role()),
+            73 => Syscall::RoleHand {
+                role: self.role(),
+                core: match self.rng.below(10) {
+                    0 => SlotAddr::NONE,
+                    1..6 => own(CORE_SLOT),
+                    _ => own(CORE_SLOT + 1),
+                },
+            },
             45 | 46 => Syscall::IoSpaceAttach {
                 iommu: if self.rng.chance(90) {
                     own(IOMMU_SLOT)
@@ -967,7 +1062,7 @@ impl Generator<'_> {
                 },
             },
             _ => Syscall::Other(self.rng.pick(&[
-                Call::CoreStatus,
+                Call::EntropyRead,
                 Call::DebugWrite,
                 Call::TraceEmit,
             ])),
@@ -1670,6 +1765,102 @@ fn crowd(model: &mut Model, first: ObjId, reached: &mut Reached) {
     }
 }
 
+/// The directed case of a `send` whose listed move the depth rule refuses
+/// at delivery (8.6): a receiver waits with its range in a capability
+/// space whose root is as deep as the root of the space being moved, so
+/// the capability is dropped and `send` returns the flag `caps_dropped`;
+/// then the same move into the start-up space, whose root is less deep,
+/// is accepted. Then every object of the case is removed. It uses slots
+/// that the scripts never use.
+fn refused_send(model: &mut Model, first: ObjId, reached: &mut Reached) {
+    let s = |index: u32| own(4100 + index);
+    let make = |kind: ObjectKind, size: u64, slot: SlotAddr| Syscall::UntypedRetype {
+        untyped: MEMORY,
+        kind,
+        size,
+        page: PageSize::Page as u64,
+        memory: 0,
+        destination: slot,
+    };
+    let setup = [
+        make(ObjectKind::Endpoint, 0, s(0)),
+        make(ObjectKind::Reply, 0, s(1)),
+        make(ObjectKind::Thread, 0, s(2)),
+        make(ObjectKind::Frame, 1, s(3)),
+        make(ObjectKind::Sched, 0, s(4)),
+        make(ObjectKind::CSpace, 128, s(5)),
+        Syscall::CSpaceGrow {
+            cspace: s(5),
+            untyped: MEMORY,
+        },
+        make(ObjectKind::CSpace, 128, s(6)),
+        Syscall::ThreadConfigure {
+            thread: s(2),
+            cspace: HERE,
+            aspace: own(START_SLOT_ASPACE),
+            fault: SlotAddr::NONE,
+            page: s(3),
+        },
+        Syscall::SchedConfigure {
+            sched: s(4),
+            core: own(CORE_SLOT),
+            budget: 100_000,
+            period: 10_000_000,
+            class: 1,
+        },
+        Syscall::SchedBind {
+            sched: s(4),
+            thread: s(2),
+        },
+        Syscall::ThreadResume(s(2)),
+    ];
+    let apply = |model: &mut Model, thread: ObjId, call: Syscall| {
+        let outcome = model.apply(thread, call);
+        assert_eq!(model.check(), Ok(()));
+        outcome
+    };
+    for call in setup {
+        assert!(apply(model, first, call).is_ok());
+    }
+    let receiver = model.object_at(first, s(2)).expect("the receiver");
+    let send = Syscall::Send {
+        target: s(0),
+        message: Message {
+            caps: vec![Transfer::Move(s(6))],
+            ..Message::default()
+        },
+    };
+    for (range, flags) in [
+        (SlotAddr::through(4105, 1), Header::FLAG_CAPS_DROPPED),
+        (s(7), 0),
+    ] {
+        let recv = Syscall::Recv {
+            endpoint: s(0),
+            reply: s(1),
+            range: Range {
+                first: range,
+                count: 1,
+            },
+            wait: 0,
+        };
+        assert_eq!(apply(model, receiver, recv), Ok(Output::Waits));
+        assert_eq!(
+            apply(model, first, send.clone()),
+            Ok(Output::Sent { flags })
+        );
+    }
+    reached.sent += 1;
+    reached.sent_refused += 1;
+    reached.count(model);
+    for index in (0..8).rev() {
+        for _ in 0..16 {
+            if apply(model, first, Syscall::CapDelete(s(index))) != Err(Error::Again) {
+                break;
+            }
+        }
+    }
+}
+
 fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let (mut model, first) = start();
@@ -1679,6 +1870,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut known: BTreeSet<ObjId> = BTreeSet::new();
     let mut walked = false;
     crowd(&mut model, first, reached);
+    refused_send(&mut model, first, reached);
     for step in 0..STEPS {
         let threads = model.runnable();
         known.extend(&threads);
@@ -1954,12 +2146,12 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps, the smaller of the two geometries: untyped 27,
-    // cspace 9,767, aspace 43, frame 9,407, thread 391, sched 16, endpoint
-    // 11, reply 9, notify 546; a copy under `cap_delete` 1,136.
+    // Measured, in steps, the smaller of the two geometries: untyped 142,
+    // cspace 8,567, aspace 41, frame 8,738, thread 27, sched 12, endpoint
+    // 13, reply 293, notify 40; a copy under `cap_delete` 325.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [13, 4800, 21, 4700, 190, 8, 5, 4, 270]);
-    at_least([reached.dying_copies], [520]);
+    at_least(dying, [71, 4200, 20, 4300, 13, 6, 6, 146, 20]);
+    at_least([reached.dying_copies], [160]);
 }
 
 #[test]
@@ -2013,7 +2205,7 @@ fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     // by `send` 8 delivered and none refused (one in pass 10).
     at_least(reached.moved, [1700, 47]);
     at_least(reached.refused, [20, 8]);
-    at_least([reached.sent, reached.sent_refused], [4, 0]);
+    at_least([reached.sent, reached.sent_refused], [4, 1]);
     // The same moves listed by `call` and by `reply_recv`: 22 and 13.
     at_least([reached.called, reached.answered], [11, 6]);
 }
@@ -2050,9 +2242,9 @@ fn untyped_retype_of_a_kind_not_made_is_reached() {
 fn faults_are_raised_delivered_and_waited_on() {
     let reached = all_seeds();
     // Measured: 151 faults found no handler and 65 were delivered; a thread
-    // waited on a fault after 30,974 steps.
+    // waited on a fault after 14,596 steps (the smaller geometry).
     at_least(reached.faults, [75, 32]);
-    at_least([reached.faulting], [15_000]);
+    at_least([reached.faulting], [7300]);
 }
 
 #[test]
@@ -2081,9 +2273,9 @@ fn scheduling_states_are_reached() {
 #[test]
 fn interrupts_and_marks_are_reached() {
     let reached = all_seeds();
-    // Measured, the smaller of the two geometries: 1,157 interrupts
-    // arrived, the marks of a thread grew twice; after 77,864 steps an irq
-    // was claimed, after 2,891 one was fired, after 7,614 a task was
+    // Measured, the smaller of the two geometries: 1,140 interrupts
+    // arrived, the marks of a thread grew 4 times; after 67,260 steps an
+    // irq was claimed, after 1,709 one was fired, after 1,059 a task was
     // revoked.
     let counts = [
         reached.interrupts,
@@ -2092,7 +2284,7 @@ fn interrupts_and_marks_are_reached() {
         reached.irq_fired,
         reached.revoked,
     ];
-    at_least(counts, [570, 2, 38_000, 1400, 3800]);
+    at_least(counts, [570, 2, 33_000, 850, 520]);
 }
 
 #[test]

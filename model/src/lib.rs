@@ -33,7 +33,9 @@ mod ipc;
 mod irq;
 mod memory;
 mod moves;
+mod recovery;
 mod remote;
+mod roles;
 mod sched;
 mod system;
 mod table;
@@ -44,8 +46,10 @@ pub use boot::{
     Arch, Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, SIXTEEN_KB, Segment,
 };
 pub use check::Census;
-pub use remote::{Body, Crossing, Granted, Packet};
-pub use system::System;
+pub use recovery::HwAction;
+pub use remote::{Body, Carried, Crossing, Granted, Packet};
+pub use roles::UnitOp;
+pub use system::{CoreState, System};
 
 use dodos_abi::{
     Call, Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
@@ -170,6 +174,44 @@ pub enum Syscall {
         sched: SlotAddr,
         core: SlotAddr,
         mode: u64,
+    },
+    /// Cores: the `core` capability and the arguments of each call.
+    CoreStart {
+        core: SlotAddr,
+        mode: u64,
+        image: u64,
+        module: u64,
+    },
+    CoreStop {
+        core: SlotAddr,
+        mode: u64,
+    },
+    CoreStatus(SlotAddr),
+    /// The table travels as the message words.
+    CoreIdle {
+        core: SlotAddr,
+        words: Vec<u64>,
+    },
+    CoreWatch {
+        core: SlotAddr,
+        index: u64,
+        notify: SlotAddr,
+    },
+    CorePlace {
+        core: SlotAddr,
+        physical: u64,
+    },
+    CorePerf {
+        core: SlotAddr,
+        lowest: u64,
+        highest: u64,
+        preference: u64,
+    },
+    RoleClaim(SlotAddr),
+    /// The role and the `core` capability of the target; none vacates.
+    RoleHand {
+        role: SlotAddr,
+        core: SlotAddr,
     },
     /// `thread_move`: the thread, the destination thread and sched (remote
     /// capabilities of the destination node), its `core` capability, and
@@ -349,6 +391,10 @@ pub enum Output {
         /// The instructions retired while counted.
         instructions: u64,
     },
+    /// `core_status`: the seven words.
+    Status([u64; 7]),
+    /// `role_claim`, `role_hand`: the epoch.
+    Epoch(u32),
     /// `timer_set`, `timer_cancel`: 1 if the timer was armed, 0 otherwise.
     WasArmed(u64),
     /// `irq_claim`: the address and the data of an MSI.
@@ -772,7 +818,7 @@ struct Armed {
 /// Bookkeeping of the current or last event: what the invariants read to
 /// judge an event. Two states that differ only in it are the same state,
 /// so it is equal to any other.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Ephemeral<T>(pub(crate) T);
 
 impl<T> PartialEq for Ephemeral<T> {
@@ -901,9 +947,27 @@ pub struct Model {
     /// Remote capabilities found invalid during the call, whose slots
     /// become dead when it ends.
     stale: Ephemeral<std::cell::RefCell<Vec<CapId>>>,
+    /// Cores (8.4): the fences this node drives, its reclaim of each node,
+    /// what it asks of the hardware, its watch slots, the member and role
+    /// words it last processed, its idle table and performance request,
+    /// the instant of its next sweep, its idle and slack time, and the
+    /// events of its core (its heartbeat).
+    fences: BTreeMap<u16, recovery::Fence>,
+    reclaims: BTreeMap<u16, recovery::Reclaim>,
+    hw_out: Vec<recovery::HwAction>,
+    watchers: [Option<(ObjId, u64)>; 4],
+    seen: (Vec<dodos_abi::Member>, Vec<dodos_abi::RoleWord>),
+    idle_table: Vec<[u64; 4]>,
+    perf: Option<(u64, u64, u64)>,
+    next_sweep: u64,
+    idle_ns: Ephemeral<u64>,
+    slack_ns: Ephemeral<u64>,
+    events: Ephemeral<u64>,
     /// What a core enables for a thread: the state features enabled on the
     /// core, as the last switch wrote them.
     enabled: u32,
+    /// The start-up space of the node.
+    start_space: Option<ObjId>,
     /// Other models of the machine share its table (`System`): the map
     /// counts hold their leaves too.
     shared: bool,
@@ -924,27 +988,10 @@ pub struct Model {
 /// groups not yet specified (cores, debugging), and those this model does
 /// not make yet.
 fn other(call: Call) -> bool {
-    use Call::{
-        CoreIdle, CorePerf, CorePlace, CoreStart, CoreStatus, CoreStop, CoreWatch, DebugWrite,
-        EntropyRead, IoportIn, IoportOut, IoportsIssue, RoleClaim, RoleHand, TraceEmit,
-    };
+    use Call::{DebugWrite, EntropyRead, IoportIn, IoportOut, IoportsIssue, TraceEmit};
     matches!(
         call,
-        CoreStart
-            | CoreStop
-            | CoreStatus
-            | DebugWrite
-            | TraceEmit
-            | CoreIdle
-            | CoreWatch
-            | CorePlace
-            | RoleClaim
-            | RoleHand
-            | IoportIn
-            | IoportOut
-            | IoportsIssue
-            | EntropyRead
-            | CorePerf
+        DebugWrite | TraceEmit | IoportIn | IoportOut | IoportsIssue | EntropyRead
     )
 }
 
@@ -980,6 +1027,16 @@ impl Model {
         let ready = |thread: &&Thread| !thread.suspended && thread.wait == Wait::None;
         let ids = self.threads.iter().filter(|(_, thread)| ready(thread));
         ids.map(|(&id, _)| id).collect()
+    }
+
+    /// The object in a slot of the start-up space (the space of the
+    /// node's first thread), to find the first thread after a start.
+    pub fn object_at_start(&self, index: u32) -> ObjId {
+        let space = self.start_space.expect("a start-up space");
+        match self.cspaces[&space].slots[index as usize] {
+            Slot::Full(cap) => self.caps[&cap].object,
+            _ => panic!("slot {index} of the start-up space is empty"),
+        }
     }
 
     /// Unlike cores: the state features the core enables, as the last
@@ -1183,6 +1240,29 @@ impl Model {
             Syscall::SchedCount { sched, core, mode } => {
                 self.sched_count(thread, sched, core, mode)
             }
+            Syscall::CoreStart {
+                core,
+                mode,
+                image,
+                module,
+            } => self.core_start(thread, core, mode, image, module),
+            Syscall::CoreStop { core, mode } => self.core_stop(thread, core, mode),
+            Syscall::CoreStatus(core) => self.core_status(thread, core),
+            Syscall::CoreIdle { core, words } => self.core_idle(thread, core, &words),
+            Syscall::CoreWatch {
+                core,
+                index,
+                notify,
+            } => self.core_watch(thread, core, index, notify),
+            Syscall::CorePlace { core, physical } => self.core_place(thread, core, physical),
+            Syscall::CorePerf {
+                core,
+                lowest,
+                highest,
+                preference,
+            } => self.core_perf(thread, core, (lowest, highest, preference)),
+            Syscall::RoleClaim(role) => self.role_claim(thread, role),
+            Syscall::RoleHand { role, core } => self.role_hand(thread, role, core),
             Syscall::ThreadMove {
                 thread: source,
                 destination,

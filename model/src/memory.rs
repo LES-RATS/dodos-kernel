@@ -234,6 +234,12 @@ impl Model {
         if missing > supplied {
             return Err(Error::NoMemory);
         }
+        // The barrier's dependency: bit X of `maps_of` is set through the
+        // gate before the first translation to memory of node X.
+        if let Some(remote) = self.remotes.get(&self.caps[&cap].object) {
+            let granter = remote.node as usize;
+            self.table.beacons[self.node as usize].maps_of[granter] = true;
+        }
         // Effect: the missing tables are taken, free list first, then the
         // untyped, cleared within the call; the record is filled and the
         // capability goes to the head of the space's list.
@@ -327,9 +333,12 @@ impl Model {
         let unit = &self.iommus[&iommu];
         let attached = unit.attached.get(&device).copied();
         let Some(iospace) = iospace else {
-            // With iospace 0: detached if attached, otherwise no effect.
+            // With iospace 0: detached if attached, otherwise no effect. The
+            // context entry is cleared by the holder of the unit's role.
             if attached.is_some() {
-                self.detach(iommu, device);
+                let unit = self.iommus[&iommu].unit;
+                self.detach_local(iommu, device);
+                return self.unit_request(Some(thread), unit, crate::roles::UnitOp::Detach(device));
             }
             return Ok(Output::Done);
         };
@@ -360,12 +369,25 @@ impl Model {
         let unit = live(&mut self.iommus, iommu);
         unit.attached.insert(device, iospace);
         unit.order.push(device);
-        Ok(Output::Done)
+        let unit = unit.unit;
+        // The node's report, and the context entry, written by the holder
+        // of the unit's role.
+        self.table.reports[self.node as usize].push((unit, device));
+        self.unit_request(Some(thread), unit, crate::roles::UnitOp::Attach(device))
     }
 
     /// IOMMU: the context entry of a device is cleared, and the device
     /// leaves the header of its iospace.
     pub(crate) fn detach(&mut self, iommu: ObjId, device: u16) {
+        let unit = self.iommus[&iommu].unit;
+        self.detach_local(iommu, device);
+        let _ = self.unit_request(None, unit, crate::roles::UnitOp::Detach(device));
+    }
+
+    /// The node's own record of a detach, and its report.
+    fn detach_local(&mut self, iommu: ObjId, device: u16) {
+        let index = self.iommus[&iommu].unit;
+        self.table.reports[self.node as usize].retain(|&r| r != (index, device));
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);
         let iospace = unit.attached.remove(&device);

@@ -273,7 +273,13 @@ impl Model {
             .flat_map(|space| space.table_pages.iter().map(|at| at / page))
             .collect();
         let classes: BTreeSet<u64> = table.classes.keys().copied().collect();
-        ensure(tables == classes, "59: page classes")?;
+        // Alone, the node's tables are every table page; on a machine of
+        // several models, `System::check` takes the union.
+        let held = match self.shared {
+            false => tables == classes,
+            true => tables.is_subset(&classes),
+        };
+        ensure(held, "59: page classes")?;
         Ok(())
     }
 }

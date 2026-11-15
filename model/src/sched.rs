@@ -96,6 +96,10 @@ impl Model {
     /// is taken as zero. Returns the context running at the entry.
     pub(crate) fn begin(&mut self) -> Option<(ObjId, bool)> {
         self.table.writes.clear();
+        self.table.member_writes.clear();
+        self.table.role_writes.clear();
+        // The core beacon's heartbeat: one more at every event.
+        self.events.0 += 1;
         self.change_list.clear();
         self.no_context_list.clear();
         *self.snapshot = self.scheds.keys().map(|&id| (id, self.snap(id))).collect();
@@ -115,6 +119,13 @@ impl Model {
             .iter()
             .map(|(&id, s)| (id, (s.consumed, s.count, s.counted)))
             .collect();
+        // The time counters of `core_status`: idle when nothing ran, slack
+        // when a context ran from its slack queue.
+        match self.running {
+            None => self.idle_ns.0 += elapsed,
+            Some((_, false)) => self.slack_ns.0 += elapsed,
+            Some(_) => {}
+        }
         let (context, ready) = self.running?;
         let counter = self.machine.counter;
         let running = self.scheds.get_mut(&context)?;
@@ -172,6 +183,7 @@ impl Model {
     /// its queue, then the choice.
     pub(crate) fn end(&mut self, entry: Option<(ObjId, bool)>) {
         self.choose(entry);
+        self.publish_counters();
         // Instructions retired: when a counted context stops running, the
         // kernel reads the processor's class of the code it ran.
         let now = self.running.map(|(context, _)| context);
@@ -448,7 +460,7 @@ impl Model {
     /// Due events and the hardware timer: after the choice, the earliest of
     /// the instant the running context's budget ends, the first
     /// replenishment instant and the first firing instant.
-    fn hardware(&self) -> Option<u64> {
+    pub(crate) fn hardware(&self) -> Option<u64> {
         let budget = self.running.and_then(|(context, ready)| {
             let sched = self.scheds.get(&context).filter(|_| ready)?;
             Some(self.now + sched.remaining.max(0) as u64)

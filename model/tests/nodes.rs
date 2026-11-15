@@ -255,7 +255,8 @@ fn send_on_a_core_capability_reaches_the_mailbox_of_that_node() {
         [Packet {
             from: 0,
             to: 1,
-            body: Body::Request { .. }
+            body: Body::Request { .. },
+            ..
         }]
     ));
     m.deliver(0);
@@ -265,7 +266,8 @@ fn send_on_a_core_capability_reaches_the_mailbox_of_that_node() {
         [Packet {
             from: 1,
             to: 0,
-            body: Body::Answer { .. }
+            body: Body::Answer { .. },
+            ..
         }]
     ));
     m.deliver(0);
@@ -1084,4 +1086,27 @@ fn a_task_made_on_node_1_carries_node_1_in_its_identifier() {
         panic!("a task");
     };
     assert_eq!(TaskId::from_raw(id).node(), 1);
+}
+
+#[test]
+fn a_remote_capability_derived_home_while_its_grant_is_revoking_is_dropped() {
+    let mut m = S::new();
+    m.granted(Frame);
+    m.ok(1, map(GOT, 1, Rights::READ));
+    let b = m.spawn(0, 200);
+    // Node 1 sends a copy of its mapped remote frame home.
+    assert_eq!(m.on(0, recv(range(GOT, 4))), WAITS);
+    let back = Syscall::Send {
+        target: core(0),
+        message: msg(8, vec![Transfer::Derive(s(GOT), Rights::READ.bits())]),
+    };
+    assert_eq!(m.on(1, back), WAITS);
+    m.deliver_where(|b| matches!(b, Body::Request { .. }));
+    m.deliver_where(|b| matches!(b, Body::TransferAsk { .. }));
+    // Node 0 revokes before the crossing arrives: the grant is revoking,
+    // with the same serial, while the holder still maps it.
+    assert_eq!(m.by(0, b, Syscall::CapRevoke(s(OBJ))), WAITS);
+    m.deliver_where(|b| matches!(b, Body::TransferGrant { .. }));
+    assert_eq!(got(m.woken(0)), (8, 0, Header::FLAG_CAPS_DROPPED));
+    m.settle();
 }

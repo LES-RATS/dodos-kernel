@@ -180,6 +180,10 @@ impl Model {
     }
 
     /// `signal`, with the bits of a capability's badge.
+    pub(crate) fn signal_bits_pub(&mut self, notify: ObjId, bits: u64) {
+        self.signal_bits(notify, bits)
+    }
+
     fn signal_bits(&mut self, notify: ObjId, bits: u64) {
         live(&mut self.notifies, notify).word |= bits;
         self.hand_over(notify);

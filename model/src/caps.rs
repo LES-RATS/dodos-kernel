@@ -857,7 +857,11 @@ impl Model {
             ObjectKind::Sched if self.clear_lend(object) => {}
             // Destroying a notify: its armed timers are disarmed, then its
             // bound irqs unbound; destroying a task detaches its threads.
-            ObjectKind::Notify if self.disarm_one(object) || self.unbind_one_irq(object) => {}
+            // Then its watch slots, one unit each (Cores).
+            ObjectKind::Notify
+                if self.disarm_one(object)
+                    || self.unbind_one_irq(object)
+                    || self.unwatch_one(object) => {}
             ObjectKind::Task if self.detach_one(object) => {}
             // IOMMU: the destruction of an iospace first detaches each of its
             // devices, most recently attached first, then empties each record
