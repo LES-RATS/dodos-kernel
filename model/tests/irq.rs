@@ -364,7 +364,7 @@ fn destroying_the_irq_frees_its_vector() {
 }
 
 #[test]
-fn arrival_on_a_dying_notify_is_delivered_as_on_a_live_one() {
+fn arrival_on_a_dying_notify_is_handled_as_on_an_idle_irq() {
     let mut k = K::new();
     k.make(Endpoint, 33);
     k.make(Reply, 34);
@@ -419,9 +419,16 @@ fn arrival_on_a_dying_notify_is_delivered_as_on_a_live_one() {
         });
     }
     k.no(Syscall::CapDelete(s(NT)), Error::Again);
+    // Nothing is delivered to a dying notify: the receiver stays waiting,
+    // the edge source records the arrival, and `irq_ack` is `busy`.
     k.arrive(48);
-    let Some(Ok(Output::Message(delivery))) = k.m.woken(receiver) else {
-        panic!("no notification");
-    };
-    assert_eq!(delivery.received.header.flags(), Header::FLAG_NOTIFICATION);
+    assert_eq!(k.m.woken(receiver), None);
+    k.no(Syscall::IrqAck(s(40)), Error::Busy);
+    // The removal unbinds the irq, idle with its pending bit: binding a
+    // new notify delivers it at once.
+    let ended = (0..10).find(|_| k.go(Syscall::CapDelete(s(NT))) == DONE);
+    assert!(ended.is_some(), "the removal ends");
+    k.make(Notify, 94);
+    k.ok(bind(40, 94));
+    assert_eq!(k.go(Syscall::Poll(s(94))), Ok(Output::Word(1)));
 }

@@ -30,9 +30,9 @@ impl Model {
     /// check of its capability, but `task_read`, `task_revoke` and the
     /// capability calls.
     ///
-    /// CONTRACT-GAP (Tasks and marks): "at the check of its capability"
-    /// does not place `gone` among the three checks; here it comes with the
-    /// slot, before the kind and the rights, as for a dying object.
+    /// A full slot whose object is a revoked task is `gone` before its kind
+    /// and rights are judged; an empty or out-of-range slot is still
+    /// `invalid` and a dead one `gone` (Tasks and marks).
     fn task(&self, thread: ObjId, at: SlotAddr, need: Rights) -> Result<ObjId, Error> {
         let cap = self.cap(thread, at, Rights::READ)?;
         let object = self.caps[&cap].object;
@@ -141,6 +141,7 @@ impl Model {
             self.wake(thread, Err(Error::Gone));
         }
         live(&mut self.threads, thread).suspended = true;
+        self.observe();
         self.detach_task(thread);
     }
 

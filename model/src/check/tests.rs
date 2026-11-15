@@ -2061,3 +2061,106 @@ fn page_class_of_no_table_is_reported() {
     });
     assert_eq!(broken, "59: page classes");
 }
+
+// The settled problems of pass 11.
+
+#[test]
+fn context_that_entered_a_queue_off_the_change_list_is_reported() {
+    let broken = spoiled(|m, _| {
+        m.event.entered_from = 0;
+        m.event.changes.clear();
+    });
+    assert_eq!(broken, "60: order of entry and the change list");
+}
+
+#[test]
+fn parameters_in_force_changed_without_a_replenishment_are_reported() {
+    let broken = spoiled(|m, _| {
+        // The same bandwidth, so that the admitted sum still holds.
+        let first = object(m, dodos_abi::START_SLOT_SCHED);
+        let sched = live(&mut m.scheds, first);
+        (sched.budget, sched.period) = (2 * sched.budget, 2 * sched.period);
+    });
+    assert_eq!(broken, "61: parameters in force changed");
+}
+
+#[test]
+fn call_that_put_five_contexts_in_new_places_is_reported() {
+    let broken = spoiled(|m, _| *m.last_event = Some((crate::sched::EventKind::Call, 5)));
+    assert_eq!(broken, "62: contexts put in a new queue position");
+    let broken = spoiled(|m, _| *m.last_event = Some((crate::sched::EventKind::TaskRevoke, 33)));
+    assert_eq!(broken, "62: contexts put in a new queue position");
+    let broken = spoiled(|m, _| *m.last_event = Some((crate::sched::EventKind::Removal, 97)));
+    assert_eq!(broken, "62: contexts put in a new queue position");
+}
+
+#[test]
+fn removal_step_that_put_96_contexts_in_new_places_is_accepted() {
+    let mut model = state();
+    *model.last_event = Some((crate::sched::EventKind::Removal, 96));
+    assert_eq!(model.check(), Ok(()));
+}
+
+#[test]
+fn recorded_fault_of_a_thread_that_is_not_suspended_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.ready).recorded = Some((1, [0; 5])));
+    assert_eq!(
+        broken,
+        "63: recorded fault of a thread that is not suspended"
+    );
+}
+
+#[test]
+fn fault_no_context_delivered_to_a_passive_receiver_is_reported() {
+    let broken = spoiled(|m, _| m.event.no_context_delivered.push(false));
+    assert_eq!(
+        broken,
+        "64: fault no context delivered to a passive receiver"
+    );
+}
+
+#[test]
+fn second_fault_of_a_thread_in_one_event_is_reported() {
+    let broken = spoiled(|m, at| {
+        m.event.raised.push((at.ready, 8));
+        m.event.raised.push((at.ready, 2));
+    });
+    assert_eq!(broken, "64: a second fault in one event");
+}
+
+#[test]
+fn clean_mark_over_memory_that_was_not_cleared_is_reported() {
+    let broken = spoiled(|m, _| {
+        let id = object(m, UNTYPED);
+        let untyped = live(&mut m.untypeds, id);
+        untyped.clean = untyped.watermark + 64;
+        untyped.zero.clear();
+    });
+    assert_eq!(broken, "65: clean mark over memory not cleared");
+}
+
+#[test]
+fn device_of_a_unit_missing_from_its_list_is_reported() {
+    let broken = spoiled(|m, at| {
+        let thread = object(m, START_SLOT_THREAD);
+        let _ = at;
+        let space = Syscall::UntypedRetype {
+            untyped: SlotAddr::own(UNTYPED),
+            kind: ObjectKind::IoSpace,
+            size: 0,
+            page: 0,
+            memory: 0,
+            destination: SlotAddr::own(300),
+        };
+        m.apply(thread, space).unwrap();
+        let attach = Syscall::IoSpaceAttach {
+            iommu: SlotAddr::own(18),
+            iospace: SlotAddr::own(300),
+            device: 0x10,
+        };
+        m.apply(thread, attach).unwrap();
+        let unit = object(m, 18);
+        live(&mut m.iommus, unit).order.clear();
+    });
+    assert_eq!(broken, "39: list of the devices of a unit");
+}

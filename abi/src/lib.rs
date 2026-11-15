@@ -89,9 +89,8 @@ pub const CSPACE_SEGMENT_SLOTS: u32 = 128;
 /// capability removed, a thread woken, or one link of a destroyed object
 /// undone (The derivation tree, provisional).
 pub const REMOVAL_STEP: usize = 32;
-/// Slots of dying capability spaces, or identifiers of a destroyed `iommu`,
-/// examined by one call of a removal before it returns `Again` (The
-/// derivation tree, provisional).
+/// Slots of dying capability spaces examined by one call of a removal
+/// before it returns `Again` (The derivation tree, provisional).
 pub const REMOVAL_SLOTS: usize = 128;
 
 /// Greatest depth of the derivation tree.

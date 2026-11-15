@@ -115,9 +115,6 @@ pub(crate) fn io_levels(geometry: Geometry, width: u32) -> u32 {
     (width - page).div_ceil(geometry.entries.trailing_zeros())
 }
 
-/// IOMMU: the identifiers of the devices of one unit, 16 bits on x86-64.
-pub(crate) const DEVICE_IDS: u32 = 1 << 16;
-
 impl Model {
     /// The levels of the tables of a space: *L* for an `aspace`; for an
     /// `iospace`, as many as its address width needs (x86-64: four with 48
@@ -344,16 +341,18 @@ impl Model {
             return Err(Error::Busy);
         }
         live(&mut self.iospaces, iospace).push((iommu, device));
-        live(&mut self.iommus, iommu)
-            .attached
-            .insert(device, iospace);
+        let unit = live(&mut self.iommus, iommu);
+        unit.attached.insert(device, iospace);
+        unit.order.push(device);
         Ok(Output::Done)
     }
 
     /// IOMMU: the context entry of a device is cleared, and the device
     /// leaves the header of its iospace.
     pub(crate) fn detach(&mut self, iommu: ObjId, device: u16) {
-        let iospace = live(&mut self.iommus, iommu).attached.remove(&device);
+        let unit = live(&mut self.iommus, iommu);
+        unit.order.retain(|&other| other != device);
+        let iospace = unit.attached.remove(&device);
         let iospace = iospace.expect("the device is attached");
         live(&mut self.iospaces, iospace).retain(|&found| found != (iommu, device));
     }

@@ -94,9 +94,25 @@ impl K {
         self.m.runnable().contains(&thread)
     }
 
+    /// The register block that `thread_read_regs` returns, without the
+    /// fault record that follows it.
     fn regs(&mut self, slot: u32) -> Vec<u64> {
+        let mut block = self.read(slot);
+        block.truncate(REGS_WORDS);
+        block
+    }
+
+    /// The fault record that follows the block: the kind, then five words.
+    fn record(&mut self, slot: u32) -> Vec<u64> {
+        self.read(slot)[REGS_WORDS..].to_vec()
+    }
+
+    fn read(&mut self, slot: u32) -> Vec<u64> {
         match self.go(Syscall::ThreadReadRegs(s(slot))) {
-            Ok(Output::Regs(block)) => block,
+            Ok(Output::Regs(block)) => {
+                assert_eq!(block.len(), REGS_WORDS + 6);
+                block
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -523,4 +539,50 @@ fn thread_write_regs_needs_write_and_forces_the_fixed_bits_of_the_flags() {
         block,
     });
     assert_eq!(k.regs(40)[REG_RFLAGS], 0x0024_0FD7);
+}
+
+// The settled problems of pass 11: the recorded fault of a thread.
+
+#[test]
+fn fault_without_a_handler_is_recorded_and_read_after_the_block() {
+    let mut k = K::new();
+    let thread = k.running(40, 0);
+    k.fault(thread, FaultKind::Page);
+    assert!(!k.can_run(thread));
+    let block = k.regs(40);
+    let record = vec![
+        1,
+        block[REG_RIP],
+        block[REG_RSP],
+        14,
+        ACCESS_WRITE,
+        0xdead_0000,
+    ];
+    assert_eq!(k.record(40), record);
+    // Resuming the suspended thread clears the record.
+    k.ok(Syscall::ThreadResume(s(40)));
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    assert_eq!(k.record(40), vec![0; 6]);
+}
+
+#[test]
+fn delivered_fault_is_not_recorded() {
+    let mut k = K::new();
+    let thread = k.running(40, EP);
+    k.fault(thread, FaultKind::Arithmetic);
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    assert_eq!(k.record(40), vec![0; 6]);
+}
+
+#[test]
+fn resuming_a_thread_that_runs_keeps_nothing_to_clear() {
+    let mut k = K::new();
+    let thread = k.running(40, 0);
+    k.fault(thread, FaultKind::Debug);
+    // Resumed, the thread runs; suspended again, its record is gone.
+    k.ok(Syscall::ThreadResume(s(40)));
+    assert!(k.can_run(thread));
+    k.ok(Syscall::ThreadResume(s(40)));
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    assert_eq!(k.record(40)[0], 0);
 }

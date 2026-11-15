@@ -433,6 +433,9 @@ struct Untyped {
     /// Rules of `untyped_retype`: the memory from the watermark to the
     /// clean mark is known to be zero. Device memory has none: it stays 0.
     clean: u64,
+    /// The ranges, as offsets, that the clearing steps cleared and no
+    /// object took since: what the clean mark claims to be zero is in them.
+    zero: Vec<(u64, u64)>,
     /// Objects, segments of capability spaces and tables of address spaces
     /// taken from it and not yet destroyed.
     live: u32,
@@ -505,8 +508,9 @@ struct Iommu {
     unit: usize,
     /// The devices attached through it, and the iospace of each.
     attached: BTreeMap<u16, ObjId>,
-    /// Once it is destroyed: the next identifier its sweep examines.
-    sweep: Option<u32>,
+    /// The same devices, most recently attached last: the list that the
+    /// device entries of the iospaces' headers link.
+    order: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -534,6 +538,9 @@ struct Thread {
     /// Faults: the thread waits on a fault, as a caller of its fault
     /// endpoint; the words of the fault are kept with its message.
     faulting: bool,
+    /// Faults: a fault that was not delivered, recorded in the thread: its
+    /// kind and its five words, until the thread is resumed.
+    recorded: Option<(u32, [u64; 5])>,
     /// Scheduling contexts: its own context, if it is that context's home.
     home: Option<ObjId>,
     /// The budget follows the call: marked as having lost its context.
@@ -711,6 +718,51 @@ struct Armed {
     entered: u64,
 }
 
+/// Bookkeeping of the current or last event: what the invariants read to
+/// judge an event. Two states that differ only in it are the same state,
+/// so it is equal to any other.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Ephemeral<T>(pub(crate) T);
+
+impl<T> PartialEq for Ephemeral<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl<T> std::ops::Deref for Ephemeral<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Ephemeral<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+/// What an event did (Order inside an event, Faults, Exhaustion and
+/// replenishment), kept until the next event so that the invariants can
+/// judge it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct EventLog {
+    /// The order of entry of the first context of the event.
+    entered_from: u64,
+    /// The change list, in its order, over the rounds of the choice.
+    changes: Vec<ObjId>,
+    /// The parameters in force of each context at the start of the event,
+    /// and the contexts whose parameters were set by a replenishment, a
+    /// reset of the wake-up rule or a configuration.
+    params: BTreeMap<ObjId, (u64, u64)>,
+    resets: Vec<ObjId>,
+    /// The faults raised, by thread and kind, and for each fault *no
+    /// context* that reached a receiver, whether it had an own context.
+    raised: Vec<(ObjId, u32)>,
+    no_context_delivered: Vec<bool>,
+}
+
 /// The whole state of the kernel of one core.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
@@ -760,6 +812,17 @@ pub struct Model {
     admitted: u64,
     /// What runs next: the order of entry into the queues.
     entered: u64,
+    /// Order inside an event: what each context was at the start of the
+    /// event (eligible, remaining, throttled, queue and key), the change
+    /// list of the node, and its no-context list.
+    snapshot: Ephemeral<BTreeMap<ObjId, sched::Snap>>,
+    change_list: Ephemeral<Vec<ObjId>>,
+    no_context_list: Ephemeral<Vec<ObjId>>,
+    /// Bounds: the contexts the last event put in a new queue position,
+    /// and what that event was.
+    last_event: Ephemeral<Option<(sched::EventKind, usize)>>,
+    /// What the last event did, for the invariants that judge an event.
+    event: Ephemeral<EventLog>,
     /// Interrupts: the claimed entries of the interrupt table.
     irqs: BTreeMap<ObjId, Irq>,
     tasks: BTreeMap<ObjId, Task>,
@@ -910,6 +973,12 @@ impl Model {
     /// next is made last.
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
+        let kind = match call {
+            Syscall::CapDelete(_) | Syscall::CapRevoke(_) => sched::EventKind::Removal,
+            Syscall::TaskRevoke(_) => sched::EventKind::TaskRevoke,
+            _ => sched::EventKind::Call,
+        };
+        *self.last_event = Some((kind, 0));
         let entry = self.begin();
         let outcome = self.made(thread, call);
         self.end(entry);
@@ -1137,10 +1206,8 @@ impl Model {
     /// derivation tree: a thread whose capability space is destroyed is
     /// bound to none (D-110).
     ///
-    /// CONTRACT-GAP (Tasks and marks): a thread of a revoked task gets
-    /// `gone` "as for a thread whose capability space is dying", which may
-    /// still `cap_delete` its own slots; the Order of checks says every
-    /// call. The Order of checks is followed.
+    /// A thread of a revoked task cannot even delete its own slots (Tasks
+    /// and marks, Order of checks).
     fn bound_space(&self, thread: ObjId) -> Result<ObjId, Error> {
         let bound = &self.threads[&thread];
         if bound.task.is_some_and(|task| self.tasks[&task].revoked) {
@@ -1299,5 +1366,6 @@ impl Model {
             return self.answered(thread, outcome);
         }
         woken.outcome = Some(outcome);
+        self.observe();
     }
 }

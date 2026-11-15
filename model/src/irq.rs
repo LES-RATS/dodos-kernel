@@ -129,8 +129,14 @@ impl Model {
     /// one, a pending arrival is signalled again, otherwise it is armed.
     pub(crate) fn irq_ack(&mut self, thread: ObjId, irq: SlotAddr) -> Outcome {
         let irq = self.object(thread, irq, ObjectKind::Irq, Rights::WRITE)?;
+        // Nothing is delivered to a dying notify: `irq_ack` on an irq whose
+        // notify is dying is `busy`, as on an idle irq.
+        let dying = self.irqs[&irq]
+            .notify
+            .is_some_and(|(notify, _)| self.dying(notify));
         let entry = live(&mut self.irqs, irq);
         match entry.state {
+            _ if dying => return Err(Error::Busy),
             IrqState::Idle => return Err(Error::Busy),
             IrqState::Armed => {}
             IrqState::Fired if entry.pending => {
@@ -145,16 +151,23 @@ impl Model {
 
     /// An arrival: the vector of a claimed entry arrives on its core. An
     /// armed irq becomes fired and signals its notify, as `signal` with the
-    /// recorded bits, whether the notify is dying or not; otherwise an edge
-    /// source sets pending. A vector claimed by no entry is ignored. The
-    /// masking of a level source and the end of interrupt are the
-    /// hardware's; an arrival is an event of the kernel.
+    /// recorded bits; otherwise an edge source sets pending. An arrival on
+    /// an irq whose notify is dying is handled as on an idle irq, and the
+    /// state of the irq does not change. A vector claimed by no entry is
+    /// ignored. The masking of a level source and the end of interrupt are
+    /// the hardware's; an arrival is an event of the kernel.
     pub fn interrupt(&mut self, vector: u8) {
+        *self.last_event = None;
         let entry = self.begin();
         let found = self.irqs.iter().find(|(_, irq)| irq.vector == vector);
         if let Some((&id, _)) = found {
+            let dying = self.irqs[&id]
+                .notify
+                .is_some_and(|(notify, _)| self.dying(notify));
             let irq = live(&mut self.irqs, id);
             match (irq.state, irq.notify) {
+                _ if dying && irq.source.level() => {}
+                _ if dying => irq.pending = true,
                 (IrqState::Armed, Some((notify, bits))) => {
                     irq.state = IrqState::Fired;
                     self.signal_bits(notify, bits);

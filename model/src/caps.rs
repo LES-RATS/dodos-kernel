@@ -1,6 +1,5 @@
 //! Capabilities and objects: the derivation tree, removal, object creation.
 
-use crate::memory::DEVICE_IDS;
 use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
     Place, Record, ReplyState, Sched, Slot, Sweep, Task, Thread, Untyped, live,
@@ -70,8 +69,6 @@ enum Undone {
     Unit,
     /// Nothing is left to undo.
     Nothing,
-    /// The identifiers that the call may still examine ran out.
-    OutOfBudget,
 }
 
 /// What `cap_delete` and `cap_revoke` remove.
@@ -310,6 +307,9 @@ impl Model {
         if let Some(child) = self.untypeds.get_mut(&id) {
             child.clean = start.clean.saturating_sub(start.at).min(bytes);
             child.base = base;
+            if child.clean > 0 {
+                child.zero.push((0, child.clean));
+            }
         }
         // The gate over page tables, G2: the root table of a space is a
         // table page.
@@ -396,11 +396,8 @@ impl Model {
     /// call clears from the clean mark, at most 64 KB, and returns `again`
     /// while the end is not reached. Device memory is never cleared.
     ///
-    /// CONTRACT-GAP (rules of `untyped_retype`): "clears from the clean
-    /// mark, at most 64 KB" does not say whether the step that reaches the
-    /// end clears exactly to the end or a whole 64 KB; the clean mark after
-    /// the creation depends on it. Here a step clears up to the end of the
-    /// new object, and never past it.
+    /// A step stops at the end of the new object if it comes first, and
+    /// clears the padding before it with it.
     pub(crate) fn take(
         &mut self,
         untyped: ObjId,
@@ -417,16 +414,24 @@ impl Model {
         };
         let clean = untyped.clean;
         if !untyped.device && clearing != Clearing::None && untyped.clean < end {
+            // A step clears from the clean mark, padding included, at most
+            // 64 KB, and stops at the end of the new object.
             let reached = match clearing {
                 Clearing::InSteps => (untyped.clean + CLEAR_STEP_BYTES).min(end),
                 _ => end,
             };
+            untyped.zero.push((untyped.clean, reached));
             untyped.clean = reached;
             if reached < end {
                 return Err(Error::Again);
             }
         }
         untyped.watermark = end;
+        // What lies below the watermark is taken: no longer known zero.
+        untyped.zero.retain(|&(_, e)| e > end);
+        for range in &mut untyped.zero {
+            range.0 = range.0.max(end);
+        }
         // When the watermark moves past the clean mark, the clean mark moves
         // with it.
         if !untyped.device {
@@ -444,6 +449,7 @@ impl Model {
         untyped.live -= 1;
         if untyped.live == 0 {
             (untyped.watermark, untyped.clean) = (0, 0);
+            untyped.zero.clear();
         }
     }
 
@@ -468,6 +474,7 @@ impl Model {
                 let untyped = Untyped {
                     base: 0,
                     block: None,
+                    zero: Vec::new(),
                     bytes: size,
                     device: from
                         .and_then(|from| self.untypeds.get(&from))
@@ -524,9 +531,10 @@ impl Model {
             // Scheduling contexts: a new one is not configured, has no
             // home, class 2, and the cores set of the kernel that holds it.
             ObjectKind::Sched => {
+                let node = u64::from(self.node);
                 let sched = Sched {
                     class: 2,
-                    cores: (0, 1),
+                    cores: (node / 64, 1 << (node % 64)),
                     ..Sched::default()
                 };
                 self.scheds.insert(id, sched);
@@ -649,9 +657,8 @@ impl Model {
             // are woken, and for a `cspace` after its sweep, each link to the
             // object is undone before the root capability is removed.
             if let Some(object) = self.rooted(next) {
-                match self.undo(object, &mut slots) {
+                match self.undo(object) {
                     Undone::Unit => continue,
-                    Undone::OutOfBudget => return Err(Error::Again),
                     Undone::Nothing => {}
                 }
             }
@@ -784,7 +791,7 @@ impl Model {
     /// What else destruction undoes (D-110): undoes one link to an object
     /// whose root capability is the next to remove, most recently made
     /// first, and says whether there was one.
-    fn undo(&mut self, object: ObjId, slots: &mut usize) -> Undone {
+    fn undo(&mut self, object: ObjId) -> Undone {
         let last = |list: &Vec<ObjId>| list.last().copied();
         let kind = self.objects[&object].kind;
         match kind {
@@ -827,26 +834,13 @@ impl Model {
                     (None, None) => return Undone::Nothing,
                 }
             }
-            // Destroying an `iommu` object detaches the devices attached
-            // through it, in increasing order of identifier, examining at
-            // most 128 identifiers per step (the budgets of a sweep). An
-            // identifier counts as examined when the sweep moves past it.
-            ObjectKind::Iommu => loop {
-                let unit = live(&mut self.iommus, object);
-                let next = unit.sweep.get_or_insert(0);
-                if *next == DEVICE_IDS {
-                    return Undone::Nothing;
-                }
-                let Some(left) = slots.checked_sub(1) else {
-                    return Undone::OutOfBudget;
-                };
-                *slots = left;
-                let device = *next as u16;
-                *next += 1;
-                if unit.attached.contains_key(&device) {
-                    self.detach(object, device);
-                    break;
-                }
+            // IOMMU: an `iommu` keeps the list of the devices attached
+            // through it; destroying it detaches them in the order of that
+            // list, most recently attached first, one unit each. With no
+            // device attached it is destroyed in one step.
+            ObjectKind::Iommu => match self.iommus[&object].order.last() {
+                Some(&device) => self.detach(object, device),
+                None => return Undone::Nothing,
             },
             _ => return Undone::Nothing,
         }

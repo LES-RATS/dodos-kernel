@@ -67,7 +67,7 @@ pub(crate) struct Table {
     pub(crate) members: Vec<Member>,
     pub(crate) roles: Vec<RoleWord>,
     /// The writes of the current event.
-    pub(crate) writes: Vec<WordWrite>,
+    pub(crate) writes: crate::Ephemeral<Vec<WordWrite>>,
 }
 
 impl Table {

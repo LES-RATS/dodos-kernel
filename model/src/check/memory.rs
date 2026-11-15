@@ -26,7 +26,8 @@ impl Model {
     /// 39. a device attached through an `iommu` is in the list of the
     ///     iospace it names, and that list holds only such devices, at most
     ///     16, all of one unit and none the kernel uses; a unit gives no more
-    ///     domain numbers than it has.
+    ///     domain numbers than it has, and lists once each the devices
+    ///     attached through it.
     pub(super) fn check_spaces(&self) -> Check {
         let mut named: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (&id, cap) in &self.caps {
@@ -149,6 +150,10 @@ impl Model {
                     .is_some_and(|devices| devices.contains(&(id, device)))
             };
             ensure(unit.attached.iter().all(listed), "39: device of a unit")?;
+            let mut order = unit.order.clone();
+            order.sort();
+            let keys: Vec<u16> = unit.attached.keys().copied().collect();
+            ensure(order == keys, "39: list of the devices of a unit")?;
             let domains: BTreeSet<_> = unit.attached.values().collect();
             let limit = self.machine.iommus.get(unit.unit).map_or(0, |u| u.domains);
             ensure(

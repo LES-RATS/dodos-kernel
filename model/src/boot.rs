@@ -663,7 +663,7 @@ impl Machine {
             devices: layout.devices.clone(),
             members: vec![live; n],
             roles,
-            writes: Vec::new(),
+            writes: Default::default(),
         }
     }
 }

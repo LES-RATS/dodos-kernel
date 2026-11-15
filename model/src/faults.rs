@@ -23,6 +23,7 @@ impl Model {
             (kind as u32) <= FaultKind::BadCall as u32,
             "{kind:?} is the kernel's"
         );
+        *self.last_event = None;
         let entry = self.begin();
         live(&mut self.threads, thread).outcome = None;
         self.raise(thread, kind, exception);
@@ -34,24 +35,36 @@ impl Model {
     /// when its capability space is dying. Without a fault endpoint, or with
     /// a dying one, the thread is suspended at once and the fault dropped.
     pub(crate) fn raise(&mut self, thread: ObjId, kind: FaultKind, exception: [u64; 3]) {
+        self.event.raised.push((thread, kind as u32));
         let faulting = &self.threads[&thread];
-        let endpoint = faulting
-            .fault
-            .filter(|&(endpoint, _)| !self.dying(endpoint));
-        let Some((endpoint, badge)) = endpoint else {
-            live(&mut self.threads, thread).suspended = true;
-            return;
-        };
         // Words: where the thread resumes after an answer with label 0, the
         // stack pointer, then the words of the exception.
         let [number, access, address] = exception;
-        let words = vec![
+        let words = [
             faulting.regs[REG_RIP],
             faulting.regs[REG_RSP],
             number,
             access,
             address,
         ];
+        let endpoint = faulting
+            .fault
+            .filter(|&(endpoint, _)| !self.dying(endpoint));
+        let Some((endpoint, badge)) = endpoint else {
+            self.record(thread, kind as u32, words);
+            return;
+        };
+        // A fault *no context* goes one level only: if the first thread
+        // that waits to receive has no own context, it is not delivered and
+        // the waiting receiver is not disturbed.
+        let passive = self
+            .receiver(endpoint)
+            .is_some_and(|(server, ..)| self.threads[&server].home.is_none());
+        if kind == FaultKind::NoContext && passive {
+            self.record(thread, kind as u32, words);
+            return;
+        }
+        let words = words.to_vec();
         let parcel = Parcel {
             label: kind as u32,
             words,
@@ -70,6 +83,14 @@ impl Model {
         self.enter(thread, endpoint, parcel, window);
     }
 
+    /// Faults: a fault that is not delivered is recorded in the thread,
+    /// which becomes suspended; its registers are unchanged.
+    pub(crate) fn record(&mut self, thread: ObjId, kind: u32, words: [u64; 5]) {
+        let recorded = live(&mut self.threads, thread);
+        (recorded.suspended, recorded.recorded) = (true, Some((kind, words)));
+        self.observe();
+    }
+
     /// Faults, the answer: with label 0 the thread resumes where its fault
     /// left it; with label 1 and at least 2 words, at the instruction and
     /// stack pointers of words 0 and 1 (a non-canonical address counts as
@@ -81,6 +102,7 @@ impl Model {
         let resumed = live(&mut self.threads, thread);
         let Ok(Output::Message(answer)) = outcome else {
             resumed.suspended = true;
+            self.observe();
             return;
         };
         let header = answer.received.header;
@@ -97,6 +119,7 @@ impl Model {
             }
             _ => resumed.suspended = true,
         }
+        self.observe();
     }
 
     /// Register calls: `read` on the thread; the caller's message page,
@@ -110,7 +133,13 @@ impl Model {
         if !read.suspended {
             return Err(Error::Busy);
         }
-        Ok(Output::Regs(read.regs.clone()))
+        // The register block, then the fault record: its kind in the low
+        // 32 bits of a word (0 if none), and its five words.
+        let (kind, words) = read.recorded.unwrap_or((0, [0; 5]));
+        let mut block = read.regs.clone();
+        block.push(u64::from(kind));
+        block.extend(words);
+        Ok(Output::Regs(block))
     }
 
     /// Register calls: `write` on the thread; the caller's message page;

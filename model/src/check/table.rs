@@ -56,7 +56,7 @@ impl Model {
             }
             _ => false,
         };
-        for write in &table.writes {
+        for write in table.writes.iter() {
             let before = read(write.before);
             let after = read(write.after);
             let ensure_write = |holds: bool| ensure(holds, "52: write of an ownership word");

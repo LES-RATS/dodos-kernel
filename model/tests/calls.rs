@@ -5521,3 +5521,31 @@ fn child_untyped_of_dirty_memory_is_made_in_one_call() {
     k.no(pages(32, kb(128), 33), Error::Again);
     k.ok(pages(32, kb(128), 33));
 }
+
+// The settled problems of pass 11: the clean mark.
+
+#[test]
+fn step_that_reaches_the_end_stops_there() {
+    let mut k = K::new();
+    let kb = kb_pages(&k);
+    dirty(&mut k, 30);
+    // 96 KB: two steps, the second stops at 96 KB.
+    k.no(pages(30, kb(96), 32), Error::Again);
+    k.ok(pages(30, kb(96), 32));
+    // The next 96 KB start from there: two steps again. Had the step
+    // cleared a whole 64 KB, to 128 KB, one would have been enough.
+    k.no(pages(30, kb(96), 33), Error::Again);
+    k.ok(pages(30, kb(96), 33));
+}
+
+#[test]
+fn padding_is_cleared_with_the_object() {
+    let mut k = K::new();
+    let kb = kb_pages(&k);
+    dirty(&mut k, 30);
+    // An endpoint at 0, then a frame of 64 KB aligned on a page: the
+    // padding before it and the frame are more than 64 KB, so two steps.
+    k.ok(retype(s(30), Endpoint, 0, s(31)));
+    k.no(pages(30, kb(64), 32), Error::Again);
+    k.ok(pages(30, kb(64), 32));
+}

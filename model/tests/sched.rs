@@ -858,3 +858,130 @@ fn timer_whose_notify_is_dying_is_disarmed_without_a_signal() {
     k.ok(Syscall::CapDelete(s(NT)));
     k.ok_armed(Syscall::TimerCancel(s(41)), 0);
 }
+
+// The settled problems of pass 11: faults *no context*, and the order of an
+// event.
+
+/// A passive thread in `slot`: bound to the start-up spaces with a message
+/// page and the fault endpoint `fault`, resumed, with no context.
+fn passive(k: &mut K, slot: u32, fault: u32) -> ObjId {
+    k.make(Thread, slot);
+    k.make(Frame, slot + 1);
+    k.ok(Syscall::ThreadConfigure {
+        thread: s(slot),
+        cspace: s(START_SLOT_CSPACE),
+        aspace: s(START_SLOT_ASPACE),
+        fault: s(fault),
+        page: s(slot + 1),
+    });
+    k.ok(Syscall::ThreadResume(s(slot)));
+    k.m.object_at(k.t, s(slot)).unwrap()
+}
+
+/// The fault record that `thread_read_regs` returns after the block.
+fn recorded(k: &mut K, slot: u32) -> Vec<u64> {
+    match k.go(Syscall::ThreadReadRegs(s(slot))) {
+        Ok(Output::Regs(block)) => block[x86_64::REGS_WORDS..].to_vec(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn fault_no_context_is_not_delivered_to_a_passive_receiver() {
+    let mut k = K::lowered(5 * MS);
+    let handler = passive(&mut k, 50, EP);
+    assert_eq!(k.on(handler, recv(EP, RP)), Ok(Output::Waits));
+    k.context(40, MS, 10 * MS, 1);
+    let victim = k.thread(60, 40);
+    // The context of the victim dies: it raises the fault, which the first
+    // receiver, without an own context, does not get.
+    k.ok(Syscall::CapDelete(s(40)));
+    assert!(!k.can_run(victim));
+    assert_eq!(k.m.woken(handler), None);
+    assert_eq!(k.m.census().receivers, 1);
+    assert_eq!(recorded(&mut k, 60)[0], FaultKind::NoContext as u64);
+    // No second fault: the handler did not lose anything.
+    assert_eq!(k.m.census().faulting, 0);
+}
+
+#[test]
+fn passive_receiver_that_finds_a_fault_no_context_gets_again() {
+    let mut k = K::lowered(5 * MS);
+    k.context(40, MS, 10 * MS, 1);
+    let victim = k.thread(60, 40);
+    k.ok(Syscall::CapDelete(s(40)));
+    // Nobody waited: the fault is queued, as any call.
+    assert_eq!(k.m.census().fault_kinds[8], 1);
+    let handler = passive(&mut k, 50, EP);
+    assert_eq!(k.on(handler, recv(EP, RP)), Err(Error::Again));
+    // The faulting thread left the queue, suspended with its fault
+    // recorded; the reply object stayed idle.
+    assert_eq!(k.m.census().fault_kinds[8], 0);
+    assert!(!k.can_run(victim));
+    assert_eq!(recorded(&mut k, 60)[0], FaultKind::NoContext as u64);
+    assert_eq!(k.on(handler, recv(EP, RP)), Ok(Output::Waits));
+}
+
+#[test]
+fn faults_no_context_are_raised_in_the_order_of_the_no_context_list() {
+    let mut k = K::lowered(5 * MS);
+    // Two passive servers, A then B, whose fault endpoint capabilities
+    // carry the badges 0xA and 0xB.
+    for (slot, badge) in [(74, 0xA), (75, 0xB)] {
+        k.ok(Syscall::CapDerive {
+            source: s(EP),
+            destination: s(slot),
+            rights: Rights::SEND.bits(),
+            badge,
+        });
+    }
+    for slot in [70, 71] {
+        k.make(Endpoint, slot);
+    }
+    for slot in [72, 73, 76] {
+        k.make(Reply, slot);
+    }
+    let a = passive(&mut k, 50, 74);
+    let b = passive(&mut k, 52, 75);
+    assert_eq!(k.on(a, recv(70, 72)), Ok(Output::Waits));
+    assert_eq!(k.on(b, recv(71, 73)), Ok(Output::Waits));
+    // A client lends its context to A, which answers and keeps the lend,
+    // then to B, on top.
+    k.context(40, MS, 10 * MS, 1);
+    let client = k.thread(45, 40);
+    assert_eq!(k.on(client, call(70)), Ok(Output::Waits));
+    k.on(a, answer(72)).unwrap();
+    assert_eq!(k.on(client, call(71)), Ok(Output::Waits));
+    // The context dies: its lends are cleared from the top, B then A, and
+    // each is marked while it runs: B's fault comes first.
+    k.ok(Syscall::CapDelete(s(40)));
+    let badges: Vec<u64> = [RP, 76]
+        .into_iter()
+        .map(|reply| match k.go(recv(EP, reply)) {
+            Ok(Output::Message(delivery)) => delivery.received.badge,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(badges, [0xB, 0xA]);
+}
+
+#[test]
+fn contexts_enter_their_queues_in_the_order_of_the_change_list() {
+    let mut k = K::lowered(5 * MS);
+    k.make(Endpoint, 70);
+    k.make(Reply, 72);
+    k.make(Reply, 73);
+    // Two contexts made in order, with the same deadline.
+    k.make(Sched, 40);
+    k.make(Sched, 41);
+    k.ok(configure(40, 100 * US, MS, 1));
+    k.ok(configure(41, 100 * US, MS, 1));
+    let first = k.thread(50, 40);
+    let second = k.thread(52, 41);
+    // The second waits first; destroying the endpoint wakes it first, and
+    // its context enters the ready queue first.
+    assert_eq!(k.on(second, recv(70, 72)), Ok(Output::Waits));
+    assert_eq!(k.on(first, recv(70, 73)), Ok(Output::Waits));
+    k.ok(Syscall::CapDelete(s(70)));
+    assert_eq!(k.m.running(), Some(second));
+}

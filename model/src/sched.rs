@@ -33,6 +33,27 @@ impl Sched {
     }
 }
 
+/// What a context is at the start of an event, for the change list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Snap {
+    eligible: bool,
+    remaining: i64,
+    throttled: Option<(u64, u64)>,
+    wanted: Option<(Queue, u64)>,
+}
+
+/// Bounds: what an event was, for the number of contexts it may put in a
+/// new queue position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum EventKind {
+    /// A step of a removal: at most 96.
+    Removal,
+    /// A step of `task_revoke`: at most 32.
+    TaskRevoke,
+    /// Any other call: at most 4.
+    Call,
+}
+
 /// The arguments of `sched_configure` after the capabilities.
 pub(crate) struct Parameters {
     pub(crate) budget: u64,
@@ -60,6 +81,7 @@ impl Model {
         assert!(to >= self.now && to < TIME_LIMIT, "the clock is monotonic");
         while let Some(instant) = self.hardware().filter(|&instant| instant <= to) {
             self.now = instant.max(self.now);
+            *self.last_event = None;
             let entry = self.begin();
             self.due();
             self.end(entry);
@@ -73,6 +95,18 @@ impl Model {
     /// is taken as zero. Returns the context running at the entry.
     pub(crate) fn begin(&mut self) -> Option<(ObjId, bool)> {
         self.table.writes.clear();
+        self.change_list.clear();
+        self.no_context_list.clear();
+        *self.snapshot = self.scheds.keys().map(|&id| (id, self.snap(id))).collect();
+        let params = self
+            .scheds
+            .iter()
+            .map(|(&id, s)| (id, (s.budget, s.period)));
+        *self.event = crate::EventLog {
+            entered_from: self.entered,
+            params: params.collect(),
+            ..crate::EventLog::default()
+        };
         let elapsed = self.now - self.previous;
         self.previous = self.now;
         let (context, ready) = self.running?;
@@ -81,7 +115,44 @@ impl Model {
         if ready {
             running.remaining = running.remaining.saturating_sub_unsigned(elapsed);
         }
+        self.observe();
         Some((context, ready))
+    }
+
+    /// What a context is, for the change list.
+    fn snap(&self, context: ObjId) -> Snap {
+        let sched = &self.scheds[&context];
+        Snap {
+            eligible: self.eligible(context),
+            remaining: sched.remaining,
+            throttled: sched.throttled,
+            wanted: self.wanted(context),
+        }
+    }
+
+    /// Order inside an event: a context is appended to the change list the
+    /// first time in the event that its eligibility, its budget or its key
+    /// changes; a thread to the no-context list when it is marked while
+    /// runnable or becomes runnable while marked. Called after each change
+    /// of the state of a thread or a context.
+    pub(crate) fn observe(&mut self) {
+        let changed: Vec<ObjId> = self
+            .scheds
+            .keys()
+            .copied()
+            .filter(|id| !self.change_list.contains(id))
+            .filter(|&id| self.snapshot.get(&id) != Some(&self.snap(id)))
+            .collect();
+        self.change_list.extend(changed);
+        let marked: Vec<ObjId> = self
+            .threads
+            .iter()
+            .filter(|(id, t)| {
+                t.lost && Self::runnable_thread(t) && !self.no_context_list.contains(id)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        self.no_context_list.extend(marked);
     }
 
     /// Order inside an event, 4 to 7: the exhaustion of the context that
@@ -102,11 +173,13 @@ impl Model {
         // the choice is made again; so does a holder of a revoked task,
         // after it is suspended. Each round takes one thread out of what can
         // run, so the loop ends.
+        let mut entered = 0;
         for _ in 0..=self.threads.len() {
             self.no_context();
-            self.requeue();
+            entered += self.requeue();
             self.running = self.pick();
             let Some(holder) = self.running() else {
+                *self.last_event = self.last_event.map(|(kind, _)| (kind, entered));
                 return;
             };
             // Tasks and marks: a thread of a revoked task never runs again;
@@ -115,10 +188,12 @@ impl Model {
             let task = self.threads[&holder].task;
             if task.is_some_and(|task| self.tasks[&task].revoked) {
                 live(&mut self.threads, holder).suspended = true;
+                self.observe();
                 continue;
             }
             let aspace = self.threads[&holder].aspace;
             if aspace.is_some_and(|aspace| !self.dying(aspace)) {
+                *self.last_event = self.last_event.map(|(kind, _)| (kind, entered));
                 return;
             }
             self.raise(holder, FaultKind::NoAddressSpace, [0; 3]);
@@ -130,24 +205,25 @@ impl Model {
     /// thread marked as having lost its context is runnable, it raises the
     /// fault *no context*, which lends nothing.
     ///
-    /// CONTRACT-GAP (The budget follows the call): the order in which
-    /// several marked threads raise their faults in one event is not given;
-    /// here, the order of their creation. And a passive handler that
-    /// receives such a fault is itself marked and faults in turn, in the
-    /// same event: the work of one event is then bounded by the number of
-    /// threads, not by a constant.
+    /// The faults are raised in the order of the no-context list; a fault
+    /// *no context* goes one level only, so no passive handler faults in
+    /// turn and the work of one event stays constant.
     fn no_context(&mut self) {
-        loop {
-            let marked = self.threads.iter().find(|(_, thread)| {
-                thread.lost && !thread.suspended && thread.wait == crate::Wait::None
-            });
-            let Some((&thread, _)) = marked else {
-                return;
-            };
+        self.observe();
+        let mut next = 0;
+        while let Some(&thread) = self.no_context_list.get(next) {
+            next += 1;
+            // A thread that is no longer marked and runnable raises nothing.
+            let raised = self.threads.get(&thread);
+            if !raised.is_some_and(|t| t.lost && Self::runnable_thread(t)) {
+                continue;
+            }
             // The fault leaves the thread waiting or suspended; the mark
             // stays until a context is bound or lent to it.
             self.raise(thread, FaultKind::NoContext, [0; 3]);
+            self.observe();
         }
+        self.no_context_list.clear();
     }
 
     /// Scheduling contexts: a thread's context, its own or the one lent to
@@ -200,16 +276,20 @@ impl Model {
     }
 
     /// Order inside an event, 6: every context whose eligibility or budget
-    /// changed is put in its queue; one that became eligible with budget
-    /// gets the wake-up rule first. A context that changes queue, or whose
-    /// key changes, enters again, after every context with the same key.
-    ///
-    /// CONTRACT-GAP (What runs next): the order of entry of several
-    /// contexts that enter a queue in the same event is not given; here,
-    /// the order of their creation.
-    fn requeue(&mut self) {
-        let contexts: Vec<ObjId> = self.scheds.keys().copied().collect();
-        for context in contexts {
+    /// changed is put in its queue, in the order of the change list; one
+    /// that became eligible with budget gets the wake-up rule first. A
+    /// context that changes queue, or whose key changes, enters again,
+    /// after every context with the same key. Returns how many contexts
+    /// entered a new queue position.
+    fn requeue(&mut self) -> usize {
+        self.observe();
+        let mut entered = 0;
+        let mut next = 0;
+        while let Some(&context) = self.change_list.get(next) {
+            next += 1;
+            if !self.scheds.contains_key(&context) {
+                continue;
+            }
             let was = self.scheds[&context].queue.map(|q| q.queue);
             let was_eligible = matches!(was, Some(Queue::Ready | Queue::Slack(_)));
             if !was_eligible && self.eligible(context) && self.scheds[&context].throttled.is_none()
@@ -226,18 +306,27 @@ impl Model {
                     entered: self.entered,
                 });
                 self.entered += 1;
+                entered += usize::from(wanted.is_some());
             }
         }
+        // Every context out of its place was on the list: a change that no
+        // observation saw is a fault of the model.
+        let missed = self
+            .scheds
+            .keys()
+            .find(|&&id| self.scheds[&id].queue.map(|q| (q.queue, q.key)) != self.wanted(id));
+        assert!(missed.is_none(), "a change of {missed:?} was not observed");
+        self.event.changes.append(&mut self.change_list);
+        *self.snapshot = self.scheds.keys().map(|&id| (id, self.snap(id))).collect();
+        entered
     }
 
     /// The wake-up rule: a context with budget that becomes eligible keeps
     /// r and d if r × T ≤ (d − now) × B and d is after now; otherwise
     /// r = B and d = now + T.
     ///
-    /// CONTRACT-GAP (Exhaustion and replenishment): "the new B and T are
-    /// used from the next replenishment" does not say whether the wake-up
-    /// rule, which sets r and d afresh, counts as one. Here it does: the
-    /// parameters given last are taken when it resets r and d.
+    /// Pending parameters come into force at the next replenishment or at
+    /// the next reset of the wake-up rule, whichever comes first.
     fn wake_up(&mut self, context: ObjId) {
         let now = self.now;
         let sched = live(&mut self.scheds, context);
@@ -250,6 +339,7 @@ impl Model {
             }
             sched.remaining = sched.budget as i64;
             sched.deadline = now + sched.period;
+            self.event.resets.push(context);
         }
     }
 
@@ -265,17 +355,17 @@ impl Model {
         } else {
             sched.throttled = Some((instant, n));
         }
+        self.observe();
     }
 
     /// Replenishment: r += n × B, d += n × T, and if d is not after now,
     /// d = now + T.
     ///
-    /// CONTRACT-GAP (Exhaustion and replenishment): with a budget lowered
-    /// while the context was throttled, n × B may leave r ≤ 0, and no rule
-    /// says what then. Here the context is exhausted again at once, by the
-    /// same rule; its next instant is after now, so this ends.
+    /// If r is still not positive, the context is exhausted again at once,
+    /// in the same event; its next instant is after now, so this ends.
     fn replenish(&mut self, context: ObjId, n: u64) {
         let now = self.now;
+        self.event.resets.push(context);
         let sched = live(&mut self.scheds, context);
         if let Some((budget, period)) = sched.pending.take() {
             (sched.budget, sched.period) = (budget, period);
@@ -289,6 +379,7 @@ impl Model {
         if sched.remaining <= 0 {
             self.exhaust(context);
         }
+        self.observe();
     }
 
     /// The choice: the first context of the ready queue; otherwise the
@@ -392,9 +483,9 @@ impl Model {
     /// checks). One node: the boot core, node 0.
     fn own_core(&self, thread: ObjId, core: SlotAddr) -> Result<(), Error> {
         let core = self.object(thread, core, ObjectKind::Core, Rights::WRITE)?;
-        match self.cores[&core] {
-            0 => Ok(()),
-            _ => Err(Error::Invalid),
+        match self.cores[&core] == u32::from(self.node) {
+            true => Ok(()),
+            false => Err(Error::Invalid),
         }
     }
 
@@ -426,6 +517,11 @@ impl Model {
         }
         self.admitted = sum;
         let now = self.now;
+        // A configuration from or to the state not configured sets the
+        // parameters in force; on a configured context they are pending.
+        if off || !self.scheds[&context].configured {
+            self.event.resets.push(context);
+        }
         let sched = live(&mut self.scheds, context);
         if off {
             sched.configured = false;
@@ -440,6 +536,7 @@ impl Model {
             sched.pending = Some((budget, period));
         }
         sched.class = class;
+        self.observe();
         Ok(Output::Done)
     }
 
@@ -460,6 +557,7 @@ impl Model {
         live(&mut self.scheds, context).home = Some(target);
         let bound = live(&mut self.threads, target);
         (bound.home, bound.lost) = (Some(context), false);
+        self.observe();
         Ok(Output::Done)
     }
 
@@ -470,14 +568,15 @@ impl Model {
         if let Some(home) = live(&mut self.scheds, context).home.take() {
             live(&mut self.threads, home).home = None;
         }
+        self.observe();
         Ok(Output::Done)
     }
 
     /// `sched_set_cores`: the cores 64 × window + i, for each bit i of the
-    /// mask; the set must hold the core of the kernel (node 0).
+    /// mask; the set must hold the own core of the node.
     ///
-    /// CONTRACT-GAP (Scheduling contexts): the contract does not say what
-    /// numbers a core; here, its node index (its place in the core list).
+    /// A core is numbered by its place in the core list of the start-up
+    /// page (Values of the machine); the own core of node i is core i.
     pub(crate) fn sched_set_cores(
         &mut self,
         thread: ObjId,
@@ -487,7 +586,9 @@ impl Model {
     ) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
         self.own_core(thread, core)?;
-        if window >= CORE_WINDOWS || mask == 0 || window != 0 || mask & 1 == 0 {
+        let own = u64::from(self.node);
+        let holds = window == own / 64 && mask & 1 << (own % 64) != 0;
+        if window >= CORE_WINDOWS || mask == 0 || !holds {
             return Err(Error::Invalid);
         }
         live(&mut self.scheds, context).cores = (window, mask);
@@ -497,9 +598,8 @@ impl Model {
     /// `sched_read`: consumed, remaining, deadline and the state bits; a
     /// context that is not configured reads 0, 0, 0 and its state bits.
     ///
-    /// CONTRACT-GAP (Scheduling contexts): "consumed" counts since the
-    /// context was created, but a context that is not configured reads 0
-    /// for it; the call's rule is followed.
+    /// Consumed counts since the context was last configured from the
+    /// state not configured, and reads 0 while it is not configured.
     pub(crate) fn sched_read(&mut self, thread: ObjId, sched: SlotAddr) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::READ)?;
         let sched = &self.scheds[&context];
@@ -542,8 +642,15 @@ impl Model {
                 sched.remaining = 0;
                 self.exhaust(context);
             }
-            Some(_) => sched.queue = None,
+            // It enters its slack queue again: a change of its place.
+            Some(_) => {
+                sched.queue = None;
+                if !self.change_list.contains(&context) {
+                    self.change_list.push(context);
+                }
+            }
         }
+        self.observe();
         Ok(Output::Done)
     }
 
@@ -562,11 +669,13 @@ impl Model {
             .filter(|&context| !self.dying(context));
         let Some(context) = context else {
             live(&mut self.threads, receiver).lost = true;
+            self.observe();
             return;
         };
         self.lends.insert(reply, (context, receiver));
         live(&mut self.scheds, context).chain.push(reply);
         live(&mut self.threads, receiver).lost = false;
+        self.observe();
     }
 
     /// A lend is released by the receive of its receiver, without a mark,
@@ -584,6 +693,7 @@ impl Model {
         {
             receiver.lost = true;
         }
+        self.observe();
     }
 
     /// The lends of a thread that begins to receive, and of the reply
@@ -603,9 +713,8 @@ impl Model {
     /// Destroying a context, the first step: it is taken out of every queue
     /// and its bandwidth out of the sum, and its home has no context.
     ///
-    /// CONTRACT-GAP (The budget follows the call): the home is marked "when
-    /// the context of which it is the home is destroyed", but it loses the
-    /// context in the first step; here it is marked then.
+    /// The home is marked when the context of which it is the home becomes
+    /// dying, at the first step of its removal.
     pub(crate) fn sched_dying(&mut self, context: ObjId) {
         let sched = live(&mut self.scheds, context);
         (sched.queue, sched.retired) = (None, true);
@@ -614,6 +723,7 @@ impl Model {
             let thread = live(&mut self.threads, home);
             (thread.home, thread.lost) = (None, true);
         }
+        self.observe();
     }
 
     // Timers.

@@ -86,7 +86,14 @@ impl Model {
     pub(crate) fn thread_resume(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         self.bound_space(target).or(Err(Error::Busy))?;
-        live(&mut self.threads, target).suspended = false;
+        // Register calls: resuming a suspended thread clears its fault
+        // record.
+        let resumed = live(&mut self.threads, target);
+        if resumed.suspended {
+            resumed.recorded = None;
+        }
+        resumed.suspended = false;
+        self.observe();
         Ok(Output::Done)
     }
 
@@ -96,6 +103,7 @@ impl Model {
     pub(crate) fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         live(&mut self.threads, target).suspended = true;
+        self.observe();
         Ok(Output::Done)
     }
 

@@ -143,6 +143,7 @@ impl Model {
                     parcel,
                     window,
                 };
+                self.observe();
             }
         }
     }
@@ -274,6 +275,7 @@ impl Model {
         }
         live(&mut self.notifies, id).waiters.push_back(thread);
         live(&mut self.threads, thread).wait = Wait::Notify(id);
+        self.observe();
         Ok(Output::Waits)
     }
 
@@ -371,6 +373,22 @@ impl Model {
                 return Ok(Output::Message(notification(word)));
             }
         }
+        // Faults: a thread without an own context that finds a fault *no
+        // context* first in the queue does not receive it: the faulting
+        // thread leaves the queue and is suspended with its fault recorded,
+        // and the receive returns `again`, having received nothing.
+        if !own
+            && let Some(&first) = self.endpoints[&endpoint].queue.front()
+            && let Wait::Call { parcel, .. } = &self.threads[&first].wait
+            && self.threads[&first].faulting
+            && parcel.label == dodos_abi::FaultKind::NoContext as u32
+        {
+            let words: [u64; 5] = parcel.words[..].try_into().expect("five words");
+            self.unlink(first);
+            live(&mut self.threads, first).faulting = false;
+            self.record(first, dodos_abi::FaultKind::NoContext as u32, words);
+            return Err(Error::Again);
+        }
         if let Some((caller, parcel, theirs)) = self.take_caller(endpoint) {
             let delivery = self.serve(caller, parcel, theirs, (thread, reply, window));
             return Ok(Output::Message(delivery));
@@ -382,6 +400,7 @@ impl Model {
             reply,
             window,
         };
+        self.observe();
         Ok(Output::Waits)
     }
 
@@ -394,6 +413,13 @@ impl Model {
         window: Window,
         (server, reply, into): (ObjId, ObjId, Window),
     ) -> Delivery {
+        // Faults: a fault *no context* reaches only a receiver with an own
+        // context; the event log keeps what each delivery found.
+        if self.threads[&caller].faulting && parcel.label == dodos_abi::FaultKind::NoContext as u32
+        {
+            let own = self.threads[&server].home.is_some();
+            self.event.no_context_delivered.push(own);
+        }
         // Transfer of capabilities: the reply will tell the caller if its
         // capabilities were dropped.
         let (delivery, flags) = self.deliver(parcel, server, into, 0);
@@ -406,6 +432,7 @@ impl Model {
         // context to a receiver that has none of its own (D-110).
         self.lend(caller, reply, server);
         live(&mut self.threads, caller).wait = Wait::Reply(reply);
+        self.observe();
         delivery
     }
 
@@ -542,7 +569,7 @@ impl Model {
 
     /// The first thread in the queue of an endpoint, if it waits to
     /// receive: the thread, its reply object, its receive range.
-    fn receiver(&self, endpoint: ObjId) -> Option<(ObjId, ObjId, Window)> {
+    pub(crate) fn receiver(&self, endpoint: ObjId) -> Option<(ObjId, ObjId, Window)> {
         let &thread = self.endpoints[&endpoint].queue.front()?;
         match self.threads[&thread].wait {
             Wait::Recv { reply, window, .. } => Some((thread, reply, window)),
@@ -583,5 +610,6 @@ impl Model {
             }
             Wait::Notify(notify) => live(&mut self.notifies, notify).waiters.retain(other),
         }
+        self.observe();
     }
 }

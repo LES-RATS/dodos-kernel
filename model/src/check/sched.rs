@@ -182,3 +182,60 @@ impl Model {
         Ok(())
     }
 }
+
+impl Model {
+    /// The settled problems of pass 11 (8.1):
+    /// 60. the contexts that entered a queue in the last event entered in
+    ///     the order of the change list, and only those of the list;
+    /// 61. the parameters in force of a context changed in the last event
+    ///     only by a replenishment, a reset of the wake-up rule, or a
+    ///     configuration from or to the state not configured;
+    /// 62. a step of a removal put at most 96 contexts in a new queue
+    ///     position, a step of `task_revoke` at most 32, any other call at
+    ///     most 4;
+    /// 63. a thread has a recorded fault only while it is suspended;
+    /// 64. a fault *no context* reached only receivers with an own context,
+    ///     and no thread raised two faults in one event.
+    pub(super) fn check_events(&self) -> Check {
+        let event = &self.event;
+        let mut entered: Vec<(u64, ObjId)> = self
+            .scheds
+            .iter()
+            .filter_map(|(&id, sched)| sched.queue.map(|q| (q.entered, id)))
+            .filter(|&(at, _)| at >= event.entered_from)
+            .collect();
+        entered.sort();
+        let positions: Option<Vec<usize>> = entered
+            .iter()
+            .map(|(_, id)| event.changes.iter().position(|c| c == id))
+            .collect();
+        let ordered = positions.is_some_and(|p| p.is_sorted());
+        ensure(ordered, "60: order of entry and the change list")?;
+        for (id, sched) in &self.scheds {
+            let before = event.params.get(id).copied().unwrap_or((0, 0));
+            let changed = before != (sched.budget, sched.period);
+            let allowed = !changed || event.resets.contains(id) || !event.params.contains_key(id);
+            ensure(allowed, "61: parameters in force changed")?;
+        }
+        if let Some((kind, count)) = *self.last_event {
+            let bound = match kind {
+                crate::sched::EventKind::Removal => 96,
+                crate::sched::EventKind::TaskRevoke => 32,
+                crate::sched::EventKind::Call => 4,
+            };
+            ensure(count <= bound, "62: contexts put in a new queue position")?;
+        }
+        for thread in self.threads.values() {
+            ensure(
+                thread.recorded.is_none() || thread.suspended,
+                "63: recorded fault of a thread that is not suspended",
+            )?;
+        }
+        let own = event.no_context_delivered.iter().all(|&own| own);
+        ensure(own, "64: fault no context delivered to a passive receiver")?;
+        let mut raisers: Vec<ObjId> = event.raised.iter().map(|&(t, _)| t).collect();
+        raisers.sort();
+        let once = raisers.windows(2).all(|pair| pair[0] != pair[1]);
+        ensure(once, "64: a second fault in one event")
+    }
+}

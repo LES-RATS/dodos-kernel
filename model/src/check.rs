@@ -252,6 +252,9 @@ impl Model {
     ///     between the watermark and the end, and device memory has none;
     /// 19. the live count of an untyped is the number of live objects,
     ///     cspace segments and tables of address spaces taken from it;
+    /// 65. between two steps of a creation, the memory from the watermark to
+    ///     the clean mark, padding included, was cleared by the steps and
+    ///     taken by no object since;
     /// 34. a frame has 1 to *E* pages, ordinary memory is write-back and
     ///     device memory is not, and only a frame capability has a record.
     pub fn check(&self) -> Check {
@@ -266,7 +269,8 @@ impl Model {
         self.check_sched()?;
         self.check_tasks()?;
         self.check_irqs()?;
-        self.check_table()
+        self.check_table()?;
+        self.check_events()
     }
 
     fn check_tree(&self) -> Check {
@@ -650,6 +654,20 @@ impl Model {
                 false => (untyped.watermark..=untyped.bytes).contains(&untyped.clean),
             };
             ensure(clean, "18: clean mark")?;
+            // From the watermark to the clean mark, padding included, every
+            // byte was cleared and taken by no object since.
+            let mut at = untyped.watermark;
+            let mut zero = untyped.zero.clone();
+            zero.sort();
+            for (start, end) in zero {
+                if start <= at && end > at {
+                    at = end;
+                }
+            }
+            ensure(
+                untyped.device || at >= untyped.clean,
+                "65: clean mark over memory not cleared",
+            )?;
         }
         for (&id, frame) in &self.frames {
             let pages = (1..=u64::from(self.machine.geometry.entries)).contains(&frame.pages);

@@ -771,15 +771,28 @@ fn dying_iospace_is_gone_for_map_and_attach_and_its_devices_detach() {
 }
 
 #[test]
-fn destroying_the_iommu_object_sweeps_its_identifiers_128_per_call() {
+fn destroying_the_iommu_object_detaches_its_list_most_recent_first() {
     let mut k = K::new();
-    k.retype(UT, IoSpace, 0, 30);
-    for device in [0x10, 0x2000, 0xffff] {
-        k.ok(attach(30, device));
+    for slot in 30..33 {
+        k.retype(UT, IoSpace, 0, slot);
     }
-    // 65,536 identifiers at 128 per call: 512 calls.
-    assert_eq!(k.done(Syscall::CapDelete(s(IOMMU)), 600), 512);
-    // The devices left the iospace: it can be destroyed in one call with
-    // nothing to detach.
+    // 40 devices over three iospaces, 0x10 first.
+    for n in 0..40u64 {
+        k.ok(attach(30 + (n / 16) as u32, 0x10 + n));
+    }
+    // 32 detached in the first step, the most recently attached: the eight
+    // first stay, in the first iospace.
+    k.no(Syscall::CapDelete(s(IOMMU)), Error::Again);
+    assert_eq!(k.m.census().devices, 8);
+    // They are those of the first iospace: destroying it leaves none.
     k.ok(Syscall::CapDelete(s(30)));
+    assert_eq!(k.m.census().devices, 0);
+    k.ok(Syscall::CapDelete(s(IOMMU)));
+}
+
+#[test]
+fn iommu_with_no_device_attached_is_destroyed_in_one_step() {
+    let mut k = K::new();
+    k.ok(Syscall::CapDelete(s(IOMMU)));
+    assert_eq!(k.go(Syscall::CapInspect(s(IOMMU))), Err(Error::Invalid));
 }

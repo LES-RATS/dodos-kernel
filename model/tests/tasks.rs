@@ -520,3 +520,18 @@ fn revoked_thread_that_the_choice_would_take_is_suspended() {
     assert!(!k.m.runnable().contains(&early));
     assert_ne!(k.m.running(), Some(early));
 }
+
+#[test]
+fn revoked_task_is_gone_before_its_kind_and_rights_are_judged() {
+    let mut k = K::new();
+    k.make(Task, 40);
+    k.ok(Syscall::CapDerive {
+        source: s(40),
+        destination: s(41),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
+    k.no(mark(41, U), Error::Denied);
+    k.ok(Syscall::TaskRevoke(s(40)));
+    k.no(mark(41, U), Error::Gone);
+}
