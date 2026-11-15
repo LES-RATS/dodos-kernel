@@ -452,3 +452,69 @@ fn destroyed_thread_leaves_its_task() {
     k.ok(Syscall::CapDelete(s(54)));
     assert_eq!(k.read(42).3, 0);
 }
+
+#[test]
+fn added_marks_word_is_read_only_with_the_flag() {
+    let mut k = K::new();
+    let receiver = k.thread(50, 0);
+    let sender = k.thread(52, 0);
+    assert_eq!(k.on(receiver, recv()), Ok(Output::Waits));
+    assert_eq!(
+        k.on(sender, send(vec![], 0, U)),
+        Ok(Output::Sent { flags: 0 })
+    );
+    assert_eq!(stamp(&k, receiver).0, 0);
+}
+
+#[test]
+fn mark_aware_sender_of_a_capability_takes_no_marks() {
+    let mut k = K::new();
+    k.make(Task, 41);
+    k.ok(mark(41, U));
+    let receiver = k.thread(50, 41);
+    let ranged = Syscall::Recv {
+        endpoint: s(EP),
+        reply: s(RP),
+        range: Range {
+            first: s(60),
+            count: 1,
+        },
+        wait: 0,
+    };
+    assert_eq!(k.on(receiver, ranged), Ok(Output::Waits));
+    // The first thread is in the mark-aware start-up task.
+    let derived = vec![Transfer::Derive(s(EP), Rights::ALL.bits())];
+    assert_eq!(k.go(send(derived, 0, 0)), Ok(Output::Sent { flags: 0 }));
+    assert_eq!(k.marks(k.t), 0);
+}
+
+#[test]
+fn revoked_thread_that_the_choice_would_take_is_suspended() {
+    let mut k = K::new();
+    k.make(Task, 40);
+    // The first thread attached (its context in slot 3002) is given a
+    // context of 1 ms period: the nearest deadline.
+    let early = k.thread(300, 40);
+    for n in 0..32 {
+        k.thread(310 + 2 * n, 40);
+    }
+    k.make(Sched, 302);
+    k.ok(Syscall::SchedConfigure {
+        sched: s(302),
+        core: s(16),
+        budget: 10_000,
+        period: 1_000_000,
+        class: 1,
+    });
+    k.ok(Syscall::SchedUnbind(s(3002)));
+    k.ok(Syscall::SchedBind {
+        sched: s(302),
+        thread: s(300),
+    });
+    assert_eq!(k.m.running(), Some(early));
+    // The first call detaches the 32 others; the early one stays attached
+    // to the revoked task, and is suspended when the choice takes it.
+    k.no(Syscall::TaskRevoke(s(40)), Error::Again);
+    assert!(!k.m.runnable().contains(&early));
+    assert_ne!(k.m.running(), Some(early));
+}

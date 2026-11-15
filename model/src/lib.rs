@@ -6,9 +6,19 @@
 //! [`Model::apply`] applies one call made by one thread, and
 //! [`Model::check`] checks every invariant of the state.
 //!
-//! Not modelled: the contents of memory, and the hardware (translations are
-//! a map; the invalidations of the TLB and of the IOMMU are done before a
-//! call returns).
+//! The clock, faults of user code and interrupts are inputs too:
+//! [`Model::advance`], [`Model::fault`], [`Model::interrupt`]. Each call,
+//! fault or interrupt is an event that ends with the choice of what runs
+//! next, which [`Model::running`] gives; `apply` accepts any runnable
+//! thread, so a harness applies the calls of `running`.
+//!
+//! Not modelled: the contents of memory (the start-up page is sized, not
+//! written); the hardware (translations are a map; the invalidations of the
+//! TLB and of the IOMMU are done before a call returns; masking, the end of
+//! interrupt and the entropy pool are not seen); the kernel's own time,
+//! taken as zero; more than one node (the waiting-for-the-core-group state
+//! is never entered); and the groups not specified (cores, debugging,
+//! `ioports`), whose calls return `unsupported`.
 //!
 //! `CONTRACT-GAP` marks a behaviour that the contract does not fix.
 
