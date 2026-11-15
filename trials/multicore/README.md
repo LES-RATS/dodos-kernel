@@ -18,16 +18,19 @@ runs (`--csv` output) are in `data/`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--suites` | `locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf,a1t,a2t,a3t,ct` | Which workloads to run (`f`: second measurement, `t`: third, below) |
+| `--suites` | `locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf,a1t,a2t,a3t,ct,a3n,br,srv` | Which workloads to run (`f`: second measurement, `t`: third, `a3n`, `br`, `srv`: fourth, below) |
 | `--reps` | 5 | Repetitions of every cell; the tables give the median and the range |
 | `--ms` | 150 | Measured time of one run (after 20 ms of warm-up) |
 | `--max-k` | cores - 2 | Largest number of cores given to the multithreaded process |
 | `--lock` | `queue` | Lock of the group candidates: `ttas`, `ticket` or `queue` |
 | `--csv` | none | One line per run, every class, for later analysis |
 
-A full run takes about 55 minutes on 10 cores (15 for the first seven
-suites, 23 for the `f` suites, 16 for the `t` suites). Markdown goes to standard
-output, progress to standard error.
+A full run takes about 65 minutes on 10 cores (15 for the first seven
+suites, 23 for the `f` suites, 16 for the `t` suites, 10 for the fourth
+series; `srv` runs 4 times `--ms`). Markdown goes to standard output,
+progress to standard error. A measurement is two such runs (passes) one
+after the other, each with its own `--csv` file; the results compare the
+medians of the two passes cell by cell, and pool their runs.
 
 On Linux the bench pins worker `i` to the `i`-th physical core (the first
 hardware thread of each core, read from sysfs) with `sched_setaffinity`, and
@@ -133,9 +136,12 @@ functions, so Miri and the sanitizer run them.
 **Self-checks.** After every run: the sum of all node-state lines equals the
 number of line updates the workers made (a lock that let two cores in would
 lose updates), and every node of every process applied every change of that
-process. Every wait has a 10 s limit that panics. `cargo test` runs every
-workload under every candidate briefly, and tests the locks, the ring and the
-histogram.
+process; in `srv`, the endpoint ends with no caller queued and every server
+thread free (and a mutex inside the endpoint panics if its lock ever let two
+cores in). Every wait has a 10 s limit that panics. `cargo test` runs every
+workload under every candidate briefly, and tests the locks, the ring, the
+histogram, the atomic notify under a race, the endpoint's lending rule and
+the effect of the server policies.
 
 ## Switches (second measurement)
 
@@ -192,14 +198,91 @@ does not check them.
 | One per slot range of a capability space (8 ranges) | Capability changes inside one group: a change takes the locks of the two ranges it writes, in index order, and no group lock | A change writes only those two ranges: a derive (source and destination slots, and the derivation link between them) and a delete of a capability with no descendants; a delete or revoke of a subtree crosses ranges without bound and needs a lock of the whole space (or hand-over-hand locking along the tree), which is not measured; a transfer of capabilities by IPC between two spaces takes their range locks in a global order; slots are type-stable memory so a lock-free reader never follows a freed slot |
 | Lock-free read of one slot | Lookups, and the check half of a signal | The read is a seqlock on the slot's range: the writer makes the counter odd, writes, makes it even; the reader rereads if the counter was odd or moved. The rest of the call's `W` runs after the read, on state the calling thread owns |
 
-Unchanged with `Locks::Fine`: an unmap (it changes the page tables of the
-whole address space and keeps the group lock; `b` is therefore not rerun),
-and a capability change of a process spread over several groups (candidate
-2 with k larger than the group), whose protocol between groups keeps the
+Unchanged with `Locks::Fine`: an unmap keeps the group lock (the fourth
+measurement adds range locks for it as a separate switch, below), and a
+capability change of a process spread over several groups (candidate 2
+with k larger than the group), whose protocol between groups keeps the
 group lock.
 
 Latency classes since the second measurement: 0 lookups; 1 deletes (and, in
 `b`, unmaps); 2 lookups of the independent processes (`c`); 3 derives.
+
+## Switches and suites (fourth measurement)
+
+Three more switches, each measured beside the setting it replaces, and a
+new workload. The legality conditions are assumed, not checked, as above.
+
+| Switch or lock | Used by | What a real kernel must guarantee for it to be legal |
+|---|---|---|
+| `Signals::Atomic`: a notify updated by one atomic OR (`sync::Notify`) | Signals: in a group, the check half (a lock-free slot read plus `W/2`) then one fetch-or on the notify's word; the notify's lock only when its thread waits. Candidate 1: the notify's node applies the message with the same OR, without the `W/2` | The word holds 63 signal bits and a WAITING bit. Signals touch it only with atomic read-modify-writes; WAITING and the registration of the waiting thread change only under the notify's lock; the waiter sets WAITING with a fetch-or and sleeps only if that fetch-or returned no bit. Then no wake-up is lost (the argument is in `sync::Notify`; `notify_loses_no_wake_up` hammers it). The wake-up is sent after the lock is released, through the target core's mailbox and an interrupt. A wake-up may find no bit (two signals both saw WAITING); the wait loops, once per such signal. A thread waits on one notify; binding a notify to an endpoint is not measured |
+| `Unmaps::Range`: a lock per range of an address space (8 ranges) | Unmaps of a process that fits in one group: the lock of the range, `W` and the range's lines, the invalidations posted to the process's cores; acknowledged after the lock is released, as with the group lock | The unmap lies inside one range (one that spans ranges would take their locks in index order: not measured); it clears leaf entries only and frees no page-table page (those stay until the address space is destroyed); a map that adds an intermediate table installs it with a compare-and-swap on the parent entry; no core waits for acknowledgements while it holds a range lock, and a core spinning for a range lock keeps answering invalidations; the frame is freed only after every acknowledgement; the membership of the group is read without its lock, so a core that joins flushes its TLB and a core that leaves acknowledges what is pending (as in `d`). **Not covered**: revoking a memory capability whose derived mappings are in several ranges or address spaces (removing a derivation subtree): it crosses ranges and spaces without bound and needs a lock of the whole space or hand-over-hand locking, whose order against the capability range locks is not settled; it is not measured |
+| `Policy`: what the kernel does for a caller of a busy passive server | `srv` only | Below |
+
+**Interrupts per message to a group.** Until this measurement every core
+of a group that saw the doorbell while running user code paid an interrupt
+for the same message (each charged its entry before taking the doorbell).
+Now a core in an interrupt entry for its node's rings marks the node, and
+another core of the node that finds the mark leaves the batch to it; a core
+spinning in the kernel still takes messages at once, and what arrives
+during the entry is still handled in the same batch. On a node of one core
+nothing changes. Checked against the third series' binary (`a3t` and `bf`,
+k ≤ 4, 3 repetitions): candidates 1 and 3 within 3 % in every cell (median
+0.6 %); candidate 2 with groups of 2 at `ipi` 1 µs gains 3 to 16 % in `a3t`
+(median 6 %) and up to 14 % in `bf`. So the candidate-2 cells of the first
+three series where a message reaches a group of several cores (a process
+spanning groups, signals to another group) overstate its interrupt cost by
+up to that much at `ipi` 1 µs; their candidate-1 and candidate-3 cells are
+unaffected (no message reached a group of candidate 3 there).
+
+**Workload `srv`: the busy shared server.** A passive server runs on the
+budget of its caller. Server threads are on cores `0..t` (t = 1 or 2), the
+foreground client on core t, the background client on core t + 1. Layouts:
+candidate 1 (every core a node); candidate 3 with the server's threads as
+one group and each client alone (with one thread, this is the same code as
+candidate 1: a control); candidate 3 with clients and server in one group
+(`3 all`, realised as a group of 4 that covers the 3 or 4 cores). Groups use
+the endpoint lock (`Locks::Fine`).
+
+- The background client calls back to back (2 µs apart) with requests of
+  50 µs; the foreground client calls every 125 to 375 µs (uniform) with
+  requests of 5 µs. A request is a length of wall time on a server core.
+- Budgets: every client has a period of 250 µs (the two a third of a period
+  apart); background 120 µs per period, foreground 100 µs. A call carries
+  the caller's budget left (its grant), the server thread charges it the
+  wall time of each 1 µs chunk (interrupts included), and the reply hands
+  back what is left. On a spent grant the server thread stalls until the
+  grant's next period. Background requests therefore stall in the middle:
+  two fit in a period, the third runs 20 µs, waits about 130 µs, and ends in
+  the next period.
+- The endpoint (queue, free threads, what each thread serves) lives on the
+  node of server thread 0 under its lock; in candidate 1 the second server
+  thread is on another node and hears from it by message (dispatch, lend,
+  free). Kernel work: `W/2` on each side of each one-way trip, as in `a2`.
+  The endpoint hands a call to the lowest free thread, not to the core that
+  took the interrupt: with two idle threads in one group that can cost a
+  second interrupt (a weakness of the model against that layout).
+- (a) `fifo`: callers queue in order. The written rule "a service on the
+  display path has one thread per core or its own budget" is the case
+  t = 2 (the foreground always finds a free thread).
+- (b) `lend`: a queued caller of a higher class lends its grant to a thread
+  serving a lower class, which runs on it from its next chunk on (a stalled
+  thread resumes at once), and serves the lender next; no other thread
+  takes a caller whose grant is lent.
+- (c) `refuse`: a call whose grant is below the endpoint's longest request
+  (50 µs) is refused at once on the caller's core; a refused background
+  client waits for its next period.
+- Measured: foreground call latency (class 0), background calls served
+  (class 1), refused calls (class 2); with the background client (contention)
+  and without it (the common path, where (b) and (c) only add their checks).
+- Not modelled: classes beyond lending (no third load competes for a
+  server core, so a lent class only matters through the budget); budget
+  accounting of the clients' own user time; budget donation across nodes
+  in candidate 1 is assumed to need only the grant carried by the call and
+  the reply, which a contract would have to allow.
+
+Latency classes of the fourth series: `a3n` 0 signals that took no lock
+(every signal in the locked settings), 1 signals that found the thread
+waiting and took the lock; `br` 0 unmaps; `srv` as above.
 
 ## Workloads
 
@@ -215,6 +298,9 @@ Latency classes since the second measurement: 0 lookups; 1 deletes (and, in
 | `a1f`, `bf`, `cf` | As `a1`, `b`, `c` (k ≥ 2 for `a1f`), each candidate with the first and the fair settings; `a1f` also turns each switch of candidate 1 on alone | As above, plus repeated seqlock reads | Whether the conclusions survive removing the unfair points |
 | `a2f`, `a3f` | As `a2`, `a3`; candidate 1 with interrupts per batch and per message | As above | Only the interrupt switch applies to IPC and signals |
 | `a1t`, `a2t`, `a3t`, `ct` | As the `f` suites; groups with the group lock and with fine locks, candidate 1 with its first and fair settings | As above | Whether finer locks change the rows candidate 1 kept |
+| `a3n` | As `a3t`, in three regimes: as `a3t`; the waiting thread busy 20 µs after each wake-up (rarely waiting); producers 20 µs apart (nearly always waiting). Candidates 1 and 3, locked and atomic apply | Signals/s, signal latency, share of signals that took the lock | Whether an atomic notify takes the signal row from candidate 1 |
+| `br` | As `bf`: candidate 1 fair, candidate 3 with the group lock and with range locks | Unmaps/s, unmap latency | Whether finer locks change the unmap row |
+| `srv` | A passive server, a background and a foreground client; 1 or 2 server threads; with and without the background client; three policies × three layouts | Foreground latency, background calls served, refusals | What a shared server costs the display path, and what each policy costs when nobody contends |
 
 Latencies are per operation, from the caller's side, in µs: p50 / p99 /
 p99.9, the median over the repetitions, with the range of the p99.9 over the

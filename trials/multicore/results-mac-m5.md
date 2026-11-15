@@ -9,7 +9,10 @@ and cheaper copies in candidate 1, interrupts per message) follows the first
 one: [Second series](#second-series-the-unfair-points-as-switches). It changes
 several conclusions of the first; read both. **A third series** (finer locks in a group, a
 lock-free read of one slot) follows the second:
-[Third series](#third-series-finer-locks-in-a-group).
+[Third series](#third-series-finer-locks-in-a-group). **A fourth series**
+(a notify updated by one atomic OR, unmaps under range locks, a busy shared
+server under three policies) follows the third, with corrections to the
+earlier series: [Fourth series](#fourth-series-atomic-notify-range-locks-for-unmap-a-busy-shared-server).
 
 ## Conditions, and how far to trust them
 
@@ -842,6 +845,278 @@ ct all processes together, operations/s:
 | 8 1000 3 | 3.10M | 3.19M | 3.18M | 3.19M | 3.35M | 3.41M | 3.35M | 3.41M |
 | 8 1000 5 | 2.67M | 2.83M | 2.80M | 2.83M | 2.73M | 2.87M | 3.11M | 3.37M |
 | 8 1000 6 | 2.41M | 2.62M | 2.70M | 2.73M | 2.62M | 2.76M | 2.96M | 3.35M |
+
+## Fourth series: atomic notify, range locks for unmap, a busy shared server
+
+15 November 2026, 13:33 to 13:56 (a first pair of passes, 12:52 to 13:15,
+was discarded: see the corrections at the end). Three things the third
+series left unmeasured, each as a switch or a workload (README, "Switches
+and suites (fourth measurement)", which also lists what a kernel must
+guarantee for each to be legal):
+
+- `a3n`: the signal of a group is one atomic OR on the notify's word; the
+  notify's lock is taken only when its thread waits, to wake it
+  (`sync::Notify`; the no-lost-wake-up argument is in its comment, and
+  `notify_loses_no_wake_up` hammers the race; with the registration made
+  check-then-set instead of one fetch-or, the test fails in 3 runs out of 3).
+  Candidate 1 gets the same: the notify's node applies the message with that
+  OR instead of `W/2`. Three regimes: as in `a3t`; a busy receiver (20 µs of
+  its own work per wake-up: rarely waiting); an idle one (producers 20 µs
+  apart: nearly always waiting).
+- `br`: an unmap in a group under the lock of the one address-space range it
+  changes instead of the group lock.
+- `srv`: a passive server shared by a background client (50 µs requests,
+  back to back, budget 120 µs per 250 µs) and a foreground client (5 µs
+  requests every 125 to 375 µs), with 1 or 2 server threads, with and without
+  the background client, under (a) FIFO, (b) lending of the waiter's
+  context, (c) refusal of a call whose budget is below the longest request.
+
+Two full passes of 5 repetitions, pooled (10 runs per cell); `srv` runs are
+600 ms. Per cell, median throughput of pass 2 over pass 1: `a3n` p10 0.997,
+median 1.001, p90 1.007; `br` 0.994, 1.000, 1.009; `srv` (background calls)
+1.000, 1.000, 1.000. Latency p50, pass 2 over pass 1: p10 0.985 to p90 1.013
+in every suite; most cells are identical to the clock tick. Within-pass
+spread of throughput: median 1.1 % (`a3n`), 2.0 % (`br`), 0.1 % (`srv`), p90
+2.7, 4.7 and 0.5 %. **Below, a throughput difference under 2 % or a latency
+difference under one tick (0.04 µs) is called level, not a win.** Load
+average 2.5 to 6 (the bench's own threads). Rows with k = 8 ran about half
+on efficiency cores, as before; rows with k = 4 are the ones to trust.
+
+### a3n: notify by one atomic OR (k = 4, `ipi` 1 µs)
+
+Signals/s; signal latency p50 / p99.9 in µs over every signal (both passes
+gave the same p50 to the tick; the p99.9 is given for pass 1 | pass 2);
+share of signals that found the thread waiting and took the lock.
+
+| Regime | W | 1 locked apply | 1 OR apply | 3 notify lock (third series) | 3 atomic | lock taken | 3 atomic against best of 1 |
+|---|---|---|---|---|---|---|---|
+| as a3t | 50 | 2.09M; 0.08 / 0.29 \| 0.29 | 2.09M; 0.08 / 0.33 \| 0.25 | 1.95M; 0.21 / 0.58 \| 0.66 | 1.93M; 0.25 / 0.50 \| 0.46 | 67 % | −8 % |
+| as a3t | 200 | 1.94M; 0.21 / 0.37 \| 0.37 | 1.94M; 0.21 / 0.42 \| 0.37 | 1.67M; 0.42 / 1.00 \| 1.15 | 1.80M; 0.33 / 0.62 \| 0.58 | 67–70 % | −7 % |
+| as a3t | 1000 | 1.56M; 0.58 / 0.78 \| 0.74 | 1.56M; 0.58 / 0.79 \| 0.79 | 1.06M; 1.62 / 8.0 \| 7.3 | 1.47M; 0.70 / 1.00 \| 1.04 | 67–69 % | −6 % |
+| busy | 50 | 2.09M; 0.08 / 0.25 \| 0.25 | 2.09M; 0.08 / 0.33 \| 0.29 | 1.95M; 0.21 / 0.54 \| 0.54 | 2.10M; 0.08 / 0.25 \| 0.25 | 0 % | level (+0.4 %) |
+| busy | 200 | 1.94M; 0.21 / 0.33 \| 0.42 | 1.94M; 0.21 / 0.42 \| 0.42 | 1.67M; 0.42 / 1.00 \| 0.95 | 1.96M; 0.21 / 0.37 \| 0.33 | 0 % | level (+0.9 %) |
+| busy | 1000 | 1.56M; 0.58 / 0.79 \| 0.78 | 1.56M; 0.58 / 0.79 \| 0.83 | 1.17M; 1.15 / 4.7 \| 4.1 | 1.57M; 0.58 / 0.74 \| 0.74 | 0 % | level (+0.6 %) |
+| idle | 50 | 116k; 0.08 / 3.14 \| 3.20 | 116k; 0.08 / 3.20 \| 3.23 | 115k; 0.21 / 1.20 \| 1.12 | 115k; 0.21 / 1.04 \| 0.95 | 87–88 % | p50 +0.13 µs, p99.9 −2.2 µs |
+| idle | 200 | 115k; 0.21 / 3.26 \| 3.26 | 116k; 0.21 / 3.33 \| 3.39 | 114k; 0.46 / 1.25 \| 1.28 | 115k; 0.33 / 1.00 \| 1.20 | 83–87 % | p50 +0.12 µs, p99.9 −2.2 µs |
+| idle | 1000 | 114k; 0.58 / 3.65 \| 3.74 | 114k; 0.58 / 3.74 \| 3.74 | 111k; 1.20 / 7.0 \| 5.4 | 113k; 0.70 / 1.79 \| 1.54 | 82 % | p50 +0.12 µs, p99.9 −2.0 µs |
+
+`ipi` 0 gives the same picture (appendices G and H). Reading:
+
+- **As in `a3t`, candidate 1 keeps the row, by 6 to 8 % instead of 8 % to
+  1.7 times.** The atomic notify is level with the notify lock at W = 50 ns
+  and gains 8 % at 200 ns and 39 % at 1 µs (the OR replaces `W/2` under the
+  lock), but in this regime the waiting thread wakes, takes the bits and
+  waits again within about a microsecond, so two signals in three find it
+  waiting and take the slow path (the notify's lock, then the wake-up
+  through the mailbox), and the waiter's registration takes the same lock.
+  The margin is 6 to 8 times the pass-to-pass difference (under 1 %).
+- **A busy receiver: level.** No signal takes the lock (0.0 % in every
+  cell); candidate 3 is 0.4 to 0.9 % ahead of candidate 1 at k = 4 and 0.7 to
+  1.6 % at k = 8, inside the noise. Not visible in these numbers, and not
+  measured: candidate 1 interrupts the busy receiver's core once per batch
+  of signals, the group does not interrupt it at all.
+- **An idle receiver: the slow path costs one lock and a wake-up, about
+  0.12 µs of median** (0.33 against 0.21 µs at W = 200 ns), three ticks, both
+  passes. Throughput is set by the producers' 20 µs and is level. The p99.9
+  is lower in the groups (0.95 to 1.8 µs against 3.1 to 3.7 µs for candidate
+  1, in both passes and at every W and `ipi`, at k = 4 only; at k = 8
+  candidate 1's p99.9 is 0.4 to 0.9 µs). The cause of that candidate-1 tail
+  was not found; treat it as unexplained, not as a property of the design.
+- **The OR apply also helps candidate 1** where its notify's node was the
+  bottleneck: at k = 8, W = 1 µs (low trust), 1.87 M becomes 3.61 M
+  signals/s, and the p99.9 of 344 to 348 µs (rings full, back-pressure, as in
+  the first three series) becomes 0.87 µs. At k = 4 it changes nothing. The
+  back-pressure reported since the first series came from charging `W/2` per
+  applied signal on one core; with a one-OR apply it is gone.
+- At k = 8 (low trust): as in `a3t`, candidate 1 (OR apply) ahead by 1.5 to
+  10 % (3.44 against 3.61 M at W = 1 µs, `ipi` 0); busy receiver level.
+
+### br: unmap with a lock per address-space range (k = 4; k = 8 in parentheses)
+
+Unmaps/s; unmap p50 / p99.9 in µs.
+
+| Initiators | ipi | W | 1 fair | 3 group lock | 3 range locks | Range against group lock | Range against 1 |
+|---|---|---|---|---|---|---|---|
+| one | 0 | 50 | 467k; 0.74 / 7.9 | 467k; 0.74 / 7.5 | 474k; 0.70 / 7.4 | +1.5 %, level | +1.6 %, level |
+| one | 0 | 200 | 418k; 1.00 / 8.4 | 439k; 0.87 / 8.3 | 447k; 0.87 / 8.0 | +1.8 %, level | +7 % |
+| one | 1000 | 1000 | 228k; 2.93 / 14.9 | 245k; 2.66 / 13.4 | 247k; 2.62 / 12.9 | +1.0 %, level | +8 % |
+| all | 0 | 50 | 1.17M; 1.07 / 10.6 | 1.09M; 2.27 / 11.4 | 1.50M; 1.25 / 8.8 | +37 % | +28 % (×1.70) |
+| all | 0 | 200 | 1.04M; 1.43 / 12.8 | 944k; 2.82 / 12.6 | 1.39M; 1.46 / 9.3 | +47 % | +33 % (×1.79) |
+| all | 0 | 1000 | 656k; 2.82 / 18.2 | 539k; 5.95 / 22.8 | 953k; 3.04 / 13.1 | +77 % | +45 % (×2.04) |
+| all | 1000 | 50 | 731k; 2.26 / 15.2 | 1.07M; 2.24 / 12.3 | 1.13M; 1.53 / 11.3 | +6 % (pass difference 5 %) | +55 % (×1.54) |
+| all | 1000 | 200 | 676k; 2.53 / 15.6 | 940k; 2.82 / 13.6 | 1.36M; 1.46 / 9.9 | +45 % | ×2.01 (×1.71) |
+| all | 1000 | 1000 | 484k; 4.74 / 22.1 | 538k; 5.95 / 23.2 | 951k; 3.04 / 13.6 | +77 % | ×1.97 (×2.28) |
+
+Against the second series (`bf`, same cells): candidate 3 with the group
+lock and candidate 1 fair reproduce within 2 to 4 % (all, `ipi` 1 µs:
+1.07M, 940k, 538k now against 1.09M, 956k, 541k then for candidate 3;
+731k, 676k, 484k against 730k, 662k, 504k for candidate 1; all, `ipi` 0,
+W = 200 ns: 944k and 1.04M against 960k and 1.04M; one initiator: 439k
+against 441k).
+
+- **With one initiator nothing changes**: there is no contention, so range
+  locks and the group lock are level (1 to 2 %, at the edge of the noise),
+  and candidate 3 keeps its 5 to 13 % lower p50 than candidate 1.
+- **With every thread unmapping, the group lock was the limit, and range
+  locks widen candidate 3's lead and reverse the second series' `ipi` 0
+  row.** The second series had candidate 1 ahead by 6 to 21 % at `ipi` 0;
+  with range locks candidate 3 is ahead by 28 to 45 % there (k = 8: 1.7 to
+  2.0 times). At `ipi` 1 µs, where the group lock already led by 1.07 to
+  1.49 times, range locks take the lead to 1.55 to 2.0 times. The unmap p50
+  falls to candidate 1's level or below (1.46 against 1.43 µs at `ipi` 0,
+  W = 200 ns; 1.46 against 2.53 µs at `ipi` 1 µs), and the p99.9 is lower
+  (9 to 14 against 11 to 22 µs). The only small gain over the group lock is
+  W = 50 ns with a 1 µs interrupt (+6 %, about this cell's pass difference),
+  where the lock is held briefly and the interrupts dominate.
+- **What is not covered**: an unmap that spans ranges, one that frees a
+  page-table page, a map that installs an intermediate table, and above all
+  the revocation of a memory capability whose derived mappings lie in
+  several ranges or address spaces (removing a derivation subtree). That
+  operation crosses ranges and spaces without bound, needs a lock of the
+  whole space or hand-over-hand locking, and its lock order against the
+  capability range locks is not settled; it is not measured, and the
+  numbers above say nothing about it. Moves of cores during an unmap (`d`)
+  were not rerun with range locks.
+
+### srv: the busy shared server
+
+Foreground call latency, p50 / p99 / p99.9 in µs (10 runs of 600 ms,
+about 2400 calls each), with the background client, `ipi` 1 µs. "1":
+candidate 1; "3": the server's threads as one group, clients alone; "3 all":
+clients and server in one group. With one thread, "1" and "3" run the same
+code (a control of the noise).
+
+| Threads | Policy | 1 | 3 | 3 all | Background calls/s |
+|---|---|---|---|---|---|
+| 1 | (a) fifo | 50.9 / 170 / 174 | 50.9 / 168 / 173 | 50.7 / 170 / 174 | 9.58k |
+| 1 | (b) lend | 33.3 / 58.9 / 64.0 | 33.3 / 58.9 / 67.1 | 33.8 / 59.9 / 63.0 | 10.83k to 10.90k |
+| 1 | (c) refuse | 8.51 / 57.9 / 59.7 | 8.45 / 57.9 / 60.7 | 8.45 / 59.4 / 60.4 | 8.00k (4.0k refused/s) |
+| 2 | (a) fifo | 9.60 / 14.8 / 34.6 | 8.70 / 12.4 / 27.5 | 8.45 / 11.6 / 30.6 | 9.57k |
+| 2 | (b) lend | 9.60 / 14.4 / 42.0 | 8.64 / 12.4 / 28.8 | 8.45 / 11.6 / 33.2 | 9.57k |
+| 2 | (c) refuse | 8.58 / 13.4 / 39.2 | 8.70 / 13.2 / 37.4 | 8.45 / 11.6 / 42.2 | 8.00k |
+
+With `ipi` 0, one thread: fifo 51 to 52 / 172 to 173 µs (p50 / p99), lend
+32 to 33 / 57.9, refuse 6.5 / 57; two threads 6.4 to 6.7 / 9.4 to 10.8 in
+every column.
+
+Without the background client (the common path, no contention), p50 in µs:
+
+| Threads | ipi | (a) fifo: 1 / 3 / 3 all | (b) lend | (c) refuse |
+|---|---|---|---|---|
+| 1 | 0 | 6.40 / 6.40 / 6.40 | 6.40 / 6.40 / 6.40 | 6.40 / 6.40 / 6.40 |
+| 1 | 1000 | 8.45 / 8.45 / 8.45 | 8.45 / 8.45 / 8.45 | 8.45 / 8.45 / 8.45 |
+| 2 | 0 | 6.46 / 6.72 / 6.46 | 6.46 / 6.75 / 6.46 | 6.43 / 6.75 / 6.46 |
+| 2 | 1000 | 8.45 / 9.86 / 8.45 | 8.45 / 9.41 / 8.45 | 8.45 / 9.79 / 8.45 |
+
+- **With one server thread the policy decides everything and the candidate
+  nothing**: the three layouts are within 1 µs of each other under every
+  policy (the p99.9 within 4 µs), about the pass-to-pass difference of one
+  cell. Under FIFO the foreground waits behind a background request that
+  stops halfway for its budget: p50 51 µs, p99 168 to 172 µs (the rest of a
+  request plus a stall of about 130 µs). Lending removes the stall: p99 58 to
+  60 µs, at most one background request run on the foreground's budget; the
+  background gets 13 to 14 % more calls through, paid by the foreground's
+  budget. Refusal removes it too: p99 57 to 59 µs, and the p50 drops to 6.5
+  to 8.5 µs because the server now idles 60 % of the time; the background
+  loses 16 % of its calls. **Neither policy brings the tail below one long
+  request (50 µs); only the written rule does.**
+- **Two threads (the written rule)**: p50 6.4 to 9.6 µs, p99 9.4 to 15 µs,
+  under every policy (nobody queues, so the policies are level). Here the
+  candidate matters, through interrupts: with `ipi` 1 µs and the background
+  client holding the first server thread, candidate 1 is 0.9 to 1.2 µs
+  slower (9.60 against 8.70 and 8.45 µs, 10 to 14 %), because its second
+  server thread is on another node and a call to the busy endpoint costs a
+  dispatch message and one more interrupt. Under refusal the first thread is
+  often free and the gap closes (8.58 against 8.70 and 8.45). With `ipi` 0
+  the gap is 0.1 to 0.3 µs.
+- **The server group without contention is slower than it should be**: with
+  two idle threads, a call may interrupt the second thread, which hands the
+  request to the first (the endpoint picks the lowest free thread), so two
+  interrupts instead of one: 9.4 to 9.9 µs against 8.45 µs. A kernel would
+  serve the call on the core that took the interrupt. This is a weakness of
+  the model against candidate 3 in that one row, not a measured cost.
+- **What (b) and (c) cost when nobody contends: nothing this bench can
+  resolve.** With one thread, and in the "1" and "3 all" layouts with two,
+  the p50 is identical to the tick in every policy (6.40, 6.46 and 8.45 µs).
+  In the server-group layout with two threads the p50 moves by up to 0.45 µs
+  between policies (9.86, 9.41, 9.79 µs), as much as the two passes of one
+  cell differ, and the policies' branches are not even taken there. The
+  checks are a comparison on the caller's own grant (c) and one field of the
+  endpoint (b): a few nanoseconds, below the 41.7 ns tick.
+- Modelling limits (README): no third load competes for a server core, so a
+  lent class matters only through the budget; with such a load FIFO would be
+  worse and lending better. Budget donation across nodes (candidate 1, two
+  threads) is assumed to need only the grant carried by the call and the
+  reply.
+
+### Which candidate each fourth-series row favours
+
+| Row (k = 4) | Favours | Margin | Noise |
+|---|---|---|---|
+| Many-to-one signal, as in `a3t`, atomic notify | 1 | 6 to 8 % | ±1 % |
+| Many-to-one signal, busy receiver | Level | 0.4 to 0.9 % | ±1 % |
+| Many-to-one signal, idle receiver | 1 in the median, 3 in the p99.9 | p50 +0.12 µs; p99.9 −2.0 to −2.2 µs (cause in candidate 1 unknown) | one tick |
+| Unmap, one initiator, range locks | 3, unchanged | 5 to 13 % lower p50 | ±1 % |
+| Unmap, all threads, range locks | 3 | 28 to 45 % (`ipi` 0); 1.55 to 2.0 times (`ipi` 1 µs) | ±1 % |
+| Busy server, 1 thread | Level; the policy decides | p99: fifo 170, lend 59, refuse 58 µs | ±1 µs |
+| Busy server, 2 threads, contended | 3 with `ipi` 1 µs; level with `ipi` 0 | 0.9 to 1.2 µs (10 to 14 %); 0.1 to 0.3 µs | ±0.5 µs |
+| Policy cost, uncontended | – | not resolved (under 0.04 µs) | – |
+
+### What the fourth series still cannot decide on this Mac
+
+- The real interrupt cost: it decides the two-thread server row, and how
+  much candidate 1's per-batch interrupt of a busy receiver costs it.
+- Whether a kernel can meet the range-lock conditions, and how a subtree
+  revocation would be locked: not measured.
+- A notify whose registration is also lock-free (only the wake-up locked)
+  could shrink the slow path that still costs candidate 3 the `a3t` regime;
+  not measured.
+- Competing load at an intermediate class on the server's core, which would
+  separate lending from FIFO further.
+- Everything about the host listed for the first series: no pinning,
+  efficiency cores at k ≥ 6, 41.7 ns clock, host preemption in the p99.9.
+
+### Corrections: the first three series, and this one
+
+- **An interrupt charged twice in groups.** `poll` let every core of a
+  group that saw the doorbell during its 1 µs interrupt entry pay an
+  interrupt for the same message. This touched only candidate 2 where a
+  process spans groups (and signals to another group), at `ipi` 1 µs.
+  Checked by running the third series' binary and the fixed one side by side
+  (`a3t` and `bf`, k ≤ 4, 3 repetitions each): candidates 1 and 3 within 3 %
+  in every cell (median 0.6 %); candidate 2 with groups of 2 gains 3 to 16 %
+  in `a3t` (median 6 %) and up to 14 % in `bf` (`all`, W = 50 ns). The
+  earlier tables therefore overstate the cost of fixed groups by up to that
+  much in those cells; no conclusion about candidates 1 and 3 changes. Fixed
+  in this series (one core of a node takes one interrupt per batch); the
+  earlier tables are left as measured.
+- **A first fix of that was wrong, and two passes were discarded.** It took
+  the doorbell and the invalidation mailbox before charging the interrupt,
+  which lost what arrives during the entry (a handler reads its mailbox
+  after the entry) and let a core in user code take an acknowledgement from
+  a core spinning in the kernel. The side-by-side check above caught it
+  (candidate 3 lost 15 to 34 % in `bf`, `all`, `ipi` 1 µs, where it never
+  receives a message); the two passes run with it were discarded and the
+  series rerun. In the discarded passes `a3n` and `srv` agreed with the
+  kept ones within the noise (they send no message to a group of several
+  cores); `br` at `ipi` 1 µs did not.
+- **A lost-update race on the space-wide seqlock counter** (`write_stripes`
+  in `sim.rs`): with fine locks, two changes of different ranges both
+  increment the counter of the whole capability space with a plain load and
+  store, so increments can be lost and the counter can stay odd. No measured
+  setting reads that counter with fine locks (the slot read uses the range
+  counters), so no result is wrong, but every fine change writes one more
+  shared line than it needs: a small bias against fine locks in `a1t` and
+  `ct`. Fine locks with the whole-call seqlock would be incorrect. Not fixed,
+  so the third series' code path stays as it ran.
+- **Small**: the third series summary gives candidate 1's IPC lead at k = 4
+  as "1 to 2 %"; the table gives 1.0 to 2.4 %.
+
+### Tables
+
+Raw runs: `data/pass-q1.csv.gz`, `data/pass-q2.csv.gz` (the workload name
+`Server { threads: 1; bg: On }` is written with `;` instead of `,`). Full
+tables of both passes: appendices G and H.
 
 ## Appendix A: full tables, pass A
 
@@ -4593,4 +4868,868 @@ The k-thread process: operations/s
 Seqlock reads repeated per 1000 lookups: 2/2 fair: 8.75; 2/2 fine: 0.07; 2/4 fair: 21.51; 2/4 fine: 0.12; 3 fair: 32.61; 3 fine: 0.10;
 
 Migrations seen: 148221 over 314919477 samples (one sample per measured operation).
+
+
+## Appendix G: full tables, fourth series, pass 1
+
+
+host: macos aarch64, Apple M5, 4 performance + 6 efficiency cores
+pinning: none possible; user-interactive QoS
+clock: resolution 41 ns, 19.0 ns per read
+reps 5, 150 ms per run, max k 8, lock of the group candidates: queue
+
+### Suite a3n: k-1 threads signal one notify, notify by one atomic OR
+
+load average before: { 2.54 3.38 3.69 }
+load average after: { 5.77 4.89 4.30 }; 269 s
+
+Throughput, signals/s, median (min–max)
+
+| regime | ipi ns | W ns | k | 1 locked apply | 1 OR apply | 3 notify lock | 3 atomic | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|
+| as a3t | 0 | 50 | 2 | 707k (702k–710k) | 707k (701k–708k) | 657k (656k–663k) | 645k (642k–649k) | 100% | 0 |
+| as a3t | 0 | 50 | 4 | 2.09M (2.08M–2.10M) | 2.09M (2.09M–2.10M) | 1.93M (1.92M–1.94M) | 1.93M (1.92M–1.95M) | 100% | 0 |
+| as a3t | 0 | 50 | 6 | 3.40M (3.39M–3.42M) | 3.39M (3.35M–3.40M) | 2.53M (2.43M–2.70M) | 3.06M (3.04M–3.08M) | 66% | 27 |
+| as a3t | 0 | 50 | 8 | 4.68M (4.66M–4.70M) | 4.69M (4.66M–4.70M) | 2.85M (2.81M–3.10M) | 4.28M (4.21M–4.28M) | 50% | 46 |
+| as a3t | 0 | 200 | 2 | 654k (652k–661k) | 653k (652k–658k) | 567k (565k–568k) | 602k (600k–605k) | 100% | 0 |
+| as a3t | 0 | 200 | 4 | 1.94M (1.94M–1.94M) | 1.94M (1.89M–1.94M) | 1.66M (1.63M–1.67M) | 1.81M (1.79M–1.81M) | 99% | 1 |
+| as a3t | 0 | 200 | 6 | 3.19M (3.18M–3.21M) | 3.19M (3.16M–3.21M) | 1.92M (1.78M–2.01M) | 2.88M (2.86M–2.88M) | 66% | 66 |
+| as a3t | 0 | 200 | 8 | 4.42M (4.42M–4.44M) | 4.41M (4.40M–4.41M) | 2.15M (2.08M–2.20M) | 4.06M (4.03M–4.06M) | 49% | 24 |
+| as a3t | 0 | 1000 | 2 | 525k (525k–528k) | 525k (524k–528k) | 397k (397k–399k) | 490k (490k–493k) | 100% | 0 |
+| as a3t | 0 | 1000 | 4 | 1.56M (1.55M–1.57M) | 1.56M (1.56M–1.56M) | 890k (882k–901k) | 1.46M (1.44M–1.48M) | 98% | 0 |
+| as a3t | 0 | 1000 | 6 | 1.88M (1.87M–1.89M) | 2.57M (2.55M–2.60M) | 987k (974k–1.02M) | 2.39M (2.35M–2.40M) | 66% | 59 |
+| as a3t | 0 | 1000 | 8 | 1.87M (1.87M–1.88M) | 3.61M (3.57M–3.62M) | 1.07M (1.02M–1.08M) | 3.44M (3.44M–3.48M) | 49% | 36 |
+| as a3t | 1000 | 50 | 2 | 706k (702k–711k) | 705k (699k–706k) | 660k (657k–661k) | 646k (642k–651k) | 100% | 0 |
+| as a3t | 1000 | 50 | 4 | 2.09M (2.09M–2.10M) | 2.09M (2.08M–2.10M) | 1.95M (1.93M–1.95M) | 1.93M (1.92M–1.94M) | 99% | 0 |
+| as a3t | 1000 | 50 | 6 | 3.40M (3.38M–3.41M) | 3.39M (3.38M–3.42M) | 2.79M (2.71M–2.93M) | 3.13M (3.13M–3.15M) | 66% | 46 |
+| as a3t | 1000 | 50 | 8 | 4.72M (4.70M–4.74M) | 4.71M (4.69M–4.73M) | 3.17M (2.89M–3.49M) | 4.44M (4.42M–4.48M) | 50% | 7 |
+| as a3t | 1000 | 200 | 2 | 655k (654k–658k) | 653k (650k–654k) | 568k (565k–571k) | 603k (602k–603k) | 100% | 0 |
+| as a3t | 1000 | 200 | 4 | 1.94M (1.93M–1.94M) | 1.94M (1.94M–1.94M) | 1.67M (1.67M–1.68M) | 1.80M (1.80M–1.80M) | 100% | 0 |
+| as a3t | 1000 | 200 | 6 | 3.17M (3.16M–3.19M) | 3.19M (3.14M–3.19M) | 2.26M (2.15M–2.34M) | 2.97M (2.94M–2.98M) | 66% | 32 |
+| as a3t | 1000 | 200 | 8 | 4.42M (4.39M–4.43M) | 4.41M (4.39M–4.43M) | 2.24M (2.21M–2.37M) | 4.18M (4.13M–4.22M) | 49% | 45 |
+| as a3t | 1000 | 1000 | 2 | 524k (524k–526k) | 525k (522k–527k) | 396k (394k–398k) | 492k (491k–494k) | 100% | 0 |
+| as a3t | 1000 | 1000 | 4 | 1.56M (1.56M–1.56M) | 1.56M (1.55M–1.56M) | 1.06M (1.06M–1.06M) | 1.47M (1.47M–1.47M) | 100% | 0 |
+| as a3t | 1000 | 1000 | 6 | 1.87M (1.85M–1.88M) | 2.58M (2.55M–2.59M) | 1.08M (1.05M–1.11M) | 2.43M (2.40M–2.43M) | 66% | 43 |
+| as a3t | 1000 | 1000 | 8 | 1.87M (1.85M–1.87M) | 3.63M (3.62M–3.63M) | 1.12M (1.08M–1.15M) | 3.57M (3.56M–3.58M) | 49% | 40 |
+| busy | 0 | 50 | 2 | 706k (703k–707k) | 705k (704k–707k) | 698k (696k–702k) | 720k (716k–722k) | 100% | 0 |
+| busy | 0 | 50 | 4 | 2.09M (2.08M–2.10M) | 2.09M (2.07M–2.09M) | 1.94M (1.93M–1.95M) | 2.10M (2.08M–2.11M) | 99% | 0 |
+| busy | 0 | 50 | 6 | 3.37M (3.35M–3.42M) | 3.38M (3.37M–3.40M) | 2.83M (2.80M–2.89M) | 3.41M (3.39M–3.43M) | 66% | 32 |
+| busy | 0 | 50 | 8 | 4.68M (4.65M–4.71M) | 4.70M (4.67M–4.71M) | 3.49M (3.25M–3.88M) | 4.76M (4.74M–4.78M) | 50% | 21 |
+| busy | 0 | 200 | 2 | 654k (648k–656k) | 653k (650k–654k) | 620k (617k–622k) | 681k (675k–682k) | 100% | 0 |
+| busy | 0 | 200 | 4 | 1.94M (1.93M–1.94M) | 1.94M (1.93M–1.94M) | 1.67M (1.66M–1.68M) | 1.95M (1.93M–1.97M) | 99% | 0 |
+| busy | 0 | 200 | 6 | 3.19M (3.17M–3.19M) | 3.18M (3.17M–3.19M) | 2.48M (2.40M–2.57M) | 3.19M (3.16M–3.19M) | 66% | 41 |
+| busy | 0 | 200 | 8 | 4.42M (4.40M–4.43M) | 4.39M (4.36M–4.41M) | 2.52M (2.36M–2.67M) | 4.45M (4.45M–4.46M) | 49% | 40 |
+| busy | 0 | 1000 | 2 | 524k (524k–527k) | 525k (522k–529k) | 420k (419k–421k) | 539k (538k–541k) | 100% | 0 |
+| busy | 0 | 1000 | 4 | 1.56M (1.56M–1.56M) | 1.56M (1.55M–1.56M) | 1.16M (1.15M–1.17M) | 1.57M (1.56M–1.57M) | 100% | 1 |
+| busy | 0 | 1000 | 6 | 1.88M (1.88M–1.89M) | 2.57M (2.54M–2.58M) | 1.25M (1.17M–1.26M) | 2.58M (2.57M–2.59M) | 66% | 40 |
+| busy | 0 | 1000 | 8 | 1.87M (1.86M–1.89M) | 3.62M (3.60M–3.62M) | 1.21M (1.19M–1.23M) | 3.63M (3.59M–3.64M) | 49% | 62 |
+| busy | 1000 | 50 | 2 | 703k (699k–708k) | 704k (701k–706k) | 700k (697k–702k) | 721k (720k–726k) | 100% | 0 |
+| busy | 1000 | 50 | 4 | 2.09M (2.09M–2.09M) | 2.09M (2.07M–2.10M) | 1.95M (1.93M–1.96M) | 2.10M (2.08M–2.10M) | 100% | 0 |
+| busy | 1000 | 50 | 6 | 3.40M (3.38M–3.41M) | 3.37M (3.37M–3.41M) | 2.89M (2.81M–2.92M) | 3.41M (3.38M–3.43M) | 65% | 13 |
+| busy | 1000 | 50 | 8 | 4.71M (4.70M–4.73M) | 4.69M (4.62M–4.72M) | 3.58M (3.40M–3.66M) | 4.75M (4.74M–4.78M) | 50% | 20 |
+| busy | 1000 | 200 | 2 | 652k (650k–657k) | 652k (650k–658k) | 619k (617k–622k) | 678k (676k–679k) | 100% | 0 |
+| busy | 1000 | 200 | 4 | 1.94M (1.93M–1.94M) | 1.93M (1.93M–1.95M) | 1.67M (1.66M–1.68M) | 1.94M (1.93M–1.96M) | 99% | 0 |
+| busy | 1000 | 200 | 6 | 3.17M (3.15M–3.18M) | 3.16M (3.15M–3.20M) | 2.48M (2.27M–2.53M) | 3.18M (3.16M–3.20M) | 66% | 48 |
+| busy | 1000 | 200 | 8 | 4.41M (4.40M–4.42M) | 4.42M (4.40M–4.43M) | 2.56M (2.48M–2.64M) | 4.46M (4.45M–4.47M) | 50% | 2 |
+| busy | 1000 | 1000 | 2 | 525k (524k–528k) | 525k (522k–528k) | 420k (419k–422k) | 541k (539k–543k) | 100% | 0 |
+| busy | 1000 | 1000 | 4 | 1.56M (1.55M–1.56M) | 1.56M (1.55M–1.56M) | 1.17M (1.15M–1.18M) | 1.57M (1.54M–1.58M) | 99% | 1 |
+| busy | 1000 | 1000 | 6 | 1.88M (1.86M–1.89M) | 2.56M (2.53M–2.58M) | 1.25M (1.18M–1.28M) | 2.57M (2.55M–2.58M) | 66% | 48 |
+| busy | 1000 | 1000 | 8 | 1.87M (1.85M–1.88M) | 3.61M (3.59M–3.62M) | 1.23M (1.15M–1.30M) | 3.63M (3.61M–3.65M) | 49% | 26 |
+| idle | 0 | 50 | 2 | 39k (38k–39k) | 39k (39k–39k) | 39k (38k–39k) | 39k (38k–39k) | 100% | 0 |
+| idle | 0 | 50 | 4 | 115k (115k–116k) | 115k (115k–116k) | 115k (113k–116k) | 116k (113k–117k) | 99% | 0 |
+| idle | 0 | 50 | 6 | 198k (197k–201k) | 198k (196k–199k) | 197k (195k–197k) | 196k (196k–197k) | 64% | 0 |
+| idle | 0 | 50 | 8 | 281k (280k–283k) | 281k (279k–283k) | 279k (278k–279k) | 281k (279k–282k) | 47% | 0 |
+| idle | 0 | 200 | 2 | 39k (38k–39k) | 39k (38k–39k) | 38k (38k–39k) | 38k (38k–39k) | 100% | 0 |
+| idle | 0 | 200 | 4 | 115k (115k–116k) | 115k (114k–115k) | 113k (112k–114k) | 114k (113k–114k) | 100% | 0 |
+| idle | 0 | 200 | 6 | 197k (195k–198k) | 198k (197k–199k) | 195k (193k–196k) | 195k (194k–197k) | 64% | 0 |
+| idle | 0 | 200 | 8 | 281k (278k–282k) | 279k (275k–281k) | 276k (275k–277k) | 279k (278k–280k) | 48% | 9 |
+| idle | 0 | 1000 | 2 | 38k (38k–39k) | 38k (38k–38k) | 37k (37k–37k) | 38k (38k–38k) | 100% | 0 |
+| idle | 0 | 1000 | 4 | 114k (112k–114k) | 114k (113k–115k) | 110k (109k–111k) | 112k (111k–113k) | 99% | 0 |
+| idle | 0 | 1000 | 6 | 195k (193k–196k) | 195k (194k–195k) | 188k (187k–189k) | 193k (193k–194k) | 64% | 1 |
+| idle | 0 | 1000 | 8 | 275k (273k–277k) | 276k (274k–279k) | 266k (266k–269k) | 275k (274k–277k) | 48% | 1 |
+| idle | 1000 | 50 | 2 | 39k (39k–39k) | 39k (39k–39k) | 38k (38k–39k) | 39k (38k–39k) | 100% | 0 |
+| idle | 1000 | 50 | 4 | 115k (115k–116k) | 116k (115k–117k) | 115k (115k–116k) | 114k (113k–116k) | 99% | 0 |
+| idle | 1000 | 50 | 6 | 198k (197k–199k) | 198k (197k–200k) | 197k (195k–198k) | 197k (196k–199k) | 64% | 0 |
+| idle | 1000 | 50 | 8 | 282k (278k–283k) | 283k (280k–284k) | 279k (276k–280k) | 282k (280k–283k) | 47% | 0 |
+| idle | 1000 | 200 | 2 | 39k (38k–39k) | 39k (38k–39k) | 38k (38k–39k) | 38k (38k–39k) | 100% | 0 |
+| idle | 1000 | 200 | 4 | 115k (114k–116k) | 116k (113k–117k) | 113k (113k–116k) | 114k (113k–116k) | 99% | 0 |
+| idle | 1000 | 200 | 6 | 198k (197k–199k) | 198k (196k–199k) | 195k (193k–196k) | 196k (193k–197k) | 64% | 0 |
+| idle | 1000 | 200 | 8 | 279k (278k–281k) | 279k (248k–280k) | 276k (275k–278k) | 280k (277k–282k) | 47% | 3 |
+| idle | 1000 | 1000 | 2 | 38k (38k–39k) | 38k (38k–38k) | 37k (37k–37k) | 38k (38k–38k) | 100% | 0 |
+| idle | 1000 | 1000 | 4 | 113k (113k–114k) | 114k (113k–114k) | 111k (110k–113k) | 113k (111k–114k) | 99% | 0 |
+| idle | 1000 | 1000 | 6 | 196k (194k–197k) | 195k (193k–196k) | 188k (168k–189k) | 193k (191k–194k) | 64% | 9 |
+| idle | 1000 | 1000 | 8 | 276k (274k–276k) | 276k (275k–278k) | 267k (267k–269k) | 276k (274k–277k) | 47% | 0 |
+
+Signal call latency, µs: p50 / p99 / p99.9 (p99.9 min–max)
+
+| regime | ipi ns | W ns | k | 1 locked apply | 1 OR apply | 3 notify lock | 3 atomic | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|
+| as a3t | 0 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.21 / 0.25 / 0.29 (0.29–0.33) | 0.21 / 0.25 / 0.33 (0.33–0.33) | 100% | 0 |
+| as a3t | 0 | 50 | 4 | 0.08 / 0.12 / 0.29 (0.21–0.33) | 0.08 / 0.12 / 0.33 (0.25–0.33) | 0.21 / 0.33 / 0.79 (0.62–1.04) | 0.25 / 0.33 / 0.54 (0.37–0.58) | 100% | 0 |
+| as a3t | 0 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.29–0.33) | 0.12 / 0.25 / 0.33 (0.33–0.33) | 0.62 / 1.15 / 4.93 (2.03–5.12) | 0.25 / 0.70 / 0.83 (0.79–0.83) | 66% | 27 |
+| as a3t | 0 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 1.07 / 1.78 / 8.70 (6.21–9.22) | 0.25 / 0.83 / 1.04 (1.04–1.12) | 50% | 46 |
+| as a3t | 0 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.33) | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.46 / 0.50 / 0.54 (0.54–0.54) | 0.33 / 0.37 / 0.42 (0.37–0.46) | 100% | 0 |
+| as a3t | 0 | 200 | 4 | 0.21 / 0.25 / 0.42 (0.33–0.42) | 0.21 / 0.25 / 0.37 (0.33–0.62) | 0.46 / 0.70 / 1.28 (0.87–8.70) | 0.33 / 0.46 / 0.62 (0.50–0.66) | 99% | 1 |
+| as a3t | 0 | 200 | 6 | 0.25 / 0.37 / 0.42 (0.42–0.42) | 0.25 / 0.37 / 0.42 (0.42–0.42) | 1.28 / 1.78 / 7.55 (6.66–8.19) | 0.37 / 0.79 / 0.91 (0.91–0.91) | 66% | 66 |
+| as a3t | 0 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.82 / 2.69 / 10.62 (8.83–12.67) | 0.33 / 0.95 / 1.15 (1.12–1.15) | 49% | 24 |
+| as a3t | 0 | 1000 | 2 | 0.58 / 0.62 / 0.62 (0.62–0.66) | 0.58 / 0.62 / 0.66 (0.62–0.66) | 1.15 / 1.20 / 1.33 (1.28–1.57) | 0.70 / 0.74 / 0.79 (0.79–0.83) | 100% | 0 |
+| as a3t | 0 | 1000 | 4 | 0.58 / 0.62 / 0.79 (0.74–0.79) | 0.58 / 0.70 / 0.83 (0.79–0.87) | 1.79 / 2.30 / 10.62 (9.60–12.93) | 0.70 / 0.83 / 1.07 (0.83–1.15) | 98% | 0 |
+| as a3t | 0 | 1000 | 6 | 0.62 / 0.74 / 141.31 (139.26–143.36) | 0.62 / 0.74 / 0.83 (0.79–0.83) | 3.65 / 4.48 / 13.57 (12.54–14.98) | 0.74 / 1.15 / 1.28 (1.28–1.28) | 66% | 59 |
+| as a3t | 0 | 1000 | 8 | 0.62 / 0.74 / 344.06 (339.97–348.16) | 0.62 / 0.79 / 0.87 (0.87–0.95) | 5.12 / 6.66 / 18.69 (15.62–19.97) | 0.66 / 1.25 / 1.49 (1.46–1.49) | 49% | 36 |
+| as a3t | 1000 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.21 / 0.25 / 0.29 (0.29–0.33) | 0.21 / 0.29 / 0.33 (0.33–0.33) | 100% | 0 |
+| as a3t | 1000 | 50 | 4 | 0.08 / 0.12 / 0.29 (0.25–0.33) | 0.08 / 0.17 / 0.33 (0.25–0.33) | 0.21 / 0.37 / 0.58 (0.46–0.79) | 0.25 / 0.33 / 0.50 (0.46–0.70) | 99% | 0 |
+| as a3t | 1000 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.33–0.33) | 0.17 / 0.25 / 0.33 (0.33–0.33) | 0.46 / 0.95 / 1.28 (1.12–2.00) | 0.21 / 0.74 / 0.83 (0.83–0.87) | 66% | 46 |
+| as a3t | 1000 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.33–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.87 / 1.66 / 6.66 (6.14–7.74) | 0.21 / 0.91 / 1.07 (1.07–1.12) | 50% | 7 |
+| as a3t | 1000 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.25) | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.42 / 0.46 / 0.54 (0.50–0.54) | 0.33 / 0.37 / 0.46 (0.42–0.46) | 100% | 0 |
+| as a3t | 1000 | 200 | 4 | 0.21 / 0.25 / 0.37 (0.33–0.42) | 0.21 / 0.29 / 0.42 (0.37–0.42) | 0.42 / 0.62 / 1.00 (0.74–1.36) | 0.33 / 0.46 / 0.62 (0.50–0.70) | 100% | 0 |
+| as a3t | 1000 | 200 | 6 | 0.25 / 0.33 / 0.42 (0.42–0.42) | 0.25 / 0.37 / 0.42 (0.42–0.42) | 0.83 / 1.49 / 5.18 (2.21–5.31) | 0.29 / 0.83 / 0.95 (0.91–0.95) | 66% | 32 |
+| as a3t | 1000 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.74 / 2.62 / 10.24 (8.70–10.24) | 0.29 / 1.00 / 1.20 (1.15–1.20) | 49% | 45 |
+| as a3t | 1000 | 1000 | 2 | 0.58 / 0.62 / 0.62 (0.62–0.66) | 0.58 / 0.62 / 0.62 (0.62–0.70) | 1.15 / 1.25 / 1.49 (1.28–1.95) | 0.70 / 0.74 / 0.83 (0.79–0.95) | 100% | 0 |
+| as a3t | 1000 | 1000 | 4 | 0.58 / 0.62 / 0.78 (0.74–0.83) | 0.58 / 0.62 / 0.79 (0.74–0.87) | 1.62 / 1.87 / 8.00 (7.81–9.34) | 0.70 / 0.83 / 1.00 (0.91–1.07) | 100% | 0 |
+| as a3t | 1000 | 1000 | 6 | 0.62 / 0.74 / 141.31 (141.31–143.36) | 0.62 / 0.74 / 0.83 (0.79–0.83) | 3.20 / 4.29 / 12.03 (11.14–14.08) | 0.66 / 1.20 / 1.33 (1.33–1.33) | 66% | 43 |
+| as a3t | 1000 | 1000 | 8 | 0.62 / 0.74 / 348.16 (348.16–348.16) | 0.62 / 0.79 / 0.87 (0.87–0.87) | 4.86 / 5.89 / 17.66 (16.00–22.53) | 0.62 / 1.15 / 1.49 (1.46–1.54) | 49% | 40 |
+| busy | 0 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.21 / 0.25 (0.25–0.25) | 0.04 / 0.08 / 0.12 (0.12–0.12) | 100% | 0 |
+| busy | 0 | 50 | 4 | 0.08 / 0.12 / 0.29 (0.21–0.29) | 0.08 / 0.12 / 0.33 (0.25–0.37) | 0.21 / 0.33 / 0.58 (0.46–0.79) | 0.08 / 0.12 / 0.25 (0.25–0.25) | 99% | 0 |
+| busy | 0 | 50 | 6 | 0.17 / 0.25 / 0.33 (0.33–0.33) | 0.12 / 0.25 / 0.33 (0.29–0.33) | 0.46 / 0.79 / 1.12 (1.00–1.15) | 0.12 / 0.25 / 0.29 (0.29–0.33) | 66% | 32 |
+| busy | 0 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.58 / 1.36 / 2.69 (2.11–5.50) | 0.17 / 0.29 / 0.37 (0.33–0.37) | 50% | 21 |
+| busy | 0 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.21 / 0.25 / 0.29 (0.25–0.29) | 0.25 / 0.42 / 0.54 (0.54–0.54) | 0.12 / 0.21 / 0.25 (0.21–0.25) | 100% | 0 |
+| busy | 0 | 200 | 4 | 0.21 / 0.25 / 0.37 (0.29–0.46) | 0.21 / 0.25 / 0.42 (0.37–0.46) | 0.42 / 0.62 / 0.91 (0.83–1.15) | 0.21 / 0.29 / 0.37 (0.29–0.37) | 99% | 0 |
+| busy | 0 | 200 | 6 | 0.25 / 0.37 / 0.42 (0.42–0.42) | 0.25 / 0.33 / 0.42 (0.42–0.42) | 0.62 / 1.28 / 2.85 (1.33–5.25) | 0.25 / 0.37 / 0.42 (0.42–0.46) | 66% | 41 |
+| busy | 0 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.36 / 2.30 / 8.32 (6.98–8.83) | 0.25 / 0.42 / 0.46 (0.46–0.46) | 49% | 40 |
+| busy | 0 | 1000 | 2 | 0.58 / 0.62 / 0.62 (0.62–0.70) | 0.58 / 0.62 / 0.66 (0.62–0.70) | 1.00 / 1.49 / 1.70 (1.66–1.70) | 0.50 / 0.58 / 0.62 (0.62–0.62) | 100% | 0 |
+| busy | 0 | 1000 | 4 | 0.58 / 0.62 / 0.78 (0.74–0.91) | 0.58 / 0.62 / 0.79 (0.79–0.91) | 1.15 / 1.78 / 3.49 (2.30–6.27) | 0.58 / 0.62 / 0.74 (0.70–0.79) | 100% | 1 |
+| busy | 0 | 1000 | 6 | 0.66 / 0.79 / 139.26 (137.22–141.31) | 0.62 / 0.74 / 0.83 (0.79–0.83) | 2.53 / 3.68 / 10.50 (8.45–11.52) | 0.62 / 0.74 / 0.79 (0.79–0.83) | 66% | 40 |
+| busy | 0 | 1000 | 8 | 0.62 / 0.79 / 339.97 (335.87–344.06) | 0.66 / 0.79 / 0.87 (0.87–0.87) | 4.29 / 5.82 / 15.23 (14.46–17.66) | 0.62 / 0.83 / 0.87 (0.87–0.91) | 49% | 62 |
+| busy | 1000 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.08 / 0.17 / 0.25 (0.25–0.25) | 0.04 / 0.08 / 0.12 (0.12–0.12) | 100% | 0 |
+| busy | 1000 | 50 | 4 | 0.08 / 0.12 / 0.25 (0.25–0.29) | 0.08 / 0.12 / 0.33 (0.21–0.33) | 0.21 / 0.33 / 0.54 (0.46–0.70) | 0.08 / 0.12 / 0.25 (0.25–0.29) | 100% | 0 |
+| busy | 1000 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.33–0.33) | 0.17 / 0.25 / 0.33 (0.33–0.33) | 0.42 / 0.74 / 1.04 (0.95–4.61) | 0.12 / 0.25 / 0.29 (0.29–0.33) | 65% | 13 |
+| busy | 1000 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.17 / 0.29 / 0.37 (0.33–0.42) | 0.54 / 1.36 / 4.99 (1.62–5.63) | 0.17 / 0.29 / 0.37 (0.33–0.37) | 50% | 20 |
+| busy | 1000 | 200 | 2 | 0.21 / 0.25 / 0.29 (0.25–0.29) | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.25 / 0.42 / 0.54 (0.54–0.54) | 0.12 / 0.21 / 0.25 (0.21–0.25) | 100% | 0 |
+| busy | 1000 | 200 | 4 | 0.21 / 0.25 / 0.33 (0.33–0.37) | 0.21 / 0.25 / 0.42 (0.37–0.42) | 0.42 / 0.58 / 1.00 (0.83–1.07) | 0.21 / 0.25 / 0.37 (0.33–0.42) | 99% | 0 |
+| busy | 1000 | 200 | 6 | 0.25 / 0.37 / 0.42 (0.42–0.42) | 0.25 / 0.37 / 0.42 (0.42–0.42) | 0.62 / 1.28 / 2.30 (1.62–4.10) | 0.25 / 0.37 / 0.42 (0.42–0.46) | 66% | 48 |
+| busy | 1000 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.33 / 2.30 / 8.58 (7.23–8.96) | 0.25 / 0.42 / 0.46 (0.46–0.46) | 50% | 2 |
+| busy | 1000 | 1000 | 2 | 0.58 / 0.62 / 0.62 (0.62–0.70) | 0.58 / 0.62 / 0.66 (0.62–0.66) | 1.00 / 1.49 / 1.70 (1.66–1.70) | 0.50 / 0.58 / 0.62 (0.58–0.62) | 100% | 0 |
+| busy | 1000 | 1000 | 4 | 0.58 / 0.62 / 0.79 (0.74–0.83) | 0.58 / 0.62 / 0.79 (0.70–0.95) | 1.15 / 1.70 / 4.74 (2.08–9.86) | 0.58 / 0.62 / 0.74 (0.70–0.95) | 99% | 1 |
+| busy | 1000 | 1000 | 6 | 0.62 / 0.78 / 141.31 (139.26–145.41) | 0.62 / 0.74 / 0.87 (0.79–0.87) | 2.53 / 3.65 / 10.62 (9.73–14.59) | 0.62 / 0.74 / 0.83 (0.79–0.83) | 66% | 48 |
+| busy | 1000 | 1000 | 8 | 0.62 / 0.74 / 344.06 (339.97–348.16) | 0.62 / 0.79 / 0.87 (0.87–0.91) | 4.22 / 5.76 / 15.62 (13.57–18.43) | 0.62 / 0.79 / 0.87 (0.87–0.91) | 49% | 26 |
+| idle | 0 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.12 / 0.17 (0.17–0.33) | 0.21 / 0.25 / 0.33 (0.29–0.33) | 0.21 / 0.25 / 0.33 (0.33–0.37) | 100% | 0 |
+| idle | 0 | 50 | 4 | 0.08 / 0.21 / 3.20 (3.20–3.26) | 0.08 / 0.17 / 3.20 (2.91–3.26) | 0.21 / 0.33 / 1.07 (0.70–2.56) | 0.21 / 0.33 / 1.00 (0.87–1.20) | 99% | 0 |
+| idle | 0 | 50 | 6 | 0.12 / 0.29 / 0.42 (0.33–0.46) | 0.17 / 0.29 / 0.46 (0.42–0.46) | 0.33 / 0.70 / 0.95 (0.83–0.95) | 0.33 / 0.74 / 0.83 (0.79–0.83) | 64% | 0 |
+| idle | 0 | 50 | 8 | 0.17 / 0.29 / 0.42 (0.37–0.46) | 0.12 / 0.29 / 0.37 (0.37–0.46) | 0.42 / 0.78 / 1.07 (0.83–1.15) | 0.29 / 0.74 / 0.79 (0.74–0.79) | 47% | 0 |
+| idle | 0 | 200 | 2 | 0.21 / 0.25 / 0.29 (0.29–0.33) | 0.21 / 0.25 / 0.29 (0.25–0.74) | 0.46 / 0.50 / 0.54 (0.50–0.58) | 0.33 / 0.37 / 0.46 (0.46–0.46) | 100% | 0 |
+| idle | 0 | 200 | 4 | 0.21 / 0.33 / 3.26 (3.20–3.26) | 0.21 / 0.33 / 3.36 (3.26–3.39) | 0.46 / 0.62 / 1.20 (1.04–3.62) | 0.33 / 0.37 / 1.15 (0.87–2.11) | 100% | 0 |
+| idle | 0 | 200 | 6 | 0.25 / 0.37 / 0.50 (0.46–0.54) | 0.29 / 0.42 / 0.54 (0.46–0.58) | 0.54 / 0.91 / 1.28 (1.15–1.58) | 0.42 / 0.83 / 0.87 (0.87–0.91) | 64% | 0 |
+| idle | 0 | 200 | 8 | 0.29 / 0.42 / 0.54 (0.42–0.58) | 0.25 / 0.37 / 0.54 (0.50–0.54) | 0.58 / 1.04 / 1.54 (1.36–4.10) | 0.37 / 0.83 / 0.87 (0.74–0.87) | 48% | 9 |
+| idle | 0 | 1000 | 2 | 0.58 / 0.62 / 0.70 (0.62–0.70) | 0.58 / 0.62 / 0.74 (0.70–1.46) | 1.15 / 1.25 / 1.33 (1.25–1.46) | 0.70 / 0.74 / 0.83 (0.79–0.83) | 100% | 0 |
+| idle | 0 | 1000 | 4 | 0.58 / 0.66 / 3.65 (3.65–4.86) | 0.58 / 0.66 / 3.65 (3.65–3.78) | 1.20 / 1.79 / 5.25 (1.95–8.45) | 0.70 / 0.79 / 1.79 (1.41–2.78) | 99% | 0 |
+| idle | 0 | 1000 | 6 | 0.62 / 0.74 / 0.87 (0.83–0.95) | 0.62 / 0.74 / 0.91 (0.83–0.91) | 1.41 / 2.43 / 3.26 (3.23–6.27) | 0.74 / 1.07 / 1.25 (1.12–1.25) | 64% | 1 |
+| idle | 0 | 1000 | 8 | 0.62 / 0.74 / 0.87 (0.79–0.91) | 0.62 / 0.74 / 0.87 (0.79–0.91) | 1.36 / 2.62 / 7.36 (3.14–8.83) | 0.74 / 1.15 / 1.25 (1.25–1.25) | 48% | 1 |
+| idle | 1000 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.25) | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.21 / 0.25 / 0.33 (0.29–0.42) | 0.21 / 0.25 / 0.33 (0.29–0.37) | 100% | 0 |
+| idle | 1000 | 50 | 4 | 0.08 / 0.17 / 3.14 (0.79–3.23) | 0.08 / 0.21 / 3.20 (0.91–3.33) | 0.21 / 0.29 / 1.20 (0.91–3.23) | 0.21 / 0.29 / 1.04 (0.79–1.36) | 99% | 0 |
+| idle | 1000 | 50 | 6 | 0.12 / 0.29 / 0.42 (0.37–0.46) | 0.17 / 0.29 / 0.42 (0.42–0.50) | 0.37 / 0.70 / 0.91 (0.87–0.95) | 0.25 / 0.74 / 0.83 (0.79–0.83) | 64% | 0 |
+| idle | 1000 | 50 | 8 | 0.17 / 0.33 / 0.42 (0.37–0.46) | 0.17 / 0.29 / 0.42 (0.37–0.42) | 0.33 / 0.74 / 1.12 (1.00–1.25) | 0.25 / 0.74 / 0.79 (0.62–0.79) | 47% | 0 |
+| idle | 1000 | 200 | 2 | 0.21 / 0.25 / 0.29 (0.29–0.54) | 0.21 / 0.25 / 0.29 (0.29–0.37) | 0.46 / 0.50 / 0.54 (0.50–0.58) | 0.33 / 0.37 / 0.46 (0.42–0.46) | 100% | 0 |
+| idle | 1000 | 200 | 4 | 0.21 / 0.37 / 3.26 (3.10–3.33) | 0.21 / 0.33 / 3.33 (3.23–3.39) | 0.46 / 0.62 / 1.25 (1.04–1.36) | 0.33 / 0.42 / 1.00 (0.66–1.33) | 99% | 0 |
+| idle | 1000 | 200 | 6 | 0.25 / 0.37 / 0.54 (0.46–0.54) | 0.29 / 0.42 / 0.54 (0.50–0.58) | 0.54 / 0.91 / 1.20 (1.12–1.57) | 0.37 / 0.83 / 0.87 (0.87–0.91) | 64% | 0 |
+| idle | 1000 | 200 | 8 | 0.29 / 0.42 / 0.54 (0.50–0.58) | 0.25 / 0.37 / 0.50 (0.46–0.50) | 0.58 / 1.04 / 1.54 (1.46–1.70) | 0.33 / 0.83 / 0.87 (0.83–0.87) | 47% | 3 |
+| idle | 1000 | 1000 | 2 | 0.58 / 0.62 / 0.70 (0.62–0.79) | 0.58 / 0.62 / 0.66 (0.66–0.91) | 1.15 / 1.25 / 1.33 (1.28–1.36) | 0.70 / 0.74 / 0.83 (0.79–0.87) | 100% | 0 |
+| idle | 1000 | 1000 | 4 | 0.58 / 0.70 / 3.65 (3.62–3.78) | 0.58 / 0.66 / 3.74 (3.46–3.78) | 1.20 / 1.78 / 7.04 (5.25–8.58) | 0.70 / 0.79 / 1.79 (1.04–3.74) | 99% | 0 |
+| idle | 1000 | 1000 | 6 | 0.62 / 0.74 / 0.87 (0.83–0.91) | 0.62 / 0.74 / 0.87 (0.83–0.91) | 1.36 / 2.37 / 4.99 (3.46–6.72) | 0.70 / 1.07 / 1.25 (1.15–1.25) | 64% | 9 |
+| idle | 1000 | 1000 | 8 | 0.62 / 0.74 / 0.87 (0.79–0.91) | 0.62 / 0.74 / 0.91 (0.83–0.91) | 1.36 / 2.53 / 6.78 (3.36–8.19) | 0.70 / 1.12 / 1.25 (1.20–1.28) | 47% | 0 |
+
+Signals that found the thread waiting (took the lock), % of signals
+
+| regime | ipi ns | W ns | k | 1 locked apply | 1 OR apply | 3 notify lock | 3 atomic | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|
+| as a3t | 0 | 50 | 2 | 0.0% | 0.0% | 0.0% | 99.8% | 100% | 0 |
+| as a3t | 0 | 50 | 4 | 0.0% | 0.0% | 0.0% | 67.7% | 100% | 0 |
+| as a3t | 0 | 50 | 6 | 0.0% | 0.0% | 0.0% | 51.6% | 66% | 27 |
+| as a3t | 0 | 50 | 8 | 0.0% | 0.0% | 0.0% | 42.9% | 50% | 46 |
+| as a3t | 0 | 200 | 2 | 0.0% | 0.0% | 0.0% | 99.7% | 100% | 0 |
+| as a3t | 0 | 200 | 4 | 0.0% | 0.0% | 0.0% | 68.7% | 99% | 1 |
+| as a3t | 0 | 200 | 6 | 0.0% | 0.0% | 0.0% | 52.3% | 66% | 66 |
+| as a3t | 0 | 200 | 8 | 0.0% | 0.0% | 0.0% | 42.2% | 49% | 24 |
+| as a3t | 0 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 99.8% | 100% | 0 |
+| as a3t | 0 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 69.2% | 98% | 0 |
+| as a3t | 0 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 47.4% | 66% | 59 |
+| as a3t | 0 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 31.6% | 49% | 36 |
+| as a3t | 1000 | 50 | 2 | 0.0% | 0.0% | 0.0% | 98.8% | 100% | 0 |
+| as a3t | 1000 | 50 | 4 | 0.0% | 0.0% | 0.0% | 67.4% | 99% | 0 |
+| as a3t | 1000 | 50 | 6 | 0.0% | 0.0% | 0.0% | 41.1% | 66% | 46 |
+| as a3t | 1000 | 50 | 8 | 0.0% | 0.0% | 0.0% | 29.8% | 50% | 7 |
+| as a3t | 1000 | 200 | 2 | 0.0% | 0.0% | 0.0% | 99.1% | 100% | 0 |
+| as a3t | 1000 | 200 | 4 | 0.0% | 0.0% | 0.0% | 69.9% | 100% | 0 |
+| as a3t | 1000 | 200 | 6 | 0.0% | 0.0% | 0.0% | 37.9% | 66% | 32 |
+| as a3t | 1000 | 200 | 8 | 0.0% | 0.0% | 0.0% | 28.3% | 49% | 45 |
+| as a3t | 1000 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 98.9% | 100% | 0 |
+| as a3t | 1000 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 68.8% | 100% | 0 |
+| as a3t | 1000 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 36.0% | 66% | 43 |
+| as a3t | 1000 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 15.9% | 49% | 40 |
+| busy | 0 | 50 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 50 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 0 | 50 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 32 |
+| busy | 0 | 50 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 50% | 21 |
+| busy | 0 | 200 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 200 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 0 | 200 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 41 |
+| busy | 0 | 200 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 49% | 40 |
+| busy | 0 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 1 |
+| busy | 0 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 40 |
+| busy | 0 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 49% | 62 |
+| busy | 1000 | 50 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 50 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 50 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 65% | 13 |
+| busy | 1000 | 50 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 50% | 20 |
+| busy | 1000 | 200 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 200 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 1000 | 200 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 48 |
+| busy | 1000 | 200 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 50% | 2 |
+| busy | 1000 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 1 |
+| busy | 1000 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 48 |
+| busy | 1000 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 49% | 26 |
+| idle | 0 | 50 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 0 | 50 | 4 | 0.0% | 0.0% | 0.0% | 97.2% | 99% | 0 |
+| idle | 0 | 50 | 6 | 0.0% | 0.0% | 0.0% | 91.5% | 64% | 0 |
+| idle | 0 | 50 | 8 | 0.0% | 0.0% | 0.0% | 86.1% | 47% | 0 |
+| idle | 0 | 200 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 0 | 200 | 4 | 0.0% | 0.0% | 0.0% | 96.2% | 100% | 0 |
+| idle | 0 | 200 | 6 | 0.0% | 0.0% | 0.0% | 89.6% | 64% | 0 |
+| idle | 0 | 200 | 8 | 0.0% | 0.0% | 0.0% | 84.0% | 48% | 9 |
+| idle | 0 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 0 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 90.9% | 99% | 0 |
+| idle | 0 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 84.3% | 64% | 1 |
+| idle | 0 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 76.4% | 48% | 1 |
+| idle | 1000 | 50 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 1000 | 50 | 4 | 0.0% | 0.0% | 0.0% | 87.7% | 99% | 0 |
+| idle | 1000 | 50 | 6 | 0.0% | 0.0% | 0.0% | 79.4% | 64% | 0 |
+| idle | 1000 | 50 | 8 | 0.0% | 0.0% | 0.0% | 70.6% | 47% | 0 |
+| idle | 1000 | 200 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 1000 | 200 | 4 | 0.0% | 0.0% | 0.0% | 87.0% | 99% | 0 |
+| idle | 1000 | 200 | 6 | 0.0% | 0.0% | 0.0% | 78.1% | 64% | 0 |
+| idle | 1000 | 200 | 8 | 0.0% | 0.0% | 0.0% | 69.5% | 47% | 3 |
+| idle | 1000 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 1000 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 82.0% | 99% | 0 |
+| idle | 1000 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 74.8% | 64% | 9 |
+| idle | 1000 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 64.2% | 47% | 0 |
+
+Migrations seen: 205647 over 337664729 samples (one sample per measured operation).
+
+
+### Suite br: unmap, lock per address-space range
+
+load average before: { 5.77 4.89 4.30 }
+load average after: { 5.69 5.27 4.56 }; 168 s
+
+Throughput, unmaps/s, median (min–max)
+
+| initiators | ipi ns | W ns | k | 1 fair | 3 group lock | 3 range locks | on P | stalls |
+|---|---|---|---|---|---|---|---|---|
+| one | 0 | 50 | 2 | 509k (491k–510k) | 491k (490k–492k) | 505k (499k–508k) | 100% | 0 |
+| one | 0 | 50 | 3 | 480k (471k–495k) | 480k (479k–481k) | 486k (484k–488k) | 100% | 0 |
+| one | 0 | 50 | 4 | 467k (445k–470k) | 467k (466k–468k) | 474k (470k–476k) | 99% | 1 |
+| one | 0 | 50 | 6 | 375k (363k–390k) | 409k (398k–413k) | 414k (410k–421k) | 65% | 32 |
+| one | 0 | 50 | 8 | 351k (345k–354k) | 385k (381k–388k) | 395k (393k–400k) | 51% | 11 |
+| one | 0 | 200 | 2 | 466k (442k–466k) | 466k (465k–467k) | 478k (477k–479k) | 100% | 0 |
+| one | 0 | 200 | 3 | 433k (421k–451k) | 450k (447k–453k) | 459k (459k–461k) | 100% | 0 |
+| one | 0 | 200 | 4 | 419k (405k–430k) | 440k (438k–443k) | 447k (444k–449k) | 100% | 0 |
+| one | 0 | 200 | 6 | 348k (336k–350k) | 383k (383k–389k) | 394k (390k–402k) | 68% | 38 |
+| one | 0 | 200 | 8 | 331k (325k–332k) | 369k (360k–371k) | 373k (371k–381k) | 47% | 15 |
+| one | 0 | 1000 | 2 | 320k (309k–322k) | 341k (340k–341k) | 345k (343k–345k) | 100% | 0 |
+| one | 0 | 1000 | 3 | 306k (305k–315k) | 331k (331k–333k) | 336k (336k–337k) | 100% | 0 |
+| one | 0 | 1000 | 4 | 301k (298k–305k) | 325k (323k–326k) | 329k (329k–331k) | 100% | 0 |
+| one | 0 | 1000 | 6 | 261k (260k–263k) | 297k (281k–299k) | 300k (295k–303k) | 69% | 32 |
+| one | 0 | 1000 | 8 | 249k (246k–253k) | 286k (282k–290k) | 290k (289k–293k) | 46% | 15 |
+| one | 1000 | 50 | 2 | 337k (329k–337k) | 329k (328k–329k) | 334k (334k–335k) | 100% | 0 |
+| one | 1000 | 50 | 3 | 318k (317k–329k) | 323k (323k–324k) | 326k (325k–327k) | 100% | 0 |
+| one | 1000 | 50 | 4 | 317k (315k–318k) | 316k (313k–317k) | 320k (318k–321k) | 99% | 0 |
+| one | 1000 | 50 | 6 | 267k (262k–274k) | 284k (282k–287k) | 289k (287k–291k) | 66% | 27 |
+| one | 1000 | 50 | 8 | 252k (250k–257k) | 276k (267k–277k) | 280k (274k–280k) | 47% | 19 |
+| one | 1000 | 200 | 2 | 316k (308k–318k) | 317k (317k–318k) | 322k (322k–323k) | 100% | 0 |
+| one | 1000 | 200 | 3 | 303k (302k–310k) | 309k (309k–310k) | 313k (312k–314k) | 100% | 0 |
+| one | 1000 | 200 | 4 | 298k (294k–299k) | 304k (300k–305k) | 308k (305k–308k) | 99% | 1 |
+| one | 1000 | 200 | 6 | 251k (247k–253k) | 275k (270k–276k) | 278k (274k–282k) | 66% | 25 |
+| one | 1000 | 200 | 8 | 242k (241k–247k) | 264k (262k–267k) | 270k (267k–272k) | 51% | 13 |
+| one | 1000 | 1000 | 2 | 242k (236k–243k) | 253k (253k–254k) | 256k (255k–256k) | 100% | 0 |
+| one | 1000 | 1000 | 3 | 233k (233k–239k) | 248k (248k–249k) | 252k (251k–252k) | 100% | 0 |
+| one | 1000 | 1000 | 4 | 231k (226k–232k) | 244k (244k–245k) | 247k (244k–248k) | 100% | 0 |
+| one | 1000 | 1000 | 6 | 200k (186k–207k) | 223k (217k–226k) | 227k (214k–230k) | 67% | 36 |
+| one | 1000 | 1000 | 8 | 195k (190k–198k) | 220k (217k–221k) | 222k (219k–223k) | 50% | 19 |
+| all | 0 | 50 | 2 | 879k (875k–881k) | 818k (810k–819k) | 961k (960k–966k) | 100% | 0 |
+| all | 0 | 50 | 3 | 1.06M (1.05M–1.07M) | 986k (982k–988k) | 1.27M (1.26M–1.28M) | 100% | 0 |
+| all | 0 | 50 | 4 | 1.17M (1.16M–1.19M) | 1.09M (1.09M–1.09M) | 1.50M (1.47M–1.50M) | 100% | 0 |
+| all | 0 | 50 | 6 | 1.04M (1.04M–1.06M) | 1.06M (1.04M–1.07M) | 1.54M (1.53M–1.56M) | 68% | 219 |
+| all | 0 | 50 | 8 | 985k (962k–1.00M) | 1.05M (1.04M–1.06M) | 1.71M (1.68M–1.72M) | 50% | 135 |
+| all | 0 | 200 | 2 | 827k (793k–829k) | 733k (731k–740k) | 902k (898k–910k) | 100% | 0 |
+| all | 0 | 200 | 3 | 965k (947k–975k) | 866k (860k–871k) | 1.17M (1.15M–1.18M) | 100% | 0 |
+| all | 0 | 200 | 4 | 1.04M (940k–1.06M) | 945k (826k–948k) | 1.39M (1.34M–1.39M) | 98% | 3 |
+| all | 0 | 200 | 6 | 954k (926k–960k) | 930k (908k–937k) | 1.49M (1.47M–1.50M) | 67% | 179 |
+| all | 0 | 200 | 8 | 924k (907k–929k) | 941k (929k–950k) | 1.65M (1.62M–1.65M) | 49% | 107 |
+| all | 0 | 1000 | 2 | 496k (495k–501k) | 464k (464k–465k) | 643k (642k–644k) | 100% | 0 |
+| all | 0 | 1000 | 3 | 607k (606k–609k) | 512k (511k–513k) | 824k (823k–828k) | 100% | 0 |
+| all | 0 | 1000 | 4 | 656k (648k–658k) | 540k (536k–542k) | 953k (951k–956k) | 100% | 0 |
+| all | 0 | 1000 | 6 | 592k (581k–599k) | 507k (498k–515k) | 1.04M (982k–1.05M) | 67% | 177 |
+| all | 0 | 1000 | 8 | 562k (551k–566k) | 506k (500k–524k) | 1.14M (1.11M–1.14M) | 50% | 197 |
+| all | 1000 | 50 | 2 | 459k (451k–461k) | 803k (803k–808k) | 893k (872k–913k) | 100% | 0 |
+| all | 1000 | 50 | 3 | 629k (621k–647k) | 966k (934k–996k) | 1.23M (1.03M–1.24M) | 100% | 28 |
+| all | 1000 | 50 | 4 | 730k (703k–746k) | 1.07M (1.01M–1.08M) | 1.17M (1.06M–1.29M) | 100% | 0 |
+| all | 1000 | 50 | 6 | 737k (729k–741k) | 874k (868k–881k) | 1.06M (1.04M–1.07M) | 66% | 165 |
+| all | 1000 | 50 | 8 | 774k (770k–782k) | 896k (884k–899k) | 1.20M (1.17M–1.21M) | 49% | 187 |
+| all | 1000 | 200 | 2 | 440k (422k–457k) | 737k (736k–738k) | 901k (897k–908k) | 100% | 0 |
+| all | 1000 | 200 | 3 | 586k (564k–593k) | 861k (848k–882k) | 1.17M (1.16M–1.18M) | 100% | 0 |
+| all | 1000 | 200 | 4 | 681k (669k–683k) | 953k (935k–961k) | 1.35M (1.34M–1.38M) | 100% | 0 |
+| all | 1000 | 200 | 6 | 695k (677k–709k) | 824k (821k–844k) | 1.12M (1.09M–1.13M) | 67% | 217 |
+| all | 1000 | 200 | 8 | 723k (713k–731k) | 834k (805k–843k) | 1.23M (1.20M–1.24M) | 49% | 130 |
+| all | 1000 | 1000 | 2 | 367k (361k–376k) | 464k (461k–465k) | 642k (641k–646k) | 100% | 0 |
+| all | 1000 | 1000 | 3 | 439k (425k–441k) | 511k (511k–514k) | 822k (821k–823k) | 100% | 0 |
+| all | 1000 | 1000 | 4 | 489k (472k–502k) | 539k (534k–544k) | 951k (949k–953k) | 100% | 0 |
+| all | 1000 | 1000 | 6 | 491k (482k–497k) | 493k (483k–500k) | 1.03M (1.01M–1.03M) | 67% | 171 |
+| all | 1000 | 1000 | 8 | 495k (490k–502k) | 479k (475k–487k) | 1.13M (1.12M–1.14M) | 50% | 175 |
+
+Unmap latency, µs: p50 / p99 / p99.9 (p99.9 min–max)
+
+| initiators | ipi ns | W ns | k | 1 fair | 3 group lock | 3 range locks | on P | stalls |
+|---|---|---|---|---|---|---|---|---|
+| one | 0 | 50 | 2 | 0.58 / 0.74 / 1.12 (0.83–1.41) | 0.66 / 0.74 / 0.87 (0.83–4.29) | 0.62 / 0.74 / 2.37 (0.79–5.31) | 100% | 0 |
+| one | 0 | 50 | 3 | 0.70 / 0.87 / 5.31 (4.00–5.95) | 0.70 / 0.83 / 5.44 (4.61–6.21) | 0.70 / 0.79 / 5.57 (3.78–6.08) | 100% | 0 |
+| one | 0 | 50 | 4 | 0.74 / 1.00 / 7.68 (6.27–8.58) | 0.74 / 0.91 / 7.49 (7.42–8.32) | 0.70 / 0.83 / 7.36 (4.86–7.87) | 99% | 1 |
+| one | 0 | 50 | 6 | 1.25 / 1.66 / 8.06 (8.00–8.83) | 1.07 / 1.25 / 7.04 (6.53–7.36) | 1.00 / 1.20 / 6.66 (5.70–8.06) | 65% | 32 |
+| one | 0 | 50 | 8 | 1.49 / 1.90 / 8.32 (7.74–9.60) | 1.20 / 1.36 / 8.19 (6.53–8.96) | 1.15 / 1.33 / 8.19 (5.76–9.09) | 51% | 11 |
+| one | 0 | 200 | 2 | 0.79 / 0.91 / 1.12 (1.00–4.74) | 0.78 / 0.91 / 2.43 (0.95–3.39) | 0.74 / 0.83 / 1.87 (0.91–4.61) | 100% | 0 |
+| one | 0 | 200 | 3 | 0.91 / 1.07 / 6.46 (4.86–7.17) | 0.83 / 0.95 / 5.82 (4.03–6.91) | 0.83 / 0.91 / 5.25 (3.52–6.78) | 100% | 0 |
+| one | 0 | 200 | 4 | 1.00 / 1.20 / 8.13 (7.62–8.96) | 0.87 / 1.00 / 8.06 (5.06–8.83) | 0.87 / 0.95 / 8.06 (5.82–11.26) | 100% | 0 |
+| one | 0 | 200 | 6 | 1.49 / 1.87 / 7.62 (6.66–8.06) | 1.20 / 1.36 / 7.74 (5.76–8.32) | 1.12 / 1.33 / 6.72 (5.31–8.06) | 68% | 38 |
+| one | 0 | 200 | 8 | 1.66 / 2.11 / 9.34 (7.74–10.24) | 1.33 / 1.49 / 9.09 (6.78–9.47) | 1.28 / 1.46 / 8.83 (6.21–12.67) | 47% | 15 |
+| one | 0 | 1000 | 2 | 1.74 / 1.87 / 6.27 (2.21–7.55) | 1.57 / 1.70 / 5.70 (1.82–7.04) | 1.54 / 1.62 / 5.82 (1.70–7.62) | 100% | 0 |
+| one | 0 | 1000 | 3 | 1.87 / 2.03 / 9.34 (7.04–10.75) | 1.66 / 1.74 / 7.68 (5.18–8.19) | 1.58 / 1.70 / 8.19 (5.18–8.58) | 100% | 0 |
+| one | 0 | 1000 | 4 | 1.95 / 2.14 / 10.88 (9.73–12.42) | 1.66 / 1.79 / 10.37 (8.96–11.78) | 1.62 / 1.74 / 10.50 (8.58–11.39) | 100% | 0 |
+| one | 0 | 1000 | 6 | 2.40 / 2.82 / 10.50 (8.70–11.78) | 2.00 / 2.21 / 8.70 (7.94–10.75) | 1.90 / 2.14 / 8.96 (8.32–9.47) | 69% | 32 |
+| one | 0 | 1000 | 8 | 2.66 / 3.20 / 11.52 (9.22–13.44) | 2.14 / 2.30 / 9.86 (7.74–10.50) | 2.11 / 2.27 / 10.24 (9.86–10.50) | 46% | 15 |
+| one | 1000 | 50 | 2 | 1.58 / 1.74 / 6.46 (1.90–6.78) | 1.66 / 1.78 / 5.70 (1.87–8.00) | 1.62 / 1.74 / 6.27 (4.86–6.91) | 100% | 0 |
+| one | 1000 | 50 | 3 | 1.78 / 1.90 / 8.45 (5.44–8.96) | 1.70 / 1.82 / 8.45 (5.70–9.34) | 1.70 / 1.79 / 8.32 (6.02–9.73) | 100% | 0 |
+| one | 1000 | 50 | 4 | 1.74 / 2.00 / 10.62 (10.11–12.03) | 1.74 / 1.95 / 11.52 (10.88–11.78) | 1.70 / 1.82 / 10.88 (9.60–11.14) | 99% | 0 |
+| one | 1000 | 50 | 6 | 2.30 / 2.78 / 10.50 (9.86–10.75) | 2.11 / 2.30 / 9.34 (9.09–9.98) | 2.03 / 2.27 / 9.34 (8.00–10.24) | 66% | 27 |
+| one | 1000 | 50 | 8 | 2.53 / 3.07 / 11.39 (9.73–12.80) | 2.24 / 2.43 / 10.88 (10.50–11.90) | 2.21 / 2.37 / 9.86 (9.60–10.62) | 47% | 19 |
+| one | 1000 | 200 | 2 | 1.79 / 1.90 / 6.40 (4.16–7.74) | 1.78 / 1.90 / 6.02 (2.00–6.78) | 1.70 / 1.87 / 5.25 (2.43–6.98) | 100% | 0 |
+| one | 1000 | 200 | 3 | 1.90 / 2.08 / 9.09 (7.55–10.11) | 1.82 / 1.95 / 9.34 (5.63–9.86) | 1.82 / 1.90 / 9.22 (6.27–10.62) | 100% | 0 |
+| one | 1000 | 200 | 4 | 1.95 / 2.24 / 12.67 (10.62–13.57) | 1.87 / 2.03 / 10.37 (9.86–12.42) | 1.82 / 2.00 / 11.65 (10.75–13.57) | 99% | 1 |
+| one | 1000 | 200 | 6 | 2.53 / 2.98 / 11.01 (10.50–12.03) | 2.21 / 2.43 / 9.98 (9.22–10.75) | 2.14 / 2.40 / 9.86 (9.34–10.24) | 66% | 25 |
+| one | 1000 | 200 | 8 | 2.72 / 3.33 / 11.26 (9.34–16.00) | 2.37 / 2.56 / 10.50 (8.83–12.03) | 2.30 / 2.53 / 10.24 (8.32–11.65) | 51% | 13 |
+| one | 1000 | 1000 | 2 | 2.72 / 2.85 / 8.00 (5.25–9.09) | 2.56 / 2.69 / 8.32 (3.39–8.96) | 2.53 / 2.66 / 7.68 (5.76–8.83) | 100% | 0 |
+| one | 1000 | 1000 | 3 | 2.85 / 3.04 / 11.01 (7.55–11.65) | 2.66 / 2.72 / 10.75 (7.49–11.01) | 2.56 / 2.69 / 9.60 (8.45–10.37) | 100% | 0 |
+| one | 1000 | 1000 | 4 | 2.91 / 3.14 / 13.82 (13.57–15.87) | 2.66 / 2.91 / 13.82 (12.16–15.10) | 2.62 / 2.85 / 12.42 (12.03–14.72) | 100% | 0 |
+| one | 1000 | 1000 | 6 | 3.55 / 4.10 / 12.67 (10.24–14.08) | 3.04 / 3.33 / 11.39 (9.86–12.16) | 2.94 / 3.23 / 11.14 (9.98–11.14) | 67% | 36 |
+| one | 1000 | 1000 | 8 | 3.65 / 4.86 / 14.85 (11.78–18.94) | 3.20 / 3.87 / 11.90 (11.26–12.67) | 3.10 / 3.46 / 12.42 (10.62–13.31) | 50% | 19 |
+| all | 0 | 50 | 2 | 0.66 / 1.00 / 4.06 (1.74–5.12) | 1.07 / 1.25 / 4.61 (1.33–4.74) | 0.66 / 1.07 / 2.98 (1.15–4.61) | 100% | 0 |
+| all | 0 | 50 | 3 | 1.00 / 1.57 / 7.17 (4.42–8.32) | 1.66 / 1.82 / 7.74 (5.18–8.70) | 0.95 / 1.54 / 6.53 (4.10–7.17) | 100% | 0 |
+| all | 0 | 50 | 4 | 1.07 / 2.00 / 9.86 (6.91–10.62) | 2.27 / 2.50 / 11.39 (9.47–12.16) | 1.25 / 1.87 / 8.70 (6.78–9.34) | 100% | 0 |
+| all | 0 | 50 | 6 | 2.43 / 5.57 / 12.93 (11.90–14.34) | 4.03 / 5.57 / 13.44 (12.42–13.70) | 1.82 / 3.26 / 9.22 (7.74–10.11) | 68% | 219 |
+| all | 0 | 50 | 8 | 4.10 / 10.50 / 17.41 (16.64–19.97) | 6.08 / 8.45 / 17.66 (16.64–22.27) | 2.21 / 4.42 / 10.88 (9.09–12.29) | 50% | 135 |
+| all | 0 | 200 | 2 | 1.00 / 1.20 / 4.00 (2.14–4.48) | 1.36 / 1.49 / 5.70 (4.99–10.37) | 0.83 / 1.33 / 2.82 (1.36–5.44) | 100% | 0 |
+| all | 0 | 200 | 3 | 1.46 / 1.90 / 7.87 (5.82–9.47) | 2.08 / 2.24 / 8.70 (6.21–11.78) | 1.07 / 1.95 / 6.40 (4.16–12.42) | 100% | 0 |
+| all | 0 | 200 | 4 | 1.46 / 2.69 / 12.80 (11.65–61.44) | 2.82 / 3.04 / 12.42 (11.01–58.88) | 1.46 / 2.24 / 9.34 (5.57–11.39) | 98% | 3 |
+| all | 0 | 200 | 6 | 2.82 / 6.27 / 14.59 (13.18–16.00) | 4.99 / 6.27 / 14.59 (13.06–15.62) | 2.21 / 3.78 / 9.60 (7.94–9.98) | 67% | 179 |
+| all | 0 | 200 | 8 | 4.48 / 11.52 / 18.69 (17.66–20.74) | 7.17 / 9.34 / 18.43 (17.41–20.22) | 2.53 / 4.99 / 11.26 (9.60–13.57) | 49% | 107 |
+| all | 0 | 1000 | 2 | 2.62 / 2.78 / 8.19 (3.04–8.45) | 2.94 / 3.07 / 8.32 (6.14–8.96) | 1.58 / 2.91 / 6.14 (6.02–6.46) | 100% | 0 |
+| all | 0 | 1000 | 3 | 2.50 / 4.10 / 11.52 (7.10–12.42) | 4.42 / 4.61 / 13.44 (11.26–14.46) | 1.87 / 4.29 / 8.96 (6.72–9.73) | 100% | 0 |
+| all | 0 | 1000 | 4 | 2.82 / 5.70 / 18.94 (15.49–19.71) | 5.95 / 6.27 / 23.81 (18.43–25.60) | 3.04 / 4.61 / 13.06 (10.75–13.57) | 100% | 0 |
+| all | 0 | 1000 | 6 | 6.21 / 13.57 / 20.48 (17.66–23.04) | 10.37 / 11.39 / 23.04 (21.25–26.62) | 4.16 / 7.23 / 12.80 (11.78–14.34) | 67% | 177 |
+| all | 0 | 1000 | 8 | 10.24 / 19.46 / 26.11 (24.32–30.72) | 14.59 / 16.26 / 28.42 (24.58–29.95) | 5.31 / 9.34 / 16.13 (14.85–18.18) | 50% | 197 |
+| all | 1000 | 50 | 2 | 1.62 / 1.79 / 7.42 (2.21–7.68) | 1.12 / 1.57 / 5.31 (1.82–5.63) | 0.70 / 1.70 / 4.00 (1.79–6.46) | 100% | 0 |
+| all | 1000 | 50 | 3 | 2.08 / 3.39 / 10.11 (7.49–19.97) | 1.66 / 1.90 / 8.06 (7.30–14.85) | 0.95 / 1.82 / 6.85 (5.76–16.13) | 100% | 28 |
+| all | 1000 | 50 | 4 | 2.27 / 4.35 / 16.13 (14.72–18.94) | 2.27 / 2.50 / 12.29 (10.88–16.90) | 1.46 / 2.00 / 10.88 (8.06–12.67) | 100% | 0 |
+| all | 1000 | 50 | 6 | 3.52 / 6.78 / 15.10 (13.31–17.41) | 3.52 / 5.63 / 13.57 (11.78–15.23) | 2.14 / 3.68 / 11.14 (9.22–19.46) | 66% | 165 |
+| all | 1000 | 50 | 8 | 5.06 / 9.47 / 18.69 (17.66–19.46) | 4.48 / 8.32 / 20.22 (14.72–28.67) | 2.43 / 4.74 / 12.42 (11.78–17.15) | 49% | 187 |
+| all | 1000 | 200 | 2 | 1.74 / 1.95 / 6.78 (2.08–7.49) | 1.36 / 1.49 / 5.70 (2.08–6.72) | 0.79 / 1.33 / 4.16 (1.66–4.74) | 100% | 0 |
+| all | 1000 | 200 | 3 | 2.03 / 3.78 / 10.37 (6.72–12.54) | 2.08 / 2.24 / 9.22 (6.34–10.37) | 1.07 / 1.95 / 7.04 (4.74–7.55) | 100% | 0 |
+| all | 1000 | 200 | 4 | 2.53 / 4.74 / 15.36 (14.85–17.66) | 2.72 / 3.23 / 13.44 (11.26–15.62) | 1.46 / 2.24 / 10.88 (6.66–11.01) | 100% | 0 |
+| all | 1000 | 200 | 6 | 4.00 / 7.49 / 16.13 (14.98–16.64) | 5.06 / 6.53 / 15.62 (12.80–20.74) | 2.30 / 4.00 / 10.62 (10.24–11.39) | 67% | 217 |
+| all | 1000 | 200 | 8 | 5.63 / 10.11 / 19.46 (18.94–25.09) | 5.95 / 9.47 / 20.22 (16.38–44.54) | 2.66 / 5.25 / 13.31 (10.75–38.40) | 49% | 130 |
+| all | 1000 | 1000 | 2 | 2.56 / 2.85 / 8.83 (7.42–9.47) | 2.94 / 3.07 / 8.32 (3.20–9.60) | 1.58 / 2.91 / 5.63 (2.98–7.49) | 100% | 0 |
+| all | 1000 | 1000 | 3 | 2.94 / 5.70 / 13.57 (9.34–16.38) | 4.42 / 4.61 / 13.95 (10.24–15.36) | 1.87 / 4.29 / 9.60 (8.83–10.62) | 100% | 0 |
+| all | 1000 | 1000 | 4 | 4.74 / 6.78 / 22.27 (21.50–26.62) | 5.95 / 6.72 / 23.55 (20.22–26.62) | 3.04 / 4.61 / 13.70 (13.18–14.21) | 100% | 0 |
+| all | 1000 | 1000 | 6 | 7.04 / 11.78 / 20.99 (20.22–22.27) | 10.50 / 12.29 / 23.30 (20.99–25.34) | 4.16 / 7.36 / 13.95 (13.06–15.36) | 67% | 171 |
+| all | 1000 | 1000 | 8 | 9.86 / 20.22 / 27.90 (25.34–31.23) | 14.85 / 17.15 / 30.98 (25.09–32.51) | 5.31 / 9.47 / 15.23 (14.08–20.99) | 50% | 175 |
+
+Migrations seen: 86083 over 85200569 samples (one sample per measured operation).
+
+
+### Suite srv: a passive server shared by a background and a foreground client
+
+load average before: { 5.69 5.27 4.56 }
+load average after: { 4.82 5.00 4.60 }; 229 s
+
+Foreground call latency, µs: p50 / p99 / p99.9 (p99.9 min–max)
+
+| threads | background | ipi ns | 1 fifo | 3 fifo | 3 all fifo | 1 lend | 3 lend | 3 all lend | 1 refuse | 3 refuse | 3 all refuse | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | on | 0 | 52.22 / 172.03 / 176.13 (176.13–176.13) | 52.22 / 172.03 / 176.13 (176.13–176.13) | 50.18 / 174.08 / 176.13 (176.13–178.18) | 32.26 / 57.86 / 59.39 (58.37–3112.96) | 32.51 / 57.86 / 59.90 (59.39–63.49) | 33.28 / 57.86 / 61.95 (60.42–69.63) | 6.46 / 56.83 / 58.37 (58.37–68.61) | 6.53 / 56.83 / 59.39 (58.37–64.00) | 6.53 / 57.34 / 60.42 (59.39–74.75) | 100% | 6 |
+| 1 | on | 1000 | 50.69 / 169.98 / 174.08 (172.03–178.18) | 50.18 / 167.94 / 172.03 (172.03–174.08) | 50.69 / 169.98 / 174.08 (174.08–174.08) | 33.28 / 58.88 / 64.00 (61.95–66.56) | 33.28 / 58.88 / 67.58 (64.51–84.99) | 33.79 / 59.90 / 65.02 (60.42–72.70) | 8.45 / 57.86 / 59.39 (58.88–59.90) | 8.45 / 57.86 / 60.42 (58.88–60.93) | 8.58 / 59.39 / 60.42 (60.42–60.42) | 100% | 0 |
+| 1 | off | 0 | 6.40 / 9.73 / 34.82 (19.20–50.18) | 6.40 / 9.47 / 26.11 (23.55–50.18) | 6.40 / 9.34 / 32.00 (18.43–3211.26) | 6.40 / 9.47 / 28.42 (20.22–44.54) | 6.40 / 9.22 / 30.72 (14.72–34.30) | 6.40 / 8.32 / 26.88 (17.66–33.28) | 6.40 / 9.09 / 32.77 (15.10–43.01) | 6.40 / 9.22 / 16.26 (10.62–25.60) | 6.40 / 9.22 / 23.04 (18.69–29.95) | 100% | 2 |
+| 1 | off | 1000 | 8.45 / 11.78 / 32.77 (28.93–41.47) | 8.45 / 11.52 / 36.35 (15.74–44.03) | 8.45 / 10.37 / 30.98 (20.22–36.35) | 8.45 / 11.65 / 23.04 (19.97–43.01) | 8.45 / 11.65 / 20.74 (16.90–33.79) | 8.45 / 11.26 / 40.45 (34.82–44.03) | 8.45 / 11.65 / 34.82 (15.23–40.45) | 8.45 / 11.65 / 29.70 (12.67–36.86) | 8.45 / 8.70 / 21.50 (20.22–41.98) | 100% | 0 |
+| 2 | on | 0 | 6.66 / 10.88 / 30.46 (24.06–46.08) | 6.53 / 10.37 / 33.28 (22.53–41.98) | 6.40 / 9.47 / 23.55 (17.15–28.93) | 6.66 / 11.01 / 37.89 (28.93–43.01) | 6.53 / 10.11 / 20.22 (17.66–35.33) | 6.40 / 9.22 / 28.67 (22.02–52.22) | 6.46 / 10.24 / 35.33 (27.14–43.52) | 6.72 / 10.37 / 24.32 (17.15–29.95) | 6.40 / 9.34 / 26.62 (19.46–32.77) | 99% | 3 |
+| 2 | on | 1000 | 9.60 / 14.34 / 36.86 (23.04–44.54) | 8.70 / 12.29 / 32.26 (22.27–49.15) | 8.45 / 11.52 / 34.82 (20.48–46.08) | 9.60 / 14.21 / 41.98 (21.25–57.86) | 8.58 / 12.29 / 26.88 (18.94–49.66) | 8.45 / 11.52 / 40.45 (23.30–44.03) | 8.58 / 13.82 / 36.86 (27.14–46.59) | 8.70 / 13.18 / 32.51 (24.58–38.40) | 8.45 / 11.52 / 44.54 (20.74–51.20) | 99% | 3 |
+| 2 | off | 0 | 6.46 / 10.62 / 34.82 (23.55–41.98) | 6.66 / 10.37 / 29.95 (15.62–51.71) | 6.46 / 9.47 / 28.42 (19.97–47.10) | 6.46 / 10.50 / 28.67 (22.53–54.78) | 6.72 / 10.37 / 28.16 (22.78–44.54) | 6.46 / 9.73 / 27.90 (22.78–45.06) | 6.46 / 10.75 / 28.67 (20.48–39.94) | 6.85 / 10.50 / 35.84 (28.67–37.89) | 6.46 / 10.50 / 27.90 (24.58–35.84) | 99% | 0 |
+| 2 | off | 1000 | 8.45 / 12.67 / 46.59 (27.39–2260.99) | 9.73 / 14.72 / 41.47 (30.21–45.57) | 8.45 / 11.90 / 27.39 (20.22–44.54) | 8.45 / 12.29 / 34.30 (30.98–61.95) | 8.83 / 13.57 / 32.26 (26.11–40.96) | 8.45 / 12.54 / 37.38 (19.20–47.62) | 8.45 / 12.29 / 33.79 (28.67–62.98) | 9.86 / 13.57 / 31.49 (30.72–38.40) | 8.45 / 11.90 / 32.00 (18.94–36.86) | 99% | 5 |
+
+Background calls served/s
+
+| threads | background | ipi ns | 1 fifo | 3 fifo | 3 all fifo | 1 lend | 3 lend | 3 all lend | 1 refuse | 3 refuse | 3 all refuse | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | on | 0 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 11k (10k–11k) | 11k (11k–11k) | 11k (11k–11k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 100% | 6 |
+| 1 | on | 1000 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 11k (11k–11k) | 11k (11k–11k) | 11k (11k–11k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 100% | 0 |
+| 1 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 2 |
+| 1 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 0 |
+| 2 | on | 0 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 99% | 3 |
+| 2 | on | 1000 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 99% | 3 |
+| 2 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 0 |
+| 2 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 5 |
+
+Calls refused/s
+
+| threads | background | ipi ns | 1 fifo | 3 fifo | 3 all fifo | 1 lend | 3 lend | 3 all lend | 1 refuse | 3 refuse | 3 all refuse | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | on | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 100% | 6 |
+| 1 | on | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 100% | 0 |
+| 1 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 2 |
+| 1 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 0 |
+| 2 | on | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 99% | 3 |
+| 2 | on | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 99% | 3 |
+| 2 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 0 |
+| 2 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 5 |
+
+Migrations seen: 36250 over 1805773 samples (one sample per measured operation).
+
+
+## Appendix H: full tables, fourth series, pass 2
+
+
+host: macos aarch64, Apple M5, 4 performance + 6 efficiency cores
+pinning: none possible; user-interactive QoS
+clock: resolution 41 ns, 13.4 ns per read
+reps 5, 150 ms per run, max k 8, lock of the group candidates: queue
+
+### Suite a3n: k-1 threads signal one notify, notify by one atomic OR
+
+load average before: { 4.82 5.00 4.60 }
+load average after: { 5.74 5.50 4.94 }; 268 s
+
+Throughput, signals/s, median (min–max)
+
+| regime | ipi ns | W ns | k | 1 locked apply | 1 OR apply | 3 notify lock | 3 atomic | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|
+| as a3t | 0 | 50 | 2 | 707k (703k–710k) | 707k (703k–709k) | 659k (657k–662k) | 645k (645k–649k) | 100% | 0 |
+| as a3t | 0 | 50 | 4 | 2.09M (2.08M–2.11M) | 2.09M (2.07M–2.10M) | 1.94M (1.92M–1.95M) | 1.94M (1.93M–1.95M) | 99% | 0 |
+| as a3t | 0 | 50 | 6 | 3.40M (3.28M–3.42M) | 3.38M (2.98M–3.41M) | 2.53M (2.45M–2.66M) | 3.05M (3.04M–3.06M) | 67% | 65 |
+| as a3t | 0 | 50 | 8 | 4.69M (4.67M–4.70M) | 4.69M (4.63M–4.70M) | 2.87M (2.82M–2.91M) | 4.26M (4.22M–4.29M) | 50% | 39 |
+| as a3t | 0 | 200 | 2 | 653k (652k–655k) | 654k (647k–655k) | 565k (565k–567k) | 604k (601k–604k) | 100% | 0 |
+| as a3t | 0 | 200 | 4 | 1.94M (1.93M–1.95M) | 1.94M (1.93M–1.94M) | 1.66M (1.66M–1.68M) | 1.80M (1.79M–1.82M) | 99% | 0 |
+| as a3t | 0 | 200 | 6 | 3.19M (3.15M–3.20M) | 3.18M (3.16M–3.21M) | 1.84M (1.83M–1.94M) | 2.87M (2.85M–2.89M) | 67% | 44 |
+| as a3t | 0 | 200 | 8 | 4.42M (4.39M–4.42M) | 4.40M (4.38M–4.41M) | 2.10M (2.05M–2.13M) | 4.05M (4.05M–4.12M) | 50% | 45 |
+| as a3t | 0 | 1000 | 2 | 526k (525k–527k) | 526k (522k–526k) | 396k (396k–397k) | 489k (488k–492k) | 100% | 0 |
+| as a3t | 0 | 1000 | 4 | 1.56M (1.55M–1.56M) | 1.56M (1.55M–1.57M) | 890k (868k–912k) | 1.47M (1.47M–1.48M) | 99% | 0 |
+| as a3t | 0 | 1000 | 6 | 1.88M (1.86M–1.89M) | 2.57M (2.55M–2.57M) | 980k (969k–990k) | 2.38M (2.36M–2.40M) | 66% | 59 |
+| as a3t | 0 | 1000 | 8 | 1.87M (1.85M–1.88M) | 3.61M (3.60M–3.62M) | 1.04M (1.02M–1.08M) | 3.43M (3.42M–3.48M) | 49% | 49 |
+| as a3t | 1000 | 50 | 2 | 705k (702k–711k) | 704k (701k–713k) | 660k (657k–662k) | 646k (645k–651k) | 100% | 0 |
+| as a3t | 1000 | 50 | 4 | 2.09M (2.08M–2.11M) | 2.09M (2.08M–2.10M) | 1.94M (1.93M–1.95M) | 1.94M (1.93M–1.95M) | 100% | 0 |
+| as a3t | 1000 | 50 | 6 | 3.41M (3.36M–3.41M) | 3.40M (3.30M–3.42M) | 2.77M (2.75M–2.89M) | 3.16M (3.11M–3.19M) | 67% | 36 |
+| as a3t | 1000 | 50 | 8 | 4.71M (4.67M–4.74M) | 4.70M (4.68M–4.72M) | 3.25M (2.78M–3.44M) | 4.45M (4.33M–4.48M) | 50% | 70 |
+| as a3t | 1000 | 200 | 2 | 654k (651k–656k) | 652k (647k–656k) | 569k (566k–569k) | 603k (602k–606k) | 100% | 0 |
+| as a3t | 1000 | 200 | 4 | 1.94M (1.93M–1.95M) | 1.94M (1.93M–1.95M) | 1.67M (1.67M–1.69M) | 1.81M (1.80M–1.82M) | 99% | 0 |
+| as a3t | 1000 | 200 | 6 | 3.20M (3.19M–3.20M) | 3.20M (3.19M–3.20M) | 2.20M (2.14M–2.26M) | 2.97M (2.95M–2.97M) | 66% | 41 |
+| as a3t | 1000 | 200 | 8 | 4.42M (4.39M–4.42M) | 4.41M (4.39M–4.43M) | 2.24M (2.21M–2.27M) | 4.21M (4.18M–4.24M) | 50% | 24 |
+| as a3t | 1000 | 1000 | 2 | 527k (525k–527k) | 527k (525k–528k) | 396k (395k–396k) | 492k (491k–493k) | 100% | 0 |
+| as a3t | 1000 | 1000 | 4 | 1.56M (1.56M–1.56M) | 1.56M (1.55M–1.56M) | 1.06M (1.05M–1.06M) | 1.47M (1.47M–1.49M) | 99% | 0 |
+| as a3t | 1000 | 1000 | 6 | 1.88M (1.87M–1.89M) | 2.56M (2.55M–2.58M) | 1.08M (1.05M–1.10M) | 2.45M (2.44M–2.46M) | 66% | 69 |
+| as a3t | 1000 | 1000 | 8 | 1.87M (1.86M–1.88M) | 3.62M (3.61M–3.63M) | 1.11M (1.10M–1.12M) | 3.57M (3.57M–3.58M) | 50% | 62 |
+| busy | 0 | 50 | 2 | 705k (702k–712k) | 707k (702k–710k) | 697k (696k–701k) | 722k (719k–724k) | 100% | 0 |
+| busy | 0 | 50 | 4 | 2.09M (2.08M–2.10M) | 2.09M (2.08M–2.10M) | 1.95M (1.95M–1.96M) | 2.11M (2.09M–2.11M) | 99% | 1 |
+| busy | 0 | 50 | 6 | 3.40M (3.36M–3.42M) | 3.40M (3.36M–3.42M) | 2.88M (2.80M–2.97M) | 3.42M (3.39M–3.43M) | 67% | 25 |
+| busy | 0 | 50 | 8 | 4.69M (4.58M–4.70M) | 4.69M (4.66M–4.70M) | 3.60M (3.39M–3.81M) | 4.78M (4.77M–4.80M) | 50% | 22 |
+| busy | 0 | 200 | 2 | 652k (649k–656k) | 653k (650k–654k) | 619k (619k–625k) | 677k (674k–680k) | 100% | 0 |
+| busy | 0 | 200 | 4 | 1.94M (1.93M–1.95M) | 1.94M (1.93M–1.95M) | 1.68M (1.67M–1.68M) | 1.96M (1.95M–1.96M) | 99% | 0 |
+| busy | 0 | 200 | 6 | 3.18M (3.16M–3.19M) | 3.18M (3.17M–3.20M) | 2.50M (2.40M–2.60M) | 3.20M (3.18M–3.20M) | 66% | 33 |
+| busy | 0 | 200 | 8 | 4.42M (4.40M–4.43M) | 4.41M (4.40M–4.41M) | 2.55M (2.47M–2.64M) | 4.47M (4.46M–4.48M) | 49% | 51 |
+| busy | 0 | 1000 | 2 | 526k (525k–529k) | 525k (523k–525k) | 420k (419k–424k) | 539k (539k–541k) | 100% | 0 |
+| busy | 0 | 1000 | 4 | 1.56M (1.55M–1.56M) | 1.56M (1.55M–1.56M) | 1.16M (1.16M–1.17M) | 1.57M (1.57M–1.57M) | 100% | 0 |
+| busy | 0 | 1000 | 6 | 1.88M (1.86M–1.90M) | 2.57M (2.54M–2.57M) | 1.22M (1.19M–1.28M) | 2.58M (2.57M–2.59M) | 66% | 56 |
+| busy | 0 | 1000 | 8 | 1.87M (1.86M–1.88M) | 3.61M (3.57M–3.62M) | 1.24M (1.19M–1.29M) | 3.64M (3.62M–3.64M) | 50% | 51 |
+| busy | 1000 | 50 | 2 | 706k (702k–707k) | 706k (702k–710k) | 698k (696k–702k) | 718k (718k–721k) | 100% | 0 |
+| busy | 1000 | 50 | 4 | 2.09M (2.07M–2.10M) | 2.09M (2.09M–2.10M) | 1.95M (1.94M–1.96M) | 2.10M (2.10M–2.12M) | 99% | 0 |
+| busy | 1000 | 50 | 6 | 3.40M (3.34M–3.41M) | 3.40M (3.36M–3.42M) | 2.88M (2.76M–2.99M) | 3.40M (3.39M–3.43M) | 67% | 33 |
+| busy | 1000 | 50 | 8 | 4.71M (4.68M–4.73M) | 4.69M (4.61M–4.70M) | 3.63M (3.42M–3.90M) | 4.77M (4.75M–4.79M) | 50% | 22 |
+| busy | 1000 | 200 | 2 | 653k (650k–660k) | 653k (650k–657k) | 620k (618k–621k) | 679k (678k–681k) | 100% | 0 |
+| busy | 1000 | 200 | 4 | 1.94M (1.94M–1.95M) | 1.94M (1.93M–1.95M) | 1.68M (1.67M–1.69M) | 1.96M (1.95M–1.97M) | 99% | 0 |
+| busy | 1000 | 200 | 6 | 3.18M (3.11M–3.19M) | 3.18M (3.15M–3.19M) | 2.47M (2.37M–2.56M) | 3.20M (2.87M–3.21M) | 66% | 37 |
+| busy | 1000 | 200 | 8 | 4.41M (4.41M–4.42M) | 4.42M (4.39M–4.42M) | 2.52M (2.47M–2.64M) | 4.47M (4.46M–4.49M) | 49% | 33 |
+| busy | 1000 | 1000 | 2 | 525k (523k–529k) | 525k (523k–528k) | 420k (420k–423k) | 539k (537k–539k) | 100% | 0 |
+| busy | 1000 | 1000 | 4 | 1.56M (1.55M–1.56M) | 1.55M (1.55M–1.56M) | 1.17M (1.17M–1.17M) | 1.57M (1.57M–1.57M) | 99% | 0 |
+| busy | 1000 | 1000 | 6 | 1.87M (1.86M–1.89M) | 2.56M (2.53M–2.58M) | 1.25M (1.21M–1.29M) | 2.57M (2.56M–2.58M) | 66% | 76 |
+| busy | 1000 | 1000 | 8 | 1.87M (1.86M–1.88M) | 3.60M (3.56M–3.62M) | 1.24M (1.19M–1.27M) | 3.64M (3.63M–3.65M) | 49% | 67 |
+| idle | 0 | 50 | 2 | 39k (39k–40k) | 39k (39k–39k) | 39k (38k–39k) | 39k (38k–39k) | 100% | 0 |
+| idle | 0 | 50 | 4 | 116k (116k–118k) | 116k (116k–117k) | 115k (115k–117k) | 116k (115k–116k) | 100% | 0 |
+| idle | 0 | 50 | 6 | 199k (198k–201k) | 198k (198k–200k) | 197k (195k–199k) | 197k (196k–199k) | 65% | 6 |
+| idle | 0 | 50 | 8 | 282k (279k–283k) | 281k (280k–282k) | 278k (277k–280k) | 280k (279k–282k) | 48% | 0 |
+| idle | 0 | 200 | 2 | 39k (38k–39k) | 39k (38k–39k) | 38k (38k–38k) | 38k (38k–39k) | 100% | 0 |
+| idle | 0 | 200 | 4 | 115k (114k–116k) | 115k (114k–116k) | 115k (114k–115k) | 115k (114k–115k) | 99% | 0 |
+| idle | 0 | 200 | 6 | 199k (197k–200k) | 199k (198k–199k) | 196k (193k–197k) | 197k (196k–197k) | 64% | 6 |
+| idle | 0 | 200 | 8 | 281k (278k–282k) | 280k (280k–281k) | 277k (275k–278k) | 280k (278k–281k) | 47% | 0 |
+| idle | 0 | 1000 | 2 | 38k (38k–38k) | 38k (38k–39k) | 37k (37k–38k) | 38k (38k–38k) | 99% | 0 |
+| idle | 0 | 1000 | 4 | 114k (113k–114k) | 114k (113k–114k) | 112k (110k–112k) | 113k (112k–115k) | 99% | 0 |
+| idle | 0 | 1000 | 6 | 196k (194k–197k) | 195k (195k–195k) | 189k (188k–191k) | 193k (193k–195k) | 65% | 6 |
+| idle | 0 | 1000 | 8 | 276k (275k–277k) | 276k (274k–276k) | 266k (266k–268k) | 276k (275k–277k) | 48% | 0 |
+| idle | 1000 | 50 | 2 | 39k (38k–39k) | 39k (39k–39k) | 39k (39k–39k) | 39k (38k–39k) | 100% | 0 |
+| idle | 1000 | 50 | 4 | 116k (115k–117k) | 116k (115k–117k) | 116k (114k–116k) | 116k (115k–117k) | 99% | 0 |
+| idle | 1000 | 50 | 6 | 199k (197k–200k) | 199k (197k–201k) | 197k (196k–197k) | 198k (197k–199k) | 64% | 0 |
+| idle | 1000 | 50 | 8 | 281k (281k–283k) | 281k (280k–282k) | 279k (277k–281k) | 281k (280k–282k) | 48% | 0 |
+| idle | 1000 | 200 | 2 | 39k (39k–39k) | 39k (38k–39k) | 38k (38k–38k) | 38k (38k–39k) | 100% | 0 |
+| idle | 1000 | 200 | 4 | 115k (114k–116k) | 116k (115k–116k) | 114k (114k–114k) | 115k (114k–115k) | 99% | 0 |
+| idle | 1000 | 200 | 6 | 197k (197k–199k) | 198k (198k–199k) | 197k (196k–197k) | 197k (196k–197k) | 64% | 1 |
+| idle | 1000 | 200 | 8 | 280k (274k–281k) | 280k (277k–280k) | 276k (274k–277k) | 279k (277k–280k) | 48% | 0 |
+| idle | 1000 | 1000 | 2 | 38k (38k–38k) | 38k (38k–39k) | 37k (37k–38k) | 38k (38k–38k) | 100% | 0 |
+| idle | 1000 | 1000 | 4 | 114k (113k–115k) | 114k (113k–115k) | 111k (110k–112k) | 113k (113k–114k) | 99% | 0 |
+| idle | 1000 | 1000 | 6 | 195k (194k–197k) | 196k (195k–197k) | 189k (188k–191k) | 194k (193k–195k) | 65% | 5 |
+| idle | 1000 | 1000 | 8 | 276k (275k–278k) | 276k (274k–278k) | 268k (265k–268k) | 278k (275k–278k) | 48% | 0 |
+
+Signal call latency, µs: p50 / p99 / p99.9 (p99.9 min–max)
+
+| regime | ipi ns | W ns | k | 1 locked apply | 1 OR apply | 3 notify lock | 3 atomic | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|
+| as a3t | 0 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.21 / 0.25 / 0.29 (0.29–0.29) | 0.21 / 0.25 / 0.33 (0.29–0.33) | 100% | 0 |
+| as a3t | 0 | 50 | 4 | 0.08 / 0.17 / 0.25 (0.25–0.33) | 0.08 / 0.12 / 0.29 (0.25–0.33) | 0.21 / 0.37 / 0.79 (0.70–0.87) | 0.25 / 0.33 / 0.50 (0.50–0.66) | 99% | 0 |
+| as a3t | 0 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.33–0.33) | 0.12 / 0.25 / 0.33 (0.33–0.33) | 0.62 / 1.15 / 4.74 (1.74–6.21) | 0.29 / 0.70 / 0.83 (0.83–0.83) | 67% | 65 |
+| as a3t | 0 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 1.07 / 1.82 / 8.58 (6.91–18.43) | 0.29 / 0.83 / 1.07 (1.04–1.12) | 50% | 39 |
+| as a3t | 0 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.33) | 0.21 / 0.25 / 0.29 (0.25–0.29) | 0.46 / 0.50 / 0.54 (0.50–0.54) | 0.33 / 0.37 / 0.42 (0.42–0.42) | 100% | 0 |
+| as a3t | 0 | 200 | 4 | 0.21 / 0.25 / 0.42 (0.37–0.46) | 0.21 / 0.25 / 0.42 (0.37–0.46) | 0.46 / 0.58 / 1.33 (0.83–1.36) | 0.33 / 0.46 / 0.66 (0.58–0.70) | 99% | 0 |
+| as a3t | 0 | 200 | 6 | 0.25 / 0.37 / 0.42 (0.42–0.42) | 0.25 / 0.37 / 0.42 (0.42–0.42) | 1.36 / 1.79 / 7.04 (5.44–7.87) | 0.37 / 0.79 / 0.91 (0.91–0.91) | 67% | 44 |
+| as a3t | 0 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.87 / 2.82 / 10.37 (9.09–11.01) | 0.33 / 0.95 / 1.15 (1.15–1.15) | 50% | 45 |
+| as a3t | 0 | 1000 | 2 | 0.58 / 0.62 / 0.62 (0.62–0.66) | 0.58 / 0.62 / 0.66 (0.62–0.70) | 1.15 / 1.25 / 1.33 (1.28–1.33) | 0.70 / 0.74 / 0.83 (0.79–0.83) | 100% | 0 |
+| as a3t | 0 | 1000 | 4 | 0.58 / 0.66 / 0.79 (0.70–0.87) | 0.58 / 0.62 / 0.83 (0.70–0.91) | 1.79 / 2.30 / 11.14 (6.21–12.54) | 0.70 / 0.83 / 1.07 (0.87–1.20) | 99% | 0 |
+| as a3t | 0 | 1000 | 6 | 0.62 / 0.78 / 141.31 (139.26–145.41) | 0.62 / 0.74 / 0.83 (0.83–0.83) | 3.68 / 4.48 / 13.57 (11.39–15.49) | 0.74 / 1.15 / 1.28 (1.28–1.28) | 66% | 59 |
+| as a3t | 0 | 1000 | 8 | 0.62 / 0.74 / 344.06 (344.06–348.16) | 0.66 / 0.79 / 0.87 (0.87–0.87) | 5.31 / 6.66 / 16.90 (15.36–18.94) | 0.70 / 1.28 / 1.54 (1.49–1.54) | 49% | 49 |
+| as a3t | 1000 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.21 / 0.25 / 0.33 (0.29–0.33) | 0.21 / 0.29 / 0.33 (0.33–0.33) | 100% | 0 |
+| as a3t | 1000 | 50 | 4 | 0.08 / 0.12 / 0.29 (0.25–0.33) | 0.08 / 0.12 / 0.25 (0.25–0.33) | 0.21 / 0.37 / 0.66 (0.66–0.79) | 0.25 / 0.33 / 0.46 (0.37–0.58) | 100% | 0 |
+| as a3t | 1000 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.33–0.33) | 0.17 / 0.29 / 0.33 (0.33–0.37) | 0.46 / 0.91 / 1.25 (1.15–2.50) | 0.21 / 0.74 / 0.83 (0.83–0.91) | 67% | 36 |
+| as a3t | 1000 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.74 / 1.70 / 5.70 (4.35–6.91) | 0.21 / 0.87 / 1.07 (1.07–1.12) | 50% | 70 |
+| as a3t | 1000 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.21 / 0.25 / 0.25 (0.25–0.33) | 0.42 / 0.46 / 0.54 (0.50–0.58) | 0.33 / 0.37 / 0.46 (0.42–0.46) | 100% | 0 |
+| as a3t | 1000 | 200 | 4 | 0.21 / 0.29 / 0.37 (0.37–0.42) | 0.21 / 0.25 / 0.37 (0.33–0.42) | 0.42 / 0.62 / 1.15 (0.74–1.57) | 0.33 / 0.46 / 0.58 (0.50–0.66) | 99% | 0 |
+| as a3t | 1000 | 200 | 6 | 0.25 / 0.33 / 0.42 (0.42–0.42) | 0.25 / 0.33 / 0.42 (0.42–0.42) | 0.87 / 1.57 / 5.44 (2.91–5.76) | 0.29 / 0.83 / 0.95 (0.91–0.95) | 66% | 41 |
+| as a3t | 1000 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.42–0.46) | 1.70 / 2.62 / 10.37 (8.13–17.41) | 0.29 / 0.95 / 1.20 (1.15–1.20) | 50% | 24 |
+| as a3t | 1000 | 1000 | 2 | 0.58 / 0.62 / 0.66 (0.62–0.66) | 0.58 / 0.62 / 0.66 (0.62–0.66) | 1.15 / 1.25 / 1.58 (1.49–1.70) | 0.70 / 0.74 / 0.83 (0.79–0.83) | 100% | 0 |
+| as a3t | 1000 | 1000 | 4 | 0.58 / 0.62 / 0.74 (0.74–0.87) | 0.58 / 0.62 / 0.79 (0.70–0.83) | 1.62 / 1.87 / 7.30 (4.16–8.83) | 0.70 / 0.83 / 1.04 (0.87–1.12) | 99% | 0 |
+| as a3t | 1000 | 1000 | 6 | 0.62 / 0.78 / 141.31 (141.31–145.41) | 0.62 / 0.74 / 0.83 (0.83–0.87) | 3.14 / 4.29 / 12.42 (11.78–12.80) | 0.66 / 1.20 / 1.33 (1.33–1.41) | 66% | 69 |
+| as a3t | 1000 | 1000 | 8 | 0.62 / 0.78 / 344.06 (339.97–348.16) | 0.62 / 0.79 / 0.87 (0.87–0.87) | 4.86 / 5.95 / 16.38 (14.08–17.66) | 0.62 / 1.15 / 1.49 (1.46–1.49) | 50% | 62 |
+| busy | 0 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.21 / 0.25 (0.25–0.25) | 0.04 / 0.08 / 0.12 (0.12–0.12) | 100% | 0 |
+| busy | 0 | 50 | 4 | 0.08 / 0.17 / 0.29 (0.25–0.33) | 0.08 / 0.17 / 0.33 (0.21–0.33) | 0.21 / 0.29 / 0.58 (0.46–0.70) | 0.08 / 0.12 / 0.25 (0.12–0.29) | 99% | 1 |
+| busy | 0 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.29–0.33) | 0.12 / 0.25 / 0.33 (0.29–0.33) | 0.42 / 0.74 / 1.04 (0.91–1.07) | 0.12 / 0.25 / 0.29 (0.29–0.33) | 67% | 25 |
+| busy | 0 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.54 / 1.46 / 4.61 (1.87–5.12) | 0.12 / 0.25 / 0.37 (0.33–0.37) | 50% | 22 |
+| busy | 0 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.21 / 0.25 / 0.25 (0.25–0.29) | 0.25 / 0.42 / 0.54 (0.54–0.54) | 0.12 / 0.21 / 0.25 (0.21–0.25) | 100% | 0 |
+| busy | 0 | 200 | 4 | 0.21 / 0.25 / 0.37 (0.33–0.46) | 0.21 / 0.25 / 0.42 (0.37–0.42) | 0.42 / 0.58 / 1.00 (0.83–1.04) | 0.21 / 0.25 / 0.33 (0.29–0.37) | 99% | 0 |
+| busy | 0 | 200 | 6 | 0.25 / 0.37 / 0.42 (0.42–0.46) | 0.25 / 0.33 / 0.42 (0.42–0.42) | 0.62 / 1.28 / 1.82 (1.57–2.56) | 0.25 / 0.37 / 0.42 (0.42–0.46) | 66% | 33 |
+| busy | 0 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.33 / 2.30 / 8.58 (7.49–19.97) | 0.25 / 0.42 / 0.46 (0.46–0.50) | 49% | 51 |
+| busy | 0 | 1000 | 2 | 0.58 / 0.62 / 0.62 (0.62–0.66) | 0.58 / 0.62 / 0.66 (0.62–0.66) | 1.00 / 1.49 / 1.70 (1.66–1.70) | 0.50 / 0.58 / 0.62 (0.62–0.62) | 100% | 0 |
+| busy | 0 | 1000 | 4 | 0.58 / 0.62 / 0.74 (0.70–0.83) | 0.58 / 0.62 / 0.83 (0.79–0.91) | 1.15 / 1.78 / 4.93 (2.94–6.78) | 0.58 / 0.62 / 0.74 (0.74–0.78) | 100% | 0 |
+| busy | 0 | 1000 | 6 | 0.66 / 0.83 / 137.22 (129.02–143.36) | 0.62 / 0.74 / 0.83 (0.83–0.83) | 2.66 / 3.74 / 10.75 (9.98–11.26) | 0.62 / 0.74 / 0.83 (0.83–0.83) | 66% | 56 |
+| busy | 0 | 1000 | 8 | 0.66 / 0.79 / 344.06 (339.97–344.06) | 0.66 / 0.79 / 0.87 (0.87–0.91) | 4.16 / 5.50 / 15.10 (12.42–16.38) | 0.62 / 0.79 / 0.87 (0.87–0.87) | 50% | 51 |
+| busy | 1000 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.12 / 0.17 (0.17–0.17) | 0.08 / 0.17 / 0.25 (0.25–0.25) | 0.04 / 0.08 / 0.12 (0.12–0.12) | 100% | 0 |
+| busy | 1000 | 50 | 4 | 0.08 / 0.12 / 0.25 (0.21–0.29) | 0.08 / 0.17 / 0.29 (0.25–0.33) | 0.21 / 0.37 / 0.54 (0.37–0.83) | 0.08 / 0.12 / 0.25 (0.21–0.25) | 99% | 0 |
+| busy | 1000 | 50 | 6 | 0.12 / 0.25 / 0.33 (0.29–0.37) | 0.17 / 0.25 / 0.33 (0.33–0.33) | 0.42 / 0.74 / 0.95 (0.83–5.06) | 0.12 / 0.25 / 0.33 (0.29–0.33) | 67% | 33 |
+| busy | 1000 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.33–0.37) | 0.17 / 0.29 / 0.37 (0.37–0.37) | 0.54 / 1.36 / 4.42 (2.50–8.06) | 0.17 / 0.25 / 0.37 (0.33–0.42) | 50% | 22 |
+| busy | 1000 | 200 | 2 | 0.21 / 0.25 / 0.25 (0.25–0.33) | 0.21 / 0.25 / 0.25 (0.25–0.25) | 0.25 / 0.42 / 0.54 (0.54–0.54) | 0.12 / 0.21 / 0.25 (0.21–0.25) | 100% | 0 |
+| busy | 1000 | 200 | 4 | 0.21 / 0.25 / 0.42 (0.33–0.46) | 0.21 / 0.25 / 0.42 (0.33–0.42) | 0.42 / 0.58 / 0.95 (0.70–1.15) | 0.21 / 0.25 / 0.33 (0.29–0.42) | 99% | 0 |
+| busy | 1000 | 200 | 6 | 0.25 / 0.37 / 0.42 (0.42–0.46) | 0.25 / 0.33 / 0.42 (0.42–0.42) | 0.62 / 1.28 / 1.95 (1.62–3.33) | 0.25 / 0.37 / 0.42 (0.42–0.42) | 66% | 37 |
+| busy | 1000 | 200 | 8 | 0.25 / 0.37 / 0.46 (0.46–0.46) | 0.25 / 0.37 / 0.46 (0.46–0.46) | 1.36 / 2.37 / 8.58 (5.89–8.96) | 0.25 / 0.42 / 0.46 (0.46–0.46) | 49% | 33 |
+| busy | 1000 | 1000 | 2 | 0.58 / 0.62 / 0.66 (0.62–0.70) | 0.58 / 0.62 / 0.66 (0.62–0.70) | 1.00 / 1.49 / 1.70 (1.70–1.70) | 0.50 / 0.58 / 0.62 (0.62–0.62) | 100% | 0 |
+| busy | 1000 | 1000 | 4 | 0.58 / 0.62 / 0.78 (0.70–0.83) | 0.58 / 0.66 / 0.83 (0.79–0.87) | 1.15 / 1.70 / 4.10 (3.10–5.82) | 0.58 / 0.62 / 0.74 (0.74–0.79) | 99% | 0 |
+| busy | 1000 | 1000 | 6 | 0.66 / 0.79 / 139.26 (129.02–141.31) | 0.62 / 0.74 / 0.83 (0.83–0.87) | 2.56 / 3.74 / 10.11 (9.09–11.01) | 0.62 / 0.74 / 0.83 (0.83–0.83) | 66% | 76 |
+| busy | 1000 | 1000 | 8 | 0.62 / 0.74 / 348.16 (335.87–352.26) | 0.62 / 0.79 / 0.91 (0.87–2.11) | 4.10 / 5.82 / 17.41 (14.21–18.18) | 0.62 / 0.79 / 0.87 (0.87–1.49) | 49% | 67 |
+| idle | 0 | 50 | 2 | 0.08 / 0.12 / 0.21 (0.17–3.07) | 0.08 / 0.12 / 0.17 (0.17–0.25) | 0.21 / 0.25 / 0.33 (0.29–0.42) | 0.21 / 0.25 / 0.33 (0.29–0.66) | 100% | 0 |
+| idle | 0 | 50 | 4 | 0.08 / 0.17 / 3.20 (3.10–3.23) | 0.08 / 0.17 / 3.26 (3.10–3.26) | 0.21 / 0.33 / 1.15 (0.83–1.28) | 0.21 / 0.25 / 1.12 (0.79–1.66) | 100% | 0 |
+| idle | 0 | 50 | 6 | 0.12 / 0.25 / 0.37 (0.33–0.46) | 0.12 / 0.29 / 0.42 (0.37–0.42) | 0.37 / 0.66 / 0.91 (0.83–1.00) | 0.29 / 0.74 / 0.79 (0.62–0.79) | 65% | 6 |
+| idle | 0 | 50 | 8 | 0.12 / 0.29 / 0.42 (0.37–0.46) | 0.17 / 0.33 / 0.42 (0.37–0.46) | 0.42 / 0.79 / 1.12 (0.87–1.20) | 0.29 / 0.74 / 0.79 (0.74–0.79) | 48% | 0 |
+| idle | 0 | 200 | 2 | 0.21 / 0.25 / 0.29 (0.29–0.37) | 0.21 / 0.25 / 0.29 (0.25–0.42) | 0.42 / 0.50 / 0.54 (0.50–0.58) | 0.33 / 0.37 / 0.42 (0.37–0.74) | 100% | 0 |
+| idle | 0 | 200 | 4 | 0.21 / 0.29 / 3.26 (3.23–3.33) | 0.21 / 0.29 / 3.26 (3.20–3.36) | 0.46 / 0.66 / 1.33 (0.87–2.40) | 0.33 / 0.37 / 1.00 (0.62–1.15) | 99% | 0 |
+| idle | 0 | 200 | 6 | 0.29 / 0.42 / 0.54 (0.50–0.54) | 0.29 / 0.42 / 0.50 (0.46–0.54) | 0.62 / 1.00 / 1.25 (1.20–1.33) | 0.37 / 0.83 / 0.87 (0.87–0.87) | 64% | 6 |
+| idle | 0 | 200 | 8 | 0.29 / 0.42 / 0.54 (0.46–0.54) | 0.25 / 0.37 / 0.50 (0.50–0.54) | 0.62 / 1.04 / 1.70 (1.57–1.95) | 0.37 / 0.83 / 0.87 (0.70–0.87) | 47% | 0 |
+| idle | 0 | 1000 | 2 | 0.58 / 0.62 / 0.70 (0.66–0.74) | 0.58 / 0.62 / 0.70 (0.66–1.00) | 1.15 / 1.25 / 1.28 (1.28–5.18) | 0.70 / 0.74 / 0.87 (0.83–0.91) | 99% | 0 |
+| idle | 0 | 1000 | 4 | 0.58 / 0.66 / 3.65 (3.65–3.78) | 0.58 / 0.66 / 3.68 (3.65–3.74) | 1.20 / 1.78 / 5.25 (2.50–9.47) | 0.70 / 0.74 / 1.62 (1.33–3.81) | 99% | 0 |
+| idle | 0 | 1000 | 6 | 0.62 / 0.74 / 0.91 (0.83–0.91) | 0.62 / 0.74 / 0.87 (0.83–0.91) | 1.36 / 2.53 / 5.95 (3.58–6.46) | 0.74 / 1.07 / 1.20 (1.20–1.25) | 65% | 6 |
+| idle | 0 | 1000 | 8 | 0.62 / 0.74 / 0.87 (0.87–0.91) | 0.66 / 0.74 / 0.87 (0.83–0.91) | 1.41 / 2.94 / 6.59 (4.10–8.06) | 0.74 / 1.07 / 1.20 (1.20–1.25) | 48% | 0 |
+| idle | 1000 | 50 | 2 | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.08 / 0.12 / 0.17 (0.17–0.21) | 0.21 / 0.25 / 0.33 (0.33–0.33) | 0.21 / 0.25 / 0.33 (0.33–0.37) | 100% | 0 |
+| idle | 1000 | 50 | 4 | 0.08 / 0.17 / 3.20 (3.14–3.33) | 0.08 / 0.21 / 3.23 (3.20–3.36) | 0.21 / 0.29 / 1.12 (0.66–1.25) | 0.21 / 0.33 / 0.95 (0.74–1.07) | 99% | 0 |
+| idle | 1000 | 50 | 6 | 0.12 / 0.29 / 0.42 (0.37–0.50) | 0.12 / 0.29 / 0.42 (0.37–0.46) | 0.33 / 0.70 / 0.87 (0.87–0.95) | 0.25 / 0.74 / 0.79 (0.74–0.79) | 64% | 0 |
+| idle | 1000 | 50 | 8 | 0.17 / 0.29 / 0.37 (0.37–0.46) | 0.17 / 0.29 / 0.42 (0.37–0.46) | 0.33 / 0.74 / 1.15 (0.87–1.25) | 0.25 / 0.74 / 0.78 (0.74–0.79) | 48% | 0 |
+| idle | 1000 | 200 | 2 | 0.21 / 0.25 / 0.33 (0.25–0.33) | 0.21 / 0.25 / 0.33 (0.25–0.37) | 0.46 / 0.50 / 0.54 (0.50–0.58) | 0.33 / 0.37 / 0.42 (0.42–0.46) | 100% | 0 |
+| idle | 1000 | 200 | 4 | 0.21 / 0.29 / 3.26 (3.23–3.33) | 0.21 / 0.33 / 3.39 (3.23–3.39) | 0.46 / 0.62 / 1.28 (0.95–1.28) | 0.33 / 0.37 / 1.20 (0.83–1.25) | 99% | 0 |
+| idle | 1000 | 200 | 6 | 0.25 / 0.37 / 0.54 (0.50–0.58) | 0.25 / 0.37 / 0.54 (0.50–0.54) | 0.54 / 0.91 / 1.20 (1.12–1.25) | 0.37 / 0.79 / 0.87 (0.70–0.87) | 64% | 1 |
+| idle | 1000 | 200 | 8 | 0.25 / 0.37 / 0.50 (0.46–0.58) | 0.25 / 0.37 / 0.54 (0.46–0.54) | 0.54 / 1.00 / 1.41 (1.33–1.95) | 0.33 / 0.83 / 0.83 (0.83–0.87) | 48% | 0 |
+| idle | 1000 | 1000 | 2 | 0.58 / 0.62 / 0.66 (0.62–0.74) | 0.58 / 0.62 / 0.70 (0.62–0.70) | 1.15 / 1.25 / 1.28 (1.25–5.25) | 0.70 / 0.74 / 0.83 (0.79–0.87) | 100% | 0 |
+| idle | 1000 | 1000 | 4 | 0.58 / 0.66 / 3.74 (3.62–3.78) | 0.58 / 0.66 / 3.74 (3.65–3.78) | 1.20 / 1.78 / 5.38 (2.21–8.19) | 0.70 / 0.74 / 1.54 (1.25–1.70) | 99% | 0 |
+| idle | 1000 | 1000 | 6 | 0.62 / 0.74 / 0.87 (0.83–3.74) | 0.62 / 0.74 / 0.91 (0.87–0.91) | 1.36 / 2.40 / 5.82 (3.20–7.74) | 0.70 / 1.07 / 1.20 (1.15–1.25) | 65% | 5 |
+| idle | 1000 | 1000 | 8 | 0.62 / 0.74 / 0.91 (0.83–0.91) | 0.62 / 0.74 / 0.91 (0.87–0.91) | 1.41 / 2.66 / 6.46 (3.26–7.36) | 0.70 / 1.07 / 1.25 (1.15–1.25) | 48% | 0 |
+
+Signals that found the thread waiting (took the lock), % of signals
+
+| regime | ipi ns | W ns | k | 1 locked apply | 1 OR apply | 3 notify lock | 3 atomic | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|
+| as a3t | 0 | 50 | 2 | 0.0% | 0.0% | 0.0% | 99.8% | 100% | 0 |
+| as a3t | 0 | 50 | 4 | 0.0% | 0.0% | 0.0% | 66.4% | 99% | 0 |
+| as a3t | 0 | 50 | 6 | 0.0% | 0.0% | 0.0% | 52.0% | 67% | 65 |
+| as a3t | 0 | 50 | 8 | 0.0% | 0.0% | 0.0% | 42.1% | 50% | 39 |
+| as a3t | 0 | 200 | 2 | 0.0% | 0.0% | 0.0% | 99.8% | 100% | 0 |
+| as a3t | 0 | 200 | 4 | 0.0% | 0.0% | 0.0% | 67.8% | 99% | 0 |
+| as a3t | 0 | 200 | 6 | 0.0% | 0.0% | 0.0% | 52.1% | 67% | 44 |
+| as a3t | 0 | 200 | 8 | 0.0% | 0.0% | 0.0% | 40.6% | 50% | 45 |
+| as a3t | 0 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 99.8% | 100% | 0 |
+| as a3t | 0 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 66.7% | 99% | 0 |
+| as a3t | 0 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 47.2% | 66% | 59 |
+| as a3t | 0 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 33.9% | 49% | 49 |
+| as a3t | 1000 | 50 | 2 | 0.0% | 0.0% | 0.0% | 98.4% | 100% | 0 |
+| as a3t | 1000 | 50 | 4 | 0.0% | 0.0% | 0.0% | 66.5% | 100% | 0 |
+| as a3t | 1000 | 50 | 6 | 0.0% | 0.0% | 0.0% | 38.3% | 67% | 36 |
+| as a3t | 1000 | 50 | 8 | 0.0% | 0.0% | 0.0% | 29.0% | 50% | 70 |
+| as a3t | 1000 | 200 | 2 | 0.0% | 0.0% | 0.0% | 99.0% | 100% | 0 |
+| as a3t | 1000 | 200 | 4 | 0.0% | 0.0% | 0.0% | 67.0% | 99% | 0 |
+| as a3t | 1000 | 200 | 6 | 0.0% | 0.0% | 0.0% | 36.6% | 66% | 41 |
+| as a3t | 1000 | 200 | 8 | 0.0% | 0.0% | 0.0% | 27.4% | 50% | 24 |
+| as a3t | 1000 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 99.0% | 100% | 0 |
+| as a3t | 1000 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 66.8% | 99% | 0 |
+| as a3t | 1000 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 34.2% | 66% | 69 |
+| as a3t | 1000 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 15.8% | 50% | 62 |
+| busy | 0 | 50 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 50 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 1 |
+| busy | 0 | 50 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 67% | 25 |
+| busy | 0 | 50 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 50% | 22 |
+| busy | 0 | 200 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 200 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 0 | 200 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 33 |
+| busy | 0 | 200 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 49% | 51 |
+| busy | 0 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 0 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 56 |
+| busy | 0 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 50% | 51 |
+| busy | 1000 | 50 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 50 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 1000 | 50 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 67% | 33 |
+| busy | 1000 | 50 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 50% | 22 |
+| busy | 1000 | 200 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 200 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 1000 | 200 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 37 |
+| busy | 1000 | 200 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 49% | 33 |
+| busy | 1000 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 0.0% | 100% | 0 |
+| busy | 1000 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 0.0% | 99% | 0 |
+| busy | 1000 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 0.0% | 66% | 76 |
+| busy | 1000 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 0.0% | 49% | 67 |
+| idle | 0 | 50 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 0 | 50 | 4 | 0.0% | 0.0% | 0.0% | 97.4% | 100% | 0 |
+| idle | 0 | 50 | 6 | 0.0% | 0.0% | 0.0% | 92.4% | 65% | 6 |
+| idle | 0 | 50 | 8 | 0.0% | 0.0% | 0.0% | 86.2% | 48% | 0 |
+| idle | 0 | 200 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 0 | 200 | 4 | 0.0% | 0.0% | 0.0% | 96.0% | 99% | 0 |
+| idle | 0 | 200 | 6 | 0.0% | 0.0% | 0.0% | 90.0% | 64% | 6 |
+| idle | 0 | 200 | 8 | 0.0% | 0.0% | 0.0% | 83.4% | 47% | 0 |
+| idle | 0 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 99% | 0 |
+| idle | 0 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 91.1% | 99% | 0 |
+| idle | 0 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 83.9% | 65% | 6 |
+| idle | 0 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 77.3% | 48% | 0 |
+| idle | 1000 | 50 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 1000 | 50 | 4 | 0.0% | 0.0% | 0.0% | 87.1% | 99% | 0 |
+| idle | 1000 | 50 | 6 | 0.0% | 0.0% | 0.0% | 79.5% | 64% | 0 |
+| idle | 1000 | 50 | 8 | 0.0% | 0.0% | 0.0% | 70.7% | 48% | 0 |
+| idle | 1000 | 200 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 1000 | 200 | 4 | 0.0% | 0.0% | 0.0% | 83.4% | 99% | 0 |
+| idle | 1000 | 200 | 6 | 0.0% | 0.0% | 0.0% | 77.0% | 64% | 1 |
+| idle | 1000 | 200 | 8 | 0.0% | 0.0% | 0.0% | 69.5% | 48% | 0 |
+| idle | 1000 | 1000 | 2 | 0.0% | 0.0% | 0.0% | 100.0% | 100% | 0 |
+| idle | 1000 | 1000 | 4 | 0.0% | 0.0% | 0.0% | 82.4% | 99% | 0 |
+| idle | 1000 | 1000 | 6 | 0.0% | 0.0% | 0.0% | 73.1% | 65% | 5 |
+| idle | 1000 | 1000 | 8 | 0.0% | 0.0% | 0.0% | 64.4% | 48% | 0 |
+
+Migrations seen: 210792 over 337839527 samples (one sample per measured operation).
+
+
+### Suite br: unmap, lock per address-space range
+
+load average before: { 5.74 5.50 4.94 }
+load average after: { 5.65 5.52 5.04 }; 168 s
+
+Throughput, unmaps/s, median (min–max)
+
+| initiators | ipi ns | W ns | k | 1 fair | 3 group lock | 3 range locks | on P | stalls |
+|---|---|---|---|---|---|---|---|---|
+| one | 0 | 50 | 2 | 509k (493k–511k) | 492k (489k–493k) | 505k (502k–506k) | 100% | 0 |
+| one | 0 | 50 | 3 | 478k (473k–494k) | 480k (479k–481k) | 485k (485k–487k) | 100% | 0 |
+| one | 0 | 50 | 4 | 466k (455k–469k) | 467k (464k–469k) | 474k (473k–475k) | 99% | 0 |
+| one | 0 | 50 | 6 | 376k (369k–383k) | 409k (402k–412k) | 417k (416k–418k) | 66% | 18 |
+| one | 0 | 50 | 8 | 350k (346k–355k) | 386k (384k–388k) | 392k (383k–395k) | 51% | 13 |
+| one | 0 | 200 | 2 | 445k (442k–465k) | 466k (465k–468k) | 478k (477k–479k) | 100% | 0 |
+| one | 0 | 200 | 3 | 452k (437k–453k) | 451k (450k–452k) | 459k (458k–460k) | 100% | 0 |
+| one | 0 | 200 | 4 | 418k (411k–441k) | 439k (378k–441k) | 448k (445k–448k) | 98% | 6 |
+| one | 0 | 200 | 6 | 351k (341k–355k) | 386k (383k–390k) | 397k (388k–399k) | 69% | 26 |
+| one | 0 | 200 | 8 | 328k (321k–333k) | 367k (360k–372k) | 374k (371k–377k) | 52% | 17 |
+| one | 0 | 1000 | 2 | 320k (309k–321k) | 341k (340k–342k) | 345k (344k–346k) | 100% | 0 |
+| one | 0 | 1000 | 3 | 314k (305k–314k) | 331k (330k–332k) | 337k (336k–337k) | 100% | 0 |
+| one | 0 | 1000 | 4 | 303k (296k–309k) | 325k (324k–327k) | 329k (326k–330k) | 100% | 0 |
+| one | 0 | 1000 | 6 | 264k (250k–267k) | 295k (290k–298k) | 301k (298k–303k) | 68% | 25 |
+| one | 0 | 1000 | 8 | 250k (244k–251k) | 282k (278k–288k) | 291k (289k–293k) | 48% | 17 |
+| one | 1000 | 50 | 2 | 336k (330k–338k) | 328k (328k–329k) | 334k (334k–335k) | 100% | 0 |
+| one | 1000 | 50 | 3 | 324k (323k–329k) | 323k (322k–324k) | 325k (325k–327k) | 100% | 0 |
+| one | 1000 | 50 | 4 | 317k (313k–319k) | 316k (311k–317k) | 320k (318k–320k) | 99% | 0 |
+| one | 1000 | 50 | 6 | 267k (262k–271k) | 284k (277k–286k) | 288k (286k–292k) | 67% | 38 |
+| one | 1000 | 50 | 8 | 252k (248k–254k) | 274k (270k–276k) | 277k (275k–279k) | 52% | 16 |
+| one | 1000 | 200 | 2 | 316k (306k–317k) | 317k (317k–317k) | 322k (322k–323k) | 100% | 0 |
+| one | 1000 | 200 | 3 | 310k (299k–311k) | 309k (309k–310k) | 313k (312k–314k) | 100% | 0 |
+| one | 1000 | 200 | 4 | 295k (268k–303k) | 304k (299k–305k) | 307k (306k–308k) | 99% | 0 |
+| one | 1000 | 200 | 6 | 252k (250k–258k) | 277k (271k–278k) | 280k (271k–281k) | 64% | 25 |
+| one | 1000 | 200 | 8 | 241k (238k–244k) | 266k (262k–267k) | 268k (261k–270k) | 49% | 16 |
+| one | 1000 | 1000 | 2 | 242k (236k–243k) | 254k (251k–254k) | 256k (253k–257k) | 100% | 0 |
+| one | 1000 | 1000 | 3 | 234k (231k–234k) | 248k (245k–249k) | 251k (246k–252k) | 100% | 0 |
+| one | 1000 | 1000 | 4 | 228k (228k–231k) | 245k (244k–245k) | 247k (246k–248k) | 100% | 0 |
+| one | 1000 | 1000 | 6 | 200k (195k–208k) | 224k (220k–227k) | 226k (224k–230k) | 68% | 33 |
+| one | 1000 | 1000 | 8 | 197k (189k–201k) | 220k (214k–222k) | 221k (217k–224k) | 52% | 16 |
+| all | 0 | 50 | 2 | 882k (868k–886k) | 816k (812k–822k) | 963k (958k–966k) | 100% | 0 |
+| all | 0 | 50 | 3 | 1.06M (1.05M–1.07M) | 985k (981k–997k) | 1.27M (1.27M–1.27M) | 100% | 0 |
+| all | 0 | 50 | 4 | 1.17M (1.17M–1.19M) | 1.09M (1.07M–1.11M) | 1.50M (1.49M–1.51M) | 100% | 0 |
+| all | 0 | 50 | 6 | 1.05M (1.02M–1.06M) | 1.06M (1.04M–1.08M) | 1.55M (1.52M–1.56M) | 68% | 166 |
+| all | 0 | 50 | 8 | 1.01M (1.00M–1.01M) | 1.05M (1.00M–1.06M) | 1.70M (1.68M–1.73M) | 50% | 109 |
+| all | 0 | 200 | 2 | 829k (821k–835k) | 738k (735k–739k) | 905k (903k–908k) | 100% | 0 |
+| all | 0 | 200 | 3 | 969k (954k–981k) | 867k (867k–869k) | 1.18M (1.17M–1.19M) | 100% | 0 |
+| all | 0 | 200 | 4 | 1.05M (1.04M–1.08M) | 942k (933k–947k) | 1.39M (1.39M–1.40M) | 100% | 0 |
+| all | 0 | 200 | 6 | 969k (961k–988k) | 922k (916k–933k) | 1.48M (1.47M–1.50M) | 67% | 163 |
+| all | 0 | 200 | 8 | 911k (832k–920k) | 939k (909k–946k) | 1.64M (1.59M–1.64M) | 50% | 249 |
+| all | 0 | 1000 | 2 | 496k (491k–501k) | 464k (463k–466k) | 644k (643k–646k) | 100% | 0 |
+| all | 0 | 1000 | 3 | 604k (600k–606k) | 513k (510k–518k) | 823k (822k–828k) | 100% | 0 |
+| all | 0 | 1000 | 4 | 655k (649k–662k) | 539k (538k–543k) | 954k (951k–957k) | 100% | 0 |
+| all | 0 | 1000 | 6 | 591k (580k–604k) | 510k (489k–513k) | 1.03M (1.01M–1.04M) | 67% | 208 |
+| all | 0 | 1000 | 8 | 558k (556k–564k) | 513k (511k–520k) | 1.15M (1.13M–1.15M) | 50% | 125 |
+| all | 1000 | 50 | 2 | 460k (456k–461k) | 808k (804k–812k) | 911k (909k–916k) | 100% | 0 |
+| all | 1000 | 50 | 3 | 623k (621k–632k) | 969k (951k–987k) | 1.24M (1.22M–1.24M) | 100% | 0 |
+| all | 1000 | 50 | 4 | 732k (714k–753k) | 1.07M (1.06M–1.08M) | 1.11M (987k–1.25M) | 100% | 0 |
+| all | 1000 | 50 | 6 | 740k (735k–751k) | 879k (869k–890k) | 1.08M (1.04M–1.08M) | 67% | 158 |
+| all | 1000 | 50 | 8 | 779k (764k–784k) | 904k (901k–910k) | 1.20M (1.17M–1.21M) | 50% | 173 |
+| all | 1000 | 200 | 2 | 450k (441k–466k) | 738k (731k–738k) | 903k (899k–906k) | 100% | 0 |
+| all | 1000 | 200 | 3 | 590k (576k–593k) | 859k (855k–864k) | 1.17M (1.17M–1.17M) | 100% | 0 |
+| all | 1000 | 200 | 4 | 674k (662k–681k) | 938k (920k–943k) | 1.36M (1.36M–1.38M) | 100% | 4 |
+| all | 1000 | 200 | 6 | 692k (679k–695k) | 831k (811k–847k) | 1.12M (1.11M–1.12M) | 67% | 190 |
+| all | 1000 | 200 | 8 | 723k (716k–735k) | 827k (822k–840k) | 1.24M (1.23M–1.25M) | 49% | 190 |
+| all | 1000 | 1000 | 2 | 367k (366k–375k) | 464k (461k–465k) | 643k (639k–646k) | 100% | 0 |
+| all | 1000 | 1000 | 3 | 439k (425k–440k) | 511k (511k–514k) | 822k (820k–825k) | 100% | 0 |
+| all | 1000 | 1000 | 4 | 479k (469k–497k) | 537k (537k–546k) | 954k (947k–957k) | 100% | 0 |
+| all | 1000 | 1000 | 6 | 496k (468k–500k) | 489k (489k–496k) | 1.02M (1.02M–1.04M) | 67% | 165 |
+| all | 1000 | 1000 | 8 | 495k (488k–500k) | 488k (486k–489k) | 1.13M (1.12M–1.14M) | 50% | 101 |
+
+Unmap latency, µs: p50 / p99 / p99.9 (p99.9 min–max)
+
+| initiators | ipi ns | W ns | k | 1 fair | 3 group lock | 3 range locks | on P | stalls |
+|---|---|---|---|---|---|---|---|---|
+| one | 0 | 50 | 2 | 0.58 / 0.74 / 0.91 (0.83–2.66) | 0.66 / 0.74 / 1.15 (0.83–5.12) | 0.62 / 0.74 / 1.07 (0.79–1.33) | 100% | 0 |
+| one | 0 | 50 | 3 | 0.70 / 0.87 / 5.06 (3.90–5.95) | 0.70 / 0.83 / 4.86 (3.90–6.14) | 0.70 / 0.79 / 5.18 (4.42–5.44) | 100% | 0 |
+| one | 0 | 50 | 4 | 0.74 / 1.04 / 8.19 (4.80–8.58) | 0.74 / 0.87 / 7.23 (5.18–8.19) | 0.70 / 0.83 / 7.49 (4.61–8.13) | 99% | 0 |
+| one | 0 | 50 | 6 | 1.28 / 1.66 / 7.62 (6.66–9.60) | 1.07 / 1.25 / 7.30 (5.18–7.49) | 1.00 / 1.20 / 6.91 (5.31–7.68) | 66% | 18 |
+| one | 0 | 50 | 8 | 1.46 / 1.90 / 8.83 (6.98–9.22) | 1.20 / 1.36 / 8.06 (7.55–8.83) | 1.15 / 1.33 / 7.87 (6.21–8.83) | 51% | 13 |
+| one | 0 | 200 | 2 | 0.87 / 1.04 / 3.46 (1.12–4.03) | 0.78 / 0.91 / 2.00 (0.95–4.48) | 0.70 / 0.83 / 1.04 (0.95–4.61) | 100% | 0 |
+| one | 0 | 200 | 3 | 0.83 / 1.00 / 4.86 (4.16–5.95) | 0.83 / 0.95 / 5.12 (3.68–6.21) | 0.83 / 0.91 / 5.76 (4.16–6.27) | 100% | 0 |
+| one | 0 | 200 | 4 | 1.00 / 1.20 / 8.58 (6.78–8.83) | 0.87 / 1.20 / 8.45 (7.49–11.26) | 0.83 / 0.95 / 7.55 (6.14–8.32) | 98% | 6 |
+| one | 0 | 200 | 6 | 1.46 / 1.82 / 8.00 (6.91–8.45) | 1.20 / 1.36 / 7.42 (7.04–8.19) | 1.12 / 1.33 / 7.10 (6.27–7.30) | 69% | 26 |
+| one | 0 | 200 | 8 | 1.70 / 2.14 / 9.60 (8.70–10.24) | 1.33 / 1.49 / 8.70 (7.42–9.47) | 1.28 / 1.46 / 8.45 (7.55–9.22) | 52% | 17 |
+| one | 0 | 1000 | 2 | 1.74 / 1.87 / 6.14 (1.95–7.04) | 1.57 / 1.66 / 5.63 (1.79–6.98) | 1.54 / 1.62 / 5.70 (1.70–6.40) | 100% | 0 |
+| one | 0 | 1000 | 3 | 1.79 / 2.00 / 8.45 (7.49–8.96) | 1.66 / 1.74 / 8.13 (5.06–9.09) | 1.58 / 1.70 / 6.91 (5.44–8.45) | 100% | 0 |
+| one | 0 | 1000 | 4 | 1.90 / 2.24 / 11.65 (9.22–12.42) | 1.66 / 1.78 / 10.24 (9.09–11.78) | 1.66 / 1.82 / 10.50 (10.24–11.78) | 100% | 0 |
+| one | 0 | 1000 | 6 | 2.40 / 2.82 / 10.11 (8.70–10.50) | 2.00 / 2.21 / 9.60 (7.87–10.11) | 1.90 / 2.14 / 8.96 (8.58–10.24) | 68% | 25 |
+| one | 0 | 1000 | 8 | 2.62 / 3.10 / 11.01 (9.47–12.03) | 2.14 / 2.30 / 10.11 (8.32–11.14) | 2.11 / 2.27 / 9.86 (9.47–10.62) | 48% | 17 |
+| one | 1000 | 50 | 2 | 1.58 / 1.74 / 6.40 (1.87–6.66) | 1.66 / 1.78 / 6.53 (1.87–6.59) | 1.62 / 1.74 / 4.16 (1.87–6.34) | 100% | 0 |
+| one | 1000 | 50 | 3 | 1.70 / 1.87 / 8.45 (5.82–8.70) | 1.70 / 1.82 / 8.58 (5.57–9.86) | 1.70 / 1.79 / 8.13 (5.38–8.83) | 100% | 0 |
+| one | 1000 | 50 | 4 | 1.74 / 1.95 / 10.62 (8.70–11.78) | 1.74 / 2.03 / 12.42 (9.34–13.31) | 1.70 / 1.82 / 10.88 (9.98–12.42) | 99% | 0 |
+| one | 1000 | 50 | 6 | 2.30 / 2.72 / 10.24 (8.58–11.14) | 2.08 / 2.27 / 9.09 (7.74–10.24) | 2.03 / 2.27 / 8.83 (7.42–9.73) | 67% | 38 |
+| one | 1000 | 50 | 8 | 2.56 / 3.14 / 11.39 (9.22–13.18) | 2.24 / 2.43 / 12.03 (8.70–13.31) | 2.21 / 2.37 / 10.24 (9.22–11.90) | 52% | 16 |
+| one | 1000 | 200 | 2 | 1.79 / 1.90 / 6.53 (2.00–7.55) | 1.78 / 1.90 / 6.59 (2.00–7.55) | 1.70 / 1.87 / 6.59 (1.95–7.04) | 100% | 0 |
+| one | 1000 | 200 | 3 | 1.82 / 2.08 / 9.34 (6.02–9.98) | 1.82 / 1.95 / 8.32 (7.62–9.34) | 1.82 / 1.90 / 8.58 (5.95–10.37) | 100% | 0 |
+| one | 1000 | 200 | 4 | 2.00 / 2.21 / 11.90 (9.34–20.99) | 1.87 / 2.00 / 11.78 (9.98–15.10) | 1.82 / 2.08 / 11.65 (9.34–12.54) | 99% | 0 |
+| one | 1000 | 200 | 6 | 2.50 / 2.94 / 10.37 (9.34–10.75) | 2.21 / 2.43 / 9.73 (8.19–10.37) | 2.14 / 2.40 / 9.60 (7.81–10.11) | 64% | 25 |
+| one | 1000 | 200 | 8 | 2.72 / 3.23 / 11.52 (11.14–12.93) | 2.37 / 2.78 / 10.62 (9.98–13.06) | 2.30 / 2.91 / 11.26 (8.83–16.26) | 49% | 16 |
+| one | 1000 | 1000 | 2 | 2.72 / 2.85 / 7.87 (3.04–15.62) | 2.56 / 2.69 / 7.36 (6.53–11.01) | 2.53 / 2.66 / 7.30 (2.72–8.83) | 100% | 0 |
+| one | 1000 | 1000 | 3 | 2.85 / 3.04 / 12.54 (7.10–18.69) | 2.62 / 2.72 / 10.62 (7.30–16.00) | 2.56 / 2.69 / 10.62 (8.45–16.90) | 100% | 0 |
+| one | 1000 | 1000 | 4 | 2.94 / 3.39 / 15.87 (14.08–16.64) | 2.66 / 2.82 / 13.31 (12.54–14.72) | 2.62 / 2.72 / 13.44 (10.62–14.46) | 100% | 0 |
+| one | 1000 | 1000 | 6 | 3.52 / 4.10 / 13.82 (11.01–16.38) | 3.04 / 3.26 / 10.75 (9.60–12.42) | 2.94 / 3.23 / 11.78 (9.34–12.54) | 68% | 33 |
+| one | 1000 | 1000 | 8 | 3.68 / 4.61 / 14.72 (11.39–35.33) | 3.20 / 3.81 / 12.16 (10.62–15.23) | 3.10 / 4.10 / 12.93 (12.03–16.26) | 52% | 16 |
+| all | 0 | 50 | 2 | 0.74 / 1.07 / 3.33 (1.20–4.74) | 1.07 / 1.25 / 3.10 (1.33–4.99) | 0.66 / 1.07 / 2.14 (1.20–4.54) | 100% | 0 |
+| all | 0 | 50 | 3 | 1.00 / 1.58 / 6.91 (4.42–7.49) | 1.66 / 1.82 / 7.30 (5.38–8.06) | 0.95 / 1.54 / 5.44 (5.12–5.76) | 100% | 0 |
+| all | 0 | 50 | 4 | 1.07 / 1.87 / 10.62 (7.49–10.88) | 2.27 / 2.50 / 11.78 (9.60–13.82) | 1.25 / 1.87 / 8.96 (7.74–9.98) | 100% | 0 |
+| all | 0 | 50 | 6 | 2.40 / 5.44 / 13.57 (11.14–14.08) | 4.03 / 5.63 / 12.93 (12.54–15.62) | 1.87 / 3.33 / 9.34 (7.23–10.37) | 68% | 166 |
+| all | 0 | 50 | 8 | 4.06 / 10.24 / 16.64 (14.59–18.18) | 6.14 / 8.45 / 17.41 (16.00–38.91) | 2.21 / 4.48 / 11.26 (8.96–15.62) | 50% | 109 |
+| all | 0 | 200 | 2 | 1.00 / 1.20 / 5.12 (1.33–5.44) | 1.36 / 1.49 / 4.99 (1.66–5.63) | 0.79 / 1.33 / 2.14 (1.41–5.12) | 100% | 0 |
+| all | 0 | 200 | 3 | 1.41 / 1.82 / 8.13 (5.57–8.58) | 2.08 / 2.24 / 8.58 (5.89–9.60) | 1.07 / 1.95 / 6.40 (4.74–6.66) | 100% | 0 |
+| all | 0 | 200 | 4 | 1.36 / 2.53 / 12.80 (10.24–13.70) | 2.82 / 3.07 / 12.80 (11.65–14.34) | 1.46 / 2.24 / 9.22 (6.34–10.37) | 100% | 0 |
+| all | 0 | 200 | 6 | 2.82 / 6.14 / 13.44 (10.37–14.08) | 4.99 / 6.34 / 14.34 (13.31–15.49) | 2.21 / 3.87 / 10.50 (8.13–10.75) | 67% | 163 |
+| all | 0 | 200 | 8 | 4.48 / 11.65 / 18.69 (16.90–196.61) | 7.17 / 9.22 / 19.46 (16.38–19.46) | 2.53 / 5.12 / 13.18 (10.24–37.38) | 50% | 249 |
+| all | 0 | 1000 | 2 | 2.62 / 2.78 / 8.00 (3.14–8.13) | 2.94 / 3.07 / 8.70 (6.08–10.75) | 1.58 / 2.91 / 5.82 (3.04–6.40) | 100% | 0 |
+| all | 0 | 1000 | 3 | 2.43 / 4.16 / 11.14 (8.19–19.71) | 4.42 / 4.61 / 14.21 (10.75–16.38) | 1.87 / 4.29 / 9.34 (6.40–10.11) | 100% | 0 |
+| all | 0 | 1000 | 4 | 2.78 / 5.63 / 18.18 (15.62–18.18) | 5.95 / 6.85 / 22.53 (20.22–23.81) | 3.04 / 4.61 / 13.06 (10.88–13.82) | 100% | 0 |
+| all | 0 | 1000 | 6 | 6.34 / 13.70 / 20.48 (19.20–29.18) | 10.50 / 11.39 / 23.55 (22.02–25.09) | 4.16 / 7.30 / 12.80 (11.01–13.70) | 67% | 208 |
+| all | 0 | 1000 | 8 | 10.37 / 19.46 / 29.18 (26.11–29.95) | 14.59 / 16.90 / 28.42 (23.04–28.93) | 5.31 / 9.34 / 14.59 (13.44–16.38) | 50% | 125 |
+| all | 1000 | 50 | 2 | 1.62 / 1.79 / 6.66 (2.21–7.36) | 1.07 / 1.62 / 5.63 (1.87–6.14) | 0.66 / 1.70 / 4.10 (1.82–4.29) | 100% | 0 |
+| all | 1000 | 50 | 3 | 2.08 / 3.36 / 10.11 (6.66–11.90) | 1.66 / 1.90 / 8.32 (5.89–8.58) | 0.95 / 1.78 / 6.66 (5.57–7.30) | 100% | 0 |
+| all | 1000 | 50 | 4 | 2.21 / 4.16 / 14.85 (13.31–16.38) | 2.24 / 2.50 / 12.29 (9.60–12.80) | 1.57 / 2.00 / 11.52 (9.73–12.29) | 100% | 0 |
+| all | 1000 | 50 | 6 | 3.52 / 6.85 / 14.85 (13.31–15.87) | 3.52 / 5.63 / 13.31 (11.90–13.70) | 2.21 / 3.68 / 10.62 (9.34–12.42) | 67% | 158 |
+| all | 1000 | 50 | 8 | 5.06 / 9.34 / 18.18 (16.64–22.02) | 4.42 / 8.19 / 16.90 (16.38–17.41) | 2.43 / 4.74 / 13.06 (10.62–17.15) | 50% | 173 |
+| all | 1000 | 200 | 2 | 1.70 / 1.90 / 6.78 (2.08–7.49) | 1.36 / 1.49 / 5.57 (2.37–6.14) | 0.79 / 1.33 / 3.68 (1.87–4.48) | 100% | 0 |
+| all | 1000 | 200 | 3 | 2.03 / 3.78 / 10.37 (8.32–11.78) | 2.08 / 2.24 / 9.22 (7.87–10.50) | 1.07 / 1.95 / 7.23 (4.86–7.87) | 100% | 0 |
+| all | 1000 | 200 | 4 | 2.53 / 4.80 / 16.13 (14.59–18.18) | 2.82 / 3.14 / 13.70 (11.39–14.21) | 1.46 / 2.24 / 9.86 (7.04–10.88) | 100% | 4 |
+| all | 1000 | 200 | 6 | 4.03 / 7.55 / 16.90 (15.62–17.41) | 4.74 / 6.46 / 13.70 (13.31–16.26) | 2.30 / 4.00 / 10.75 (8.58–11.26) | 67% | 190 |
+| all | 1000 | 200 | 8 | 5.70 / 10.11 / 19.97 (18.43–21.25) | 5.95 / 9.34 / 18.43 (17.41–21.76) | 2.66 / 5.25 / 13.06 (10.37–13.57) | 49% | 190 |
+| all | 1000 | 1000 | 2 | 2.56 / 2.85 / 8.32 (3.04–8.70) | 2.94 / 3.07 / 8.45 (3.23–8.96) | 1.58 / 2.91 / 6.98 (2.98–7.62) | 100% | 0 |
+| all | 1000 | 1000 | 3 | 2.98 / 5.76 / 13.31 (12.29–14.72) | 4.42 / 4.61 / 13.95 (9.47–14.59) | 1.87 / 4.29 / 9.60 (6.40–11.26) | 100% | 0 |
+| all | 1000 | 1000 | 4 | 4.74 / 6.91 / 22.02 (18.69–28.42) | 5.95 / 6.27 / 22.78 (17.66–26.88) | 3.04 / 4.61 / 12.93 (9.98–15.87) | 100% | 0 |
+| all | 1000 | 1000 | 6 | 6.98 / 11.78 / 21.50 (19.97–24.58) | 10.50 / 12.54 / 23.55 (18.94–27.14) | 4.16 / 7.36 / 13.06 (11.39–14.08) | 67% | 165 |
+| all | 1000 | 1000 | 8 | 9.86 / 20.22 / 25.60 (24.83–27.14) | 14.98 / 17.41 / 27.65 (24.83–30.46) | 5.31 / 9.47 / 15.49 (12.93–16.90) | 50% | 101 |
+
+Migrations seen: 82478 over 85217220 samples (one sample per measured operation).
+
+
+### Suite srv: a passive server shared by a background and a foreground client
+
+load average before: { 5.65 5.52 5.04 }
+load average after: { 4.62 4.91 4.87 }; 229 s
+
+Foreground call latency, µs: p50 / p99 / p99.9 (p99.9 min–max)
+
+| threads | background | ipi ns | 1 fifo | 3 fifo | 3 all fifo | 1 lend | 3 lend | 3 all lend | 1 refuse | 3 refuse | 3 all refuse | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | on | 0 | 52.22 / 172.03 / 176.13 (176.13–178.18) | 52.74 / 172.03 / 176.13 (174.08–176.13) | 51.20 / 172.03 / 176.13 (176.13–180.22) | 32.26 / 57.86 / 59.39 (58.37–74.75) | 32.77 / 57.86 / 65.54 (59.39–82.94) | 32.77 / 57.86 / 60.42 (59.39–503.81) | 6.53 / 56.83 / 58.37 (57.86–72.70) | 6.53 / 57.34 / 58.37 (58.37–62.98) | 6.53 / 56.83 / 58.37 (58.37–149.50) | 100% | 12 |
+| 1 | on | 1000 | 51.20 / 169.98 / 172.03 (172.03–174.08) | 51.20 / 167.94 / 174.08 (172.03–174.08) | 50.69 / 169.98 / 174.08 (174.08–186.37) | 32.77 / 58.88 / 64.00 (60.93–81.92) | 33.79 / 59.39 / 65.54 (60.93–73.73) | 33.79 / 59.90 / 60.42 (60.42–74.75) | 8.58 / 57.86 / 61.95 (59.39–74.75) | 8.45 / 57.86 / 60.93 (58.88–64.51) | 8.45 / 59.39 / 60.42 (59.90–76.80) | 100% | 0 |
+| 1 | off | 0 | 6.40 / 9.47 / 28.42 (20.99–37.89) | 6.40 / 9.34 / 18.43 (14.21–29.18) | 6.40 / 7.36 / 34.82 (15.49–47.62) | 6.40 / 9.47 / 28.93 (15.36–31.49) | 6.40 / 9.22 / 27.65 (16.90–29.70) | 6.40 / 6.66 / 16.00 (12.54–19.46) | 6.40 / 8.00 / 33.79 (14.46–43.52) | 6.40 / 9.60 / 30.21 (17.15–36.35) | 6.40 / 6.91 / 20.48 (10.11–1916.93) | 100% | 3 |
+| 1 | off | 1000 | 8.45 / 11.90 / 43.01 (23.55–52.22) | 8.45 / 11.90 / 35.84 (21.76–35.84) | 8.45 / 8.96 / 28.67 (25.09–35.84) | 8.45 / 11.65 / 26.11 (25.86–38.40) | 8.45 / 11.78 / 35.33 (18.69–35.84) | 8.45 / 11.52 / 26.11 (17.66–36.86) | 8.45 / 11.14 / 26.88 (16.90–42.50) | 8.45 / 11.90 / 30.72 (20.99–40.45) | 8.45 / 9.47 / 32.26 (16.00–39.94) | 100% | 0 |
+| 2 | on | 0 | 6.66 / 10.75 / 38.40 (30.21–39.94) | 6.53 / 10.50 / 38.40 (27.39–43.52) | 6.40 / 9.47 / 26.62 (25.86–34.30) | 6.66 / 10.62 / 37.38 (25.34–56.32) | 6.53 / 10.24 / 36.86 (26.11–49.66) | 6.40 / 9.60 / 33.28 (20.74–58.88) | 6.46 / 10.75 / 37.89 (20.99–43.52) | 6.72 / 10.11 / 25.60 (21.50–42.50) | 6.46 / 9.60 / 28.67 (18.94–43.52) | 99% | 1 |
+| 2 | on | 1000 | 9.60 / 15.23 / 32.77 (23.04–43.52) | 8.70 / 12.42 / 24.83 (17.15–50.69) | 8.45 / 11.65 / 26.88 (26.62–34.30) | 9.60 / 14.72 / 41.98 (40.45–45.06) | 8.70 / 12.42 / 29.70 (17.66–55.30) | 8.45 / 11.65 / 25.34 (22.53–38.91) | 8.58 / 13.18 / 40.45 (19.46–48.64) | 8.70 / 13.18 / 41.47 (30.72–589.82) | 8.45 / 11.65 / 38.91 (20.99–53.25) | 99% | 7 |
+| 2 | off | 0 | 6.46 / 10.37 / 30.46 (16.26–39.42) | 6.78 / 10.75 / 35.33 (19.97–49.15) | 6.46 / 10.37 / 27.39 (23.55–36.86) | 6.46 / 10.11 / 29.44 (18.18–37.89) | 6.78 / 10.50 / 29.95 (24.58–32.77) | 6.46 / 9.98 / 30.72 (21.25–47.62) | 6.40 / 9.98 / 27.90 (13.31–38.40) | 6.72 / 10.62 / 24.83 (16.38–49.15) | 6.40 / 9.60 / 35.33 (20.22–37.38) | 99% | 1 |
+| 2 | off | 1000 | 8.45 / 12.42 / 27.14 (21.25–49.66) | 9.86 / 14.21 / 34.82 (28.42–37.89) | 8.45 / 11.65 / 34.30 (26.88–40.96) | 8.45 / 13.06 / 38.40 (27.39–45.06) | 9.86 / 13.70 / 32.77 (29.70–44.54) | 8.45 / 12.29 / 28.16 (24.58–37.38) | 8.45 / 14.21 / 34.82 (29.18–50.69) | 9.73 / 13.44 / 32.77 (30.98–42.50) | 8.45 / 11.78 / 35.84 (27.39–43.52) | 99% | 0 |
+
+Background calls served/s
+
+| threads | background | ipi ns | 1 fifo | 3 fifo | 3 all fifo | 1 lend | 3 lend | 3 all lend | 1 refuse | 3 refuse | 3 all refuse | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | on | 0 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 11k (11k–11k) | 11k (11k–11k) | 11k (11k–11k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 100% | 12 |
+| 1 | on | 1000 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 11k (11k–11k) | 11k (11k–11k) | 11k (11k–11k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 100% | 0 |
+| 1 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 3 |
+| 1 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 0 |
+| 2 | on | 0 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 99% | 1 |
+| 2 | on | 1000 | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 10k (10k–10k) | 8k (8k–8k) | 8k (8k–8k) | 8k (8k–8k) | 99% | 7 |
+| 2 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 1 |
+| 2 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 0 |
+
+Calls refused/s
+
+| threads | background | ipi ns | 1 fifo | 3 fifo | 3 all fifo | 1 lend | 3 lend | 3 all lend | 1 refuse | 3 refuse | 3 all refuse | on P | stalls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | on | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 100% | 12 |
+| 1 | on | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 100% | 0 |
+| 1 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 3 |
+| 1 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 100% | 0 |
+| 2 | on | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 99% | 1 |
+| 2 | on | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 4k (4k–4k) | 4k (4k–4k) | 4k (4k–4k) | 99% | 7 |
+| 2 | off | 0 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 1 |
+| 2 | off | 1000 | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) | 99% | 0 |
+
+Migrations seen: 38482 over 1807898 samples (one sample per measured operation).
 
