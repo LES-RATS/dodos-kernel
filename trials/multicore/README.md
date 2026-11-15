@@ -18,14 +18,15 @@ runs (`--csv` output) are in `data/`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--suites` | `locks,a1,a2,a3,b,c,d` | Which workloads to run |
+| `--suites` | `locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf` | Which workloads to run (the `f` suites are the second measurement, below) |
 | `--reps` | 5 | Repetitions of every cell; the tables give the median and the range |
 | `--ms` | 150 | Measured time of one run (after 20 ms of warm-up) |
 | `--max-k` | cores - 2 | Largest number of cores given to the multithreaded process |
 | `--lock` | `queue` | Lock of the group candidates: `ttas`, `ticket` or `queue` |
 | `--csv` | none | One line per run, every class, for later analysis |
 
-A full run takes about 15 minutes on 10 cores. Markdown goes to standard
+A full run takes about 40 minutes on 10 cores (15 for the first seven
+suites, 23 for the `f` suites). Markdown goes to standard
 output, progress to standard error.
 
 On Linux the bench pins worker `i` to the `i`-th physical core (the first
@@ -123,6 +124,12 @@ array queue lock (fair, each waiter spins on its own line, the cache
 behaviour of an MCS lock without pointers). The `locks` suite measures them on
 one group; the other suites use the queue lock (the reason is in the results).
 
+**Unsafe code** is confined to `src/platform.rs`: the foreign calls that set
+the QoS class (macOS), pin a thread (`sched_setaffinity`, Linux) and read the
+current CPU. Every other file is safe Rust. The crate cannot carry
+`#![forbid(unsafe_code)]` for that reason; its tests never call the foreign
+functions, so Miri and the sanitizer run them.
+
 **Self-checks.** After every run: the sum of all node-state lines equals the
 number of line updates the workers made (a lock that let two cores in would
 lose updates), and every node of every process applied every change of that
@@ -130,17 +137,60 @@ process. Every wait has a 10 s limit that panics. `cargo test` runs every
 workload under every candidate briefly, and tests the locks, the ring and the
 histogram.
 
+## Switches (second measurement)
+
+The first measurement left three choices that favoured one side. Each is now
+a switch, and the `f` suites measure both settings side by side in the same
+pass ("first" = as in the first measurement, "fair" = every switch on).
+
+1. **Lookups without the lock (candidates 2 and 3).** A seqlock per
+   capability space: a writer (a change, under the queue lock) makes the
+   counter odd, changes the lines, makes it even; a reader reads the counter,
+   reads its lines, does its `W`, and reads again from the start if the
+   counter was odd or has moved. Chosen over a read-copy-update path because
+   it needs no grace periods and no deferred freeing (the kernel has no heap,
+   and a capability slot is type-stable memory that is never freed, so a
+   torn read is only retried, never followed), and because its cost to a
+   reader is visible: a reader that overlaps a writer waits for it, or wastes
+   its whole read and starts again. The read section is the whole `W` of the
+   lookup, which is pessimistic for the reader (a real lookup reads the slot
+   in a fraction of the call); the suites print how many reads were repeated
+   per 1000 lookups. Readers write nothing shared, so their lines stay shared
+   in every cache. Changes, IPC and signals still take the lock.
+2. **Lazy additions and a cheaper copy (candidate 1, and candidate 2 between
+   groups).** A derive only adds rights, so it waits for its own node's copy
+   only (applied in the home node's order); the other copies apply it later.
+   A delete, and every unmap, still waits for every copy. This needs a
+   contract point: a thread on another node may briefly find the new slot
+   empty (`invalid`); the TLB rule already accepts the same for added
+   mappings. The cost of applying a change to a non-home copy is a parameter
+   (`replica_pct`, 100 or 25 % of `W`): a copy may cost less because the home
+   node has already checked rights, depth and the destination slot, and the
+   copy only writes the result; it may not, because each node keeps its own
+   derivation links for its own revocation walks, and a page-table copy may
+   need a table allocated and cleared. Lines touched are unchanged.
+3. **Interrupts per batch or per message (candidate 1).** The first
+   measurement already charged one interrupt per batch: a core that finds
+   messages handles every message already in its rings for one `ipi`. The
+   switch adds the pessimistic setting, one `ipi` per message, to show what
+   batching is worth.
+
+Latency classes since the second measurement: 0 lookups; 1 deletes (and, in
+`b`, unmaps); 2 lookups of the independent processes (`c`); 3 derives.
+
 ## Workloads
 
 | Suite | What | Measured | Why |
 |---|---|---|---|
 | `locks` | Candidate 3 with one group of k cores, all operations under the lock; `gap` 0 and 1 µs | Throughput, latency of a locked operation, fairness (fewest operations of a core over most) | Choose an honest lock before comparing designs |
-| `a1` | k threads of one process: lookups, and 1 % or 10 % changes (derive/delete) | Throughput; latency of lookups (class 0) and of changes (class 1) | The everyday kernel use of a multithreaded process: the lock against replicas kept by messages |
+| `a1` | k threads of one process: lookups, and 1 % or 10 % changes (derive/delete) | Throughput; latency of lookups (class 0), deletes (class 1) and derives (class 3; in the first measurement class 1 held both) | The everyday kernel use of a multithreaded process: the lock against replicas kept by messages |
 | `a2` | k/2 client-server pairs of one process, IPC call and reply; the pairs are aligned with the groups (cores 0-1, 2-3, ...) | Round trips per second, round-trip latency | IPC between threads of one process, with lock contention between pairs in a group |
 | `a3` | k-1 threads signal one notify on which one thread waits | Signals per second, latency of the signal call | Many-to-one completion: one lock, or all messages to one node |
 | `b` | Unmap with TLB invalidation by one thread, or by all k at once; the others run user code | Unmaps per second, unmap latency | A change every core must see |
 | `c` | n cores: the process of `a1` (10 % changes) on cores `0..k`, a single-thread process that only looks up its own capabilities on each other core | Latency and throughput of the independent processes (class 2); throughput of the k-thread process | Does a group's lock or message traffic disturb the others? |
 | `d` | Candidate 3: group A (core 0) and group B (core 1), and core 2 that moves from one to the other 0, 100, 1000 or 10 000 times per second; 1 % of operations are unmaps inside the group | Move latency (class 1), first operation after a move (class 2), other operations (class 0), total throughput | What a move costs and how often it can be afforded. A and B alternate between one and two cores, so the load is the same with and without moves |
+| `a1f`, `bf`, `cf` | As `a1`, `b`, `c` (k ≥ 2 for `a1f`), each candidate with the first and the fair settings; `a1f` also turns each switch of candidate 1 on alone | As above, plus repeated seqlock reads | Whether the conclusions survive removing the unfair points |
+| `a2f`, `a3f` | As `a2`, `a3`; candidate 1 with interrupts per batch and per message | As above | Only the interrupt switch applies to IPC and signals |
 
 Latencies are per operation, from the caller's side, in µs: p50 / p99 /
 p99.9, the median over the repetitions, with the range of the p99.9 over the

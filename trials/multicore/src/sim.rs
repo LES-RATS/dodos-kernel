@@ -15,8 +15,9 @@
 use crate::hist::Hist;
 use crate::platform;
 use crate::sync::{Guard, LockKind, MAX_CORES, Msg, Padded, Ring, busy};
+use std::hint::black_box;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,8 +54,46 @@ pub struct Params {
     /// Percentage of capability operations that change the capability space.
     pub change_pct: u64,
     pub lock: LockKind,
+    /// How a lookup reads the capability space.
+    pub lookup: Lookup,
+    /// Whether a change that only adds waits for every copy (candidate 1, and
+    /// candidate 2 between groups).
+    pub adds: Adds,
+    /// Cost of applying a change to a copy other than the home one, in
+    /// percent of `work_ns`.
+    pub replica_pct: u64,
+    /// How interrupts are charged to a core reached while in user code.
+    pub irq: Irq,
     pub warmup: Duration,
     pub dur: Duration,
+}
+
+/// The read path of a lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lookup {
+    /// Under the node lock, as every other operation.
+    Locked,
+    /// No lock: a sequence counter per capability space, which writers make
+    /// odd while they change it; a reader that sees it odd, or changed when
+    /// it has finished, reads again.
+    Seqlock,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Adds {
+    /// Every change waits for every copy's acknowledgement.
+    Eager,
+    /// A derive waits only for its own node's copy (ordered by the home
+    /// node); a delete still waits for every copy.
+    Lazy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Irq {
+    /// One interrupt delivers every message already there.
+    PerBatch,
+    /// One interrupt per message (the pessimistic bound).
+    PerMessage,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,7 +135,7 @@ enum Role {
 }
 
 /// Latency classes. Their meaning depends on the workload (README).
-pub const CLASSES: usize = 3;
+pub const CLASSES: usize = 4;
 /// Lines of node state touched by a full operation (half by a half one).
 const LINES: usize = 4;
 /// Lines of node state per process, and processes whose lines are distinct.
@@ -122,13 +161,20 @@ const SIGNAL: u64 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Change {
-    Cap = 0,
+    /// Capability delete: removes rights.
+    CapRemove = 0,
     Unmap = 1,
+    /// Capability derive: only adds.
+    CapAdd = 2,
 }
 
 impl Change {
     fn from_word(w: u64) -> Change {
-        if w == 1 { Change::Unmap } else { Change::Cap }
+        match w {
+            1 => Change::Unmap,
+            2 => Change::CapAdd,
+            _ => Change::CapRemove,
+        }
     }
 }
 
@@ -145,9 +191,18 @@ enum Held {
     No,
 }
 
+/// Which copy a change is applied to.
+#[derive(Clone, Copy)]
+enum Copy {
+    Home,
+    Replica,
+}
+
 struct Node {
     lock: crate::sync::Lock,
     state: Box<[Padded<AtomicU64>]>,
+    /// Sequence counter of each process region (capability space).
+    seqs: Box<[Padded<AtomicU64>]>,
     inbox: Box<[Ring]>,
     applied: Box<[AtomicU64]>,
     members: Padded<AtomicU64>,
@@ -170,6 +225,7 @@ struct Machine {
     bye: Box<[Padded<AtomicBool>]>,
     phase: Padded<AtomicU8>,
     done: Padded<AtomicUsize>,
+    drained: Padded<AtomicUsize>,
     p: Params,
     e_cores: usize,
 }
@@ -184,6 +240,8 @@ pub struct RunOut {
     pub samples: u64,
     pub preferred: u64,
     pub stalls: u64,
+    /// Lookups read again because a writer was active (seqlock).
+    pub retries: u64,
     /// Operations per worker that issues any, for fairness.
     pub per_core: Vec<u64>,
 }
@@ -197,6 +255,7 @@ struct CoreOut {
     preferred: u64,
     touches: u64,
     changes: Vec<u64>,
+    retries: u64,
 }
 
 /// Node of each core, the lock of each node, and the process of each core.
@@ -275,6 +334,7 @@ impl Machine {
                 state: (0..PROC_LINES * PROC_REGIONS)
                     .map(|_| Padded::default())
                     .collect(),
+                seqs: (0..PROC_REGIONS).map(|_| Padded::default()).collect(),
                 inbox: (0..locked.len()).map(|_| Ring::default()).collect(),
                 doorbell: Padded::default(),
                 applied: (0..nprocs).map(|_| AtomicU64::new(0)).collect(),
@@ -298,6 +358,7 @@ impl Machine {
             bye: (0..n).map(|_| Padded::default()).collect(),
             phase: Padded(AtomicU8::new(WARMUP)),
             done: Padded::default(),
+            drained: Padded::default(),
             p,
             e_cores: platform::efficiency_cores(),
         }
@@ -407,7 +468,8 @@ impl<'m> Core<'m> {
     }
 
     /// Handles what has reached this core: messages on its node's rings and
-    /// invalidation requests. Returns whether an interrupt was charged.
+    /// invalidation requests. Returns whether anything was found (and, in
+    /// interruptible mode, an interrupt charged).
     fn poll(&mut self, mode: Mode) -> bool {
         let m = self.m;
         let node = &m.nodes[self.node];
@@ -417,7 +479,8 @@ impl<'m> Core<'m> {
             return false;
         }
         let charged = mode == Mode::Interruptible;
-        if charged {
+        let per_message = charged && m.p.irq == Irq::PerMessage;
+        if charged && !per_message {
             busy(m.p.ipi_ns);
         }
         if bell {
@@ -427,17 +490,23 @@ impl<'m> Core<'m> {
                     let _g = self.lock();
                     // Another core of the node may have taken it.
                     let Some(msg) = ring.pop() else { break };
+                    if per_message {
+                        busy(m.p.ipi_ns);
+                    }
                     self.handle(msg);
                 }
             }
         }
         if tlb {
             for origin in bits(m.mbox_tlb[self.id].swap(0, Ordering::Acquire)) {
+                if per_message {
+                    busy(m.p.ipi_ns);
+                }
                 busy(m.p.tlb_ns);
                 self.ack(origin, Held::No);
             }
         }
-        charged
+        true
     }
 
     /// One message from another node; the node lock is held.
@@ -447,7 +516,7 @@ impl<'m> Core<'m> {
         match msg.kind {
             REQ => self.home_apply(a, Change::from_word(msg.b)),
             APPLY => {
-                self.apply_here(a);
+                self.apply_here(a, Copy::Replica);
                 self.apply_tail(a, Change::from_word(msg.b));
             }
             ACK => {
@@ -494,17 +563,28 @@ impl<'m> Core<'m> {
         }
     }
 
-    /// Applies a change of `origin`'s process to this node's copy.
-    fn apply_here(&mut self, origin: usize) {
-        let pr = self.m.proc_of[origin];
-        self.work(pr, LINES, self.m.p.work_ns);
-        self.m.nodes[self.node].applied[pr].fetch_add(1, Ordering::Relaxed);
+    /// Applies a change of `origin`'s process to this node's copy, inside
+    /// the write side of the seqlock of that capability space.
+    fn apply_here(&mut self, origin: usize, copy: Copy) {
+        let m = self.m;
+        let pr = m.proc_of[origin];
+        let ns = match copy {
+            Copy::Home => m.p.work_ns,
+            Copy::Replica => m.p.work_ns * m.p.replica_pct / 100,
+        };
+        let seq = &m.nodes[self.node].seqs[pr % PROC_REGIONS];
+        let s = seq.load(Ordering::Relaxed);
+        seq.store(s + 1, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.work(pr, LINES, ns);
+        seq.store(s + 2, Ordering::Release);
+        m.nodes[self.node].applied[pr].fetch_add(1, Ordering::Relaxed);
     }
 
     /// On the home node, lock held: apply, then send to the other copies.
     fn home_apply(&mut self, origin: usize, change: Change) {
         let m = self.m;
-        self.apply_here(origin);
+        self.apply_here(origin, Copy::Home);
         for &n in &m.proc_nodes[m.proc_of[origin]] {
             if n != self.node {
                 let msg = Msg {
@@ -519,12 +599,16 @@ impl<'m> Core<'m> {
     }
 
     /// After this node's copy is changed, lock held: a capability change is
-    /// acknowledged once per node; an unmap once per core of the process on
-    /// this node, after its TLB invalidation.
+    /// acknowledged once per node (a lazy addition by the origin's node
+    /// only); an unmap once per core of the process on this node, after its
+    /// TLB invalidation.
     fn apply_tail(&mut self, origin: usize, change: Change) {
         let m = self.m;
-        if change == Change::Cap {
-            self.ack(origin, Held::Yes);
+        let lazy = m.p.adds == Adds::Lazy && change == Change::CapAdd;
+        if change != Change::Unmap {
+            if !lazy || self.node == m.node_of(origin) {
+                self.ack(origin, Held::Yes);
+            }
             return;
         }
         for &c in &m.proc_cores[m.proc_of[origin]] {
@@ -546,7 +630,8 @@ impl<'m> Core<'m> {
         let m = self.m;
         let pr = self.proc;
         let expected = match change {
-            Change::Cap => m.proc_nodes[pr].len(),
+            Change::CapAdd if m.p.adds == Adds::Lazy => 1,
+            Change::CapAdd | Change::CapRemove => m.proc_nodes[pr].len(),
             Change::Unmap => m.proc_cores[pr].len(),
         };
         m.waits[self.id].store(expected as u64, Ordering::Relaxed);
@@ -575,8 +660,41 @@ impl<'m> Core<'m> {
     }
 
     fn lookup(&mut self) {
+        if self.m.p.lookup == Lookup::Seqlock {
+            return self.read_lookup();
+        }
         let _g = self.lock();
         self.work(self.proc, LINES, self.m.p.work_ns);
+    }
+
+    /// A lookup that takes no lock: it only reads its lines, and pays what
+    /// a writer costs it by reading again (the retries are counted).
+    fn read_lookup(&mut self) {
+        let m = self.m;
+        let node = &m.nodes[self.node];
+        let seq = &node.seqs[self.proc % PROC_REGIONS];
+        let base = (self.proc % PROC_REGIONS) * PROC_LINES;
+        let start = self.rand() as usize;
+        loop {
+            let s = seq.load(Ordering::Acquire);
+            if !s.is_multiple_of(2) {
+                // A writer is in: wait for it (the time is in the latency).
+                std::hint::spin_loop();
+                continue;
+            }
+            for j in 0..LINES {
+                black_box(node.state[base + (start + j) % PROC_LINES].load(Ordering::Relaxed));
+            }
+            busy(m.p.work_ns);
+            fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == s {
+                return;
+            }
+            // A writer came in during the read: the whole read is wasted.
+            if m.phase.load(Ordering::Relaxed) == MEASURE {
+                self.out.retries += 1;
+            }
+        }
     }
 
     /// Unmap inside one group, with the dynamic membership of workload d.
@@ -657,7 +775,11 @@ impl<'m> Core<'m> {
 
     fn cap_op(&mut self) {
         if self.rand() % 100 < self.m.p.change_pct {
-            self.timed(1, |c| c.change(Change::Cap));
+            if self.rand().is_multiple_of(2) {
+                self.timed(3, |c| c.change(Change::CapAdd));
+            } else {
+                self.timed(1, |c| c.change(Change::CapRemove));
+            }
         } else {
             self.timed(0, Core::lookup);
         }
@@ -814,6 +936,16 @@ impl<'m> Core<'m> {
             self.poll(Mode::Kernel);
             self.stuck(since, "the final drain");
         }
+        // Lazy additions may still be on their way to other copies: the home
+        // node can still be sending them when their origin is done. Once
+        // every core has passed this point no core is inside a handler, so
+        // nothing more is sent, and one last look empties the rings.
+        m.drained.fetch_add(1, Ordering::AcqRel);
+        while m.drained.load(Ordering::Acquire) < m.roles.len() {
+            self.poll(Mode::Kernel);
+            self.stuck(since, "the final drain");
+        }
+        while self.poll(Mode::Kernel) {}
     }
 }
 
@@ -869,6 +1001,7 @@ pub fn run(
         r.migrations += o.migrations;
         r.samples += o.samples;
         r.preferred += o.preferred;
+        r.retries += o.retries;
         let mine: u64 = o.ops.iter().sum();
         if mine > 0 {
             r.per_core.push(mine);
@@ -900,7 +1033,7 @@ fn check(m: &Machine, outs: &[CoreOut]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cand, Initiators, Params, Workload, run};
+    use super::{Adds, Cand, Initiators, Irq, Lookup, Params, Workload, run};
     use crate::sync::LockKind;
     use std::time::Duration;
 
@@ -913,13 +1046,29 @@ mod tests {
             switch_ns: 100,
             change_pct: 30,
             lock,
+            lookup: Lookup::Seqlock,
+            adds: Adds::Lazy,
+            replica_pct: 25,
+            irq: Irq::PerMessage,
             warmup: Duration::from_millis(1),
             dur: Duration::from_millis(5),
         }
     }
 
-    /// Every workload ends under every candidate and passes the
-    /// self-checks of `run`; each measures operations.
+    /// The first settings: lookups under the lock, every change eager.
+    fn first(lock: LockKind) -> Params {
+        Params {
+            lookup: Lookup::Locked,
+            adds: Adds::Eager,
+            replica_pct: 100,
+            irq: Irq::PerBatch,
+            ..params(lock)
+        }
+    }
+
+    /// Every workload ends under every candidate, with both settings of
+    /// every switch, and passes the self-checks of `run` (which include
+    /// that lazy additions reach every copy); each measures operations.
     #[test]
     fn every_workload_runs_under_every_candidate() {
         let works = [
@@ -929,23 +1078,47 @@ mod tests {
             Workload::Unmap(Initiators::One),
             Workload::Unmap(Initiators::All),
         ];
-        for w in works {
-            for cand in [Cand::PerCore, Cand::Fixed(2), Cand::Sized] {
-                let r = run(w, cand, 4, 4, params(LockKind::Ticket), &[]);
-                assert!(r.ops.iter().sum::<u64>() > 0, "{w:?} {cand:?}");
+        for make in [first, params] {
+            for w in works {
+                for cand in [Cand::PerCore, Cand::Fixed(2), Cand::Sized] {
+                    let r = run(w, cand, 4, 4, make(LockKind::Queue), &[]);
+                    assert!(r.ops.iter().sum::<u64>() > 0, "{w:?} {cand:?}");
+                }
             }
+            let r = run(
+                Workload::Mixed,
+                Cand::Fixed(2),
+                3,
+                4,
+                make(LockKind::Queue),
+                &[],
+            );
+            assert!(r.ops[2] > 0, "independent processes measured");
         }
-        let r = run(
-            Workload::Mixed,
-            Cand::Fixed(2),
-            3,
-            4,
-            params(LockKind::Queue),
-            &[],
-        );
-        assert!(r.ops[2] > 0, "independent processes measured");
         let mv = Workload::Move { rate: 2000 };
         let r = run(mv, Cand::Sized, 2, 4, params(LockKind::Ttas), &[]);
         assert!(r.ops[1] > 0, "moves measured");
+    }
+
+    /// A lazy derive returns before the other copies have applied it; an
+    /// eager one waits for all of them, so it is slower on four nodes.
+    #[test]
+    fn lazy_additions_wait_less_than_eager_ones() {
+        let lazy = Params {
+            change_pct: 100,
+            ipi_ns: 2000,
+            ..params(LockKind::Queue)
+        };
+        let eager = Params {
+            adds: Adds::Eager,
+            ..lazy
+        };
+        let p50 = |p| run(Workload::CapOps, Cand::PerCore, 4, 4, p, &[]).hist[3].quantile(0.5);
+        assert!(
+            p50(lazy) * 2 < p50(eager),
+            "lazy {} eager {}",
+            p50(lazy),
+            p50(eager)
+        );
     }
 }

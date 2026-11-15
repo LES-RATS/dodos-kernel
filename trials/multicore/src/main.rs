@@ -1,7 +1,8 @@
 //! Measured trial for the DodOS kernel: may a node run on more than one core
 //! at the same time? See README.md for the method.
 //!
-//! Usage: dodos-trial-multicore [--suites locks,a1,a2,a3,b,c,d] [--reps N]
+//! Usage: dodos-trial-multicore [--suites locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf]
+//!        [--reps N]
 //!        [--ms N] [--max-k N] [--lock ttas|ticket|queue] [--csv FILE]
 
 mod hist;
@@ -9,7 +10,7 @@ mod platform;
 mod sim;
 mod sync;
 
-use sim::{CLASSES, Cand, Initiators, Params, RunOut, Workload};
+use sim::{Adds, CLASSES, Cand, Initiators, Irq, Lookup, Params, RunOut, Workload};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -35,9 +36,11 @@ fn parse_lock(s: &str) -> LockKind {
 
 fn opts(cores: usize) -> Opts {
     let mut o = Opts {
-        suites: ["locks", "a1", "a2", "a3", "b", "c", "d"]
-            .map(String::from)
-            .to_vec(),
+        suites: [
+            "locks", "a1", "a2", "a3", "b", "c", "d", "a1f", "a2f", "a3f", "bf", "cf",
+        ]
+        .map(String::from)
+        .to_vec(),
         reps: 5,
         dur: Duration::from_millis(150),
         max_k: cores.saturating_sub(2).max(2),
@@ -63,7 +66,8 @@ fn opts(cores: usize) -> Opts {
                     (0..CLASSES).map(|c| format!("c{c}_n,c{c}_p50,c{c}_p99,c{c}_p999,c{c}_max"));
                 let head = "suite,rep,labels,column,workload,k,n,lock,work_ns,gap_ns,ipi_ns,change_pct,migrations,stalls,ops_per_s";
                 let classes: Vec<String> = classes.collect();
-                writeln!(f, "{head},{},samples,preferred", classes.join(",")).expect("CSV write");
+                let tail = "samples,preferred,lookup,adds,replica_pct,irq,retries";
+                writeln!(f, "{head},{},{tail}", classes.join(",")).expect("CSV write");
                 o.csv = Some(f);
             }
             other => panic!("unknown option {other}; see the head of main.rs"),
@@ -86,6 +90,41 @@ struct Col {
     name: String,
     cand: Cand,
     lock: LockKind,
+    v: Variant,
+}
+
+/// The settings of the switches of the second measurement.
+#[derive(Clone, Copy)]
+struct Variant {
+    lookup: Lookup,
+    adds: Adds,
+    replica_pct: u64,
+    irq: Irq,
+}
+
+/// The settings of the first measurement.
+const FIRST: Variant = Variant {
+    lookup: Lookup::Locked,
+    adds: Adds::Eager,
+    replica_pct: 100,
+    irq: Irq::PerBatch,
+};
+
+/// Each unfairness of the first measurement removed.
+const FAIR: Variant = Variant {
+    lookup: Lookup::Seqlock,
+    adds: Adds::Lazy,
+    replica_pct: 25,
+    irq: Irq::PerBatch,
+};
+
+fn col(name: &str, cand: Cand, lock: LockKind, v: Variant) -> Col {
+    Col {
+        name: name.into(),
+        cand,
+        lock,
+        v,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -177,7 +216,7 @@ impl Bench {
         let mut line = format!(
             "{suite},{rep},{},{},{:?},{},{},{},{},{},{},{},{},{},{:.0}",
             row.labels.join(" "),
-            col.name,
+            col.name.replace(',', ";"),
             row.w,
             row.k,
             row.n,
@@ -188,7 +227,7 @@ impl Bench {
             row.p.change_pct,
             r.migrations,
             r.stalls,
-            rate(r, 0b111)
+            rate(r, 0b1111)
         );
         for h in &r.hist {
             let _ = write!(
@@ -201,7 +240,12 @@ impl Bench {
                 h.max
             );
         }
-        let _ = writeln!(f, "{line},{},{}", r.samples, r.preferred);
+        let v = col.v;
+        let _ = writeln!(
+            f,
+            "{line},{},{},{:?},{:?},{},{:?},{}",
+            r.samples, r.preferred, v.lookup, v.adds, v.replica_pct, v.irq, r.retries
+        );
     }
 
     /// Runs every row under every column, `reps` times, the repetitions
@@ -229,6 +273,10 @@ impl Bench {
                     let p = Params {
                         lock: col.lock,
                         dur: self.o.dur,
+                        lookup: col.v.lookup,
+                        adds: col.v.adds,
+                        replica_pct: col.v.replica_pct,
+                        irq: col.v.irq,
                         ..row.p
                     };
                     let r = sim::run(row.w, col.cand, row.k, row.n, p, &self.cpus);
@@ -272,6 +320,28 @@ impl Bench {
             t.push('\n');
             self.emit(&t);
         }
+        let mut retries = String::new();
+        for (j, c) in cols.iter().enumerate() {
+            let tried: u64 = runs.iter().flat_map(|r| &r[j]).map(|r| r.retries).sum();
+            let looked: u64 = runs
+                .iter()
+                .flat_map(|r| &r[j])
+                .map(|r| r.ops[0] + r.ops[2])
+                .sum();
+            if tried > 0 {
+                let _ = write!(
+                    retries,
+                    " {}: {:.2};",
+                    c.name,
+                    1000.0 * tried as f64 / looked.max(1) as f64
+                );
+            }
+        }
+        if !retries.is_empty() {
+            self.emit(&format!(
+                "Seqlock reads repeated per 1000 lookups:{retries}\n"
+            ));
+        }
         let mig: u64 = runs.iter().flatten().flatten().map(|r| r.migrations).sum();
         let samples: u64 = runs.iter().flatten().flatten().map(|r| r.samples).sum();
         self.emit(&format!(
@@ -283,11 +353,7 @@ impl Bench {
 fn candidates(lock: LockKind) -> Vec<Col> {
     [Cand::PerCore, Cand::Fixed(2), Cand::Fixed(4), Cand::Sized]
         .into_iter()
-        .map(|cand| Col {
-            name: cand.name(),
-            cand,
-            lock,
-        })
+        .map(|cand| col(&cand.name(), cand, lock, FIRST))
         .collect()
 }
 
@@ -300,6 +366,10 @@ fn base(o: &Opts) -> Params {
         switch_ns: 1000,
         change_pct: 10,
         lock: o.lock,
+        lookup: FIRST.lookup,
+        adds: FIRST.adds,
+        replica_pct: FIRST.replica_pct,
+        irq: FIRST.irq,
         warmup: Duration::from_millis(20),
         dur: o.dur,
     }
@@ -320,6 +390,7 @@ fn run_suite(b: &mut Bench, name: &str) {
     let even: Vec<usize> = ks.iter().copied().filter(|k| k % 2 == 0).collect();
     let p0 = base(&b.o);
     let lat = |c| Metric::Lat(c);
+    let l = b.o.lock;
     match name {
         "locks" => {
             let mut rows = Vec::new();
@@ -342,16 +413,12 @@ fn run_suite(b: &mut Bench, name: &str) {
                 }
             }
             let cols = [LockKind::Ttas, LockKind::Ticket, LockKind::Queue]
-                .map(|lock| Col {
-                    name: lock.name().into(),
-                    cand: Cand::Sized,
-                    lock,
-                })
+                .map(|lock| col(lock.name(), Cand::Sized, lock, FIRST))
                 .into();
             let m = [
                 (
                     "Throughput, operations/s, median (min–max)",
-                    Metric::Rate(0b11),
+                    Metric::Rate(0b1011),
                 ),
                 (
                     "Latency of a locked operation, µs: p50 / p99 / p99.9 (p99.9 min–max)",
@@ -393,7 +460,7 @@ fn run_suite(b: &mut Bench, name: &str) {
             let m = [
                 (
                     "Throughput, operations/s, median (min–max)",
-                    Metric::Rate(0b11),
+                    Metric::Rate(0b1011),
                 ),
                 (
                     "Lookup latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
@@ -518,7 +585,7 @@ fn run_suite(b: &mut Bench, name: &str) {
                     lat(2),
                 ),
                 ("Independent processes: operations/s", Metric::Rate(0b100)),
-                ("The k-thread process: operations/s", Metric::Rate(0b11)),
+                ("The k-thread process: operations/s", Metric::Rate(0b1011)),
             ];
             b.suite(
                 "c: one k-thread process and n-k single-thread processes",
@@ -543,11 +610,7 @@ fn run_suite(b: &mut Bench, name: &str) {
                     }
                 }
             }
-            let col = vec![Col {
-                name: "3 sized".into(),
-                cand: Cand::Sized,
-                lock: b.o.lock,
-            }];
+            let cols = vec![col("3 sized", Cand::Sized, b.o.lock, FIRST)];
             let m = [
                 (
                     "Throughput of the 3 cores, operations/s",
@@ -564,7 +627,215 @@ fn run_suite(b: &mut Bench, name: &str) {
                 "d: one core moving between group A and group B (one fixed core each)",
                 &["switch ns", "W ns", "moves/s"],
                 rows,
-                col,
+                cols,
+                &m,
+            );
+        }
+        "a1f" => {
+            let mut rows = Vec::new();
+            for change in [1, 10] {
+                for ipi in IPIS {
+                    for w in WORKS {
+                        for &k in ks.iter().filter(|&&k| k >= 2) {
+                            let p = Params {
+                                work_ns: w,
+                                ipi_ns: ipi,
+                                change_pct: change,
+                                ..p0
+                            };
+                            let l = vec![
+                                change.to_string(),
+                                ipi.to_string(),
+                                w.to_string(),
+                                k.to_string(),
+                            ];
+                            rows.push(row(l, Workload::CapOps, k, k, p));
+                        }
+                    }
+                }
+            }
+            let lazy = Variant {
+                adds: Adds::Lazy,
+                ..FIRST
+            };
+            let cheap = Variant {
+                replica_pct: 25,
+                ..FIRST
+            };
+            let per_msg = Variant {
+                irq: Irq::PerMessage,
+                ..FAIR
+            };
+            let cols = vec![
+                col("1 first", Cand::PerCore, l, FIRST),
+                col("1 lazy adds", Cand::PerCore, l, lazy),
+                col("1 replica 25%", Cand::PerCore, l, cheap),
+                col("1 fair", Cand::PerCore, l, FAIR),
+                col("1 fair, irq/msg", Cand::PerCore, l, per_msg),
+                col("2/2 first", Cand::Fixed(2), l, FIRST),
+                col("2/2 fair", Cand::Fixed(2), l, FAIR),
+                col("2/4 first", Cand::Fixed(4), l, FIRST),
+                col("2/4 fair", Cand::Fixed(4), l, FAIR),
+                col("3 first", Cand::Sized, l, FIRST),
+                col("3 fair", Cand::Sized, l, FAIR),
+            ];
+            let m = [
+                (
+                    "Throughput, operations/s, median (min–max)",
+                    Metric::Rate(0b1011),
+                ),
+                (
+                    "Lookup latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(0),
+                ),
+                ("Delete (removal) latency, µs", lat(1)),
+                ("Derive (addition) latency, µs", lat(3)),
+            ];
+            let heads = ["change %", "ipi ns", "W ns", "k"];
+            b.suite(
+                "a1f: capability operations, first and fair settings",
+                &heads,
+                rows,
+                cols,
+                &m,
+            );
+        }
+        "a2f" | "a3f" => {
+            let w = if name == "a2f" {
+                Workload::Ipc
+            } else {
+                Workload::Signal
+            };
+            let mut rows = Vec::new();
+            for ipi in IPIS {
+                for work in WORKS {
+                    for &k in &even {
+                        let p = Params {
+                            work_ns: work,
+                            ipi_ns: ipi,
+                            ..p0
+                        };
+                        rows.push(row(
+                            vec![ipi.to_string(), work.to_string(), k.to_string()],
+                            w,
+                            k,
+                            k,
+                            p,
+                        ));
+                    }
+                }
+            }
+            // No lookup, addition or copy here: only the interrupt switch
+            // applies, and only to messages between nodes.
+            let per_msg = Variant {
+                irq: Irq::PerMessage,
+                ..FIRST
+            };
+            let cols = vec![
+                col("1 batched", Cand::PerCore, l, FIRST),
+                col("1 irq/msg", Cand::PerCore, l, per_msg),
+                col("2/2", Cand::Fixed(2), l, FIRST),
+                col("2/4", Cand::Fixed(4), l, FIRST),
+                col("3", Cand::Sized, l, FIRST),
+            ];
+            let (title, what) = if name == "a2f" {
+                ("a2f: IPC call and reply, interrupt switch", "Round trip")
+            } else {
+                (
+                    "a3f: k-1 threads signal one notify, interrupt switch",
+                    "Signal call",
+                )
+            };
+            let lt = format!("{what} latency, µs: p50 / p99 / p99.9 (p99.9 min–max)");
+            let m = [
+                (
+                    "Throughput, operations/s, median (min–max)",
+                    Metric::Rate(0b1),
+                ),
+                (lt.as_str(), lat(0)),
+            ];
+            b.suite(title, &["ipi ns", "W ns", "k"], rows, cols, &m);
+        }
+        "bf" => {
+            let mut rows = Vec::new();
+            for (who, init) in [("one", Initiators::One), ("all", Initiators::All)] {
+                for ipi in IPIS {
+                    for work in WORKS {
+                        for &k in ks.iter().filter(|&&k| k >= 2) {
+                            let p = Params {
+                                work_ns: work,
+                                ipi_ns: ipi,
+                                ..p0
+                            };
+                            let l =
+                                vec![who.into(), ipi.to_string(), work.to_string(), k.to_string()];
+                            rows.push(row(l, Workload::Unmap(init), k, k, p));
+                        }
+                    }
+                }
+            }
+            let per_msg = Variant {
+                irq: Irq::PerMessage,
+                ..FAIR
+            };
+            let cols = vec![
+                col("1 first", Cand::PerCore, l, FIRST),
+                col("1 fair", Cand::PerCore, l, FAIR),
+                col("1 fair, irq/msg", Cand::PerCore, l, per_msg),
+                col("2/2 first", Cand::Fixed(2), l, FIRST),
+                col("2/2 fair", Cand::Fixed(2), l, FAIR),
+                col("2/4 first", Cand::Fixed(4), l, FIRST),
+                col("2/4 fair", Cand::Fixed(4), l, FAIR),
+                col("3", Cand::Sized, l, FIRST),
+            ];
+            let m = [
+                ("Throughput, unmaps/s, median (min–max)", Metric::Rate(0b1)),
+                (
+                    "Unmap latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(0),
+                ),
+            ];
+            let heads = ["initiators", "ipi ns", "W ns", "k"];
+            b.suite("bf: unmap, first and fair settings", &heads, rows, cols, &m);
+        }
+        "cf" => {
+            let mut rows = Vec::new();
+            let big = b.o.max_k;
+            for n in [4.min(big), big] {
+                for work in [200, 1000] {
+                    for k in [1, 2, 3, 5, 6].into_iter().filter(|&k| k < n) {
+                        let p = Params {
+                            work_ns: work,
+                            ..p0
+                        };
+                        rows.push(row(
+                            vec![n.to_string(), work.to_string(), k.to_string()],
+                            Workload::Mixed,
+                            k,
+                            n,
+                            p,
+                        ));
+                    }
+                }
+            }
+            let mut cols = Vec::new();
+            for cand in [Cand::PerCore, Cand::Fixed(2), Cand::Fixed(4), Cand::Sized] {
+                cols.push(col(&format!("{} first", cand.name()), cand, l, FIRST));
+                cols.push(col(&format!("{} fair", cand.name()), cand, l, FAIR));
+            }
+            let m = [
+                (
+                    "Independent processes: lookup latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(2),
+                ),
+                ("Independent processes: operations/s", Metric::Rate(0b100)),
+                ("The k-thread process: operations/s", Metric::Rate(0b1011)),
+            ];
+            b.suite(
+                "cf: k-thread process beside single-thread ones, first and fair settings",
+                &["n", "W ns", "k"],
+                rows,
+                cols,
                 &m,
             );
         }
