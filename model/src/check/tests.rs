@@ -1761,3 +1761,105 @@ fn armed_timer_its_notify_does_not_list_is_reported() {
     });
     assert_eq!(broken, "47: armed timer");
 }
+
+// The invariants of tasks and marks, and of interrupts.
+
+#[test]
+fn thread_whose_task_does_not_list_it_is_reported() {
+    let broken = spoiled(|m, at| {
+        let task = m.threads[&at.ready].task.unwrap();
+        live(&mut m.tasks, task).threads.clear();
+    });
+    assert_eq!(broken, "48: task of a thread");
+}
+
+#[test]
+fn task_that_lists_a_thread_attached_elsewhere_is_reported() {
+    let broken = spoiled(|m, at| {
+        let task = m.threads[&at.ready].task.unwrap();
+        live(&mut m.tasks, task).threads.push(at.waiter);
+    });
+    assert_eq!(broken, "48: threads of a task");
+}
+
+#[test]
+fn task_identifier_not_given_out_or_with_a_reserved_mark_is_reported() {
+    let broken = spoiled(|m, at| {
+        let task = m.threads[&at.ready].task.unwrap();
+        live(&mut m.tasks, task).id = dodos_abi::TaskId::new(0, 99);
+    });
+    assert_eq!(broken, "49: task identifier");
+    let broken = spoiled(|m, at| {
+        let task = m.threads[&at.ready].task.unwrap();
+        live(&mut m.tasks, task).marks = 1 << 5;
+    });
+    assert_eq!(broken, "49: marks of a task");
+    let broken = spoiled(|m, at| live(&mut m.threads, at.waiter).marks = 1 << 5);
+    assert_eq!(broken, "49: marks of a thread");
+}
+
+#[test]
+fn running_thread_of_a_revoked_task_is_reported() {
+    let broken = spoiled(|m, at| {
+        let task = m.threads[&at.ready].task.unwrap();
+        live(&mut m.tasks, task).revoked = true;
+    });
+    assert_eq!(broken, "50: running thread of a revoked task");
+}
+
+/// An irq claimed on vector 48 into slot 61, bound to the notify.
+fn with_irq(m: &mut Model) -> ObjId {
+    let boot = object(m, START_SLOT_THREAD);
+    let own = SlotAddr::own;
+    let claim = Syscall::IrqClaim {
+        control: own(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::msi(0, 1, 0, 0).raw(),
+        vector: 48,
+        destination: own(61),
+    };
+    m.apply(boot, claim).unwrap();
+    let bind = Syscall::IrqBind {
+        irq: own(61),
+        notify: own(NT),
+    };
+    m.apply(boot, bind).unwrap();
+    object(m, 61)
+}
+
+#[test]
+fn irq_of_a_vector_that_cannot_be_claimed_is_reported() {
+    let broken = spoiled(|m, _| {
+        let irq = with_irq(m);
+        live(&mut m.irqs, irq).vector = 47;
+    });
+    assert_eq!(broken, "51: vector of an irq");
+}
+
+#[test]
+fn bound_irq_that_its_notify_does_not_list_is_reported() {
+    let broken = spoiled(|m, at| {
+        with_irq(m);
+        live(&mut m.notifies, at.notify).irqs.clear();
+    });
+    assert_eq!(broken, "51: binding of an irq");
+}
+
+#[test]
+fn idle_irq_bound_to_a_notify_is_reported() {
+    let broken = spoiled(|m, _| {
+        let irq = with_irq(m);
+        live(&mut m.irqs, irq).state = IrqState::Idle;
+    });
+    assert_eq!(broken, "51: binding of an irq");
+}
+
+#[test]
+fn irq_whose_root_capability_is_not_a_child_of_an_irq_control_is_reported() {
+    let broken = spoiled(|m, _| {
+        let irq = with_irq(m);
+        let root = m.objects[&irq].root;
+        orphan(m, root);
+        live(&mut m.caps, root).parent = None;
+    });
+    assert_eq!(broken, "11: parent of an irq");
+}
