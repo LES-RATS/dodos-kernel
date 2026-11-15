@@ -259,10 +259,10 @@ impl Bench {
     fn csv(&mut self, suite: &str, rep: usize, row: &Row, col: &Col, r: &RunOut) {
         let Some(f) = self.o.csv.as_mut() else { return };
         let mut line = format!(
-            "{suite},{rep},{},{},{:?},{},{},{},{},{},{},{},{},{},{:.0}",
+            "{suite},{rep},{},{},{},{},{},{},{},{},{},{},{},{},{:.0}",
             row.labels.join(" "),
             col.name.replace(',', ";"),
-            row.w,
+            format!("{:?}", row.w).replace(',', ";"),
             row.k,
             row.n,
             col.lock.name(),

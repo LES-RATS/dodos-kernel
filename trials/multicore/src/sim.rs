@@ -300,6 +300,8 @@ struct Node {
     /// Nodes that pushed since the last look: the stand-in for the interrupt
     /// a sender raises, so that an idle node reads one line, not every ring.
     doorbell: Padded<AtomicU64>,
+    /// Set while a core of the node is in an interrupt entry for its rings.
+    irq: Padded<AtomicBool>,
 }
 
 struct Machine {
@@ -464,6 +466,7 @@ impl Machine {
                 seqs: (0..PROC_REGIONS).map(|_| Padded::default()).collect(),
                 inbox: (0..locked.len()).map(|_| Ring::default()).collect(),
                 doorbell: Padded::default(),
+                irq: Padded::default(),
                 applied: (0..nprocs).map(|_| AtomicU64::new(0)).collect(),
                 members: Padded(AtomicU64::new(
                     (0..n).filter(|&c| node_of[c] == i).map(|c| 1u64 << c).sum(),
@@ -699,30 +702,41 @@ impl<'m> Core<'m> {
     /// invalidation requests. Returns whether anything was found (and, in
     /// interruptible mode, an interrupt charged).
     ///
-    /// The doorbell is taken before the interrupt is charged, so that one
-    /// message to a group interrupts one of its cores. Until the fourth
-    /// series it was charged first, and every core of a group that saw the
-    /// doorbell during that charge paid an interrupt for the same message
-    /// (README, "Fourth series").
+    /// One interrupt per batch reaches one core of a node: a core that finds
+    /// another core of its node in the middle of an interrupt entry leaves
+    /// the batch to it (`Node::irq`). Until the fourth series every core of
+    /// a group that saw the doorbell paid an interrupt for the same message
+    /// (README, "Fourth series"). What arrives during the entry is handled
+    /// in the same batch, and a core spinning in the kernel takes messages
+    /// at once, as before.
     fn poll(&mut self, mode: Mode) -> bool {
         let m = self.m;
         let node = &m.nodes[self.node];
-        let take = |w: &AtomicU64| {
-            if w.load(Ordering::Relaxed) == 0 {
-                0
-            } else {
-                w.swap(0, Ordering::Acquire)
-            }
-        };
-        let bells = take(&node.doorbell);
-        let tlbs = take(&m.mbox_tlb[self.id]);
-        if bells == 0 && tlbs == 0 {
+        let bell = node.doorbell.load(Ordering::Relaxed) != 0;
+        let tlb = m.mbox_tlb[self.id].load(Ordering::Relaxed) != 0;
+        if !bell && !tlb {
             return false;
         }
         let charged = mode == Mode::Interruptible;
         let per_message = charged && m.p.irq == Irq::PerMessage;
+        let mut claimed = false;
         if charged && !per_message {
+            // An invalidation interrupts this core whatever the others do.
+            if !tlb {
+                if node.irq.swap(true, Ordering::Acquire) {
+                    return false;
+                }
+                claimed = true;
+            }
             busy(m.p.ipi_ns);
+        }
+        let bells = if bell {
+            node.doorbell.swap(0, Ordering::Acquire)
+        } else {
+            0
+        };
+        if claimed {
+            node.irq.store(false, Ordering::Release);
         }
         for from in bits(bells) {
             let ring = &node.inbox[from];
@@ -736,12 +750,14 @@ impl<'m> Core<'m> {
                 self.handle(msg);
             }
         }
-        for origin in bits(tlbs) {
-            if per_message {
-                busy(m.p.ipi_ns);
+        if tlb {
+            for origin in bits(m.mbox_tlb[self.id].swap(0, Ordering::Acquire)) {
+                if per_message {
+                    busy(m.p.ipi_ns);
+                }
+                busy(m.p.tlb_ns);
+                self.ack(origin, Held::No);
             }
-            busy(m.p.tlb_ns);
-            self.ack(origin, Held::No);
         }
         true
     }
