@@ -11,7 +11,7 @@ use crate::recovery::HwAction;
 use crate::remote::{Body, Packet};
 use crate::table::GrantState;
 use crate::{Model, ObjId, Outcome, Refusal, Syscall};
-use dodos_abi::{DRIVER_NONE, Evidence, Member, MemberState, RoleKind, RoleState};
+use dodos_abi::{Member, MemberState, RoleKind, RoleState};
 use std::collections::BTreeSet;
 
 /// The state of a physical core, as the hardware has it.
@@ -48,34 +48,6 @@ pub struct System {
 
 /// `Err` names the invariant that fails.
 type Check = Result<(), String>;
-
-/// 85: the rows of the table of transitions of a member word, read from
-/// the raw fields (not through `member_transition`).
-fn transition(from: Member, to: Member) -> bool {
-    use MemberState::{Dead, Fenced, Fencing, Live, Sealed, Sealing, Starting, Unfenced};
-    let (g, h) = (from.generation(), to.generation());
-    let kept = from.evidence() == to.evidence() && from.driver() == to.driver();
-    let cleared = to.evidence() == Evidence::None && to.driver() == DRIVER_NONE;
-    match (from.state(), to.state()) {
-        (Dead, Starting) => h == g.wrapping_add(1) && cleared,
-        (Sealed, Starting) => h == g && cleared,
-        (Starting, Live) | (Live, Sealing) | (Sealing, Sealed) => h == g && kept,
-        (Fencing, Fenced) | (Fencing, Unfenced) | (Unfenced, Fenced) | (Fenced, Dead) => {
-            h == g && kept
-        }
-        (Starting | Live | Sealing | Sealed, Fencing) => {
-            h == g && to.evidence() != Evidence::None && to.driver() != DRIVER_NONE
-        }
-        (Fencing, Fencing) => {
-            h == g && from.evidence() == to.evidence() && to.driver() != from.driver()
-        }
-        // A node parked on a fenced core whose seal is valid becomes sealed
-        // (After a confirmed stop): a change that the table of transitions
-        // does not list (CONTRACT-GAP, reported).
-        (Starting | Live, Sealed) => h == g,
-        _ => false,
-    }
-}
 
 impl System {
     /// Every node started from its floor and the kept image, with the
@@ -138,6 +110,11 @@ impl System {
         self.table().roles[index]
     }
 
+    /// The number of roles of the machine.
+    pub fn node_count_roles(&self) -> usize {
+        self.table().roles.len()
+    }
+
     /// The state of a physical core.
     pub fn core(&self, core: usize) -> CoreState {
         self.cores[core]
@@ -155,9 +132,13 @@ impl System {
             return false;
         };
         let core = model.table.placed[node as usize];
-        let state = model.table.member(node).state();
+        let member = model.table.member(node);
+        // A stopped node whose block is saved on a core that runs another
+        // node is never loaded again.
+        let unloaded = !member.writes() && model.parked_block(node);
         self.cores[core] == CoreState::Running
-            && !matches!(state, MemberState::Sealed | MemberState::Dead)
+            && !matches!(member.state(), MemberState::Sealed | MemberState::Dead)
+            && !unloaded
     }
 
     fn model(&mut self, node: u16) -> &mut Model {
@@ -401,9 +382,21 @@ impl System {
                     _ => {}
                 }
             }
+            // The core is parked only when no node that is starting, live or
+            // sealing remains placed on it; otherwise it saves the node's
+            // block and goes on running the others.
             HwAction::ParkSelf { node } => {
                 let core = self.table().placed[node as usize];
-                self.cores[core] = CoreState::Parked;
+                let other = (0..self.nodes.len() as u16).find(|&z| {
+                    z != node && self.table().placed[z as usize] == core && self.table().writes(z)
+                });
+                match other {
+                    None => self.cores[core] = CoreState::Parked,
+                    Some(other) => self.write_beacon(|t| {
+                        t.beacons[node as usize].save_seal = true;
+                        t.core_beacons[core].running = other;
+                    }),
+                }
             }
             HwAction::Start { node, mode } => self.start_node(node, mode),
         }
@@ -448,8 +441,8 @@ impl System {
 
     /// A node that became dead has no kernel: its model is dropped, and the
     /// gate clears the map counts of its tables, their page classes, and
-    /// its grant and use tables (model choice: the contract does not say
-    /// who clears what a dead node's gate wrote; the serials stay).
+    /// its grant and use tables (R6): every entry becomes free and its
+    /// serial grows, so no name of this generation is used again.
     fn drop_dead(&mut self) {
         for node in 0..self.nodes.len() {
             let dead = self.nodes[node]
@@ -470,7 +463,9 @@ impl System {
                     t.classes.remove(page);
                 }
                 t.reports[node].clear();
-                t.grants[node].clear();
+                for (grant, entry) in std::mem::take(&mut t.grants[node]) {
+                    t.serials[node].insert(grant, (entry.serial + 1) & 0x3FFF_FFFF);
+                }
                 t.uses[node].clear();
             });
             if matches!(
@@ -556,8 +551,14 @@ impl System {
                 // A remote object of this grant, with its serial, is held by
                 // its grantee only.
                 for (holder, uses) in table.uses.iter().enumerate() {
+                    // A use entry of an earlier generation of the granting
+                    // node names nothing of this one.
+                    let generation = table.generation(granter as u16);
                     let held = uses.values().any(|u| {
-                        u.granter == granter as u16 && u.grant == grant && u.serial == entry.serial
+                        u.granter == granter as u16
+                            && u.grant == grant
+                            && u.serial == entry.serial
+                            && u.generation == generation
                     });
                     let live = entry.state == GrantState::Live;
                     ensure(
@@ -668,7 +669,7 @@ impl System {
         }
         for &(node, _, from, to) in table.member_writes.iter() {
             ensure(
-                transition(from, to),
+                dodos_abi::member_transition(from, to).is_some(),
                 "85: a member word written off the table of transitions",
             )?;
             if to.state() == MemberState::Dead && from.state() != MemberState::Dead {
@@ -703,7 +704,7 @@ mod tests {
     use super::*;
     use crate::table::{GrantEntry, UseEntry};
     use crate::{Message, Range, Transfer, live};
-    use dodos_abi::{ObjectKind, PageSize, Rights, SlotAddr};
+    use dodos_abi::{DRIVER_NONE, Evidence, ObjectKind, PageSize, Rights, SlotAddr};
 
     const OBJ: u32 = 101;
     const GOT: u32 = 110;
@@ -840,6 +841,95 @@ mod tests {
         // The grant made for it was freed at the refusal: only grant 0 is
         // left on node 0.
         assert_eq!(sys.nodes[0].as_mut().unwrap().table.grants[0].len(), 1);
+    }
+
+    /// A message that names a grant, sent by a node that is not the grantee
+    /// with the generation the entry records, is refused and traced (Who
+    /// may send what); the right sender's is acted on.
+    #[test]
+    fn a_release_from_a_node_that_is_not_the_grantee_is_refused_and_traced() {
+        let (mut sys, _) = granted();
+        let packet = |generation| Packet {
+            from: 1,
+            generation,
+            to: 0,
+            body: Body::Release {
+                grant: 0,
+                serial: 0,
+            },
+        };
+        // The entry records another generation of node 1 than the one that
+        // sends: the release is refused.
+        tables(&mut sys, |t| live(&mut t.grants[0], 0).generation = 7);
+        sys.in_flight.push(packet(1));
+        sys.settle(1);
+        assert!(sys.node(0).grant_entry(0).is_some());
+        let traced = sys.node(0).ring(false);
+        let entry = traced.last().expect("an entry");
+        assert_eq!(entry.code(), dodos_abi::TraceCode::Refused as u16);
+        assert_eq!(entry.payload[0], 1 | 1 << 32);
+        // From the grantee with its generation, the release frees the entry
+        // once its anchor has no descendant.
+        tables(&mut sys, |t| live(&mut t.grants[0], 0).generation = 1);
+        sys.in_flight.push(packet(1));
+        sys.settle(1);
+        assert_eq!(sys.node(0).grant_entry(0), None);
+    }
+
+    /// A sealed node is never observed, and the gate refuses evidence other
+    /// than kill, retire and host against it, even an old observation.
+    #[test]
+    fn a_sealed_node_is_never_observed_nor_accused_with_stale_evidence() {
+        let mut machine = Machine::example();
+        machine.membership.stale_ms = 10;
+        machine.membership.sweep_ms = 100;
+        let (mut sys, t) = System::boot(&machine).unwrap();
+        let seal = Syscall::CoreStop {
+            core: SlotAddr::own(17),
+            mode: dodos_abi::CORE_STOP_SEAL,
+        };
+        assert_eq!(sys.apply(0, t[0], seal), Ok(crate::Output::Done));
+        sys.run(2_000_000, 100_000);
+        assert_eq!(sys.member(1).state(), MemberState::Sealed);
+        sys.run(300_000_000, 1_000_000);
+        let observed = |sys: &System| {
+            sys.table().beacons[0]
+                .observations
+                .iter()
+                .any(|o| o.node == 1)
+        };
+        assert!(!observed(&sys));
+        // An observation of its heartbeat, as if made before the seal.
+        let core = sys.table().placed[1];
+        let heartbeat = sys.table().core_beacons[core].heartbeat.0;
+        let now = sys.now();
+        tables(&mut sys, |t| {
+            t.beacons[0].observations.push(crate::table::Observation {
+                node: 1,
+                watched: crate::table::Watched::Heartbeat { core, heartbeat },
+                at: now,
+            })
+        });
+        sys.run(now + 30_000_000, 1_000_000);
+        assert_eq!(sys.member(1).state(), MemberState::Sealed);
+    }
+
+    /// A use entry of an earlier generation of the granting node names no
+    /// grant of the later one (invariant 71 judges the generation).
+    #[test]
+    fn a_use_entry_of_an_ended_generation_does_not_count_as_holding_a_live_grant() {
+        let (mut sys, _) = granted();
+        tables(&mut sys, |t| live(&mut t.grants[0], 0).grantee = 0);
+        assert_eq!(
+            sys.check(),
+            Err("71: remote object held by another node".into())
+        );
+        tables(&mut sys, |t| {
+            for used in t.uses[1].values_mut() {
+                used.generation = 9;
+            }
+        });
+        assert_eq!(sys.check(), Ok(()));
     }
 
     #[test]

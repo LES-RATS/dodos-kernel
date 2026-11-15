@@ -43,7 +43,17 @@ impl Model {
                 let word = Ownership::from_raw(self.table.owners[chunk as usize]);
                 word.is_some_and(|w| match (w.state(), w.owner()) {
                     (dodos_abi::OwnState::Taken, dodos_abi::Owner::Node(n)) => !self.table.dead(n),
-                    (dodos_abi::OwnState::Taken, dodos_abi::Owner::Reserve(_)) => true,
+                    // Taken by the role's holder with that generation.
+                    (dodos_abi::OwnState::Taken, dodos_abi::Owner::Reserve(r)) => {
+                        let word = self.table.roles.iter().zip(&self.table.role_records).find(
+                            |(_, record)| record.kind == RoleKind::Reserve && record.object == r,
+                        );
+                        word.is_none_or(|(word, _)| {
+                            word.state() == RoleState::Vacant
+                                || !self.table.dead(word.holder())
+                                    && self.table.generation(word.holder()) == w.generation()
+                        })
+                    }
                     _ => false,
                 })
             })
@@ -321,20 +331,15 @@ impl Model {
         if self.table.member(me).state() != MemberState::Live {
             return false;
         }
+        if self.take_handed() {
+            return true;
+        }
         for role in 0..self.table.roles.len() {
             let record = self.table.role_records[role];
             if record.kind != RoleKind::Unit {
                 continue;
             }
             let word = self.table.roles[role];
-            // Step 5: the target maps the unit, checks its queue, and
-            // writes held.
-            if word.state() == RoleState::Handing && word.target() == me {
-                self.map_unit(role);
-                let epoch = word.epoch().wrapping_add(1) & 0x3FFF_FFFF;
-                self.table.write_role(me, role, RoleWord::held(me, epoch));
-                return true;
-            }
             // Take-over: the node the role waits for is no longer live.
             // After step 4 the role waits for the target (step 5); if the
             // target dies, its successor takes over with a rebuild.
@@ -399,6 +404,36 @@ impl Model {
         false
     }
 
+    /// Step 5 of a hand-over to this node, live or sealing: it maps the
+    /// unit, checks its queue, runs R1 on the unit for every node that is
+    /// already fencing, fenced, unfenced or dead (R1 at every change of
+    /// holder), and writes held.
+    fn take_handed(&mut self) -> bool {
+        let me = self.node;
+        let handed = (0..self.table.roles.len()).find(|&role| {
+            let word = self.table.roles[role];
+            self.table.role_records[role].kind == RoleKind::Unit
+                && word.state() == RoleState::Handing
+                && word.target() == me
+        });
+        let Some(role) = handed else {
+            return false;
+        };
+        let word = self.table.roles[role];
+        self.map_unit(role);
+        let dying: Vec<u16> = (0..self.table.nodes)
+            .filter(|&n| {
+                !self.table.writes(n) && self.table.member(n).state() != MemberState::Sealed
+            })
+            .collect();
+        if let Some(unit) = self.table.units.get_mut(&role) {
+            unit.entries.retain(|_, &mut (n, _)| !dying.contains(&n));
+        }
+        let epoch = word.epoch().wrapping_add(1) & 0x3FFF_FFFF;
+        self.table.write_role(me, role, RoleWord::held(me, epoch));
+        true
+    }
+
     /// The rebuild of an IOMMU unit by its new holder, from the reports of
     /// the live nodes: the entries they claim are kept or rewritten, the
     /// others cleared.
@@ -430,6 +465,11 @@ impl Model {
         let me = self.node;
         if self.table.member(me).state() != MemberState::Sealing {
             return false;
+        }
+        // A seal aimed at the target of a hand-over waits for it: the node
+        // completes step 5, then hands the role on below.
+        if self.take_handed() {
+            return true;
         }
         let classes: Vec<u8> = (0..self.table.nodes)
             .map(|n| self.table.fence_of(n))

@@ -122,7 +122,24 @@ impl Model {
                     let claimed = unused
                         && before.is_some_and(|(state, owner, _)| state == 1 && owner == 0xFFFF)
                         && after_owner == write.writer;
-                    ensure_write(mine(write.before) || claimed)?
+                    // R6: a reserve word taken by a holder that died in this
+                    // event, with its generation, freed with the reserve's code.
+                    let cleared = before.is_some_and(|(state, owner, g)| {
+                        state == 2
+                            && owner == after_owner
+                            && (0xFFF0..0xFFF8).contains(&owner)
+                            && table.role_writes.iter().any(|&(role, _, was, _)| {
+                                let record = table.role_records[role];
+                                let holder = table.members.get(was.holder() as usize);
+                                record.kind == dodos_abi::RoleKind::Reserve
+                                    && record.object == owner - 0xFFF0
+                                    && holder.is_some_and(|m| {
+                                        m.state() == dodos_abi::MemberState::Dead
+                                            && m.generation() == g
+                                    })
+                            })
+                    });
+                    ensure_write(mine(write.before) || claimed || cleared)?
                 }
                 _ => ensure_write(false)?,
             }

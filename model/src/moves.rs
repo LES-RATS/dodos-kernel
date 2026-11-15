@@ -98,6 +98,7 @@ impl Model {
         self.requests.insert(
             id,
             Request::Move {
+                peer: node,
                 caller: Some(caller),
                 source: Some(source),
                 context,
@@ -116,6 +117,15 @@ impl Model {
         live(&mut self.threads, source).wait = Wait::Node(id);
         self.observe();
         Ok(Output::Waits)
+    }
+
+    /// Whether a thread or a context is part of a move in flight from this
+    /// node: frozen until the answer.
+    pub(crate) fn in_move(&self, object: ObjId) -> bool {
+        self.requests.values().any(|r| {
+            matches!(r, Request::Move { source, context, .. }
+                if *context == object || *source == Some(object))
+        })
     }
 
     /// A capability argument judged by the caller's kernel: slot (a remote
@@ -147,6 +157,10 @@ impl Model {
         let (Some(target), Some(context)) = (anchored(self, thread), anchored(self, sched)) else {
             return Err(Error::Gone);
         };
+        // A destination thread or sched that is dying is `gone`.
+        if self.dying(target) || self.dying(context) {
+            return Err(Error::Gone);
+        }
         let lent = self.lends.values().any(|(_, receiver)| *receiver == target);
         let dest = &self.threads[&target];
         if !dest.suspended
@@ -209,6 +223,7 @@ impl Model {
             caller,
             source,
             context,
+            ..
         }) = self.requests.remove(&id)
         else {
             return;

@@ -1079,6 +1079,13 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
         (none(Starting, 3), none(Live, 3), Transition::Up),
         (none(Live, 3), none(Sealing, 3), Transition::Seal),
         (none(Sealing, 3), none(Sealed, 3), Transition::Sealed),
+        (none(Live, 3), none(Sealed, 3), Transition::HostSealed),
+        (none(Starting, 3), none(Sealed, 3), Transition::HostSealed),
+        (
+            kill(Unfenced, 3),
+            m(Unfenced, Evidence::Kill, 2, 3),
+            Transition::Redrive,
+        ),
         (none(Live, 3), kill(Fencing, 3), Transition::Accuse),
         (none(Sealed, 3), kill(Fencing, 3), Transition::Accuse),
         (
@@ -1103,6 +1110,9 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
         (kill(Fencing, 3), kill(Fencing, 3)),
         (none(Live, 3), none(Sealing, 4)),
         (kill(Fenced, 3), none(Dead, 3)),
+        (none(Live, 3), none(Sealed, 4)),
+        (kill(Unfenced, 3), kill(Unfenced, 3)),
+        (kill(Fenced, 3), m(Fenced, Evidence::Kill, 2, 3)),
     ];
     for (from, to) in refused {
         assert_eq!(member_transition(from, to), None, "{from:?} {to:?}");
@@ -1411,6 +1421,7 @@ fn debug_values_have_their_numbers() {
         StrayVector,
         Transition,
         BadWord,
+        Refused,
     ];
     for (number, code) in codes.into_iter().enumerate() {
         assert_eq!(code as u16, number as u16 + 1);

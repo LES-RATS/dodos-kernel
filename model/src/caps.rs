@@ -240,6 +240,11 @@ impl Model {
             // Removal ends: from the first step the capability is dying,
             // and only `cap_delete` can still use it.
             Some(&Slot::Full(cap)) => {
+                // `thread_move`: the root of a thread or a context in a move
+                // in flight is removed only after the answer.
+                if self.rooted(cap).is_some_and(|object| self.in_move(object)) {
+                    return Err(Error::Again);
+                }
                 live(&mut self.caps, cap).dying = true;
                 self.remover = Some(thread);
                 let outcome = self.remove(cap, Removal::DescendantsThenSelf);
@@ -729,6 +734,11 @@ impl Model {
             );
             self.longest_walk = self.longest_walk.max(walk);
             if let Some(object) = self.rooted(cap) {
+                // `thread_move`: the thread and its context are frozen until
+                // the answer; the step returns `again`, changing nothing.
+                if self.in_move(object) {
+                    return None;
+                }
                 live(&mut self.caps, cap).dying = true;
                 if self.scheds.get(&object).is_some_and(|sched| !sched.retired) {
                     self.sched_dying(object);

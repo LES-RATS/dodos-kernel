@@ -492,9 +492,12 @@ pub enum Transition {
     Seal,
     /// sealing (g) → sealed (g), by the node itself.
     Sealed,
+    /// starting, live (g) → sealed (g), by the driver of the fence of
+    /// another node placed on the same core, after a confirmed stop.
+    HostSealed,
     /// starting, live, sealing, sealed (g) → fencing (g), with evidence.
     Accuse,
-    /// fencing (g), driver D → fencing (g), driver E.
+    /// fencing or unfenced (g), driver D → the same state, driver E.
     Redrive,
     /// fencing (g) → fenced (g), by the driver.
     Fence,
@@ -524,10 +527,11 @@ pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
         (Starting, Live) if same && kept => Some(Transition::Up),
         (Live, Sealing) if same && kept => Some(Transition::Seal),
         (Sealing, Sealed) if same && kept => Some(Transition::Sealed),
+        (Starting | Live, Sealed) if same && cleared => Some(Transition::HostSealed),
         (Starting | Live | Sealing | Sealed, Fencing) if same && accused => {
             Some(Transition::Accuse)
         }
-        (Fencing, Fencing)
+        (Fencing, Fencing) | (Unfenced, Unfenced)
             if same
                 && from.evidence() as u8 == to.evidence() as u8
                 && to.driver() != DRIVER_NONE
@@ -1077,9 +1081,12 @@ mod proofs {
                 assert!(from.writes() || from.state() == Sealed);
                 assert!(to.state() == Fencing && same && to.evidence() != Evidence::None);
             }
+            Some(Transition::HostSealed) => {
+                assert!(matches!(from.state(), Starting | Live) && to.state() == Sealed && same)
+            }
             Some(Transition::Redrive) => {
-                assert!(from.state() == Fencing && to.state() == Fencing && same);
-                assert!(from.driver() != to.driver());
+                assert!(matches!(from.state(), Fencing | Unfenced) && to.state() == from.state());
+                assert!(from.driver() != to.driver() && same);
             }
             Some(Transition::Fence) => {
                 assert!(from.state() == Fencing && to.state() == Fenced && same)

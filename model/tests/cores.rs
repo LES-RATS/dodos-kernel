@@ -794,7 +794,7 @@ fn thread_cancel_does_not_end_the_wait_of_a_move() {
 }
 
 #[test]
-fn a_move_whose_thread_is_destroyed_meanwhile_still_answers_the_caller() {
+fn the_thread_of_a_move_in_flight_is_destroyed_only_after_the_answer() {
     let mut m = S::new();
     let b = m.helper();
     let call = Syscall::ThreadMove {
@@ -807,6 +807,16 @@ fn a_move_whose_thread_is_destroyed_meanwhile_still_answers_the_caller() {
         class: 0,
     };
     assert_eq!(m.on(0, call), WAITS);
+    // The thread is frozen until the answer: its removal changes nothing.
+    for _ in 0..3 {
+        assert_eq!(
+            m.sys.apply(0, b, Syscall::CapDelete(s(A))),
+            Err(Error::Again)
+        );
+        assert_eq!(m.sys.check(), Ok(()));
+    }
+    m.settle();
+    assert_eq!(m.sys.node(0).woken(m.t[0]), Some(&DONE));
     let mut steps = 0;
     while m.sys.apply(0, b, Syscall::CapDelete(s(A))) != DONE {
         assert_eq!(m.sys.check(), Ok(()));
@@ -814,8 +824,6 @@ fn a_move_whose_thread_is_destroyed_meanwhile_still_answers_the_caller() {
         assert!(steps < 16);
     }
     assert_eq!(m.sys.check(), Ok(()));
-    m.settle();
-    assert_eq!(m.sys.node(0).woken(m.t[0]), Some(&DONE));
     // The context the thread left is no longer configured.
     let (_, state) = m.read(0, A + 2);
     assert_eq!(state & SCHED_STATE_CONFIGURED, 0);

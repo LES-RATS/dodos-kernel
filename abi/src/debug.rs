@@ -52,6 +52,8 @@ pub enum TraceCode {
     StrayVector = 8,
     Transition = 9,
     BadWord = 10,
+    /// A message between kernels refused: its sender may not send it.
+    Refused = 11,
     UserText = 16,
     UserEmit = 17,
 }

@@ -190,9 +190,11 @@ pub(crate) enum Request {
         /// The call waits on an object there (`call`, `recv`, `wait`).
         waits: bool,
     },
-    /// The grants of the capabilities of a delivery to `receiver`.
+    /// The grants of the capabilities of a delivery to `receiver` (`None`
+    /// once destroyed), asked of node `peer`.
     Transfer {
-        receiver: ObjId,
+        receiver: Option<ObjId>,
+        peer: u16,
         delivery: Delivery,
         window: Window,
         /// A proxy whose `send` waits for the transfer to answer.
@@ -200,8 +202,9 @@ pub(crate) enum Request {
         /// The reply object armed with a proxy, whose flags wait for it.
         reply: Option<ObjId>,
     },
-    /// The removal step of `thread` waits for the holder of `grant`.
-    Revoke { thread: ObjId, grant: u16 },
+    /// The removal step of `thread` (`None` once destroyed) waits for the
+    /// holder of `grant`.
+    Revoke { thread: Option<ObjId>, grant: u16 },
     /// A request to the holder of a unit's role, waited for by `thread` if
     /// any; the epoch and the holder it was last sent to.
     Unit {
@@ -213,9 +216,11 @@ pub(crate) enum Request {
     },
     /// A carried call of `thread` to node `peer`.
     Carry { thread: ObjId, peer: u16 },
-    /// `thread_move`: the caller and the thread wait for the answer (each
-    /// `None` once destroyed); the context the thread gives up.
+    /// `thread_move` to node `peer`: the caller and the thread wait for the
+    /// answer (the caller `None` once destroyed); the context the thread
+    /// gives up.
     Move {
+        peer: u16,
         caller: Option<ObjId>,
         source: Option<ObjId>,
         context: ObjId,
@@ -499,6 +504,21 @@ impl Model {
             self.end(entry);
             return;
         }
+        // Who may send what: a message that acts on a grant, a role, a move
+        // or a transfer comes only from the node with that part.
+        if let Some((kind, named)) = self.misdirected(from, packet.generation, &packet.body) {
+            self.trace(
+                dodos_abi::TraceCode::Refused,
+                None,
+                [
+                    u64::from(from) | u64::from(packet.generation) << 32,
+                    kind,
+                    named,
+                ],
+            );
+            self.end(entry);
+            return;
+        }
         match packet.body {
             Body::Request {
                 id,
@@ -557,6 +577,90 @@ impl Model {
         }
         self.bury_stale();
         self.end(entry);
+    }
+
+    /// Who may send what (Calls on an object of another node): `Some` with
+    /// the kind of the message and what it named if `from`, of generation
+    /// `generation`, does not have the part the message needs.
+    fn misdirected(&self, from: u16, generation: u32, body: &Body) -> Option<(u64, u64)> {
+        let me = self.node as usize;
+        // The grantee an entry names, with the generation it records.
+        let grantee = |grant: u16, serial: u32| {
+            self.table.grants[me].get(&grant).is_some_and(|e| {
+                e.serial == serial && e.grantee == from && e.generation == generation
+            })
+        };
+        // The granting node a use entry names, with its generation.
+        let granter = |grant: u16, serial: u32| {
+            self.remotes.values().any(|r| {
+                r.node == from
+                    && r.grant == grant
+                    && r.serial == serial
+                    && self.table.uses[me]
+                        .get(&r.use_entry)
+                        .is_some_and(|u| u.generation == generation)
+            })
+        };
+        // The node a request of this node was sent to; a request no longer
+        // here is judged by its handler.
+        let asked = |id: u64| match self.requests.get(&id) {
+            None => true,
+            Some(Request::Call { peer, .. })
+            | Some(Request::Carry { peer, .. })
+            | Some(Request::Transfer { peer, .. })
+            | Some(Request::Move { peer, .. }) => *peer == from,
+            Some(Request::Revoke { grant, .. }) => self.table.grants[me]
+                .get(grant)
+                .is_none_or(|e| e.grantee == from && e.generation == generation),
+            Some(Request::Unit { sent_to, .. }) => *sent_to == Some(from),
+        };
+        let ok = |held: bool, kind: u64, named: u64| (!held).then_some((kind, named));
+        match body {
+            Body::Answer { id, .. } => ok(asked(*id), 1, *id),
+            Body::TransferAsk { request, .. } => ok(asked(*request), 3, *request),
+            Body::TransferGrant { id, .. } => ok(asked(*id), 4, *id),
+            Body::Revoke { grant, serial, .. } => {
+                let held = granter(*grant, *serial)
+                    || !self
+                        .remotes
+                        .values()
+                        .any(|r| r.node == from && r.grant == *grant);
+                ok(held, 5, u64::from(*grant))
+            }
+            Body::RevokeStep { id, .. } => ok(asked(*id), 6, *id),
+            Body::Release { grant, serial } => ok(grantee(*grant, *serial), 7, u64::from(*grant)),
+            Body::Refused { grants } => {
+                let held = grants.iter().all(|&(g, s)| grantee(g, s));
+                ok(held, 8, grants.first().map_or(0, |&(g, _)| u64::from(g)))
+            }
+            Body::Returned { grants } => {
+                let held = grants.iter().all(|&(g, s)| granter(g, s));
+                ok(held, 9, grants.first().map_or(0, |&(g, _)| u64::from(g)))
+            }
+            Body::Move { thread, sched, .. } => {
+                let names = |g: &u16| {
+                    self.table.grants[me]
+                        .get(g)
+                        .is_some_and(|e| e.grantee == from && e.generation == generation)
+                };
+                ok(names(thread) && names(sched), 10, u64::from(*thread))
+            }
+            Body::Moved { id, .. } => ok(asked(*id), 11, *id),
+            Body::Handed { role } => {
+                let word = self.table.roles[*role as usize];
+                let held = word.state() == dodos_abi::RoleState::Handing
+                    && word.holder() == from
+                    && word.target() == self.node;
+                ok(held, 12, u64::from(*role))
+            }
+            Body::UnitAnswer { id, .. } => ok(asked(*id), 14, *id),
+            Body::CarryDone { id } => ok(asked(*id), 16, *id),
+            Body::Request { .. }
+            | Body::Cancel { .. }
+            | Body::Ping
+            | Body::UnitRequest { .. }
+            | Body::Carry { .. } => None,
+        }
     }
 
     /// A proxy of node `from` makes the call, with the stamp and the wait
@@ -709,7 +813,8 @@ impl Model {
         self.requests.insert(
             id,
             Request::Transfer {
-                receiver,
+                receiver: Some(receiver),
+                peer,
                 delivery,
                 window,
                 answer: None,
@@ -729,7 +834,7 @@ impl Model {
             ..
         }) = self.requests.get_mut(&id)
         {
-            (*waiting, *kept) = (receiver, delivery);
+            (*waiting, *kept) = (Some(receiver), delivery);
         }
         live(&mut self.threads, receiver).wait = Wait::Node(id);
         self.observe();
@@ -862,6 +967,7 @@ impl Model {
             window,
             answer,
             reply,
+            ..
         }) = self.requests.remove(&id)
         else {
             return;
@@ -917,8 +1023,11 @@ impl Model {
                 .filter(|c| matches!(c, Crossing::Grant(_)))
                 .count()
         };
+        // A receiver destroyed meanwhile refuses the grants: the
+        // capabilities stay with their sender.
         let accepted = grants.clone().filter(|grants| {
-            room(self, grants.len())
+            receiver.is_some()
+                && room(self, grants.len())
                 && grants.iter().all(|c| fits(landing(self, c)))
                 && uses_free >= new_grants(grants)
         });
@@ -983,11 +1092,11 @@ impl Model {
         {
             *flags |= dropped;
         }
-        if self
-            .threads
-            .get(&receiver)
-            .is_some_and(|t| t.wait == Wait::Node(id))
-        {
+        if let Some(receiver) = receiver.filter(|r| {
+            self.threads
+                .get(r)
+                .is_some_and(|t| t.wait == Wait::Node(id))
+        }) {
             self.unlink(receiver);
             self.wake(receiver, Ok(Output::Message(delivery)));
         }
@@ -1067,7 +1176,13 @@ impl Model {
         let Some(remote) = self.remotes.remove(&object) else {
             return;
         };
-        self.table.uses[self.node as usize].remove(&remote.use_entry);
+        let used = self.table.uses[self.node as usize].remove(&remote.use_entry);
+        // A grant of a generation that is over died with it: no release.
+        let current = used.is_some_and(|u| u.generation == self.table.generation(remote.node))
+            && self.table.writes(remote.node);
+        if !current {
+            return;
+        }
         let (grant, serial) = (remote.grant, remote.serial);
         self.send_packet(remote.node, Body::Release { grant, serial });
     }
@@ -1183,7 +1298,12 @@ impl Model {
         // until the grantee is dead; the removal step returns `again`
         // until then (model choice).
         if entry.state == GrantState::Pinned {
-            return Ok(false);
+            let entry = *entry;
+            if !self.grantee_over(&entry) {
+                return Ok(false);
+            }
+            self.free_grant(grant);
+            return Ok(true);
         }
         entry.state = GrantState::Revoking;
         let (grantee, serial) = (entry.grantee, entry.serial);
@@ -1202,7 +1322,13 @@ impl Model {
             return Ok(false);
         };
         let id = self.new_request();
-        self.requests.insert(id, Request::Revoke { thread, grant });
+        self.requests.insert(
+            id,
+            Request::Revoke {
+                thread: Some(thread),
+                grant,
+            },
+        );
         self.send_packet(grantee, Body::Revoke { id, grant, serial });
         live(&mut self.threads, thread).wait = Wait::Node(id);
         self.observe();
@@ -1236,11 +1362,11 @@ impl Model {
         if done {
             self.free_grant(grant);
         }
-        if self
-            .threads
-            .get(&thread)
-            .is_some_and(|t| t.wait == Wait::Node(id))
-        {
+        if let Some(thread) = thread.filter(|t| {
+            self.threads
+                .get(t)
+                .is_some_and(|t| t.wait == Wait::Node(id))
+        }) {
             self.unlink(thread);
             live(&mut self.threads, thread).answered = true;
             self.wake(thread, Err(Error::Again));

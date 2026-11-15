@@ -1131,6 +1131,26 @@ impl Model {
         self.table.maps[chunk as usize]
     }
 
+    /// Every used entry of this node's grant table, by index, as
+    /// `grant_entry` gives it.
+    pub fn grant_entries(&self) -> Vec<(u16, (u16, u32, u32, u8))> {
+        let used = self.table.grants[self.node as usize].keys();
+        used.filter_map(|&g| Some((g, self.grant_entry(g)?)))
+            .collect()
+    }
+
+    /// An entry of this node's grant table: the grantee, its generation,
+    /// the serial, and the state (0 live, 1 revoking, 2 pinned).
+    pub fn grant_entry(&self, grant: u16) -> Option<(u16, u32, u32, u8)> {
+        let entry = self.table.grants[self.node as usize].get(&grant)?;
+        let state = match entry.state {
+            table::GrantState::Live => 0,
+            table::GrantState::Revoking => 1,
+            table::GrantState::Pinned => 2,
+        };
+        Some((entry.grantee, entry.generation, entry.serial, state))
+    }
+
     /// An entry of the device table.
     pub fn device_entry(&self, index: usize) -> dodos_abi::DeviceEntry {
         self.table.devices[index]

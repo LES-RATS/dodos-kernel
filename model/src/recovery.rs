@@ -88,6 +88,27 @@ impl Model {
         (0..self.table.nodes).filter(|&n| self.table.member(n).state() == MemberState::Live)
     }
 
+    /// Several nodes on one core (D-108): the event of this node runs on
+    /// its core, whose kernel loads its block and keeps the blocks of the
+    /// other nodes placed there saved, their seals valid.
+    pub(crate) fn load_block(&mut self) {
+        let me = self.node;
+        let core = self.table.placed[me as usize];
+        self.table.core_beacons[core].running = me;
+        for z in 0..self.table.nodes {
+            if self.table.placed[z as usize] == core && !self.table.dead(z) {
+                self.table.beacons[z as usize].save_seal = z != me;
+            }
+        }
+    }
+
+    /// Whether `node` is not the node its core runs and its block is saved:
+    /// it cannot execute, so its stop needs no stop of the core.
+    pub(crate) fn parked_block(&self, node: u16) -> bool {
+        let core = self.table.placed[node as usize];
+        self.table.beacons[node as usize].save_seal && self.table.core_beacons[core].running != node
+    }
+
     /// `core_start`.
     pub(crate) fn core_start(
         &mut self,
@@ -192,8 +213,18 @@ impl Model {
         if refused {
             return Err(Error::Busy);
         }
-        // The last node: no other node would be live afterwards.
-        if !self.live_nodes().any(|n| n != node) {
+        // The last node: no other node would be live afterwards. The check
+        // counts nodes: one placed on the stopped node's core stays live
+        // unless that core must be stopped; a phantom node runs nothing and
+        // does not count.
+        let core_of = self.table.placed[node as usize];
+        let stops_core = mode != CORE_STOP_SEAL && !self.parked_block(node);
+        let stays = |n: u16| {
+            n != node
+                && (self.shared || n == self.node)
+                && !(stops_core && self.table.placed[n as usize] == core_of)
+        };
+        if !self.live_nodes().any(stays) {
             return Err(Error::Busy);
         }
         match mode {
@@ -444,7 +475,7 @@ impl Model {
             let n = self.table.nodes;
             let successors = (1..n)
                 .map(|step| (self.node + step) % n)
-                .filter(|&z| !self.table.dead(z))
+                .filter(|&z| self.table.writes(z))
                 .take(2);
             needed.extend(successors);
         }
@@ -463,8 +494,10 @@ impl Model {
             .observations
             .retain(|o| now < o.at + life);
         let swept = now >= self.next_sweep;
+        // A sealed node does not beat: it is never observed (only kill,
+        // retire and host accuse it).
         for node in self.needed() {
-            if !self.table.writes(node) && self.table.member(node).state() != MemberState::Sealed {
+            if !self.table.writes(node) {
                 continue;
             }
             let core = self.table.placed[node as usize];
@@ -513,7 +546,7 @@ impl Model {
             let n = self.table.nodes;
             let successors: Vec<u16> = (1..n)
                 .map(|step| (self.node + step) % n)
-                .filter(|&z| !self.table.dead(z))
+                .filter(|&z| self.table.writes(z))
                 .take(2)
                 .collect();
             for z in successors {
@@ -551,10 +584,7 @@ impl Model {
             let state = self.table.member(node).state();
             let accusable = matches!(
                 state,
-                MemberState::Starting
-                    | MemberState::Live
-                    | MemberState::Sealing
-                    | MemberState::Sealed
+                MemberState::Starting | MemberState::Live | MemberState::Sealing
             );
             if !accusable {
                 continue;
@@ -577,13 +607,11 @@ impl Model {
             }
             let driver = member.driver();
             let driver_gone = driver == DRIVER_NONE || !self.table.writes(driver);
-            if member.state() == MemberState::Fencing && driver != me && driver_gone {
-                let redriven = Member::new(
-                    MemberState::Fencing,
-                    member.evidence(),
-                    me,
-                    member.generation(),
-                );
+            // A fencing or unfenced node whose driver is gone is driven
+            // again by this node.
+            if driver != me && driver_gone {
+                let redriven =
+                    Member::new(member.state(), member.evidence(), me, member.generation());
                 self.table.write_member(me, node, redriven);
                 self.begin_fence(node);
                 return true;
@@ -602,6 +630,9 @@ impl Model {
             if self.barrier_unit(node) {
                 return true;
             }
+        }
+        if self.unpin() {
+            return true;
         }
         self.roles_unit()
     }
@@ -623,6 +654,11 @@ impl Model {
             ..Fence::default()
         };
         self.fences.insert(node, fence);
+        // A node whose block is saved on a core that runs another node is
+        // stopped without a stop of that core (Several nodes on one core).
+        if self.parked_block(node) {
+            return;
+        }
         let core = self.table.placed[node as usize];
         match self.machine.arch {
             crate::boot::Arch::X86_64 => self.hw_out.push(HwAction::Nmi { core, epoch }),
@@ -653,8 +689,13 @@ impl Model {
                     .init
                     .is_some_and(|at| fence.init_clear && now >= at + SETTLE_NS))
             || (!x86 && self.table.off[core]);
+        if self.parked_block(node) {
+            self.fenced(node, false);
+            self.fences.remove(&node);
+            return true;
+        }
         if confirmed {
-            self.fenced(node);
+            self.fenced(node, true);
             self.fences.remove(&node);
             return true;
         }
@@ -699,10 +740,13 @@ impl Model {
         false
     }
 
-    /// The stop of `node`'s core is confirmed: it is fenced; every other
-    /// node placed on that core becomes sealed if its save seal is valid,
-    /// and is otherwise accused with evidence host and fenced too.
-    fn fenced(&mut self, node: u16) {
+    /// The stop of `node` is confirmed: it is fenced. If its core was
+    /// stopped, every other node placed on that core that is fencing or
+    /// unfenced becomes fenced with its own evidence and driver; one that is
+    /// starting or live becomes sealed if its save seal is valid and no unit
+    /// role names it, and is otherwise accused with evidence host and fenced
+    /// too.
+    fn fenced(&mut self, node: u16, stopped: bool) {
         let member = self.table.member(node);
         let fenced = Member::new(
             MemberState::Fenced,
@@ -714,7 +758,7 @@ impl Model {
         self.table.fences[node as usize].confirmed = Some(self.now);
         let core = self.table.placed[node as usize];
         let hosted: Vec<u16> = (0..self.table.nodes)
-            .filter(|&z| z != node && self.table.placed[z as usize] == core)
+            .filter(|&z| stopped && z != node && self.table.placed[z as usize] == core)
             .collect();
         for z in hosted {
             let state = self.table.member(z).state();
@@ -726,7 +770,27 @@ impl Model {
                 continue;
             }
             let g = self.table.generation(z);
-            if self.table.beacons[z as usize].save_seal {
+            let member = self.table.member(z);
+            if matches!(state, MemberState::Fencing | MemberState::Unfenced) {
+                // The same stop confirms its own fence.
+                let fenced =
+                    Member::new(MemberState::Fenced, member.evidence(), member.driver(), g);
+                self.table.write_member(self.node, z, fenced);
+                self.table.fences[z as usize].confirmed = Some(self.now);
+                self.fences.remove(&z);
+                continue;
+            }
+            let named = self
+                .table
+                .roles
+                .iter()
+                .zip(&self.table.role_records)
+                .any(|(w, r)| {
+                    r.kind == RoleKind::Unit
+                        && w.state() != RoleState::Vacant
+                        && (w.holder() == z || (w.state() == RoleState::Handing && w.target() == z))
+                });
+            if self.table.beacons[z as usize].save_seal && !named {
                 let sealed = Member::new(MemberState::Sealed, Evidence::None, DRIVER_NONE, g);
                 self.table.write_member(self.node, z, sealed);
             } else {
@@ -821,29 +885,65 @@ impl Model {
     /// threads on it end with `gone`; its proxies here stop standing for
     /// its threads; the unit roles this node holds block its devices.
     fn isolate(&mut self, node: u16) {
-        let waiting: Vec<(u64, ObjId)> = self
+        // Every wait on the node ends, whatever the request: the waiting
+        // thread gets `gone`, and nothing the request would have changed has
+        // changed here.
+        let ended: Vec<u64> = self
             .requests
             .iter()
-            .filter_map(|(&id, request)| match request {
-                Request::Call { peer, thread, .. } if *peer == node => Some((id, *thread)),
-                Request::Carry { peer, thread } if *peer == node => Some((id, *thread)),
-                Request::Revoke { thread, .. } => {
-                    let grantee = self.revoked_grantee(id);
-                    (grantee == Some(node)).then_some((id, *thread))
-                }
-                _ => None,
+            .filter(|&(&id, request)| match request {
+                Request::Call { peer, .. }
+                | Request::Carry { peer, .. }
+                | Request::Transfer { peer, .. }
+                | Request::Move { peer, .. } => *peer == node,
+                Request::Revoke { .. } => self.revoked_grantee(id) == Some(node),
+                Request::Unit { .. } => false,
             })
+            .map(|(&id, _)| id)
             .collect();
-        for (id, thread) in waiting {
-            self.requests.remove(&id);
-            if self
-                .threads
-                .get(&thread)
-                .is_some_and(|t| t.wait == Wait::Node(id))
-            {
-                live(&mut self.threads, thread).wait = Wait::None;
-                live(&mut self.threads, thread).answered = true;
-                self.wake(thread, Err(Error::Gone));
+        for id in ended {
+            // Each waiting thread, and whether its call returns `gone` (the
+            // thread of a move only leaves its wait).
+            let waiting: Vec<(ObjId, bool)> = match self.requests.remove(&id) {
+                Some(Request::Call { thread, .. }) | Some(Request::Carry { thread, .. }) => {
+                    vec![(thread, true)]
+                }
+                Some(Request::Revoke { thread, .. }) => {
+                    thread.map(|t| (t, true)).into_iter().collect()
+                }
+                Some(Request::Transfer {
+                    receiver, reply, ..
+                }) => {
+                    // The reply object armed for the node's caller is idle.
+                    if let Some(reply) = reply
+                        && self.replies.contains_key(&reply)
+                    {
+                        *live(&mut self.replies, reply) = crate::ReplyState::Idle;
+                    }
+                    receiver.map(|t| (t, true)).into_iter().collect()
+                }
+                // The thread and its context are as before the call.
+                Some(Request::Move { caller, source, .. }) => {
+                    let caller = caller.map(|t| (t, true));
+                    caller
+                        .into_iter()
+                        .chain(source.map(|t| (t, false)))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            for (thread, caller) in waiting {
+                if self
+                    .threads
+                    .get(&thread)
+                    .is_some_and(|t| t.wait == Wait::Node(id))
+                {
+                    live(&mut self.threads, thread).wait = Wait::None;
+                    if caller {
+                        live(&mut self.threads, thread).answered = true;
+                        self.wake(thread, Err(Error::Gone));
+                    }
+                }
             }
         }
         self.held_requests.remove(&node);
@@ -884,10 +984,6 @@ impl Model {
         if member.state() != MemberState::Fenced
             || self.table.member(self.node).state() != MemberState::Live
         {
-            // A node that sees a node dead unpins the frames of R3.
-            if member.state() == MemberState::Dead {
-                return self.unpin(node);
-            }
             return false;
         }
         let g = member.generation();
@@ -914,11 +1010,15 @@ impl Model {
                 .iter()
                 .zip(&self.table.roles)
                 .all(|(record, word)| {
+                    // Every unit role held, not handing, by a node that is
+                    // live or sealing.
                     record.kind != RoleKind::Unit
-                        || (word.state() == RoleState::Held && word.holder() != node)
-                        || (word.state() == RoleState::Handing
+                        || (word.state() == RoleState::Held
                             && word.holder() != node
-                            && word.target() != node)
+                            && matches!(
+                                self.table.member(word.holder()).state(),
+                                MemberState::Live | MemberState::Sealing
+                            ))
                 });
         // CONTRACT-GAP (reported): the barrier does not say that the
         // context entries of the node must be gone; when the holder of a
@@ -932,6 +1032,10 @@ impl Model {
         if !blocked || !dodos_abi::barrier(g, &views, units_clear) {
             return false;
         }
+        // R6: the chunks of the reserves whose role the node holds, taken
+        // with its generation, become free with the reserve's code, so the
+        // reserve can be claimed again (the model clears all at once).
+        self.free_reserves_of(node, g);
         let dead = Member::new(MemberState::Dead, member.evidence(), member.driver(), g);
         self.table.write_member(self.node, node, dead);
         for role in 0..self.table.roles.len() {
@@ -947,13 +1051,46 @@ impl Model {
         true
     }
 
-    /// The frames pinned by R3 for a node now dead: the entries are freed
-    /// and their anchors removed, one unit.
-    fn unpin(&mut self, node: u16) -> bool {
+    /// R6 for the reserves a dying node holds: each word of such a reserve
+    /// taken with its generation is written free with the reserve's code.
+    fn free_reserves_of(&mut self, node: u16, generation: u32) {
+        let shift = self.table.geometry.chunk_shift();
+        let held: Vec<u16> = (0..self.table.roles.len())
+            .filter(|&r| {
+                let word = self.table.roles[r];
+                self.table.role_records[r].kind == RoleKind::Reserve
+                    && word.state() == RoleState::Held
+                    && word.holder() == node
+            })
+            .map(|r| self.table.role_records[r].object)
+            .collect();
+        for j in held {
+            let owner = dodos_abi::Owner::Reserve(j);
+            let taken = dodos_abi::Ownership::taken(owner, generation).raw();
+            let ranges = self.table.reserves[j as usize].clone();
+            for chunk in ranges.iter().flat_map(|&(a, b)| a >> shift..b >> shift) {
+                if self.table.owners[chunk as usize] == taken {
+                    let free = dodos_abi::Ownership::free(owner);
+                    assert!(self.table.write_owner(self.node, chunk, taken, free));
+                }
+            }
+        }
+    }
+
+    /// Whether the generation a grant entry was made to is over: its
+    /// grantee is dead, or names another generation (R3).
+    pub(crate) fn grantee_over(&self, entry: &crate::table::GrantEntry) -> bool {
+        self.table.dead(entry.grantee) || self.table.generation(entry.grantee) != entry.generation
+    }
+
+    /// The frames pinned by R3 for a generation now over, even if the
+    /// grantee started again meanwhile: the entries are freed and their
+    /// anchors removed, one unit.
+    fn unpin(&mut self) -> bool {
         let me = self.node as usize;
         let pinned = self.table.grants[me]
             .iter()
-            .find(|(_, e)| e.grantee == node && e.state == GrantState::Pinned)
+            .find(|(_, e)| e.state == GrantState::Pinned && self.grantee_over(e))
             .map(|(&grant, _)| grant);
         let Some(grant) = pinned else {
             return false;
@@ -1033,6 +1170,10 @@ impl Model {
         let me = self.node;
         let member = self.table.member(me);
         if readable {
+            // A node that was sealed while a granting node's generation ended
+            // drops its remote capabilities of that generation first (R2),
+            // with no release.
+            self.drop_stale_remotes();
             let live = Member::new(
                 MemberState::Live,
                 member.evidence(),
@@ -1047,6 +1188,23 @@ impl Model {
         self.next_sweep = self.now + self.table.sweep_ns;
         self.observe_watched();
         self.end(entry);
+    }
+
+    /// Removes every remote capability whose use entry records a
+    /// generation of its granting node that is over.
+    fn drop_stale_remotes(&mut self) {
+        loop {
+            let stale = self.remotes.iter().find(|(_, r)| {
+                let used = self.table.uses[self.node as usize].get(&r.use_entry);
+                !self.table.writes(r.node)
+                    || used.is_none_or(|u| u.generation != self.table.generation(r.node))
+            });
+            let Some(root) = stale.map(|(&o, _)| self.objects[&o].root) else {
+                return;
+            };
+            live(&mut self.caps, root).dying = true;
+            while self.remove_root(root) == Err(Error::Again) {}
+        }
     }
 
     /// A start-up space slot, to reach the kernel space in tests.

@@ -100,6 +100,9 @@ impl Model {
         self.table.role_writes.clear();
         // The core beacon's heartbeat: one more at every event.
         self.events.0 += 1;
+        if self.shared {
+            self.load_block();
+        }
         self.change_list.clear();
         self.no_context_list.clear();
         *self.snapshot = self.scheds.keys().map(|&id| (id, self.snap(id))).collect();
@@ -565,6 +568,10 @@ impl Model {
         if !(off || on) || class > 2 {
             return Err(Error::Invalid);
         }
+        // A context in a move in flight is frozen until the answer.
+        if self.in_move(context) {
+            return Err(Error::Busy);
+        }
         // Admission: the sum with the new bandwidth in place of the old one
         // is at most one whole core; removing a configuration never fails.
         let before = self.scheds[&context].bandwidth();
@@ -608,7 +615,11 @@ impl Model {
         // `busy` if the context has a home, if the thread has an own
         // context, or if a context is lent to it.
         let lent = self.lends.values().any(|(_, receiver)| *receiver == target);
-        if self.scheds[&context].home.is_some() || self.threads[&target].home.is_some() || lent {
+        if self.in_move(context)
+            || self.scheds[&context].home.is_some()
+            || self.threads[&target].home.is_some()
+            || lent
+        {
             return Err(Error::Busy);
         }
         live(&mut self.scheds, context).home = Some(target);
@@ -622,6 +633,9 @@ impl Model {
     /// being marked; the lends go on.
     pub(crate) fn sched_unbind(&mut self, thread: ObjId, sched: SlotAddr) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
+        if self.in_move(context) {
+            return Err(Error::Busy);
+        }
         if let Some(home) = live(&mut self.scheds, context).home.take() {
             live(&mut self.threads, home).home = None;
         }
@@ -647,6 +661,9 @@ impl Model {
         let holds = window == own / 64 && mask & 1 << (own % 64) != 0;
         if window >= CORE_WINDOWS || mask == 0 || !holds {
             return Err(Error::Invalid);
+        }
+        if self.in_move(context) {
+            return Err(Error::Busy);
         }
         live(&mut self.scheds, context).cores = (window, mask);
         Ok(Output::Done)

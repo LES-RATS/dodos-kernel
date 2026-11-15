@@ -693,13 +693,17 @@ impl Model {
             Wait::Node(id) => match self.requests.get_mut(&id) {
                 // A move goes on without the thread that left: its answer
                 // still ends the other's wait.
-                Some(Request::Move { caller, source, .. }) => {
-                    for waiting in [caller, source] {
-                        if *waiting == Some(thread) {
-                            *waiting = None;
-                        }
+                Some(Request::Move { caller, .. }) => {
+                    if *caller == Some(thread) {
+                        *caller = None;
                     }
                 }
+                // Grants that arrive for a destroyed receiver are refused,
+                // and a revocation step completes without its thread.
+                Some(Request::Transfer { receiver, .. }) => *receiver = None,
+                Some(Request::Revoke {
+                    thread: waiting, ..
+                }) => *waiting = None,
                 _ => {
                     self.cancel_remote(id);
                     self.requests.remove(&id);

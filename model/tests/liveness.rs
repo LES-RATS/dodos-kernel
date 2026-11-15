@@ -4,7 +4,11 @@
 //! with fair runs of the nodes that remain, every crashed node becomes
 //! dead, every unit role is held by a live node, a live node remains, and
 //! every thread that waited for a unit's holder got its answer or `gone`.
-//! Every invariant is checked after every step.
+//! Every invariant is checked after every step. At the end every state of a
+//! member word, a role word and a grant entry has a way out: no node is
+//! left fencing, fenced or unfenced, no role names a dead node, and no
+//! grant is pinned or names a generation that is over (the states the sixth
+//! review found stuck).
 //!
 //! The crashed node hangs with its NMI handler still able to run, so that
 //! its stop succeeds (the fairness assumption of 8.4). The times are the
@@ -102,7 +106,92 @@ fn attach(sys: &mut System, t: &[ObjId]) {
     assert_eq!(sys.apply(0, t[0], call), Ok(Output::Waits));
 }
 
-const SCENARIOS: [Scenario; 4] = [
+fn grant(sys: &mut System, t: &[ObjId]) {
+    // Node 0 grants a frame to node 2, which maps it.
+    let make = Syscall::UntypedRetype {
+        untyped: s(25),
+        kind: ObjectKind::Frame,
+        size: 1,
+        page: PageSize::Page as u64,
+        memory: 0,
+        destination: s(100),
+    };
+    assert_eq!(sys.apply(0, t[0], make), Ok(Output::Done));
+    let reply = Syscall::UntypedRetype {
+        untyped: s(25),
+        kind: ObjectKind::Reply,
+        size: 0,
+        page: 0,
+        memory: 0,
+        destination: s(99),
+    };
+    assert_eq!(sys.apply(2, t[2], reply), Ok(Output::Done));
+    let recv = Syscall::Recv {
+        endpoint: s(START_SLOT_MAILBOX),
+        reply: s(99),
+        range: Range {
+            first: s(110),
+            count: 1,
+        },
+        wait: 0,
+    };
+    assert_eq!(sys.apply(2, t[2], recv), Ok(Output::Waits));
+    let send = Syscall::Send {
+        target: core(2),
+        message: Message {
+            label: 1,
+            flags: 0,
+            words: vec![1],
+            caps: vec![Transfer::Derive(s(100), Rights::READ.bits())],
+            marks: 0,
+        },
+    };
+    assert_eq!(sys.apply(0, t[0], send), Ok(Output::Waits));
+    sys.settle(32);
+    let map = Syscall::ASpaceMap(Map {
+        space: s(START_SLOT_ASPACE),
+        frame: s(110),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    });
+    assert_eq!(sys.apply(2, t[2], map), Ok(Output::Done));
+}
+
+fn reserve(sys: &mut System, t: &[ObjId]) {
+    // Node 2 claims a reserve role and takes a chunk of its reserve.
+    let claim = Syscall::RoleClaim(s(22));
+    assert!(matches!(sys.apply(2, t[2], claim), Ok(Output::Epoch(_))));
+    let shift = sys.node(2).geometry().chunk_shift();
+    let base = (0..1u64 << 20)
+        .map(|c| c << shift)
+        .find(|&at| sys.node(2).ownership(at >> shift) == Ownership::free(Owner::Reserve(0)).raw())
+        .expect("a chunk of reserve 0");
+    let take = Syscall::MemoryTake {
+        control: s(START_SLOT_MEMORY_CONTROL),
+        kind: 0,
+        place: base,
+        size: u64::from(shift),
+        destination: s(120),
+    };
+    assert_eq!(sys.apply(2, t[2], take), Ok(Output::Done));
+}
+
+const SCENARIOS: [Scenario; 6] = [
+    Scenario {
+        name: "grant",
+        begin: grant,
+        stopped: &[],
+        waiting: None,
+    },
+    Scenario {
+        name: "reserve",
+        begin: reserve,
+        stopped: &[],
+        waiting: None,
+    },
     Scenario {
         name: "kill",
         begin: kill,
@@ -166,10 +255,45 @@ fn recovered(sys: &System, t: &[ObjId], scenario: &Scenario, crashed: u16) -> Re
             return Err(format!("unit role {role}: {word:?}"));
         }
     }
+    way_out(sys)?;
     if let Some(node) = scenario.waiting.filter(|&n| n != crashed) {
         let woken = sys.node(node).woken(t[node as usize]);
         if !matches!(woken, Some(Ok(Output::Done)) | Some(Err(Error::Gone))) {
             return Err(format!("the waiting thread got {woken:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Every member word, role word and grant entry is in a state that a rule
+/// leads out of: no node between accusation and death, no role naming a
+/// dead node, no grant pinned or made to a generation that is over.
+fn way_out(sys: &System) -> Result<(), String> {
+    let nodes = 3u16;
+    for node in 0..nodes {
+        let state = sys.member(node).state();
+        if !matches!(
+            state,
+            MemberState::Live | MemberState::Sealed | MemberState::Dead
+        ) {
+            return Err(format!("node {node} stays {state:?}"));
+        }
+    }
+    for role in 0..sys.node_count_roles() {
+        let word = sys.role(role);
+        if word.state() != RoleState::Vacant
+            && sys.member(word.holder()).state() == MemberState::Dead
+        {
+            return Err(format!("role {role} names dead node {}", word.holder()));
+        }
+    }
+    for node in (0..nodes).filter(|&n| sys.has(n)) {
+        for (grant, (grantee, generation, _, state)) in sys.node(node).grant_entries() {
+            let over = sys.member(grantee).state() == MemberState::Dead
+                || sys.member(grantee).generation() != generation;
+            if state == 2 || over {
+                return Err(format!("grant {grant} of node {node} has no way out"));
+            }
         }
     }
     Ok(())
