@@ -8,11 +8,6 @@ use dodos_abi::x86_64::{
 };
 use dodos_abi::{Error, IrqSource, ObjectKind, Rights, SlotAddr};
 
-/// Interrupt remapping: the address of a remappable MSI for a handle.
-fn remapped(handle: u64) -> u64 {
-    0xFEE0_0000 | (handle & 0x7FFF) << 5 | 1 << 4 | (handle >> 15 & 1) << 2
-}
-
 impl Model {
     /// `irq_claim`: one vector of the node, bound to one source. Returns the
     /// address and the data a device must be given for an MSI (0 and 0 for
@@ -90,8 +85,10 @@ impl Model {
         let handle = u64::from(self.node) * IRQ_TABLE_ENTRIES as u64 + entry;
         let (address, data) = match (source.is_line(), self.machine.remapping) {
             (true, _) => (0, 0),
-            (false, true) => (remapped(handle), 0),
-            (false, false) => (0xFEE0_0000 | apic << 12, u64::from(vector)),
+            (false, true) => (dodos_abi::x86_64::msi_remapped(handle), 0),
+            (false, false) => {
+                dodos_abi::x86_64::msi_direct(apic as u32, vector).expect("checked above")
+            }
         };
         assert!(entry < IRQ_TABLE_ENTRIES as u64);
         Ok(Output::Msi { address, data })

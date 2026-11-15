@@ -174,8 +174,13 @@ pub struct Machine {
     pub membership: BootMembership,
     /// Whether the boot image declares a console (a unit role).
     pub console: bool,
-    /// The largest map count of a chunk (G4): the contract fixes no width.
+    /// The largest map count of a chunk (G4): `MAP_COUNT_MAX`, 32 bits; the
+    /// tests make it smaller so that the rule is reached.
     pub map_count_max: u64,
+    /// The chunks one call of the gate checks (G3): *E*; the tests make it
+    /// smaller so that a mapping made in steps is reached on a machine
+    /// whose frames touch at most *E* chunks.
+    pub gate_chunks: u64,
 }
 
 /// The second geometry of the tests (D-121): a page of 16 KB with *E* =
@@ -330,7 +335,8 @@ impl Machine {
                 reserved: [0; 3],
             },
             console: false,
-            map_count_max: u64::from(u32::MAX),
+            map_count_max: dodos_abi::MAP_COUNT_MAX,
+            gate_chunks: u64::from(geometry.entries),
         }
     }
 
@@ -785,6 +791,7 @@ impl Machine {
             maps: std::sync::Arc::new(vec![0; layout.owners.len()]),
             classes: Default::default(),
             devices: std::sync::Arc::new(layout.devices.clone()),
+            identifiers: Default::default(),
             members: vec![live; n],
             roles: roles.clone(),
             grants: vec![Default::default(); n],
@@ -1057,6 +1064,7 @@ impl Model {
                 first: 0,
                 count,
                 rights,
+                partial: false,
             };
             self.record_mapping(cap, aspace, mapping);
         }

@@ -99,6 +99,110 @@ impl RemoteRef {
 pub const NODES_MAX: usize = 1024;
 /// Entries of the grant table and of the use table of each node.
 pub const GRANTS: usize = 4096;
+/// The largest map count of a chunk: the count is 32 bits of its gate word
+/// (G4); a mapping that would pass it is `busy`.
+pub const MAP_COUNT_MAX: u64 = u32::MAX as u64;
+/// Identifier words of each PCI segment an IOMMU unit serves: one per bus,
+/// device and function (IOMMU).
+pub const IDENTIFIERS_PER_SEGMENT: usize = 65_536;
+/// Bit 5 of word 2 of a frame slot: the mapping its record holds is partial,
+/// made in steps (G3).
+pub const SLOT_RECORD_PARTIAL: u64 = 1 << 5;
+
+/// The class of a page (The gate over page tables, G2), one byte per page
+/// of ordinary memory: 0 data, 1 gate, 2 global read-only, 3 device, 4
+/// iospace table, 16 + k a page table of level k.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageClass(u8);
+
+/// What a leaf asks of the page it targets (G3 (4)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leaf {
+    pub write: bool,
+    pub exec: bool,
+    /// The leaf carries a device memory type (uncached or write-combining).
+    pub device_type: bool,
+}
+
+impl PageClass {
+    pub const DATA: Self = Self(0);
+    pub const GATE: Self = Self(1);
+    pub const GLOBAL_READ_ONLY: Self = Self(2);
+    pub const DEVICE: Self = Self(3);
+    pub const IOSPACE_TABLE: Self = Self(4);
+
+    /// A page table of level `level`, 1 (its entries are pages) to 8.
+    pub const fn table(level: u8) -> Option<Self> {
+        match level {
+            1..=8 => Some(Self(16 + level)),
+            _ => None,
+        }
+    }
+
+    /// `None` for a byte that names no class.
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0..=4 | 17..=24 => Some(Self(raw)),
+            _ => None,
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// The permission rules of G3 (3) and (4): a leaf may target data,
+    /// device and global read-only pages only; a data page never with a
+    /// device memory type nor both writable and executable; a global
+    /// read-only page never writable; a device page never executable and
+    /// always with a device memory type. A table or gate page is never the
+    /// target of a leaf (outside the gate's own view).
+    pub const fn permits(self, leaf: Leaf) -> bool {
+        match self.0 {
+            0 => !leaf.device_type && !(leaf.write && leaf.exec),
+            2 => !leaf.write && !leaf.device_type,
+            3 => !leaf.exec && leaf.device_type,
+            _ => false,
+        }
+    }
+}
+
+/// The gate word of a chunk (G4): the map count in bits 0-31, the number of
+/// pages of the chunk not of class data in bits 32-44, the other bits 0.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateWord(u64);
+
+impl GateWord {
+    pub const fn new(map_count: u32, not_data: u16) -> Option<Self> {
+        if not_data > 1 << 12 {
+            return None;
+        }
+        Some(Self(map_count as u64 | (not_data as u64) << 32))
+    }
+
+    /// `None` for a word with a bit above 44 set, or more pages not of
+    /// class data than a chunk can have (*E* ≤ 4,096).
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw >> 45 != 0 || (raw >> 32) as u16 > 1 << 12 {
+            return None;
+        }
+        Some(Self(raw))
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn map_count(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub const fn not_data(self) -> u16 {
+        (self.0 >> 32) as u16
+    }
+}
 pub const GRANT_ENTRY_BYTES: usize = 128;
 pub const USE_ENTRY_BYTES: usize = 32;
 /// Proxies each node keeps for each other node, and their bytes.
@@ -956,6 +1060,39 @@ pub const fn ioport_check(
 /// Whether two ranges of ports, inclusive, meet.
 pub const fn ports_meet(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
+}
+
+#[cfg(kani)]
+mod page_class_proofs {
+    use super::{Leaf, PageClass};
+
+    /// G3 (4), for every class byte and every leaf: a table or gate page is
+    /// never the target of a leaf; no leaf of an accepted class is both
+    /// writable and executable; a global read-only page is never writable;
+    /// a device page is never executable and always of a device type.
+    #[kani::proof]
+    fn a_class_refuses_what_g3_refuses() {
+        let raw: u8 = kani::any();
+        let leaf = Leaf {
+            write: kani::any(),
+            exec: kani::any(),
+            device_type: kani::any(),
+        };
+        let Some(class) = PageClass::from_raw(raw) else {
+            return;
+        };
+        if class.permits(leaf) {
+            assert!(!(leaf.write && leaf.exec));
+            assert!(
+                class == PageClass::DATA
+                    || class == PageClass::GLOBAL_READ_ONLY
+                    || class == PageClass::DEVICE
+            );
+            assert!(class != PageClass::GLOBAL_READ_ONLY || !leaf.write);
+            assert!(class != PageClass::DEVICE || (!leaf.exec && leaf.device_type));
+            assert!(class != PageClass::DATA || !leaf.device_type);
+        }
+    }
 }
 
 #[cfg(kani)]

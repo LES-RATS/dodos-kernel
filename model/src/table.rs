@@ -173,6 +173,9 @@ pub(crate) struct Table {
     /// The page classes, by page number, of the pages not of class *data*.
     pub(crate) classes: Arc<BTreeMap<u64, PageClass>>,
     pub(crate) devices: Arc<Vec<DeviceEntry>>,
+    /// The identifier words of the devices, by segment << 16 | identifier,
+    /// as raw ownership words; one not listed is free and unclaimed.
+    pub(crate) identifiers: BTreeMap<u32, u64>,
     pub(crate) members: Vec<Member>,
     pub(crate) roles: Vec<RoleWord>,
     /// The grant table and the use table of each node, by index, and the

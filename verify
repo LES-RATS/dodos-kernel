@@ -13,5 +13,6 @@ cargo test --workspace
 for page in 16k 32k; do
 	DODOS_PAGE=$page cargo test -p dodos-model --lib \
 		--test adversarial_nodes --test blocks --test boot --test calls \
-		--test faults --test memory --test nodes --test property
+		--test faults --test gate_attack --test gate_words --test memory \
+		--test nodes --test property
 done

@@ -185,24 +185,67 @@ impl Model {
             return Err(Error::Denied);
         }
         // 4. The state: the record is full (`busy`, even if it names this
-        // space); some address of the range is translated (`busy`); the
-        // tables needed are more than the free list and the untyped supply
-        // (`no_memory`), and nothing is taken.
-        if self.caps[&cap].record != Record::Empty {
-            return Err(Error::Busy);
-        }
+        // space), unless it is a partial mapping of the same call, which
+        // goes on where it stopped (G3); some address of the range not yet
+        // written is translated (`busy`); a page's class refuses the leaf
+        // (`denied`, G3); a map count would pass its maximum (`busy`, G4);
+        // the tables needed are more than the free list and the untyped
+        // supply (`no_memory`), and nothing is taken.
+        let done = match self.caps[&cap].record {
+            Record::Empty => 0,
+            Record::Mapping(m)
+                if m.partial
+                    && m.space == space
+                    && m.address == map.address
+                    && m.first == map.first
+                    && m.rights == rights
+                    && m.count < map.count =>
+            {
+                m.count
+            }
+            _ => return Err(Error::Busy),
+        };
         let size = self.bytes(frame.page);
+        let start = map.address + done * size;
         let end = map.address + map.count * size;
         let aspace = &self.aspaces[&space];
-        let before = aspace.translations.range(..map.address).next_back();
-        let covers = before.is_some_and(|(&at, t)| at + self.bytes(t.size) > map.address);
-        if covers || aspace.translations.range(map.address..end).next().is_some() {
+        let before = aspace.translations.range(..start).next_back();
+        let covers = before.is_some_and(|(&at, t)| at + self.bytes(t.size) > start);
+        if covers || aspace.translations.range(start..end).next().is_some() {
             return Err(Error::Busy);
         }
-        // The gate over page tables, G4: a map count that would overflow is
-        // `busy`.
+        // G3, the bound: this step writes the leaves whose checks fit in the
+        // gate's chunks per call (*E*; a leaf of device memory reads one
+        // word), at least one.
+        let budget = self.machine.gate_chunks;
+        let device = frame.memory != dodos_abi::MemoryType::WriteBack;
+        let cost = |model: &Self, page: u64| match device {
+            true => 1,
+            false => model.leaf_chunks(frame, page, 1).len() as u64,
+        };
+        let (mut step, mut spent) = (0, 0);
+        while done + step < map.count {
+            let c = cost(self, map.first + done + step);
+            if step > 0 && spent + c > budget {
+                break;
+            }
+            spent += c;
+            step += 1;
+        }
+        let first = map.first + done;
+        // G3 (3) and (4): the class of every page the step's leaves target.
+        let leaf = dodos_abi::Leaf {
+            write: rights.contains(Rights::WRITE),
+            exec: rights.contains(Rights::EXEC),
+            device_type: device,
+        };
+        if (first..first + step).any(|page| !self.class_of(frame, page).permits(leaf)) {
+            return Err(Error::Denied);
+        }
+        // The gate over page tables, G4: a map count that would pass its
+        // maximum is `busy`.
         let mut added: std::collections::BTreeMap<u64, u64> = Default::default();
-        for chunk in self.leaf_chunks(frame, map.first, map.count) {
+        for chunk in self.leaf_chunks(frame, first, step) {
             *added.entry(chunk).or_default() += 1;
         }
         let remote = self.remotes.contains_key(&self.caps[&cap].object);
@@ -223,7 +266,7 @@ impl Model {
             .collect();
         let geometry = self.machine.geometry;
         let hooked = tables(held.iter().copied(), levels, geometry);
-        let pages = (0..map.count).map(|n| (map.address + n * size, frame.page));
+        let pages = (done..done + step).map(|n| (map.address + n * size, frame.page));
         let wanted = tables(held.into_iter().chain(pages), levels, geometry).len() as u64;
         let free = aspace.tables - hooked.len() as u64;
         let missing = (wanted - hooked.len() as u64).saturating_sub(free);
@@ -257,15 +300,82 @@ impl Model {
             live(&mut self.aspaces, space).table_pages.push(at);
         }
         live(&mut self.aspaces, space).tables += missing;
-        let mapping = Mapping {
-            space,
-            address: map.address,
-            first: map.first,
-            count: map.count,
-            rights,
+        let partial = done + step < map.count;
+        if done > 0 {
+            self.extend_mapping(cap, step, partial);
+        } else {
+            let mapping = Mapping {
+                space,
+                address: map.address,
+                first: map.first,
+                count: step,
+                rights,
+                partial,
+            };
+            self.record_mapping(cap, space, mapping);
+        }
+        match partial {
+            true => Err(Error::Again),
+            false => Ok(Output::Done),
+        }
+    }
+
+    /// The class of a page of a frame (G2): device memory is of class
+    /// device, a kept frame or range of class global read-only, a table
+    /// page of its class, every other page of ordinary memory data. For a
+    /// leaf larger than a page, the first class of a page it covers that is
+    /// not data, as the gate reads it from the count of each chunk's gate
+    /// word.
+    pub(crate) fn class_of(&self, frame: crate::Frame, page: u64) -> dodos_abi::PageClass {
+        use dodos_abi::PageClass;
+        if frame.memory != dodos_abi::MemoryType::WriteBack {
+            return PageClass::DEVICE;
+        }
+        let bytes = self.bytes(frame.page);
+        let (start, end) = (frame.base + page * bytes, frame.base + (page + 1) * bytes);
+        if frame.kept || self.table.kept.iter().any(|&(s, e)| s <= start && end <= e) {
+            return PageClass::GLOBAL_READ_ONLY;
+        }
+        let small = self.page();
+        match self
+            .table
+            .classes
+            .range(start / small..end.div_ceil(small))
+            .next()
+        {
+            Some(_) => PageClass::table(1).expect("level 1"),
+            None => PageClass::DATA,
+        }
+    }
+
+    /// The next step of a partial mapping: `more` pages written after those
+    /// it holds, their leaves counted.
+    fn extend_mapping(&mut self, cap: CapId, more: u64, partial: bool) {
+        let Record::Mapping(mut mapping) = self.caps[&cap].record else {
+            unreachable!("a partial mapping")
         };
-        self.record_mapping(cap, space, mapping);
-        Ok(Output::Done)
+        let frame = self.frames[&self.caps[&cap].object];
+        let bytes = self.bytes(frame.page);
+        let aspace = live(&mut self.aspaces, mapping.space);
+        for page in mapping.first + mapping.count..mapping.first + mapping.count + more {
+            let at = mapping.address + (page - mapping.first) * bytes;
+            let translation = Translation {
+                cap,
+                page,
+                size: frame.page,
+                rights: mapping.rights,
+            };
+            aspace.translations.insert(at, translation);
+        }
+        let added = Mapping {
+            first: mapping.first + mapping.count,
+            count: more,
+            ..mapping
+        };
+        mapping.count += more;
+        mapping.partial = partial;
+        live(&mut self.caps, cap).record = Record::Mapping(mapping);
+        self.count_leaves(cap, frame, added, 1);
     }
 
     /// `aspace_unmap` and `iospace_unmap`: no right on the capability
@@ -305,8 +415,32 @@ impl Model {
         let Record::Mapping(mut mapping) = self.caps[&cap].record else {
             return Err(Error::Busy);
         };
-        if mapping.space != space {
+        if mapping.space != space || mapping.partial {
             return Err(Error::Busy);
+        }
+        // G3: the class reads of a protect follow the bound: a mapping that
+        // touches more chunks than one call of the gate checks is `busy`;
+        // then the class of each page must allow the new rights (`denied`).
+        let frame = self.frames[&self.caps[&cap].object];
+        let device = frame.memory != dodos_abi::MemoryType::WriteBack;
+        let touched = match device {
+            true => mapping.count,
+            false => self.leaf_chunks(frame, mapping.first, mapping.count).len() as u64,
+        };
+        if touched > self.machine.gate_chunks {
+            return Err(Error::Busy);
+        }
+        let leaf = dodos_abi::Leaf {
+            write: rights.contains(Rights::WRITE),
+            exec: rights.contains(Rights::EXEC),
+            device_type: device,
+        };
+        let pages = mapping.first..mapping.first + mapping.count;
+        if pages
+            .clone()
+            .any(|page| !self.class_of(frame, page).permits(leaf))
+        {
+            return Err(Error::Denied);
         }
         mapping.rights = rights;
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
@@ -335,7 +469,12 @@ impl Model {
         let attached = unit.attached.get(&device).copied();
         let Some(iospace) = iospace else {
             // With iospace 0: detached if attached, otherwise no effect. The
-            // context entry is cleared by the holder of the unit's role.
+            // context entry is cleared by the holder of the unit's role. A
+            // device attached by another live node is `denied`.
+            let key = self.identifier_key(unit.unit, device);
+            if attached.is_none() && !self.holds_identifier(key) {
+                return Err(Error::Denied);
+            }
             if attached.is_some() {
                 let unit = self.iommus[&iommu].unit;
                 self.detach_local(iommu, device);
@@ -346,6 +485,12 @@ impl Model {
         // The state, in this order.
         if self.machine.kernel_devices.contains(&(unit.unit, device)) {
             return Err(Error::Busy);
+        }
+        // A device identifier has an owner: its word must be free for this
+        // node to take, or already this node's (`denied`).
+        let key = self.identifier_key(unit.unit, device);
+        if !self.holds_identifier(key) {
+            return Err(Error::Denied);
         }
         match attached {
             Some(other) if other != iospace => return Err(Error::Busy),
@@ -366,6 +511,11 @@ impl Model {
         if served.is_empty() && domains >= limit {
             return Err(Error::Busy);
         }
+        let taken = dodos_abi::Ownership::taken(
+            dodos_abi::Owner::Node(self.node),
+            self.table.generation(self.node),
+        );
+        self.table.identifiers.insert(key, taken.raw());
         live(&mut self.iospaces, iospace).push((iommu, device));
         let unit = live(&mut self.iommus, iommu);
         unit.attached.insert(device, iospace);
@@ -385,9 +535,33 @@ impl Model {
         let _ = self.unit_request(None, unit, crate::roles::UnitOp::Detach(device));
     }
 
-    /// The node's own record of a detach, and its report.
+    /// The identifier word of a device of an IOMMU unit: its segment and its
+    /// identifier.
+    fn identifier_key(&self, unit: usize, device: u16) -> u32 {
+        u32::from(self.machine.iommus[unit].segment) << 16 | u32::from(device)
+    }
+
+    /// Whether this node may attach the device whose identifier word is
+    /// `key`: the word is free for it to take (rules of taking), or taken
+    /// by its current generation.
+    fn holds_identifier(&self, key: u32) -> bool {
+        let raw = self.table.identifiers.get(&key).copied();
+        let raw = raw.unwrap_or(dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed).raw());
+        let Some(word) = dodos_abi::Ownership::from_raw(raw) else {
+            return false;
+        };
+        let mine = word.state() == dodos_abi::OwnState::Taken
+            && word.owner() == dodos_abi::Owner::Node(self.node)
+            && word.generation() == self.table.generation(self.node);
+        mine || self.table.may_take(word, self.node)
+    }
+
+    /// The node's own record of a detach, and its report; the identifier
+    /// word becomes free and unclaimed.
     fn detach_local(&mut self, iommu: ObjId, device: u16) {
         let index = self.iommus[&iommu].unit;
+        let key = self.identifier_key(index, device);
+        self.table.identifiers.remove(&key);
         self.table.reports[self.node as usize].retain(|&r| r != (index, device));
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);

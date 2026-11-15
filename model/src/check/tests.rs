@@ -2372,3 +2372,144 @@ fn a_breakpoint_word_outside_the_user_range_is_reported() {
         spoiled(|m, at| live(&mut m.threads, at.waiter).regs[dodos_abi::x86_64::REG_UINTR] = 1);
     assert_eq!(broken, "95: breakpoint words of a thread");
 }
+
+// The gate over page tables, judged by the calls (sixth review, DeepSeek).
+
+/// A frame of one page in slot 120, and its frame record.
+fn with_frame() -> (Model, ObjId, Frame) {
+    let (mut m, t) = Model::boot(&Machine::example()).unwrap();
+    let retype = Syscall::UntypedRetype {
+        untyped: SlotAddr::own(UNTYPED),
+        kind: ObjectKind::Frame,
+        size: 1,
+        page: dodos_abi::PageSize::Page as u64,
+        memory: 0,
+        destination: SlotAddr::own(120),
+    };
+    assert_eq!(m.apply(t, retype), Ok(Output::Done));
+    let object = m.object_at(t, SlotAddr::own(120)).unwrap();
+    let frame = m.frames[&object];
+    (m, t, frame)
+}
+
+fn map_frame(rights: Rights) -> Syscall {
+    Syscall::ASpaceMap(Map {
+        space: SlotAddr::own(dodos_abi::START_SLOT_ASPACE),
+        frame: SlotAddr::own(120),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: rights.bits(),
+    })
+}
+
+/// DeepSeek F1 and F2: the call itself reads the class of every page a leaf
+/// targets (G3 (3) and (4)), and refuses with `denied`: a table page; a
+/// global read-only page for `write`; a device page for `exec`.
+#[test]
+fn a_leaf_whose_page_class_refuses_it_is_denied_by_the_call() {
+    let (mut m, t, frame) = with_frame();
+    let page = m.geometry().page();
+    std::sync::Arc::make_mut(&mut m.table.classes)
+        .insert(frame.base / page, crate::table::PageClass::Table);
+    assert_eq!(m.apply(t, map_frame(Rights::READ)), Err(Error::Denied));
+    let (mut m, t, frame) = with_frame();
+    let object = m.object_at(t, SlotAddr::own(120)).unwrap();
+    live(&mut m.frames, object).kept = true;
+    let rw = Rights::READ.union(Rights::WRITE);
+    assert_eq!(m.apply(t, map_frame(rw)), Err(Error::Denied));
+    assert_eq!(m.apply(t, map_frame(Rights::READ)), Ok(Output::Done));
+    let _ = frame;
+    let (mut m, t, _) = with_frame();
+    let object = m.object_at(t, SlotAddr::own(120)).unwrap();
+    live(&mut m.frames, object).memory = dodos_abi::MemoryType::Uncached;
+    let rx = Rights::READ.union(Rights::EXEC);
+    assert_eq!(m.apply(t, map_frame(rx)), Err(Error::Denied));
+    assert_eq!(m.apply(t, map_frame(Rights::READ)), Ok(Output::Done));
+    // A protect that would add what the class refuses is denied too.
+    let protect = Syscall::ASpaceProtect {
+        aspace: SlotAddr::own(dodos_abi::START_SLOT_ASPACE),
+        frame: SlotAddr::own(120),
+        rights: rx.bits(),
+    };
+    assert_eq!(m.apply(t, protect), Err(Error::Denied));
+}
+
+/// DeepSeek F5 (M08): a leaf of the second large page counts in each of the
+/// E chunks it covers.
+#[test]
+fn a_leaf_of_the_second_large_page_counts_in_every_chunk_it_covers() {
+    let (m, _) = Model::boot(&Machine::example()).unwrap();
+    let frame = Frame {
+        page: dodos_abi::PageSize::Large2,
+        pages: 2,
+        memory: dodos_abi::MemoryType::WriteBack,
+        base: 0,
+        kept: false,
+    };
+    let chunks = m.leaf_chunks(frame, 1, 1);
+    let entries = u64::from(m.geometry().entries);
+    assert_eq!(chunks, (entries..2 * entries).collect::<Vec<_>>());
+}
+
+/// DeepSeek F5 (M20): the gate refuses to give a block one of whose chunks
+/// has a map count, even when no piece of it lives (G5).
+#[test]
+fn the_gate_refuses_to_give_a_block_whose_map_count_is_not_zero() {
+    let (mut m, t) = Model::boot(&Machine::example()).unwrap();
+    let shift = m.geometry().chunk_shift();
+    let free = (0..m.table.owners.len() as u64)
+        .find(|&c| m.ownership(c) == Ownership::free(Owner::Unclaimed).raw())
+        .unwrap();
+    let take = Syscall::MemoryTake {
+        control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        kind: 0,
+        place: free << shift,
+        size: u64::from(shift),
+        destination: SlotAddr::own(120),
+    };
+    assert_eq!(m.apply(t, take), Ok(Output::Done));
+    std::sync::Arc::make_mut(&mut m.table.maps)[free as usize] = 1;
+    let give = Syscall::MemoryGive {
+        control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        untyped: SlotAddr::own(120),
+        node: 1,
+    };
+    assert_eq!(m.apply(t, give.clone()), Err(Error::Busy));
+    std::sync::Arc::make_mut(&mut m.table.maps)[free as usize] = 0;
+    assert_eq!(m.apply(t, give), Ok(Output::Done));
+}
+
+/// DeepSeek F5 (M11): a use entry counts the leaves its node holds under
+/// the grant (G6); one that counts others is reported.
+#[test]
+fn a_use_entry_that_counts_leaves_its_node_does_not_hold_is_reported() {
+    let broken = spoiled(|m, _| {
+        let node = m.node as usize;
+        m.table.uses[node].insert(
+            9,
+            crate::table::UseEntry {
+                granter: 1,
+                grant: 0,
+                serial: 0,
+                generation: 1,
+                leaves: 1,
+            },
+        );
+    });
+    assert_eq!(broken, "58: leaves of a use entry");
+}
+
+/// 88: the identifier word of an attached device names its node.
+#[test]
+fn an_attached_device_whose_identifier_word_is_not_its_nodes_is_reported() {
+    let broken = spoiled(|m, _| {
+        m.table
+            .identifiers
+            .insert(4, Ownership::free(Owner::Unclaimed).raw());
+        let taken = Ownership::taken(Owner::Node(0), m.table.generation(0)).raw();
+        m.table.identifiers.insert(7, taken);
+    });
+    assert_eq!(broken, "88: identifier words and attached devices");
+}

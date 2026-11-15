@@ -275,9 +275,37 @@ impl Model {
         self.check_tasks()?;
         self.check_irqs()?;
         self.check_table()?;
+        self.check_identifiers()?;
         self.check_cores()?;
         self.check_debug()?;
         self.check_events()
+    }
+
+    /// 88. a device is attached to an iospace of this node exactly while
+    ///     its identifier word reads taken by this node's generation
+    ///     (IOMMU: a device identifier has an owner).
+    fn check_identifiers(&self) -> Check {
+        let generation = self.table.generation(self.node);
+        let taken =
+            dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation).raw();
+        let mut attached = std::collections::BTreeSet::new();
+        for iommu in self.iommus.values() {
+            let segment = u32::from(self.machine.iommus[iommu.unit].segment);
+            for &device in iommu.attached.keys() {
+                attached.insert(segment << 16 | u32::from(device));
+            }
+        }
+        let held: std::collections::BTreeSet<u32> = self
+            .table
+            .identifiers
+            .iter()
+            .filter(|&(_, &raw)| raw == taken)
+            .map(|(&key, _)| key)
+            .collect();
+        match held == attached {
+            true => Ok(()),
+            false => Err("88: identifier words and attached devices"),
+        }
     }
 
     fn check_tree(&self) -> Check {

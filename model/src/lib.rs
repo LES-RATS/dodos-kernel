@@ -489,6 +489,8 @@ struct Mapping {
     first: u64,
     count: u64,
     rights: Rights,
+    /// Made in steps and not finished (G3): `count` pages written so far.
+    partial: bool,
 }
 
 /// One translation of a space: a page of the frame of the capability whose

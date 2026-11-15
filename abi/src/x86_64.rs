@@ -121,6 +121,23 @@ pub const fn canonical(address: u64) -> bool {
     top == 0 || top == (1 << 17) - 1
 }
 
+/// The address of a remappable MSI for the remapping handle `handle`, whose
+/// data is 0 (Interrupts, with interrupt remapping): bit 4 the remappable
+/// format, bits 5-19 the handle's bits 0-14, bit 2 its bit 15.
+pub const fn msi_remapped(handle: u64) -> u64 {
+    0xFEE0_0000 | (handle & 0x7FFF) << 5 | 1 << 4 | (handle >> 15 & 1) << 2
+}
+
+/// The address and data of an MSI in physical destination, fixed delivery
+/// mode, edge (Interrupts, without interrupt remapping): `None` for an APIC
+/// ID above 255, which this format cannot reach.
+pub const fn msi_direct(apic_id: u32, vector: u8) -> Option<(u64, u64)> {
+    if apic_id > 255 {
+        return None;
+    }
+    Some((0xFEE0_0000 | (apic_id as u64) << 12, vector as u64))
+}
+
 /// rflags as a write gives it, with the bits user code cannot change forced
 /// to their fixed values.
 pub const fn rflags(written: u64) -> u64 {

@@ -1588,3 +1588,85 @@ fn ownership_words_read_back_and_refuse_flipped_bits() {
     assert!(flips - caught <= flips / 4096, "{caught} of {flips}");
     assert_eq!(Ownership::free(Owner::Unclaimed).generation(), 0);
 }
+
+/// DeepSeek F2: the six classes of G2 have their bytes, and their permission
+/// rules are those of G3 (4).
+#[test]
+fn page_classes_have_their_bytes_and_the_rules_of_g3() {
+    use crate::{Leaf, PageClass};
+    let raw = [
+        PageClass::DATA,
+        PageClass::GATE,
+        PageClass::GLOBAL_READ_ONLY,
+        PageClass::DEVICE,
+        PageClass::IOSPACE_TABLE,
+    ]
+    .map(PageClass::raw);
+    assert_eq!(raw, [0, 1, 2, 3, 4]);
+    assert_eq!(PageClass::table(1).map(PageClass::raw), Some(17));
+    assert_eq!(PageClass::table(0), None);
+    assert_eq!(PageClass::table(9), None);
+    for byte in [5, 16, 25, 255] {
+        assert_eq!(PageClass::from_raw(byte), None, "{byte}");
+    }
+    let leaf = |write, exec, device_type| Leaf {
+        write,
+        exec,
+        device_type,
+    };
+    let data = PageClass::DATA;
+    assert!(data.permits(leaf(true, false, false)));
+    assert!(data.permits(leaf(false, true, false)));
+    assert!(!data.permits(leaf(true, true, false)));
+    assert!(!data.permits(leaf(false, false, true)));
+    let shared = PageClass::GLOBAL_READ_ONLY;
+    assert!(shared.permits(leaf(false, true, false)));
+    assert!(!shared.permits(leaf(true, false, false)));
+    let device = PageClass::DEVICE;
+    assert!(device.permits(leaf(true, false, true)));
+    assert!(!device.permits(leaf(false, true, true)));
+    assert!(!device.permits(leaf(false, false, false)));
+    for class in [
+        PageClass::GATE,
+        PageClass::IOSPACE_TABLE,
+        PageClass::table(1).unwrap(),
+        PageClass::table(4).unwrap(),
+    ] {
+        assert!(!class.permits(leaf(false, false, false)), "{class:?}");
+    }
+}
+
+/// DeepSeek F4: the map count is the low 32 bits of the gate word.
+#[test]
+fn the_gate_word_holds_a_32_bit_map_count_and_the_pages_not_of_class_data() {
+    use crate::{GateWord, MAP_COUNT_MAX};
+    assert_eq!(MAP_COUNT_MAX, (1 << 32) - 1);
+    let word = GateWord::new(u32::MAX, 4096).unwrap();
+    assert_eq!((word.map_count(), word.not_data()), (u32::MAX, 4096));
+    assert_eq!(word.raw(), 0xFFFF_FFFF | 4096 << 32);
+    assert_eq!(GateWord::from_raw(word.raw()), Some(word));
+    assert_eq!(GateWord::new(0, 4097), None);
+    assert_eq!(GateWord::from_raw(1 << 45), None);
+    assert_eq!(GateWord::from_raw(4097 << 32), None);
+}
+
+/// DeepSeek F9: the MSI formats of the result of `irq_claim`.
+#[test]
+fn msi_addresses_follow_the_remappable_and_the_direct_formats() {
+    use x86_64::{msi_direct, msi_remapped};
+    assert_eq!(msi_remapped(0), 0xFEE0_0010);
+    assert_eq!(msi_remapped(1), 0xFEE0_0030);
+    assert_eq!(msi_remapped(0x7FFF), 0xFEE0_0000 | 0x7FFF << 5 | 1 << 4);
+    assert_eq!(msi_remapped(0x8000), 0xFEE0_0014);
+    assert_eq!(msi_direct(1, 48), Some((0xFEE0_1000, 48)));
+    assert_eq!(msi_direct(255, 239), Some((0xFEE0_0000 | 255 << 12, 239)));
+    assert_eq!(msi_direct(256, 48), None);
+}
+
+/// DeepSeek F11: the bits of the marks (Tasks and marks) and of the task
+/// flags.
+#[test]
+fn marks_and_task_flags_have_their_bits() {
+    assert_eq!((Marks::PRIVATE.bits(), Marks::UNTRUSTED.bits()), (1, 2));
+    assert_eq!((TaskFlags::AWARE, TaskFlags::REVOKED), (1, 2));
+}
