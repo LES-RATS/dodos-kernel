@@ -35,13 +35,17 @@ pub const fn slot(index: u32) -> u32 {
     }
 }
 
-/// Takes the device entry 0 of the machine, its 2 MB device range, as a
-/// block in `DEVICE`.
+/// Takes the device entry of the machine's 2 MB device range at 2 MB as a
+/// block in `DEVICE` (the parts of usable memory below it left out of the
+/// chunks are device entries too).
 pub fn take_device(model: &mut Model, thread: ObjId) {
+    let index = (0..model.device_count())
+        .find(|&i| model.device_entry(i).base() == 2 << 20)
+        .expect("the 2 MB device range");
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(START_SLOT_MEMORY_CONTROL),
         kind: 1,
-        place: 0,
+        place: index as u64,
         size: 0,
         destination: SlotAddr::own(DEVICE),
     };

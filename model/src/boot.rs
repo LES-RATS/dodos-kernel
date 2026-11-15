@@ -617,11 +617,14 @@ impl Machine {
             }
         }
         let none = (0..words).filter(|&c| owners[c as usize] == 0).collect();
-        // Device memory: every address below the physical width that is not
-        // ordinary memory, not kept, and not unusable, in blocks.
-        let mut taken = regions(RegionKind::Usable);
-        taken.extend(kept.iter().copied());
-        taken.extend(regions(RegionKind::Unusable));
+        // Device memory: every page below the physical width that holds no
+        // chunk, no kept byte and no byte of unusable memory, in blocks; so
+        // the parts of usable memory left out of the chunks are device
+        // memory, and no usable page is dropped.
+        let outward = |(s, e): (u64, u64)| (s / page * page, e.next_multiple_of(page));
+        let mut taken: Ranges = chunks.iter().map(|&at| (at, at + chunk)).collect();
+        taken.extend(kept.iter().copied().map(outward));
+        taken.extend(regions(RegionKind::Unusable).into_iter().map(outward));
         let device = without(&vec![(0, 1u64 << self.phys_bits)], &sorted(taken));
         let mut devices: Vec<DeviceEntry> = device
             .into_iter()

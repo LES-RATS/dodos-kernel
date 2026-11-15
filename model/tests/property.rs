@@ -98,6 +98,18 @@ fn page() -> u64 {
     geometry().page()
 }
 
+/// The index of the device entry of the 2 MB device range: the entries
+/// before it hold the parts of usable memory left out of the chunks.
+fn device_index() -> u64 {
+    static INDEX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INDEX.get_or_init(|| {
+        let (m, _) = Model::boot(&Machine::example()).unwrap();
+        (0..m.device_count())
+            .find(|&i| m.device_entry(i).base() == 2 << 20)
+            .unwrap() as u64
+    })
+}
+
 fn large() -> u64 {
     geometry().chunk()
 }
@@ -1062,7 +1074,7 @@ impl Generator<'_> {
                         let place = ram() + (self.rng.below(chunks) << log2);
                         (0, place, log2)
                     }
-                    7..9 => (1, self.rng.below(4), 0),
+                    7..9 => (1, device_index() + self.rng.below(4), 0),
                     _ => (self.rng.below(3), self.rng.next() >> 20, self.rng.below(40)),
                 };
                 Syscall::MemoryTake {

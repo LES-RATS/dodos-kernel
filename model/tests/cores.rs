@@ -875,3 +875,40 @@ fn thread_move_refuses_a_sched_of_a_third_node() {
     };
     assert_eq!(on(&mut sys, 0, call), Err(Error::Invalid));
 }
+
+/// Argon F1: on a machine where the other places are phantom nodes, the
+/// only node that runs cannot stop itself (a phantom node could neither
+/// drive its fence nor take a role), so the node keeps writing and a take
+/// that follows works.
+#[test]
+fn the_only_running_node_cannot_stop_itself_beside_phantom_nodes() {
+    for mode in [CORE_STOP_KILL, CORE_STOP_RETIRE, CORE_STOP_SEAL] {
+        let machine = Machine::example();
+        let (mut m, t) = Model::boot(&machine).unwrap();
+        let stop = Syscall::CoreStop {
+            core: SlotAddr::own(START_SLOT_FIRST),
+            mode,
+        };
+        assert_eq!(m.apply(t, stop), Err(Error::Busy));
+        assert_eq!(m.member(0).state(), MemberState::Live);
+        let shift = m.geometry().chunk_shift();
+        let free = (0..1u64 << (machine.phys_bits - shift))
+            .find(|&c| m.ownership(c) == Ownership::free(Owner::Unclaimed).raw())
+            .unwrap();
+        let take = Syscall::MemoryTake {
+            control: SlotAddr::own(START_SLOT_MEMORY_CONTROL),
+            kind: 0,
+            place: free << shift,
+            size: u64::from(shift),
+            destination: SlotAddr::own(120),
+        };
+        assert_eq!(m.apply(t, take), Ok(Output::Done));
+        assert_eq!(m.check(), Ok(()));
+        // A phantom node can still be stopped by the node that runs.
+        let other = Syscall::CoreStop {
+            core: SlotAddr::own(START_SLOT_FIRST + 1),
+            mode: CORE_STOP_KILL,
+        };
+        assert_eq!(m.apply(t, other), Ok(Output::Done));
+    }
+}

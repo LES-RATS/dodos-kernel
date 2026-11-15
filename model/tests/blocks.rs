@@ -58,6 +58,13 @@ impl K {
     fn free(&self) -> u64 {
         Machine::example().memory[4].base + 8 * self.chunk()
     }
+
+    /// The index of the device entry of the 2 MB device range at 2 MB.
+    fn dev(&self) -> u64 {
+        (0..self.m.device_count())
+            .find(|&i| self.m.device_entry(i).base() == 2 << 20)
+            .expect("the device range") as u64
+    }
 }
 
 fn take(kind: u64, place: u64, size: u64, destination: u32) -> Syscall {
@@ -179,7 +186,7 @@ fn plain_arguments_of_memory_take_are_judged_in_order() {
     k.no(take(0, 0, shift, 40), Error::Invalid);
     // Kind 1: the size is 0, the place below the capacity.
     k.no(take(1, 0, 1, 40), Error::Invalid);
-    let capacity = 1 + DEVICE_TABLE_SPARE as u64;
+    let capacity = k.m.device_count() as u64;
     k.no(take(1, capacity, 0, 40), Error::Invalid);
     // An unused entry is a state error, not a plain one.
     k.no(take(1, capacity - 1, 0, 40), Error::Busy);
@@ -220,8 +227,8 @@ fn state_of_memory_take_is_judged_in_order() {
     k.no(take(0, reserve, shift, 40), Error::Busy);
     k.no(take(0, next, shift, 40), Error::NoSlot);
     // The device entry: an unused one, then a taken one.
-    k.ok(take(1, 0, 0, 41));
-    k.no(take(1, 0, 0, 42), Error::Busy);
+    k.ok(take(1, k.dev(), 0, 41));
+    k.no(take(1, k.dev(), 0, 42), Error::Busy);
 }
 
 #[test]
@@ -239,7 +246,7 @@ fn a_word_given_to_another_live_node_is_refused() {
 fn block_rights_have_exec_only_for_ordinary_memory_through_exec() {
     let mut k = K::new();
     let (free, shift) = (k.free(), k.shift());
-    k.ok(take(1, 0, 0, 41));
+    k.ok(take(1, k.dev(), 0, 41));
     assert_eq!(
         inspect(&mut k, 41),
         (Untyped, Rights::ALL.without(Rights::EXEC))
@@ -269,9 +276,12 @@ fn memory_give_destroys_the_block_and_frees_its_words_for_the_node() {
         assert_eq!(word, Ownership::free(Owner::Node(1)));
     }
     // A device entry is given the same way.
-    k.ok(take(1, 0, 0, 41));
+    k.ok(take(1, k.dev(), 0, 41));
     k.ok(give(41, 1));
-    assert_eq!(k.m.device_entry(0).owner, Ownership::free(Owner::Node(1)));
+    assert_eq!(
+        k.m.device_entry(k.dev() as usize).owner,
+        Ownership::free(Owner::Node(1))
+    );
 }
 
 #[test]
@@ -316,12 +326,15 @@ fn revoking_the_memory_control_destroys_the_blocks_taken_through_it() {
     let (free, shift) = (k.free(), k.shift());
     k.ok(derive(CONTROL, 40, Rights::ALL));
     k.ok(take_through(40, 0, free, shift, 41));
-    k.ok(take_through(40, 1, 0, 0, 42));
+    k.ok(take_through(40, 1, k.dev(), 0, 42));
     k.ok(Syscall::CapRevoke(own(40)));
     assert_eq!(k.go(Syscall::CapInspect(own(41))), Err(Error::Gone));
     let word = Ownership::from_raw(k.m.ownership(free >> shift)).unwrap();
     assert_eq!(word, Ownership::free(Owner::Node(0)));
-    assert_eq!(k.m.device_entry(0).owner, Ownership::free(Owner::Node(0)));
+    assert_eq!(
+        k.m.device_entry(k.dev() as usize).owner,
+        Ownership::free(Owner::Node(0))
+    );
 }
 
 // memory_split.
@@ -329,12 +342,16 @@ fn revoking_the_memory_control_destroys_the_blocks_taken_through_it() {
 #[test]
 fn memory_split_cuts_a_device_entry_into_two_halves() {
     let mut k = K::new();
-    k.ok(take(1, 0, 0, 40));
-    let entry = k.m.device_entry(0);
+    k.ok(take(1, k.dev(), 0, 40));
+    let entry = k.m.device_entry(k.dev() as usize);
     // The lowest unused entry that is unclaimed gets the upper half.
-    assert_eq!(k.go(split(40)), Ok(Output::Index(1)));
+    let used = (k.m.device_count() - DEVICE_TABLE_SPARE) as u64;
+    assert_eq!(k.go(split(40)), Ok(Output::Index(used)));
     assert_eq!(k.go(Syscall::CapInspect(own(40))), Err(Error::Invalid));
-    let (lower, upper) = (k.m.device_entry(0), k.m.device_entry(1));
+    let (lower, upper) = (
+        k.m.device_entry(k.dev() as usize),
+        k.m.device_entry(used as usize),
+    );
     assert_eq!(
         (lower.base(), lower.log2()),
         (entry.base(), entry.log2() - 1)
@@ -349,8 +366,8 @@ fn memory_split_cuts_a_device_entry_into_two_halves() {
         assert_eq!(e.owner, Ownership::free(Owner::Node(0)));
     }
     // Both halves are this node's to take.
-    k.ok(take(1, 1, 0, 41));
-    k.ok(take(1, 0, 0, 42));
+    k.ok(take(1, used, 0, 41));
+    k.ok(take(1, k.dev(), 0, 42));
 }
 
 #[test]
@@ -360,21 +377,20 @@ fn checks_of_memory_split_come_in_order() {
     // A block of ordinary memory, and a device block of one page.
     k.ok(take(0, free, shift, 40));
     k.no(split(40), Error::Invalid);
-    k.ok(take(1, 0, 0, 41));
+    k.ok(take(1, k.dev(), 0, 41));
     let page = k.m.geometry().page().trailing_zeros();
-    let halvings = k.m.device_entry(0).log2() - page;
-    let mut index = 0;
+    let halvings = k.m.device_entry(k.dev() as usize).log2() - page;
+    let used = (k.m.device_count() - DEVICE_TABLE_SPARE) as u64;
     for _ in 0..halvings {
         let Ok(Output::Index(_)) = k.go(split(41)) else {
             panic!("a split");
         };
-        k.ok(take(1, index, 0, 41));
-        index = 0;
+        k.ok(take(1, k.dev(), 0, 41));
     }
-    assert_eq!(k.m.device_entry(0).log2(), page);
+    assert_eq!(k.m.device_entry(k.dev() as usize).log2(), page);
     k.no(split(41), Error::Invalid);
     // A descendant, then a live piece.
-    k.ok(take(1, 1, 0, 42));
+    k.ok(take(1, used, 0, 42));
     k.ok(derive(42, 43, Rights::READ));
     k.no(split(42), Error::Busy);
     k.ok(Syscall::CapDelete(own(43)));
@@ -402,7 +418,10 @@ fn memory_split_is_busy_when_no_entry_is_unused_and_unclaimed() {
         m
     };
     let mut k = K::on(&machine);
-    let big = (0..4).find(|&i| k.m.device_entry(i).log2() == 33).unwrap() as u64;
+    let used = k.m.device_count() - DEVICE_TABLE_SPARE;
+    let big = (0..used)
+        .find(|&i| k.m.device_entry(i).log2() == 33)
+        .unwrap() as u64;
     let mut work = vec![big];
     let mut splits = 0;
     while splits < DEVICE_TABLE_SPARE {

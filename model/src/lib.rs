@@ -1151,6 +1151,21 @@ impl Model {
         Some((entry.grantee, entry.generation, entry.serial, state))
     }
 
+    /// Whether an address lies in a chunk of ordinary memory (a floor's
+    /// included) or in memory the kernel keeps.
+    pub fn chunked_or_kept(&self, at: u64) -> bool {
+        let shift = self.table.geometry.chunk_shift();
+        let inside = |ranges: &[(u64, u64)]| ranges.iter().any(|&(s, e)| s <= at && at < e);
+        self.table.owners.get((at >> shift) as usize) != Some(&dodos_abi::Ownership::none().raw())
+            || self.table.floors.iter().any(|f| inside(f))
+            || inside(&self.table.kept)
+    }
+
+    /// The capacity of the device table.
+    pub fn device_count(&self) -> usize {
+        self.table.devices.len()
+    }
+
     /// An entry of the device table.
     pub fn device_entry(&self, index: usize) -> dodos_abi::DeviceEntry {
         self.table.devices[index]

@@ -467,11 +467,18 @@ fn device_memory_is_every_address_that_is_not_ram_kept_or_unusable() {
             .insert(4, region(7 * mb, low - 7 * mb, RegionKind::Unusable));
     });
     let (m, _) = boot(&machine);
-    let sizes: Vec<u32> = (0..3).map(|i| m.device_entry(i).log2()).collect();
+    // The entries below 2 MB hold the part of the usable second megabyte
+    // left out of the chunks (Argon F2); then the device ranges.
+    let used = m.device_count() - DEVICE_TABLE_SPARE;
+    let low = (0..used)
+        .filter(|&i| m.device_entry(i).base() < 2 << 20)
+        .count();
+    assert!((0..low).all(|i| m.device_entry(i).base() >= 1 << 20));
+    let sizes: Vec<u32> = (low..used).map(|i| m.device_entry(i).log2()).collect();
     assert_eq!(sizes, [20, 21, 20]);
-    assert!((0..3).all(|i| m.device_entry(i).is_used()));
-    assert!(!m.device_entry(3).is_used());
-    assert!(!m.device_entry(3 + DEVICE_TABLE_SPARE - 1).is_used());
+    assert!((0..used).all(|i| m.device_entry(i).is_used()));
+    assert!(!m.device_entry(used).is_used());
+    assert!(!m.device_entry(used + DEVICE_TABLE_SPARE - 1).is_used());
     // No device untyped is given at start-up.
     let (mut m, t) = boot(&Machine::example());
     assert_eq!(m.apply(t, take(1, 0, 0, 40)), Ok(Output::Done));
@@ -588,4 +595,40 @@ fn ports_exist_only_on_x86_64() {
     let other = with(|m| m.arch = Arch::Other);
     let (mut m, t) = boot(&other);
     assert_eq!(kind(&mut m, t, START_SLOT_IOPORTS), Err(Error::Invalid));
+}
+
+/// Argon F2: the parts of usable memory left out of the chunks are device
+/// memory, so no usable page is dropped: every page of a usable region is
+/// in a chunk (its ownership word is not none, or it lies in a floor or a
+/// reserve), kept, or under a used entry of the device table.
+#[test]
+fn no_usable_page_is_left_out_of_both_the_chunks_and_the_device_table() {
+    let machine = Machine::example();
+    let (m, _) = Model::boot(&machine).unwrap();
+    let geometry = m.geometry();
+    let page = geometry.page();
+    let entries: Vec<_> = (0..m.device_count())
+        .map(|i| m.device_entry(i))
+        .filter(|e| e.is_used())
+        .map(|e| (e.base(), e.base() + (1 << e.log2())))
+        .collect();
+    let device = |at: u64| entries.iter().any(|&(s, e)| s <= at && at < e);
+    let mut fragments = 0;
+    for region in machine
+        .memory
+        .iter()
+        .filter(|r| r.kind == RegionKind::Usable)
+    {
+        let (start, end) = (
+            region.base.next_multiple_of(page),
+            (region.base + region.len) / page * page,
+        );
+        for at in (start..end).step_by(page as usize) {
+            if !m.chunked_or_kept(at) {
+                assert!(device(at), "usable page {at:#x} dropped");
+                fragments += 1;
+            }
+        }
+    }
+    assert!(fragments > 0, "the example machine has a fragment");
 }
