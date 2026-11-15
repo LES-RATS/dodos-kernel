@@ -10,9 +10,17 @@ cargo test --workspace
 # levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). The tests of
 # membership, roles, scheduling, interrupts, tasks and debugging do not
 # depend on the page and run once, above.
-for page in 16k 32k; do
-	DODOS_PAGE=$page cargo test -p dodos-model --lib \
+# The two runs share the binaries the first run built (the page is read at
+# run time), so they run side by side; each must pass.
+geometry() {
+	DODOS_PAGE=$1 cargo test -p dodos-model --lib \
 		--test adversarial_nodes --test blocks --test boot --test calls \
 		--test faults --test gate_attack --test gate_words --test memory \
 		--test nodes --test property
-done
+}
+geometry 16k &
+sixteen=$!
+geometry 32k &
+thirty_two=$!
+wait "$sixteen"
+wait "$thirty_two"

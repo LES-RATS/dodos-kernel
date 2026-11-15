@@ -23,3 +23,8 @@ opt-level = 2
 # times; optimized like the model, they keep their overflow checks.
 [profile.dev.package.dodos-abi]
 opt-level = 2
+
+# Debug information only for line numbers: panics keep their places,
+# and the tests build in less time.
+[profile.dev]
+debug = "line-tables-only"
