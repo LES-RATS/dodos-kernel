@@ -1612,7 +1612,9 @@ fn with_device(m: &mut Model) -> (ObjId, ObjId) {
         memory: 0,
         destination: own(60),
     };
-    m.apply(boot, retype).unwrap();
+    // The clearing of the space may take several calls (one 64 KB step
+    // each): a space of two pages of 32 KB does.
+    while m.apply(boot, retype.clone()) == Err(Error::Again) {}
     let attach = Syscall::IoSpaceAttach {
         iommu: own(18),
         iospace: own(60),
@@ -1980,7 +1982,8 @@ fn two_blocks_on_one_chunk_are_reported() {
 #[test]
 fn block_on_a_word_not_taken_by_its_node_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
-        m.table.owners[chunk as usize] = Ownership::taken(Owner::Node(0), 7).raw();
+        std::sync::Arc::make_mut(&mut m.table.owners)[chunk as usize] =
+            Ownership::taken(Owner::Node(0), 7).raw();
     });
     assert_eq!(broken, "54: block on a word not taken");
 }
@@ -1997,7 +2000,8 @@ fn start_up_untyped_outside_the_floor_is_reported() {
 #[test]
 fn block_on_a_free_word_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
-        m.table.owners[chunk as usize] = Ownership::free(Owner::Node(0)).raw();
+        std::sync::Arc::make_mut(&mut m.table.owners)[chunk as usize] =
+            Ownership::free(Owner::Node(0)).raw();
     });
     assert_eq!(broken, "55: block on a free word");
 }
@@ -2018,7 +2022,8 @@ fn word_changed_from_none_is_reported() {
     let broken = spoiled(|m, _| {
         // A chunk of the floor of node 1.
         let chunk = (m.machine.memory[4].base >> m.machine.geometry.chunk_shift()) + 3;
-        m.table.owners[chunk as usize] = Ownership::taken(Owner::Node(1), 1).raw();
+        std::sync::Arc::make_mut(&mut m.table.owners)[chunk as usize] =
+            Ownership::taken(Owner::Node(1), 1).raw();
     });
     assert_eq!(broken, "56: a word changed from or to none");
 }
@@ -2038,7 +2043,8 @@ fn kernel_space_that_maps_a_chunk_the_node_does_not_hold_is_reported() {
 #[test]
 fn translation_to_memory_of_another_node_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
-        m.table.owners[chunk as usize + 1] = Ownership::taken(Owner::Node(1), 1).raw();
+        std::sync::Arc::make_mut(&mut m.table.owners)[chunk as usize + 1] =
+            Ownership::taken(Owner::Node(1), 1).raw();
         let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
         let shift = m.machine.geometry.chunk_shift();
         live(&mut m.frames, start).base = (chunk + 1) << shift;
@@ -2070,14 +2076,16 @@ fn translation_to_a_table_page_is_reported() {
     let broken = spoiled(|m, _| {
         let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
         let page = m.frames[&start].base / m.machine.geometry.page();
-        m.table.classes.insert(page, crate::table::PageClass::Table);
+        std::sync::Arc::make_mut(&mut m.table.classes).insert(page, crate::table::PageClass::Table);
     });
     assert_eq!(broken, "58: translation to a table page");
 }
 
 #[test]
 fn map_count_that_is_not_the_number_of_leaves_is_reported() {
-    let broken = spoiled_with_block(|m, _, chunk| m.table.maps[chunk as usize] += 1);
+    let broken = spoiled_with_block(|m, _, chunk| {
+        std::sync::Arc::make_mut(&mut m.table.maps)[chunk as usize] += 1
+    });
     assert_eq!(broken, "58: map count");
 }
 
@@ -2085,8 +2093,7 @@ fn map_count_that_is_not_the_number_of_leaves_is_reported() {
 fn page_class_of_no_table_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
         let pages = m.machine.geometry.chunk() / m.machine.geometry.page();
-        m.table
-            .classes
+        std::sync::Arc::make_mut(&mut m.table.classes)
             .insert(chunk * pages, crate::table::PageClass::Table);
     });
     assert_eq!(broken, "59: page classes");
@@ -2182,7 +2189,7 @@ fn device_of_a_unit_missing_from_its_list_is_reported() {
             memory: 0,
             destination: SlotAddr::own(300),
         };
-        m.apply(thread, space).unwrap();
+        while m.apply(thread, space.clone()) == Err(Error::Again) {}
         let attach = Syscall::IoSpaceAttach {
             iommu: SlotAddr::own(18),
             iospace: SlotAddr::own(300),
@@ -2264,10 +2271,11 @@ fn marks_lost_by_a_move_are_reported() {
 
 #[test]
 fn a_ring_entry_out_of_its_place_or_a_wrong_next_sequence_is_reported() {
-    let broken = spoiled(|m, _| m.table.crash.areas[0].next_kernel += 1);
+    let broken =
+        spoiled(|m, _| std::sync::Arc::make_mut(&mut m.table.crash).areas[0].next_kernel += 1);
     assert_eq!(broken, "88: kernel ring");
     let broken = spoiled(|m, _| {
-        let area = &mut m.table.crash.areas[0];
+        let area = &mut std::sync::Arc::make_mut(&mut m.table.crash).areas[0];
         area.user[3] = area.kernel[0];
         area.user[3].seq = 1;
     });
@@ -2276,10 +2284,11 @@ fn a_ring_entry_out_of_its_place_or_a_wrong_next_sequence_is_reported() {
 
 #[test]
 fn a_code_in_the_wrong_ring_is_reported() {
-    let broken = spoiled(|m, _| m.table.crash.areas[0].kernel[0].word2 |= 16);
+    let broken =
+        spoiled(|m, _| std::sync::Arc::make_mut(&mut m.table.crash).areas[0].kernel[0].word2 |= 16);
     assert_eq!(broken, "89: a user code in the kernel ring");
     let broken = spoiled(|m, _| {
-        let area = &mut m.table.crash.areas[0];
+        let area = &mut std::sync::Arc::make_mut(&mut m.table.crash).areas[0];
         area.user[0] = area.kernel[0];
         area.next_user = 2;
     });
@@ -2300,22 +2309,23 @@ fn a_call_on_debug_that_wrote_a_kernel_entry_or_wrong_entries_is_reported() {
 #[test]
 fn entries_over_the_rate_limit_or_suppressed_entries_not_counted_are_reported() {
     let broken = spoiled(|m, _| {
-        let entry = m.table.crash.areas[0].kernel[0];
+        let entry = std::sync::Arc::make_mut(&mut m.table.crash).areas[0].kernel[0];
         for _ in 0..17 {
             let mut copy = entry;
             copy.word2 = (copy.word2 & !0xFFFF) | 9;
-            m.table.crash.areas[0].write_raw(false, copy);
+            std::sync::Arc::make_mut(&mut m.table.crash).areas[0].write_raw(false, copy);
         }
     });
     assert_eq!(broken, "91: more than 16 entries of a code in a window");
-    let broken = spoiled(|m, _| m.table.crash.areas[0].suppressed += 1);
+    let broken =
+        spoiled(|m, _| std::sync::Arc::make_mut(&mut m.table.crash).areas[0].suppressed += 1);
     assert_eq!(broken, "91: suppressed entries not counted once");
 }
 
 #[test]
 fn a_record_of_another_boot_or_a_written_previous_area_is_reported() {
     let broken = spoiled(|m, _| {
-        m.table.crash.areas[1].record = Some(crate::debug::Record {
+        std::sync::Arc::make_mut(&mut m.table.crash).areas[1].record = Some(crate::debug::Record {
             commit: 7,
             generation: 1,
             reason: 1,
@@ -2324,7 +2334,7 @@ fn a_record_of_another_boot_or_a_written_previous_area_is_reported() {
         });
     });
     assert_eq!(broken, "92: a record committed with another boot");
-    let broken = spoiled(|m, _| m.table.previous = Some(m.table.crash.clone()));
+    let broken = spoiled(|m, _| m.table.previous = Some((*m.table.crash).clone()));
     assert_eq!(broken, "92: the previous crash area written");
 }
 

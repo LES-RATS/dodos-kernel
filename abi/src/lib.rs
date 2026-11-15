@@ -433,11 +433,28 @@ impl Geometry {
         bits
     }
 
+    /// The bits of a virtual address the tables translate: the page and
+    /// log2 *E* per level.
+    pub const fn address_bits(&self) -> u32 {
+        self.page_shift[0] as u32 + self.levels * self.entries.trailing_zeros()
+    }
+
+    /// Whether an address is canonical: it lies in the lower half, below
+    /// the power of two at or above the user range end, or in the upper
+    /// half that mirrors it (x86-64: bits 47-63 equal on four levels).
+    pub const fn canonical(&self, address: u64) -> bool {
+        let half = self.user_end.next_power_of_two();
+        address < half || address >= half.wrapping_neg()
+    }
+
     /// Whether the values are ones the kernel starts with (Values of the
-    /// machine, Start-up state): a page, a chunk above it, larger page
-    /// sizes in increasing order with none after a missing one, *E* a power
-    /// of two from 2 to 4,096, *L* at least 2, and a user range end that is
-    /// a multiple of the chunk.
+    /// machine, Start-up state): a page of at least 4 KB, a chunk above it
+    /// (a second page size is required), larger page sizes in increasing
+    /// order with none after a missing one; *E* the entries of one table
+    /// page of 8-byte entries, at most 4,096 (so a 64 KB granule, 8,192
+    /// entries, is refused); *L* at least 2; a user range end that is a
+    /// multiple of the chunk and lies in the lower half of the address bits
+    /// the tables translate.
     pub const fn valid(&self) -> bool {
         let s = self.page_shift;
         let mut ordered = s[0] >= 12 && s[1] > s[0] && s[1] < 48;
@@ -449,12 +466,14 @@ impl Geometry {
             i += 1;
         }
         ordered
-            && self.entries.is_power_of_two()
-            && self.entries >= 2
+            && self.entries as u64 == 1 << (s[0] - 3)
             && self.entries <= TABLE_ENTRIES_MAX
             && self.levels >= LEVELS_MIN
+            && self.levels <= 8
+            && self.address_bits() <= 64
             && self.user_end != 0
             && self.user_end.is_multiple_of(self.chunk())
+            && self.user_end <= 1 << (self.address_bits() - 1)
     }
 }
 

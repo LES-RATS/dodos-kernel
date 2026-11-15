@@ -336,7 +336,9 @@ impl System {
                             instant: now,
                             member: member.raw(),
                         };
-                        self.write_beacon(|t| t.crash.write_record(running, record));
+                        self.write_beacon(|t| {
+                            std::sync::Arc::make_mut(&mut t.crash).write_record(running, record)
+                        });
                     }
                     if booted(self, core) {
                         self.cores[core] = CoreState::Parked;
@@ -456,11 +458,14 @@ impl System {
             let tables = model.table_pages();
             let core = model.table.placed[node];
             self.write_beacon(|t| {
-                for (count, own) in t.maps.iter_mut().zip(&leaves) {
+                for (count, own) in std::sync::Arc::make_mut(&mut t.maps)
+                    .iter_mut()
+                    .zip(&leaves)
+                {
                     *count -= own;
                 }
                 for page in &tables {
-                    t.classes.remove(page);
+                    std::sync::Arc::make_mut(&mut t.classes).remove(page);
                 }
                 t.reports[node].clear();
                 for (grant, entry) in std::mem::take(&mut t.grants[node]) {
@@ -532,7 +537,7 @@ impl System {
                 *sum += own;
             }
         }
-        ensure(leaves == table.maps, "58: map count of the machine")?;
+        ensure(leaves == *table.maps, "58: map count of the machine")?;
         let tables: BTreeSet<u64> = self
             .nodes
             .iter()
@@ -943,7 +948,9 @@ mod tests {
             .iter()
             .position(|&m| m > 0)
             .unwrap();
-        tables(&mut sys, |t| t.maps[chunk] += 1);
+        tables(&mut sys, |t| {
+            std::sync::Arc::make_mut(&mut t.maps)[chunk] += 1
+        });
         assert_eq!(sys.check(), Err("58: map count of the machine".into()));
     }
 
@@ -958,7 +965,9 @@ mod tests {
             .iter()
             .position(|&m| m > 0)
             .unwrap();
-        tables(&mut sys, |t| t.maps[chunk] = 0);
+        tables(&mut sys, |t| {
+            std::sync::Arc::make_mut(&mut t.maps)[chunk] = 0
+        });
         assert_eq!(sys.check(), Err("node 0: 58: map count".into()));
     }
 

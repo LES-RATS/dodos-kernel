@@ -299,9 +299,13 @@ fn way_out(sys: &System) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn every_crash_at_every_step_of_a_recovery_is_recovered_from() {
-    for scenario in &SCENARIOS {
+/// Every crash at every step of one scenario is recovered from.
+fn explore(name: &str) {
+    let scenario = SCENARIOS
+        .iter()
+        .find(|s| s.name == name)
+        .expect("a scenario");
+    {
         let steps = length(scenario);
         for at in 0..=steps {
             for crashed in (0..3u16).filter(|n| !scenario.stopped.contains(n)) {
@@ -339,4 +343,35 @@ fn every_crash_at_every_step_of_a_recovery_is_recovered_from() {
             }
         }
     }
+}
+
+// One test per scenario, so that they run in parallel.
+#[test]
+fn every_crash_during_a_kill_is_recovered_from() {
+    explore("kill");
+}
+
+#[test]
+fn every_crash_during_a_seal_is_recovered_from() {
+    explore("seal");
+}
+
+#[test]
+fn every_crash_during_a_hand_over_is_recovered_from() {
+    explore("hand");
+}
+
+#[test]
+fn every_crash_while_a_thread_waits_for_a_unit_holder_is_recovered_from() {
+    explore("attach");
+}
+
+#[test]
+fn every_crash_while_a_frame_is_granted_and_mapped_is_recovered_from() {
+    explore("grant");
+}
+
+#[test]
+fn every_crash_while_a_reserve_chunk_is_taken_is_recovered_from() {
+    explore("reserve");
 }

@@ -314,10 +314,12 @@ fn answer_with_label_1_and_two_words_redirects_the_thread() {
 
 #[test]
 fn answer_with_another_label_or_a_redirect_that_cannot_be_leaves_it_suspended() {
+    // The first address that is not canonical on the machine's geometry.
+    let far = Machine::example().geometry.user_end.next_power_of_two();
     for (label, words) in [
         (2, vec![0x40_2000, 0x8000]),
         (1, vec![0x40_2000]),
-        (1, vec![1 << 47, 0x8000]),
+        (1, vec![far, 0x8000]),
         (1, vec![0x40_2000, 1 << 63]),
     ] {
         let mut k = K::new();
@@ -504,7 +506,7 @@ fn thread_write_regs_checks_the_size_then_the_canonical_words_then_the_state() {
     assert_eq!(k.go(write(good[..19].to_vec())), Err(Error::Invalid));
     for word in [REG_RIP, REG_RSP, 18, 19] {
         let mut wrong = good.clone();
-        wrong[word] = 0x8000_0000_0000;
+        wrong[word] = Machine::example().geometry.user_end.next_power_of_two();
         assert_eq!(k.go(write(wrong)), Err(Error::Invalid), "word {word}");
     }
     // Other words may hold anything.

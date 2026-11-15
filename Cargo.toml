@@ -19,3 +19,7 @@ fn_params_excessive_bools = "warn"
 # calls: optimized, `verify` runs them in seconds instead of minutes.
 [profile.dev.package.dodos-model]
 opt-level = 2
+# The model's invariants call the pure functions of `abi/` millions of
+# times; optimized like the model, they keep their overflow checks.
+[profile.dev.package.dodos-abi]
+opt-level = 2

@@ -330,8 +330,7 @@ impl Model {
         if let Some(space) = self.aspaces.get_mut(&id) {
             space.table_pages.push(base);
             let page = base / self.machine.geometry.page();
-            self.table
-                .classes
+            std::sync::Arc::make_mut(&mut self.table.classes)
                 .insert(page, crate::table::PageClass::Table);
         }
         Ok(Output::Done)
@@ -985,7 +984,7 @@ impl Model {
                 // G2: the gate turns the table pages back into data.
                 let page = self.machine.geometry.page();
                 for at in &space.table_pages {
-                    self.table.classes.remove(&(at / page));
+                    std::sync::Arc::make_mut(&mut self.table.classes).remove(&(at / page));
                 }
                 for untyped in object
                     .from

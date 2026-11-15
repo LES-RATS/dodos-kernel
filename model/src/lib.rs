@@ -45,6 +45,7 @@ mod threads;
 
 pub use boot::{
     Arch, Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, SIXTEEN_KB, Segment,
+    THIRTY_TWO_KB,
 };
 pub use check::Census;
 pub use recovery::HwAction;
@@ -1118,7 +1119,7 @@ impl Model {
     /// A stray write into the living part, which no gate made: the input a
     /// test uses to show that a word that fails its check is `busy`.
     pub fn stray_write(&mut self, chunk: u64, raw: u64) {
-        self.table.owners[chunk as usize] = raw;
+        std::sync::Arc::make_mut(&mut self.table.owners)[chunk as usize] = raw;
     }
 
     /// The raw ownership word of a chunk.

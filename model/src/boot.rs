@@ -185,24 +185,41 @@ pub const SIXTEEN_KB: Geometry = Geometry {
     page_shift: [14, 25, 36, 0],
     entries: 2048,
     levels: 3,
-    user_end: (1 << 47) - (1 << 36),
+    // Three levels of 2,048 entries translate 47 bits: the lower half is
+    // 2^46, less the root entry of the reserved slot.
+    user_end: (1 << 46) - (1 << 36),
+};
+
+/// A third geometry, of 32 KB pages, that no shipping processor has: *E* is
+/// 4,096 (the largest the contract accepts), three levels translate 51
+/// bits, a chunk is 128 MB. The tests that depend on the page run with it
+/// too, so that no constant of 4 or 16 KB stays hidden in them.
+pub const THIRTY_TWO_KB: Geometry = Geometry {
+    page_shift: [15, 27, 39, 0],
+    entries: 4096,
+    levels: 3,
+    user_end: (1 << 50) - (1 << 39),
 };
 
 impl Machine {
     /// The machine of the tests on the geometry that the environment
-    /// variable `DODOS_PAGE` names: `16k` for [`SIXTEEN_KB`], otherwise the
-    /// reference machine, x86-64 with four levels. `verify` runs the tests
-    /// with both.
+    /// variable `DODOS_PAGE` names: `16k` for [`SIXTEEN_KB`], `32k` for
+    /// [`THIRTY_TWO_KB`], otherwise the reference machine, x86-64 with four
+    /// levels. `verify` runs the tests that depend on the page with all
+    /// three.
     pub fn example() -> Self {
         match std::env::var("DODOS_PAGE").as_deref() {
             Ok("16k") => Self::example_on(SIXTEEN_KB),
+            Ok("32k") => Self::example_on(THIRTY_TWO_KB),
             _ => Self::example_on(dodos_abi::x86_64::GEOMETRY),
         }
     }
 
     /// The machine of the tests: two cores of one kind, one IOMMU unit, one
     /// IOAPIC, usable memory of 4,098 chunks (8 GB and 4 MB on the reference
-    /// machine) from the first multiple of 4 GB that is aligned on the
+    /// machine; more where a run of the second large page past the floors
+    /// would not fit, as with pages of 32 KB) from the first multiple of 4 GB
+    /// that is aligned on the
     /// second large page, whose top two chunks hold the crash areas, a 2 MB
     /// device range at 2 MB, the kept ranges and the modules in the second
     /// megabyte, and a first service of two segments from the first large
@@ -215,8 +232,9 @@ impl Machine {
         let chunk = geometry.chunk();
         let large = geometry.bytes(PageSize::Large2).unwrap_or(chunk);
         let ram = (4 * gb).next_multiple_of(large);
-        // 4,096 chunks of ordinary memory, then the two crash areas.
-        let size = 4098 * chunk;
+        // 4,096 chunks of ordinary memory, then the two crash areas; at least
+        // room for an aligned run of the second large page past the floors.
+        let size = (4098 * chunk).max(2 * large + 2 * chunk);
         let top = (ram + size).next_power_of_two();
         let mut feature_bytes = [0; 32];
         feature_bytes[dodos_abi::x86_64::AVX512 as usize] = 2048;
@@ -270,7 +288,8 @@ impl Machine {
                 },
                 Segment {
                     vaddr: chunk + 0x1_0000,
-                    len: 0x4000,
+                    // 16 KB, or one page where a page is larger.
+                    len: geometry.page().max(0x4000),
                     rights: read.union(Rights::WRITE),
                     name: 4,
                 },
@@ -707,7 +726,7 @@ impl Machine {
             reserves: layout.reserves.clone(),
             role_records: layout.roles.clone(),
             kept: self.kept_ranges(layout.image, layout.crash_len),
-            none: layout.none.iter().copied().collect(),
+            none: std::sync::Arc::new(layout.none.iter().copied().collect()),
             fence,
             booted,
             beacons: vec![
@@ -731,11 +750,11 @@ impl Machine {
             fence_epoch: 0,
             rings: vec![vec![(0, 0); n]; n],
             replacement: self.replacement,
-            crash: crate::debug::CrashArea::new(
+            crash: std::sync::Arc::new(crate::debug::CrashArea::new(
                 self.boot_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
                 self.previous_crash.as_ref().map_or(0, |p| p.sequence),
                 n,
-            ),
+            )),
             previous: self.previous_crash.clone(),
             ports: Default::default(),
             stale_ns: u64::from(self.membership.stale_ms) * 1_000_000,
@@ -762,10 +781,10 @@ impl Machine {
             off: vec![false; n],
             member_writes: Default::default(),
             role_writes: Default::default(),
-            owners: layout.owners.clone(),
-            maps: vec![0; layout.owners.len()],
+            owners: std::sync::Arc::new(layout.owners.clone()),
+            maps: std::sync::Arc::new(vec![0; layout.owners.len()]),
             classes: Default::default(),
-            devices: layout.devices.clone(),
+            devices: std::sync::Arc::new(layout.devices.clone()),
             members: vec![live; n],
             roles: roles.clone(),
             grants: vec![Default::default(); n],
@@ -1066,7 +1085,7 @@ impl Model {
         // header is right, with its generation; otherwise it is cleared.
         // Its first entry is the text of its start (code 1).
         let generation = self.table.generation(self.node);
-        let area = &mut self.table.crash.areas[self.node as usize];
+        let area = &mut std::sync::Arc::make_mut(&mut self.table.crash).areas[self.node as usize];
         if area.magic != dodos_abi::DEBUG_AREA_MAGIC
             || area.version != dodos_abi::DEBUG_AREA_VERSION
         {

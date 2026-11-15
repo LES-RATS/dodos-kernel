@@ -164,10 +164,26 @@ fn the_geometry_reads_page_sizes_from_the_machine() {
         page_shift: [14, 25, 36, 0],
         entries: 2048,
         levels: 3,
-        user_end: (1 << 47) - (1 << 36),
+        user_end: (1 << 46) - (1 << 36),
     };
     assert!(sixteen.valid());
     assert_eq!((sixteen.page(), sixteen.chunk()), (16 << 10, 32 << 20));
+    assert_eq!((x86.address_bits(), sixteen.address_bits()), (48, 47));
+    // The largest E the contract accepts, on pages of 32 KB; and two levels.
+    let thirty_two = Geometry {
+        page_shift: [15, 27, 39, 0],
+        entries: TABLE_ENTRIES_MAX,
+        levels: 3,
+        user_end: (1 << 50) - (1 << 39),
+    };
+    assert!(thirty_two.valid());
+    let two_levels = Geometry {
+        page_shift: [12, 21, 0, 0],
+        levels: LEVELS_MIN,
+        user_end: (1 << 29) - (1 << 21),
+        ..x86
+    };
+    assert!(two_levels.valid());
     let bad = [
         Geometry {
             page_shift: [11, 21, 0, 0],
@@ -198,9 +214,65 @@ fn the_geometry_reads_page_sizes_from_the_machine() {
             user_end: 4096,
             ..x86
         },
+        // Mistral F4: a 64 KB granule holds 8,192 entries per table, more
+        // than the contract accepts, whatever E is stated; and E must be
+        // the entries of one page (2 on a 4 KB page is not).
+        Geometry {
+            page_shift: [16, 29, 0, 0],
+            entries: 4096,
+            levels: 3,
+            user_end: 63 << 42,
+        },
+        Geometry {
+            page_shift: [16, 29, 0, 0],
+            entries: 8192,
+            levels: 3,
+            user_end: 63 << 42,
+        },
+        Geometry {
+            entries: 2,
+            user_end: 1 << 30,
+            ..x86
+        },
+        // DeepSeek F6: three levels of 16 KB translate 47 bits, so a user
+        // range up to 2^47 lies outside the lower half; no second page size.
+        Geometry {
+            user_end: (1 << 47) - (1 << 36),
+            ..sixteen
+        },
+        Geometry {
+            page_shift: [12, 0, 0, 0],
+            ..x86
+        },
     ];
     for geometry in bad {
         assert!(!geometry.valid(), "{geometry:?}");
+    }
+}
+
+/// DeepSeek F6: the canonical rule follows the geometry: four levels of
+/// 4 KB sign-extend bit 47, three levels of 16 KB bit 46.
+#[test]
+fn canonical_addresses_follow_the_address_bits_of_the_geometry() {
+    let x86 = x86_64::GEOMETRY;
+    let sixteen = Geometry {
+        page_shift: [14, 25, 36, 0],
+        entries: 2048,
+        levels: 3,
+        user_end: (1 << 46) - (1 << 36),
+    };
+    for (geometry, bit) in [(x86, 47), (sixteen, 46)] {
+        assert!(geometry.canonical(0));
+        assert!(geometry.canonical((1 << bit) - 1));
+        assert!(!geometry.canonical(1 << bit));
+        assert!(!geometry.canonical(u64::MAX << bit >> 1 & !(u64::MAX << 63)));
+        assert!(geometry.canonical(u64::MAX << bit));
+        assert!(!geometry.canonical((u64::MAX << bit) - 1));
+        assert!(geometry.canonical(u64::MAX));
+    }
+    // The reference value of the architecture layer agrees.
+    for address in [0, 1 << 46, (1 << 47) - 1, 1 << 47, u64::MAX << 47, 1 << 63] {
+        assert_eq!(x86.canonical(address), x86_64::canonical(address));
     }
 }
 

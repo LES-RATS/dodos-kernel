@@ -191,14 +191,14 @@ impl Model {
                         (0, 0),
                         [index as u64, limit.suppressed, 0],
                     );
-                    self.table.crash.areas[me].write(false, report);
+                    std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(false, report);
                     self.reported += limit.suppressed;
                     limit.suppressed = 0;
                 }
             }
             if limit.count >= TRACE_BURST {
                 limit.suppressed += 1;
-                self.table.crash.areas[me].suppressed += 1;
+                std::sync::Arc::make_mut(&mut self.table.crash).areas[me].suppressed += 1;
                 self.limits[index] = limit;
                 return;
             }
@@ -206,7 +206,7 @@ impl Model {
             self.limits[index] = limit;
         }
         let entry = self.entry(code, 0, stamp, payload);
-        self.table.crash.areas[me].write(false, entry);
+        std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(false, entry);
         self.event.kernel_entries += 1;
     }
 
@@ -246,7 +246,7 @@ impl Model {
             instant: self.now,
             member: member.raw(),
         };
-        self.table.crash.write_record(self.node, record);
+        std::sync::Arc::make_mut(&mut self.table.crash).write_record(self.node, record);
         self.trace(TraceCode::Failure, None, [u64::from(reason), 0, 0]);
     }
 
@@ -314,7 +314,7 @@ impl Model {
         bytes.resize(entries * TRACE_TEXT_BYTES as usize, 0);
         let stamp = self.stamp(Some(thread));
         let me = self.node as usize;
-        let first = self.table.crash.areas[me].next_user;
+        let first = std::sync::Arc::make_mut(&mut self.table.crash).areas[me].next_user;
         for (i, chunk) in bytes.chunks(TRACE_TEXT_BYTES as usize).enumerate() {
             let word =
                 |w: usize| u64::from_le_bytes(chunk[8 * w..8 * w + 8].try_into().expect("8 bytes"));
@@ -329,7 +329,7 @@ impl Model {
                 stamp,
                 [word(0), word(1), word(2)],
             );
-            self.table.crash.areas[me].write(true, entry);
+            std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(true, entry);
         }
         self.event.user_entries = Some((first, entries as u64, stamp));
         Ok(Output::Done)
@@ -345,9 +345,9 @@ impl Model {
         self.object(thread, debug, ObjectKind::Debug, Rights::WRITE)?;
         let stamp = self.stamp(Some(thread));
         let me = self.node as usize;
-        let first = self.table.crash.areas[me].next_user;
+        let first = std::sync::Arc::make_mut(&mut self.table.crash).areas[me].next_user;
         let entry = self.entry(TraceCode::UserEmit, 0, stamp, payload);
-        self.table.crash.areas[me].write(true, entry);
+        std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(true, entry);
         self.event.user_entries = Some((first, 1, stamp));
         Ok(Output::Done)
     }

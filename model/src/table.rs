@@ -8,6 +8,7 @@ use dodos_abi::{
     RoleWord,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// The fixed record of a role: its kind, what it governs, and the index of
 /// that object.
@@ -139,6 +140,10 @@ pub(crate) struct WordWrite {
     pub(crate) after: u64,
 }
 
+/// The machine table as one node reads it. Every node of a `System` keeps
+/// its copy, equal to the others after each event; the large parts are
+/// shared between the copies and copied only when one is written (they are
+/// one table, so the sharing is real ownership).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Table {
     // The fixed part.
@@ -154,7 +159,7 @@ pub(crate) struct Table {
     pub(crate) kept: Vec<(u64, u64)>,
     /// The chunks whose word is *none*, fixed at machine start-up (8.2,
     /// invariant 5).
-    pub(crate) none: BTreeSet<u64>,
+    pub(crate) none: Arc<BTreeSet<u64>>,
     /// The fence class of each physical core, by core number, and whether
     /// firmware booted it.
     pub(crate) fence: Vec<u8>,
@@ -162,12 +167,12 @@ pub(crate) struct Table {
     // The living part.
     /// The ownership words, one per chunk, as raw words: a stray write is a
     /// word that fails its check.
-    pub(crate) owners: Vec<u64>,
+    pub(crate) owners: Arc<Vec<u64>>,
     /// The map count of each chunk (G4).
-    pub(crate) maps: Vec<u64>,
+    pub(crate) maps: Arc<Vec<u64>>,
     /// The page classes, by page number, of the pages not of class *data*.
-    pub(crate) classes: BTreeMap<u64, PageClass>,
-    pub(crate) devices: Vec<DeviceEntry>,
+    pub(crate) classes: Arc<BTreeMap<u64, PageClass>>,
+    pub(crate) devices: Arc<Vec<DeviceEntry>>,
     pub(crate) members: Vec<Member>,
     pub(crate) roles: Vec<RoleWord>,
     /// The grant table and the use table of each node, by index, and the
@@ -192,7 +197,7 @@ pub(crate) struct Table {
     pub(crate) sweep_ns: u64,
     /// Debugging: the crash area of this boot, the previous one (never
     /// written), and the values the ports hold.
-    pub(crate) crash: crate::debug::CrashArea,
+    pub(crate) crash: Arc<crate::debug::CrashArea>,
     pub(crate) previous: Option<crate::debug::CrashArea>,
     pub(crate) ports: BTreeMap<u16, u8>,
     /// The slot of a replacement kernel image holds an image.
@@ -294,7 +299,7 @@ impl Table {
         if !self.member(writer).writes() || self.owners[chunk as usize] != before {
             return false;
         }
-        self.owners[chunk as usize] = after.raw();
+        Arc::make_mut(&mut self.owners)[chunk as usize] = after.raw();
         self.writes.push(WordWrite {
             chunk: Some(chunk),
             entry: None,
@@ -311,7 +316,7 @@ impl Table {
             return false;
         }
         let before = self.devices[index].owner.raw();
-        self.devices[index] = entry;
+        Arc::make_mut(&mut self.devices)[index] = entry;
         self.writes.push(WordWrite {
             chunk: None,
             entry: Some(index),

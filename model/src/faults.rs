@@ -3,7 +3,7 @@
 use crate::{Model, ObjId, Outcome, Output, Parcel, Wait, Window, live};
 use dodos_abi::x86_64::{
     REG_DR0, REG_DR3, REG_DR7, REG_RFLAGS, REG_RIP, REG_RSP, REG_UINTR, REGS_CANONICAL, REGS_WORDS,
-    canonical, dr7_valid, rflags,
+    dr7_valid, rflags,
 };
 use dodos_abi::{
     Error, FAULT_REPLY_REDIRECT, FAULT_REPLY_RESUME, FaultKind, ObjectKind, Rights, SlotAddr,
@@ -122,7 +122,11 @@ impl Model {
         };
         let header = answer.received.header;
         let redirect = match answer.words[..] {
-            [rip, rsp, ..] if header.words() >= 2 && canonical(rip) && canonical(rsp) => {
+            [rip, rsp, ..]
+                if header.words() >= 2
+                    && self.machine.geometry.canonical(rip)
+                    && self.machine.geometry.canonical(rsp) =>
+            {
                 Some((rip, rsp))
             }
             _ => None,
@@ -179,7 +183,7 @@ impl Model {
         let user_end = self.machine.geometry.user_end;
         for (index, &word) in block.iter().enumerate() {
             let bad = match index {
-                i if REGS_CANONICAL.contains(&i) => !canonical(word),
+                i if REGS_CANONICAL.contains(&i) => !self.machine.geometry.canonical(word),
                 REG_DR0..=REG_DR3 => word >= user_end,
                 REG_DR7 => !dr7_valid(word),
                 REG_UINTR if word != 0 => return Err(Error::Unsupported),

@@ -92,9 +92,12 @@ impl S {
     /// checked at each step.
     #[track_caller]
     fn run(&mut self, ns: u64) {
+        // The machine steps every 100 µs; the invariants are checked every
+        // millisecond (BEAT_NS) and at the end (a check at each step made
+        // the long runs of the heartbeat tests most of `verify`).
         let to = self.sys.now() + ns;
         while self.sys.now() < to {
-            let at = (self.sys.now() + 100_000).min(to);
+            let at = (self.sys.now() + 1_000_000).min(to);
             self.sys.run(at, 100_000);
             assert_eq!(self.sys.check(), Ok(()));
         }

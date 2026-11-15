@@ -262,11 +262,14 @@ fn address_space_maps_the_segments_the_message_page_and_the_start_up_page() {
     let geometry = m.geometry();
     let (chunk, page) = (geometry.chunk(), geometry.page());
     let mapped = |address| m.translated(t, address);
-    assert_eq!(mapped(chunk), Some(r.union(x)));
-    assert_eq!(mapped(chunk + 0xffff), Some(r.union(x)));
-    assert_eq!(mapped(chunk + 0x1_0000), Some(r.union(w)));
-    assert_eq!(mapped(chunk + 0x1_3fff), Some(r.union(w)));
-    assert_eq!(mapped(chunk + 0x1_4000), None);
+    let segments = Machine::example().segments;
+    let (code, data) = (&segments[0], &segments[1]);
+    assert_eq!(code.vaddr, chunk);
+    assert_eq!(mapped(code.vaddr), Some(r.union(x)));
+    assert_eq!(mapped(code.vaddr + code.len - 1), Some(r.union(x)));
+    assert_eq!(mapped(data.vaddr), Some(r.union(w)));
+    assert_eq!(mapped(data.vaddr + data.len - 1), Some(r.union(w)));
+    assert_eq!(mapped(data.vaddr + data.len), None);
     assert_eq!(mapped(page), Some(r.union(w)));
     assert_eq!(mapped(2 * page), Some(r));
     let start_pages = m.frame_at(t, own(START_SLOT_START_PAGE)).unwrap().1;
@@ -494,11 +497,12 @@ fn kernel_refuses_a_segment_below_the_first_large_page_or_beyond_the_user_range(
     let (chunk, page, end) = (geometry.chunk(), geometry.page(), geometry.user_end);
     let low = with(|m| m.segments[0].vaddr = chunk - page);
     assert_eq!(Model::boot(&low), Err(Refusal::SegmentPlace));
-    // The second segment is 16 KB: ending at the end of the user range is
-    // accepted, one byte beyond it refused.
-    let top = with(|m| m.segments[1].vaddr = end - 0x4000);
+    // The second segment ending at the end of the user range is accepted,
+    // a page beyond it refused.
+    let len = Machine::example().segments[1].len;
+    let top = with(|m| m.segments[1].vaddr = end - len);
     assert!(Model::boot(&top).is_ok());
-    let high = with(|m| m.segments[1].vaddr = end - 0x4000 + page);
+    let high = with(|m| m.segments[1].vaddr = end - len + page);
     assert_eq!(Model::boot(&high), Err(Refusal::SegmentPlace));
 }
 

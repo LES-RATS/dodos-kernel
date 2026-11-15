@@ -5,6 +5,13 @@ cd "$(dirname "$0")"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-# The page size is a value of the machine (D-121): the model's tests run
-# again on a second geometry, a page of 16 KB.
-DODOS_PAGE=16k cargo test -p dodos-model
+# The page size is a value of the machine (D-121): the tests whose rules
+# involve the page run again on two more geometries, 16 KB pages (three
+# levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). The tests of
+# membership, roles, scheduling, interrupts, tasks and debugging do not
+# depend on the page and run once, above.
+for page in 16k 32k; do
+	DODOS_PAGE=$page cargo test -p dodos-model --lib \
+		--test adversarial_nodes --test blocks --test boot --test calls \
+		--test faults --test memory --test nodes --test property
+done

@@ -96,7 +96,9 @@ impl Model {
             return;
         }
         for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
-            let Some(count) = self.table.maps.get_mut(chunk as usize) else {
+            let Some(count) =
+                std::sync::Arc::make_mut(&mut self.table.maps).get_mut(chunk as usize)
+            else {
                 continue;
             };
             *count = count
@@ -250,8 +252,7 @@ impl Model {
                 .expect("checked above");
             // G2: the gate turns a page of class data into a table page.
             let at = self.untypeds[&untyped].base + taken.at;
-            self.table
-                .classes
+            std::sync::Arc::make_mut(&mut self.table.classes)
                 .insert(at / table, crate::table::PageClass::Table);
             live(&mut self.aspaces, space).table_pages.push(at);
         }

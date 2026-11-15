@@ -19,6 +19,16 @@ use std::sync::OnceLock;
 const SEEDS: u64 = 24;
 const STEPS: usize = 5000;
 
+/// The steps of a run: more where a page is larger than 16 KB, since each
+/// creation then clears its memory in more calls and a run of `STEPS` makes
+/// fewer objects (the coverage below is measured on the smaller pages).
+fn steps() -> usize {
+    match page() > 16 << 10 {
+        true => 2 * STEPS,
+        false => STEPS,
+    }
+}
+
 /// xorshift64* (Marsaglia, "Xorshift RNGs", 2003; multiplier from Vigna).
 struct Rng(u64);
 
@@ -123,7 +133,7 @@ const HERE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
 const MEMORY: SlotAddr = SlotAddr::own(MEMORY_SLOT);
 
 const KINDS: [(ObjectKind, u32, u64); 12] = [
-    (ObjectKind::Untyped, UNTYPED, 1 << 16),
+    (ObjectKind::Untyped, UNTYPED, 0),
     (ObjectKind::CSpace, CSPACE, 256),
     (ObjectKind::Thread, THREAD, 0),
     (ObjectKind::Endpoint, ENDPOINT, 0),
@@ -817,6 +827,11 @@ impl Generator<'_> {
             6 => Syscall::CapInspect(self.held(class)),
             7..12 => {
                 let (mut kind, class, size) = self.rng.pick(&KINDS);
+                // A child untyped of 16 pages, whatever the page.
+                let size = match kind {
+                    ObjectKind::Untyped => 16 * page(),
+                    _ => size,
+                };
                 if self.rng.chance(3) {
                     kind = self.rng.pick(&NOT_MADE);
                 }
@@ -2025,7 +2040,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     crowd(&mut model, first, reached);
     refused_send(&mut model, first, reached);
     destroyed_space(&mut model, first, reached);
-    for step in 0..STEPS {
+    for step in 0..steps() {
         let threads = model.runnable();
         known.extend(&threads);
         // A thread is of use if its capability space holds a capability for
@@ -2240,21 +2255,152 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             .for_each(|outcome| reached.note(outcome));
         reached.count(&model);
     }
+    // Directed, after the random calls: the node that runs stops the
+    // phantom node, the one stop that can succeed beside it (a stop of
+    // itself is `busy`, Cores).
+    let holder = model
+        .runnable()
+        .into_iter()
+        .find(|&t| model.object_at(t, own(CORE_SLOT + 1)).is_some());
+    if let Some(thread) = holder
+        && model.apply(thread, stop_call()).is_ok()
+    {
+        reached.ok.resize(NAMES.len(), 0);
+        reached.ok[name_of(&stop_call())] += 1;
+    }
+    assert_eq!(model.check(), Ok(()));
     reached.seeds_walked += walked as u32;
     model
+}
+
+/// The directed stop of the phantom node, to name it.
+fn stop_call() -> Syscall {
+    Syscall::CoreStop {
+        core: own(CORE_SLOT + 1),
+        mode: CORE_STOP_KILL,
+    }
 }
 
 /// Every seed, run once for the tests below. A run panics if an invariant
 /// fails.
 fn all_seeds() -> &'static Reached {
-    static REACHED: OnceLock<Reached> = OnceLock::new();
-    REACHED.get_or_init(|| {
+    &seeds().0
+}
+
+impl Reached {
+    /// What another run reached, added: counts summed, the deepest and the
+    /// longest walk kept.
+    fn add(&mut self, other: &Reached) {
+        if self.ok.len() < other.ok.len() {
+            self.ok.resize(other.ok.len(), 0);
+        }
+        self.restarts += other.restarts;
+        self.several_threads += other.several_threads;
+        self.outside += other.outside;
+        self.outside_ok += other.outside_ok;
+        self.scripted += other.scripted;
+        self.scripted_ok += other.scripted_ok;
+        self.with_caps += other.with_caps;
+        self.dropped += other.dropped;
+        self.notifications += other.notifications;
+        self.woken_gone += other.woken_gone;
+        self.dying_copies += other.dying_copies;
+        self.callers += other.callers;
+        self.served += other.served;
+        self.receivers += other.receivers;
+        self.waiters += other.waiters;
+        self.bound += other.bound;
+        self.sent += other.sent;
+        self.sent_refused += other.sent_refused;
+        self.called += other.called;
+        self.answered += other.answered;
+        self.with_four += other.with_four;
+        self.destroyed += other.destroyed;
+        self.cancelled_by_number += other.cancelled_by_number;
+        self.retype_unsupported += other.retype_unsupported;
+        self.again += other.again;
+        self.swept_only += other.swept_only;
+        self.seeds_walked += other.seeds_walked;
+        self.mapped += other.mapped;
+        self.attached += other.attached;
+        self.faulting += other.faulting;
+        self.throttled += other.throttled;
+        self.lent += other.lent;
+        self.armed += other.armed;
+        self.lost += other.lost;
+        self.idle += other.idle;
+        self.on_slack += other.on_slack;
+        self.no_aspace += other.no_aspace;
+        self.no_context += other.no_context;
+        self.advanced += other.advanced;
+        self.fired += other.fired;
+        self.interrupts += other.interrupts;
+        self.marked += other.marked;
+        self.claimed += other.claimed;
+        self.irq_fired += other.irq_fired;
+        self.revoked += other.revoked;
+        self.unmapped_by_removal += other.unmapped_by_removal;
+        self.detached_by_removal += other.detached_by_removal;
+        for (sum, n) in self.ok.iter_mut().zip(&other.ok) {
+            *sum += n;
+        }
+        for (sum, n) in self.errors.iter_mut().zip(&other.errors) {
+            *sum += n;
+        }
+        for (sum, n) in self.dying.iter_mut().zip(&other.dying) {
+            *sum += n;
+        }
+        for (sum, n) in self.moved.iter_mut().zip(&other.moved) {
+            *sum += n;
+        }
+        for (sum, n) in self.refused.iter_mut().zip(&other.refused) {
+            *sum += n;
+        }
+        for (sum, n) in self.cancelled.iter_mut().zip(&other.cancelled) {
+            *sum += n;
+        }
+        for (sum, n) in self
+            .cancelled_at_once
+            .iter_mut()
+            .zip(&other.cancelled_at_once)
+        {
+            *sum += n;
+        }
+        for (sum, n) in self.faults.iter_mut().zip(&other.faults) {
+            *sum += n;
+        }
+        self.deepest = self.deepest.max(other.deepest);
+        self.longest_walk = self.longest_walk.max(other.longest_walk);
+    }
+}
+
+/// The runs of every seed, once: what they reached, and the final state of
+/// each, which the tests of determinism compare without running again.
+fn seeds() -> &'static (Reached, std::sync::Mutex<Vec<Model>>) {
+    static SEEDS_RUN: OnceLock<(Reached, std::sync::Mutex<Vec<Model>>)> = OnceLock::new();
+    SEEDS_RUN.get_or_init(|| {
+        // The seeds run in parallel, each on its own; what they reached is
+        // added in the order of the seeds.
+        let runs: Vec<(Reached, Model)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..SEEDS)
+                .map(|seed| {
+                    scope.spawn(move || {
+                        let mut reached = Reached::default();
+                        let state = run(seed, &mut reached);
+                        (reached, state)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
         let mut reached = Reached::default();
-        for seed in 0..SEEDS {
-            run(seed, &mut reached);
+        let mut states = Vec::new();
+        for (one, state) in runs {
+            reached.add(&one);
+            states.push(state);
         }
         println!("{reached:#?}");
-        reached
+        (reached, std::sync::Mutex::new(states))
     })
 }
 
@@ -2459,15 +2605,18 @@ fn mappings_and_devices_are_reached_and_undone_by_removals() {
 
 #[test]
 fn same_seed_gives_the_same_state() {
-    for seed in 0..2 {
-        let (mut first, mut second) = (Reached::default(), Reached::default());
-        assert_eq!(run(seed, &mut first), run(seed, &mut second));
-        assert_eq!(first, second);
-    }
+    // Seeds 0 and 1 run again and end in the state of their first run;
+    // seed 0 twice, reaching the same things.
+    let states = seeds().1.lock().unwrap();
+    let (mut first, mut second) = (Reached::default(), Reached::default());
+    assert_eq!(run(0, &mut first), states[0]);
+    assert_eq!(run(0, &mut second), states[0]);
+    assert_eq!(first, second);
+    assert_eq!(run(1, &mut Reached::default()), states[1]);
 }
 
 #[test]
 fn different_seeds_give_different_states() {
-    let mut reached = Reached::default();
-    assert_ne!(run(1, &mut reached), run(2, &mut reached));
+    let states = seeds().1.lock().unwrap();
+    assert_ne!(states[1], states[2]);
 }

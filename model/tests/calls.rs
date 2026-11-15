@@ -246,6 +246,11 @@ impl K {
 
     #[track_caller]
     fn ok(&mut self, call: Syscall) {
+        // A creation clears its memory 64 KB per call: with large pages it
+        // may take several (rules of `untyped_retype`).
+        if matches!(call, Syscall::UntypedRetype { .. }) {
+            return self.made_in(call, 64);
+        }
         assert_eq!(self.go(call), DONE);
     }
 
@@ -614,10 +619,17 @@ fn capability_space_given_at_start_up_never_grows() {
 #[test]
 fn cspace_grow_is_no_memory_when_the_untyped_is_exhausted() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 16384, s(31)));
-    k.ok(retype(s(31), CSpace, 384, s(30)));
+    // An untyped of 16 KB, or a page: its directory at 0, then one segment
+    // of 8 KB per grow until the untyped is full.
+    let bytes = k.m.geometry().page().max(16384);
+    let segments = bytes / 8192;
+    k.ok(retype(UT, Untyped, bytes, s(31)));
+    k.ok(retype(s(31), CSpace, 128 * segments, s(30)));
     let from_child = grow_from(30, s(31));
-    assert_eq!(k.go(from_child.clone()), Ok(Output::Slots(128)));
+    for grown in 1..segments {
+        let slots = 128 * grown as u32;
+        assert_eq!(k.go(from_child.clone()), Ok(Output::Slots(slots)));
+    }
     k.no(from_child, Error::NoMemory);
 }
 
@@ -1351,17 +1363,19 @@ fn three_layers_of_spaces_create_spaces_and_hand_memory_down() {
     let mut k = K::new();
     // The first thread makes a space from a child untyped, and hands it a
     // child of that untyped.
-    k.ok(retype(UT, Untyped, 1 << 20, s(30)));
+    // The sizes of the reference machine, scaled to pages larger than 4 KB.
+    let scale = k.m.geometry().page() / 4096;
+    k.ok(retype(UT, Untyped, scale << 20, s(30)));
     k.ok(retype(s(30), CSpace, 128, s(31)));
     k.go(grow_from(31, s(30))).unwrap();
-    k.ok(retype(s(30), Untyped, 1 << 18, via(31, 10)));
+    k.ok(retype(s(30), Untyped, scale << 18, via(31, 10)));
     k.ok(retype(s(30), Thread, 0, s(32)));
     k.ok(configure(32, s(31), SlotAddr::NONE, SlotAddr::NONE));
     k.ok(Syscall::ThreadResume(s(32)));
     let mut inside = k.m.object_at(k.t, s(32)).unwrap();
     // Twice, the thread of a space does the same from the untyped it got,
     // in slot 10 of its space.
-    for size in [1 << 16, 1 << 14] {
+    for size in [scale << 16, scale << 14] {
         assert_eq!(k.on(inside, retype(s(10), CSpace, 128, s(11))), DONE);
         assert_eq!(k.on(inside, grow_from(11, s(10))), Ok(Output::Slots(128)));
         assert_eq!(
@@ -1378,7 +1392,7 @@ fn three_layers_of_spaces_create_spaces_and_hand_memory_down() {
     // The first thread kept the parent, and takes everything back.
     k.finish(Syscall::CapRevoke(s(30)), 100);
     assert_eq!(k.m.runnable(), [k.t]);
-    k.ok(retype(s(30), Untyped, 1 << 20, s(40)));
+    k.ok(retype(s(30), Untyped, scale << 20, s(40)));
 }
 
 #[test]
@@ -3615,7 +3629,8 @@ fn destroying_an_endpoint_wakes_its_callers_32_per_call() {
 fn child_untyped_has_exec_only_if_the_untyped_capability_has_it() {
     let mut k = K::new();
     let no_exec = k.weak(START_SLOT_FIRST, 30, caps_without(Rights::EXEC));
-    k.ok(retype(s(no_exec), Untyped, 1 << 14, s(31)));
+    let bytes = 4 * k.m.geometry().page();
+    k.ok(retype(s(no_exec), Untyped, bytes, s(31)));
     assert_eq!(
         k.inspect(s(31)),
         Ok((Untyped, caps_without(Rights::EXEC), 0))
@@ -3623,7 +3638,7 @@ fn child_untyped_has_exec_only_if_the_untyped_capability_has_it() {
     // And so nothing made from the child has it.
     k.ok(retype(s(31), Frame, 1, s(32)));
     assert_eq!(k.inspect(s(32)), Ok((Frame, caps_without(Rights::EXEC), 0)));
-    k.ok(retype(UT, Untyped, 1 << 14, s(33)));
+    k.ok(retype(UT, Untyped, bytes, s(33)));
     assert_eq!(k.inspect(s(33)), Ok((Untyped, Rights::ALL, 0)));
 }
 

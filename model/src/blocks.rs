@@ -104,7 +104,7 @@ impl Model {
                     // The gate maps the run into the kernel's own space,
                     // with page classes data and map counts 0.
                     self.kernel_runs.insert(index);
-                    self.table.maps[index as usize] = 0;
+                    std::sync::Arc::make_mut(&mut self.table.maps)[index as usize] = 0;
                 }
                 _ => {
                     let mut entry = self.table.devices[index as usize];

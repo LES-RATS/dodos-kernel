@@ -79,12 +79,12 @@ impl Model {
                         && word.holder() == node
                 })
         };
-        let mine = |raw: u64| match read(raw) {
-            Some((2, owner, g)) if g == generation => {
-                owner == node || (0xFFF0..0xFFF8).contains(&owner) && holds(owner - 0xFFF0)
-            }
-            _ => false,
+        let mine_read = |state: u64, owner: u16, g: u32| {
+            state == 2
+                && g == generation
+                && (owner == node || (0xFFF0..0xFFF8).contains(&owner) && holds(owner - 0xFFF0))
         };
+        let mine = |raw: u64| read(raw).is_some_and(|(state, owner, g)| mine_read(state, owner, g));
         for write in table.writes.iter() {
             let before = read(write.before);
             let after = read(write.after);
@@ -180,8 +180,15 @@ impl Model {
             .filter(|untyped| untyped.block == Some(Block::Run))
             .flat_map(|untyped| untyped.base >> shift..(untyped.base + untyped.bytes) >> shift)
             .collect();
+        // One pass over the words: 55 on each free word; the counts of the
+        // words this node holds (57) and of the words none (56), judged
+        // below against the kernel's runs and the words of start-up.
+        let (mut held, mut zero) = (0, 0);
         for (chunk, &raw) in table.owners.iter().enumerate() {
-            if read(raw).is_some_and(|(state, ..)| state == 1) {
+            zero += usize::from(raw == 0);
+            let word = read(raw);
+            held += usize::from(word.is_some_and(|(state, owner, g)| mine_read(state, owner, g)));
+            if word.is_some_and(|(state, ..)| state == 1) {
                 let chunk = chunk as u64;
                 ensure(!block_chunks.contains(&chunk), "55: block on a free word")?;
                 ensure(
@@ -231,15 +238,18 @@ impl Model {
             }
         }
         // 57: the kernel maps exactly the chunks it holds.
-        let held: BTreeSet<u64> = (0..table.owners.len() as u64)
-            .filter(|&c| mine(table.owners[c as usize]))
-            .collect();
-        ensure(held == self.kernel_runs, "57: kernel space and ownership")?;
+        let word = |c: &u64| table.owners.get(*c as usize).copied();
+        let runs = self.kernel_runs.iter().all(|c| word(c).is_some_and(mine));
+        ensure(
+            runs && held == self.kernel_runs.len(),
+            "57: kernel space and ownership",
+        )?;
         // 56: the words none are those of machine start-up.
-        let none: BTreeSet<u64> = (0..table.owners.len() as u64)
-            .filter(|&c| table.owners[c as usize] == 0)
-            .collect();
-        ensure(none == table.none, "56: a word changed from or to none")?;
+        let none = table.none.iter().all(|c| word(c) == Some(0));
+        ensure(
+            none && zero == table.none.len(),
+            "56: a word changed from or to none",
+        )?;
         // 58: every translation, and the map counts.
         let owned_entries: Vec<(u64, u64)> = table
             .devices
@@ -275,8 +285,8 @@ impl Model {
         // Alone, the node's leaves are every leaf; on a machine of several
         // models, the others' count too, and `System::check` sums them.
         let counted = match self.shared {
-            false => leaves == table.maps,
-            true => leaves.iter().zip(&table.maps).all(|(l, m)| l <= m),
+            false => leaves == *table.maps,
+            true => leaves.iter().zip(table.maps.iter()).all(|(l, m)| l <= m),
         };
         ensure(counted, "58: map count")?;
         for (&entry, used) in &table.uses[node as usize] {
