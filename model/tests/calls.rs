@@ -52,7 +52,7 @@ fn retype(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAddr)
         untyped,
         kind,
         size,
-        page: PageSize::Size4K as u64,
+        page: PageSize::Page as u64,
         // Frames: write-back on ordinary memory, uncached on device memory.
         memory: (untyped == DEV) as u64,
         destination,
@@ -1464,7 +1464,7 @@ fn frame_takes_a_page_size_and_a_number_of_pages() {
     k.ok(retype(UT, Untyped, 1 << 22, s(30)));
     k.no(retype(s(30), Frame, 0, s(31)), Error::Invalid);
     let wb = MemoryType::WriteBack;
-    let large = |size, destination| frame(s(30), PageSize::Size2M, size, wb, destination);
+    let large = |size, destination| frame(s(30), PageSize::Large1, size, wb, destination);
     k.made(large(2, s(31)));
     k.no(retype(s(30), Frame, 1, s(32)), Error::NoMemory);
     k.no(large(512, s(32)), Error::NoMemory);
@@ -1484,8 +1484,10 @@ fn frame_size_argument_is_judged_page_size_then_memory_type_then_pages() {
         memory,
         destination: s(30),
     };
-    // The page size value first, then the memory type, then the pages.
-    k.no(raw(UT, 3, 1, 0), Error::Invalid);
+    // The page size value first, then whether the processor has it, then
+    // the memory type, then the pages.
+    k.no(raw(UT, 4, 1, 0), Error::Invalid);
+    k.no(raw(UT, 3, 1, 0), Error::Unsupported);
     k.no(raw(UT, 0, 1, 1), Error::Invalid);
     k.no(raw(UT, 0, 3, 1), Error::Invalid);
     k.no(raw(UT, 0, 0, 0), Error::Invalid);
@@ -1523,19 +1525,25 @@ fn size_argument_is_zero_for_the_other_kinds() {
 }
 
 #[test]
-fn kinds_that_this_version_does_not_make_are_unsupported() {
+fn the_reserved_kind_is_unsupported() {
     let mut k = K::new();
-    use ObjectKind::{Core, Debug, IoPorts, Vcpu};
-    for kind in [IoPorts, Core, Debug, Vcpu] {
-        k.no(retype(UT, kind, 0, s(30)), Error::Unsupported);
-    }
+    k.no(retype(UT, ObjectKind::Vcpu, 0, s(30)), Error::Unsupported);
 }
 
 #[test]
 fn kinds_never_made_from_an_untyped_are_invalid() {
     let mut k = K::new();
-    use ObjectKind::{Iommu, Irq, IrqControl};
-    for kind in [Irq, IrqControl, Iommu] {
+    use ObjectKind::{Core, Debug, IoPorts, Iommu, Irq, IrqControl, MemoryControl, Role};
+    for kind in [
+        Irq,
+        IrqControl,
+        Iommu,
+        MemoryControl,
+        Core,
+        Role,
+        Debug,
+        IoPorts,
+    ] {
         k.no(retype(UT, kind, 0, s(30)), Error::Invalid);
     }
 }
@@ -1558,13 +1566,7 @@ fn device_memory_becomes_only_a_frame_or_a_child_untyped() {
     k.ok(retype(DEV, Frame, 1, s(30)));
     k.ok(retype(DEV, Untyped, 4096, s(31)));
     k.no(retype(s(31), Endpoint, 0, s(32)), Error::Invalid);
-    k.ok(frame(
-        s(31),
-        PageSize::Size4K,
-        1,
-        MemoryType::Uncached,
-        s(32),
-    ));
+    k.ok(frame(s(31), PageSize::Page, 1, MemoryType::Uncached, s(32)));
 }
 
 #[test]
@@ -2783,7 +2785,7 @@ fn large_frame_is_aligned_on_its_page_size() {
         untyped: s(30),
         kind: Frame,
         size: 1,
-        page: PageSize::Size2M as u64,
+        page: PageSize::Large1 as u64,
         memory: 0,
         destination: s(32),
     };
@@ -2966,10 +2968,8 @@ fn untyped_retype_judges_the_kind_before_the_size() {
     k.no(retype(DEV, ObjectKind::Irq, 0, s(30)), Error::Invalid);
     k.no(retype(DEV, Endpoint, 1, s(30)), Error::Invalid);
     // A kind this version does not make, then the size.
-    k.no(
-        retype(UT, ObjectKind::IoPorts, 5, s(30)),
-        Error::Unsupported,
-    );
+    k.no(retype(UT, ObjectKind::Vcpu, 5, s(30)), Error::Unsupported);
+    k.no(retype(UT, ObjectKind::IoPorts, 5, s(30)), Error::Invalid);
     k.no(retype(UT, ObjectKind::Irq, 5, s(30)), Error::Invalid);
     k.no(retype(UT, Endpoint, 5, s(30)), Error::Invalid);
     // All of it after the destination.
@@ -3116,7 +3116,7 @@ fn frame_of_1_gb_pages_is_aligned_on_1_gb() {
         untyped: UT,
         kind: Frame,
         size,
-        page: PageSize::Size1G as u64,
+        page: PageSize::Large2 as u64,
         memory: 0,
         destination: s(slot),
     };
@@ -3401,35 +3401,35 @@ fn rights_of_a_capability_to_derive_are_judged_before_its_depth() {
     k.no(send(EP, derived(Rights::SEND)), Error::Invalid);
 }
 
+/// Object sizes: a thread of mask 0 on the reference machine is 1 KB +
+/// 832 bytes of x87, SSE and AVX state, rounded up to 2 KB.
 #[test]
-fn thread_takes_1_kb() {
+fn thread_takes_2_kb() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    for slot in 40..44 {
+    for slot in 40..42 {
         k.ok(retype(s(30), Thread, 0, s(slot)));
     }
-    k.no(retype(s(30), Thread, 0, s(44)), Error::NoMemory);
+    k.no(retype(s(30), Thread, 0, s(42)), Error::NoMemory);
 }
 
 #[test]
-fn thread_is_aligned_on_1_kb() {
+fn thread_is_aligned_on_2_kb() {
     let mut k = K::new();
     k.make(Untyped, 30);
     k.ok(retype(s(30), Endpoint, 0, s(40)));
-    for slot in 41..44 {
-        k.ok(retype(s(30), Thread, 0, s(slot)));
-    }
-    k.no(retype(s(30), Endpoint, 0, s(44)), Error::NoMemory);
+    k.ok(retype(s(30), Thread, 0, s(41)));
+    k.no(retype(s(30), Endpoint, 0, s(42)), Error::NoMemory);
 }
 
 #[test]
-fn sched_takes_128_bytes() {
+fn sched_takes_256_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    for slot in 40..72 {
+    for slot in 40..56 {
         k.ok(retype(s(30), ObjectKind::Sched, 0, s(slot)));
     }
-    k.no(retype(s(30), ObjectKind::Sched, 0, s(72)), Error::NoMemory);
+    k.no(retype(s(30), ObjectKind::Sched, 0, s(56)), Error::NoMemory);
 }
 
 #[test]
@@ -3564,7 +3564,7 @@ fn kind_that_is_not_made_is_unsupported_before_the_depths_and_the_state() {
     }
     // From an untyped capability at depth 64, into a slot that is full.
     k.no(
-        retype(s(92), ObjectKind::IoPorts, 0, s(30)),
+        retype(s(92), ObjectKind::Vcpu, 0, s(30)),
         Error::Unsupported,
     );
     k.no(retype(s(92), Endpoint, 0, s(30)), Error::Invalid);
@@ -3792,9 +3792,15 @@ fn numbers_of_the_contract_are_those_of_the_interface() {
     assert_eq!((CSPACE_SEGMENT_SLOTS, CSPACE_MAX_SLOTS), (128, 1 << 20));
     assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (64, 8));
     assert_eq!((ENDPOINT_BYTES, REPLY_BYTES, NOTIFY_BYTES), (64, 64, 64));
-    assert_eq!((SCHED_BYTES, THREAD_BYTES, ASPACE_BYTES), (128, 1024, 8192));
+    assert_eq!(
+        (SCHED_BYTES, THREAD_FIXED_BYTES, x86_64::ASPACE_BYTES),
+        (256, 1024, 8192)
+    );
     assert_eq!((TIMER_BYTES, IRQ_BYTES, TASK_BYTES), (64, 64, 256));
-    assert_eq!((IOSPACE_BYTES, UNTYPED_MIN_BYTES), (8192, 4096));
+    assert_eq!(
+        (x86_64::IOSPACE_BYTES, x86_64::UNTYPED_MIN_BYTES),
+        (8192, 4096)
+    );
     let fixed = [
         START_SLOT_CSPACE,
         START_SLOT_ASPACE,
@@ -3966,15 +3972,15 @@ fn cap_delete_on_an_empty_slot_of_an_own_dying_space_is_invalid() {
 }
 
 #[test]
-fn sched_is_aligned_on_128_bytes() {
+fn sched_is_aligned_on_256_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    // An endpoint at 0, then 31 scheduling contexts from 128: nothing left.
+    // An endpoint at 0, then 15 scheduling contexts from 256: nothing left.
     k.ok(retype(s(30), Endpoint, 0, s(40)));
-    for slot in 41..72 {
+    for slot in 41..56 {
         k.ok(retype(s(30), ObjectKind::Sched, 0, s(slot)));
     }
-    k.no(retype(s(30), Endpoint, 0, s(72)), Error::NoMemory);
+    k.no(retype(s(30), Endpoint, 0, s(56)), Error::NoMemory);
 }
 
 #[test]
@@ -5031,9 +5037,9 @@ fn message_page_is_a_frame_of_one_4_kb_page_of_ordinary_memory() {
     let mut k = K::new();
     k.make(Thread, 30);
     let wb = MemoryType::WriteBack;
-    k.ok(frame(UT, PageSize::Size4K, 2, wb, s(31)));
-    k.made(frame(UT, PageSize::Size2M, 1, wb, s(32)));
-    k.ok(frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, s(33)));
+    k.ok(frame(UT, PageSize::Page, 2, wb, s(31)));
+    k.made(frame(UT, PageSize::Large1, 1, wb, s(32)));
+    k.ok(frame(DEV, PageSize::Page, 1, MemoryType::Uncached, s(33)));
     k.make(Endpoint, 34);
     for slot in [31, 32, 33, 34] {
         assert_eq!(
@@ -5056,7 +5062,7 @@ fn message_page_needs_read_and_write_judged_after_its_size() {
     assert_eq!(configured(&mut k, 30, s(read)), Err(Error::Denied));
     assert_eq!(configured(&mut k, 30, s(write)), Err(Error::Denied));
     // A frame of two pages without the rights: its size first.
-    k.ok(frame(UT, PageSize::Size4K, 2, MemoryType::WriteBack, s(34)));
+    k.ok(frame(UT, PageSize::Page, 2, MemoryType::WriteBack, s(34)));
     let small = k.weak(34, 35, Rights::READ);
     assert_eq!(configured(&mut k, 30, s(small)), Err(Error::Invalid));
 }
@@ -5085,7 +5091,7 @@ fn thread_that_runs_is_busy_before_its_message_page_is_looked_at() {
     // The frame is bound to thread 30, and thread 31 runs: `busy` either
     // way; a frame of the wrong size is `invalid` first.
     assert_eq!(configured(&mut k, 31, s(32)), Err(Error::Busy));
-    k.ok(frame(UT, PageSize::Size4K, 2, MemoryType::WriteBack, s(33)));
+    k.ok(frame(UT, PageSize::Page, 2, MemoryType::WriteBack, s(33)));
     assert_eq!(configured(&mut k, 31, s(33)), Err(Error::Invalid));
 }
 
@@ -5233,7 +5239,7 @@ fn dirty(k: &mut K, slot: u32) {
 
 fn pages(untyped: u32, count: u64, slot: u32) -> Syscall {
     let wb = MemoryType::WriteBack;
-    frame(s(untyped), PageSize::Size4K, count, wb, s(slot))
+    frame(s(untyped), PageSize::Page, count, wb, s(slot))
 }
 
 #[test]
@@ -5304,9 +5310,9 @@ fn memory_is_dirty_again_once_the_watermark_returns_to_the_start() {
 fn device_memory_is_never_cleared() {
     let mut k = K::new();
     let uncached = MemoryType::Uncached;
-    k.ok(frame(DEV, PageSize::Size4K, 256, uncached, s(30)));
+    k.ok(frame(DEV, PageSize::Page, 256, uncached, s(30)));
     k.ok(Syscall::CapDelete(s(30)));
-    k.ok(frame(DEV, PageSize::Size4K, 256, uncached, s(30)));
+    k.ok(frame(DEV, PageSize::Page, 256, uncached, s(30)));
 }
 
 #[test]

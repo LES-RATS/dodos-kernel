@@ -39,8 +39,8 @@ pub use boot::{Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKi
 pub use check::Census;
 
 use dodos_abi::{
-    Call, Error, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights, SlotAddr,
-    TaskId,
+    Call, Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
+    SlotAddr, TaskId,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
@@ -679,9 +679,6 @@ pub struct Model {
     /// The derivation tree: the longest walk so far to the next capability
     /// to remove, in capabilities. The contract says: shorter than 192.
     longest_walk: usize,
-    /// Large pages: the page sizes the processor supports, bit `i` for
-    /// `PageSize` `i`.
-    page_sizes: u32,
     /// The `core` objects, with their node index.
     cores: BTreeMap<ObjId, u32>,
     /// IOMMU: the devices each `iospace` serves, the most recently attached
@@ -719,10 +716,34 @@ pub struct Model {
 /// groups not yet specified (cores, debugging), and those this model does
 /// not make yet.
 fn other(call: Call) -> bool {
-    use Call::{CoreStart, CoreStatus, CoreStop, DebugWrite, TraceEmit};
+    use Call::{
+        CoreIdle, CorePerf, CorePlace, CoreStart, CoreStatus, CoreStop, CoreWatch, DebugWrite,
+        EntropyRead, IoportIn, IoportOut, IoportsIssue, MemoryGive, MemorySplit, MemoryTake,
+        RoleClaim, RoleHand, SchedCount, ThreadMove, ThreadSetFeatures, TraceEmit,
+    };
     matches!(
         call,
-        CoreStart | CoreStop | CoreStatus | DebugWrite | TraceEmit
+        CoreStart
+            | CoreStop
+            | CoreStatus
+            | DebugWrite
+            | TraceEmit
+            | MemoryTake
+            | MemoryGive
+            | MemorySplit
+            | CoreIdle
+            | CoreWatch
+            | CorePlace
+            | RoleClaim
+            | RoleHand
+            | ThreadSetFeatures
+            | ThreadMove
+            | SchedCount
+            | IoportIn
+            | IoportOut
+            | IoportsIssue
+            | EntropyRead
+            | CorePerf
     )
 }
 
@@ -733,6 +754,25 @@ fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
 }
 
 impl Model {
+    /// Values of the machine: the values that fix the shape of memory.
+    pub fn geometry(&self) -> Geometry {
+        self.machine.geometry
+    }
+
+    /// Values of the machine: the bytes of a page size the processor
+    /// supports. Every frame has one, so the model never asks for another.
+    pub(crate) fn bytes(&self, size: PageSize) -> u64 {
+        self.machine
+            .geometry
+            .bytes(size)
+            .expect("a supported page size")
+    }
+
+    /// *P*, the bytes of a page.
+    pub(crate) fn page(&self) -> u64 {
+        self.machine.geometry.page()
+    }
+
     /// The threads that can run: not suspended and not waiting. A call can
     /// be applied for any of them.
     pub fn runnable(&self) -> Vec<ObjId> {
@@ -767,7 +807,7 @@ impl Model {
     pub fn translated(&self, thread: ObjId, address: u64) -> Option<Rights> {
         let aspace = &self.aspaces[&self.threads.get(&thread)?.aspace?];
         let (&at, translation) = aspace.translations.range(..=address).next_back()?;
-        (address - at < translation.size.bytes()).then_some(translation.rights)
+        (address - at < self.bytes(translation.size)).then_some(translation.rights)
     }
 
     /// Applies one call made by `thread`, which must be able to run.

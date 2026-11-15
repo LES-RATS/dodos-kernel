@@ -2,8 +2,8 @@
 
 use crate::{CapId, Model, ObjId, Output, Place, Record, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
-    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FAULT_WORDS, FRAME_MAX_PAGES, Header,
-    LONGEST_WALK, MAX_CAPS, MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
+    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FAULT_WORDS, Header, LONGEST_WALK, MAX_CAPS,
+    MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::mem::discriminant;
@@ -249,7 +249,7 @@ impl Model {
     ///     between the watermark and the end, and device memory has none;
     /// 19. the live count of an untyped is the number of live objects,
     ///     cspace segments and tables of address spaces taken from it;
-    /// 34. a frame has 1 to 512 pages, ordinary memory is write-back and
+    /// 34. a frame has 1 to *E* pages, ordinary memory is write-back and
     ///     device memory is not, and only a frame capability has a record.
     pub fn check(&self) -> Check {
         self.check_tree()?;
@@ -629,7 +629,7 @@ impl Model {
             ensure(clean, "18: clean mark")?;
         }
         for (&id, frame) in &self.frames {
-            let pages = (1..=FRAME_MAX_PAGES).contains(&frame.pages);
+            let pages = (1..=u64::from(self.machine.geometry.entries)).contains(&frame.pages);
             let from = self.objects.get(&id).and_then(|object| object.from);
             let device =
                 from.is_some_and(|from| self.untypeds.get(&from).is_some_and(|u| u.device));

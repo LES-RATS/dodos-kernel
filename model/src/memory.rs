@@ -5,49 +5,40 @@ use crate::{
     ASpace, CapId, Map, Mapping, Model, ObjId, Outcome, Output, Record, Translation, live,
 };
 use dodos_abi::{
-    Error, IOSPACE_MAX_DEVICES, ObjectKind, PageSize, Rights, SlotAddr, TABLE_BYTES,
+    Error, Geometry, IOSPACE_MAX_DEVICES, ObjectKind, PageSize, Rights, SlotAddr,
     io_mapping_rights, mapping_range, mapping_rights,
 };
 use std::collections::BTreeSet;
 
-/// The user range and the reserved slot: on x86-64 with four levels of
-/// tables, the user range runs from 0 to 255 × 512 GB.
-///
-/// CONTRACT-GAP (Values to add to `abi/`): the end of the user range is not
-/// among the values of `abi/`, although user space and the model need it.
-pub const USER_END: u64 = 255 << 39;
-
 /// Address spaces and their tables: the lower tables hooked in a space of
-/// `levels` levels (4 for an `aspace`; 4 or 3 for an `iospace`). A hooked
-/// table always has a present entry, so the hooked tables are those on the
-/// paths of the translations: a table of the second level per 512 GB that
-/// holds one (with four levels), of the third per 1 GB that holds a page
-/// smaller than 1 GB, of the last per 2 MB that holds a 4 KB page.
-pub(crate) fn hooked(space: &ASpace, levels: u32) -> u64 {
+/// `levels` levels. A hooked table always has a present entry, so the
+/// hooked tables are those on the paths of the translations: a table of
+/// level k (1 for the last, `levels` − 1 for the one under the root) covers
+/// P × E^k bytes, and a page of size index s is a leaf of the table of
+/// level s + 1, under one table of each level above it.
+pub(crate) fn hooked(space: &ASpace, levels: u32, geometry: Geometry) -> u64 {
     tables(
         space.translations.iter().map(|(&at, t)| (at, t.size)),
         levels,
+        geometry,
     )
     .len() as u64
 }
 
-/// The lower tables on the paths of pages, each named by its level (3 for
-/// the one under the root of four levels, 1 for the last) and the address
-/// bits above what it covers.
+/// The lower tables on the paths of pages, each named by its level and the
+/// address bits above what it covers.
 pub(crate) fn tables(
     pages: impl Iterator<Item = (u64, PageSize)>,
     levels: u32,
+    geometry: Geometry,
 ) -> BTreeSet<(u32, u64)> {
+    let page = u32::from(geometry.page_shift[0]);
+    let per_level = geometry.entries.trailing_zeros();
     let mut found = BTreeSet::new();
     for (at, size) in pages {
-        if levels == 4 {
-            found.insert((3, at >> 39));
-        }
-        if size != PageSize::Size1G {
-            found.insert((2, at >> 30));
-        }
-        if size == PageSize::Size4K {
-            found.insert((1, at >> 21));
+        let leaf = (u32::from(geometry.page_shift[size as usize]) - page) / per_level + 1;
+        for level in leaf..levels {
+            found.insert((level, at >> (page + per_level * level)));
         }
     }
     found
@@ -60,9 +51,10 @@ impl Model {
     pub(crate) fn record_mapping(&mut self, cap: CapId, space: ObjId, mapping: Mapping) {
         let frame = self.frames[&self.caps[&cap].object];
         let size = frame.page;
+        let bytes = self.bytes(size);
         let aspace = live(&mut self.aspaces, space);
         for page in mapping.first..mapping.first + mapping.count {
-            let at = mapping.address + (page - mapping.first) * size.bytes();
+            let at = mapping.address + (page - mapping.first) * bytes;
             let translation = Translation {
                 cap,
                 page,
@@ -88,16 +80,24 @@ impl Model {
     }
 }
 
+/// IOMMU: the levels of the tables of an `iospace` of `width` address bits.
+pub(crate) fn io_levels(geometry: Geometry, width: u32) -> u32 {
+    let page = u32::from(geometry.page_shift[0]);
+    (width - page).div_ceil(geometry.entries.trailing_zeros())
+}
+
 /// IOMMU: the identifiers of the devices of one unit, 16 bits on x86-64.
 pub(crate) const DEVICE_IDS: u32 = 1 << 16;
 
 impl Model {
-    /// The levels of the tables of a space: four for an `aspace`; for an
-    /// `iospace`, four with an address width of 48 bits, otherwise three.
-    fn levels(&self, space: ObjId) -> u32 {
-        match self.iospaces.contains_key(&space) && self.machine.io_width < 48 {
-            true => 3,
-            false => 4,
+    /// The levels of the tables of a space: *L* for an `aspace`; for an
+    /// `iospace`, as many as its address width needs (x86-64: four with 48
+    /// bits, three with 39).
+    pub(crate) fn levels(&self, space: ObjId) -> u32 {
+        let geometry = self.machine.geometry;
+        match self.iospaces.contains_key(&space) {
+            true => io_levels(geometry, self.machine.io_width),
+            false => geometry.levels,
         }
     }
 
@@ -118,7 +118,7 @@ impl Model {
         // 3. The plain arguments.
         let frame = self.frames[&self.caps[&cap].object];
         let (limit, rights) = match kind {
-            ObjectKind::ASpace => (USER_END, mapping_rights(map.rights)),
+            ObjectKind::ASpace => (self.machine.geometry.user_end, mapping_rights(map.rights)),
             // IOMMU: the frame's page size must be one every unit supports
             // (`unsupported`, the first plain check); the range lies inside
             // the iospace's address width; the rights are a non-empty subset
@@ -135,7 +135,7 @@ impl Model {
             map.first,
             map.count,
             frame.pages,
-            frame.page,
+            self.bytes(frame.page),
             limit,
         )?;
         let rights = rights?;
@@ -149,11 +149,11 @@ impl Model {
         if self.caps[&cap].record != Record::Empty {
             return Err(Error::Busy);
         }
-        let size = frame.page.bytes();
+        let size = self.bytes(frame.page);
         let end = map.address + map.count * size;
         let aspace = &self.aspaces[&space];
         let before = aspace.translations.range(..map.address).next_back();
-        let covers = before.is_some_and(|(&at, t)| at + t.size.bytes() > map.address);
+        let covers = before.is_some_and(|(&at, t)| at + self.bytes(t.size) > map.address);
         if covers || aspace.translations.range(map.address..end).next().is_some() {
             return Err(Error::Busy);
         }
@@ -163,15 +163,17 @@ impl Model {
             .iter()
             .map(|(&at, t)| (at, t.size))
             .collect();
-        let hooked = tables(held.iter().copied(), levels);
+        let geometry = self.machine.geometry;
+        let hooked = tables(held.iter().copied(), levels, geometry);
         let pages = (0..map.count).map(|n| (map.address + n * size, frame.page));
-        let wanted = tables(held.into_iter().chain(pages), levels).len() as u64;
+        let wanted = tables(held.into_iter().chain(pages), levels, geometry).len() as u64;
         let free = aspace.tables - hooked.len() as u64;
         let missing = (wanted - hooked.len() as u64).saturating_sub(free);
+        let table = self.page();
         let supplied = untyped.map_or(0, |untyped| {
             let untyped = &self.untypeds[&untyped];
-            let start = untyped.watermark.next_multiple_of(TABLE_BYTES as u64);
-            untyped.bytes.saturating_sub(start) / TABLE_BYTES as u64
+            let start = untyped.watermark.next_multiple_of(table);
+            untyped.bytes.saturating_sub(start) / table
         });
         if missing > supplied {
             return Err(Error::NoMemory);
@@ -181,13 +183,8 @@ impl Model {
         // capability goes to the head of the space's list.
         for _ in 0..missing {
             let untyped = untyped.expect("an untyped supplies the tables");
-            self.take(
-                untyped,
-                TABLE_BYTES as u64,
-                TABLE_BYTES as u64,
-                Clearing::WithinCall,
-            )
-            .expect("checked above");
+            self.take(untyped, table, table, Clearing::WithinCall)
+                .expect("checked above");
         }
         live(&mut self.aspaces, space).tables += missing;
         let mapping = Mapping {

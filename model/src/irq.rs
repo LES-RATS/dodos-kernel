@@ -49,6 +49,10 @@ impl Model {
         if !self.machine.remapping && apic > 255 {
             return Err(Error::Unsupported);
         }
+        // Unlike cores: without such an event, kind 3 is `unsupported`.
+        if source.is_core_event() && !self.machine.core_events {
+            return Err(Error::Unsupported);
+        }
         // The depth checks come last.
         self.fits(place.space, cap, Placing::Retyped(ObjectKind::Irq))?;
         // The state: the vector claimed, a line whose input is claimed, then

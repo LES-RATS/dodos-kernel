@@ -1,4 +1,6 @@
+extern crate std;
 use super::*;
+use std::vec::Vec;
 
 #[test]
 fn error_codes_are_stable() {
@@ -86,8 +88,24 @@ fn calls_keep_their_place() {
         ThreadCancel,
         IrqClaim,
         SchedRead,
+        MemoryTake,
+        MemoryGive,
+        MemorySplit,
+        CoreIdle,
+        CoreWatch,
+        CorePlace,
+        RoleClaim,
+        RoleHand,
+        ThreadSetFeatures,
+        ThreadMove,
+        SchedCount,
+        IoportIn,
+        IoportOut,
+        IoportsIssue,
+        EntropyRead,
+        CorePerf,
     ];
-    assert_eq!(calls.len(), 48);
+    assert_eq!(calls.len(), 64);
     for (number, call) in calls.into_iter().enumerate() {
         assert_eq!(call as usize, number, "{call:?}");
     }
@@ -97,19 +115,93 @@ fn calls_keep_their_place() {
 fn object_kinds_and_page_sizes_have_their_numbers() {
     use ObjectKind::*;
     let kinds = [
-        Untyped, CSpace, ASpace, Frame, Thread, Sched, Endpoint, Reply, Notify, Timer, Irq,
-        IoPorts, IoSpace, Task, Core, Debug, Vcpu, IrqControl, Iommu,
+        Untyped,
+        CSpace,
+        ASpace,
+        Frame,
+        Thread,
+        Sched,
+        Endpoint,
+        Reply,
+        Notify,
+        Timer,
+        Irq,
+        IoPorts,
+        IoSpace,
+        Task,
+        Core,
+        Debug,
+        Vcpu,
+        IrqControl,
+        Iommu,
+        MemoryControl,
+        Role,
     ];
+    assert_eq!(kinds, ObjectKind::ALL);
     for (number, kind) in kinds.into_iter().enumerate() {
         assert_eq!(kind as usize, number, "{kind:?}");
     }
-    let pages = [PageSize::Size4K, PageSize::Size2M, PageSize::Size1G];
-    for (number, page) in pages.into_iter().enumerate() {
+    for (number, page) in PageSize::ALL.into_iter().enumerate() {
         assert_eq!(page as usize, number, "{page:?}");
-        assert_eq!(page.bytes(), 1 << (12 + 9 * number));
         assert_eq!(PageSize::from_raw(number as u64), Some(page));
     }
-    assert_eq!(PageSize::from_raw(3), None);
+    assert_eq!(PageSize::from_raw(4), None);
+}
+
+#[test]
+fn the_geometry_reads_page_sizes_from_the_machine() {
+    let x86 = x86_64::GEOMETRY;
+    assert!(x86.valid());
+    assert_eq!(x86.page(), 4096);
+    assert_eq!(x86.bytes(PageSize::Large1), Some(2 << 20));
+    assert_eq!(x86.bytes(PageSize::Large2), Some(1 << 30));
+    assert_eq!(x86.bytes(PageSize::Large3), None);
+    assert_eq!(
+        (x86.chunk(), x86.chunk_shift(), x86.sizes()),
+        (2 << 20, 21, 0b111)
+    );
+    let sixteen = Geometry {
+        page_shift: [14, 25, 36, 0],
+        entries: 2048,
+        levels: 3,
+        user_end: (1 << 47) - (1 << 36),
+    };
+    assert!(sixteen.valid());
+    assert_eq!((sixteen.page(), sixteen.chunk()), (16 << 10, 32 << 20));
+    let bad = [
+        Geometry {
+            page_shift: [11, 21, 0, 0],
+            ..x86
+        },
+        Geometry {
+            page_shift: [12, 12, 0, 0],
+            ..x86
+        },
+        Geometry {
+            page_shift: [12, 21, 0, 30],
+            ..x86
+        },
+        Geometry {
+            page_shift: [12, 21, 20, 0],
+            ..x86
+        },
+        Geometry {
+            entries: 8192,
+            ..x86
+        },
+        Geometry {
+            entries: 500,
+            ..x86
+        },
+        Geometry { levels: 1, ..x86 },
+        Geometry {
+            user_end: 4096,
+            ..x86
+        },
+    ];
+    for geometry in bad {
+        assert!(!geometry.valid(), "{geometry:?}");
+    }
 }
 
 #[test]
@@ -146,7 +238,7 @@ fn sizes_and_limits_have_their_values() {
     assert_eq!((REMOVAL_STEP, REMOVAL_SLOTS), (32, 128));
     assert_eq!((TREE_DEPTH, LONGEST_WALK), (64, 191));
     assert_eq!((CSPACE_MAX_SLOTS, CSPACE_DIRECTORY_BYTES), (1 << 20, 8));
-    assert_eq!((UNTYPED_MIN_BYTES, CLEAR_STEP_BYTES), (4096, 65_536));
+    assert_eq!(CLEAR_STEP_BYTES, 65_536);
     let small = [
         ENDPOINT_BYTES,
         REPLY_BYTES,
@@ -155,13 +247,78 @@ fn sizes_and_limits_have_their_values() {
         IRQ_BYTES,
     ];
     assert_eq!(small, [64; 5]);
-    assert_eq!((TASK_BYTES, SCHED_BYTES, THREAD_BYTES), (256, 128, 1024));
-    assert_eq!((ASPACE_BYTES, IOSPACE_BYTES), (8192, 8192));
     assert_eq!(
-        (TABLE_BYTES, TABLE_ENTRIES, FRAME_MAX_PAGES),
-        (4096, 512, 512)
+        (TASK_BYTES, SCHED_BYTES, THREAD_FIXED_BYTES),
+        (256, 256, 1024)
     );
+    assert_eq!((ASPACE_PAGES, IOSPACE_PAGES), (2, 2));
+    assert_eq!((TABLE_ENTRIES_MAX, LEVELS_MIN), (4096, 2));
     assert_eq!((IOSPACE_MAX_DEVICES, IOMMU_WAIT_NS), (16, 1_000_000));
+    assert_eq!(ENTROPY_MAX_BYTES, 64);
+}
+
+#[test]
+fn numbers_of_the_multi_node_part_have_their_values() {
+    assert_eq!((NODES_MAX, GRANTS), (1024, 4096));
+    assert_eq!((GRANT_ENTRY_BYTES, USE_ENTRY_BYTES), (128, 32));
+    assert_eq!((PROXIES_PER_PEER, PROXY_BYTES), (16, 1024));
+    assert_eq!(DEVICE_TABLE_SPARE, 8192);
+    assert_eq!((RESERVES_MIN, RESERVES_MAX, ROLES_PLAIN_MAX), (2, 8, 64));
+    assert_eq!(
+        (CORE_WATCH_SLOTS, IDLE_STATES_MAX, OBSERVATIONS_MAX),
+        (4, 15, 8)
+    );
+    assert_eq!(IDLE_ENTRY_WORDS * IDLE_STATES_MAX, 60);
+    assert_eq!((STALE_NS, STUCK_NS), (100_000_000, 100_000_000));
+    assert_eq!(STALE_RANGE_NS, (10_000_000, 1_000_000_000));
+    assert_eq!(
+        (SWEEP_NS, SWEEP_RANGE_NS),
+        (1_000_000_000, (100_000_000, 60_000_000_000))
+    );
+    let fence = [NMI_GRACE_NS, FENCE_NS, SETTLE_NS, START_NS];
+    assert_eq!(fence, [1_000_000, 10_000_000, 1_000_000, 1_000_000_000]);
+    assert_eq!(
+        (RECOVERY_BANDWIDTH, RECOVERY_PERIOD_NS),
+        (1 << 26, 10_000_000)
+    );
+    assert_eq!(OBSERVATION_LIFE, 4);
+    // The first context and the recovery reserve fill one core.
+    let first = bandwidth(START_SCHED_BUDGET_NS, START_SCHED_PERIOD_NS);
+    assert_eq!(first + RECOVERY_BANDWIDTH, ADMISSION_WHOLE_CORE);
+    assert_eq!(
+        bandwidth(RECOVERY_PERIOD_NS / 64, RECOVERY_PERIOD_NS),
+        RECOVERY_BANDWIDTH
+    );
+}
+
+#[test]
+fn values_of_the_cores_have_their_numbers() {
+    assert_eq!((CORE_START_FRESH, CORE_START_RESUME), (0, 1));
+    assert_eq!((CORE_IMAGE_BOOT, CORE_IMAGE_REPLACEMENT), (0, 1));
+    assert_eq!(
+        (CORE_STOP_KILL, CORE_STOP_SEAL, CORE_STOP_RETIRE),
+        (0, 1, 2)
+    );
+    assert_eq!(
+        (CORE_STATUS_PARKED, CORE_STATUS_UNUSABLE),
+        (1 << 32, 1 << 33)
+    );
+    assert_eq!((CORE_STATUS_FENCE_SHIFT, CORE_STATUS_WORDS), (34, 7));
+    let methods = [
+        IDLE_METHOD_HALT,
+        IDLE_METHOD_MWAIT,
+        IDLE_METHOD_PSCI,
+        IDLE_METHOD_SBI,
+    ];
+    assert_eq!(methods, [0, 1, 2, 3]);
+    assert_eq!(IDLE_FLAG_LOSES_CONTEXT, 1);
+    let classes = [
+        FENCE_CLASS_COOPERATIVE,
+        FENCE_CLASS_SIGNALLED,
+        FENCE_CLASS_FORCED,
+    ];
+    assert_eq!(classes, [0, 1, 2]);
+    assert_eq!(CORE_EVENT_FEEDBACK, 1);
 }
 
 #[test]
@@ -176,10 +333,16 @@ fn fault_values_have_their_numbers() {
         BadCall,
         NoAddressSpace,
         NoContext,
+        HardwareBreakpoint,
     ];
     for (number, kind) in kinds.into_iter().enumerate() {
         assert_eq!(kind as usize, number + 1, "{kind:?}");
+        assert_eq!(FaultKind::from_raw(number as u32 + 1), Some(kind));
     }
+    assert_eq!(
+        (FaultKind::from_raw(0), FaultKind::from_raw(10)),
+        (None, None)
+    );
     assert_eq!(FAULT_WORDS, 5);
     assert_eq!((FAULT_REPLY_RESUME, FAULT_REPLY_REDIRECT), (0, 1));
     let access = [ACCESS_READ, ACCESS_WRITE, ACCESS_EXEC, ACCESS_PRESENT];
@@ -202,6 +365,11 @@ fn scheduling_values_have_their_numbers() {
     assert_eq!(ADMISSION_WHOLE_CORE, 1 << 32);
     assert_eq!((CORE_WINDOWS, CORE_WINDOW_BITS), (1024, 64));
     assert_eq!((TIME_EVENT_STEP, START_SCHED_PERIOD_NS), (16, 10_000_000));
+    assert_eq!(START_SCHED_BUDGET_NS, 9_843_750);
+    assert_eq!(SCHED_STATE_COUNTED, 1 << 4);
+    assert_eq!(SCHED_STATE_HW_CLASS_SHIFT, 8);
+    assert_eq!(SCHED_STATE_HW_CLASS_MASK, 0xFF00);
+    assert_eq!((SCHED_COUNT_OFF, SCHED_COUNT_ON), (0, 1));
     let states = [
         SCHED_STATE_CONFIGURED,
         SCHED_STATE_THROTTLED,
@@ -282,10 +450,25 @@ fn irq_source_follows_the_table_of_the_source_word() {
     assert_eq!(line.raw(), 9 << 32 | 0x302);
     assert!(line.is_line() && line.level() && line.active_low() && line.id() == 9);
     assert_eq!(IrqSource::from_raw(line.raw()), Ok(line));
-    // A kind other than 1 or 2, a reserved bit, bits 8-9 on an MSI.
-    for raw in [0, 3, 1 << 10 | 2, 1 << 31 | 1, 0x101, 0x201] {
+    // A kind other than 1 to 3, a reserved bit, bits 8-9 on an MSI, a bit
+    // beyond the event on a core event.
+    for raw in [
+        0,
+        4,
+        1 << 10 | 2,
+        1 << 31 | 1,
+        0x101,
+        0x201,
+        1 << 16 | 3,
+        1 << 40 | 3,
+    ] {
         assert_eq!(IrqSource::from_raw(raw), Err(Error::Invalid), "{raw:#x}");
     }
+    let event = IrqSource::core_event(CORE_EVENT_FEEDBACK);
+    assert_eq!(event.raw(), 0x103);
+    assert_eq!(IrqSource::from_raw(0x103), Ok(event));
+    assert!(event.is_core_event() && event.event() == 1 && !event.level() && !event.is_line());
+    assert_eq!(IrqSource::KIND_CORE_EVENT, 3);
 }
 
 #[test]
@@ -300,9 +483,9 @@ fn task_values_have_their_bits() {
 
 #[test]
 fn mapping_range_refuses_in_the_order_of_the_contract() {
-    let ok = mapping_range(0x20_0000, 1, 511, 512, PageSize::Size4K, 1 << 47);
+    let ok = mapping_range(0x20_0000, 1, 511, 512, 4096, 1 << 47);
     assert_eq!(ok, Ok(()));
-    let page = PageSize::Size2M;
+    let page = 1 << 21;
     assert_eq!(
         mapping_range(0x1000, 0, 1, 1, page, 1 << 47),
         Err(Error::Invalid)
@@ -363,7 +546,7 @@ fn x86_64_values_have_their_numbers() {
     // The last node that can claim has handles below 65,536.
     assert!(IRQ_MAX_NODES_REMAPPED as usize * IRQ_TABLE_ENTRIES - 1 < 1 << 16);
     assert!((IRQ_MAX_NODES_REMAPPED as usize + 1) * IRQ_TABLE_ENTRIES > 1 << 16);
-    assert_eq!(REGS_WORDS, 20);
+    assert_eq!(REGS_WORDS, 26);
     let order = [REG_RIP, REG_RSP, REG_RFLAGS, REG_RAX, REG_RBX, REG_RCX];
     assert_eq!(order, [0, 1, 2, 3, 4, 5]);
     assert_eq!(
@@ -371,12 +554,51 @@ fn x86_64_values_have_their_numbers() {
         [6, 7, 8, 9, 10]
     );
     assert_eq!([REG_FS_BASE, REG_GS_BASE], [18, 19]);
+    let debug = [REG_DR0, REG_DR1, REG_DR2, REG_DR3, REG_DR7, REG_UINTR];
+    assert_eq!(debug, [20, 21, 22, 23, 24, 25]);
+    assert_eq!(HW_BREAKPOINTS, 4);
     assert_eq!(REGS_CANONICAL, [0, 1, 18, 19]);
     assert_eq!((RFLAGS_USER_MASK, RFLAGS_FIXED), (0x0024_0DD5, 0x202));
     assert_eq!(rflags(0), 0x202);
     assert_eq!(rflags(u64::MAX), 0x0024_0FD7);
     assert!(canonical(0x7fff_ffff_ffff) && canonical(0xffff_8000_0000_0000));
     assert!(!canonical(0x8000_0000_0000) && !canonical(0xfff7_ffff_ffff_ffff));
+    assert_eq!(
+        (PAGE, LARGE, TABLE_ENTRIES, LEVELS),
+        (4096, [2 << 20, 1 << 30], 512, 4)
+    );
+    assert_eq!(USER_RANGE_END, 255 << 39);
+    assert_eq!(
+        (ASPACE_BYTES, IOSPACE_BYTES, TABLE_BYTES),
+        (8192, 8192, 4096)
+    );
+    assert_eq!((UNTYPED_MIN_BYTES, CHUNK_BYTES), (4096, 2 << 20));
+    assert_eq!((START_MESSAGE_PAGE_ADDR, START_PAGE_ADDR), (0x1000, 0x2000));
+    assert_eq!(FIRST_SERVICE_MIN_ADDR, 0x20_0000);
+    assert_eq!(XSTATE_X87_SSE_AVX_BYTES, 832);
+    assert_eq!((AVX, AVX512, AMX, APX), (0, 1, 2, 3));
+    assert_eq!(
+        (FEATURES.state, FEATURES.with_length, FEATURES.large),
+        (0b1111, 0, 0b100)
+    );
+    assert_eq!(KERNEL_PORTS, [(0x20, 0x21), (0xA0, 0xA1)]);
+    assert_eq!((PCI_CONFIG_PORTS, UART_PORTS), ((0xCF8, 0xCFF), 8));
+}
+
+#[test]
+fn the_breakpoint_control_word_has_its_user_mask() {
+    use x86_64::{DR7_USER_MASK, dr7_valid};
+    assert_eq!(DR7_USER_MASK, 0xFFFF_0055);
+    // The local enables, and an execute breakpoint and data watchpoints.
+    assert!(dr7_valid(0) && dr7_valid(0x55) && dr7_valid(0b0001_1101 << 16 | 1));
+    // Global enables, LE, GE, GD, a reserved bit: outside the mask.
+    for bit in [1, 3, 5, 7, 8, 9, 10, 11, 13, 32] {
+        assert!(!dr7_valid(1 << bit), "bit {bit}");
+    }
+    // The I/O condition in any of the four fields.
+    for n in 0..4 {
+        assert!(!dr7_valid(0b10 << (16 + 4 * n)), "field {n}");
+    }
 }
 
 #[test]
@@ -393,16 +615,38 @@ fn start_up_slots_and_layout_have_their_values() {
         START_SLOT_START_PAGE,
         START_SLOT_MESSAGE_PAGE,
         START_SLOT_MESSAGE_PAGE_MAP,
+        START_SLOT_MEMORY_CONTROL,
+        START_SLOT_MACHINE_LIVING,
+        START_SLOT_MACHINE_FIXED,
+        START_SLOT_MAILBOX,
     ];
-    assert_eq!(slots, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(slots, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     assert_eq!((START_SLOT_FIRST, START_FREE_SLOTS), (16, 4096));
-    assert_eq!((START_VERSION, START_PAGE_MAX_PAGES), (1, 63));
-    assert_eq!(START_RESERVE_BYTES, 256 * 1024);
-    assert_eq!((START_MESSAGE_PAGE_ADDR, START_PAGE_ADDR), (0x1000, 0x2000));
-    assert_eq!((FIRST_SERVICE_MIN_ADDR, SHARE_ALIGN), (0x20_0000, 2 << 20));
-    // The start-up page and the message page fill the reserve.
-    assert_eq!((START_PAGE_MAX_PAGES + 1) * 4096, START_RESERVE_BYTES);
-    assert_eq!((START_UNTYPED_DEVICE, START_UNTYPED_IMAGE), (1, 2));
+    assert_eq!((START_VERSION, START_PAGE_MAX_PAGES), (2, 63));
+    assert_eq!(START_UNTYPED_DEVICE, 1);
+    assert_eq!((START_CORE_BOOTED, START_CORE_FENCE_SHIFT), (1, 1));
+    let module = [
+        START_MODULE_MAPPED,
+        START_MODULE_READ,
+        START_MODULE_WRITE,
+        START_MODULE_EXEC,
+        START_MODULE_FIRST_SERVICE,
+    ];
+    assert_eq!(module, [1, 2, 4, 8, 16]);
+    assert_eq!((START_NODE_FRESH, START_NODE_RESUMED), (1, 2));
+    let irq = [
+        START_IRQ_REMAPPING,
+        START_IRQ_X2APIC,
+        START_IRQ_DIRECTED_EOI,
+    ];
+    assert_eq!(irq, [1, 2, 4]);
+    let memory = [
+        START_MEMORY_MAP_THROUGH_ROLE,
+        START_MEMORY_GATE_NO_WINDOW,
+        START_MEMORY_CONTROL_FLOW,
+        START_MEMORY_MONITOR,
+    ];
+    assert_eq!(memory, [1, 2, 4, 8]);
 }
 
 #[test]
@@ -422,11 +666,19 @@ fn start_up_page_has_its_magic_and_kinds() {
         Process,
         Modules,
         Node,
-        Shares,
+        Floors,
         Interrupts,
         Kept,
         Memory,
         Iommu,
+        Machine,
+        Roles,
+        Reserves,
+        Image,
+        Kinds,
+        Features,
+        Feedback,
+        Debug,
     ];
     for (number, kind) in kinds.into_iter().enumerate() {
         assert_eq!(kind as usize, number, "{kind:?}");
@@ -465,14 +717,16 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
     ];
     assert_eq!(untyped, [0, 8, 12, 13, 14]);
     let module = [
-        offset_of!(StartModule, slot),
-        offset_of!(StartModule, flags),
+        offset_of!(StartModule, first_slot),
+        offset_of!(StartModule, slots),
         offset_of!(StartModule, vaddr),
         offset_of!(StartModule, len),
+        offset_of!(StartModule, flags),
         offset_of!(StartModule, name_offset),
         offset_of!(StartModule, name_len),
+        offset_of!(StartModule, reserved),
     ];
-    assert_eq!(module, [0, 4, 8, 16, 24, 28]);
+    assert_eq!(module, [0, 4, 8, 16, 24, 28, 32, 36]);
     let process = [
         offset_of!(StartProcess, entry),
         offset_of!(StartProcess, start_page_len),
@@ -484,10 +738,82 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
     assert_eq!(share, [8, 16]);
     let memory = [
         offset_of!(StartMemory, clock_page),
-        offset_of!(StartMemory, page_sizes),
+        offset_of!(StartMemory, page_shift),
+        offset_of!(StartMemory, table_entries),
+        offset_of!(StartMemory, levels),
+        offset_of!(StartMemory, iospace_width),
+        offset_of!(StartMemory, iospace_page_sizes),
+        offset_of!(StartMemory, flags),
         offset_of!(StartMemory, reserved),
     ];
-    assert_eq!(memory, [16, 24, 36]);
+    assert_eq!(memory, [16, 24, 28, 32, 36, 40, 44, 48]);
+    let core = [
+        offset_of!(StartCore, slot),
+        offset_of!(StartCore, kind),
+        offset_of!(StartCore, flags),
+        offset_of!(StartCore, threads),
+        offset_of!(StartCore, efficiency_class),
+        offset_of!(StartCore, package),
+        offset_of!(StartCore, reserved),
+    ];
+    assert_eq!(core, [8, 12, 14, 16, 19, 20, 24]);
+    let machine = [
+        offset_of!(StartMachine, uses),
+        offset_of!(StartMachine, chunks),
+        offset_of!(StartMachine, device_capacity),
+        offset_of!(StartMachine, layout),
+        offset_of!(StartMachine, reserved),
+    ];
+    assert_eq!(machine, [28, 32, 40, 52, 56]);
+    let kind = [
+        offset_of!(StartKindRecord, baseline),
+        offset_of!(StartKindRecord, id),
+        offset_of!(StartKindRecord, cores),
+        offset_of!(StartKindRecord, baseline_bytes),
+    ];
+    assert_eq!(kind, [8, 16, 40, 48]);
+    let debug = [
+        offset_of!(StartDebug, console_address),
+        offset_of!(StartDebug, crash_base),
+        offset_of!(StartDebug, slot),
+        offset_of!(StartDebug, kernel_entries),
+        offset_of!(StartDebug, reserved),
+    ];
+    assert_eq!(debug, [8, 16, 32, 40, 50]);
+    let header = [
+        offset_of!(DebugAreaHeader, generation),
+        offset_of!(DebugAreaHeader, next_kernel),
+        offset_of!(DebugAreaHeader, next_user),
+        offset_of!(DebugAreaHeader, suppressed),
+    ];
+    assert_eq!(header, [8, 16, 24, 32]);
+    // The node record sits at offset 64 of the debug area.
+    let record = [
+        offset_of!(NodeCrashRecord, generation),
+        offset_of!(NodeCrashRecord, instant),
+        offset_of!(NodeCrashRecord, member),
+        offset_of!(NodeCrashRecord, detail),
+        offset_of!(NodeCrashRecord, text),
+        offset_of!(NodeCrashRecord, kernel),
+        offset_of!(NodeCrashRecord, user),
+        offset_of!(NodeCrashRecord, reserved),
+    ];
+    let at = record.map(|offset| offset + DEBUG_HEADER_BYTES);
+    assert_eq!(at, [72, 80, 88, 96, 352, 480, 2528, 3552]);
+    let crash = [
+        offset_of!(CrashAreaHeader, boot_id),
+        offset_of!(CrashAreaHeader, sequence),
+        offset_of!(CrashAreaHeader, area_bytes),
+        offset_of!(CrashAreaHeader, build),
+        offset_of!(CrashAreaHeader, stop),
+    ];
+    assert_eq!(crash, [16, 24, 32, 36, 48]);
+    let floors = [
+        offset_of!(BootFloors, reserve_per_gib),
+        offset_of!(BootFloors, reserves),
+        offset_of!(BootFloors, plain_roles),
+    ];
+    assert_eq!(floors, [16, 24, 28]);
     let clock = [
         offset_of!(ClockPage, seq),
         offset_of!(ClockPage, flags),
@@ -503,8 +829,9 @@ fn layouts_are_fixed() {
     assert_eq!(size_of::<StartHeader>(), 16);
     assert_eq!(size_of::<StartEntry>(), 24);
     assert_eq!(size_of::<StartUntyped>(), 16);
-    assert_eq!(size_of::<StartCore>(), 24);
-    assert_eq!(size_of::<StartModule>(), 32);
+    assert_eq!(size_of::<StartCore>(), 32);
+    assert_eq!(size_of::<StartCrash>(), 32);
+    assert_eq!(size_of::<StartModule>(), 40);
     assert_eq!(size_of::<StartProcess>(), 40);
     assert_eq!(size_of::<StartNode>(), 16);
     assert_eq!(size_of::<StartShare>(), 24);
@@ -513,10 +840,27 @@ fn layouts_are_fixed() {
     assert_eq!(size_of::<StartInterrupts>(), 16);
     assert_eq!(size_of::<StartFramebuffer>(), 32);
     assert_eq!(size_of::<StartBootTimes>(), 40);
-    assert_eq!(size_of::<StartMemory>(), 40);
+    assert_eq!(size_of::<StartMemory>(), 56);
     assert_eq!(size_of::<StartIommu>(), 16);
+    assert_eq!(size_of::<StartMachine>(), 64);
+    assert_eq!(size_of::<StartRole>(), 8);
+    assert_eq!(size_of::<StartImage>(), 48);
+    assert_eq!(size_of::<StartKindRecord>(), 56);
+    assert_eq!(size_of::<StartFeedback>(), 16);
+    assert_eq!(size_of::<StartDebug>(), 56);
+    assert_eq!(size_of::<BootFloors>(), 32);
+    assert_eq!(size_of::<BootMembership>(), 24);
     assert_eq!(size_of::<ClockPage>(), 40);
-    assert_eq!(PageSize::Size2M.bytes(), 2 * 1024 * 1024);
+    assert_eq!(size_of::<DeviceEntry>(), 16);
+    assert_eq!(size_of::<TraceEntry>(), TRACE_ENTRY_BYTES);
+    assert_eq!(size_of::<DebugAreaHeader>(), DEBUG_HEADER_BYTES);
+    assert_eq!(size_of::<NodeCrashRecord>(), NODE_CRASH_RECORD_BYTES);
+    assert_eq!(size_of::<CrashAreaHeader>(), CRASH_HEADER_BYTES);
+    assert_eq!(size_of::<Ownership>(), 8);
+    assert_eq!(size_of::<Member>(), 8);
+    assert_eq!(size_of::<RoleWord>(), 8);
+    assert_eq!(size_of::<FeatureMask>(), 8);
+    assert_eq!(size_of::<IoPortRange>(), 8);
 }
 
 #[test]
@@ -586,5 +930,537 @@ fn fast_path_is_registers_without_capabilities_or_flags() {
         !Header::new(1, 0, 0, Header::FLAG_ADD_MARKS)
             .unwrap()
             .is_fast()
+    );
+}
+
+#[test]
+fn slot_layout_has_its_bits() {
+    let states = [SLOT_EMPTY, SLOT_FULL, SLOT_DEAD, SLOT_REMOTE];
+    assert_eq!((states, SLOT_STATE_MASK), ([0, 1, 2, 3], 3));
+    assert_eq!((SLOT_DYING, SLOT_ROOT), (4, 8));
+    let shifts = [
+        SLOT_KIND_SHIFT,
+        SLOT_RIGHTS_SHIFT,
+        SLOT_DEPTH_SHIFT,
+        SLOT_BY_KIND_SHIFT,
+    ];
+    assert_eq!(shifts, [4, 10, 18, 25]);
+    let frame = [
+        SLOT_FRAME_PAGE_SHIFT,
+        SLOT_FRAME_MEMORY_SHIFT,
+        SLOT_FRAME_PAGES_SHIFT,
+        SLOT_FRAME_FIRST_SHIFT,
+    ];
+    assert_eq!((frame, SLOT_FRAME_DEVICE), ([25, 27, 30, 42], 1 << 29));
+    // The number of pages − 1 and the first page have 12 bits: E ≤ 4,096.
+    assert_eq!(SLOT_FRAME_FIRST_SHIFT - SLOT_FRAME_PAGES_SHIFT, 12);
+    assert_eq!(1 << 12, TABLE_ENTRIES_MAX);
+    let record = [SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_BINDING];
+    assert_eq!((record, SLOT_RECORD_RIGHTS_SHIFT), ([0, 1, 2], 2));
+    let untyped = [
+        SLOT_UNTYPED_DEVICE,
+        SLOT_UNTYPED_CLEAN,
+        SLOT_UNTYPED_BLOCK,
+        SLOT_UNTYPED_ENTRY,
+    ];
+    assert_eq!(untyped, [1 << 31, 1 << 32, 1 << 33, 1 << 34]);
+    assert_eq!(
+        (SLOT_UNTYPED_LOG2_SHIFT, SLOT_UNTYPED_ENTRY_SHIFT),
+        (25, 35)
+    );
+    let remote = RemoteRef::new(1023, 4095, (1 << 30) - 1, 4095);
+    assert_eq!(remote.raw(), u64::MAX);
+    let remote = RemoteRef::new(5, 6, 7, 8);
+    assert_eq!(remote.raw(), 5 | 6 << 10 | 7 << 22 | 8 << 52);
+    assert_eq!(
+        (
+            remote.node(),
+            remote.grant(),
+            remote.serial(),
+            remote.use_entry()
+        ),
+        (5, 6, 7, 8)
+    );
+}
+
+#[test]
+fn ownership_words_carry_their_check() {
+    assert_eq!(Ownership::none().raw(), 0);
+    let free = Ownership::free(Owner::Unclaimed);
+    assert_eq!(free.state(), OwnState::Free);
+    assert_eq!((free.owner(), free.generation()), (Owner::Unclaimed, 0));
+    assert_eq!(free.raw() >> 16 & 0xFFFF, 0xFFFF);
+    let v = 1 | 0xFFFF << 2;
+    assert_eq!(
+        free.raw() >> 2 & 0x3FFF,
+        (v as u64).wrapping_mul(CHECK_MUL) >> 50
+    );
+    let taken = Ownership::taken(Owner::Node(3), 7);
+    assert_eq!(
+        (taken.state(), taken.owner(), taken.generation()),
+        (OwnState::Taken, Owner::Node(3), 7)
+    );
+    assert_eq!(Ownership::from_raw(taken.raw()), Some(taken));
+    // A flipped bit fails the check; state 3 never passes.
+    assert_eq!(Ownership::from_raw(taken.raw() ^ 1 << 40), None);
+    assert_eq!(Ownership::from_raw(taken.raw() | 3), None);
+    // A reserve keeps its code; an owner that names nothing fails.
+    let reserve = Ownership::taken(Owner::Reserve(2), 9);
+    assert_eq!(reserve.raw() >> 16 & 0xFFFF, 0xFFF2);
+    assert_eq!(Owner::from_code(0xFFF8), None);
+    assert_eq!(Owner::from_code(1024), None);
+    assert_eq!(Owner::from_code(1023), Some(Owner::Node(1023)));
+    assert_eq!(
+        (OWNER_UNCLAIMED, OWNER_RESERVE_BASE, CHECK_MUL),
+        (0xFFFF, 0xFFF0, 0x9E37_79B9_7F4A_7C15)
+    );
+}
+
+#[test]
+fn may_take_follows_rules_1_to_4() {
+    let (x, g) = (2, 5);
+    // 1. Its own word: free, or taken by another generation.
+    assert!(Ownership::free(Owner::Node(x)).may_take(x, g, false, false));
+    assert!(Ownership::taken(Owner::Node(x), g - 1).may_take(x, g, false, false));
+    assert!(!Ownership::taken(Owner::Node(x), g).may_take(x, g, false, false));
+    // 2. Unclaimed, free or taken.
+    assert!(Ownership::free(Owner::Unclaimed).may_take(x, g, false, false));
+    // 3. A dead node's word, whatever its state.
+    assert!(Ownership::taken(Owner::Node(1), 3).may_take(x, g, true, false));
+    assert!(!Ownership::taken(Owner::Node(1), 3).may_take(x, g, false, false));
+    assert!(!Ownership::free(Owner::Node(1)).may_take(x, g, false, true));
+    // 4. A reserve only by the holder of its role.
+    assert!(Ownership::free(Owner::Reserve(0)).may_take(x, g, false, true));
+    assert!(!Ownership::free(Owner::Reserve(0)).may_take(x, g, true, false));
+    assert!(!Ownership::none().may_take(x, g, true, true));
+}
+
+#[test]
+fn device_entries_hold_a_range_and_an_owner() {
+    let entry = DeviceEntry::used(0xFE00_0000, 21);
+    assert!(entry.is_used());
+    assert_eq!((entry.base(), entry.log2()), (0xFE00_0000, 21));
+    assert_eq!(entry.owner, Ownership::free(Owner::Unclaimed));
+    assert!(!DeviceEntry::unused().is_used());
+    assert_eq!(DeviceEntry::USED, 1 << 6);
+}
+
+#[test]
+fn member_words_read_back_and_refuse_what_is_never_written() {
+    let word = Member::new(MemberState::Fencing, Evidence::Stale, 4, 9);
+    assert_eq!(word.raw(), 5 | 2 << 4 | 4 << 16 | 9 << 32);
+    assert_eq!(Member::from_raw(word.raw()), Some(word));
+    assert_eq!(
+        (
+            word.state(),
+            word.evidence(),
+            word.driver(),
+            word.generation()
+        ),
+        (MemberState::Fencing, Evidence::Stale, 4, 9)
+    );
+    assert_eq!(Member::never().raw(), 0xFFFF << 16);
+    for raw in [8, 15, 7 << 4, 1 << 7, 1 << 15] {
+        assert_eq!(Member::from_raw(raw), None, "{raw:#x}");
+    }
+    assert!(Member::new(MemberState::Sealing, Evidence::None, DRIVER_NONE, 1).writes());
+    assert!(!Member::new(MemberState::Sealed, Evidence::None, DRIVER_NONE, 1).writes());
+}
+
+#[test]
+fn the_transition_check_accepts_the_rows_of_the_table() {
+    use MemberState::*;
+    let m = |state, evidence, driver, generation| Member::new(state, evidence, driver, generation);
+    let none = |state, generation| m(state, Evidence::None, DRIVER_NONE, generation);
+    let kill = |state, generation| m(state, Evidence::Kill, 1, generation);
+    let rows = [
+        (none(Dead, 3), none(Starting, 4), Transition::Start),
+        (none(Sealed, 3), none(Starting, 3), Transition::Resume),
+        (none(Starting, 3), none(Live, 3), Transition::Up),
+        (none(Live, 3), none(Sealing, 3), Transition::Seal),
+        (none(Sealing, 3), none(Sealed, 3), Transition::Sealed),
+        (none(Live, 3), kill(Fencing, 3), Transition::Accuse),
+        (none(Sealed, 3), kill(Fencing, 3), Transition::Accuse),
+        (
+            kill(Fencing, 3),
+            m(Fencing, Evidence::Kill, 2, 3),
+            Transition::Redrive,
+        ),
+        (kill(Fencing, 3), kill(Fenced, 3), Transition::Fence),
+        (kill(Fencing, 3), kill(Unfenced, 3), Transition::Unfence),
+        (kill(Unfenced, 3), kill(Fenced, 3), Transition::LateFence),
+        (kill(Fenced, 3), kill(Dead, 3), Transition::Reclaim),
+    ];
+    for (from, to, row) in rows {
+        assert_eq!(member_transition(from, to), Some(row), "{from:?} {to:?}");
+    }
+    let refused = [
+        (none(Dead, 3), none(Starting, 3)),
+        (none(Fenced, 3), none(Live, 3)),
+        (kill(Dead, 3), none(Live, 4)),
+        (none(Live, 3), none(Fencing, 3)),
+        (none(Dead, 3), none(Fencing, 3)),
+        (kill(Fencing, 3), kill(Fencing, 3)),
+        (none(Live, 3), none(Sealing, 4)),
+        (kill(Fenced, 3), none(Dead, 3)),
+    ];
+    for (from, to) in refused {
+        assert_eq!(member_transition(from, to), None, "{from:?} {to:?}");
+    }
+}
+
+#[test]
+fn the_successor_is_the_next_live_node_of_the_best_class() {
+    use MemberState::*;
+    let at = |state| Member::new(state, Evidence::None, DRIVER_NONE, 1);
+    let members = [at(Live), at(Live), at(Fenced), at(Live)];
+    assert_eq!(successor(&members, &[2, 1, 2, 2], 2), Some(3));
+    assert_eq!(successor(&members, &[2, 1, 2, 2], 3), Some(0));
+    assert_eq!(successor(&members, &[1, 2, 2, 1], 2), Some(1));
+    assert_eq!(successor(&members, &[1, 1, 1, 1], 0), Some(1));
+    let gone = [at(Dead), at(Sealed), at(Fencing), at(Unfenced)];
+    assert_eq!(successor(&gone, &[2; 4], 0), None);
+}
+
+#[test]
+fn the_barrier_waits_for_every_node_that_could_reach_the_memory() {
+    use MemberState::*;
+    let view = |state, acked, maps, all| BarrierView {
+        member: Member::new(state, Evidence::None, DRIVER_NONE, 1),
+        acked,
+        maps,
+        acknowledged_by_all: all,
+    };
+    assert!(barrier(
+        4,
+        &[view(Live, 4, true, false), view(Dead, 0, true, false)],
+        true
+    ));
+    assert!(!barrier(4, &[view(Live, 3, false, false)], true));
+    assert!(!barrier(4, &[view(Live, 4, false, false)], false));
+    assert!(barrier(4, &[view(Sealed, 0, false, false)], true));
+    assert!(!barrier(4, &[view(Sealed, 4, true, false)], true));
+    assert!(!barrier(4, &[view(Unfenced, 4, true, false)], true));
+    assert!(barrier(4, &[view(Fenced, 0, true, true)], true));
+    assert!(!barrier(4, &[view(Fenced, 0, true, false)], true));
+}
+
+#[test]
+fn role_words_read_back() {
+    let word = RoleWord::handing(3, 5, 77);
+    assert_eq!(word.raw(), 2 | 3 << 2 | 5 << 18 | 77 << 34);
+    assert_eq!(
+        (word.state(), word.holder(), word.target(), word.epoch()),
+        (RoleState::Handing, 3, 5, 77)
+    );
+    assert_eq!(RoleWord::from_raw(word.raw()), Some(word));
+    assert_eq!(RoleWord::held(2, 1).target(), ROLE_NOBODY);
+    assert_eq!(RoleWord::vacant(4).holder(), ROLE_NOBODY);
+    assert_eq!(RoleWord::from_raw(3), None);
+    assert_eq!(RoleWord::from_raw(1 | 7 << 18), None);
+    assert_eq!(RoleWord::from_raw(7 << 2), None);
+    assert_eq!(RoleWord::held(0, 1 << 30).epoch(), 0);
+    assert_eq!(
+        [
+            RoleKind::Unit as u8,
+            RoleKind::Reserve as u8,
+            RoleKind::Plain as u8
+        ],
+        [0, 1, 2]
+    );
+    assert_eq!(
+        [
+            Governs::IommuUnit as u8,
+            Governs::Console as u8,
+            Governs::Plain as u8
+        ],
+        [0, 4, 6]
+    );
+    assert_eq!(ROLE_PLAIN_PLATFORM, 0);
+}
+
+#[test]
+fn feature_masks_are_judged_invalid_then_unsupported() {
+    let list = aarch64::FEATURES;
+    let mut bytes = [0; 32];
+    bytes[0] = 512;
+    bytes[1] = 4096;
+    let kind = Kind {
+        features: 0b011,
+        vector_bytes: 32,
+        baseline_bytes: 528,
+        feature_bytes: bytes,
+    };
+    assert_eq!(kind.baseline(list), 0b001);
+    assert_eq!(FeatureMask::new(0b001, 32).check(list, &kind), Ok(()));
+    assert_eq!(FeatureMask::new(0b011, 32).check(list, &kind), Ok(()));
+    let invalid = [1 << 48, 1 << 3, 32 << 32, 0b001];
+    for raw in invalid {
+        let mask = FeatureMask::from_raw(raw);
+        assert_eq!(mask.check(list, &kind), Err(Error::Invalid), "{raw:#x}");
+    }
+    let unsupported = [
+        1 << 31,
+        FeatureMask::new(0b101, 32).raw(),
+        FeatureMask::new(0b001, 16).raw(),
+    ];
+    for raw in unsupported {
+        let mask = FeatureMask::from_raw(raw);
+        assert_eq!(mask.check(list, &kind), Err(Error::Unsupported), "{raw:#x}");
+    }
+    // Invalid comes first: a reserved bit with bit 31.
+    assert_eq!(
+        FeatureMask::from_raw(1 << 31 | 1 << 50).check(list, &kind),
+        Err(Error::Invalid)
+    );
+    assert_eq!(FEATURE_USER_INTERRUPTS, 31);
+    assert_eq!(FEATURE_INSTRUCTION_FIRST, 32);
+}
+
+#[test]
+fn the_size_of_a_thread_follows_its_mask() {
+    let list = x86_64::FEATURES;
+    let mut bytes = [0; 32];
+    bytes[x86_64::AVX512 as usize] = 2048;
+    bytes[x86_64::AMX as usize] = 8192;
+    let kind = Kind {
+        features: 0b0111,
+        vector_bytes: 0,
+        baseline_bytes: x86_64::XSTATE_X87_SSE_AVX_BYTES,
+        feature_bytes: bytes,
+    };
+    // AVX and AVX-512 are baseline; AMX is large.
+    assert_eq!(kind.baseline(list), 0b011);
+    assert_eq!(thread_bytes(FeatureMask::NONE, list, &kind), Some(2048));
+    assert_eq!(
+        thread_bytes(FeatureMask::new(0b011, 0), list, &kind),
+        Some(2048)
+    );
+    assert_eq!(
+        thread_bytes(FeatureMask::new(0b100, 0), list, &kind),
+        Some(16384)
+    );
+    let host = Kind {
+        features: 0b1111,
+        ..kind
+    };
+    assert!(kind_covers(&host, &kind) && !kind_covers(&kind, &host));
+    let longer = Kind {
+        vector_bytes: 64,
+        ..kind
+    };
+    let shorter = Kind {
+        vector_bytes: 32,
+        ..kind
+    };
+    assert!(!kind_covers(&longer, &shorter) && kind_covers(&kind, &kind));
+    assert!(FeatureMask::new(0b100, 0).fits(&kind) && !FeatureMask::new(0b1000, 0).fits(&kind));
+    assert_eq!(riscv64::FEATURES.with_length, 1);
+}
+
+#[test]
+fn floors_are_whole_chunks_of_the_boot_numbers() {
+    let boot = BootFloors {
+        floor_node: (64 << 20) + 1,
+        reserve_bytes: 128 << 20,
+        reserve_per_gib: 1 << 20,
+        reserves: 2,
+        plain_roles: 0,
+    };
+    let chunk = 2 << 20;
+    let f = floors(8 << 30, 4, boot, chunk).unwrap();
+    assert_eq!(f.floor, 66 << 20);
+    assert_eq!(f.reserve, 136 << 20);
+    assert_eq!(f.total, 4 * (66 << 20) + 2 * (136 << 20));
+    assert_eq!(floors(256 << 20, 4, boot, chunk), None);
+    let huge = BootFloors {
+        floor_node: u64::MAX,
+        ..boot
+    };
+    assert_eq!(floors(u64::MAX, 1, huge, chunk), None);
+}
+
+#[test]
+fn module_frames_take_the_largest_size_that_fits() {
+    let g = x86_64::GEOMETRY;
+    let frames: Vec<_> = module_frames(0x20_0000 - 0x1000, None, 0x40_1000, g).collect();
+    let expected = [
+        ModuleFrame {
+            size: PageSize::Page,
+            pages: 1,
+            offset: 0,
+        },
+        ModuleFrame {
+            size: PageSize::Large1,
+            pages: 2,
+            offset: 0x1000,
+        },
+    ];
+    assert_eq!(frames, expected);
+    // A virtual address that is not aligned keeps small pages.
+    let frames: Vec<_> = module_frames(0x20_0000, Some(0x20_1000), 0x20_0000, g).collect();
+    assert_eq!(
+        frames,
+        [ModuleFrame {
+            size: PageSize::Page,
+            pages: 512,
+            offset: 0
+        }]
+    );
+    // At most E pages; the last one ends at the length rounded up.
+    let frames: Vec<_> = module_frames(0, Some(0x1000), 513 * 4096 - 5, g).collect();
+    let pages: Vec<_> = frames.iter().map(|f| (f.size, f.pages)).collect();
+    assert_eq!(pages, [(PageSize::Page, 512), (PageSize::Page, 1)]);
+    let frames: Vec<_> = module_frames(0, None, 513 * 4096 - 5, g).collect();
+    let pages: Vec<_> = frames.iter().map(|f| (f.size, f.pages)).collect();
+    assert_eq!(pages, [(PageSize::Large1, 1), (PageSize::Page, 1)]);
+    // Small pages end at the first position aligned on a larger size.
+    let frames: Vec<_> = module_frames(0x1000, None, 0x40_0000, g).collect();
+    assert_eq!(
+        frames[0],
+        ModuleFrame {
+            size: PageSize::Page,
+            pages: 511,
+            offset: 0
+        }
+    );
+    assert_eq!(frames[1].size, PageSize::Large1);
+}
+
+#[test]
+fn a_creation_clears_64_kb_per_call() {
+    assert_eq!(clear_step(0, 1 << 20), 65_536);
+    assert_eq!(clear_step(65_536, 100_000), 100_000);
+    assert_eq!(clear_step(5, 5), 5);
+    assert_eq!(clear_steps(0, 2 << 20), 32);
+    assert_eq!(clear_steps(0, 1), 1);
+    assert_eq!(clear_steps(9, 9), 1);
+}
+
+#[test]
+fn port_ranges_and_checks_follow_the_contract() {
+    let range = IoPortRange::new(0x60, 0x64).unwrap();
+    assert_eq!(
+        (range.raw(), range.first(), range.last()),
+        (0x64_0060, 0x60, 0x64)
+    );
+    assert_eq!(IoPortRange::ALL.raw(), 0xFFFF_0000);
+    assert_eq!(IoPortRange::new(5, 4), None);
+    assert_eq!(IoPortRange::new(0, 0x1_0000), None);
+    assert!(range.contains(0x60, 4) && range.contains(0x64, 1));
+    assert!(!range.contains(0x62, 4) && !range.contains(0x5F, 2) && !range.contains(0x60, 0));
+    assert!(!IoPortRange::ALL.contains(u64::MAX, 2));
+    assert!(IoPortRange::ALL.covers(range) && !range.covers(IoPortRange::ALL));
+    assert_eq!(ioport_check(range, 0x60, 3, None), Err(Error::Invalid));
+    assert_eq!(ioport_check(range, 0x63, 2, None), Ok(()));
+    assert_eq!(ioport_check(range, 0x64, 2, None), Err(Error::Invalid));
+    assert_eq!(ioport_check(range, 0x60, 1, Some(0xFF)), Ok(()));
+    assert_eq!(
+        ioport_check(range, 0x60, 1, Some(0x100)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(ioport_check(range, 0x60, 4, Some(u32::MAX as u64)), Ok(()));
+    assert!(ports_meet((0x20, 0x21), (0x21, 0x30)) && !ports_meet((0x20, 0x21), (0x22, 0x30)));
+}
+
+#[test]
+fn debug_values_have_their_numbers() {
+    assert_eq!(
+        (
+            DEBUG_AREA_BYTES,
+            DEBUG_HEADER_BYTES,
+            NODE_CRASH_RECORD_BYTES
+        ),
+        (69_632, 64, 4_032)
+    );
+    assert_eq!(DEBUG_AREA_BYTES, 17 * 4096);
+    assert_eq!(
+        DEBUG_HEADER_BYTES + NODE_CRASH_RECORD_BYTES,
+        TRACE_KERNEL_OFFSET
+    );
+    assert_eq!(
+        TRACE_KERNEL_OFFSET + TRACE_KERNEL_ENTRIES as usize * TRACE_ENTRY_BYTES,
+        TRACE_USER_OFFSET
+    );
+    assert_eq!(
+        TRACE_USER_OFFSET + TRACE_USER_ENTRIES as usize * TRACE_ENTRY_BYTES,
+        DEBUG_AREA_BYTES
+    );
+    assert_eq!(
+        (CRASH_HEADER_BYTES, TRACE_TEXT_BYTES, DEBUG_WRITE_MAX),
+        (4096, 24, 512)
+    );
+    assert_eq!((TRACE_BURST, TRACE_BURST_NS), (16, 1_000_000));
+    assert_eq!(
+        (CONSOLE_STEP_BYTES, CONSOLE_TICK_NS, STUB_STOP_NS),
+        (16, 1_000_000, 10_000_000)
+    );
+    assert_eq!(
+        (CRASH_RECORD_KERNEL_ENTRIES, CRASH_RECORD_USER_ENTRIES),
+        (32, 16)
+    );
+    use TraceCode::*;
+    let codes = [
+        Text,
+        DmaFault,
+        Suppressed,
+        UnitTimeout,
+        FaultRecorded,
+        Failure,
+        HardwareError,
+        StrayVector,
+        Transition,
+        BadWord,
+    ];
+    for (number, code) in codes.into_iter().enumerate() {
+        assert_eq!(code as u16, number as u16 + 1);
+        assert!(!code.user());
+    }
+    assert_eq!((UserText as u16, UserEmit as u16), (16, 17));
+    assert!(UserText.user() && UserEmit.user());
+    assert_eq!(TRACE_FLAG_CONTINUED, 1 << 16);
+    assert_eq!(
+        (
+            trace_index(1, 256),
+            trace_index(256, 256),
+            trace_index(257, 256)
+        ),
+        (0, 255, 0)
+    );
+    let entry = TraceEntry {
+        word2: 16 | TRACE_FLAG_CONTINUED | 3 << 32,
+        ..TraceEntry::default()
+    };
+    assert_eq!(
+        (entry.code(), entry.continued(), entry.generation()),
+        (16, true, 3)
+    );
+    let reasons = [
+        CrashReason::Assertion as u32,
+        CrashReason::Fenced as u32,
+        CrashReason::StartRefused as u32,
+    ];
+    assert_eq!(reasons, [1, 5, 8]);
+    use ConsoleKind as C;
+    assert_eq!(
+        [
+            C::None as u32,
+            C::Uart16550Port as u32,
+            C::Uart16550Mmio as u32,
+            C::Pl011 as u32,
+            C::SbiDbcn as u32
+        ],
+        [0, 1, 2, 3, 4]
+    );
+    assert_eq!(
+        (
+            ConsoleMessage::KernelStarts as u32,
+            ConsoleMessage::Suppressed as u32
+        ),
+        (1, 14)
+    );
+    assert_eq!(
+        (Build::Production as u32, Build::Development as u32),
+        (0, 1)
     );
 }

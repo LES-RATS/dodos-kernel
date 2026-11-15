@@ -95,7 +95,7 @@ const KINDS: [(ObjectKind, u32, u64); 12] = [
 ];
 /// The kinds that this version does not make, and those never made from an
 /// untyped.
-const NOT_MADE: [ObjectKind; 7] = [
+const NOT_MADE: [ObjectKind; 9] = [
     ObjectKind::IoPorts,
     ObjectKind::Core,
     ObjectKind::Debug,
@@ -103,13 +103,15 @@ const NOT_MADE: [ObjectKind; 7] = [
     ObjectKind::Irq,
     ObjectKind::IrqControl,
     ObjectKind::Iommu,
+    ObjectKind::MemoryControl,
+    ObjectKind::Role,
 ];
 const PAGES: [PageSize; 5] = [
-    PageSize::Size4K,
-    PageSize::Size4K,
-    PageSize::Size4K,
-    PageSize::Size2M,
-    PageSize::Size1G,
+    PageSize::Page,
+    PageSize::Page,
+    PageSize::Page,
+    PageSize::Large1,
+    PageSize::Large2,
 ];
 
 /// The kinds that the model makes, as `Census::dying` names them.
@@ -242,7 +244,7 @@ fn retype(kind: ObjectKind, size: u64, destination: SlotAddr) -> Syscall {
         untyped: MEMORY,
         kind,
         size,
-        page: PageSize::Size4K as u64,
+        page: PageSize::Page as u64,
         memory: 0,
         destination,
     }
@@ -1867,9 +1869,10 @@ fn removal_steps_that_only_move_the_sweep_are_reached() {
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 44 calls returned `unsupported` for a kind this version
-    // does not make.
-    at_least([reached.retype_unsupported], [22]);
+    // Measured: 9 calls returned `unsupported` for the one kind this
+    // version does not make, the reserved `vcpu` (the other kinds never
+    // made from an untyped are `invalid` since 16 November 2026).
+    at_least([reached.retype_unsupported], [4]);
 }
 
 #[test]

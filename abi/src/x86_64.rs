@@ -1,5 +1,52 @@
-//! Values that the x86-64 architecture layer fixes (Interrupts, Register
-//! calls).
+//! Values that the x86-64 architecture layer fixes (Values of the machine,
+//! Interrupts, Register calls, Unlike cores, I/O ports).
+
+use crate::{ASPACE_PAGES, FeatureList, Geometry, IOSPACE_PAGES};
+
+/// *P*, the large pages, *E* and *L* with four levels of tables.
+pub const PAGE: u64 = 4096;
+pub const LARGE: [u64; 2] = [2 << 20, 1 << 30];
+pub const TABLE_ENTRIES: u32 = 512;
+pub const LEVELS: u32 = 4;
+/// The first address beyond the user range: 255 × 512 GB.
+pub const USER_RANGE_END: u64 = 0x7F80_0000_0000;
+/// The machine's values as the entry `Memory` publishes them, with 1 GB
+/// pages.
+pub const GEOMETRY: Geometry = Geometry {
+    page_shift: [12, 21, 30, 0],
+    entries: TABLE_ENTRIES,
+    levels: LEVELS,
+    user_end: USER_RANGE_END,
+};
+/// Two pages, a table page, the smallest untyped, a chunk.
+pub const ASPACE_BYTES: u64 = ASPACE_PAGES * PAGE;
+pub const IOSPACE_BYTES: u64 = IOSPACE_PAGES * PAGE;
+pub const TABLE_BYTES: u64 = PAGE;
+pub const UNTYPED_MIN_BYTES: u64 = PAGE;
+pub const CHUNK_BYTES: u64 = LARGE[0];
+/// The start-up page and the message page at *P* and 2 × *P*; no segment of
+/// the first service below the first large page.
+pub const START_MESSAGE_PAGE_ADDR: u64 = PAGE;
+pub const START_PAGE_ADDR: u64 = 2 * PAGE;
+pub const FIRST_SERVICE_MIN_ADDR: u64 = LARGE[0];
+
+/// The save area of x87, SSE and AVX state (`X86_XSTATE_AVX_SIZE`): a
+/// thread of mask 0 on the reference machine is 1,024 + 832, rounded up to
+/// 2,048 bytes.
+pub const XSTATE_X87_SSE_AVX_BYTES: u32 = 832;
+
+/// State features (bits 0-30) and the first instruction feature.
+pub const AVX: u32 = 0;
+pub const AVX512: u32 = 1;
+/// Large: always optional, disabled through the extended feature disable
+/// register.
+pub const AMX: u32 = 2;
+pub const APX: u32 = 3;
+pub const FEATURES: FeatureList = FeatureList {
+    state: 1 << AVX | 1 << AVX512 | 1 << AMX | 1 << APX,
+    with_length: 0,
+    large: 1 << AMX,
+};
 
 /// The vectors that `irq_claim` accepts; the others are the kernel's.
 pub const IRQ_VECTOR_FIRST: u8 = 48;
@@ -11,7 +58,7 @@ pub const IRQ_TABLE_ENTRIES: usize = 192;
 pub const IRQ_MAX_NODES_REMAPPED: u32 = 341;
 
 /// Words of the register block.
-pub const REGS_WORDS: usize = 20;
+pub const REGS_WORDS: usize = 26;
 pub const REG_RIP: usize = 0;
 pub const REG_RSP: usize = 1;
 pub const REG_RFLAGS: usize = 2;
@@ -26,6 +73,40 @@ pub const REG_RBP: usize = 9;
 pub const REG_R8: usize = 10;
 pub const REG_FS_BASE: usize = 18;
 pub const REG_GS_BASE: usize = 19;
+/// The breakpoint addresses DR0 to DR3, the breakpoint control DR7, and the
+/// word of user interrupts (always 0 today).
+pub const REG_DR0: usize = 20;
+pub const REG_DR1: usize = 21;
+pub const REG_DR2: usize = 22;
+pub const REG_DR3: usize = 23;
+pub const REG_DR7: usize = 24;
+pub const REG_UINTR: usize = 25;
+/// Hardware breakpoints of a user thread.
+pub const HW_BREAKPOINTS: usize = 4;
+/// The bits of DR7 a user thread may set (Intel SDM, volume 3, 18.2.4):
+/// the local enables L0-L3 (bits 0, 2, 4, 6) and the condition and length
+/// fields R/W0-3 and LEN0-3 (bits 16-31). Not the global enables, not LE
+/// and GE, not RTM, not the general-detect bit GD (13).
+pub const DR7_USER_MASK: u64 = 0xFFFF_0055;
+/// The condition 0b10 of a R/W field is the I/O condition (with CR4.DE).
+pub const DR7_CONDITION_IO: u64 = 0b10;
+
+/// Whether a breakpoint control word is one a user thread may set: no bit
+/// outside the user mask, and no condition field naming I/O.
+pub const fn dr7_valid(word: u64) -> bool {
+    if word & !DR7_USER_MASK != 0 {
+        return false;
+    }
+    let mut n = 0;
+    while n < HW_BREAKPOINTS {
+        if word >> (16 + 4 * n) & 0b11 == DR7_CONDITION_IO {
+            return false;
+        }
+        n += 1;
+    }
+    true
+}
+
 /// The words that must be canonical addresses.
 pub const REGS_CANONICAL: [usize; 4] = [REG_RIP, REG_RSP, REG_FS_BASE, REG_GS_BASE];
 /// The bits of rflags that user code can change: CF, PF, AF, ZF, SF, TF, DF,
@@ -45,3 +126,11 @@ pub const fn canonical(address: u64) -> bool {
 pub const fn rflags(written: u64) -> u64 {
     written & RFLAGS_USER_MASK | RFLAGS_FIXED
 }
+
+/// The ports the kernel keeps for the whole boot: the legacy PIC.
+pub const KERNEL_PORTS: [(u64, u64); 2] = [(0x20, 0x21), (0xA0, 0xA1)];
+/// The PCI configuration mechanism: allowed only to the holder of the plain
+/// role `platform`.
+pub const PCI_CONFIG_PORTS: (u64, u64) = (0xCF8, 0xCFF);
+/// The ports of a 16550 UART, from its base.
+pub const UART_PORTS: u64 = 8;

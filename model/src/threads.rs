@@ -61,14 +61,14 @@ impl Model {
         Ok(Output::Done)
     }
 
-    /// Threads: the message page is a frame of exactly one 4 KB page of
+    /// Threads: the message page is a frame of exactly one page (index 0) of
     /// ordinary memory (`invalid`, judged with its kind), with `read` and
     /// `write`.
     fn message_page(&self, thread: ObjId, at: SlotAddr) -> Result<CapId, Error> {
         let cap = self.cap(thread, at, Rights::READ)?;
         let object = self.caps[&cap].object;
         let one_page = self.frames.get(&object).is_some_and(|frame| {
-            frame.page == PageSize::Size4K
+            frame.page == PageSize::Page
                 && frame.pages == 1
                 && frame.memory == MemoryType::WriteBack
         });

@@ -7,16 +7,14 @@ use crate::{
 };
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
-    ASPACE_BYTES, CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
-    ENDPOINT_BYTES, Error, FRAME_MAX_PAGES, IOSPACE_BYTES, LONGEST_WALK, MemoryType, NOTIFY_BYTES,
+    ASPACE_PAGES, CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
+    ENDPOINT_BYTES, Error, Geometry, IOSPACE_PAGES, LONGEST_WALK, MemoryType, NOTIFY_BYTES,
     ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP, REPLY_BYTES, Rights, SCHED_BYTES,
-    SLOT_BYTES, SlotAddr, TASK_BYTES, THREAD_BYTES, TIMER_BYTES, TREE_DEPTH, UNTYPED_MIN_BYTES,
+    SLOT_BYTES, SlotAddr, TASK_BYTES, THREAD_FIXED_BYTES, TIMER_BYTES, TREE_DEPTH,
 };
 
 /// Slots and addresses: one segment of a capability space, 8 KB.
 const SEGMENT_BYTES: u64 = CSPACE_SEGMENT_SLOTS as u64 * SLOT_BYTES as u64;
-/// Rules of `untyped_retype`: the greatest alignment of a kernel object.
-const PAGE: u64 = PageSize::Size4K.bytes();
 
 /// The size argument of `untyped_retype`, as the caller gives it. For a
 /// frame: the number of pages, and the raw words of the page size and of
@@ -95,8 +93,10 @@ fn footprint(
     kind: ObjectKind,
     arg: SizeArgument,
     device: bool,
-    supported: u32,
+    geometry: Geometry,
+    thread: u64,
 ) -> Result<(u64, u64, Option<Frame>), Error> {
+    let page = geometry.page();
     let size = arg.size;
     if device && kind != ObjectKind::Frame && kind != ObjectKind::Untyped {
         return Err(Error::Invalid);
@@ -104,24 +104,23 @@ fn footprint(
     let segments = size / u64::from(CSPACE_SEGMENT_SLOTS);
     let fixed = |bytes: usize| (bytes as u64, size == 0);
     let (bytes, valid) = match kind {
-        ObjectKind::Untyped => (size, size.is_power_of_two() && size >= UNTYPED_MIN_BYTES),
+        // Capabilities and objects: a power of two, at least one page.
+        ObjectKind::Untyped => (size, size.is_power_of_two() && size >= page),
         ObjectKind::Frame => {
-            let page = PageSize::from_raw(arg.page).ok_or(Error::Invalid)?;
-            if supported & 1 << page as u32 == 0 {
-                return Err(Error::Unsupported);
-            }
+            let size_index = PageSize::from_raw(arg.page).ok_or(Error::Invalid)?;
+            let bytes = geometry.bytes(size_index).ok_or(Error::Unsupported)?;
             let memory = MemoryType::for_memory(arg.memory, device)?;
-            if size == 0 || size > FRAME_MAX_PAGES {
+            if size == 0 || size > u64::from(geometry.entries) {
                 return Err(Error::Invalid);
             }
             // Rules of `untyped_retype`: a frame takes exactly its number of
             // pages times its page size, aligned on its page size.
             let frame = Frame {
-                page,
+                page: size_index,
                 pages: size,
                 memory,
             };
-            return Ok((size * page.bytes(), page.bytes(), Some(frame)));
+            return Ok((size * bytes, bytes, Some(frame)));
         }
         // Slots and addresses: a non-zero multiple of 128, at most 2^20, and
         // a directory rounded up to a power of two.
@@ -131,29 +130,35 @@ fn footprint(
                 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into())
                 && size <= CSPACE_MAX_SLOTS.into(),
         ),
-        ObjectKind::ASpace => fixed(ASPACE_BYTES),
-        ObjectKind::IoSpace => fixed(IOSPACE_BYTES),
-        // Rules of `untyped_retype`: a thread in the one-core reference is
-        // 1 KB.
-        ObjectKind::Thread => fixed(THREAD_BYTES),
+        // Address spaces and their tables: two pages.
+        ObjectKind::ASpace => (ASPACE_PAGES * page, size == 0),
+        ObjectKind::IoSpace => (IOSPACE_PAGES * page, size == 0),
+        // Object sizes: a thread is its fixed part and its save area,
+        // rounded up to a power of two.
+        ObjectKind::Thread => (thread, size == 0),
         ObjectKind::Sched => fixed(SCHED_BYTES),
         ObjectKind::Endpoint => fixed(ENDPOINT_BYTES),
         ObjectKind::Reply => fixed(REPLY_BYTES),
         ObjectKind::Notify => fixed(NOTIFY_BYTES),
         ObjectKind::Timer => fixed(TIMER_BYTES),
         ObjectKind::Task => fixed(TASK_BYTES),
-        ObjectKind::Irq | ObjectKind::IrqControl | ObjectKind::Iommu => {
-            return Err(Error::Invalid);
-        }
-        ObjectKind::IoPorts | ObjectKind::Core | ObjectKind::Debug | ObjectKind::Vcpu => {
-            return Err(Error::Unsupported);
-        }
+        // Order of checks, step 3: a kind never made from an untyped is
+        // `invalid` (D-110); the reserved `vcpu` is `unsupported`.
+        ObjectKind::Irq
+        | ObjectKind::IrqControl
+        | ObjectKind::Iommu
+        | ObjectKind::MemoryControl
+        | ObjectKind::Core
+        | ObjectKind::Role
+        | ObjectKind::Debug
+        | ObjectKind::IoPorts => return Err(Error::Invalid),
+        ObjectKind::Vcpu => return Err(Error::Unsupported),
     };
     // Rules of `untyped_retype`: aligned on the size of a child untyped, and
-    // for the other objects on their size, or on 4 KB if they are larger.
+    // for the other objects on their size, or on a page if they are larger.
     let align = match kind {
         ObjectKind::Untyped => bytes,
-        _ => bytes.min(PAGE),
+        _ => bytes.min(page),
     };
     valid.then_some((bytes, align, None)).ok_or(Error::Invalid)
 }
@@ -271,7 +276,9 @@ impl Model {
         // Order of checks, step 3: the kind is judged before the size
         // argument.
         let device = self.untypeds[&object].device;
-        let (bytes, align, frame) = footprint(kind, size, device, self.page_sizes)?;
+        let thread = self.thread_bytes();
+        let geometry = self.machine.geometry;
+        let (bytes, align, frame) = footprint(kind, size, device, geometry, thread)?;
         self.fits(place.space, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
         // Rules of `untyped_retype`: the kernel clears every object it
@@ -330,6 +337,13 @@ impl Model {
         let slots = space.slots.len() + CSPACE_SEGMENT_SLOTS as usize;
         space.slots.resize(slots, Slot::Empty);
         Ok(Output::Slots(slots as u32))
+    }
+
+    /// Object sizes: the bytes of a thread of mask 0 on the reference
+    /// machine, x86-64 with x87, SSE and AVX state: 1 KB + 832, rounded up.
+    pub(crate) fn thread_bytes(&self) -> u64 {
+        let area = u64::from(dodos_abi::x86_64::XSTATE_X87_SSE_AVX_BYTES);
+        (THREAD_FIXED_BYTES + area).next_power_of_two()
     }
 
     /// The derivation tree: a start-up capability is at depth 1. The walk

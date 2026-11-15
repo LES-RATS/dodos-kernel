@@ -408,7 +408,7 @@ fn first_thread_starts_at_the_entry_point_with_the_start_up_page() {
         panic!("no registers");
     };
     assert_eq!(block[REG_RIP], ENTRY);
-    assert_eq!(block[REG_RDI], START_PAGE_ADDR);
+    assert_eq!(block[REG_RDI], x86_64::START_PAGE_ADDR);
     assert_eq!(block[REG_RFLAGS], 0x202);
     assert_eq!(block[REG_RSP], 0);
 }

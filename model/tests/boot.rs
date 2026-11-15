@@ -199,10 +199,10 @@ fn address_space_maps_the_segments_the_message_page_and_the_start_up_page() {
     assert_eq!(mapped(0x21_0000), Some(r.union(w)));
     assert_eq!(mapped(0x21_3fff), Some(r.union(w)));
     assert_eq!(mapped(0x21_4000), None);
-    assert_eq!(mapped(START_MESSAGE_PAGE_ADDR), Some(r.union(w)));
-    assert_eq!(mapped(START_PAGE_ADDR), Some(r));
+    assert_eq!(mapped(x86_64::START_MESSAGE_PAGE_ADDR), Some(r.union(w)));
+    assert_eq!(mapped(x86_64::START_PAGE_ADDR), Some(r));
     // One page of start-up page, and nothing else.
-    assert_eq!(mapped(START_PAGE_ADDR + 0x1000), None);
+    assert_eq!(mapped(x86_64::START_PAGE_ADDR + 0x1000), None);
     assert_eq!(mapped(0), None);
 }
 
@@ -222,7 +222,7 @@ fn message_page_frame_holds_the_binding_and_its_copy_the_mapping() {
     }
     // Deleting the copy undoes the mapping; the binding stays.
     m.apply(t, Syscall::CapDelete(own(11))).unwrap();
-    assert_eq!(m.translated(t, START_MESSAGE_PAGE_ADDR), None);
+    assert_eq!(m.translated(t, x86_64::START_MESSAGE_PAGE_ADDR), None);
     let long = Message {
         words: vec![0; 7],
         ..Message::default()
@@ -338,8 +338,14 @@ fn kernel_refuses_a_start_up_page_of_more_than_63_pages() {
     let fits = with(|m| m.files[0].name = 61 * 4096);
     let (m, t) = boot(&fits);
     // 62 pages: mapped from 0x2000.
-    assert!(m.translated(t, START_PAGE_ADDR + 61 * 4096).is_some());
-    assert!(m.translated(t, START_PAGE_ADDR + 62 * 4096).is_none());
+    assert!(
+        m.translated(t, x86_64::START_PAGE_ADDR + 61 * 4096)
+            .is_some()
+    );
+    assert!(
+        m.translated(t, x86_64::START_PAGE_ADDR + 62 * 4096)
+            .is_none()
+    );
 }
 
 #[test]

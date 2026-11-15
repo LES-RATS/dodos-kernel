@@ -11,18 +11,66 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+mod debug;
+mod features;
+mod machine;
 mod start;
+
+pub mod aarch64;
+pub mod riscv64;
 pub mod x86_64;
 
+pub use debug::{
+    Build, CONSOLE_STEP_BYTES, CONSOLE_TICK_NS, CRASH_AREA_MAGIC, CRASH_AREA_VERSION,
+    CRASH_HEADER_BYTES, CRASH_RECORD_KERNEL_ENTRIES, CRASH_RECORD_USER_ENTRIES, ConsoleKind,
+    ConsoleMessage, CrashAreaHeader, CrashReason, DEBUG_AREA_BYTES, DEBUG_AREA_MAGIC,
+    DEBUG_AREA_VERSION, DEBUG_HEADER_BYTES, DEBUG_WRITE_MAX, DebugAreaHeader,
+    NODE_CRASH_RECORD_BYTES, NodeCrashRecord, STUB_STOP_NS, StopRecord, TRACE_BURST,
+    TRACE_BURST_NS, TRACE_ENTRY_BYTES, TRACE_FLAG_CONTINUED, TRACE_KERNEL_ENTRIES,
+    TRACE_KERNEL_OFFSET, TRACE_TEXT_BYTES, TRACE_USER_ENTRIES, TRACE_USER_OFFSET, TraceCode,
+    TraceEntry, trace_index,
+};
+pub use features::{
+    FEATURE_INSTRUCTION_FIRST, FEATURE_USER_INTERRUPTS, FeatureList, FeatureMask, Kind,
+    kind_covers, thread_bytes,
+};
+pub use machine::{
+    BarrierView, BootFloors, BootMembership, CHECK_MUL, CORE_EVENT_FEEDBACK, CORE_IMAGE_BOOT,
+    CORE_IMAGE_REPLACEMENT, CORE_START_FRESH, CORE_START_RESUME, CORE_STATUS_FENCE_SHIFT,
+    CORE_STATUS_PARKED, CORE_STATUS_UNUSABLE, CORE_STATUS_WORDS, CORE_STOP_KILL, CORE_STOP_RETIRE,
+    CORE_STOP_SEAL, CORE_WATCH_SLOTS, DEVICE_TABLE_SPARE, DRIVER_NONE, DeviceEntry, Evidence,
+    FENCE_CLASS_COOPERATIVE, FENCE_CLASS_FORCED, FENCE_CLASS_SIGNALLED, FENCE_NS, Floors,
+    GRANT_ENTRY_BYTES, GRANTS, Governs, IDLE_ENTRY_WORDS, IDLE_FLAG_LOSES_CONTEXT,
+    IDLE_METHOD_HALT, IDLE_METHOD_MWAIT, IDLE_METHOD_PSCI, IDLE_METHOD_SBI, IDLE_STATES_MAX,
+    IoPortRange, Member, MemberState, ModuleFrame, ModuleFrames, NMI_GRACE_NS, NODES_MAX,
+    OBSERVATION_LIFE, OBSERVATIONS_MAX, OWNER_RESERVE_BASE, OWNER_UNCLAIMED, OwnState, Owner,
+    Ownership, PROXIES_PER_PEER, PROXY_BYTES, RECOVERY_BANDWIDTH, RECOVERY_PERIOD_NS, RESERVES_MAX,
+    RESERVES_MIN, ROLE_NOBODY, ROLE_PLAIN_PLATFORM, ROLES_PLAIN_MAX, RemoteRef, RoleKind,
+    RoleState, RoleWord, SETTLE_NS, SLOT_BY_KIND_SHIFT, SLOT_DEAD, SLOT_DEPTH_SHIFT, SLOT_DYING,
+    SLOT_EMPTY, SLOT_FRAME_DEVICE, SLOT_FRAME_FIRST_SHIFT, SLOT_FRAME_MEMORY_SHIFT,
+    SLOT_FRAME_PAGE_SHIFT, SLOT_FRAME_PAGES_SHIFT, SLOT_FULL, SLOT_KIND_SHIFT, SLOT_RECORD_BINDING,
+    SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_RIGHTS_SHIFT, SLOT_REMOTE,
+    SLOT_REMOTE_GRANT_SHIFT, SLOT_REMOTE_SERIAL_SHIFT, SLOT_REMOTE_USE_SHIFT, SLOT_RIGHTS_SHIFT,
+    SLOT_ROOT, SLOT_STATE_MASK, SLOT_UNTYPED_BLOCK, SLOT_UNTYPED_CLEAN, SLOT_UNTYPED_DEVICE,
+    SLOT_UNTYPED_ENTRY, SLOT_UNTYPED_ENTRY_SHIFT, SLOT_UNTYPED_LOG2_SHIFT, STALE_NS,
+    STALE_RANGE_NS, START_NS, STUCK_NS, SWEEP_NS, SWEEP_RANGE_NS, Transition, USE_ENTRY_BYTES,
+    barrier, clear_step, clear_steps, floors, ioport_check, member_transition, module_frames,
+    ports_meet, successor,
+};
 pub use start::{
-    FIRST_SERVICE_MIN_ADDR, SHARE_ALIGN, START_FREE_SLOTS, START_MAGIC, START_MESSAGE_PAGE_ADDR,
-    START_PAGE_ADDR, START_PAGE_MAX_PAGES, START_RESERVE_BYTES, START_SLOT_ASPACE,
-    START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS,
-    START_SLOT_IRQ_CONTROL, START_SLOT_MESSAGE_PAGE, START_SLOT_MESSAGE_PAGE_MAP, START_SLOT_SCHED,
-    START_SLOT_START_PAGE, START_SLOT_TASK, START_SLOT_THREAD, START_UNTYPED_DEVICE,
-    START_UNTYPED_IMAGE, START_VERSION, StartBootTimes, StartCore, StartEntry, StartFramebuffer,
-    StartHeader, StartInterrupts, StartIoApic, StartIommu, StartKept, StartKind, StartMemory,
-    StartModule, StartNode, StartProcess, StartShare, StartUntyped,
+    START_CORE_BOOTED, START_CORE_FENCE_SHIFT, START_FREE_SLOTS, START_IRQ_DIRECTED_EOI,
+    START_IRQ_REMAPPING, START_IRQ_X2APIC, START_MAGIC, START_MEMORY_CONTROL_FLOW,
+    START_MEMORY_GATE_NO_WINDOW, START_MEMORY_MAP_THROUGH_ROLE, START_MEMORY_MONITOR,
+    START_MODULE_EXEC, START_MODULE_FIRST_SERVICE, START_MODULE_MAPPED, START_MODULE_READ,
+    START_MODULE_WRITE, START_NODE_FRESH, START_NODE_RESUMED, START_PAGE_MAX_PAGES,
+    START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS,
+    START_SLOT_IRQ_CONTROL, START_SLOT_MACHINE_FIXED, START_SLOT_MACHINE_LIVING,
+    START_SLOT_MAILBOX, START_SLOT_MEMORY_CONTROL, START_SLOT_MESSAGE_PAGE,
+    START_SLOT_MESSAGE_PAGE_MAP, START_SLOT_SCHED, START_SLOT_START_PAGE, START_SLOT_TASK,
+    START_SLOT_THREAD, START_UNTYPED_DEVICE, START_VERSION, StartBootTimes, StartCore, StartCrash,
+    StartDebug, StartEntry, StartFeedback, StartFramebuffer, StartHeader, StartImage,
+    StartInterrupts, StartIoApic, StartIommu, StartKept, StartKind, StartKindRecord, StartMachine,
+    StartMemory, StartModule, StartNode, StartProcess, StartRole, StartShare, StartUntyped,
 };
 
 /// Message words carried in registers on x86-64. A message that fits here,
@@ -34,7 +82,8 @@ pub const MAX_WORDS: usize = 64;
 pub const MAX_CAPS: usize = 4;
 /// Bytes of one capability slot (Object sizes).
 pub const SLOT_BYTES: usize = 64;
-/// Slots added by one `cspace_grow`: one segment of 8 KB.
+/// Slots added by one `cspace_grow`: one segment of 8 KB, a byte size that
+/// does not change with the page (Values of the machine).
 pub const CSPACE_SEGMENT_SLOTS: u32 = 128;
 /// Units of work of one call of a removal before it returns `Again`: a
 /// capability removed, a thread woken, or one link of a destroyed object
@@ -63,11 +112,8 @@ pub const CSPACE_MAX_SLOTS: u32 = 1 << 20;
 /// addresses).
 pub const CSPACE_DIRECTORY_BYTES: usize = 8;
 
-/// Bytes of the smallest `untyped` (Capabilities and objects,
-/// `untyped_retype`: a power of two, at least 4 KB).
-pub const UNTYPED_MIN_BYTES: u64 = 4096;
 /// Bytes that one call of a creation clears, at most (rules of
-/// `untyped_retype`, the clean mark).
+/// `untyped_retype`, the clean mark). A byte size, not a number of pages.
 pub const CLEAR_STEP_BYTES: u64 = 65_536;
 /// Bytes of an `endpoint`, of a `reply`, of a `notify` and of a `timer`
 /// (Object sizes).
@@ -79,24 +125,27 @@ pub const TIMER_BYTES: usize = 64;
 pub const IRQ_BYTES: usize = 64;
 /// Bytes of a `task` (Object sizes).
 pub const TASK_BYTES: usize = 256;
-/// Bytes of a `sched` (Object sizes).
-pub const SCHED_BYTES: usize = 128;
-/// Bytes of a `thread` in the one-core reference, without the vector state
-/// area (Capabilities and objects, rules of `untyped_retype`).
-pub const THREAD_BYTES: usize = 1024;
-/// Bytes of an `aspace` and of an `iospace`: the root table and a header
-/// (Object sizes).
-pub const ASPACE_BYTES: usize = 8192;
-pub const IOSPACE_BYTES: usize = 8192;
-/// Bytes of one lower table of an address space, and its entries.
-pub const TABLE_BYTES: usize = 4096;
-pub const TABLE_ENTRIES: usize = 512;
-/// Pages of one frame, at most.
-pub const FRAME_MAX_PAGES: u64 = 512;
+/// Bytes of a `sched` (Object sizes: the parameters in force and pending,
+/// the links of the queues and of the change list, the chain, the count).
+pub const SCHED_BYTES: usize = 256;
+/// Bytes of the fixed part of a `thread`; the vector state area is added
+/// and the sum rounded up to a power of two (Object sizes, Unlike cores).
+pub const THREAD_FIXED_BYTES: u64 = 1024;
+/// Pages of an `aspace` and of an `iospace`: the root table and a header
+/// (Address spaces and their tables).
+pub const ASPACE_PAGES: u64 = 2;
+pub const IOSPACE_PAGES: u64 = 2;
+/// Entries of one table page, at most: the number of pages of a frame and
+/// the fields of a mapping record have 12 bits (Values of the machine).
+pub const TABLE_ENTRIES_MAX: u32 = 4096;
+/// Levels of the tables of an `aspace`, at least (Values of the machine).
+pub const LEVELS_MIN: u32 = 2;
 /// Devices that one `iospace` serves, at most.
 pub const IOSPACE_MAX_DEVICES: usize = 16;
 /// Nanoseconds within which an IOMMU unit confirms an invalidation.
 pub const IOMMU_WAIT_NS: u64 = 1_000_000;
+/// Bytes of `entropy_read`, at most (Entropy).
+pub const ENTROPY_MAX_BYTES: u64 = 64;
 
 /// Address of a capability slot: an index, reached directly in the caller's
 /// own capability space (`via` = 0) or through one `cspace` capability held
@@ -271,34 +320,142 @@ pub enum ObjectKind {
     /// Reserved, not built.
     Vcpu = 16,
     IrqControl = 17,
+    /// A machine object: one IOMMU unit.
     Iommu = 18,
+    /// The authority to take, give and split the blocks of one node.
+    MemoryControl = 19,
+    /// A machine object: one duty with one holder at a time.
+    Role = 20,
 }
 
+impl ObjectKind {
+    /// The kinds, by number: the entry `ObjectSizes` covers them all.
+    pub const ALL: [Self; 21] = [
+        Self::Untyped,
+        Self::CSpace,
+        Self::ASpace,
+        Self::Frame,
+        Self::Thread,
+        Self::Sched,
+        Self::Endpoint,
+        Self::Reply,
+        Self::Notify,
+        Self::Timer,
+        Self::Irq,
+        Self::IoPorts,
+        Self::IoSpace,
+        Self::Task,
+        Self::Core,
+        Self::Debug,
+        Self::Vcpu,
+        Self::IrqControl,
+        Self::Iommu,
+        Self::MemoryControl,
+        Self::Role,
+    ];
+}
+
+/// A page size, by its index (Values of the machine): 0 the page, 1 the
+/// first large page, 2 the second, 3 the third. Its bytes are a value of the
+/// machine, read from the entry `Memory` of the start-up page
+/// ([`Geometry::bytes`]).
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PageSize {
-    Size4K = 0,
-    Size2M = 1,
-    Size1G = 2,
+    Page = 0,
+    Large1 = 1,
+    Large2 = 2,
+    Large3 = 3,
 }
 
 impl PageSize {
-    pub const fn bytes(self) -> u64 {
-        match self {
-            Self::Size4K => 1 << 12,
-            Self::Size2M => 1 << 21,
-            Self::Size1G => 1 << 30,
-        }
-    }
+    pub const ALL: [Self; 4] = [Self::Page, Self::Large1, Self::Large2, Self::Large3];
 
     /// `None` for a value that names no page size.
     pub const fn from_raw(raw: u64) -> Option<Self> {
         match raw {
-            0 => Some(Self::Size4K),
-            1 => Some(Self::Size2M),
-            2 => Some(Self::Size1G),
+            0 => Some(Self::Page),
+            1 => Some(Self::Large1),
+            2 => Some(Self::Large2),
+            3 => Some(Self::Large3),
             _ => None,
         }
+    }
+}
+
+/// The values of the machine that fix the shape of memory (Values of the
+/// machine), as the entry `Memory` of the start-up page publishes them.
+/// The default is all zero, which [`Geometry::valid`] refuses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Geometry {
+    /// The log2 of each page size, by index; 0 where the processor has none.
+    pub page_shift: [u8; 4],
+    /// *E*, the entries of one table page.
+    pub entries: u32,
+    /// *L*, the levels of the tables of an `aspace`.
+    pub levels: u32,
+    /// The first address beyond the user range.
+    pub user_end: u64,
+}
+
+impl Geometry {
+    /// The bytes of a page size, `None` where the processor has none.
+    pub const fn bytes(&self, size: PageSize) -> Option<u64> {
+        match self.page_shift[size as usize] {
+            0 => None,
+            shift => Some(1 << shift),
+        }
+    }
+
+    /// *P*, the bytes of a page.
+    pub const fn page(&self) -> u64 {
+        1 << self.page_shift[0]
+    }
+
+    /// The log2 of the chunk: the first large page (Chunks).
+    pub const fn chunk_shift(&self) -> u32 {
+        self.page_shift[1] as u32
+    }
+
+    pub const fn chunk(&self) -> u64 {
+        1 << self.chunk_shift()
+    }
+
+    /// The bit set of the supported page sizes, bit `i` for index `i`.
+    pub const fn sizes(&self) -> u32 {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < 4 {
+            if self.page_shift[i] != 0 {
+                bits |= 1 << i;
+            }
+            i += 1;
+        }
+        bits
+    }
+
+    /// Whether the values are ones the kernel starts with (Values of the
+    /// machine, Start-up state): a page, a chunk above it, larger page
+    /// sizes in increasing order with none after a missing one, *E* a power
+    /// of two from 2 to 4,096, *L* at least 2, and a user range end that is
+    /// a multiple of the chunk.
+    pub const fn valid(&self) -> bool {
+        let s = self.page_shift;
+        let mut ordered = s[0] >= 12 && s[1] > s[0] && s[1] < 48;
+        let mut i = 2;
+        while i < 4 {
+            if s[i] != 0 && (s[i] <= s[i - 1] || s[i - 1] == 0 || s[i] >= 48) {
+                ordered = false;
+            }
+            i += 1;
+        }
+        ordered
+            && self.entries.is_power_of_two()
+            && self.entries >= 2
+            && self.entries <= TABLE_ENTRIES_MAX
+            && self.levels >= LEVELS_MIN
+            && self.user_end != 0
+            && self.user_end.is_multiple_of(self.chunk())
     }
 }
 
@@ -326,26 +483,26 @@ impl MemoryType {
 }
 
 /// Calls on address spaces: the plain arguments that place a mapping. The
-/// address is a multiple of the page size; the first page is in the frame;
-/// the page count is at least 1 and does not run past the frame; and the
-/// range lies below `limit`, computed without overflow. `Invalid` otherwise,
-/// in that order.
+/// address is a multiple of the page size (`page` bytes, a power of two);
+/// the first page is in the frame; the page count is at least 1 and does
+/// not run past the frame; and the range lies below `limit`, computed
+/// without overflow. `Invalid` otherwise, in that order. A frame has at most
+/// *E* pages, so an accepted range holds at most *E* pages.
 pub const fn mapping_range(
     address: u64,
     first: u64,
     count: u64,
     frame_pages: u64,
-    page: PageSize,
+    page: u64,
     limit: u64,
 ) -> Result<(), Error> {
-    let size = page.bytes();
-    if !address.is_multiple_of(size) || first >= frame_pages {
+    if !address.is_multiple_of(page) || first >= frame_pages {
         return Err(Error::Invalid);
     }
     if count == 0 || count > frame_pages - first {
         return Err(Error::Invalid);
     }
-    match count.checked_mul(size) {
+    match count.checked_mul(page) {
         Some(bytes) if address <= limit && bytes <= limit - address => Ok(()),
         _ => Err(Error::Invalid),
     }
@@ -427,6 +584,22 @@ pub enum Call {
     ThreadCancel,
     IrqClaim,
     SchedRead,
+    MemoryTake,
+    MemoryGive,
+    MemorySplit,
+    CoreIdle,
+    CoreWatch,
+    CorePlace,
+    RoleClaim,
+    RoleHand,
+    ThreadSetFeatures,
+    ThreadMove,
+    SchedCount,
+    IoportIn,
+    IoportOut,
+    IoportsIssue,
+    EntropyRead,
+    CorePerf,
 }
 
 /// Header word of a message: label (bits 0-31, opaque to the kernel), number
@@ -522,6 +695,27 @@ pub enum FaultKind {
     BadCall = 6,
     NoAddressSpace = 7,
     NoContext = 8,
+    /// A breakpoint or watchpoint of the thread's debug registers; word 3
+    /// holds the bits of those that hit, word 4 the status (x86-64: DR6).
+    HardwareBreakpoint = 9,
+}
+
+impl FaultKind {
+    /// `None` for a label that names no kind.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Page),
+            2 => Some(Self::Undefined),
+            3 => Some(Self::Arithmetic),
+            4 => Some(Self::Protection),
+            5 => Some(Self::Debug),
+            6 => Some(Self::BadCall),
+            7 => Some(Self::NoAddressSpace),
+            8 => Some(Self::NoContext),
+            9 => Some(Self::HardwareBreakpoint),
+            _ => None,
+        }
+    }
 }
 
 /// Words of a fault message.
@@ -551,13 +745,24 @@ pub const CORE_WINDOWS: u64 = 1024;
 pub const CORE_WINDOW_BITS: u32 = 64;
 /// Due events processed by one timer interrupt, at most.
 pub const TIME_EVENT_STEP: usize = 16;
-/// Budget and period of the scheduling context of the first thread.
+/// Period and budget of the scheduling context of the first thread: 63/64
+/// of the core, the recovery reserve holding the other 1/64 (Start-up
+/// state).
 pub const START_SCHED_PERIOD_NS: u64 = 10_000_000;
+pub const START_SCHED_BUDGET_NS: u64 = 9_843_750;
 /// The bits of the state word of `sched_read`.
 pub const SCHED_STATE_CONFIGURED: u64 = 1 << 0;
 pub const SCHED_STATE_THROTTLED: u64 = 1 << 1;
 pub const SCHED_STATE_HOME: u64 = 1 << 2;
 pub const SCHED_STATE_LENT: u64 = 1 << 3;
+/// Counting is on (`sched_count`).
+pub const SCHED_STATE_COUNTED: u64 = 1 << 4;
+/// Bits 8-15: 1 + the last hardware class, or 0 (Unlike cores).
+pub const SCHED_STATE_HW_CLASS_SHIFT: u32 = 8;
+pub const SCHED_STATE_HW_CLASS_MASK: u64 = 0xFF << 8;
+/// The modes of `sched_count`.
+pub const SCHED_COUNT_OFF: u64 = 0;
+pub const SCHED_COUNT_ON: u64 = 1;
 
 /// Admission: the bandwidth of a context, ⌈budget × 2^32 / period⌉, and 0
 /// for a period of 0 (a context that is not configured). The period is
@@ -639,6 +844,8 @@ pub struct IrqSource(u64);
 impl IrqSource {
     pub const KIND_MSI: u64 = 1;
     pub const KIND_LINE: u64 = 2;
+    /// A core event (Unlike cores): bits 8-15 the event, every other bit 0.
+    pub const KIND_CORE_EVENT: u64 = 3;
     const LEVEL: u64 = 1 << 8;
     const ACTIVE_LOW: u64 = 1 << 9;
 
@@ -663,19 +870,34 @@ impl IrqSource {
         Self(raw)
     }
 
-    /// `Invalid` for a kind other than 1 or 2, a reserved bit set, or bits
-    /// 8-9 set for an MSI.
+    /// A core event of the node's core (Unlike cores).
+    pub const fn core_event(event: u8) -> Self {
+        Self((event as u64) << 8 | Self::KIND_CORE_EVENT)
+    }
+
+    /// `Invalid` for a kind other than 1, 2 or 3, a reserved bit set, bits
+    /// 8-9 set for an MSI, or any bit but the event set for a core event.
     pub const fn from_raw(raw: u64) -> Result<Self, Error> {
         let reserved = raw >> 10 & 0x3f_ffff != 0;
         let valid = match raw & 0xff {
-            Self::KIND_MSI => raw & (Self::LEVEL | Self::ACTIVE_LOW) == 0,
-            Self::KIND_LINE => true,
+            Self::KIND_MSI => !reserved && raw & (Self::LEVEL | Self::ACTIVE_LOW) == 0,
+            Self::KIND_LINE => !reserved,
+            Self::KIND_CORE_EVENT => raw >> 16 == 0,
             _ => false,
         };
-        if reserved || !valid {
+        if !valid {
             return Err(Error::Invalid);
         }
         Ok(Self(raw))
+    }
+
+    pub const fn is_core_event(self) -> bool {
+        self.0 & 0xff == Self::KIND_CORE_EVENT
+    }
+
+    /// The event of a core event.
+    pub const fn event(self) -> u8 {
+        (self.0 >> 8) as u8
     }
 
     pub const fn raw(self) -> u64 {
@@ -707,12 +929,13 @@ impl IrqSource {
         (self.0 >> 32) as u8 & 0x7
     }
 
+    /// A level line; MSI messages and core events are edge sources.
     pub const fn level(self) -> bool {
-        self.0 & Self::LEVEL != 0
+        self.is_line() && self.0 & Self::LEVEL != 0
     }
 
     pub const fn active_low(self) -> bool {
-        self.0 & Self::ACTIVE_LOW != 0
+        self.is_line() && self.0 & Self::ACTIVE_LOW != 0
     }
 }
 
@@ -818,7 +1041,7 @@ mod proofs {
     }
 
     #[kani::proof]
-    fn accepted_mapping_lies_below_the_limit_and_holds_at_most_512_pages() {
+    fn accepted_mapping_lies_below_the_limit_and_holds_at_most_e_pages() {
         let (address, first, count, pages, limit): (u64, u64, u64, u64, u64) = (
             kani::any(),
             kani::any(),
@@ -826,16 +1049,15 @@ mod proofs {
             kani::any(),
             kani::any(),
         );
-        let page = match kani::any::<u8>() % 3 {
-            0 => PageSize::Size4K,
-            1 => PageSize::Size2M,
-            _ => PageSize::Size1G,
-        };
-        kani::assume(pages >= 1 && pages <= FRAME_MAX_PAGES);
+        let (shift, entries): (u32, u64) = (kani::any(), kani::any());
+        kani::assume((12..48).contains(&shift));
+        kani::assume(entries >= 2 && entries <= TABLE_ENTRIES_MAX as u64);
+        kani::assume(pages >= 1 && pages <= entries);
+        let page = 1u64 << shift;
         if mapping_range(address, first, count, pages, page, limit).is_ok() {
-            assert!(count >= 1 && count <= FRAME_MAX_PAGES && first + count <= pages);
-            assert!(address % page.bytes() == 0);
-            let end = address as u128 + count as u128 * page.bytes() as u128;
+            assert!(count >= 1 && count <= entries && first + count <= pages);
+            assert!(address % page == 0);
+            let end = address as u128 + count as u128 * page as u128;
             assert!(end <= limit as u128);
         }
     }
@@ -879,6 +1101,21 @@ mod proofs {
         assert!(IrqSource::from_raw(line.raw()) == Ok(line));
         assert!(line.is_line() && line.id() == gsi);
         assert!(line.level() == level && line.active_low() == low);
+        let event: u8 = kani::any();
+        let core = IrqSource::core_event(event);
+        assert!(IrqSource::from_raw(core.raw()) == Ok(core));
+        assert!(core.is_core_event() && core.event() == event && !core.level());
+    }
+
+    #[kani::proof]
+    fn irq_source_accepts_only_its_three_kinds() {
+        let raw: u64 = kani::any();
+        if let Ok(source) = IrqSource::from_raw(raw) {
+            let kind = raw & 0xff;
+            assert!(kind >= 1 && kind <= 3 && source.raw() == raw);
+            assert!(kind != 3 || raw >> 16 == 0);
+            assert!(kind == 3 || raw >> 10 & 0x3f_ffff == 0);
+        }
     }
 }
 

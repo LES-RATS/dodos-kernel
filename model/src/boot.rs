@@ -3,20 +3,21 @@
 //! the contract.
 
 use crate::caps::Clearing;
-use crate::memory::{USER_END, hooked};
+use crate::memory::hooked;
 use crate::{Frame, Iommu, Mapping, Model, ObjId, Place, live};
 use dodos_abi::TaskId;
 use dodos_abi::x86_64::{REG_RDI, REG_RIP};
 use dodos_abi::{
-    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, FIRST_SERVICE_MIN_ADDR, FRAME_MAX_PAGES, MemoryType,
-    ObjectKind, PageSize, Rights, SHARE_ALIGN, START_FREE_SLOTS, START_MESSAGE_PAGE_ADDR,
-    START_PAGE_ADDR, START_PAGE_MAX_PAGES, START_RESERVE_BYTES, START_SCHED_PERIOD_NS,
-    START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS,
+    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Geometry, MemoryType, ObjectKind, PageSize, Rights,
+    START_FREE_SLOTS, START_PAGE_MAX_PAGES, START_SCHED_PERIOD_NS, START_SLOT_ASPACE,
+    START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS,
     START_SLOT_IRQ_CONTROL, START_SLOT_MESSAGE_PAGE, START_SLOT_MESSAGE_PAGE_MAP, START_SLOT_SCHED,
     START_SLOT_START_PAGE, START_SLOT_TASK, START_SLOT_THREAD,
 };
 
-const PAGE: u64 = PageSize::Size4K.bytes();
+/// Pages of the start-up untyped that hold the start-up page and the
+/// message page.
+const START_RESERVE_PAGES: u64 = START_PAGE_MAX_PAGES + 1;
 
 /// The UEFI types of memory, as the start-up rules group them.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,11 +100,15 @@ pub struct Machine {
     pub entry: u64,
     /// The free tables that the address space of the first process keeps.
     pub reserve_tables: u64,
-    /// The page sizes of the processor, bit `i` for `PageSize` `i`.
-    pub page_sizes: u32,
+    /// Values of the machine: the page sizes the processor supports, *E*,
+    /// *L* and the end of the user range.
+    pub geometry: Geometry,
     /// The address width and the page sizes of the iospaces.
     pub io_width: u32,
     pub io_page_sizes: u32,
+    /// Unlike cores: whether the processor signals a change of the feedback
+    /// table or of the performance capabilities (source kind 3).
+    pub core_events: bool,
     /// The devices the kernel uses itself: an IOMMU unit, by its index, and
     /// a device identifier.
     pub kernel_devices: Vec<(usize, u16)>,
@@ -175,9 +180,10 @@ impl Machine {
             }],
             entry: 0x20_0000,
             reserve_tables: 4,
-            page_sizes: 0b111,
+            geometry: dodos_abi::x86_64::GEOMETRY,
             io_width: 48,
             io_page_sizes: 0b011,
+            core_events: false,
             kernel_devices: vec![(0, 0x00f8)],
             descriptor_size: 48,
             framebuffer: false,
@@ -254,8 +260,8 @@ fn blocks((mut at, end): (u64, u64)) -> Vec<(u64, u64)> {
 }
 
 /// The bytes of a module once laid out: a whole number of pages.
-fn laid_out(len: u64) -> u64 {
-    len.next_multiple_of(PAGE)
+fn laid_out(len: u64, page: u64) -> u64 {
+    len.next_multiple_of(page)
 }
 
 /// The start-up page: a header, a table of entries, then their contents,
@@ -306,10 +312,13 @@ impl Model {
             let regions = machine.memory.iter().filter(|region| region.kind == kind);
             sorted(regions.map(|r| (r.base, r.base + r.len)).collect())
         };
+        let geometry = machine.geometry;
+        let page = geometry.page();
         // The refusals: where the segments lie, and write or execute.
         for segment in &machine.segments {
             let end = segment.vaddr.checked_add(segment.len);
-            if segment.vaddr < FIRST_SERVICE_MIN_ADDR || end.is_none_or(|end| end > USER_END) {
+            let user_end = geometry.user_end;
+            if segment.vaddr < geometry.chunk() || end.is_none_or(|end| end > user_end) {
                 return Err(Refusal::SegmentPlace);
             }
             if segment.rights.contains(Rights::WRITE.union(Rights::EXEC)) {
@@ -319,25 +328,25 @@ impl Model {
         let mut placed: Ranges = machine
             .segments
             .iter()
-            .map(|s| (s.vaddr, s.vaddr + laid_out(s.len)))
+            .map(|s| (s.vaddr, s.vaddr + laid_out(s.len, page)))
             .collect();
         placed.sort();
         let overlap = placed.windows(2).any(|pair| pair[0].1 > pair[1].0);
-        if overlap || placed.iter().any(|(s, _)| !s.is_multiple_of(PAGE)) {
+        if overlap || placed.iter().any(|(s, _)| !s.is_multiple_of(page)) {
             return Err(Refusal::SegmentLayout);
         }
         let lens = machine.segments.iter().map(|s| s.len);
         let lens: Vec<u64> = lens.chain(machine.files.iter().map(|f| f.len)).collect();
         if lens
             .iter()
-            .any(|&len| laid_out(len) > FRAME_MAX_PAGES * PAGE)
+            .any(|&len| laid_out(len, page) > u64::from(geometry.entries) * page)
         {
             return Err(Refusal::ModuleSize);
         }
         // 2. The image region: 2^k bytes, the smallest power of two that
         // holds the modules and the reserve of 256 KB.
-        let modules: u64 = lens.iter().map(|&len| laid_out(len)).sum();
-        let image = (modules + START_RESERVE_BYTES).next_power_of_two();
+        let modules: u64 = lens.iter().map(|&len| laid_out(len, page)).sum();
+        let image = (modules + START_RESERVE_PAGES * page).next_power_of_two();
         let image_range = (machine.image_base, machine.image_base + image);
         assert!(
             machine.image_base.is_multiple_of(image),
@@ -351,14 +360,14 @@ impl Model {
         let cut = sorted(cut);
         let ordinary: Ranges = without(&ordinary_ranges(RegionKind::Usable), &cut)
             .into_iter()
-            .map(|(s, e)| (s.next_multiple_of(PAGE), e / PAGE * PAGE))
+            .map(|(s, e)| (s.next_multiple_of(page), e / page * page))
             .filter(|(s, e)| s < e)
             .collect();
         // 4. Shares: node 0, the boot node, takes the first S bytes in order
         // of ascending address; the last node takes the rest.
         let nodes = machine.cores.len() as u64;
         let total: u64 = ordinary.iter().map(|(s, e)| e - s).sum();
-        let share = total / nodes / SHARE_ALIGN * SHARE_ALIGN;
+        let share = total / nodes / geometry.chunk() * geometry.chunk();
         let mut wanted = if nodes == 1 { total } else { share };
         let mut boot_share = Ranges::new();
         for &(s, e) in &ordinary {
@@ -387,7 +396,7 @@ impl Model {
         let untypeds = 1 + ordinary_blocks.len() + device_blocks.len();
         // The start-up page, and the number of slots.
         let start_bytes = start_page_bytes(machine, untypeds as u64, nodes);
-        let start_pages = start_bytes.div_ceil(PAGE);
+        let start_pages = start_bytes.div_ceil(page);
         if start_pages > START_PAGE_MAX_PAGES {
             return Err(Refusal::StartPage);
         }
@@ -400,7 +409,6 @@ impl Model {
         }
         let mut model = Self {
             machine: machine.clone(),
-            page_sizes: machine.page_sizes,
             ..Self::default()
         };
         let blocks = [&ordinary_blocks[..], &device_blocks[..]];
@@ -478,15 +486,16 @@ impl Model {
         // modules, start-up page, message page; its watermark stands after
         // the message page, and its clean mark at its watermark.
         let image_cap = self.objects[&image_untyped].root;
+        let page = machine.geometry.page();
         let frame = |model: &mut Self, pages: u64, index: u32| {
-            let bytes = pages * PAGE;
+            let bytes = pages * page;
             model
-                .take(image_untyped, bytes, PAGE, Clearing::None)
+                .take(image_untyped, bytes, page, Clearing::None)
                 .expect("the image region holds the modules and the reserve");
             let place = Place { space, index };
             let cap = model.create(ObjectKind::Frame, pages, Some(image_cap), all, place);
             let frame = Frame {
-                page: PageSize::Size4K,
+                page: PageSize::Page,
                 pages,
                 memory: MemoryType::WriteBack,
             };
@@ -497,7 +506,7 @@ impl Model {
         let lens: Vec<u64> = lens.chain(machine.files.iter().map(|f| f.len)).collect();
         let module_caps: Vec<_> = lens
             .iter()
-            .map(|&len| frame(self, laid_out(len) / PAGE, next()))
+            .map(|&len| frame(self, laid_out(len, page) / page, next()))
             .collect();
         let start_page = frame(self, start_pages, START_SLOT_START_PAGE);
         let message_page = frame(self, 1, START_SLOT_MESSAGE_PAGE);
@@ -516,9 +525,9 @@ impl Model {
             .zip(&module_caps)
             .map(|(segment, &cap)| (cap, segment.vaddr, segment.rights))
             .collect();
-        mappings.push((start_page, START_PAGE_ADDR, Rights::READ));
+        mappings.push((start_page, 2 * page, Rights::READ));
         let read_write = Rights::READ.union(Rights::WRITE);
-        mappings.push((message_map, START_MESSAGE_PAGE_ADDR, read_write));
+        mappings.push((message_map, page, read_write));
         for (cap, address, rights) in mappings {
             let count = self.frames[&self.caps[&cap].object].pages;
             let mapping = Mapping {
@@ -532,7 +541,9 @@ impl Model {
         }
         // The address space was built with the tables these mappings need
         // and the reserve of free tables the boot image states.
-        let tables = hooked(&self.aspaces[&aspace], 4) + machine.reserve_tables;
+        let levels = machine.geometry.levels;
+        let tables =
+            hooked(&self.aspaces[&aspace], levels, machine.geometry) + machine.reserve_tables;
         live(&mut self.aspaces, aspace).tables = tables;
         // The first thread: bound to the space in slot 1, the address space
         // in slot 2 and the message page in slot 10; not suspended.
@@ -546,7 +557,7 @@ impl Model {
         let first = live(&mut self.threads, thread);
         first.suspended = false;
         first.regs[REG_RIP] = machine.entry;
-        first.regs[REG_RDI] = START_PAGE_ADDR;
+        first.regs[REG_RDI] = 2 * page;
         // Scheduling: the `sched` is configured with budget = period = 10 ms,
         // class 1, the cores set of the boot core, and bound to it.
         self.first_context(sched, thread, START_SCHED_PERIOD_NS);

@@ -2,7 +2,7 @@
 
 use super::{Check, ensure};
 use crate::{Mapping, Model, ObjId, Record};
-use dodos_abi::{IOSPACE_MAX_DEVICES, PageSize, Rights};
+use dodos_abi::{IOSPACE_MAX_DEVICES, Rights};
 use std::collections::{BTreeMap, BTreeSet};
 
 impl Model {
@@ -57,7 +57,11 @@ impl Model {
                     .frames
                     .get(&held.object)
                     .ok_or("35: record of a frame")?;
-                let size = frame.page.bytes();
+                let size = self
+                    .machine
+                    .geometry
+                    .bytes(frame.page)
+                    .ok_or("35: page size")?;
                 let inside = count >= 1
                     && first
                         .checked_add(count)
@@ -65,7 +69,7 @@ impl Model {
                 let io = self.iospaces.contains_key(&id);
                 let limit = match io {
                     true => 1u128 << self.machine.io_width,
-                    false => crate::memory::USER_END as u128,
+                    false => self.machine.geometry.user_end as u128,
                 };
                 let end = (count as u128) * (size as u128) + address as u128;
                 let below = end <= limit && address.is_multiple_of(size);
@@ -90,26 +94,30 @@ impl Model {
                 .map(|(&at, t)| (at, (t.cap, t.page, t.size, t.rights)))
                 .collect();
             ensure(actual == expected, "35: translations of the records")?;
+            let geometry = self.machine.geometry;
+            let bytes = |size| geometry.bytes(size).map_or(0, u128::from);
             let mut end = 0;
             for (&at, t) in &space.translations {
-                ensure(at >= end, "35: translations that overlap")?;
-                end = at + t.size.bytes();
+                ensure(u128::from(at) >= end, "35: translations that overlap")?;
+                end = u128::from(at) + bytes(t.size);
             }
-            let four = !self.iospaces.contains_key(&id) || self.machine.io_width >= 48;
-            let mut per = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
+            // The levels of the space, and the bytes a table of each level
+            // covers: P × E^k. A page needs a table of every level that
+            // covers more than the page.
+            let span = |k: u32| u128::from(geometry.page()) * u128::from(geometry.entries).pow(k);
+            let levels = match self.iospaces.contains_key(&id) {
+                true => (1..=64)
+                    .find(|&k| span(k) >= 1u128 << self.machine.io_width)
+                    .unwrap_or(64),
+                false => geometry.levels,
+            };
+            let mut hooked = BTreeSet::new();
             for (&at, t) in &space.translations {
-                if four {
-                    per[0].insert(at >> 39);
-                }
-                if t.size != PageSize::Size1G {
-                    per[1].insert(at >> 30);
-                }
-                if t.size == PageSize::Size4K {
-                    per[2].insert(at >> 21);
+                for k in (1..levels).filter(|&k| span(k) > bytes(t.size)) {
+                    hooked.insert((k, u128::from(at) / span(k)));
                 }
             }
-            let hooked: usize = per.iter().map(BTreeSet::len).sum();
-            ensure(space.tables >= hooked as u64, "37: tables of a space")?;
+            ensure(space.tables >= hooked.len() as u64, "37: tables of a space")?;
         }
         ensure(
             named.is_empty(),

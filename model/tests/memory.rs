@@ -97,7 +97,7 @@ impl K {
     }
 
     fn small(&mut self, pages: u64, slot: u32) {
-        self.frame(UT, PageSize::Size4K, pages, MemoryType::WriteBack, slot);
+        self.frame(UT, PageSize::Page, pages, MemoryType::WriteBack, slot);
     }
 
     fn derive(&mut self, from: u32, to: u32, rights: Rights) {
@@ -254,7 +254,7 @@ fn start_up_aspace_takes_no_untyped_and_uses_its_reserve() {
 #[test]
 fn plain_arguments_of_aspace_map_are_judged_in_order() {
     let (mut k, _) = with_aspace();
-    k.frame(UT, PageSize::Size2M, 2, MemoryType::WriteBack, 40);
+    k.frame(UT, PageSize::Large1, 2, MemoryType::WriteBack, 40);
     let page = 2 * MB;
     // The address is a multiple of the frame's page size.
     k.no(map(30, 40, UT, AT + 0x1000, 0, 1, R), Error::Invalid);
@@ -320,8 +320,8 @@ fn translated_address_of_any_page_size_is_busy() {
     let (mut k, _) = with_aspace();
     k.small(1, 40);
     k.small(1, 41);
-    k.frame(UT, PageSize::Size2M, 1, MemoryType::WriteBack, 42);
-    k.frame(UT, PageSize::Size2M, 1, MemoryType::WriteBack, 43);
+    k.frame(UT, PageSize::Large1, 1, MemoryType::WriteBack, 42);
+    k.frame(UT, PageSize::Large1, 1, MemoryType::WriteBack, 43);
     k.ok(map(30, 40, UT, AT + 0x5000, 0, 1, R));
     // A 2 MB page over a 4 KB one.
     k.no(map(30, 42, UT, AT, 0, 1, R), Error::Busy);
@@ -390,7 +390,7 @@ fn tables_count_as_live_pieces_until_the_aspace_is_destroyed() {
 #[test]
 fn large_pages_map_with_the_frame_s_page_size() {
     let (mut k, v) = with_aspace();
-    k.frame(UT, PageSize::Size2M, 1, MemoryType::WriteBack, 40);
+    k.frame(UT, PageSize::Large1, 1, MemoryType::WriteBack, 40);
     k.ok(map(30, 40, UT, AT, 0, 1, R));
     assert_eq!(seen(&k, v, AT + 2 * MB - 1), Some(R));
     assert_eq!(seen(&k, v, AT + 2 * MB), None);
@@ -399,7 +399,7 @@ fn large_pages_map_with_the_frame_s_page_size() {
 #[test]
 fn device_frame_maps_into_an_aspace_without_exec() {
     let (mut k, v) = with_aspace();
-    k.frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, 40);
+    k.frame(DEV, PageSize::Page, 1, MemoryType::Uncached, 40);
     k.no(map(30, 40, UT, AT, 0, 1, R.union(X)), Error::Denied);
     k.ok(map(30, 40, UT, AT, 0, 1, rw()));
     assert_eq!(seen(&k, v, AT), Some(rw()));
@@ -560,7 +560,7 @@ fn cap_inspect_says_nothing_of_the_record() {
 fn iospace_map_judges_the_page_size_first_then_the_width_and_the_rights() {
     let mut k = K::new();
     k.retype(UT, IoSpace, 0, 30);
-    k.frame(UT, PageSize::Size1G, 1, MemoryType::WriteBack, 40);
+    k.frame(UT, PageSize::Large2, 1, MemoryType::WriteBack, 40);
     // The units do not support 1 GB pages: `unsupported`, before an address
     // that is not even aligned.
     k.no(iomap(30, 40, 1, 1, R), Error::Unsupported);
@@ -573,7 +573,7 @@ fn iospace_map_judges_the_page_size_first_then_the_width_and_the_rights() {
     k.no(iomap(30, 42, 0, 1, W), Error::Denied);
     // Write only, and device memory, are accepted.
     k.ok(iomap(30, 41, (1 << 48) - 0x1000, 1, W));
-    k.frame(DEV, PageSize::Size4K, 1, MemoryType::Uncached, 43);
+    k.frame(DEV, PageSize::Page, 1, MemoryType::Uncached, 43);
     k.ok(iomap(30, 43, 0, 1, rw()));
 }
 

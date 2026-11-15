@@ -169,7 +169,7 @@ fn source_then_vector_are_judged_after_the_destination() {
     k.no(raw(0, 0, 0), Error::Invalid);
     // A source the format refuses; a GSI that no IOAPIC serves; a vector
     // outside 48 to 239.
-    k.no(raw(3, 48, 40), Error::Invalid);
+    k.no(raw(4, 48, 40), Error::Invalid);
     k.no(
         raw(IrqSource::line(24, false, false).raw(), 48, 40),
         Error::Invalid,
