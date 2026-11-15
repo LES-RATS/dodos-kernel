@@ -326,7 +326,9 @@ fn a_map_count_that_would_pass_its_limit_is_busy() {
     let count = m.sys.node(0).map_count(first / chunk);
     m.ok(0, map(200, 1, Rights::READ));
     assert_eq!(m.sys.node(0).map_count(first / chunk), count + 1);
-    m.no(0, map(201, 1, Rights::READ), Error::Busy);
+    // At another address, so that the busy is the count's (the same address
+    // would be busy as already translated).
+    m.no(0, map_at(ASPACE, 201, 2 * AT, 1, Rights::READ), Error::Busy);
     assert_eq!(m.sys.node(0).map_count(first / chunk), count + 1);
 }
 

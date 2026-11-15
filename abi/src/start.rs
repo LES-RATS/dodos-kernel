@@ -250,6 +250,8 @@ pub const START_MEMORY_MAP_THROUGH_ROLE: u32 = 1 << 0;
 pub const START_MEMORY_GATE_NO_WINDOW: u32 = 1 << 1;
 pub const START_MEMORY_CONTROL_FLOW: u32 = 1 << 2;
 pub const START_MEMORY_MONITOR: u32 = 1 << 3;
+/// The image accepts a core of fence class 0 beside other nodes (The fence).
+pub const START_MEMORY_UNFENCED_ACCEPTED: u32 = 1 << 4;
 
 /// The values of the machine.
 #[repr(C)]

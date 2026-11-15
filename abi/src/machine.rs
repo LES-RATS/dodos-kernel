@@ -725,6 +725,8 @@ pub enum Governs {
     Console = 4,
     Reserve = 5,
     Plain = 6,
+    /// The APLIC of a RISC-V interrupt domain.
+    Aplic = 7,
 }
 
 /// Plain role 0: the node of its holder alone may use the PCI configuration

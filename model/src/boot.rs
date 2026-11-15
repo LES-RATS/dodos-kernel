@@ -174,6 +174,14 @@ pub struct Machine {
     pub membership: BootMembership,
     /// Whether the boot image declares a console (a unit role).
     pub console: bool,
+    /// The image declares the hardening monitor: every core is of fence
+    /// class 2.
+    pub monitor: bool,
+    /// The image accepts a core of fence class 0 beside other nodes (a
+    /// development setting).
+    pub accept_unfenced: bool,
+    /// The kernel can read a processor source of entropy.
+    pub processor_entropy: bool,
     /// The largest map count of a chunk (G4): `MAP_COUNT_MAX`, 32 bits; the
     /// tests make it smaller so that the rule is reached.
     pub map_count_max: u64,
@@ -335,14 +343,24 @@ impl Machine {
                 reserved: [0; 3],
             },
             console: false,
+            monitor: false,
+            accept_unfenced: false,
+            processor_entropy: true,
             map_count_max: dodos_abi::MAP_COUNT_MAX,
             gate_chunks: u64::from(geometry.entries),
         }
     }
 
-    /// The nodes: one per usable core.
+    /// The nodes: one per usable core; but a machine with a core of fence
+    /// class 0, which no other core can stop, runs one node unless the image
+    /// declares the hardening monitor or accepts an unfenced core (The
+    /// fence: D-116, D-117).
     pub fn nodes(&self) -> usize {
-        self.cores.len()
+        let unstoppable = self.cores.iter().any(|core| core.fence == 0);
+        match unstoppable && !self.monitor && !self.accept_unfenced {
+            true => 1,
+            false => self.cores.len(),
+        }
     }
 
     /// Unlike cores: the own kind of a node, the kind of its core in the
@@ -387,6 +405,9 @@ pub enum Refusal {
     /// *E* would be more than 4,096, or the values of the machine are out
     /// of range, or there are more usable cores than `NODES_MAX`.
     MachineValues,
+    /// The loader hands no entropy seed and the kernel can read no
+    /// processor source (Entropy).
+    NoEntropy,
 }
 
 /// Ranges as sorted, disjoint [start, end) pairs.
@@ -527,6 +548,9 @@ impl Machine {
         let n = self.nodes() as u64;
         if !geometry.valid() || n == 0 || n as usize > NODES_MAX {
             return Err(Refusal::MachineValues);
+        }
+        if self.boot_seed == 0 && !self.processor_entropy {
+            return Err(Refusal::NoEntropy);
         }
         let (page, chunk) = (geometry.page(), geometry.chunk());
         for segment in &self.segments {
@@ -705,7 +729,12 @@ impl Machine {
     /// best fence class, the reserve and plain roles vacant.
     pub(crate) fn table(&self, layout: &Layout) -> Table {
         let n = self.nodes();
-        let fence: Vec<u8> = self.core_list().iter().map(|core| core.fence).collect();
+        // Under the hardening monitor every core is of class 2.
+        let fence: Vec<u8> = self
+            .core_list()
+            .iter()
+            .map(|core| if self.monitor { 2 } else { core.fence })
+            .collect();
         let booted: Vec<bool> = self.core_list().iter().map(|core| core.booted).collect();
         let best = fence.iter().copied().max().unwrap_or(0);
         let best_nodes: Vec<u16> = (0..n as u16)

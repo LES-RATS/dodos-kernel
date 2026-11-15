@@ -636,3 +636,52 @@ fn no_usable_page_is_left_out_of_both_the_chunks_and_the_device_table() {
     }
     assert!(fragments > 0, "the example machine has a fragment");
 }
+
+/// Mistral F7: the generator is seeded from the start-up page's seed always,
+/// and from the processor's source where the kernel can read one; with
+/// neither the kernel does not start.
+#[test]
+fn kernel_refuses_a_machine_with_no_seed_and_no_processor_source() {
+    let none = with(|m| {
+        m.boot_seed = 0;
+        m.processor_entropy = false;
+    });
+    assert_eq!(Model::boot(&none).err(), Some(Refusal::NoEntropy));
+    let seed_only = with(|m| m.processor_entropy = false);
+    assert!(Model::boot(&seed_only).is_ok());
+    let source_only = with(|m| m.boot_seed = 0);
+    assert!(Model::boot(&source_only).is_ok());
+}
+
+/// Mistral F1, F2: a machine with a core that no other core can stop (fence
+/// class 0) runs one node, unless the image declares the hardening monitor
+/// (every core then of class 2) or accepts an unfenced core.
+#[test]
+fn a_machine_with_a_core_of_fence_class_0_runs_one_node_unless_declared() {
+    let mut machine = Machine::example();
+    machine.cores[1].fence = 0;
+    assert_eq!(machine.nodes(), 1);
+    let (sys, _) = System::boot(&machine).unwrap();
+    assert!(sys.has(0));
+    let mut monitored = machine.clone();
+    monitored.monitor = true;
+    assert_eq!(monitored.nodes(), 2);
+    let (m, _) = Model::boot(&monitored).unwrap();
+    assert!(m.core_list_fences().iter().all(|&c| c == 2));
+    let mut accepted = machine.clone();
+    accepted.accept_unfenced = true;
+    assert_eq!(accepted.nodes(), 2);
+    assert!(System::boot(&accepted).is_ok());
+}
+
+/// DODOS_PAGE selects the geometry of the machine of the tests (Argon F3,
+/// mutant 119).
+#[test]
+fn the_geometry_of_the_tests_is_the_one_dodos_page_names() {
+    let page = Machine::example().geometry.page();
+    match std::env::var("DODOS_PAGE").as_deref() {
+        Ok("16k") => assert_eq!(page, 16 << 10),
+        Ok("32k") => assert_eq!(page, 32 << 10),
+        _ => assert_eq!(page, 4 << 10),
+    }
+}

@@ -1254,9 +1254,10 @@ fn role_words_read_back() {
         [
             Governs::IommuUnit as u8,
             Governs::Console as u8,
-            Governs::Plain as u8
+            Governs::Plain as u8,
+            Governs::Aplic as u8
         ],
-        [0, 4, 6]
+        [0, 4, 6, 7]
     );
     assert_eq!(ROLE_PLAIN_PLATFORM, 0);
 }

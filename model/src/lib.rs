@@ -1164,6 +1164,11 @@ impl Model {
             || inside(&self.table.kept)
     }
 
+    /// The fence class of each physical core, by core number.
+    pub fn core_list_fences(&self) -> Vec<u8> {
+        self.table.fence.clone()
+    }
+
     /// The capacity of the device table.
     pub fn device_count(&self) -> usize {
         self.table.devices.len()
