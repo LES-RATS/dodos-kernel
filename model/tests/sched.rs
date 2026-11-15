@@ -3,6 +3,8 @@
 //! (10 ms every 10 ms, class 1); the boot core's capability is in slot 16,
 //! the other core's in slot 17.
 
+mod common;
+
 use dodos_abi::ObjectKind::{Endpoint, Frame, Notify, Reply, Sched, Thread, Timer};
 use dodos_abi::*;
 use dodos_model::*;
@@ -20,7 +22,7 @@ const DONE: Outcome = Ok(Output::Done);
 const ALL: u64 = SCHED_STATE_CONFIGURED | SCHED_STATE_HOME;
 
 fn s(index: u32) -> SlotAddr {
-    SlotAddr::own(index)
+    SlotAddr::own(common::slot(index))
 }
 
 struct K {
@@ -193,8 +195,10 @@ fn timer_set(timer: u32, notify: u32, deadline: u64, tolerance: u64) -> Syscall 
 fn first_thread_runs_on_a_context_of_10_ms_every_10_ms() {
     let mut k = K::new();
     assert_eq!(k.m.running(), Some(k.t));
-    assert_eq!(k.read(FIRST), (0, 10 * MS as i64, 10 * MS, ALL));
-    // It takes the whole core: nothing else is admitted.
+    let budget = START_SCHED_BUDGET_NS;
+    assert_eq!(k.read(FIRST), (0, budget as i64, 10 * MS, ALL));
+    // With the recovery reserve it takes the whole core: nothing else is
+    // admitted.
     k.make(Sched, 40);
     k.no(configure(40, 10 * US, 10 * MS, 1), Error::Budget);
 }
@@ -206,7 +210,8 @@ fn time_is_charged_to_the_running_context_at_the_next_event() {
     // The clock moved; nothing was charged yet: the charge comes with the
     // next event, which `sched_read` is.
     let (consumed, remaining, ..) = k.read(FIRST);
-    assert_eq!((consumed, remaining), (3 * MS, 7 * MS as i64));
+    let left = START_SCHED_BUDGET_NS - 3 * MS;
+    assert_eq!((consumed, remaining), (3 * MS, left as i64));
 }
 
 // The calls of the scheduling contexts.
@@ -269,7 +274,9 @@ fn admission_refuses_more_than_one_whole_core_and_changes_nothing() {
     let mut k = K::lowered(5 * MS);
     k.make(Sched, 40);
     k.make(Sched, 41);
-    k.ok(configure(40, 5 * MS, 10 * MS, 1));
+    // Half of the core, 31/64 here, and the recovery reserve's 1/64.
+    k.no(configure(40, 5 * MS, 10 * MS, 1), Error::Budget);
+    k.ok(configure(40, 4_843_750, 10 * MS, 1));
     k.no(configure(41, 10 * US, 10 * MS, 1), Error::Budget);
     assert_eq!(k.state(41), 0);
     // Removing a configuration never fails, and frees its share at once.
@@ -514,7 +521,7 @@ fn yield_from_a_thread_whose_space_is_dying_is_gone() {
     for index in 1..40 {
         k.ok(Syscall::CapDerive {
             source: s(EP),
-            destination: SlotAddr::through(40, index),
+            destination: SlotAddr::through(common::slot(40), index),
             rights: Rights::ALL.bits(),
             badge: 0,
         });
@@ -638,13 +645,15 @@ fn destroying_the_reply_object_of_a_lend_marks_its_receiver() {
 
 #[test]
 fn destroying_a_context_marks_its_home_and_frees_its_share() {
+    // Half of the core but the recovery reserve's 1/64.
+    let half = 4_843_750;
     let mut k = K::lowered(5 * MS);
-    k.context(40, 5 * MS, 10 * MS, 1);
+    k.context(40, half, 10 * MS, 1);
     let thread = k.thread(50, 40);
     k.ok(Syscall::CapDelete(s(40)));
     assert!(!k.can_run(thread));
     assert_eq!(k.m.census().fault_kinds[8], 1);
-    k.context(41, 5 * MS, 10 * MS, 1);
+    k.context(41, half, 10 * MS, 1);
 }
 
 #[test]
@@ -808,7 +817,8 @@ fn firing_timer_wakes_a_waiter() {
 
 #[test]
 fn wake_up_rule_judges_with_the_parameters_in_force_and_resets_with_the_new_ones() {
-    let mut k = K::lowered(5 * MS);
+    // Half of the core but the recovery reserve's 1/64.
+    let mut k = K::lowered(4_843_750);
     k.context(40, 2 * MS, 10 * MS, 1);
     let thread = k.thread(50, 40);
     assert_eq!(k.on(thread, Syscall::Wait(s(NT), 0)), Ok(Output::Waits));

@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+mod blocks;
 mod boot;
 mod caps;
 mod check;
@@ -32,10 +33,13 @@ mod ipc;
 mod irq;
 mod memory;
 mod sched;
+mod table;
 mod tasks;
 mod threads;
 
-pub use boot::{Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, Segment};
+pub use boot::{
+    Arch, Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, SIXTEEN_KB, Segment,
+};
 pub use check::Census;
 
 use dodos_abi::{
@@ -253,6 +257,26 @@ pub enum Syscall {
     },
     TaskRevoke(SlotAddr),
     TaskRead(SlotAddr),
+    /// The memory_control, the kind (0 a run, 1 a device entry), the place
+    /// (a physical base or an entry's index), the size (the log2 of the
+    /// run's bytes, or 0), and the destination.
+    MemoryTake {
+        control: SlotAddr,
+        kind: u64,
+        place: u64,
+        size: u64,
+        destination: SlotAddr,
+    },
+    /// The memory_control, the block, and the node it is given to.
+    MemoryGive {
+        control: SlotAddr,
+        untyped: SlotAddr,
+        node: u64,
+    },
+    MemorySplit {
+        control: SlotAddr,
+        untyped: SlotAddr,
+    },
     /// A call that this model does not make: it returns `Unsupported`. A
     /// call that has a variant above is refused here with a panic.
     Other(Call),
@@ -310,6 +334,8 @@ pub enum Output {
     Sent { flags: u32 },
     /// `recv`, `reply_recv`: a message or a notification. `call`: the reply.
     Message(Delivery),
+    /// `memory_split`: the index of the new entry.
+    Index(u64),
     /// The thread waits. The outcome of its call comes later, in
     /// [`Model::woken`].
     Waits,
@@ -389,10 +415,18 @@ struct Object {
     root: CapId,
     /// The untyped its memory came from; `None` for a start-up object.
     from: Option<ObjId>,
+    /// Made at start-up (Start-up state): the frames of the start-up
+    /// untyped have no `exec`, against the rule of `untyped_retype`.
+    boot: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct Untyped {
+    /// The physical address of its first byte.
+    base: u64,
+    /// A block made by `memory_take`: of a run of chunks, or of an entry of
+    /// the device table.
+    block: Option<Block>,
     bytes: u64,
     device: bool,
     watermark: u64,
@@ -404,12 +438,23 @@ struct Untyped {
     live: u32,
 }
 
+/// What a block covers (`memory_take`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Block {
+    Run,
+    Entry(usize),
+}
+
 /// Frames: fixed by `untyped_retype` and never changed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Frame {
     page: PageSize,
     pages: u64,
     memory: MemoryType,
+    /// The physical address of its first page.
+    base: u64,
+    /// A kept frame: made at start-up over kept memory, from no untyped.
+    kept: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -447,6 +492,10 @@ struct ASpace {
     /// Address spaces and their tables: the lower tables taken, hooked or on
     /// the free list. The hooked ones follow from the translations.
     tables: u64,
+    /// The gate over page tables (G2): the physical pages of its root table
+    /// and of the lower tables taken from its untyped, of class *table*. The
+    /// start-up aspace, made from kept memory, has none here.
+    table_pages: Vec<u64>,
 }
 
 /// IOMMU: one unit, made by the kernel at start.
@@ -681,6 +730,14 @@ pub struct Model {
     longest_walk: usize,
     /// The `core` objects, with their node index.
     cores: BTreeMap<ObjId, u32>,
+    /// The `role` objects, with the index of their role.
+    roles: BTreeMap<ObjId, usize>,
+    /// The index of this node, and the machine table it shares with the
+    /// other nodes.
+    node: u16,
+    table: table::Table,
+    /// The write gate: the chunks the node maps in its kernel space.
+    kernel_runs: std::collections::BTreeSet<u64>,
     /// IOMMU: the devices each `iospace` serves, the most recently attached
     /// last, each by its `iommu` and its identifier.
     iospaces: BTreeMap<ObjId, Vec<(ObjId, u16)>>,
@@ -718,8 +775,8 @@ pub struct Model {
 fn other(call: Call) -> bool {
     use Call::{
         CoreIdle, CorePerf, CorePlace, CoreStart, CoreStatus, CoreStop, CoreWatch, DebugWrite,
-        EntropyRead, IoportIn, IoportOut, IoportsIssue, MemoryGive, MemorySplit, MemoryTake,
-        RoleClaim, RoleHand, SchedCount, ThreadMove, ThreadSetFeatures, TraceEmit,
+        EntropyRead, IoportIn, IoportOut, IoportsIssue, RoleClaim, RoleHand, SchedCount,
+        ThreadMove, ThreadSetFeatures, TraceEmit,
     };
     matches!(
         call,
@@ -728,9 +785,6 @@ fn other(call: Call) -> bool {
             | CoreStatus
             | DebugWrite
             | TraceEmit
-            | MemoryTake
-            | MemoryGive
-            | MemorySplit
             | CoreIdle
             | CoreWatch
             | CorePlace
@@ -800,6 +854,45 @@ impl Model {
         self.threads.get(&thread)?;
         let cap = self.cap(thread, slot, Rights::READ).ok()?;
         Some(self.caps[&cap].object)
+    }
+
+    /// The machine table, as user space reads it through the kept frame of
+    /// slot 13: the member word of a node.
+    pub fn member(&self, node: u16) -> dodos_abi::Member {
+        self.table.members[node as usize]
+    }
+
+    /// The role word of role `index`, in the order of the entry `Roles`.
+    pub fn role(&self, index: usize) -> dodos_abi::RoleWord {
+        self.table.roles[index]
+    }
+
+    /// A stray write into the living part, which no gate made: the input a
+    /// test uses to show that a word that fails its check is `busy`.
+    pub fn stray_write(&mut self, chunk: u64, raw: u64) {
+        self.table.owners[chunk as usize] = raw;
+    }
+
+    /// The raw ownership word of a chunk.
+    pub fn ownership(&self, chunk: u64) -> u64 {
+        self.table.owners[chunk as usize]
+    }
+
+    /// The map count of a chunk (G4).
+    pub fn map_count(&self, chunk: u64) -> u64 {
+        self.table.maps[chunk as usize]
+    }
+
+    /// An entry of the device table.
+    pub fn device_entry(&self, index: usize) -> dodos_abi::DeviceEntry {
+        self.table.devices[index]
+    }
+
+    /// The page size, the number of pages and the physical base of the frame
+    /// that a slot address names for `thread`, as the slot records them.
+    pub fn frame_at(&self, thread: ObjId, slot: SlotAddr) -> Option<(PageSize, u64, u64)> {
+        let frame = self.frames.get(&self.object_at(thread, slot)?)?;
+        Some((frame.page, frame.pages, frame.base))
     }
 
     /// The rights of the translation that covers `address` in the address
@@ -988,6 +1081,21 @@ impl Model {
             Syscall::TaskMark { task, marks } => self.task_mark(thread, task, marks),
             Syscall::TaskRevoke(task) => self.task_revoke(thread, task),
             Syscall::TaskRead(task) => self.task_read(thread, task),
+            Syscall::MemoryTake {
+                control,
+                kind,
+                place,
+                size,
+                destination,
+            } => self.memory_take(thread, control, (kind, place, size), destination),
+            Syscall::MemoryGive {
+                control,
+                untyped,
+                node,
+            } => self.memory_give(thread, control, untyped, node),
+            Syscall::MemorySplit { control, untyped } => {
+                self.memory_split(thread, control, untyped)
+            }
             // The calls not yet made by this model, and those of the groups
             // not yet specified (cores, debugging), return `unsupported` as
             // soon as the capability space of the caller is found, before

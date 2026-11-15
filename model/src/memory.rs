@@ -65,6 +65,33 @@ impl Model {
         }
         aspace.records.push(cap);
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
+        self.count_leaves(frame, mapping, 1);
+    }
+
+    /// The gate over page tables, G4: the chunks that the leaves of a
+    /// mapping target, one entry per leaf and chunk: a leaf of a page size
+    /// larger than a chunk counts in each chunk it covers.
+    pub(crate) fn leaf_chunks(&self, frame: crate::Frame, first: u64, count: u64) -> Vec<u64> {
+        let bytes = self.bytes(frame.page);
+        let shift = self.table.geometry.chunk_shift();
+        let mut chunks = Vec::new();
+        for page in first..first + count {
+            let at = frame.base + page * bytes;
+            chunks.extend(at >> shift..(at + bytes).div_ceil(1 << shift));
+        }
+        chunks
+    }
+
+    /// G4: adds or takes the leaves of a mapping to the map counts.
+    fn count_leaves(&mut self, frame: crate::Frame, mapping: Mapping, sign: i64) {
+        for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
+            let Some(count) = self.table.maps.get_mut(chunk as usize) else {
+                continue;
+            };
+            *count = count
+                .checked_add_signed(sign)
+                .expect("a map count never goes below 0");
+        }
     }
 
     /// Mapping records: empties the record of a frame capability that holds
@@ -77,6 +104,8 @@ impl Model {
         aspace.translations.retain(|_, t| t.cap != cap);
         aspace.records.retain(|&other| other != cap);
         live(&mut self.caps, cap).record = Record::Empty;
+        let frame = self.frames[&self.caps[&cap].object];
+        self.count_leaves(frame, mapping, -1);
     }
 }
 
@@ -157,6 +186,20 @@ impl Model {
         if covers || aspace.translations.range(map.address..end).next().is_some() {
             return Err(Error::Busy);
         }
+        // The gate over page tables, G4: a map count that would overflow is
+        // `busy`.
+        let mut added: std::collections::BTreeMap<u64, u64> = Default::default();
+        for chunk in self.leaf_chunks(frame, map.first, map.count) {
+            *added.entry(chunk).or_default() += 1;
+        }
+        let overflow = added.iter().any(|(&chunk, &leaves)| {
+            let count = self.table.maps.get(chunk as usize).copied().unwrap_or(0);
+            count + leaves > self.machine.map_count_max
+        });
+        if overflow {
+            return Err(Error::Busy);
+        }
+        let aspace = &self.aspaces[&space];
         let levels = self.levels(space);
         let held: Vec<(u64, PageSize)> = aspace
             .translations
@@ -183,8 +226,15 @@ impl Model {
         // capability goes to the head of the space's list.
         for _ in 0..missing {
             let untyped = untyped.expect("an untyped supplies the tables");
-            self.take(untyped, table, table, Clearing::WithinCall)
+            let taken = self
+                .take(untyped, table, table, Clearing::WithinCall)
                 .expect("checked above");
+            // G2: the gate turns a page of class data into a table page.
+            let at = self.untypeds[&untyped].base + taken.at;
+            self.table
+                .classes
+                .insert(at / table, crate::table::PageClass::Table);
+            live(&mut self.aspaces, space).table_pages.push(at);
         }
         live(&mut self.aspaces, space).tables += missing;
         let mapping = Mapping {

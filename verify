@@ -5,3 +5,6 @@ cd "$(dirname "$0")"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# The page size is a value of the machine (D-121): the model's tests run
+# again on a second geometry, a page of 16 KB.
+DODOS_PAGE=16k cargo test -p dodos-model

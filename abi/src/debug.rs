@@ -217,10 +217,17 @@ pub enum ConsoleMessage {
 mod proofs {
     use super::*;
 
+    /// For the two rings; a sequence below 2^32, more than any boot
+    /// writes into one ring.
     #[kani::proof]
     fn the_index_of_an_entry_is_its_sequence_minus_one_mod_n() {
-        let (seq, entries): (u64, u64) = (kani::any(), kani::any());
-        kani::assume(seq >= 1 && entries >= 1);
+        let seq = kani::any::<u32>() as u64;
+        let entries = if kani::any() {
+            TRACE_KERNEL_ENTRIES
+        } else {
+            TRACE_USER_ENTRIES
+        };
+        kani::assume(seq >= 1);
         let index = trace_index(seq, entries);
         assert!(index < entries);
         if seq < u64::MAX {

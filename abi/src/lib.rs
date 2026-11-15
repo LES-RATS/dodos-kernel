@@ -1049,8 +1049,15 @@ mod proofs {
             kani::any(),
             kani::any(),
         );
-        let (shift, entries): (u32, u64) = (kani::any(), kani::any());
-        kani::assume((12..48).contains(&shift));
+        // The page sizes of the two geometries of the tests and their
+        // first large pages.
+        let shift = match kani::any::<u8>() % 4 {
+            0 => 12,
+            1 => 14,
+            2 => 21,
+            _ => 25,
+        };
+        let entries: u64 = kani::any();
         kani::assume(entries >= 2 && entries <= TABLE_ENTRIES_MAX as u64);
         kani::assume(pages >= 1 && pages <= entries);
         let page = 1u64 << shift;

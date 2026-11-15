@@ -3,7 +3,9 @@
 
 use crate::caps::Placing;
 use crate::{Irq, IrqState, Model, ObjId, Outcome, Output, live};
-use dodos_abi::x86_64::{IRQ_TABLE_ENTRIES, IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST};
+use dodos_abi::x86_64::{
+    IRQ_MAX_NODES_REMAPPED, IRQ_TABLE_ENTRIES, IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST,
+};
 use dodos_abi::{Error, IrqSource, ObjectKind, Rights, SlotAddr};
 
 /// Interrupt remapping: the address of a remappable MSI for a handle.
@@ -43,10 +45,11 @@ impl Model {
             .filter(|vector| (IRQ_VECTOR_FIRST..=IRQ_VECTOR_LAST).contains(vector));
         let vector = vector.ok_or(Error::Invalid)?;
         // `unsupported` if this machine cannot deliver the source to the
-        // core: without remapping, an APIC ID above 255. With remapping a
-        // node of index 341 or more cannot claim: on one node, never.
-        let apic = self.machine.cores[0].apic_id;
-        if !self.machine.remapping && apic > 255 {
+        // core: without remapping, an APIC ID above 255; with remapping, a
+        // node of index 341 or more.
+        let apic = self.machine.core_list()[self.node as usize].hw_id;
+        let remapped_node = u32::from(self.node) >= IRQ_MAX_NODES_REMAPPED;
+        if !self.machine.remapping && apic > 255 || self.machine.remapping && remapped_node {
             return Err(Error::Unsupported);
         }
         // Unlike cores: without such an event, kind 3 is `unsupported`.
@@ -82,13 +85,15 @@ impl Model {
             notify: None,
         };
         self.irqs.insert(id, irq);
-        let handle = u64::from(vector - IRQ_VECTOR_FIRST);
+        // The fixed remapping entry of the vector on this node.
+        let entry = u64::from(vector - IRQ_VECTOR_FIRST);
+        let handle = u64::from(self.node) * IRQ_TABLE_ENTRIES as u64 + entry;
         let (address, data) = match (source.is_line(), self.machine.remapping) {
             (true, _) => (0, 0),
             (false, true) => (remapped(handle), 0),
-            (false, false) => (0xFEE0_0000 | u64::from(apic) << 12, u64::from(vector)),
+            (false, false) => (0xFEE0_0000 | apic << 12, u64::from(vector)),
         };
-        assert!(handle < IRQ_TABLE_ENTRIES as u64);
+        assert!(entry < IRQ_TABLE_ENTRIES as u64);
         Ok(Output::Msi { address, data })
     }
 

@@ -155,9 +155,10 @@ impl Model {
     ///    the order of derivation;
     /// 3. a capability derived from another has a subset of its rights, and
     ///    its badge if it has one; a root capability has every right, with
-    ///    `exec` if and only if the untyped capability it was made from has
-    ///    it, and no badge; only an endpoint or a notify capability has a
-    ///    badge;
+    ///    `exec` if and only if the capability it was made from has it (a
+    ///    frame of the start-up never has it, an irq always), and no badge,
+    ///    but a kept frame, which has the rights of its row; only an endpoint
+    ///    or a notify capability has a badge;
     /// 4. a capability is the root capability of its object, or was derived
     ///    from a capability for the same object;
     /// 20. the tree is at most `TREE_DEPTH` deep;
@@ -191,8 +192,10 @@ impl Model {
     /// 11. an object taken from an untyped names a live untyped, and its root
     ///     capability is a child of a capability for that untyped; an irq was
     ///     taken from none and its root capability is a child of an
-    ///     irq_control capability; another start-up object was taken from
-    ///     none and its root capability has no parent;
+    ///     irq_control capability; a block was taken from none and its root
+    ///     capability is a child of a memory_control capability; another
+    ///     start-up object was taken from none and its root capability has
+    ///     no parent;
     /// 25. device memory holds only frames and child untypeds, which are
     ///     device memory too, and no capability for a device untyped has
     ///     `exec` (so, with 3, none for what is made from it either);
@@ -262,7 +265,8 @@ impl Model {
         self.check_bindings()?;
         self.check_sched()?;
         self.check_tasks()?;
-        self.check_irqs()
+        self.check_irqs()?;
+        self.check_table()
     }
 
     fn check_tree(&self) -> Check {
@@ -288,11 +292,23 @@ impl Model {
             ensure(cap.children.iter().all(named), "2: children name it")?;
             ensure(cap.children.is_sorted(), "2: order of derivation")?;
             ensure(object.root == id || derived, "4: root or derivation")?;
+            // A kept frame has the rights of its row: `read` and `derive`,
+            // and `exec` for one of the kept image.
+            let kept = self.frames.get(&cap.object).is_some_and(|frame| frame.kept);
+            let read_derive = Rights::READ.union(Rights::DERIVE);
+            let row = cap.rights == read_derive || cap.rights == read_derive.union(Rights::EXEC);
             let every = cap.rights.contains(Rights::ALL.without(Rights::EXEC));
-            ensure(derived || every && cap.badge == 0, "3: root capability")?;
+            let rights = if kept { row } else { every };
+            ensure(derived || rights && cap.badge == 0, "3: root capability")?;
             let exec = |cap: &CapId| self.caps[cap].rights.contains(Rights::EXEC);
             let made = cap.parent.filter(|_| !derived);
-            let same = made.is_none_or(|from| exec(&from) == exec(&id));
+            let device = self.untypeds.get(&cap.object).is_some_and(|u| u.device);
+            // The frames of the start-up, children of the start-up untyped,
+            // have no `exec`; an irq's root has every right; device memory
+            // is judged by invariant 25.
+            let irq = self.irqs.contains_key(&cap.object);
+            let boot = object.boot && !exec(&id);
+            let same = irq || boot || made.is_none_or(|from| exec(&from) == exec(&id) || device);
             ensure(same, "3: exec of a root capability")?;
             let badged = matches!(object.kind, ObjectKind::Endpoint | ObjectKind::Notify);
             ensure(badged || cap.badge == 0, "3: badge on another kind")?;
@@ -441,6 +457,13 @@ impl Model {
                 let control = parent.and_then(|parent| self.objects.get(&parent.object));
                 let claimed = control.is_some_and(|c| c.kind == ObjectKind::IrqControl);
                 ensure(claimed, "11: parent of an irq")?;
+            } else if self.untypeds.get(&id).is_some_and(|u| u.block.is_some()) {
+                // `memory_control`: a block is a child of the memory_control
+                // capability it was taken through.
+                let parent = root.parent.and_then(|parent| self.caps.get(&parent));
+                let control = parent.and_then(|parent| self.objects.get(&parent.object));
+                let taken = control.is_some_and(|c| c.kind == ObjectKind::MemoryControl);
+                ensure(taken, "11: parent of a block")?;
             } else {
                 ensure(root.parent.is_none(), "11: parent of a start-up capability")?;
             }
@@ -704,6 +727,7 @@ impl Model {
 
 mod memory;
 mod sched;
+mod table;
 mod tasks;
 #[cfg(test)]
 mod tests;

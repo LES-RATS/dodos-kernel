@@ -2,6 +2,8 @@
 //! `Machine::example` (the start-up task in slot 8, mark-aware, with the
 //! first thread).
 
+mod common;
+
 use dodos_abi::ObjectKind::{Endpoint, Frame, Reply, Sched, Task, Thread};
 use dodos_abi::*;
 use dodos_model::*;
@@ -15,7 +17,7 @@ const U: u64 = 2;
 const P: u64 = 1;
 
 fn s(index: u32) -> SlotAddr {
-    SlotAddr::own(index)
+    SlotAddr::own(common::slot(index))
 }
 
 struct K {

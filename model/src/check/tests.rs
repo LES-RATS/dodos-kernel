@@ -6,10 +6,12 @@ use dodos_abi::{
     FAULT_WORDS, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, START_SLOT_CSPACE, START_SLOT_DEBUG,
     START_SLOT_THREAD, TREE_DEPTH,
 };
+use dodos_abi::{Owner, Ownership};
 
-/// The ordinary and the device untyped of `Machine::example`.
-const UNTYPED: u32 = 20;
-const DEVICE: u32 = 21;
+/// The untyped of one chunk of the floor of `Machine::example`, and the
+/// block of its device range, which `state` takes.
+const UNTYPED: u32 = 25;
+const DEVICE: u32 = 64;
 const EP: u32 = 40;
 const RP: u32 = 41;
 const NT: u32 = 42;
@@ -23,6 +25,14 @@ const CALLER: u32 = 46;
 fn state() -> Model {
     let (mut model, boot) = Model::boot(&Machine::example()).unwrap();
     let own = SlotAddr::own;
+    let take = Syscall::MemoryTake {
+        control: own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        kind: 1,
+        place: 0,
+        size: 0,
+        destination: own(DEVICE),
+    };
+    model.apply(boot, take).unwrap();
     let mut on = |thread: ObjId, call: Syscall| model.apply(thread, call).unwrap();
     let mut threads = Vec::new();
     for (kind, slot) in [
@@ -508,7 +518,7 @@ fn chain_down_to(m: &mut Model, at: At, depth: usize) {
             0,
             Place {
                 space: at.space,
-                index: 60 + index,
+                index: 200 + index,
             },
         );
         parent = *m.caps[&parent].children.last().unwrap();
@@ -680,10 +690,10 @@ fn badge_on_a_capability_that_is_not_for_an_endpoint_or_a_notify_is_reported() {
 
 #[test]
 fn start_up_capability_with_a_parent_is_reported() {
-    let broken = spoiled(|m, at| {
-        let debug = cap(m, START_SLOT_DEBUG);
-        live(&mut m.caps, at.untyped_cap).parent = Some(debug);
-        live(&mut m.caps, debug).children.push(at.untyped_cap);
+    let broken = spoiled(|m, _| {
+        let (debug, space) = (cap(m, START_SLOT_DEBUG), cap(m, START_SLOT_CSPACE));
+        live(&mut m.caps, debug).parent = Some(space);
+        live(&mut m.caps, space).children.push(debug);
     });
     assert_eq!(broken, "11: parent of a start-up capability");
 }
@@ -792,9 +802,9 @@ fn inner_space(m: &mut Model, at: At, index: u32) -> ObjId {
 fn untyped_capability_less_deep_than_the_space_that_holds_it_is_reported() {
     let broken = spoiled(|m, at| {
         let inner = inner_space(m, at, 60);
-        let device = cap(m, DEVICE);
+        let untyped = cap(m, 24);
         m.place(
-            device,
+            untyped,
             Place {
                 space: inner,
                 index: 1,
@@ -994,8 +1004,8 @@ fn capability_space_without_an_object_is_reported() {
 #[test]
 fn untyped_without_its_state_is_reported() {
     let broken = spoiled(|m, _| {
-        let device = object(m, DEVICE);
-        m.untypeds.remove(&device);
+        let untyped = object(m, UNTYPED);
+        m.untypeds.remove(&untyped);
     });
     assert_eq!(broken, "10: state of an object");
 }
@@ -1230,7 +1240,7 @@ fn census_counts_what_the_state_holds() {
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
         // Twenty at start-up, five objects, two copies.
-        capabilities: 27,
+        capabilities: 39,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,
@@ -1257,9 +1267,9 @@ fn census_counts_what_the_state_holds() {
     on(bound).unwrap();
     // A copy of the endpoint capability in slot 60, 33 copies of that copy
     // and 33 more copies of the endpoint capability.
-    let copies = (61..94)
+    let copies = (161..194)
         .map(|slot| (60, slot))
-        .chain((100..133).map(|slot| (EP, slot)));
+        .chain((200..233).map(|slot| (EP, slot)));
     for (source, destination) in [(EP, 60)].into_iter().chain(copies) {
         let copy = Syscall::CapDerive {
             source: own(source),
@@ -1419,11 +1429,11 @@ fn message_page_of_two_pages_is_reported() {
 }
 
 #[test]
-fn frame_of_513_pages_or_of_the_wrong_memory_type_is_reported() {
+fn frame_of_more_than_e_pages_or_of_the_wrong_memory_type_is_reported() {
     let page = |m: &Model, at: At| m.caps[&m.threads[&at.ready].page.unwrap()].object;
     let broken = spoiled(|m, at| {
         let frame = page(m, at);
-        live(&mut m.frames, frame).pages = 513;
+        live(&mut m.frames, frame).pages = u64::from(m.machine.geometry.entries) + 1;
     });
     assert_eq!(broken, "34: frame");
     let broken = spoiled(|m, at| {
@@ -1522,10 +1532,11 @@ fn record_missing_from_the_list_of_its_space_is_reported() {
 #[test]
 fn space_with_fewer_tables_than_its_translations_hook_is_reported() {
     let broken = spoiled(|m, at| {
-        // The segments at 2 MB and the pages at 4 KB: one table under the
-        // root, one of the third level, two of the last; the reserve is 4.
+        // One table fewer than the translations hook.
         let space = start_aspace(m, at);
-        live(&mut m.aspaces, space).tables = 3;
+        let geometry = m.machine.geometry;
+        let hooked = crate::memory::hooked(&m.aspaces[&space], geometry.levels, geometry);
+        live(&mut m.aspaces, space).tables = hooked - 1;
     });
     assert_eq!(broken, "37: tables of a space");
 }
@@ -1535,7 +1546,9 @@ fn space_with_as_many_tables_as_its_translations_hook_is_accepted() {
     let mut model = state();
     let at = places(&model);
     let space = start_aspace(&model, at);
-    live(&mut model.aspaces, space).tables = 4;
+    let geometry = model.machine.geometry;
+    let hooked = crate::memory::hooked(&model.aspaces[&space], geometry.levels, geometry);
+    live(&mut model.aspaces, space).tables = hooked;
     assert_eq!(model.check(), Ok(()));
 }
 
@@ -1862,4 +1875,189 @@ fn irq_whose_root_capability_is_not_a_child_of_an_irq_control_is_reported() {
         live(&mut m.caps, root).parent = None;
     });
     assert_eq!(broken, "11: parent of an irq");
+}
+
+// Memory between nodes and the gate over page tables.
+
+/// A block of one chunk of ordinary memory in slot 300, taken by the first
+/// thread: the first chunk past the floors and the reserves.
+fn with_block(m: &mut Model) -> (ObjId, u64) {
+    let thread = object(m, START_SLOT_THREAD);
+    let geometry = m.machine.geometry;
+    let place = m.machine.memory[4].base + 8 * geometry.chunk();
+    let take = Syscall::MemoryTake {
+        control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        kind: 0,
+        place,
+        size: u64::from(geometry.chunk_shift()),
+        destination: SlotAddr::own(300),
+    };
+    assert_eq!(m.apply(thread, take), Ok(Output::Done));
+    (object(m, 300), place >> geometry.chunk_shift())
+}
+
+fn spoiled_with_block(spoil: impl FnOnce(&mut Model, ObjId, u64)) -> &'static str {
+    let mut model = state();
+    let (block, chunk) = with_block(&mut model);
+    assert_eq!(model.check(), Ok(()));
+    spoil(&mut model, block, chunk);
+    model.check().expect_err("the state is spoiled")
+}
+
+#[test]
+fn take_of_a_word_the_rules_of_taking_refuse_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        let before = Ownership::free(Owner::Node(1)).raw();
+        let after = Ownership::taken(Owner::Node(0), 1).raw();
+        m.table.writes.push(crate::table::WordWrite {
+            chunk: Some(chunk),
+            entry: None,
+            writer: 0,
+            before,
+            after,
+        });
+    });
+    assert_eq!(broken, "52: write of an ownership word");
+}
+
+#[test]
+fn release_of_a_word_the_writer_did_not_hold_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        let before = Ownership::taken(Owner::Node(1), 1).raw();
+        let after = Ownership::free(Owner::Node(0)).raw();
+        m.table.writes.push(crate::table::WordWrite {
+            chunk: Some(chunk),
+            entry: None,
+            writer: 0,
+            before,
+            after,
+        });
+    });
+    assert_eq!(broken, "52: write of an ownership word");
+}
+
+#[test]
+fn two_blocks_on_one_chunk_are_reported() {
+    let broken = spoiled_with_block(|m, block, _| {
+        let device = object(m, DEVICE);
+        let (base, bytes) = (m.untypeds[&block].base, m.untypeds[&block].bytes);
+        let other = live(&mut m.untypeds, device);
+        (other.base, other.bytes, other.block) = (base, bytes, Some(crate::Block::Run));
+    });
+    assert_eq!(broken, "53: two blocks on a chunk");
+}
+
+#[test]
+fn block_on_a_word_not_taken_by_its_node_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        m.table.owners[chunk as usize] = Ownership::taken(Owner::Node(0), 7).raw();
+    });
+    assert_eq!(broken, "54: block on a word not taken");
+}
+
+#[test]
+fn start_up_untyped_outside_the_floor_is_reported() {
+    let broken = spoiled(|m, _| {
+        let untyped = object(m, UNTYPED);
+        live(&mut m.untypeds, untyped).base = 0;
+    });
+    assert_eq!(broken, "54: start-up untyped outside the floor");
+}
+
+#[test]
+fn block_on_a_free_word_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        m.table.owners[chunk as usize] = Ownership::free(Owner::Node(0)).raw();
+    });
+    assert_eq!(broken, "55: block on a free word");
+}
+
+#[test]
+fn translation_to_a_free_word_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        // The message page of the first thread now lies on a free chunk.
+        let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
+        let shift = m.machine.geometry.chunk_shift();
+        live(&mut m.frames, start).base = (chunk + 1) << shift;
+    });
+    assert_eq!(broken, "55: translation to a free word");
+}
+
+#[test]
+fn word_changed_from_none_is_reported() {
+    let broken = spoiled(|m, _| {
+        // A chunk of the floor of node 1.
+        let chunk = (m.machine.memory[4].base >> m.machine.geometry.chunk_shift()) + 3;
+        m.table.owners[chunk as usize] = Ownership::taken(Owner::Node(1), 1).raw();
+    });
+    assert_eq!(broken, "56: a word changed from or to none");
+}
+
+#[test]
+fn kernel_space_that_maps_a_chunk_the_node_does_not_hold_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        m.kernel_runs.insert(chunk + 1);
+    });
+    assert_eq!(broken, "57: kernel space and ownership");
+    let broken = spoiled_with_block(|m, _, chunk| {
+        m.kernel_runs.remove(&chunk);
+    });
+    assert_eq!(broken, "57: kernel space and ownership");
+}
+
+#[test]
+fn translation_to_memory_of_another_node_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        m.table.owners[chunk as usize + 1] = Ownership::taken(Owner::Node(1), 1).raw();
+        let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
+        let shift = m.machine.geometry.chunk_shift();
+        live(&mut m.frames, start).base = (chunk + 1) << shift;
+    });
+    assert_eq!(broken, "58: translation to memory the node does not own");
+}
+
+#[test]
+fn writable_translation_to_the_kept_image_is_reported() {
+    let broken = spoiled(|m, _| {
+        // The kept frame of the executable segment, mapped read and write.
+        let cap = cap(m, 27);
+        let rw = Rights::READ.union(Rights::WRITE);
+        let Record::Mapping(mut mapping) = m.caps[&cap].record else {
+            panic!("mapped");
+        };
+        mapping.rights = rw;
+        live(&mut m.caps, cap).record = Record::Mapping(mapping);
+        let space = live(&mut m.aspaces, mapping.space);
+        for t in space.translations.values_mut().filter(|t| t.cap == cap) {
+            t.rights = rw;
+        }
+    });
+    assert_eq!(broken, "58: writable translation to read-only memory");
+}
+
+#[test]
+fn translation_to_a_table_page_is_reported() {
+    let broken = spoiled(|m, _| {
+        let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
+        let page = m.frames[&start].base / m.machine.geometry.page();
+        m.table.classes.insert(page, crate::table::PageClass::Table);
+    });
+    assert_eq!(broken, "58: translation to a table page");
+}
+
+#[test]
+fn map_count_that_is_not_the_number_of_leaves_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| m.table.maps[chunk as usize] += 1);
+    assert_eq!(broken, "58: map count");
+}
+
+#[test]
+fn page_class_of_no_table_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        let pages = m.machine.geometry.chunk() / m.machine.geometry.page();
+        m.table
+            .classes
+            .insert(chunk * pages, crate::table::PageClass::Table);
+    });
+    assert_eq!(broken, "59: page classes");
 }

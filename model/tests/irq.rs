@@ -2,6 +2,8 @@
 //! `Machine::example` (its irq_control in slot 6, one IOAPIC of 24 inputs,
 //! interrupt remapping on, the boot core's APIC ID 0).
 
+mod common;
+
 use dodos_abi::ObjectKind::{Endpoint, Notify, Reply, Sched, Thread};
 use dodos_abi::*;
 use dodos_model::*;
@@ -12,7 +14,7 @@ const NT: u32 = 30;
 const DONE: Outcome = Ok(Output::Done);
 
 fn s(index: u32) -> SlotAddr {
-    SlotAddr::own(index)
+    SlotAddr::own(common::slot(index))
 }
 
 struct K {
@@ -125,13 +127,15 @@ fn irq_claim_returns_the_remappable_msi_of_its_handle_and_0_for_a_line() {
 fn without_remapping_the_msi_names_the_apic_and_the_vector() {
     let mut machine = Machine::example();
     machine.remapping = false;
-    machine.cores[0].apic_id = 5;
+    // Node 0's core is the first by hardware identifier.
+    machine.cores[0].hw_id = 1;
     let mut k = K::on(&machine);
     let result = k.go(claim(msi(), 60, 40));
-    let address = 0xFEE0_0000 | 5 << 12;
+    let address = 0xFEE0_0000 | 1 << 12;
     assert_eq!(result, Ok(Output::Msi { address, data: 60 }));
     // A core of APIC ID 256 cannot be reached this way, after the vector.
-    machine.cores[0].apic_id = 256;
+    machine.cores[0].hw_id = 256;
+    machine.cores[1].hw_id = 257;
     let mut k = K::on(&machine);
     k.no(claim(msi(), 300, 40), Error::Invalid);
     k.no(claim(msi(), 60, 40), Error::Unsupported);
@@ -200,7 +204,7 @@ fn irq_claim_checks_the_depth_last() {
         k.ok(Syscall::CapDerive {
             source: s(from),
             destination: s(slot),
-            rights: Rights::ALL.bits(),
+            rights: Rights::ALL.without(Rights::EXEC).bits(),
             badge: 0,
         });
         from = slot;
@@ -222,7 +226,7 @@ fn revoking_the_control_capability_releases_its_vectors() {
     k.ok(Syscall::CapDerive {
         source: s(CONTROL),
         destination: s(31),
-        rights: Rights::ALL.bits(),
+        rights: Rights::ALL.without(Rights::EXEC).bits(),
         badge: 0,
     });
     let through = Syscall::IrqClaim {

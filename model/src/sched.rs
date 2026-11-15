@@ -2,6 +2,7 @@
 //! what runs next, the lends of the budget across `call`, and timers.
 
 use crate::{Armed, Model, ObjId, Outcome, Output, Queue, Queued, Sched, Thread, live};
+use dodos_abi::RECOVERY_BANDWIDTH;
 use dodos_abi::{
     ADMISSION_WHOLE_CORE, CORE_WINDOWS, Error, FaultKind, ObjectKind, Rights, SCHED_MAX_PERIOD_NS,
     SCHED_MIN_BUDGET_NS, SCHED_STATE_CONFIGURED, SCHED_STATE_HOME, SCHED_STATE_LENT,
@@ -71,6 +72,7 @@ impl Model {
     /// to its budget if it ran from the ready queue. The kernel's own time
     /// is taken as zero. Returns the context running at the entry.
     pub(crate) fn begin(&mut self) -> Option<(ObjId, bool)> {
+        self.table.writes.clear();
         let elapsed = self.now - self.previous;
         self.previous = self.now;
         let (context, ready) = self.running?;
@@ -365,14 +367,21 @@ impl Model {
     }
 
     /// Start-up state: the context of the first thread is configured with
-    /// budget = period = 10 ms, class 1, and bound to it.
-    pub(crate) fn first_context(&mut self, context: ObjId, thread: ObjId, period: u64) {
+    /// its budget and period, class 1, and bound to it. The recovery
+    /// reserve (Cores) is admitted in the node's sum from start-up.
+    pub(crate) fn first_context(
+        &mut self,
+        context: ObjId,
+        thread: ObjId,
+        budget: u64,
+        period: u64,
+    ) {
         let sched = live(&mut self.scheds, context);
-        (sched.configured, sched.budget, sched.period, sched.class) = (true, period, period, 1);
-        (sched.remaining, sched.deadline) = (period as i64, self.now + period);
+        (sched.configured, sched.budget, sched.period, sched.class) = (true, budget, period, 1);
+        (sched.remaining, sched.deadline) = (budget as i64, self.now + period);
         sched.home = Some(thread);
         live(&mut self.threads, thread).home = Some(context);
-        self.admitted = bandwidth(period, period);
+        self.admitted = bandwidth(budget, period) + RECOVERY_BANDWIDTH;
         self.end(None);
     }
 

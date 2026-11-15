@@ -29,7 +29,7 @@ pub(crate) struct SizeArgument {
 /// Where `Model::take` placed an object, and where the clean mark of the
 /// untyped stood before.
 pub(crate) struct Taken {
-    at: u64,
+    pub(crate) at: u64,
     clean: u64,
 }
 
@@ -119,6 +119,8 @@ fn footprint(
                 page: size_index,
                 pages: size,
                 memory,
+                base: 0,
+                kept: false,
             };
             return Ok((size * bytes, bytes, Some(frame)));
         }
@@ -299,13 +301,24 @@ impl Model {
         };
         let cap = self.create(kind, size.size, Some(parent), new, place);
         let id = self.caps[&cap].object;
+        let base = self.untypeds[&object].base + start.at;
         if let Some(frame) = frame {
-            self.frames.insert(id, frame);
+            self.frames.insert(id, Frame { base, ..frame });
         }
         // A child untyped: its clean mark starts at the end of the part of
         // its range that the parent's clean mark covered.
         if let Some(child) = self.untypeds.get_mut(&id) {
             child.clean = start.clean.saturating_sub(start.at).min(bytes);
+            child.base = base;
+        }
+        // The gate over page tables, G2: the root table of a space is a
+        // table page.
+        if let Some(space) = self.aspaces.get_mut(&id) {
+            space.table_pages.push(base);
+            let page = base / self.machine.geometry.page();
+            self.table
+                .classes
+                .insert(page, crate::table::PageClass::Table);
         }
         Ok(Output::Done)
     }
@@ -450,9 +463,15 @@ impl Model {
         let from = parent.map(|parent| self.caps[&parent].object);
         match kind {
             ObjectKind::Untyped => {
+                // A child untyped lies inside its parent; `untyped_retype`
+                // places it.
                 let untyped = Untyped {
+                    base: 0,
+                    block: None,
                     bytes: size,
-                    device: from.is_some_and(|from| self.untypeds[&from].device),
+                    device: from
+                        .and_then(|from| self.untypeds.get(&from))
+                        .is_some_and(|from| from.device),
                     watermark: 0,
                     clean: 0,
                     live: 0,
@@ -533,7 +552,15 @@ impl Model {
         // The derivation tree: the capability that `untyped_retype` returns,
         // or the one given at start-up, is the root capability.
         let root = self.new_cap(id, rights, 0, parent, place);
-        self.objects.insert(id, Object { kind, root, from });
+        self.objects.insert(
+            id,
+            Object {
+                kind,
+                root,
+                from,
+                boot: false,
+            },
+        );
         root
     }
 
@@ -826,6 +853,11 @@ impl Model {
         Undone::Unit
     }
 
+    /// Removes a capability that has no descendant, and empties its slot.
+    pub(crate) fn remove_leaf(&mut self, id: CapId) {
+        self.remove_cap(id, Slot::Empty);
+    }
+
     /// Removes a capability that has no descendant, and leaves `left` in
     /// its slot. The derivation tree: the object is destroyed with its root
     /// capability. Removing a frame capability with a full record undoes
@@ -853,7 +885,9 @@ impl Model {
     fn destroy(&mut self, id: ObjId) {
         let object = self.objects.remove(&id).expect("names a live entry");
         match object.kind {
+            // Destruction of a block: its words become free (D-114).
             ObjectKind::Untyped => {
+                self.free_block(id, crate::blocks::Freed::Destroyed);
                 self.untypeds.remove(&id);
             }
             ObjectKind::CSpace => {
@@ -884,6 +918,11 @@ impl Model {
             ObjectKind::ASpace | ObjectKind::IoSpace => {
                 let space = self.aspaces.remove(&id).expect("names a live entry");
                 self.iospaces.remove(&id);
+                // G2: the gate turns the table pages back into data.
+                let page = self.machine.geometry.page();
+                for at in &space.table_pages {
+                    self.table.classes.remove(&(at / page));
+                }
                 for untyped in object
                     .from
                     .iter()

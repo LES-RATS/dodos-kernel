@@ -15,7 +15,8 @@ impl Model {
     ///     runnable, else the receiver of the top lend); the orders of entry
     ///     were given out once each;
     /// 42. the admitted sum is the sum of the bandwidths of the configured
-    ///     contexts that are not dying, at most one whole core;
+    ///     contexts that are not dying and of the recovery reserve, at most
+    ///     one whole core;
     /// 43. a configured context has 10 µs ≤ budget ≤ period ≤ 2^36 ns (and
     ///     so do the parameters it waits to use), class 0 to 2, budget left
     ///     if and only if it is not throttled, and a replenishment instant
@@ -91,6 +92,8 @@ impl Model {
             let once = sched.chain.iter().collect::<BTreeSet<_>>().len() == sched.chain.len();
             ensure(chained && once, "44: chain of a context")?;
         }
+        // The recovery reserve is admitted in the sum from start-up.
+        let sum = sum + dodos_abi::RECOVERY_BANDWIDTH;
         ensure(
             sum == self.admitted && sum <= ADMISSION_WHOLE_CORE,
             "42: admitted sum",

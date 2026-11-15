@@ -1,6 +1,8 @@
 //! One test per behaviour of the call reference. Every call goes through
 //! `K::on`, which checks the invariants after it.
 
+mod common;
+
 use dodos_abi::ObjectKind::{ASpace, CSpace, Endpoint, Frame, Notify, Reply, Thread, Untyped};
 use dodos_abi::*;
 use dodos_model::*;
@@ -14,20 +16,25 @@ const CORE: SlotAddr = SlotAddr::own(16);
 /// the tests.
 const BEYOND: SlotAddr = SlotAddr::own(4224);
 const DROPPED: u32 = Header::FLAG_CAPS_DROPPED;
+/// Every right but `exec`: the rights of a root made at start-up from no
+/// untyped, and of a machine object.
+const NOT_EXEC: Rights = Rights::ALL.without(Rights::EXEC);
 // Slots that the tests use for the same thing.
 const EP: u32 = 20;
 const RP: u32 = 21;
 const NT: u32 = 22;
 
 /// The slot numbers of the tests, on the start-up space of
-/// `Machine::example`: 16 and 17 are its ordinary and its device untyped
-/// (slots 20 and 21), and the slots from 18 are 16 further, after the
-/// start-up capabilities. The fixed slots below 16 are themselves.
+/// `Machine::example`: 16 is its untyped of one chunk (slot 25) and 17 the
+/// block of its device range (taken into slot 64), and the slots from 18
+/// are 64 further, after the start-up capabilities and the device block.
+/// The fixed slots below 16 are themselves.
 const fn shifted(index: u32) -> u32 {
     match index {
         0..16 => index,
-        16 | 17 => index + 4,
-        _ => index + 16,
+        16 => common::UNTYPED,
+        17 => common::DEVICE,
+        _ => index + 64,
     }
 }
 
@@ -214,7 +221,8 @@ impl K {
     /// The first thread's context keeps half of the core, so that the
     /// threads that `spawn` makes have contexts of their own.
     fn new() -> Self {
-        let (m, t) = Model::boot(&Machine::example()).unwrap();
+        let (mut m, t) = Model::boot(&Machine::example()).unwrap();
+        common::take_device(&mut m, t);
         let mut k = Self { m, t, spare: 4000 };
         k.ok(Syscall::SchedConfigure {
             sched: SlotAddr::own(START_SLOT_SCHED),
@@ -266,7 +274,12 @@ impl K {
     /// are checked once, at the end.
     #[track_caller]
     fn made(&mut self, creation: Syscall) {
-        for _ in 0..40_000 {
+        self.made_in(creation, 40_000);
+    }
+
+    /// As `made`, within `calls` calls.
+    fn made_in(&mut self, creation: Syscall, calls: u64) {
+        for _ in 0..calls {
             match self.m.apply(self.t, creation.clone()) {
                 DONE => return assert_eq!(self.m.check(), Ok(())),
                 Err(Error::Again) => {}
@@ -279,7 +292,7 @@ impl K {
     /// A new object from the ordinary untyped, in a slot of the first thread.
     fn make(&mut self, kind: ObjectKind, slot: u32) {
         let size = match kind {
-            Untyped => 4096,
+            Untyped => self.m.geometry().page(),
             CSpace => 128,
             Frame => 1,
             _ => 0,
@@ -337,6 +350,17 @@ impl K {
         self.schedule(slot);
         self.ok(Syscall::ThreadResume(s(slot)));
         self.m.object_at(self.t, s(slot)).unwrap()
+    }
+
+    /// Values of the machine: the bytes of a page size.
+    fn bytes(&self, size: PageSize) -> u64 {
+        self.m.geometry().bytes(size).unwrap()
+    }
+
+    /// A block of `1 << log2` bytes of ordinary memory in `slot`.
+    fn run(&mut self, log2: u32, slot: u32) {
+        common::take_run(&mut self.m, self.t, log2, shifted(slot));
+        assert_eq!(self.m.check(), Ok(()));
     }
 
     /// A copy of a capability with the given rights only.
@@ -600,20 +624,34 @@ fn cspace_grow_is_no_memory_when_the_untyped_is_exhausted() {
 #[test]
 fn segments_go_back_to_the_untyped_when_the_cspace_is_destroyed() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 16384, s(31)));
+    let page = k.m.geometry().page();
+    let bytes = 2 * page.max(8192);
+    k.ok(retype(UT, Untyped, bytes, s(31)));
     k.ok(retype(s(31), CSpace, 128, s(30)));
     let from_child = grow_from(30, s(31));
     k.go(from_child).unwrap();
+    // The directory at 0, the segment at 8 KB, directories of 8 KB to the
+    // end.
+    for slot in 0..(bytes - 16384) / 8192 {
+        k.ok(retype(s(31), CSpace, 1024 * 128, s(1000 + slot as u32)));
+    }
     k.no(retype(s(31), Endpoint, 0, s(40)), Error::NoMemory);
+    for slot in 0..(bytes - 16384) / 8192 {
+        k.ok(Syscall::CapDelete(s(1000 + slot as u32)));
+    }
     k.ok(Syscall::CapDelete(s(30)));
     // The watermark is back at zero: the whole untyped can be taken again.
-    k.ok(retype(s(31), ASpace, 0, s(40)));
-    k.ok(retype(s(31), ASpace, 0, s(41)));
+    k.ok(retype(s(31), Untyped, bytes, s(40)));
 }
 
 /// Every right but one.
+/// Every right but `right`, and without `exec` but for an `exec` asked
+/// for: the start-up capabilities of the tests have no `exec`.
 fn caps_without(right: Rights) -> Rights {
-    Rights::from_bits(Rights::ALL.bits() & !right.bits()).unwrap()
+    match right == Rights::EXEC {
+        true => Rights::ALL.without(right),
+        false => NOT_EXEC.without(right),
+    }
 }
 
 // Order of checks.
@@ -782,7 +820,8 @@ fn cap_delete_removes_the_descendants_instead_of_handing_them_up() {
 #[test]
 fn object_lives_as_long_as_its_root_capability_wherever_it_is_moved() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 2 * page, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.weak(31, 32, Rights::ALL);
     k.ok(mv(s(31), s(33)));
@@ -1067,7 +1106,7 @@ fn thread_whose_capability_space_is_dying_deletes_its_own_slots_only() {
     let mut k = K::with_ipc();
     let inside = space_with_a_thread(&mut k);
     // In its slot 25, a capability for the first space, which is not dying.
-    k.ok(derive(SPACE, via(30, 25), Rights::ALL, 0));
+    k.ok(derive(SPACE, via(30, 25), NOT_EXEC, 0));
     assert_eq!(
         k.on(
             inside,
@@ -1169,9 +1208,10 @@ fn untyped_capability_is_placed_only_in_a_space_that_is_not_deeper() {
     let mut k = K::new();
     k.make(CSpace, 30);
     k.go(grow(30)).unwrap();
-    // The space is at depth 2, the start-up untypeds at depth 1.
+    // The space is at depth 2, the start-up untypeds at depth 1; a block,
+    // a child of the memory_control, is at depth 2.
     k.no(mv(UT, via(30, 5)), Error::Invalid);
-    k.no(mv(DEV, via(30, 5)), Error::Invalid);
+    k.ok(mv(DEV, via(30, 4)));
     // A child and a copy are at depth 2.
     k.make(Untyped, 31);
     k.weak(START_SLOT_FIRST, 32, Rights::ALL);
@@ -1185,18 +1225,19 @@ fn untyped_capability_is_derived_or_created_only_in_a_space_that_is_not_deeper()
     k.make(CSpace, 30);
     k.go(grow(30)).unwrap();
     deeper_space(&mut k);
+    let page = k.m.geometry().page();
     k.ok(derive(UT, via(30, 5), Rights::ALL, 0));
-    k.ok(retype(UT, Untyped, 4096, via(30, 6)));
+    k.ok(retype(UT, Untyped, page, via(30, 6)));
     k.no(derive(UT, via(34, 5), Rights::ALL, 0), Error::Invalid);
-    k.no(retype(UT, Untyped, 4096, via(34, 5)), Error::Invalid);
-    k.ok(retype(s(33), Untyped, 4096, via(34, 5)));
+    k.no(retype(UT, Untyped, page, via(34, 5)), Error::Invalid);
+    k.ok(retype(s(33), Untyped, page, via(34, 5)));
     k.ok(retype(UT, Notify, 0, via(34, 6)));
 }
 
 #[test]
 fn capability_of_another_kind_moves_into_any_capability_space() {
     let mut k = K::with_ipc();
-    k.weak(START_SLOT_CSPACE, 31, Rights::ALL);
+    k.weak(START_SLOT_CSPACE, 31, NOT_EXEC);
     k.make(CSpace, 30);
     k.go(grow(30)).unwrap();
     // All three are older than the space; the second is not a root.
@@ -1235,7 +1276,7 @@ fn copy_of_a_space_capability_is_derived_into_any_space() {
         k.go(grow(slot)).unwrap();
     }
     k.ok(derive(s(30), via(31, 5), Rights::ALL, 0));
-    k.ok(derive(SPACE, via(31, 6), Rights::ALL, 0));
+    k.ok(derive(SPACE, via(31, 6), NOT_EXEC, 0));
 }
 
 #[test]
@@ -1449,27 +1490,30 @@ fn untyped_retype_needs_an_empty_destination() {
 }
 
 #[test]
-fn child_untyped_is_a_power_of_two_of_at_least_4_kb() {
+fn child_untyped_is_a_power_of_two_of_at_least_one_page() {
     let mut k = K::new();
-    for size in [0, 2048, 4097, 12288] {
+    let page = k.m.geometry().page();
+    for size in [0, page / 2, page + 1, 3 * page] {
         k.no(retype(UT, Untyped, size, s(30)), Error::Invalid);
     }
-    k.ok(retype(UT, Untyped, 4096, s(30)));
+    k.ok(retype(UT, Untyped, page, s(30)));
     k.ok(retype(UT, Untyped, 1 << 20, s(31)));
 }
 
 #[test]
 fn frame_takes_a_page_size_and_a_number_of_pages() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 22, s(30)));
+    let chunk = k.m.geometry().chunk_shift();
+    let entries = u64::from(k.m.geometry().entries);
+    k.run(chunk + 1, 30);
     k.no(retype(s(30), Frame, 0, s(31)), Error::Invalid);
     let wb = MemoryType::WriteBack;
     let large = |size, destination| frame(s(30), PageSize::Large1, size, wb, destination);
     k.made(large(2, s(31)));
     k.no(retype(s(30), Frame, 1, s(32)), Error::NoMemory);
-    k.no(large(512, s(32)), Error::NoMemory);
-    // Frames: at most 512 pages (D-110).
-    k.no(large(513, s(32)), Error::Invalid);
+    k.no(large(entries, s(32)), Error::NoMemory);
+    // Frames: at most E pages (D-110).
+    k.no(large(entries + 1, s(32)), Error::Invalid);
     k.no(large(u64::MAX, s(32)), Error::Invalid);
 }
 
@@ -1491,8 +1535,9 @@ fn frame_size_argument_is_judged_page_size_then_memory_type_then_pages() {
     k.no(raw(UT, 0, 1, 1), Error::Invalid);
     k.no(raw(UT, 0, 3, 1), Error::Invalid);
     k.no(raw(UT, 0, 0, 0), Error::Invalid);
-    k.no(raw(UT, 0, 0, 513), Error::Invalid);
-    k.made(raw(UT, 0, 0, 512));
+    let entries = u64::from(k.m.geometry().entries);
+    k.no(raw(UT, 0, 0, entries + 1), Error::Invalid);
+    k.made(raw(UT, 0, 0, entries));
     k.ok(Syscall::CapDelete(s(30)));
     // Device memory is uncached or write-combining, never write-back.
     k.no(raw(DEV, 0, 0, 1), Error::Invalid);
@@ -1561,10 +1606,11 @@ fn timers_tasks_and_iospaces_are_made_from_an_untyped() {
 #[test]
 fn device_memory_becomes_only_a_frame_or_a_child_untyped() {
     let mut k = K::new();
+    let page = k.m.geometry().page();
     k.no(retype(DEV, Endpoint, 0, s(30)), Error::Invalid);
     k.no(retype(DEV, CSpace, 128, s(30)), Error::Invalid);
     k.ok(retype(DEV, Frame, 1, s(30)));
-    k.ok(retype(DEV, Untyped, 4096, s(31)));
+    k.ok(retype(DEV, Untyped, page, s(31)));
     k.no(retype(s(31), Endpoint, 0, s(32)), Error::Invalid);
     k.ok(frame(s(31), PageSize::Page, 1, MemoryType::Uncached, s(32)));
 }
@@ -1594,8 +1640,9 @@ fn new_capability_has_exec_only_if_the_untyped_capability_has_it() {
 #[test]
 fn new_capability_never_has_exec_on_device_memory() {
     let mut k = K::new();
+    let page = k.m.geometry().page();
     k.ok(retype(DEV, Frame, 1, s(30)));
-    k.ok(retype(DEV, Untyped, 4096, s(31)));
+    k.ok(retype(DEV, Untyped, page, s(31)));
     assert_eq!(k.inspect(s(30)), Ok((Frame, caps_without(Rights::EXEC), 0)));
     assert_eq!(
         k.inspect(s(31)),
@@ -1615,7 +1662,8 @@ fn new_capability_is_a_child_of_the_untyped_capability() {
 #[test]
 fn untyped_retype_is_no_memory_when_the_untyped_is_exhausted() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 2 * page, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.no(retype(s(30), Endpoint, 0, s(32)), Error::NoMemory);
 }
@@ -1623,51 +1671,61 @@ fn untyped_retype_is_no_memory_when_the_untyped_is_exhausted() {
 #[test]
 fn memory_is_aligned_on_the_size_of_the_object() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 16384, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 4 * page, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
-    // An address space of 8 KB is aligned on 4 KB: at 4 KB, which leaves
-    // room for a directory of 4 KB at 12 KB, and nothing after it.
+    // An address space of two pages is aligned on a page: at one page,
+    // which leaves room for a directory of a page at three, and nothing
+    // after it.
     k.ok(retype(s(30), ASpace, 0, s(32)));
-    k.ok(retype(s(30), CSpace, 512 * 128, s(34)));
+    k.ok(retype(s(30), CSpace, page / 8 * 128, s(34)));
     k.no(retype(s(30), Endpoint, 0, s(33)), Error::NoMemory);
 }
 
 #[test]
 fn child_untyped_is_aligned_on_its_size() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 16, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 16 * page, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
-    k.ok(retype(s(30), Untyped, 1 << 15, s(32)));
-    k.no(retype(s(30), Untyped, 4096, s(33)), Error::NoMemory);
+    k.ok(retype(s(30), Untyped, 8 * page, s(32)));
+    k.no(retype(s(30), Untyped, page, s(33)), Error::NoMemory);
 }
 
 #[test]
-fn kernel_object_larger_than_4_kb_is_aligned_on_4_kb() {
+fn kernel_object_larger_than_a_page_is_aligned_on_a_page() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 15, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 8 * page, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
-    // A directory of 8 KB, at 4 KB, then an address space of 8 KB at 12 KB:
-    // 12 KB are left.
-    k.ok(retype(s(30), CSpace, 513 * 128, s(32)));
+    // An address space of two pages at one page, then another at three:
+    // three pages are left, which three more address spaces of two pages
+    // cannot use but for one.
+    k.ok(retype(s(30), ASpace, 0, s(32)));
     k.ok(retype(s(30), ASpace, 0, s(33)));
-    k.ok(retype(s(30), CSpace, 512 * 128, s(34)));
-    k.ok(retype(s(30), CSpace, 513 * 128, s(35)));
-    k.no(retype(s(30), Endpoint, 0, s(36)), Error::NoMemory);
+    k.ok(retype(s(30), ASpace, 0, s(34)));
+    k.no(retype(s(30), ASpace, 0, s(35)), Error::NoMemory);
+    k.ok(retype(s(30), Endpoint, 0, s(36)));
 }
 
 #[test]
 fn cspace_directory_is_rounded_up_to_a_power_of_two() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 8192, s(30)));
-    // 513 segments: 4,104 bytes of directory, rounded up to 8 KB.
-    k.ok(retype(s(30), CSpace, 513 * 128, s(31)));
-    k.no(retype(s(30), Endpoint, 0, s(32)), Error::NoMemory);
+    // An untyped of a page, at least 8 KB, filled by directories of 513
+    // segments: 4,104 bytes each, rounded up to 8 KB.
+    let bytes = k.m.geometry().page().max(8192);
+    k.ok(retype(UT, Untyped, bytes, s(30)));
+    for slot in 0..bytes / 8192 {
+        k.ok(retype(s(30), CSpace, 513 * 128, s(31 + slot as u32)));
+    }
+    k.no(retype(s(30), Endpoint, 0, s(29)), Error::NoMemory);
 }
 
 #[test]
 fn frame_is_aligned_on_its_page_size() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 16384, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 4 * page, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
     k.ok(retype(s(30), Frame, 3, s(32)));
     k.no(retype(s(30), Endpoint, 0, s(33)), Error::NoMemory);
@@ -1676,7 +1734,8 @@ fn frame_is_aligned_on_its_page_size() {
 #[test]
 fn watermark_returns_to_zero_only_when_the_last_object_is_destroyed() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 16384, s(30)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, 4 * page, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.ok(retype(s(30), ASpace, 0, s(32)));
     k.ok(Syscall::CapDelete(s(31)));
@@ -2779,7 +2838,8 @@ fn send_on_an_idle_reply_object_would_wait_and_moves_nothing() {
 #[test]
 fn large_frame_is_aligned_on_its_page_size() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 22, s(30)));
+    let chunk = k.m.geometry().chunk_shift();
+    k.run(chunk + 1, 30);
     k.ok(retype(s(30), Endpoint, 0, s(31)));
     let large = Syscall::UntypedRetype {
         untyped: s(30),
@@ -2936,27 +2996,36 @@ fn state_is_checked_after_every_argument() {
 #[test]
 fn cspace_grow_checks_the_untyped_then_the_maximum_then_the_memory() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 16384, s(31)));
+    let page = k.m.geometry().page();
+    k.ok(retype(UT, Untyped, page.max(16384), s(31)));
     k.ok(retype(s(31), CSpace, 128, s(30)));
     k.go(grow_from(30, s(31))).unwrap();
     // At its maximum, and its untyped is exhausted.
     k.no(grow_from(30, UT), Error::Invalid);
     k.no(grow_from(30, s(31)), Error::NoSlot);
-    k.ok(retype(UT, Untyped, 4096, s(33)));
-    k.ok(retype(s(33), CSpace, 256, s(32)));
+    // A space whose untyped runs out before its maximum.
+    k.ok(retype(UT, Untyped, page, s(33)));
+    k.ok(retype(s(33), CSpace, 2 * 128 * page.div_ceil(8192), s(32)));
+    let segments = (page - 8192.min(page)) / 8192;
+    for _ in 0..segments {
+        k.go(grow_from(32, s(33))).unwrap();
+    }
     k.no(grow_from(32, s(33)), Error::NoMemory);
 }
 
 #[test]
 fn segment_is_aligned_on_8_kb() {
     let mut k = K::new();
-    k.ok(retype(UT, Untyped, 1 << 15, s(31)));
-    // The directory at 0, the segment of 8 KB at 8 KB, two address spaces
-    // at 16 KB and 24 KB: nothing is left.
+    let page = k.m.geometry().page();
+    let bytes = 4 * page.max(8192);
+    k.ok(retype(UT, Untyped, bytes, s(31)));
+    // The directory at 0, the segment of 8 KB at 8 KB, then directories of
+    // 8 KB up to the end: nothing is left.
     k.ok(retype(s(31), CSpace, 128, s(30)));
     k.go(grow_from(30, s(31))).unwrap();
-    k.ok(retype(s(31), ASpace, 0, s(32)));
-    k.ok(retype(s(31), ASpace, 0, s(33)));
+    for slot in 0..(bytes - 16384) / 8192 {
+        k.ok(retype(s(31), CSpace, 1024 * 128, s(1000 + slot as u32)));
+    }
     k.no(retype(s(31), Endpoint, 0, s(34)), Error::NoMemory);
 }
 
@@ -3110,10 +3179,13 @@ fn root_capability_of_a_space_moved_by_ipc_follows_the_depth_rule() {
 }
 
 #[test]
-fn frame_of_1_gb_pages_is_aligned_on_1_gb() {
+fn frame_of_the_second_large_page_is_aligned_on_its_size() {
     let mut k = K::new();
+    // A block of one page of the second large page (the largest run).
+    let log2 = k.bytes(PageSize::Large2).trailing_zeros();
+    k.run(log2, 29);
     let huge = |size, slot| Syscall::UntypedRetype {
-        untyped: UT,
+        untyped: s(29),
         kind: Frame,
         size,
         page: PageSize::Large2 as u64,
@@ -3122,12 +3194,14 @@ fn frame_of_1_gb_pages_is_aligned_on_1_gb() {
     };
     k.no(huge(0, 30), Error::Invalid);
     k.no(huge(1 << 34, 30), Error::Invalid);
-    // The first untyped has 4 GB: an endpoint at 0, one page at 1 GB, two
-    // at 2 GB, and nothing is left.
-    k.make(Endpoint, 30);
-    k.made(huge(1, 31));
-    k.made(huge(2, 32));
-    k.no(retype(UT, Endpoint, 0, s(33)), Error::NoMemory);
+    // A page fills the block, from dirty memory: one call per 64 KB.
+    let calls = k.bytes(PageSize::Large2) / CLEAR_STEP_BYTES;
+    k.made_in(huge(1, 31), calls);
+    k.no(retype(s(29), Endpoint, 0, s(33)), Error::NoMemory);
+    // An endpoint at 0 leaves no room for one.
+    k.ok(Syscall::CapDelete(s(31)));
+    k.ok(retype(s(29), Endpoint, 0, s(30)));
+    k.no(huge(1, 31), Error::NoMemory);
 }
 
 #[test]
@@ -3188,12 +3262,12 @@ fn longest_walk_that_the_depth_rule_allows_is_within_the_bound() {
     // The deepest space holds, in its slot 1, a capability at depth 1 and
     // then a copy of it at each depth down to 64.
     k.ok(mv(SlotAddr::own(300 + START_SLOT_DEBUG), via(102, 1)));
-    k.ok(derive(via(102, 1), via(102, 3), Rights::ALL, 0));
+    k.ok(derive(via(102, 1), via(102, 3), NOT_EXEC, 0));
     for index in 3..65 {
-        k.ok(derive(via(102, index), via(102, index + 1), Rights::ALL, 0));
+        k.ok(derive(via(102, index), via(102, index + 1), NOT_EXEC, 0));
     }
     k.no(
-        derive(via(102, 65), via(102, 66), Rights::ALL, 0),
+        derive(via(102, 65), via(102, 66), NOT_EXEC, 0),
         Error::Invalid,
     );
     // The walk: the root capability of the start-up space, the untyped it
@@ -3407,10 +3481,11 @@ fn rights_of_a_capability_to_derive_are_judged_before_its_depth() {
 fn thread_takes_2_kb() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    for slot in 40..42 {
-        k.ok(retype(s(30), Thread, 0, s(slot)));
+    let fit = (k.m.geometry().page() / 2048) as u32;
+    for slot in 0..fit {
+        k.ok(retype(s(30), Thread, 0, s(1000 + slot)));
     }
-    k.no(retype(s(30), Thread, 0, s(42)), Error::NoMemory);
+    k.no(retype(s(30), Thread, 0, s(999)), Error::NoMemory);
 }
 
 #[test]
@@ -3418,7 +3493,10 @@ fn thread_is_aligned_on_2_kb() {
     let mut k = K::new();
     k.make(Untyped, 30);
     k.ok(retype(s(30), Endpoint, 0, s(40)));
-    k.ok(retype(s(30), Thread, 0, s(41)));
+    let fit = (k.m.geometry().page() / 2048) as u32 - 1;
+    for slot in 0..fit {
+        k.ok(retype(s(30), Thread, 0, s(1000 + slot)));
+    }
     k.no(retype(s(30), Endpoint, 0, s(42)), Error::NoMemory);
 }
 
@@ -3426,44 +3504,49 @@ fn thread_is_aligned_on_2_kb() {
 fn sched_takes_256_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    for slot in 40..56 {
-        k.ok(retype(s(30), ObjectKind::Sched, 0, s(slot)));
+    let fit = (k.m.geometry().page() / 256) as u32;
+    for slot in 0..fit {
+        k.ok(retype(s(30), ObjectKind::Sched, 0, s(1000 + slot)));
     }
-    k.no(retype(s(30), ObjectKind::Sched, 0, s(56)), Error::NoMemory);
+    k.no(retype(s(30), ObjectKind::Sched, 0, s(999)), Error::NoMemory);
 }
 
 #[test]
 fn endpoint_reply_and_notify_take_64_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    for slot in 40..104 {
+    let fit = (k.m.geometry().page() / 64) as u32;
+    for slot in 0..fit {
         let kind = [Endpoint, Reply, Notify][slot as usize % 3];
-        k.ok(retype(s(30), kind, 0, s(slot)));
+        k.ok(retype(s(30), kind, 0, s(1000 + slot)));
     }
-    k.no(retype(s(30), Endpoint, 0, s(104)), Error::NoMemory);
+    k.no(retype(s(30), Endpoint, 0, s(999)), Error::NoMemory);
 }
 
 #[test]
 fn directory_of_one_segment_takes_8_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    // Eight directories in the first 64 bytes, then 63 endpoints.
+    // Eight directories in the first 64 bytes, then endpoints.
     for slot in 40..48 {
         k.ok(retype(s(30), CSpace, 128, s(slot)));
     }
-    for slot in 48..111 {
-        k.ok(retype(s(30), Endpoint, 0, s(slot)));
+    let fit = (k.m.geometry().page() / 64) as u32 - 1;
+    for slot in 0..fit {
+        k.ok(retype(s(30), Endpoint, 0, s(1000 + slot)));
     }
-    k.no(retype(s(30), Endpoint, 0, s(111)), Error::NoMemory);
+    k.no(retype(s(30), Endpoint, 0, s(999)), Error::NoMemory);
 }
 
 #[test]
 fn directory_is_aligned_on_its_size() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    // 8 bytes at 0, then 2 KB at 2 KB: nothing is left.
+    // 8 bytes at 0, then directories of half a page from half a page:
+    // nothing is left.
+    let half = k.m.geometry().page() / 2;
     k.ok(retype(s(30), CSpace, 128, s(40)));
-    k.ok(retype(s(30), CSpace, 256 * 128, s(41)));
+    k.ok(retype(s(30), CSpace, half / 8 * 128, s(41)));
     k.no(retype(s(30), Endpoint, 0, s(42)), Error::NoMemory);
 }
 
@@ -3854,11 +3937,13 @@ fn bits_of_the_rights_are_those_of_the_interface() {
 #[test]
 fn start_up_untypeds_of_the_machine_of_the_tests_have_their_sizes() {
     let mut k = K::new();
-    // The share of node 0, 4 GB from 4 GB, and the device range of 2 MB.
-    k.ok(retype(UT, Untyped, 4 << 30, s(30)));
-    k.no(retype(UT, Untyped, 4096, s(31)), Error::NoMemory);
+    // The second untyped of the floor of node 0, one chunk, and the device
+    // range of 2 MB.
+    let (chunk, page) = (k.m.geometry().chunk(), k.m.geometry().page());
+    k.ok(retype(UT, Untyped, chunk, s(30)));
+    k.no(retype(UT, Untyped, page, s(31)), Error::NoMemory);
     k.ok(retype(DEV, Untyped, 2 << 20, s(32)));
-    k.no(retype(DEV, Untyped, 4096, s(33)), Error::NoMemory);
+    k.no(retype(DEV, Untyped, page, s(33)), Error::NoMemory);
 }
 
 #[test]
@@ -3975,12 +4060,13 @@ fn cap_delete_on_an_empty_slot_of_an_own_dying_space_is_invalid() {
 fn sched_is_aligned_on_256_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    // An endpoint at 0, then 15 scheduling contexts from 256: nothing left.
+    // An endpoint at 0, then scheduling contexts from 256: nothing left.
     k.ok(retype(s(30), Endpoint, 0, s(40)));
-    for slot in 41..56 {
-        k.ok(retype(s(30), ObjectKind::Sched, 0, s(slot)));
+    let fit = (k.m.geometry().page() / 256) as u32 - 1;
+    for slot in 0..fit {
+        k.ok(retype(s(30), ObjectKind::Sched, 0, s(1000 + slot)));
     }
-    k.no(retype(s(30), Endpoint, 0, s(56)), Error::NoMemory);
+    k.no(retype(s(30), Endpoint, 0, s(999)), Error::NoMemory);
 }
 
 #[test]
@@ -4225,7 +4311,7 @@ fn supervisor_kills_a_process_by_deleting_its_space_then_its_untyped() {
     // Then its untyped, and with it its thread.
     k.ok(Syscall::CapDelete(s(30)));
     assert_eq!(k.m.runnable(), [k.t]);
-    k.ok(retype(UT, Untyped, 1 << 20, s(30)));
+    assert_eq!(k.kind(30), Err(Error::Invalid));
 }
 
 // What the mutation check of the last pass found without a test.
@@ -5033,12 +5119,13 @@ fn long(words: u64) -> Message {
 }
 
 #[test]
-fn message_page_is_a_frame_of_one_4_kb_page_of_ordinary_memory() {
+fn message_page_is_a_frame_of_one_page_of_ordinary_memory() {
     let mut k = K::new();
     k.make(Thread, 30);
     let wb = MemoryType::WriteBack;
     k.ok(frame(UT, PageSize::Page, 2, wb, s(31)));
-    k.made(frame(UT, PageSize::Large1, 1, wb, s(32)));
+    k.run(k.m.geometry().chunk_shift(), 29);
+    k.made(frame(s(29), PageSize::Large1, 1, wb, s(32)));
     k.ok(frame(DEV, PageSize::Page, 1, MemoryType::Uncached, s(33)));
     k.make(Endpoint, 34);
     for slot in [31, 32, 33, 34] {
@@ -5237,6 +5324,12 @@ fn dirty(k: &mut K, slot: u32) {
     k.ok(Syscall::CapDelete(s(slot + 1)));
 }
 
+/// The pages of a number of kilobytes, on the geometry of the run.
+fn kb_pages(k: &K) -> impl Fn(u64) -> u64 + use<> {
+    let page = k.m.geometry().page();
+    move |kb| (kb << 10) / page
+}
+
 fn pages(untyped: u32, count: u64, slot: u32) -> Syscall {
     let wb = MemoryType::WriteBack;
     frame(s(untyped), PageSize::Page, count, wb, s(slot))
@@ -5245,15 +5338,16 @@ fn pages(untyped: u32, count: u64, slot: u32) -> Syscall {
 #[test]
 fn creation_from_dirty_memory_clears_64_kb_per_call_and_makes_nothing_until_the_end() {
     let mut k = K::new();
+    let kb = kb_pages(&k);
     dirty(&mut k, 30);
     // 128 KB: two calls.
-    k.no(pages(30, 32, 32), Error::Again);
+    k.no(pages(30, kb(128), 32), Error::Again);
     assert_eq!(k.kind(32), Err(Error::Invalid));
-    k.ok(pages(30, 32, 32));
+    k.ok(pages(30, kb(128), 32));
     // 192 KB: three.
-    k.no(pages(30, 48, 33), Error::Again);
-    k.no(pages(30, 48, 33), Error::Again);
-    k.ok(pages(30, 48, 33));
+    k.no(pages(30, kb(192), 33), Error::Again);
+    k.no(pages(30, kb(192), 33), Error::Again);
+    k.ok(pages(30, kb(192), 33));
     // An endpoint after it: one call.
     k.ok(retype(s(30), Endpoint, 0, s(34)));
 }
@@ -5261,58 +5355,67 @@ fn creation_from_dirty_memory_clears_64_kb_per_call_and_makes_nothing_until_the_
 #[test]
 fn work_of_a_clearing_step_does_not_depend_on_the_arguments() {
     let mut k = K::new();
+    let kb = kb_pages(&k);
     dirty(&mut k, 30);
-    k.no(pages(30, 32, 32), Error::Again);
+    k.no(pages(30, kb(128), 32), Error::Again);
     // The first 64 KB are clear: an endpoint is made at once, at the
-    // watermark, and the frame then starts at 4 KB and ends at 132 KB.
+    // watermark, and the frame then starts at a page and ends 128 KB
+    // later: two more calls.
     k.ok(retype(s(30), Endpoint, 0, s(33)));
-    k.no(pages(30, 32, 32), Error::Again);
-    k.ok(pages(30, 32, 32));
+    k.no(pages(30, kb(128), 32), Error::Again);
+    k.ok(pages(30, kb(128), 32));
 }
 
 #[test]
 fn every_check_comes_before_the_clearing() {
     let mut k = K::new();
+    let kb = kb_pages(&k);
     dirty(&mut k, 30);
-    k.no(pages(30, 32, 30), Error::NoSlot);
-    k.no(pages(30, 512, 32), Error::NoMemory);
+    k.no(pages(30, kb(128), 30), Error::NoSlot);
+    let entries = u64::from(k.m.geometry().entries);
+    let too_many = (2 << 20) / k.m.geometry().page() + 1;
+    k.no(pages(30, too_many.min(entries), 32), Error::NoMemory);
     // Nothing was cleared: 128 KB still take two calls.
-    k.no(pages(30, 32, 32), Error::Again);
-    k.ok(pages(30, 32, 32));
+    k.no(pages(30, kb(128), 32), Error::Again);
+    k.ok(pages(30, kb(128), 32));
 }
 
 #[test]
 fn child_untyped_is_not_cleared_and_keeps_what_its_parent_had_cleared() {
     let mut k = K::new();
+    let kb = kb_pages(&k);
     dirty(&mut k, 30);
     // The parent clears its first 64 KB, then gives its first 128 KB to a
     // child at once.
-    k.no(pages(30, 32, 32), Error::Again);
+    k.no(pages(30, kb(128), 32), Error::Again);
     k.ok(retype(s(30), Untyped, 1 << 17, s(33)));
     // The child knows its first 64 KB are clear: 128 KB in one call.
-    k.ok(pages(33, 32, 34));
+    k.ok(pages(33, kb(128), 34));
     // The parent's clean mark moved with its watermark: the next 64 KB in
     // one call.
-    k.ok(pages(30, 16, 35));
+    k.ok(pages(30, kb(64), 35));
 }
 
 #[test]
 fn memory_is_dirty_again_once_the_watermark_returns_to_the_start() {
     let mut k = K::new();
+    let kb = kb_pages(&k);
     k.ok(retype(UT, Untyped, 1 << 20, s(30)));
-    k.made(pages(30, 32, 32));
+    k.made(pages(30, kb(128), 32));
     k.ok(Syscall::CapDelete(s(32)));
-    k.no(pages(30, 32, 32), Error::Again);
-    k.ok(pages(30, 32, 32));
+    k.no(pages(30, kb(128), 32), Error::Again);
+    k.ok(pages(30, kb(128), 32));
 }
 
 #[test]
 fn device_memory_is_never_cleared() {
     let mut k = K::new();
     let uncached = MemoryType::Uncached;
-    k.ok(frame(DEV, PageSize::Page, 256, uncached, s(30)));
+    // Half of the 2 MB device range, in one call.
+    let pages = (1 << 20) / k.m.geometry().page();
+    k.ok(frame(DEV, PageSize::Page, pages, uncached, s(30)));
     k.ok(Syscall::CapDelete(s(30)));
-    k.ok(frame(DEV, PageSize::Page, 256, uncached, s(30)));
+    k.ok(frame(DEV, PageSize::Page, pages, uncached, s(30)));
 }
 
 #[test]
@@ -5411,9 +5514,10 @@ fn removal_of_a_frame_capability_and_its_binding_is_one_unit() {
 #[test]
 fn child_untyped_of_dirty_memory_is_made_in_one_call() {
     let mut k = K::new();
+    let kb = kb_pages(&k);
     dirty(&mut k, 30);
     k.ok(retype(s(30), Untyped, 1 << 19, s(32)));
     // Its own memory is dirty: 128 KB from it take two calls.
-    k.no(pages(32, 32, 33), Error::Again);
-    k.ok(pages(32, 32, 33));
+    k.no(pages(32, kb(128), 33), Error::Again);
+    k.ok(pages(32, kb(128), 33));
 }

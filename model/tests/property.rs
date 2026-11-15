@@ -9,6 +9,8 @@
 //! space, a nest of spaces and its removal) and finishes it over the next
 //! steps, while the other threads go on making calls in between.
 
+mod common;
+
 use dodos_abi::*;
 use dodos_model::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -65,9 +67,13 @@ const SCRIPT_FIRST: u32 = 110;
 const CHILD_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
 /// The slots of the start-up space that the scripts use.
 const HOME_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
-/// The ordinary untyped of `Machine::example`, and its device untyped in
-/// the next slot.
-const UNTYPED_SLOT: u32 = 20;
+/// The untyped of one chunk of the floor of `Machine::example`, at depth 1,
+/// and the start-up untyped before it.
+const UNTYPED_SLOT: u32 = 25;
+/// The blocks the scripts take objects from: an ordinary run of 32 chunks
+/// and the device range, at depth 2.
+const MEMORY_SLOT: u32 = 107;
+const DEVICE_SLOT: u32 = 108;
 /// The `core` capabilities of `Machine::example`: the boot core's, then
 /// the other's.
 const CORE_SLOT: u32 = 16;
@@ -76,8 +82,28 @@ const IOMMU_SLOT: u32 = 18;
 /// The links of a chain of copies that starts at depth 2 and ends at 64.
 const CHAIN_LINKS: usize = TREE_DEPTH - 2;
 
+/// Values of the machine of the run: a page, a first large page, and the
+/// bytes a root entry covers.
+fn geometry() -> Geometry {
+    static GEOMETRY: std::sync::OnceLock<Geometry> = std::sync::OnceLock::new();
+    *GEOMETRY.get_or_init(|| Machine::example().geometry)
+}
+
+fn page() -> u64 {
+    geometry().page()
+}
+
+fn large() -> u64 {
+    geometry().chunk()
+}
+
+fn root_span() -> u64 {
+    let geometry = geometry();
+    geometry.page() << ((geometry.levels - 1) * geometry.entries.trailing_zeros())
+}
+
 const HERE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
-const MEMORY: SlotAddr = SlotAddr::own(UNTYPED_SLOT);
+const MEMORY: SlotAddr = SlotAddr::own(MEMORY_SLOT);
 
 const KINDS: [(ObjectKind, u32, u64); 12] = [
     (ObjectKind::Untyped, UNTYPED, 1 << 16),
@@ -223,6 +249,7 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::TaskMark { .. } => 41,
         Syscall::TaskRevoke(_) => 42,
         Syscall::TaskRead(_) => 43,
+        Syscall::MemoryTake { .. } | Syscall::MemoryGive { .. } | Syscall::MemorySplit { .. } => 18,
     }
 }
 
@@ -357,7 +384,7 @@ impl Generator<'_> {
     /// A capability of a class: often one of those in the fixed slots.
     fn held(&mut self, class: u32) -> SlotAddr {
         let fixed = match class {
-            UNTYPED => UNTYPED_SLOT + self.rng.chance(10) as u32,
+            UNTYPED => MEMORY_SLOT + self.rng.chance(10) as u32,
             CSPACE => START_SLOT_CSPACE,
             _ => return self.find(class, Wanted::Full),
         };
@@ -525,11 +552,7 @@ impl Generator<'_> {
     /// mostly the untyped in slot 20, and a range near the bottom of the
     /// user range, so that mappings meet.
     fn map(&mut self) -> Map {
-        let page = if self.rng.chance(90) {
-            1 << 12
-        } else {
-            1 << 21
-        };
+        let size = if self.rng.chance(90) { page() } else { large() };
         Map {
             space: self.held(SPACE),
             frame: self.held(OTHER),
@@ -538,7 +561,7 @@ impl Generator<'_> {
                 7 => SlotAddr::NONE,
                 _ => self.held(UNTYPED),
             },
-            address: (1 << 30) + page * self.rng.below(16) + (self.rng.chance(2) as u64) * 4096,
+            address: (1 << 30) + size * self.rng.below(16) + (self.rng.chance(2) as u64) * page(),
             first: self.rng.chance(15) as u64,
             count: 1 + self.rng.below(3),
             rights: self.mapping_rights(),
@@ -573,7 +596,9 @@ impl Generator<'_> {
                 destination: self.free(near),
             },
             // Rarely a capability in a fixed slot: that ends most of the run.
-            4 if self.rng.below(300) == 0 => Syscall::CapDelete(own(self.rng.below(18) as u32)),
+            // Now and then a start-up capability, the floor untypeds
+            // included.
+            4 if self.rng.below(300) == 0 => Syscall::CapDelete(own(self.rng.below(26) as u32)),
             4 => Syscall::CapDelete(self.slot(class)),
             5 if self.rng.chance(2) => Syscall::CapRevoke(self.held(UNTYPED)),
             5 => Syscall::CapRevoke(self.find(class, Wanted::Full)),
@@ -650,7 +675,7 @@ impl Generator<'_> {
             28 => Syscall::Poll(self.held(NOTIFY)),
             // A start-up untyped, the least deep, into another space.
             29 if self.rng.chance(40) => Syscall::CapMove {
-                source: own(UNTYPED_SLOT + self.rng.chance(30) as u32),
+                source: own(UNTYPED_SLOT - self.rng.chance(30) as u32),
                 destination: {
                     let via = self.find(CSPACE, Wanted::Full).index();
                     SlotAddr::through(via, self.class_slot(UNTYPED))
@@ -956,7 +981,7 @@ impl Generator<'_> {
         };
         let mut calls = vec![retype(ObjectKind::CSpace, CHILD_SLOTS.into(), own(space))];
         calls.extend(vec![grown; (CHILD_SLOTS / CSPACE_SEGMENT_SLOTS) as usize]);
-        calls.push(derive(MEMORY, inside(UNTYPED_SLOT)));
+        calls.push(derive(MEMORY, inside(MEMORY_SLOT)));
         calls.push(derive(own(space), inside(START_SLOT_CSPACE)));
         // The address space and the core capability of this space, so that
         // the threads of the new one can run and have contexts.
@@ -1170,7 +1195,7 @@ impl Generator<'_> {
                 .map(|&frame| retype(ObjectKind::Frame, 2, own(frame))),
         );
         let (r, w, x) = (Rights::READ, Rights::WRITE, Rights::EXEC);
-        let base = (1 << 30) + (self.rng.below(4) << 39);
+        let base = (1 << 30) + self.rng.below(4) * root_span();
         for (n, &frame) in frames.iter().enumerate() {
             let far = if self.rng.chance(30) { 1 << 30 } else { 0 };
             let rights = self.rng.pick(&[r, r.union(w), r.union(x)]);
@@ -1178,7 +1203,7 @@ impl Generator<'_> {
                 space: own(*aspace),
                 frame: own(frame),
                 untyped: MEMORY,
-                address: base + far + 0x2000 * n as u64,
+                address: base + far + 2 * page() * n as u64,
                 first: 0,
                 count: 1 + self.rng.below(2),
                 rights: rights.bits(),
@@ -1198,7 +1223,7 @@ impl Generator<'_> {
                     space: own(*aspace),
                     frame: own(copy),
                     untyped: MEMORY,
-                    address: (1 << 31) + 0x1000 * n as u64,
+                    address: (1 << 31) + page() * n as u64,
                     first: 0,
                     count: 1,
                     rights: r.bits(),
@@ -1499,7 +1524,40 @@ fn start() -> (Model, ObjId) {
         class: 1,
     };
     assert_eq!(model.apply(first, half), Ok(Output::Done));
+    let chunk = model.geometry().chunk_shift();
+    common::take_run(&mut model, first, chunk + 5, MEMORY_SLOT);
+    common::take_device(&mut model, first);
+    let to_place = Syscall::CapMove {
+        source: own(common::DEVICE),
+        destination: own(DEVICE_SLOT),
+    };
+    assert_eq!(model.apply(first, to_place), Ok(Output::Done));
     (model, first)
+}
+
+/// Before the random calls: a child untyped of the memory with 40
+/// endpoints in it, then its removal, which takes two calls, so that an
+/// untyped is seen dying; then the slots are emptied. It uses slots that
+/// the scripts never use.
+fn crowd(model: &mut Model, first: ObjId, reached: &mut Reached) {
+    let slots: Vec<u32> = (4000..4041).collect();
+    let mut calls = vec![retype(ObjectKind::Untyped, 1 << 16, own(slots[0]))];
+    calls.extend(slots[1..].iter().map(|&slot| Syscall::UntypedRetype {
+        untyped: own(slots[0]),
+        kind: ObjectKind::Endpoint,
+        size: 0,
+        page: 0,
+        memory: 0,
+        destination: own(slot),
+    }));
+    calls.extend(vec![Syscall::CapDelete(own(slots[0])); 2]);
+    calls.extend(slots[1..].iter().map(|&slot| Syscall::CapDelete(own(slot))));
+    for call in calls {
+        let outcome = model.apply(first, call);
+        assert!(matches!(outcome, Ok(_) | Err(Error::Again)), "{outcome:?}");
+        assert_eq!(model.check(), Ok(()));
+        reached.count(model);
+    }
 }
 
 fn run(seed: u64, reached: &mut Reached) -> Model {
@@ -1510,6 +1568,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     // Every thread that could run at some step: those that can be woken.
     let mut known: BTreeSet<ObjId> = BTreeSet::new();
     let mut walked = false;
+    crowd(&mut model, first, reached);
     for step in 0..STEPS {
         let threads = model.runnable();
         known.extend(&threads);
@@ -1808,8 +1867,9 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 56,702, reply objects armed 28,594,
-    // receivers 51,856, waiters on a notify 33,107, a notify bound 36,889.
+    // Measured, in steps, the smaller of the two geometries: callers queued
+    // 38,742, reply objects armed 13,686, receivers 39,375, waiters on a
+    // notify 14,847, a notify bound 28,800.
     let waits = [
         reached.callers,
         reached.served,
@@ -1817,16 +1877,17 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [28_000, 14_000, 25_000, 16_000, 18_000]);
-    // Measured, each once: 31 messages with capabilities, 19 with the
-    // capabilities dropped, 6 notifications, 11 threads woken with `gone`.
+    at_least(waits, [19_000, 6800, 19_000, 7400, 14_000]);
+    // Measured, each once, on both geometries: 29 messages with
+    // capabilities, 4 with the capabilities dropped, 2 notifications, 15
+    // threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [15, 9, 3, 5]);
+    at_least(ends, [15, 2, 1, 7]);
     // Measured: 14 messages received with four capabilities, and 15 calls
     // by a thread whose capability space is destroyed.
     at_least([reached.with_four, reached.destroyed], [7, 7]);
@@ -1887,10 +1948,11 @@ fn faults_are_raised_delivered_and_waited_on() {
 #[test]
 fn scheduling_states_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: a context throttled 91,416, lent 7,282, a timer
-    // armed 530, a thread marked as having lost its context 8,997, the core
-    // idle 8,327, running on slack 74,691, a fault no address space queued
-    // 12,624, a fault no context queued 2,075.
+    // Measured, in steps, the smaller of the two geometries: a context
+    // throttled 83,741, lent 2,871, a timer armed 489, a thread marked as
+    // having lost its context 4,558, the core idle 10,677, running on slack
+    // 69,773, a fault no address space queued 2,734, a fault no context
+    // queued 2,849.
     let states = [
         reached.throttled,
         reached.lent,
@@ -1901,7 +1963,7 @@ fn scheduling_states_are_reached() {
         reached.no_aspace,
         reached.no_context,
     ];
-    at_least(states, [45_000, 3600, 260, 4400, 4100, 37_000, 6300, 1000]);
+    at_least(states, [41_000, 1400, 240, 2200, 5300, 34_000, 1300, 1400]);
     // Measured: the clock moved 4,730 times, and a timer fired in 13.
     at_least([reached.advanced, reached.fired], [2300, 6]);
 }
@@ -1909,9 +1971,10 @@ fn scheduling_states_are_reached() {
 #[test]
 fn interrupts_and_marks_are_reached() {
     let reached = all_seeds();
-    // Measured: 1,151 interrupts arrived, the marks of a thread grew 4
-    // times; after 81,080 steps an irq was claimed, after 7,106 one was
-    // fired, after 8,417 a task was revoked.
+    // Measured, the smaller of the two geometries: 1,157 interrupts
+    // arrived, the marks of a thread grew twice; after 77,864 steps an irq
+    // was claimed, after 2,891 one was fired, after 7,614 a task was
+    // revoked.
     let counts = [
         reached.interrupts,
         reached.marked,
@@ -1919,7 +1982,7 @@ fn interrupts_and_marks_are_reached() {
         reached.irq_fired,
         reached.revoked,
     ];
-    at_least(counts, [570, 2, 40_000, 3500, 4200]);
+    at_least(counts, [570, 2, 38_000, 1400, 3800]);
 }
 
 #[test]

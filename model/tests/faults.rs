@@ -1,6 +1,8 @@
 //! Threads: faults and the register calls, one test per rule, on the
 //! start-up space of `Machine::example`.
 
+mod common;
+
 use dodos_abi::ObjectKind::{Endpoint, Frame, Reply, Thread};
 use dodos_abi::x86_64::{REG_RAX, REG_RDI, REG_RFLAGS, REG_RIP, REG_RSP, REGS_WORDS};
 use dodos_abi::*;
@@ -10,10 +12,9 @@ const UT: u32 = 20;
 const EP: u32 = 30;
 const RP: u32 = 31;
 const DONE: Outcome = Ok(Output::Done);
-const ENTRY: u64 = 0x20_0000;
 
 fn s(index: u32) -> SlotAddr {
-    SlotAddr::own(index)
+    SlotAddr::own(common::slot(index))
 }
 
 struct K {
@@ -243,7 +244,7 @@ fn fault_is_sent_when_the_capability_space_of_the_thread_is_dying() {
     for index in 1..41 {
         k.ok(Syscall::CapDerive {
             source: s(EP),
-            destination: SlotAddr::through(60, index),
+            destination: SlotAddr::through(common::slot(60), index),
             rights: Rights::ALL.bits(),
             badge: 0,
         });
@@ -407,8 +408,9 @@ fn first_thread_starts_at_the_entry_point_with_the_start_up_page() {
     let Ok(Output::Regs(block)) = k.on(other, Syscall::ThreadReadRegs(s(first))) else {
         panic!("no registers");
     };
-    assert_eq!(block[REG_RIP], ENTRY);
-    assert_eq!(block[REG_RDI], x86_64::START_PAGE_ADDR);
+    let geometry = Machine::example().geometry;
+    assert_eq!(block[REG_RIP], geometry.chunk());
+    assert_eq!(block[REG_RDI], 2 * geometry.page());
     assert_eq!(block[REG_RFLAGS], 0x202);
     assert_eq!(block[REG_RSP], 0);
 }

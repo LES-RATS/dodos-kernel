@@ -1464,3 +1464,44 @@ fn debug_values_have_their_numbers() {
         (0, 1)
     );
 }
+
+/// The check of an ownership word is a product of 64 bits that Kani does
+/// not prove in reasonable time: here every owner code, with extreme and
+/// random generations, reads back through `from_raw`, and flipped bits are
+/// refused.
+#[test]
+fn ownership_words_read_back_and_refuse_flipped_bits() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let owners = (0..NODES_MAX as u16)
+        .map(Owner::Node)
+        .chain([Owner::Unclaimed])
+        .chain((0..RESERVES_MAX as u16).map(Owner::Reserve));
+    let (mut flips, mut caught) = (0u32, 0u32);
+    for owner in owners {
+        for generation in [0, 1, u32::MAX, next() as u32, next() as u32] {
+            for word in [Ownership::taken(owner, generation), Ownership::free(owner)] {
+                assert_eq!(Ownership::from_raw(word.raw()), Some(word));
+                assert_eq!(word.owner(), owner);
+                for bit in 0..64 {
+                    let flipped = Ownership::from_raw(word.raw() ^ 1 << bit);
+                    // A flip of a check bit is always caught.
+                    if (2..16).contains(&bit) {
+                        assert_eq!(flipped, None, "{word:?} bit {bit}");
+                    }
+                    flips += 1;
+                    caught += flipped.is_none() as u32;
+                }
+            }
+        }
+    }
+    // A flip elsewhere escapes only when the product keeps its top 14 bits:
+    // about one in 16,384.
+    assert!(flips - caught <= flips / 4096, "{caught} of {flips}");
+    assert_eq!(Ownership::free(Owner::Unclaimed).generation(), 0);
+}
