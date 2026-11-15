@@ -701,3 +701,17 @@ fn a_start_up_page_of_exactly_63_pages_is_accepted() {
     assert!(m.translated(t, at(62)).is_some());
     assert!(m.translated(t, at(63)).is_none());
 }
+
+/// Mistral F4: a machine of 64 KB pages (a table page of 8,192 entries) is
+/// refused at start.
+#[test]
+fn kernel_refuses_a_sixty_four_kb_granule() {
+    let mut machine = Machine::example();
+    machine.geometry = Geometry {
+        page_shift: [16, 29, 0, 0],
+        entries: 4096,
+        levels: 3,
+        user_end: 63 << 42,
+    };
+    assert_eq!(Model::boot(&machine).err(), Some(Refusal::MachineValues));
+}
