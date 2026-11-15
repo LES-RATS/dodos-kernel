@@ -438,7 +438,8 @@ impl Model {
         {
             let words: [u64; 5] = parcel.words[..].try_into().expect("five words");
             self.unlink(first);
-            live(&mut self.threads, first).faulting = false;
+            let first_thread = live(&mut self.threads, first);
+            (first_thread.faulting, first_thread.raised) = (false, None);
             self.record(first, dodos_abi::FaultKind::NoContext as u32, words);
             return Err(Error::Again);
         }

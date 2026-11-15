@@ -3,8 +3,8 @@
 
 use crate::*;
 use dodos_abi::{
-    FAULT_WORDS, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, START_SLOT_CSPACE, START_SLOT_DEBUG,
-    START_SLOT_THREAD, TREE_DEPTH,
+    FAULT_WORDS, FaultKind, Header, LONGEST_WALK, MAX_CAPS, MAX_WORDS, START_SLOT_CSPACE,
+    START_SLOT_DEBUG, START_SLOT_THREAD, TREE_DEPTH,
 };
 use dodos_abi::{Owner, Ownership};
 
@@ -462,6 +462,36 @@ fn thread_that_waits_to_receive_with_an_idle_reply_object_is_reported() {
 fn outcome_of_a_thread_that_still_waits_is_reported() {
     let broken = spoiled(|m, at| live(&mut m.threads, at.waiter).outcome = Some(Ok(Output::Done)));
     assert_eq!(broken, "16: outcome while waiting");
+}
+
+/// A waiting thread with an outcome, waiting on a fault of `kind` whose
+/// word 0 is its instruction pointer plus `off`.
+fn outcome_on_a_fault(kind: FaultKind, off: u64) -> &'static str {
+    spoiled(|m, at| {
+        let waiter = live(&mut m.threads, at.waiter);
+        let rip = waiter.regs[dodos_abi::x86_64::REG_RIP];
+        waiter.outcome = Some(Ok(Output::Done));
+        waiter.faulting = true;
+        waiter.raised = Some((kind as u32, rip + off));
+    })
+}
+
+#[test]
+fn outcome_while_waiting_on_a_fault_is_reported_unless_of_kind_7_or_8_at_the_address_after_the_call()
+ {
+    assert_eq!(
+        outcome_on_a_fault(FaultKind::Page, 0),
+        "16: outcome while waiting"
+    );
+    assert_eq!(
+        outcome_on_a_fault(FaultKind::NoContext, 4),
+        "16: outcome while waiting"
+    );
+    // Kinds 7 and 8 at the address after the call are allowed by 16; the
+    // state then fails later invariants of the faulting wait, not 16.
+    for kind in [FaultKind::NoAddressSpace, FaultKind::NoContext] {
+        assert_ne!(outcome_on_a_fault(kind, 0), "16: outcome while waiting");
+    }
 }
 
 #[test]

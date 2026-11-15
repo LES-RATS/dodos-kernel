@@ -649,6 +649,8 @@ struct Thread {
     /// Faults: the thread waits on a fault, as a caller of its fault
     /// endpoint; the words of the fault are kept with its message.
     faulting: bool,
+    /// The kind and word 0 of the fault it waits on as a caller.
+    raised: Option<(u32, u64)>,
     /// Faults: a fault that was not delivered, recorded in the thread: its
     /// kind and its five words, until the thread is resumed.
     recorded: Option<(u32, [u64; 5])>,
@@ -1649,6 +1651,7 @@ impl Model {
         let woken = live(&mut self.threads, thread);
         woken.number = 0;
         if std::mem::take(&mut woken.faulting) {
+            woken.raised = None;
             return self.answered(thread, outcome);
         }
         // A proxy's call is over: its outcome goes back to its node.

@@ -880,3 +880,23 @@ fn a_node_that_is_not_live_does_not_accuse_the_last_live_node() {
     assert_eq!(m.state(0), MemberState::Live);
     assert_eq!(m.state(1), MemberState::Sealing);
 }
+
+#[test]
+fn a_sealed_node_that_acknowledged_a_death_does_not_delay_the_next_one() {
+    // Node 1 maps a frame of node 2; node 2 dies and is reclaimed; node 2
+    // starts again, node 1 is sealed, and node 2 dies again: node 1's bit
+    // of node 2 in `maps_of` was cleared by its acknowledgement, so the
+    // barrier holds without it.
+    let mut m = three();
+    granted_frame(&mut m, 2, 1);
+    m.ok(0, stop(2, CORE_STOP_KILL));
+    m.run(10 * MS);
+    assert_eq!(m.state(2), MemberState::Dead);
+    m.ok(0, start(2, CORE_START_FRESH));
+    m.ok(0, stop(1, CORE_STOP_SEAL));
+    m.run(MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    m.ok(0, stop(2, CORE_STOP_KILL));
+    m.run(10 * MS);
+    assert_eq!(m.state(2), MemberState::Dead);
+}

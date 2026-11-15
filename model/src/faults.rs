@@ -74,6 +74,7 @@ impl Model {
             self.record(thread, kind as u32, words);
             return;
         }
+        let word0 = words[0];
         let words = words.to_vec();
         let parcel = Parcel {
             label: kind as u32,
@@ -89,7 +90,8 @@ impl Model {
             first: 0,
             count: 0,
         };
-        live(&mut self.threads, thread).faulting = true;
+        let raising = live(&mut self.threads, thread);
+        (raising.faulting, raising.raised) = (true, Some((kind as u32, word0)));
         self.enter(thread, endpoint, parcel, window);
     }
 

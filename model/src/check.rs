@@ -2,8 +2,8 @@
 
 use crate::{CapId, Model, ObjId, Output, Place, Record, ReplyState, Slot, Thread, Wait, Window};
 use dodos_abi::{
-    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FAULT_WORDS, Header, LONGEST_WALK, MAX_CAPS,
-    MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
+    CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, Error, FAULT_WORDS, FaultKind, Header, LONGEST_WALK,
+    MAX_CAPS, MAX_WORDS, MemoryType, ObjectKind, REG_WORDS, Rights, TREE_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::mem::discriminant;
@@ -626,8 +626,19 @@ impl Model {
                 _ => true,
             };
             ensure(agrees, "15: reply object of a thread")?;
+            // 16 (8.6, its strongest form): a thread that waits has no
+            // outcome, unless it waits as a caller on a fault of kind 7 or 8
+            // raised after its last call ended and before it ran again;
+            // word 0 of that fault is the address after that call, the
+            // thread's instruction pointer, which nothing has moved since.
             let ready = thread.wait == Wait::None;
-            let waited = ready || thread.outcome.is_none() || thread.faulting;
+            let raised = thread.faulting
+                && thread.raised.is_some_and(|(kind, word)| {
+                    let kernel = kind == FaultKind::NoAddressSpace as u32
+                        || kind == FaultKind::NoContext as u32;
+                    kernel && word == thread.regs[dodos_abi::x86_64::REG_RIP]
+                });
+            let waited = ready || thread.outcome.is_none() || raised;
             ensure(waited, "16: outcome while waiting")?;
             let outcome = match &thread.outcome {
                 _ if thread.answered => true,
