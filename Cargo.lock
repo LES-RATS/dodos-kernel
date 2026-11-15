@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "dodos-abi"
 version = "0.0.0"
+
+[[package]]
+name = "dodos-trial-multicore"
+version = "0.0.0"
