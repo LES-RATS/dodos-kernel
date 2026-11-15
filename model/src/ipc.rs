@@ -1,6 +1,7 @@
 //! IPC, transfer of capabilities and notifications.
 
 use crate::caps::Placing;
+use crate::remote::Request;
 use crate::{
     CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Place, Range, ReplyState,
     Slot, Transfer, Wait, Window, live,
@@ -688,10 +689,21 @@ impl Model {
             Wait::Notify(notify) => live(&mut self.notifies, notify).waiters.retain(other),
             // A wait for another node: the request is forgotten, and a wait
             // that a proxy holds there is ended there.
-            Wait::Node(id) => {
-                self.cancel_remote(id);
-                self.requests.remove(&id);
-            }
+            Wait::Node(id) => match self.requests.get_mut(&id) {
+                // A move goes on without the thread that left: its answer
+                // still ends the other's wait.
+                Some(Request::Move { caller, source, .. }) => {
+                    for waiting in [caller, source] {
+                        if *waiting == Some(thread) {
+                            *waiting = None;
+                        }
+                    }
+                }
+                _ => {
+                    self.cancel_remote(id);
+                    self.requests.remove(&id);
+                }
+            },
         }
         self.observe();
     }

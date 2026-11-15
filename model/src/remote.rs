@@ -60,6 +60,16 @@ pub enum Body {
     /// The receiving node took back the anchors of these grants, moved
     /// home by a transfer: the holder removes its remote capability.
     Returned { grants: Vec<(u16, u32)> },
+    /// `thread_move`: the state of a thread, for the destination thread and
+    /// sched, named by the grants of the caller's remote capabilities.
+    Move {
+        id: u64,
+        thread: u16,
+        sched: u16,
+        state: Box<crate::moves::Moved>,
+    },
+    /// The destination node's answer to a move.
+    Moved { id: u64, outcome: Outcome },
 }
 
 /// One capability of a transfer as the receiving node gets it.
@@ -128,6 +138,13 @@ pub(crate) enum Request {
     },
     /// The removal step of `thread` waits for the holder of `grant`.
     Revoke { thread: ObjId, grant: u16 },
+    /// `thread_move`: the caller and the thread wait for the answer (each
+    /// `None` once destroyed); the context the thread gives up.
+    Move {
+        caller: Option<ObjId>,
+        source: Option<ObjId>,
+        context: ObjId,
+    },
 }
 
 /// The index, in the kernel space of a node, of the anchor of grant `g`,
@@ -212,7 +229,7 @@ impl Model {
         });
     }
 
-    fn new_request(&mut self) -> u64 {
+    pub(crate) fn new_request(&mut self) -> u64 {
         self.next_request += 1;
         u64::from(self.node) << 48 | self.next_request
     }
@@ -246,13 +263,8 @@ impl Model {
         {
             return Some(self.mailbox(thread, call, cap));
         }
+        // A remote capability that is invalid was judged with its slot.
         let remote = *self.remotes.get(&object)?;
-        // A use of an invalid remote capability is `gone`, judged with the
-        // slot, and the slot becomes dead.
-        if !self.valid(&remote) {
-            self.remove_leaf_dead(cap);
-            return Some(Err(Error::Gone));
-        }
         Some(self.forward(thread, call, &slots, remote.node))
     }
 
@@ -302,12 +314,8 @@ impl Model {
             let cap = self.cap(thread, slot, Rights::READ)?;
             let remote = self.remotes.get(&self.caps[&cap].object).copied();
             match remote {
-                Some(remote) if remote.node == node && self.valid(&remote) => {
-                    anchors.push(SlotAddr::own(anchor_index(remote.grant)));
-                }
                 Some(remote) if remote.node == node => {
-                    self.remove_leaf_dead(cap);
-                    return Err(Error::Gone);
+                    anchors.push(SlotAddr::own(anchor_index(remote.grant)));
                 }
                 _ => return Err(Error::Invalid),
             }
@@ -411,7 +419,15 @@ impl Model {
             Body::Release { grant, serial } => self.released(grant, serial),
             Body::Refused { grants } => self.refused(grants),
             Body::Returned { grants } => self.returned(from, grants),
+            Body::Move {
+                id,
+                thread,
+                sched,
+                state,
+            } => self.receive_move(from, id, (thread, sched), *state),
+            Body::Moved { id, outcome } => self.moved(id, outcome),
         }
+        self.bury_stale();
         self.end(entry);
     }
 
@@ -619,10 +635,9 @@ impl Model {
                 None => true,
                 Some(remote) if remote.node != from => false,
                 Some(_) if derived.is_some() => true,
-                Some(remote) => {
+                Some(_) => {
                     let held = &self.caps[&cap];
-                    remote.root
-                        && held.parent.is_none()
+                    self.objects[&held.object].root == cap
                         && held.children.is_empty()
                         && held.record == Record::Empty
                 }

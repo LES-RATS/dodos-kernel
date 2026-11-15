@@ -140,6 +140,14 @@ pub struct Machine {
     /// Unlike cores: whether the processor signals a change of the feedback
     /// table or of the performance capabilities (source kind 3).
     pub core_events: bool,
+    /// Instructions retired, on demand: the architecture layer names a
+    /// counter (x86-64: a fixed counter of the PMU); without one the count
+    /// reads 0. The model's cores retire one instruction per nanosecond.
+    pub counter: bool,
+    /// The class the processor gives the running code (Intel Thread
+    /// Director), as the model's processor reads it when a counted context
+    /// stops; `None` where there is no classification.
+    pub classifier: Option<u8>,
     /// The devices the kernel uses itself: an IOMMU unit, by its index, and
     /// a device identifier.
     pub kernel_devices: Vec<(usize, u16)>,
@@ -262,6 +270,8 @@ impl Machine {
             io_width: 48,
             io_page_sizes: 0b001,
             core_events: false,
+            counter: true,
+            classifier: None,
             kernel_devices: vec![(0, 0x00f8)],
             descriptor_size: 48,
             framebuffer: false,
@@ -286,6 +296,21 @@ impl Machine {
     /// The nodes: one per usable core.
     pub fn nodes(&self) -> usize {
         self.cores.len()
+    }
+
+    /// Unlike cores: the own kind of a node, the kind of its core in the
+    /// core list.
+    pub fn own_kind(&self, node: u16) -> dodos_abi::Kind {
+        self.kinds[usize::from(self.core_list()[usize::from(node)].kind)]
+    }
+
+    /// The features the architecture lists (ARM64's for the other
+    /// architectures, which this model does not tell apart).
+    pub fn features(&self) -> dodos_abi::FeatureList {
+        match self.arch {
+            Arch::X86_64 => dodos_abi::x86_64::FEATURES,
+            Arch::Other => dodos_abi::aarch64::FEATURES,
+        }
     }
 
     /// The cores by core number: sorted by hardware identifier.

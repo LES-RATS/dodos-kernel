@@ -275,6 +275,7 @@ impl Model {
         self.check_tasks()?;
         self.check_irqs()?;
         self.check_table()?;
+        self.check_cores()?;
         self.check_events()
     }
 
@@ -758,6 +759,7 @@ impl Model {
     }
 }
 
+mod cores;
 mod memory;
 mod sched;
 mod table;

@@ -155,6 +155,28 @@ impl Model {
         Ok(Output::Done)
     }
 
+    /// `thread_set_features`: the mask of a suspended thread that does not
+    /// wait, within the area it was made with; the vector state is reset
+    /// (its contents are not modelled).
+    pub(crate) fn thread_set_features(
+        &mut self,
+        thread: ObjId,
+        target: SlotAddr,
+        mask: u64,
+    ) -> Outcome {
+        let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
+        let needed = self.thread_size(mask)?;
+        let changed = &self.threads[&target];
+        if !changed.suspended || changed.wait != Wait::None {
+            return Err(Error::Busy);
+        }
+        if needed > changed.area {
+            return Err(Error::NoMemory);
+        }
+        live(&mut self.threads, target).mask = mask;
+        Ok(Output::Done)
+    }
+
     // Bindings: each is a link both ways, so undoing it is one step. A
     // thread goes to the head of the list of what it is bound to (here the
     // end of the vector) after it leaves the list of what it was bound to.

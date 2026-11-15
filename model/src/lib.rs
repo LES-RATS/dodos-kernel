@@ -32,6 +32,7 @@ mod faults;
 mod ipc;
 mod irq;
 mod memory;
+mod moves;
 mod remote;
 mod sched;
 mod system;
@@ -159,6 +160,29 @@ pub enum Syscall {
     ThreadSuspend(SlotAddr),
     /// The thread, and a wait number.
     ThreadCancel(SlotAddr, u64),
+    /// Unlike cores: the thread and its new feature mask.
+    ThreadSetFeatures {
+        thread: SlotAddr,
+        mask: u64,
+    },
+    /// The context, the `core` capability of its node, and the mode.
+    SchedCount {
+        sched: SlotAddr,
+        core: SlotAddr,
+        mode: u64,
+    },
+    /// `thread_move`: the thread, the destination thread and sched (remote
+    /// capabilities of the destination node), its `core` capability, and
+    /// the parameters (all 0: the context's own).
+    ThreadMove {
+        thread: SlotAddr,
+        destination: SlotAddr,
+        sched: SlotAddr,
+        core: SlotAddr,
+        budget: u64,
+        period: u64,
+        class: u64,
+    },
     /// `wait`, here and below, is the wait number of the call; 0 is none.
     Call {
         endpoint: SlotAddr,
@@ -322,6 +346,8 @@ pub enum Output {
         remaining: i64,
         deadline: u64,
         state: u64,
+        /// The instructions retired while counted.
+        instructions: u64,
     },
     /// `timer_set`, `timer_cancel`: 1 if the timer was armed, 0 otherwise.
     WasArmed(u64),
@@ -557,6 +583,10 @@ struct Thread {
     /// lists, which are transferred by grants at delivery.
     stamp: Option<(u64, u64)>,
     foreign: Option<(u16, u64, usize)>,
+    /// Unlike cores: the feature mask, and the bytes of the thread as it
+    /// was made, which fix its save area.
+    mask: u64,
+    area: u64,
     /// The outcome is the answer of another node to a forwarded call: any
     /// outcome that call has.
     answered: bool,
@@ -705,6 +735,12 @@ struct Sched {
     queue: Option<Queued>,
     /// Destroying a context: its first step is done.
     retired: bool,
+    /// Instructions retired, on demand: counting on, the count, and the
+    /// hardware class read when it last stopped running (1 + the class, or
+    /// 0).
+    counted: bool,
+    count: u64,
+    hw_class: u64,
 }
 
 /// What runs next: the queues of the scheduler.
@@ -776,6 +812,12 @@ struct EventLog {
     /// context* that reached a receiver, whether it had an own context.
     raised: Vec<(ObjId, u32)>,
     no_context_delivered: Vec<bool>,
+    /// The consumed time and the instruction count of each context at the
+    /// start of the event.
+    counts: BTreeMap<ObjId, (u64, u64, bool)>,
+    /// The destination threads of `thread_move` placed in the event, with
+    /// the effective marks of their source.
+    moved: Vec<(ObjId, u64)>,
 }
 
 /// The whole state of the kernel of one core.
@@ -856,6 +898,12 @@ pub struct Model {
     transfer: Option<u64>,
     last_transfer: Option<u64>,
     proxies: BTreeMap<ObjId, Option<(u16, u64)>>,
+    /// Remote capabilities found invalid during the call, whose slots
+    /// become dead when it ends.
+    stale: Ephemeral<std::cell::RefCell<Vec<CapId>>>,
+    /// What a core enables for a thread: the state features enabled on the
+    /// core, as the last switch wrote them.
+    enabled: u32,
     /// Other models of the machine share its table (`System`): the map
     /// counts hold their leaves too.
     shared: bool,
@@ -878,8 +926,7 @@ pub struct Model {
 fn other(call: Call) -> bool {
     use Call::{
         CoreIdle, CorePerf, CorePlace, CoreStart, CoreStatus, CoreStop, CoreWatch, DebugWrite,
-        EntropyRead, IoportIn, IoportOut, IoportsIssue, RoleClaim, RoleHand, SchedCount,
-        ThreadMove, ThreadSetFeatures, TraceEmit,
+        EntropyRead, IoportIn, IoportOut, IoportsIssue, RoleClaim, RoleHand, TraceEmit,
     };
     matches!(
         call,
@@ -893,9 +940,6 @@ fn other(call: Call) -> bool {
             | CorePlace
             | RoleClaim
             | RoleHand
-            | ThreadSetFeatures
-            | ThreadMove
-            | SchedCount
             | IoportIn
             | IoportOut
             | IoportsIssue
@@ -936,6 +980,12 @@ impl Model {
         let ready = |thread: &&Thread| !thread.suspended && thread.wait == Wait::None;
         let ids = self.threads.iter().filter(|(_, thread)| ready(thread));
         ids.map(|(&id, _)| id).collect()
+    }
+
+    /// Unlike cores: the state features the core enables, as the last
+    /// switch wrote them.
+    pub fn enabled(&self) -> u32 {
+        self.enabled
     }
 
     /// The outcome of the call in which `thread` waited, once it is over and
@@ -1053,7 +1103,27 @@ impl Model {
         Ok(outcome)
     }
 
+    /// One call, after which the slots of the invalid remote capabilities
+    /// it used are dead.
     fn dispatch(&mut self, thread: ObjId, call: Syscall) -> Outcome {
+        self.stale.0.borrow_mut().clear();
+        let outcome = self.dispatch_call(thread, call);
+        self.bury_stale();
+        outcome
+    }
+
+    /// The slots of the invalid remote capabilities found since the last
+    /// call become dead.
+    pub(crate) fn bury_stale(&mut self) {
+        let stale = std::mem::take(&mut *self.stale.0.borrow_mut());
+        for cap in stale {
+            if self.caps.contains_key(&cap) {
+                self.remove_leaf_dead(cap);
+            }
+        }
+    }
+
+    fn dispatch_call(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         if let Some(outcome) = self.forwarded(thread, &call) {
             return outcome;
         }
@@ -1106,6 +1176,27 @@ impl Model {
             } => self.thread_write_regs(thread, target, block),
             Syscall::ThreadSuspend(target) => self.thread_suspend(thread, target),
             Syscall::ThreadCancel(target, number) => self.thread_cancel(thread, target, number),
+            Syscall::ThreadSetFeatures {
+                thread: target,
+                mask,
+            } => self.thread_set_features(thread, target, mask),
+            Syscall::SchedCount { sched, core, mode } => {
+                self.sched_count(thread, sched, core, mode)
+            }
+            Syscall::ThreadMove {
+                thread: source,
+                destination,
+                sched,
+                core,
+                budget,
+                period,
+                class,
+            } => self.thread_move(
+                thread,
+                source,
+                (destination, sched, core),
+                (budget, period, class),
+            ),
             Syscall::Call {
                 endpoint,
                 message,
@@ -1278,7 +1369,21 @@ impl Model {
             Some(&Slot::Full(cap)) => {
                 let held = &self.caps[&cap];
                 let dying = held.dying || self.dying(held.object);
-                if dying { Err(Error::Gone) } else { Ok(cap) }
+                // Grants: a use of an invalid remote capability is `gone`,
+                // judged with the slot, and the slot becomes dead at the end
+                // of the call.
+                let invalid = self
+                    .remotes
+                    .get(&held.object)
+                    .is_some_and(|r| !self.valid(r));
+                if invalid {
+                    self.stale.0.borrow_mut().push(cap);
+                }
+                if dying || invalid {
+                    Err(Error::Gone)
+                } else {
+                    Ok(cap)
+                }
             }
             Some(Slot::Dead) => Err(Error::Gone),
             Some(Slot::Empty) | None => Err(Error::Invalid),

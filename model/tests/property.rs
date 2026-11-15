@@ -89,6 +89,11 @@ fn geometry() -> Geometry {
     *GEOMETRY.get_or_init(|| Machine::example().geometry)
 }
 
+/// The base of the ordinary memory of the machine past its floors' start.
+fn ram() -> u64 {
+    Machine::example_on(geometry()).memory[4].base
+}
+
 fn page() -> u64 {
     geometry().page()
 }
@@ -154,7 +159,7 @@ const MADE: [ObjectKind; 9] = [
 ];
 
 /// The calls, numbered as `name_of` numbers them.
-const NAMES: [&str; 44] = [
+const NAMES: [&str; 50] = [
     "cap_derive",
     "cap_move",
     "cap_delete",
@@ -199,7 +204,17 @@ const NAMES: [&str; 44] = [
     "task_mark",
     "task_revoke",
     "task_read",
+    "thread_set_features",
+    "sched_count",
+    "thread_move",
+    "memory_take",
+    "memory_give",
+    "memory_split",
 ];
+/// The calls that never succeed on one node: "other" stands for the calls
+/// that are not modelled, and `thread_move` needs a destination thread of
+/// another node (its successes are in `tests/nodes.rs`).
+const NEVER_ON_ONE_NODE: [&str; 2] = ["other", "thread_move"];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
 
@@ -249,7 +264,12 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::TaskMark { .. } => 41,
         Syscall::TaskRevoke(_) => 42,
         Syscall::TaskRead(_) => 43,
-        Syscall::MemoryTake { .. } | Syscall::MemoryGive { .. } | Syscall::MemorySplit { .. } => 18,
+        Syscall::ThreadSetFeatures { .. } => 44,
+        Syscall::SchedCount { .. } => 45,
+        Syscall::ThreadMove { .. } => 46,
+        Syscall::MemoryTake { .. } => 47,
+        Syscall::MemoryGive { .. } => 48,
+        Syscall::MemorySplit { .. } => 49,
     }
 }
 
@@ -536,6 +556,30 @@ impl Generator<'_> {
         }
     }
 
+    /// A feature mask: mostly mask 0 or a baseline feature; the large
+    /// optional feature, which needs a larger area; and masks that the
+    /// node's kind refuses.
+    fn mask(&mut self) -> u64 {
+        match self.rng.below(10) {
+            0..3 => 0,
+            3 => 1 << x86_64::AVX,
+            4..6 => 1 << x86_64::AMX,
+            6 => 1 << x86_64::AVX512,
+            7 => 1 << FEATURE_USER_INTERRUPTS,
+            8 => 1 << 40,
+            _ => self.rng.next() & 0xFF,
+        }
+    }
+
+    /// The memory_control of the node, mostly.
+    fn control(&mut self) -> SlotAddr {
+        if self.rng.chance(95) {
+            own(START_SLOT_MEMORY_CONTROL)
+        } else {
+            self.held(OTHER)
+        }
+    }
+
     /// The rights word of a mapping: mostly a valid one.
     fn mapping_rights(&mut self) -> u32 {
         let (r, w, x) = (Rights::READ, Rights::WRITE, Rights::EXEC);
@@ -578,7 +622,7 @@ impl Generator<'_> {
         let roll = if self.rng.chance(14) {
             29 + self.rng.below(8)
         } else {
-            self.rng.below(64)
+            self.rng.below(70)
         };
         match roll {
             0..3 => Syscall::CapDerive {
@@ -611,7 +655,11 @@ impl Generator<'_> {
                 Syscall::UntypedRetype {
                     untyped: self.memory(),
                     kind,
-                    size: if self.rng.chance(95) {
+                    // A thread with the large optional feature, whose
+                    // area fits either mask.
+                    size: if kind == ObjectKind::Thread && self.rng.chance(30) {
+                        1 << x86_64::AMX
+                    } else if self.rng.chance(95) {
                         size
                     } else {
                         self.rng.below(300)
@@ -831,6 +879,68 @@ impl Generator<'_> {
             } else {
                 self.held(OTHER)
             }),
+            64 => Syscall::ThreadSetFeatures {
+                thread: self.held(THREAD),
+                mask: self.mask(),
+            },
+            65 => Syscall::SchedCount {
+                sched: self.held(OTHER),
+                core: own(CORE_SLOT + self.rng.chance(5) as u32),
+                mode: self.rng.below(100).saturating_sub(95).min(2) + self.rng.chance(50) as u64,
+            },
+            66 => {
+                let control = self.control();
+                let (kind, place, size) = match self.rng.below(10) {
+                    0..7 => {
+                        let shift = geometry().chunk_shift() as u64;
+                        let log2 = shift + self.rng.below(3);
+                        let chunks = 4098 >> (log2 - shift);
+                        let place = ram() + (self.rng.below(chunks) << log2);
+                        (0, place, log2)
+                    }
+                    7..9 => (1, self.rng.below(4), 0),
+                    _ => (self.rng.below(3), self.rng.next() >> 20, self.rng.below(40)),
+                };
+                Syscall::MemoryTake {
+                    control,
+                    kind,
+                    place,
+                    size,
+                    destination: self.free(UNTYPED),
+                }
+            }
+            // Seldom the blocks of the scripts: given, they end most of a
+            // run.
+            67 => Syscall::MemoryGive {
+                control: self.control(),
+                untyped: if self.rng.below(50) == 0 {
+                    self.held(UNTYPED)
+                } else {
+                    self.find(UNTYPED, Wanted::Full)
+                },
+                node: match self.rng.below(10) {
+                    0..8 => 1,
+                    8 => 0,
+                    _ => 2,
+                },
+            },
+            68 => Syscall::MemorySplit {
+                control: self.control(),
+                untyped: if self.rng.chance(10) {
+                    own(DEVICE_SLOT)
+                } else {
+                    self.find(UNTYPED, Wanted::Full)
+                },
+            },
+            69 => Syscall::ThreadMove {
+                thread: self.held(THREAD),
+                destination: self.held(THREAD),
+                sched: self.held(OTHER),
+                core: own(CORE_SLOT + self.rng.chance(80) as u32),
+                budget: 0,
+                period: 0,
+                class: 0,
+            },
             45 | 46 => Syscall::IoSpaceAttach {
                 iommu: if self.rng.chance(90) {
                     own(IOMMU_SLOT)
@@ -1807,7 +1917,7 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     let reached = all_seeds();
     // "other" stands for the calls that are not modelled: it never succeeds.
     for (name, &ok) in NAMES.iter().zip(&reached.ok) {
-        assert_eq!(ok == 0, *name == "other", "{name}");
+        assert_eq!(ok == 0, NEVER_ON_ONE_NODE.contains(name), "{name}");
     }
     // Every error code is returned.
     for (code, &count) in reached.errors.iter().enumerate().skip(1) {
@@ -1844,12 +1954,12 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 1, cspace 13,347, aspace 49, frame
-    // 9,615, thread 34, sched 5, endpoint 21, reply 580, notify 46; a copy
-    // under `cap_delete` 136.
+    // Measured, in steps, the smaller of the two geometries: untyped 27,
+    // cspace 9,767, aspace 43, frame 9,407, thread 391, sched 16, endpoint
+    // 11, reply 9, notify 546; a copy under `cap_delete` 1,136.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [1, 6600, 24, 4800, 17, 2, 10, 290, 23]);
-    at_least([reached.dying_copies], [68]);
+    at_least(dying, [13, 4800, 21, 4700, 190, 8, 5, 4, 270]);
+    at_least([reached.dying_copies], [520]);
 }
 
 #[test]
@@ -1949,10 +2059,10 @@ fn faults_are_raised_delivered_and_waited_on() {
 fn scheduling_states_are_reached() {
     let reached = all_seeds();
     // Measured, in steps, the smaller of the two geometries: a context
-    // throttled 83,741, lent 2,871, a timer armed 489, a thread marked as
-    // having lost its context 4,558, the core idle 10,677, running on slack
-    // 69,773, a fault no address space queued 2,734, a fault no context
-    // queued 2,849.
+    // throttled 80,877, lent 4,650, a timer armed 529, a thread marked as
+    // having lost its context 2,257, the core idle 7,656, running on slack
+    // 69,285, a fault no address space queued 7,194, a fault no context
+    // queued 386.
     let states = [
         reached.throttled,
         reached.lent,
@@ -1963,7 +2073,7 @@ fn scheduling_states_are_reached() {
         reached.no_aspace,
         reached.no_context,
     ];
-    at_least(states, [41_000, 1400, 240, 2200, 5300, 34_000, 1300, 1400]);
+    at_least(states, [40_000, 2300, 260, 1100, 3800, 34_000, 3500, 190]);
     // Measured: the clock moved 4,730 times, and a timer fired in 13.
     at_least([reached.advanced, reached.fired], [2300, 6]);
 }

@@ -124,6 +124,7 @@ impl K {
                 remaining,
                 deadline,
                 state,
+                ..
             }) => (consumed, remaining, deadline, state),
             other => panic!("{other:?}"),
         }

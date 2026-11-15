@@ -4,8 +4,9 @@
 use crate::{Armed, Model, ObjId, Outcome, Output, Queue, Queued, Sched, Thread, live};
 use dodos_abi::RECOVERY_BANDWIDTH;
 use dodos_abi::{
-    ADMISSION_WHOLE_CORE, CORE_WINDOWS, Error, FaultKind, ObjectKind, Rights, SCHED_MAX_PERIOD_NS,
-    SCHED_MIN_BUDGET_NS, SCHED_STATE_CONFIGURED, SCHED_STATE_HOME, SCHED_STATE_LENT,
+    ADMISSION_WHOLE_CORE, CORE_WINDOWS, Error, FaultKind, ObjectKind, Rights, SCHED_COUNT_OFF,
+    SCHED_COUNT_ON, SCHED_MAX_PERIOD_NS, SCHED_MIN_BUDGET_NS, SCHED_STATE_CONFIGURED,
+    SCHED_STATE_COUNTED, SCHED_STATE_HOME, SCHED_STATE_HW_CLASS_SHIFT, SCHED_STATE_LENT,
     SCHED_STATE_THROTTLED, SlotAddr, TIME_EVENT_STEP, TIME_LIMIT, bandwidth, firing_instant,
 };
 
@@ -23,7 +24,7 @@ impl Sched {
     /// Admission: the bandwidth of a context, from the parameters last
     /// given, which count in the sum from the call that gave them; 0 when
     /// it is not configured.
-    fn bandwidth(&self) -> u64 {
+    pub(crate) fn bandwidth(&self) -> u64 {
         let (budget, period) = self.pending.unwrap_or((self.budget, self.period));
         if self.configured {
             bandwidth(budget, period)
@@ -109,9 +110,20 @@ impl Model {
         };
         let elapsed = self.now - self.previous;
         self.previous = self.now;
+        self.event.counts = self
+            .scheds
+            .iter()
+            .map(|(&id, s)| (id, (s.consumed, s.count, s.counted)))
+            .collect();
         let (context, ready) = self.running?;
+        let counter = self.machine.counter;
         let running = self.scheds.get_mut(&context)?;
         running.consumed = running.consumed.saturating_add(elapsed);
+        // Instructions retired: charged at the same events as the time,
+        // one per nanosecond on the model's cores.
+        if running.counted && counter {
+            running.count = running.count.saturating_add(elapsed);
+        }
         if ready {
             running.remaining = running.remaining.saturating_sub_unsigned(elapsed);
         }
@@ -159,6 +171,38 @@ impl Model {
     /// ran from the ready queue, the faults *no context*, every context in
     /// its queue, then the choice.
     pub(crate) fn end(&mut self, entry: Option<(ObjId, bool)>) {
+        self.choose(entry);
+        // Instructions retired: when a counted context stops running, the
+        // kernel reads the processor's class of the code it ran.
+        let now = self.running.map(|(context, _)| context);
+        if let Some((stopped, _)) = entry
+            && now != Some(stopped)
+            && let Some(sched) = self.scheds.get_mut(&stopped)
+            && sched.counted
+        {
+            sched.hw_class = self
+                .machine
+                .classifier
+                .map_or(0, |class| 1 + u64::from(class));
+        }
+        // What a core enables for a thread: the baseline of the node and the
+        // optional features of the thread's mask, written at a switch.
+        if let Some(holder) = self.running() {
+            self.enabled = self.enabled_for(holder);
+        }
+    }
+
+    /// The state features enabled for a thread on its node's cores.
+    pub(crate) fn enabled_for(&self, thread: ObjId) -> u32 {
+        let kind = self.machine.own_kind(self.node);
+        let list = self.machine.features();
+        let optional = self.threads[&thread].mask as u32
+            & list.state
+            & !(1 << dodos_abi::FEATURE_USER_INTERRUPTS);
+        kind.baseline(list) | optional
+    }
+
+    fn choose(&mut self, entry: Option<(ObjId, bool)>) {
         if let Some((context, true)) = entry {
             let exhausted = self
                 .scheds
@@ -607,7 +651,9 @@ impl Model {
         let state = bit(sched.configured, SCHED_STATE_CONFIGURED)
             | bit(sched.throttled.is_some(), SCHED_STATE_THROTTLED)
             | bit(sched.home.is_some(), SCHED_STATE_HOME)
-            | bit(!sched.chain.is_empty(), SCHED_STATE_LENT);
+            | bit(!sched.chain.is_empty(), SCHED_STATE_LENT)
+            | bit(sched.counted, SCHED_STATE_COUNTED)
+            | sched.hw_class << SCHED_STATE_HW_CLASS_SHIFT;
         let read = match sched.configured {
             true => (sched.consumed, sched.remaining, sched.deadline),
             false => (0, 0, 0),
@@ -617,7 +663,32 @@ impl Model {
             remaining: read.1,
             deadline: read.2,
             state,
+            instructions: sched.count,
         })
+    }
+
+    /// `sched_count`: counting of the instructions a context retires, on
+    /// or off. Off sets the count and the class to 0. No state error.
+    pub(crate) fn sched_count(
+        &mut self,
+        thread: ObjId,
+        sched: SlotAddr,
+        core: SlotAddr,
+        mode: u64,
+    ) -> Outcome {
+        let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
+        self.own_core(thread, core)?;
+        let on = match mode {
+            SCHED_COUNT_OFF => false,
+            SCHED_COUNT_ON => true,
+            _ => return Err(Error::Invalid),
+        };
+        let sched = live(&mut self.scheds, context);
+        if !on {
+            (sched.count, sched.hw_class) = (0, 0);
+        }
+        sched.counted = on;
+        Ok(Output::Done)
     }
 
     /// `yield`: the context the caller runs on gives up its remaining

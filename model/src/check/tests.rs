@@ -2164,3 +2164,68 @@ fn device_of_a_unit_missing_from_its_list_is_reported() {
     });
     assert_eq!(broken, "39: list of the devices of a unit");
 }
+
+// Unlike cores.
+
+#[test]
+fn enabled_features_other_than_the_running_threads_are_reported() {
+    let broken = spoiled(|m, _| m.enabled ^= 1 << dodos_abi::x86_64::AMX);
+    assert_eq!(broken, "74: features enabled for the running thread");
+}
+
+#[test]
+fn save_area_smaller_than_the_mask_needs_is_reported() {
+    let broken = spoiled(|m, at| {
+        live(&mut m.threads, at.ready).mask = 1 << dodos_abi::x86_64::AMX;
+    });
+    assert_eq!(broken, "74: features enabled for the running thread");
+    let broken = spoiled(|m, at| live(&mut m.threads, at.waiter).area = 1024);
+    assert_eq!(broken, "76: save area of a thread");
+}
+
+#[test]
+fn count_of_an_uncounted_context_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = m.threads[&at.ready].home.unwrap();
+        live(&mut m.scheds, context).hw_class = 1;
+    });
+    assert_eq!(broken, "77: count of an uncounted context");
+}
+
+#[test]
+fn instructions_charged_without_time_are_reported() {
+    let broken = spoiled(|m, at| {
+        let context = m.threads[&at.ready].home.unwrap();
+        let sched = live(&mut m.scheds, context);
+        sched.counted = true;
+        let before = (sched.consumed, sched.count, true);
+        sched.count += 1;
+        m.event.counts.insert(context, before);
+    });
+    assert_eq!(
+        broken,
+        "77: instructions and time charged at different events"
+    );
+}
+
+#[test]
+fn time_charged_without_instructions_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = m.threads[&at.ready].home.unwrap();
+        let sched = live(&mut m.scheds, context);
+        sched.counted = true;
+        let before = (sched.consumed, sched.count, true);
+        sched.consumed += 1;
+        m.event.counts.insert(context, before);
+    });
+    assert_eq!(
+        broken,
+        "77: instructions and time charged at different events"
+    );
+}
+
+#[test]
+fn marks_lost_by_a_move_are_reported() {
+    let broken = spoiled(|m, at| m.event.moved.push((at.waiter, 1)));
+    assert_eq!(broken, "78: marks lost by a move");
+}

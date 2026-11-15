@@ -146,16 +146,10 @@ impl Model {
         // argument. Then the untyped, unless it is 0: slot, kind, `write`,
         // then that it is the space's own untyped (`invalid`; any untyped
         // is `invalid` for the start-up aspace, made from none).
-        let cap = self.cap(thread, map.frame, Rights::READ)?;
         // Memory under a grant: the gate maps a frame of another node only
-        // while the grant is live; an invalid remote capability is `gone`
-        // and its slot dead.
-        if let Some(remote) = self.remotes.get(&self.caps[&cap].object).copied()
-            && !self.valid(&remote)
-        {
-            self.remove_leaf_dead(cap);
-            return Err(Error::Gone);
-        }
+        // while the grant is live (an invalid remote capability is `gone`,
+        // judged with its slot).
+        let cap = self.cap(thread, map.frame, Rights::READ)?;
         self.is(cap, ObjectKind::Frame, Rights::NONE)?;
         let untyped = self.optional(thread, map.untyped, ObjectKind::Untyped, Rights::WRITE)?;
         if untyped.is_some() && untyped != self.objects[&space].from {

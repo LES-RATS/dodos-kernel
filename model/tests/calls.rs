@@ -1558,8 +1558,9 @@ fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_20() {
 
 #[test]
 fn size_argument_is_zero_for_the_other_kinds() {
+    // A thread's size argument is its feature mask (tests/cores.rs).
     let mut k = K::new();
-    for kind in [ASpace, Thread, ObjectKind::Sched, Endpoint, Reply, Notify] {
+    for kind in [ASpace, ObjectKind::Sched, Endpoint, Reply, Notify] {
         for size in [1, 7, 4096, u64::MAX] {
             k.no(retype(UT, kind, size, s(30)), Error::Invalid);
         }

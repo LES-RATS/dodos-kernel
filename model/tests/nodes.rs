@@ -65,6 +65,17 @@ fn recv(window: Range) -> Syscall {
     }
 }
 
+/// A receive on the mailbox with the reply object in `reply`, made first,
+/// into one slot at `first`.
+fn recv_into(reply: u32, first: u32) -> Syscall {
+    Syscall::Recv {
+        endpoint: MAILBOX,
+        reply: s(reply),
+        range: range(first, 1),
+        wait: 0,
+    }
+}
+
 fn map(frame: u32, count: u64, rights: Rights) -> Syscall {
     Syscall::ASpaceMap(Map {
         space: ASPACE,
@@ -467,17 +478,18 @@ fn destroying_a_thread_whose_wait_a_proxy_holds_ends_that_wait_on_the_other_node
 fn sixteen_proxies_per_peer_and_further_requests_wait_first_in_first_out() {
     let mut m = S::new();
     m.granted(Notify);
-    let threads: Vec<ObjId> = (0..PROXIES_PER_PEER as u32 + 1)
+    let threads: Vec<ObjId> = (0..PROXIES_PER_PEER as u32 + 2)
         .map(|i| m.spawn(1, 200 + i))
         .collect();
     for &t in &threads {
         assert_eq!(m.by(1, t, Syscall::Wait(s(GOT), 0)), WAITS);
     }
-    // Sixteen requests are in flight; the seventeenth waits on node 1.
+    // Sixteen requests are in flight; the seventeenth and eighteenth wait
+    // on node 1.
     assert_eq!(m.sys.pending().len(), PROXIES_PER_PEER);
     m.settle();
     // One signal wakes the first proxy; its answer frees a proxy and the
-    // held request goes out.
+    // first held request goes out, the seventeenth.
     m.ok(0, Syscall::Signal(s(OBJ)));
     m.deliver_where(|b| matches!(b, Body::Answer { .. }));
     assert!(matches!(
@@ -495,7 +507,8 @@ fn sixteen_proxies_per_peer_and_further_requests_wait_first_in_first_out() {
     for (i, &t) in threads.iter().enumerate().skip(1) {
         assert_eq!(m.sys.node(1).woken(t), None, "thread {i}");
     }
-    // Every later signal wakes the next in order, the held one last.
+    // Every later signal wakes the next in order, the held ones last, in
+    // the order they were made.
     for &t in &threads[1..] {
         m.ok(0, Syscall::Signal(s(OBJ)));
         m.settle();
@@ -866,4 +879,209 @@ fn thread_cancel_of_a_request_waiting_for_a_free_proxy_takes_it_out_of_the_list(
         m.sys.node(1).woken(threads[0]),
         Some(Ok(Output::Word(1)))
     ));
+    // The other fifteen proxies wake their threads; no proxy waits for the
+    // two that left, so a further signal stays pending.
+    for &t in &threads[1..PROXIES_PER_PEER] {
+        m.ok(0, Syscall::Signal(s(OBJ)));
+        m.settle();
+        assert!(matches!(m.sys.node(1).woken(t), Some(Ok(Output::Word(1)))));
+    }
+    m.ok(0, Syscall::Signal(s(OBJ)));
+    assert!(matches!(
+        m.on(0, Syscall::Poll(s(OBJ))),
+        Ok(Output::Word(1))
+    ));
+}
+
+#[test]
+fn a_revoking_grant_makes_its_remote_capabilities_invalid_at_once() {
+    let mut m = S::new();
+    m.granted(Frame);
+    m.ok(1, map(GOT, 1, Rights::READ));
+    assert_eq!(m.on(0, Syscall::CapRevoke(s(OBJ))), WAITS);
+    // Before the holder hears of it, a use of the remote capability is
+    // `gone`, and its slot dead; the mapping goes with it.
+    assert_eq!(m.on(1, Syscall::CapInspect(s(GOT))), Err(Error::Gone));
+    assert_eq!(m.sys.node(1).translated(m.t[1], AT), None);
+    m.settle();
+    assert_eq!(m.woken(0), Some(&Err(Error::Again)));
+    m.ok(0, Syscall::CapRevoke(s(OBJ)));
+    assert!(m.sys.pending().is_empty());
+}
+
+#[test]
+fn derive_and_move_from_an_invalid_remote_capability_are_gone() {
+    for moved in [false, true] {
+        let mut m = S::new();
+        m.granted(Notify);
+        m.ok(0, Syscall::CapRevoke(s(OBJ)));
+        let call = match moved {
+            false => Syscall::CapDerive {
+                source: s(GOT),
+                destination: s(OBJ),
+                rights: Rights::SEND.bits(),
+                badge: 0,
+            },
+            true => Syscall::CapMove {
+                source: s(GOT),
+                destination: s(OBJ),
+            },
+        };
+        assert_eq!(m.on(1, call), Err(Error::Gone));
+        // The slot is dead: `cap_delete` empties it.
+        assert_eq!(m.on(1, Syscall::CapInspect(s(GOT))), Err(Error::Gone));
+        m.ok(1, Syscall::CapDelete(s(GOT)));
+        assert_eq!(m.on(1, Syscall::CapInspect(s(GOT))), Err(Error::Invalid));
+    }
+}
+
+#[test]
+fn a_reused_grant_has_the_next_serial_so_an_old_remote_capability_stays_invalid() {
+    let mut m = S::new();
+    m.granted(Notify);
+    // The grant is freed; the remote capability in `GOT` is invalid but
+    // its slot is not yet dead.
+    m.ok(0, Syscall::CapRevoke(s(OBJ)));
+    // A new grant takes entry 0 again, into the next slots of node 1.
+    assert_eq!(m.on(1, recv(range(GOT + 1, 4))), WAITS);
+    let send = Syscall::Send {
+        target: core(1),
+        message: msg(7, vec![Transfer::Derive(s(OBJ), Rights::SEND.bits())]),
+    };
+    assert_eq!(m.on(0, send), WAITS);
+    m.settle();
+    assert_eq!(got(m.woken(1)), (7, 1, 0));
+    // The old capability names serial 0, the entry serial 1.
+    assert_eq!(m.on(1, Syscall::Signal(s(GOT))), Err(Error::Gone));
+    assert_eq!(m.on(1, Syscall::Signal(s(GOT + 1))), WAITS);
+    m.settle();
+    assert_eq!(m.woken(1), Some(&DONE));
+}
+
+#[test]
+fn a_cspace_root_moved_to_a_range_in_a_space_as_deep_is_dropped() {
+    let mut m = S::new();
+    // Node 0 moves the root of a cspace made from its untyped (depth 2);
+    // node 1 receives in a cspace made the same way, whose root is as deep.
+    m.ok(0, retype(ObjectKind::CSpace, 128, OBJ));
+    m.ok(1, retype(ObjectKind::CSpace, 128, OBJ));
+    let grown = m.on(
+        1,
+        Syscall::CSpaceGrow {
+            cspace: s(OBJ),
+            untyped: UT,
+        },
+    );
+    assert_eq!(grown, Ok(Output::Slots(128)));
+    let window = Range {
+        first: SlotAddr::through(OBJ, 8),
+        count: 1,
+    };
+    assert_eq!(m.on(1, recv(window)), WAITS);
+    let send = Syscall::Send {
+        target: core(1),
+        message: msg(7, vec![Transfer::Move(s(OBJ))]),
+    };
+    assert_eq!(m.on(0, send), WAITS);
+    m.settle();
+    let dropped = Header::FLAG_CAPS_DROPPED;
+    assert_eq!(got(m.woken(1)), (7, 0, dropped));
+    // The root is back in its slot on node 0. Into the start-up space,
+    // whose root is at depth 1, the same move is accepted.
+    assert!(m.sys.node(0).object_at(m.t[0], s(OBJ)).is_some());
+    assert_eq!(m.transfer(vec![Transfer::Move(s(OBJ))]), (7, 1, 0));
+}
+
+#[test]
+fn a_revocation_whose_holder_needs_several_steps_returns_again_after_each() {
+    let mut m = S::new();
+    m.granted(Frame);
+    // Forty copies of the remote frame on node 1, each mapped: removing
+    // the root remote capability takes more than one step of 32 units.
+    let page = m.sys.node(1).geometry().page();
+    for i in 0..40u32 {
+        m.ok(
+            1,
+            Syscall::CapDerive {
+                source: s(GOT),
+                destination: s(300 + i),
+                rights: Rights::READ.bits(),
+                badge: 0,
+            },
+        );
+        let at = Syscall::ASpaceMap(Map {
+            space: ASPACE,
+            frame: s(300 + i),
+            untyped: SlotAddr::NONE,
+            address: AT + u64::from(i) * page,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        });
+        m.ok(1, at);
+    }
+    assert_eq!(m.on(0, Syscall::CapRevoke(s(OBJ))), WAITS);
+    m.deliver_where(|b| matches!(b, Body::Revoke { .. }));
+    // The first step does not finish: the grant stays, revoking.
+    m.deliver_where(|b| matches!(b, Body::RevokeStep { done: false, .. }));
+    assert_eq!(m.woken(0), Some(&Err(Error::Again)));
+    assert!(
+        m.sys.node(1).translated(m.t[1], AT + 39 * page).is_some()
+            || m.sys.node(1).translated(m.t[1], AT).is_some()
+    );
+    let mut rounds = 0;
+    while m.on(0, Syscall::CapRevoke(s(OBJ))) == WAITS {
+        m.settle();
+        assert_eq!(m.woken(0), Some(&Err(Error::Again)));
+        rounds += 1;
+        assert!(rounds < 8);
+    }
+    assert!(rounds >= 1);
+    for i in 0..40u64 {
+        assert_eq!(m.sys.node(1).translated(m.t[1], AT + i * page), None);
+    }
+}
+
+#[test]
+fn a_stale_remote_capability_sent_home_is_dropped() {
+    let mut m = S::new();
+    m.granted(Notify);
+    let b = m.spawn(0, 200);
+    let c = m.spawn(1, 200);
+    m.ok(1, retype(Reply, 0, REPLY + 1));
+    // Node 1 sends its remote capability home, moved; node 0 receives.
+    assert_eq!(m.on(0, recv(range(GOT, 4))), WAITS);
+    let back = Syscall::Send {
+        target: core(0),
+        message: msg(8, vec![Transfer::Move(s(GOT))]),
+    };
+    assert_eq!(m.on(1, back), WAITS);
+    m.deliver_where(|b| matches!(b, Body::Request { .. }));
+    m.deliver_where(|b| matches!(b, Body::TransferAsk { .. }));
+    // Before the crossing arrives, node 0 revokes the grant and grants the
+    // object again: the entry is live, with the next serial.
+    assert_eq!(m.by(0, b, Syscall::CapRevoke(s(OBJ))), DONE);
+    assert_eq!(m.by(1, c, recv_into(REPLY + 1, GOT + 4)), WAITS);
+    let send = Syscall::Send {
+        target: core(1),
+        message: msg(9, vec![Transfer::Derive(s(OBJ), Rights::SEND.bits())]),
+    };
+    assert_eq!(m.by(0, b, send), WAITS);
+    for _ in 0..4 {
+        m.deliver_where(|body| !matches!(body, Body::TransferGrant { grants: Some(g), .. } if matches!(g[..], [Crossing::Home { .. }])));
+    }
+    assert_eq!(got(m.sys.node(1).woken(c)), (9, 1, 0));
+    m.settle();
+    // The crossing of serial 0 is refused.
+    assert_eq!(got(m.woken(0)), (8, 0, Header::FLAG_CAPS_DROPPED));
+}
+
+#[test]
+fn a_task_made_on_node_1_carries_node_1_in_its_identifier() {
+    let mut m = S::new();
+    m.ok(1, retype(ObjectKind::Task, 0, OBJ));
+    let Ok(Output::Task { id, .. }) = m.on(1, Syscall::TaskRead(s(OBJ))) else {
+        panic!("a task");
+    };
+    assert_eq!(TaskId::from_raw(id).node(), 1);
 }

@@ -7,9 +7,9 @@ use crate::{
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
     ASPACE_PAGES, CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
-    ENDPOINT_BYTES, Error, Geometry, IOSPACE_PAGES, LONGEST_WALK, MemoryType, NOTIFY_BYTES,
-    ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP, REPLY_BYTES, Rights, SCHED_BYTES,
-    SLOT_BYTES, SlotAddr, TASK_BYTES, THREAD_FIXED_BYTES, TIMER_BYTES, TREE_DEPTH,
+    ENDPOINT_BYTES, Error, FeatureMask, Geometry, IOSPACE_PAGES, LONGEST_WALK, MemoryType,
+    NOTIFY_BYTES, ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP, REPLY_BYTES, Rights,
+    SCHED_BYTES, SLOT_BYTES, SlotAddr, TASK_BYTES, TIMER_BYTES, TREE_DEPTH, thread_bytes,
 };
 
 /// Slots and addresses: one segment of a capability space, 8 KB.
@@ -91,7 +91,7 @@ fn footprint(
     arg: SizeArgument,
     device: bool,
     geometry: Geometry,
-    thread: u64,
+    thread: Result<u64, Error>,
 ) -> Result<(u64, u64, Option<Frame>), Error> {
     let page = geometry.page();
     let size = arg.size;
@@ -134,7 +134,7 @@ fn footprint(
         ObjectKind::IoSpace => (IOSPACE_PAGES * page, size == 0),
         // Object sizes: a thread is its fixed part and its save area,
         // rounded up to a power of two.
-        ObjectKind::Thread => (thread, size == 0),
+        ObjectKind::Thread => (thread?, true),
         ObjectKind::Sched => fixed(SCHED_BYTES),
         ObjectKind::Endpoint => fixed(ENDPOINT_BYTES),
         ObjectKind::Reply => fixed(REPLY_BYTES),
@@ -281,7 +281,10 @@ impl Model {
         // Order of checks, step 3: the kind is judged before the size
         // argument.
         let device = self.untypeds[&object].device;
-        let thread = self.thread_bytes();
+        let thread = match kind {
+            ObjectKind::Thread => self.thread_size(size.size),
+            _ => Ok(0),
+        };
         let geometry = self.machine.geometry;
         let (bytes, align, frame) = footprint(kind, size, device, geometry, thread)?;
         self.fits(place.space, parent, Placing::Retyped(kind))?;
@@ -358,11 +361,14 @@ impl Model {
         Ok(Output::Slots(slots as u32))
     }
 
-    /// Object sizes: the bytes of a thread of mask 0 on the reference
-    /// machine, x86-64 with x87, SSE and AVX state: 1 KB + 832, rounded up.
-    pub(crate) fn thread_bytes(&self) -> u64 {
-        let area = u64::from(dodos_abi::x86_64::XSTATE_X87_SSE_AVX_BYTES);
-        (THREAD_FIXED_BYTES + area).next_power_of_two()
+    /// Unlike cores: the size argument of a thread is its feature mask,
+    /// judged on the node's own kind (`invalid`, then `unsupported`); the
+    /// thread's bytes follow from it.
+    pub(crate) fn thread_size(&self, mask: u64) -> Result<u64, Error> {
+        let (list, kind) = (self.machine.features(), self.machine.own_kind(self.node));
+        let mask = FeatureMask::from_raw(mask);
+        mask.check(list, &kind)?;
+        thread_bytes(mask, list, &kind).ok_or(Error::Unsupported)
     }
 
     /// The derivation tree: a start-up capability is at depth 1. The walk
@@ -528,6 +534,8 @@ impl Model {
                 let thread = Thread {
                     suspended: true,
                     regs,
+                    mask: size,
+                    area: self.thread_size(size).expect("judged by the caller"),
                     ..Thread::default()
                 };
                 self.threads.insert(id, thread);

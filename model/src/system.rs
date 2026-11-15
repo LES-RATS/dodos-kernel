@@ -193,7 +193,7 @@ mod tests {
 
     /// Two nodes; node 0 has granted node 1 a notify, whose remote
     /// capability is in slot `GOT` of node 1.
-    fn granted() -> System {
+    fn granted() -> (System, Vec<ObjId>) {
         let (mut sys, t) = System::boot(&Machine::example()).unwrap();
         let retype = |kind, destination| Syscall::UntypedRetype {
             untyped: SlotAddr::own(25),
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(sys.settle(16), 4);
         assert_eq!(sys.check(), Ok(()));
         assert_eq!(sys.nodes[1].remotes.len(), 1);
-        sys
+        (sys, t)
     }
 
     /// Changes the machine table of every node the same way.
@@ -248,9 +248,86 @@ mod tests {
         }
     }
 
+    /// Node 1 waits on its mailbox for one capability; node 0 sends it a
+    /// derived capability for its notify. Returns the flags of the message
+    /// node 1 gets.
+    fn second_transfer(sys: &mut System, t: &[ObjId]) -> u32 {
+        let recv = Syscall::Recv {
+            endpoint: SlotAddr::own(dodos_abi::START_SLOT_MAILBOX),
+            reply: SlotAddr::own(100),
+            range: Range {
+                first: SlotAddr::own(GOT + 1),
+                count: 1,
+            },
+            wait: 0,
+        };
+        assert_eq!(sys.apply(1, t[1], recv), Ok(crate::Output::Waits));
+        let send = Syscall::Send {
+            target: SlotAddr::own(17),
+            message: Message {
+                label: 2,
+                flags: 0,
+                words: vec![2],
+                caps: vec![Transfer::Derive(SlotAddr::own(OBJ), Rights::SEND.bits())],
+                marks: 0,
+            },
+        };
+        assert_eq!(sys.apply(0, t[0], send), Ok(crate::Output::Waits));
+        sys.settle(16);
+        match sys.nodes[1].woken(t[1]) {
+            Some(Ok(crate::Output::Message(delivery))) => delivery.received.header.flags(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_grant_table_drops_the_capabilities_of_a_transfer() {
+        let (mut sys, t) = granted();
+        // Every other entry of node 0's grant table is taken.
+        let entry = GrantEntry {
+            grantee: 1,
+            generation: 0,
+            serial: 0,
+            state: GrantState::Live,
+        };
+        tables(&mut sys, |t| {
+            for grant in 1..dodos_abi::GRANTS as u16 {
+                t.grants[0].insert(grant, entry);
+            }
+        });
+        assert_eq!(
+            second_transfer(&mut sys, &t),
+            dodos_abi::Header::FLAG_CAPS_DROPPED
+        );
+    }
+
+    #[test]
+    fn a_full_use_table_on_the_receiver_drops_the_capabilities_and_frees_the_grant() {
+        let (mut sys, t) = granted();
+        let used = UseEntry {
+            granter: 0,
+            grant: 9,
+            serial: 0,
+            generation: 0,
+            leaves: 0,
+        };
+        tables(&mut sys, |t| {
+            for entry in 1..dodos_abi::GRANTS as u16 {
+                t.uses[1].insert(entry, used);
+            }
+        });
+        assert_eq!(
+            second_transfer(&mut sys, &t),
+            dodos_abi::Header::FLAG_CAPS_DROPPED
+        );
+        // The grant made for it was freed at the refusal: only grant 0 is
+        // left on node 0.
+        assert_eq!(sys.nodes[0].table.grants[0].len(), 1);
+    }
+
     #[test]
     fn a_map_count_above_the_leaves_of_every_node_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         let chunk = sys.nodes[0].table.maps.iter().position(|&m| m > 0).unwrap();
         tables(&mut sys, |t| t.maps[chunk] += 1);
         assert_eq!(sys.check(), Err("58: map count of the machine".into()));
@@ -258,7 +335,7 @@ mod tests {
 
     #[test]
     fn a_map_count_below_the_leaves_of_one_node_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         let chunk = sys.nodes[0].table.maps.iter().position(|&m| m > 0).unwrap();
         tables(&mut sys, |t| t.maps[chunk] = 0);
         assert_eq!(sys.check(), Err("node 0: 58: map count".into()));
@@ -266,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_grant_entry_without_its_anchor_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         let entry = GrantEntry {
             grantee: 1,
             generation: 0,
@@ -281,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_remote_object_of_a_live_grant_on_another_node_than_its_grantee_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         tables(&mut sys, |t| live(&mut t.grants[0], 0).grantee = 0);
         assert_eq!(
             sys.check(),
@@ -291,7 +368,7 @@ mod tests {
 
     #[test]
     fn a_use_entry_of_no_remote_object_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         let used = UseEntry {
             granter: 0,
             grant: 0,
@@ -310,7 +387,7 @@ mod tests {
 
     #[test]
     fn a_use_entry_of_a_grant_of_its_own_node_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         tables(&mut sys, |t| {
             for used in t.uses[1].values_mut() {
                 used.granter = 1;
@@ -324,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_remote_object_of_its_own_node_is_reported() {
-        let mut sys = granted();
+        let (mut sys, _) = granted();
         for remote in sys.nodes[1].remotes.values_mut() {
             remote.node = 1;
         }
