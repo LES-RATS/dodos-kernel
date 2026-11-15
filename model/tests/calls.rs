@@ -8,6 +8,8 @@ use dodos_model::*;
 const SPACE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
 const UT: SlotAddr = s(START_SLOT_FIRST);
 const DEV: SlotAddr = s(START_SLOT_FIRST + 1);
+/// The `core` capability of the boot core.
+const CORE: SlotAddr = SlotAddr::own(16);
 /// The first slot beyond the table of the start-up space of the machine of
 /// the tests.
 const BEYOND: SlotAddr = SlotAddr::own(4224);
@@ -209,9 +211,19 @@ struct K {
 }
 
 impl K {
+    /// The first thread's context keeps half of the core, so that the
+    /// threads that `spawn` makes have contexts of their own.
     fn new() -> Self {
         let (m, t) = Model::boot(&Machine::example()).unwrap();
-        Self { m, t, spare: 127 }
+        let mut k = Self { m, t, spare: 4000 };
+        k.ok(Syscall::SchedConfigure {
+            sched: SlotAddr::own(START_SLOT_SCHED),
+            core: CORE,
+            budget: 5_000_000,
+            period: 10_000_000,
+            class: 1,
+        });
+        k
     }
 
     fn on(&mut self, thread: ObjId, call: Syscall) -> Outcome {
@@ -285,6 +297,25 @@ impl K {
     }
 
     /// A new thread that runs in the capability space of the first thread.
+    /// A scheduling context of 10 µs every 10 ms, bound to the thread in
+    /// `slot` as its own.
+    fn schedule(&mut self, slot: u32) {
+        let sched = self.spare;
+        self.spare -= 1;
+        self.make(ObjectKind::Sched, sched);
+        self.ok(Syscall::SchedConfigure {
+            sched: s(sched),
+            core: CORE,
+            budget: 10_000,
+            period: 10_000_000,
+            class: 1,
+        });
+        self.ok(Syscall::SchedBind {
+            sched: s(sched),
+            thread: s(slot),
+        });
+    }
+
     /// A frame for a message page, in a slot that the tests leave free.
     fn page(&mut self) -> u32 {
         let page = self.spare;
@@ -293,12 +324,17 @@ impl K {
         page
     }
 
-    /// It has a message page of its own.
+    /// It has a message page and a scheduling context of its own, and runs
+    /// in the address space of the first thread.
     fn spawn(&mut self, slot: u32) -> ObjId {
         self.make(Thread, slot);
         let page = self.page();
-        let none = SlotAddr::NONE;
-        self.ok(with_page(configure(slot, SPACE, none, none), page));
+        let aspace = SlotAddr::own(START_SLOT_ASPACE);
+        self.ok(with_page(
+            configure(slot, SPACE, aspace, SlotAddr::NONE),
+            page,
+        ));
+        self.schedule(slot);
         self.ok(Syscall::ThreadResume(s(slot)));
         self.m.object_at(self.t, s(slot)).unwrap()
     }
@@ -1019,7 +1055,7 @@ fn thread_whose_capability_space_is_dying_gets_gone_from_every_call_but_cap_dele
         k.on(inside, derive(o(20), o(30), Rights::ALL, 0)),
         Err(Error::Gone)
     );
-    assert_eq!(k.on(inside, Syscall::Other(Call::Yield)), Err(Error::Gone));
+    assert_eq!(k.on(inside, Syscall::Yield), Err(Error::Gone));
     // `cap_delete` works, on a full slot and on a dead one.
     assert_eq!(k.on(inside, Syscall::CapDelete(o(20))), DONE);
     assert_eq!(k.on(inside, Syscall::CapDelete(s(1))), DONE);
@@ -1092,7 +1128,7 @@ fn thread_whose_capability_space_is_destroyed_gets_gone_from_every_call() {
     k.ok(Syscall::CapDelete(s(30)));
     assert!(k.can_run(other));
     assert_eq!(k.on(other, Syscall::CapInspect(s(1))), Err(Error::Gone));
-    assert_eq!(k.on(other, Syscall::Other(Call::Yield)), Err(Error::Gone));
+    assert_eq!(k.on(other, Syscall::Yield), Err(Error::Gone));
     assert_eq!(k.on(other, Syscall::CapDelete(s(1))), Err(Error::Gone));
 }
 
@@ -1782,7 +1818,7 @@ fn suspended_thread_keeps_its_place_in_its_queue_and_still_gets_its_message() {
 #[test]
 fn calls_outside_the_one_core_model_are_unsupported() {
     let mut k = K::new();
-    for call in [Call::Yield, Call::CoreStart, Call::DebugWrite] {
+    for call in [Call::CoreStart, Call::DebugWrite] {
         k.no(Syscall::Other(call), Error::Unsupported);
     }
 }
@@ -4976,6 +5012,7 @@ fn runs_with_page(k: &mut K, slot: u32, page: u32) -> ObjId {
     k.make(Thread, slot);
     let page = if page == 0 { SlotAddr::NONE } else { s(page) };
     assert_eq!(configured(k, slot, page), DONE);
+    k.schedule(slot);
     k.ok(Syscall::ThreadResume(s(slot)));
     k.m.object_at(k.t, s(slot)).unwrap()
 }

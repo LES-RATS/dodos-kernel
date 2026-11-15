@@ -15,15 +15,18 @@ impl Model {
     /// number, the access or the error code, and the address.
     ///
     /// The faults *no address space* and *no context* are raised by the
-    /// kernel itself, never given here.
+    /// kernel itself, never given here. A fault is an event of the kernel,
+    /// as a call is.
     pub fn fault(&mut self, thread: ObjId, kind: FaultKind, exception: [u64; 3]) {
         assert!(self.runnable().contains(&thread), "{thread:?} does not run");
         assert!(
             (kind as u32) <= FaultKind::BadCall as u32,
             "{kind:?} is the kernel's"
         );
+        let entry = self.begin();
         live(&mut self.threads, thread).outcome = None;
         self.raise(thread, kind, exception);
+        self.end(entry);
     }
 
     /// Faults: delivery is a `call` by the faulting thread on its fault

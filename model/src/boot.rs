@@ -9,8 +9,8 @@ use dodos_abi::x86_64::{REG_RDI, REG_RIP};
 use dodos_abi::{
     CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS, FIRST_SERVICE_MIN_ADDR, FRAME_MAX_PAGES, MemoryType,
     ObjectKind, PageSize, Rights, SHARE_ALIGN, START_FREE_SLOTS, START_MESSAGE_PAGE_ADDR,
-    START_PAGE_ADDR, START_PAGE_MAX_PAGES, START_RESERVE_BYTES, START_SLOT_ASPACE,
-    START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS,
+    START_PAGE_ADDR, START_PAGE_MAX_PAGES, START_RESERVE_BYTES, START_SCHED_PERIOD_NS,
+    START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS,
     START_SLOT_IRQ_CONTROL, START_SLOT_MESSAGE_PAGE, START_SLOT_MESSAGE_PAGE_MAP, START_SLOT_SCHED,
     START_SLOT_START_PAGE, START_SLOT_TASK, START_SLOT_THREAD,
 };
@@ -427,7 +427,7 @@ impl Model {
         add(self, ObjectKind::CSpace, slots, START_SLOT_CSPACE, all);
         let aspace = add(self, ObjectKind::ASpace, 0, START_SLOT_ASPACE, all);
         let thread = add(self, ObjectKind::Thread, 0, START_SLOT_THREAD, all);
-        add(self, ObjectKind::Sched, 0, START_SLOT_SCHED, all);
+        let sched = add(self, ObjectKind::Sched, 0, START_SLOT_SCHED, all);
         add(self, ObjectKind::Debug, 0, START_SLOT_DEBUG, all);
         add(self, ObjectKind::IrqControl, 0, START_SLOT_IRQ_CONTROL, all);
         add(self, ObjectKind::IoPorts, 0, START_SLOT_IOPORTS, all);
@@ -540,6 +540,9 @@ impl Model {
         first.suspended = false;
         first.regs[REG_RIP] = machine.entry;
         first.regs[REG_RDI] = START_PAGE_ADDR;
+        // Scheduling: the `sched` is configured with budget = period = 10 ms,
+        // class 1, the cores set of the boot core, and bound to it.
+        self.first_context(sched, thread, START_SCHED_PERIOD_NS);
         thread
     }
 }

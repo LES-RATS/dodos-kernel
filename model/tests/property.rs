@@ -68,6 +68,9 @@ const HOME_SLOTS: u32 = 4 * CSPACE_SEGMENT_SLOTS;
 /// The ordinary untyped of `Machine::example`, and its device untyped in
 /// the next slot.
 const UNTYPED_SLOT: u32 = 20;
+/// The `core` capabilities of `Machine::example`: the boot core's, then
+/// the other's.
+const CORE_SLOT: u32 = 16;
 /// The `iommu` capability of `Machine::example`.
 const IOMMU_SLOT: u32 = 18;
 /// The links of a chain of copies that starts at depth 2 and ends at 64.
@@ -123,7 +126,7 @@ const MADE: [ObjectKind; 9] = [
 ];
 
 /// The calls, numbered as `name_of` numbers them.
-const NAMES: [&str; 28] = [
+const NAMES: [&str; 36] = [
     "cap_derive",
     "cap_move",
     "cap_delete",
@@ -152,6 +155,14 @@ const NAMES: [&str; 28] = [
     "iospace_attach",
     "thread_read_regs",
     "thread_write_regs",
+    "sched_configure",
+    "sched_bind",
+    "sched_unbind",
+    "sched_set_cores",
+    "sched_read",
+    "yield",
+    "timer_set",
+    "timer_cancel",
 ];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
@@ -186,6 +197,14 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::IoSpaceAttach { .. } => 25,
         Syscall::ThreadReadRegs(_) => 26,
         Syscall::ThreadWriteRegs { .. } => 27,
+        Syscall::SchedConfigure { .. } => 28,
+        Syscall::SchedBind { .. } => 29,
+        Syscall::SchedUnbind(_) => 30,
+        Syscall::SchedSetCores { .. } => 31,
+        Syscall::SchedRead(_) => 32,
+        Syscall::Yield => 33,
+        Syscall::TimerSet { .. } => 34,
+        Syscall::TimerCancel(_) => 35,
     }
 }
 
@@ -462,6 +481,16 @@ impl Generator<'_> {
         }
     }
 
+    /// A duration: mostly between the smallest budget and a millisecond,
+    /// seldom 0 or below the smallest budget.
+    fn duration(&mut self) -> u64 {
+        match self.rng.below(20) {
+            0 => 0,
+            1 => self.rng.below(SCHED_MIN_BUDGET_NS),
+            _ => SCHED_MIN_BUDGET_NS + self.rng.below(1_000_000),
+        }
+    }
+
     /// The rights word of a mapping: mostly a valid one.
     fn mapping_rights(&mut self) -> u32 {
         let (r, w, x) = (Rights::READ, Rights::WRITE, Rights::EXEC);
@@ -508,7 +537,7 @@ impl Generator<'_> {
         let roll = if self.rng.chance(14) {
             29 + self.rng.below(8)
         } else {
-            self.rng.below(48)
+            self.rng.below(56)
         };
         match roll {
             0..3 => Syscall::CapDerive {
@@ -677,6 +706,33 @@ impl Generator<'_> {
                     block
                 },
             },
+            48 => Syscall::SchedConfigure {
+                sched: self.held(OTHER),
+                core: own(CORE_SLOT + self.rng.chance(5) as u32),
+                budget: self.duration(),
+                period: self.duration() * 4,
+                class: self.rng.below(4),
+            },
+            49 => Syscall::SchedBind {
+                sched: self.held(OTHER),
+                thread: self.held(THREAD),
+            },
+            50 => Syscall::SchedUnbind(self.held(OTHER)),
+            51 => Syscall::SchedSetCores {
+                sched: self.held(OTHER),
+                core: own(CORE_SLOT),
+                window: self.rng.chance(5) as u64,
+                mask: self.rng.below(4),
+            },
+            52 => Syscall::SchedRead(self.held(OTHER)),
+            53 => Syscall::Yield,
+            54 => Syscall::TimerSet {
+                timer: self.held(OTHER),
+                notify: self.held(NOTIFY),
+                deadline: self.model.now() + self.duration() * self.rng.below(3),
+                tolerance: self.duration() * self.rng.below(2),
+            },
+            55 => Syscall::TimerCancel(self.held(OTHER)),
             45 | 46 => Syscall::IoSpaceAttach {
                 iommu: if self.rng.chance(90) {
                     own(IOMMU_SLOT)
@@ -702,10 +758,11 @@ impl Generator<'_> {
                     self.held(ENDPOINT)
                 },
             },
-            _ => Syscall::Other(
-                self.rng
-                    .pick(&[Call::Yield, Call::CoreStatus, Call::DebugWrite]),
-            ),
+            _ => Syscall::Other(self.rng.pick(&[
+                Call::CoreStatus,
+                Call::DebugWrite,
+                Call::TraceEmit,
+            ])),
         }
     }
 
@@ -828,6 +885,10 @@ impl Generator<'_> {
         calls.extend(vec![grown; (CHILD_SLOTS / CSPACE_SEGMENT_SLOTS) as usize]);
         calls.push(derive(MEMORY, inside(UNTYPED_SLOT)));
         calls.push(derive(own(space), inside(START_SLOT_CSPACE)));
+        // The address space and the core capability of this space, so that
+        // the threads of the new one can run and have contexts.
+        calls.push(derive(own(START_SLOT_ASPACE), inside(START_SLOT_ASPACE)));
+        calls.push(derive(own(CORE_SLOT), inside(CORE_SLOT)));
         for (kind, class) in [
             (ObjectKind::Endpoint, ENDPOINT),
             (ObjectKind::Reply, REPLY),
@@ -846,15 +907,40 @@ impl Generator<'_> {
         // The capability of the second goes into the new space.
         // Each has one of the two frames of the new space as its message
         // page.
-        for (thread, page) in [(own(thread), 34), (inside(34 + THREAD), 43)] {
+        // Each has a context of its own, now and then none: a passive one.
+        // The first one's is in this space, and outlives the new one, as
+        // the first thread does; the second one's is in the new space, and
+        // dies with it. Now and then a thread has no address space, and
+        // faults when it would run.
+        let kept = self.find_own(OTHER, Wanted::Free).map_or(inside(107), own);
+        let threads = [
+            (own(thread), 34, kept),
+            (inside(34 + THREAD), 43, inside(106)),
+        ];
+        for (thread, page, sched) in threads {
             calls.push(retype(ObjectKind::Thread, 0, thread));
             calls.push(Syscall::ThreadConfigure {
                 thread,
                 cspace: own(space),
-                aspace: SlotAddr::NONE,
+                aspace: if self.rng.chance(10) {
+                    SlotAddr::NONE
+                } else {
+                    own(START_SLOT_ASPACE)
+                },
                 fault: inside(34 + ENDPOINT),
                 page: inside(page + OTHER),
             });
+            if self.rng.chance(80) {
+                calls.push(retype(ObjectKind::Sched, 0, sched));
+                calls.push(Syscall::SchedConfigure {
+                    sched,
+                    core: own(CORE_SLOT),
+                    budget: SCHED_MIN_BUDGET_NS,
+                    period: 10_000_000,
+                    class: self.rng.below(3),
+                });
+                calls.push(Syscall::SchedBind { sched, thread });
+            }
             calls.push(Syscall::ThreadResume(thread));
         }
         calls
@@ -1103,7 +1189,7 @@ impl Generator<'_> {
 #[derive(Debug, Default, PartialEq)]
 struct Reached {
     /// Calls that did not fail, by their place in `NAMES`.
-    ok: [u32; 28],
+    ok: Vec<u32>,
     /// Calls that returned each error, by its code.
     errors: [u32; 12],
     /// Times nothing of use could run, and the run went on from the
@@ -1184,6 +1270,21 @@ struct Reached {
     /// which a thread waited on a fault.
     faults: [u32; 2],
     faulting: u32,
+    /// Steps after which: a context was throttled, a context was lent, a
+    /// timer was armed, a thread was marked as having lost its context,
+    /// the core was idle, the running context ran on slack, a thread waited
+    /// on a fault *no address space*, on a fault *no context*.
+    throttled: u32,
+    lent: u32,
+    armed: u32,
+    lost: u32,
+    idle: u32,
+    on_slack: u32,
+    no_aspace: u32,
+    no_context: u32,
+    /// Times the clock moved, and those in which a timer fired.
+    advanced: u32,
+    fired: u32,
     unmapped_by_removal: u32,
     detached_by_removal: u32,
 }
@@ -1217,6 +1318,14 @@ impl Reached {
         self.bound += (census.bound > 0) as u32;
         self.mapped += (census.mappings > 0) as u32;
         self.faulting += (census.faulting > 0) as u32;
+        self.throttled += (census.throttled > 0) as u32;
+        self.lent += (census.lends > 0) as u32;
+        self.armed += (census.armed > 0) as u32;
+        self.lost += (census.lost > 0) as u32;
+        self.idle += census.idle as u32;
+        self.on_slack += census.on_slack as u32;
+        self.no_aspace += (census.fault_kinds[7] > 0) as u32;
+        self.no_context += (census.fault_kinds[8] > 0) as u32;
         self.attached += (census.devices > 0) as u32;
     }
 }
@@ -1295,9 +1404,24 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
     }
 }
 
+/// The start-up state, in which the first thread's context keeps half of the
+/// core, so that other contexts can be admitted.
+fn start() -> (Model, ObjId) {
+    let (mut model, first) = Model::boot(&Machine::example()).unwrap();
+    let half = Syscall::SchedConfigure {
+        sched: own(START_SLOT_SCHED),
+        core: own(CORE_SLOT),
+        budget: 5_000_000,
+        period: 10_000_000,
+        class: 1,
+    };
+    assert_eq!(model.apply(first, half), Ok(Output::Done));
+    (model, first)
+}
+
 fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let (mut model, first) = Model::boot(&Machine::example()).unwrap();
+    let (mut model, first) = start();
     let home = model.object_at(first, HERE).expect("the start-up space");
     let mut plan = Plan::default();
     // Every thread that could run at some step: those that can be woken.
@@ -1319,7 +1443,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         if of_use.is_empty() {
             // Nothing of use can run: go on from the start-up state.
             reached.restarts += 1;
-            (model, _) = Model::boot(&Machine::example()).unwrap();
+            (model, _) = start();
             (plan, known) = (Plan::default(), BTreeSet::new());
             continue;
         }
@@ -1336,6 +1460,19 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             _ => rng.pick(&threads),
         };
         let space = space_of(&thread);
+        // Now and then time passes.
+        if rng.chance(4) {
+            let to = model.now() + rng.below(3_000_000);
+            let armed = model.census().armed;
+            model.advance(to);
+            reached.advanced += 1;
+            reached.fired += (model.census().armed < armed) as u32;
+            if let Err(broken) = model.check() {
+                panic!("seed {seed}, step {step}, advance to {to}: {broken}");
+            }
+            reached.count(&model);
+            continue;
+        }
         // Now and then the thread faults instead of making a call.
         if rng.below(200) == 0 && !plan.scripts.contains_key(&thread) {
             let kinds = [
@@ -1460,7 +1597,10 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         reached.destroyed += destroyed as u32;
         walked |= model.longest_walk() > 0;
         match &outcome {
-            Ok(_) => reached.ok[name] += 1,
+            Ok(_) => {
+                reached.ok.resize(NAMES.len(), 0);
+                reached.ok[name] += 1;
+            }
             Err(error) => reached.errors[*error as usize] += 1,
         }
         reached.outside += (space != Some(home)) as u32;
@@ -1502,13 +1642,9 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     for (name, &ok) in NAMES.iter().zip(&reached.ok) {
         assert_eq!(ok == 0, *name == "other", "{name}");
     }
+    // Every error code is returned.
     for (code, &count) in reached.errors.iter().enumerate().skip(1) {
-        // `budget` belongs to the scheduling calls, which are not modelled.
-        assert_eq!(
-            count == 0,
-            code == Error::Budget as usize,
-            "error code {code}"
-        );
+        assert!(count > 0, "error code {code}");
     }
     assert!(reached.several_threads as usize > STEPS);
 }
@@ -1541,19 +1677,19 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 4, cspace 10,051, aspace 46, frame 8,157,
-    // thread 84, sched 5, endpoint 55, reply 13, notify 917; a copy under
-    // `cap_delete` 66.
+    // Measured, in steps: untyped 941, cspace 10,550, aspace 32, frame
+    // 3,458, thread 895, sched 9, endpoint 25, reply 5,171, notify 429; a
+    // copy under `cap_delete` 309.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [2, 5000, 23, 4000, 42, 2, 27, 6, 450]);
-    at_least([reached.dying_copies], [33]);
+    at_least(dying, [470, 5000, 16, 1700, 440, 4, 12, 2500, 210]);
+    at_least([reached.dying_copies], [150]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 43,896 of 64,627 calls.
-    at_least([reached.outside], [32_000]);
+    // Measured: 37,761 of 56,497 calls.
+    at_least([reached.outside], [28_000]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -1564,8 +1700,8 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 51,647, reply objects armed 27,024,
-    // receivers 58,961, waiters on a notify 31,848, a notify bound 44,171.
+    // Measured, in steps: callers queued 56,747, reply objects armed 28,073,
+    // receivers 49,289, waiters on a notify 35,644, a notify bound 42,733.
     let waits = [
         reached.callers,
         reached.served,
@@ -1573,19 +1709,19 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [25_000, 13_000, 29_000, 15_000, 22_000]);
-    // Measured, each once: 46 messages with capabilities, 23 with the
-    // capabilities dropped, 22 notifications, 11 threads woken with `gone`.
+    at_least(waits, [28_000, 14_000, 24_000, 17_000, 21_000]);
+    // Measured, each once: 29 messages with capabilities, 19 with the
+    // capabilities dropped, 13 notifications, 13 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [23, 11, 11, 5]);
-    // Measured: 11 messages received with four capabilities, and 92 calls
+    at_least(ends, [14, 9, 6, 6]);
+    // Measured: 11 messages received with four capabilities, and 103 calls
     // by a thread whose capability space is destroyed.
-    at_least([reached.with_four, reached.destroyed], [5, 46]);
+    at_least([reached.with_four, reached.destroyed], [5, 51]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -1594,63 +1730,85 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 3,746 accepted and 72 refused, cspace 126 and 17;
-    // by `send` 11 delivered and 1 refused.
-    at_least(reached.moved, [1800, 63]);
-    at_least(reached.refused, [36, 8]);
-    at_least([reached.sent, reached.sent_refused], [5, 0]);
-    // The same moves listed by `call` and by `reply_recv`: 39 and 26.
-    at_least([reached.called, reached.answered], [19, 13]);
+    // Measured: untyped 3,428 accepted and 61 refused, cspace 127 and 12;
+    // by `send` 4 delivered and none refused (one in pass 10).
+    at_least(reached.moved, [1700, 63]);
+    at_least(reached.refused, [30, 6]);
+    at_least([reached.sent, reached.sent_refused], [2, 0]);
+    // The same moves listed by `call` and by `reply_recv`: 21 and 15.
+    at_least([reached.called, reached.answered], [10, 7]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 39 queued callers, 11 callers that wait for the reply, 63
-    // receivers, 31 waiters on a notify; 29 of the ends by a wait number.
-    at_least(reached.cancelled, [19, 5, 31, 15]);
-    at_least([reached.cancelled_by_number], [14]);
-    // Measured: `call` 38, `recv` 21, `reply_recv` 17 and `wait` 18 returned
+    // Measured: 46 queued callers, 11 callers that wait for the reply, 45
+    // receivers, 20 waiters on a notify; 22 of the ends by a wait number.
+    at_least(reached.cancelled, [23, 5, 22, 10]);
+    at_least([reached.cancelled_by_number], [11]);
+    // Measured: `call` 16, `recv` 8, `reply_recv` 8 and `wait` 5 returned
     // `cancelled` at once.
-    at_least(reached.cancelled_at_once, [19, 10, 8, 9]);
+    at_least(reached.cancelled_at_once, [8, 4, 4, 2]);
 }
 
 #[test]
 fn removal_steps_that_only_move_the_sweep_are_reached() {
     let reached = all_seeds();
-    // Measured: 45 `again` of a removal removed nothing.
-    at_least([reached.swept_only], [22]);
+    // Measured: 47 `again` of a removal removed nothing.
+    at_least([reached.swept_only], [23]);
 }
 
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 51 calls returned `unsupported` for a kind this version
+    // Measured: 42 calls returned `unsupported` for a kind this version
     // does not make.
-    at_least([reached.retype_unsupported], [25]);
+    at_least([reached.retype_unsupported], [21]);
 }
 
 #[test]
 fn faults_are_raised_delivered_and_waited_on() {
     let reached = all_seeds();
-    // Measured: 142 faults found no handler and 60 were delivered; a thread
-    // waited on a fault after 18,580 steps.
-    at_least(reached.faults, [71, 30]);
-    at_least([reached.faulting], [9000]);
+    // Measured: 158 faults found no handler and 61 were delivered; a thread
+    // waited on a fault after 40,408 steps.
+    at_least(reached.faults, [79, 30]);
+    at_least([reached.faulting], [20_000]);
+}
+
+#[test]
+fn scheduling_states_are_reached() {
+    let reached = all_seeds();
+    // Measured, in steps: a context throttled 91,922, lent 5,125, a timer
+    // armed 1,177, a thread marked as having lost its context 9,483, the
+    // core idle 9,372, running on slack 74,434, a fault no address space
+    // queued 16,590, a fault no context queued 9,052.
+    let states = [
+        reached.throttled,
+        reached.lent,
+        reached.armed,
+        reached.lost,
+        reached.idle,
+        reached.on_slack,
+        reached.no_aspace,
+        reached.no_context,
+    ];
+    at_least(states, [45_000, 2500, 580, 4700, 4600, 37_000, 8000, 4500]);
+    // Measured: the clock moved 4,865 times, and a timer fired in 30.
+    at_least([reached.advanced, reached.fired], [2400, 15]);
 }
 
 #[test]
 fn mappings_and_devices_are_reached_and_undone_by_removals() {
     let reached = all_seeds();
-    // Measured: a mapping held after 119,807 steps, a device attached after
-    // 30,745; 421 removals undid a mapping and 47 detached a device.
+    // Measured: a mapping held after 119,514 steps, a device attached after
+    // 27,100; 486 removals undid a mapping and 67 detached a device.
     let counts = [
         reached.mapped,
         reached.attached,
         reached.unmapped_by_removal,
         reached.detached_by_removal,
     ];
-    at_least(counts, [59_000, 15_000, 210, 23]);
+    at_least(counts, [59_000, 13_000, 240, 33]);
 }
 
 #[test]

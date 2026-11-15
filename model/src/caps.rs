@@ -3,7 +3,7 @@
 use crate::memory::DEVICE_IDS;
 use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
-    Place, Record, ReplyState, Slot, Sweep, Thread, Untyped, live,
+    Place, Record, ReplyState, Sched, Slot, Sweep, Thread, Untyped, live,
 };
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
@@ -488,6 +488,20 @@ impl Model {
             ObjectKind::Notify => {
                 self.notifies.insert(id, Notify::default());
             }
+            // Scheduling contexts: a new one is not configured, has no
+            // home, class 2, and the cores set of the kernel that holds it.
+            ObjectKind::Sched => {
+                let sched = Sched {
+                    class: 2,
+                    cores: (0, 1),
+                    ..Sched::default()
+                };
+                self.scheds.insert(id, sched);
+            }
+            // Timers: a new timer is idle.
+            ObjectKind::Timer => {
+                self.timers.insert(id, None);
+            }
             _ => {}
         }
         // The derivation tree: the capability that `untyped_retype` returns,
@@ -626,6 +640,9 @@ impl Model {
             self.longest_walk = self.longest_walk.max(walk);
             if let Some(object) = self.rooted(cap) {
                 live(&mut self.caps, cap).dying = true;
+                if self.scheds.get(&object).is_some_and(|sched| !sched.retired) {
+                    self.sched_dying(object);
+                }
                 if let Some(space) = self.cspaces.get_mut(&object) {
                     // The derivation tree: the sweep of a space starts at
                     // slot 1.
@@ -716,7 +733,8 @@ impl Model {
     /// first, and says whether there was one.
     fn undo(&mut self, object: ObjId, slots: &mut usize) -> Undone {
         let last = |list: &Vec<ObjId>| list.last().copied();
-        match self.objects[&object].kind {
+        let kind = self.objects[&object].kind;
+        match kind {
             // The threads bound to a `cspace`, an `aspace` or an endpoint (as
             // their fault endpoint) are unbound.
             ObjectKind::CSpace => match last(&self.cspaces[&object].threads) {
@@ -738,6 +756,10 @@ impl Model {
                 Some(thread) => self.bind_fault(thread, None),
                 None => return Undone::Nothing,
             },
+            // Destroying a context clears its lends from the top of the
+            // chain down; destroying a notify disarms its armed timers.
+            ObjectKind::Sched if self.clear_lend(object) => {}
+            ObjectKind::Notify if self.disarm_one(object) => {}
             // IOMMU: the destruction of an iospace first detaches each of its
             // devices, most recently attached first, then empties each record
             // of its list, most recently mapped first.
@@ -819,6 +841,7 @@ impl Model {
                 // destroyed. IPC: when a caller disappears the reply object
                 // becomes idle. Bindings: each of its bindings is undone.
                 self.unlink(id);
+                self.thread_unscheduled(id);
                 self.unbind_all(id);
                 self.threads.remove(&id);
             }
@@ -848,9 +871,14 @@ impl Model {
                     live(&mut self.notifies, notify).endpoint = None;
                 }
             }
+            // The budget follows the call: destroying a reply object takes
+            // its lend out of the chain, and marks its receiver.
             ObjectKind::Reply => {
+                self.release_lend(id, None);
                 self.replies.remove(&id);
             }
+            ObjectKind::Sched => self.sched_destroyed(id),
+            ObjectKind::Timer => self.timer_destroyed(id),
             ObjectKind::Notify => {
                 let notify = self.notifies.remove(&id).expect("names a live entry");
                 if let Some(endpoint) = notify.endpoint {

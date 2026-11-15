@@ -20,6 +20,7 @@ mod check;
 mod faults;
 mod ipc;
 mod memory;
+mod sched;
 mod threads;
 
 pub use boot::{Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, Segment};
@@ -186,6 +187,33 @@ pub enum Syscall {
         iospace: SlotAddr,
         device: u64,
     },
+    SchedConfigure {
+        sched: SlotAddr,
+        core: SlotAddr,
+        budget: u64,
+        period: u64,
+        class: u64,
+    },
+    SchedBind {
+        sched: SlotAddr,
+        thread: SlotAddr,
+    },
+    SchedUnbind(SlotAddr),
+    SchedSetCores {
+        sched: SlotAddr,
+        core: SlotAddr,
+        window: u64,
+        mask: u64,
+    },
+    SchedRead(SlotAddr),
+    Yield,
+    TimerSet {
+        timer: SlotAddr,
+        notify: SlotAddr,
+        deadline: u64,
+        tolerance: u64,
+    },
+    TimerCancel(SlotAddr),
     /// A call that this model does not make: it returns `Unsupported`. A
     /// call that has a variant above is refused here with a panic.
     Other(Call),
@@ -221,6 +249,15 @@ pub enum Output {
     Word(u64),
     /// `thread_read_regs`: the register block.
     Regs(Vec<u64>),
+    /// `sched_read`.
+    SchedRead {
+        consumed: u64,
+        remaining: i64,
+        deadline: u64,
+        state: u64,
+    },
+    /// `timer_set`, `timer_cancel`: 1 if the timer was armed, 0 otherwise.
+    WasArmed(u64),
     /// `send`: 0, or `Header::FLAG_CAPS_DROPPED`.
     Sent { flags: u32 },
     /// `recv`, `reply_recv`: a message or a notification. `call`: the reply.
@@ -400,6 +437,10 @@ struct Thread {
     /// Faults: the thread waits on a fault, as a caller of its fault
     /// endpoint; the words of the fault are kept with its message.
     faulting: bool,
+    /// Scheduling contexts: its own context, if it is that context's home.
+    home: Option<ObjId>,
+    /// The budget follows the call: marked as having lost its context.
+    lost: bool,
 }
 
 /// IPC: the states of a thread. `None` is ready.
@@ -472,6 +513,64 @@ struct Notify {
     word: u64,
     waiters: VecDeque<ObjId>,
     endpoint: Option<ObjId>,
+    /// Timers: the armed timers that signal it, the most recently armed
+    /// last.
+    timers: Vec<ObjId>,
+}
+
+/// Scheduling contexts: the parameters and the state of a `sched`.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sched {
+    configured: bool,
+    /// The budget and the period in force.
+    budget: u64,
+    period: u64,
+    /// Those `sched_configure` gave, used from the next replenishment.
+    pending: Option<(u64, u64)>,
+    class: u64,
+    /// The cores where the context may be placed: a window and a mask.
+    cores: (u64, u64),
+    /// Signed nanoseconds left in the current period.
+    remaining: i64,
+    deadline: u64,
+    /// While throttled: the replenishment instant, and the number of
+    /// budgets it brings.
+    throttled: Option<(u64, u64)>,
+    consumed: u64,
+    home: Option<ObjId>,
+    /// The budget follows the call: the reply objects that carry its lends,
+    /// in the order they were made; the last is the top.
+    chain: Vec<ObjId>,
+    /// What runs next: its place in a queue, by key and order of entry.
+    queue: Option<Queued>,
+    /// Destroying a context: its first step is done.
+    retired: bool,
+}
+
+/// What runs next: the queues of the scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Queue {
+    Ready,
+    /// One per class.
+    Slack(u64),
+    Sleeping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Queued {
+    queue: Queue,
+    key: u64,
+    entered: u64,
+}
+
+/// Timers: an armed timer, with its firing instant, its notify and the bits
+/// it sets, and its order of arming.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Armed {
+    instant: u64,
+    notify: ObjId,
+    bits: u64,
+    entered: u64,
 }
 
 /// The whole state of the kernel of one core.
@@ -500,6 +599,24 @@ pub struct Model {
     /// last, each by its `iommu` and its identifier.
     iospaces: BTreeMap<ObjId, Vec<(ObjId, u16)>>,
     iommus: BTreeMap<ObjId, Iommu>,
+    scheds: BTreeMap<ObjId, Sched>,
+    /// Timers: `None` while idle.
+    timers: BTreeMap<ObjId, Option<Armed>>,
+    /// The budget follows the call: the lends, by the reply object that
+    /// records each, with its context and its receiver.
+    lends: BTreeMap<ObjId, (ObjId, ObjId)>,
+    /// Clock: the instant of the clock, which only `Model::advance` moves,
+    /// and the instant of the previous event.
+    now: u64,
+    previous: u64,
+    /// What runs next: the context that runs, and whether from the ready
+    /// queue (not from a slack queue).
+    running: Option<(ObjId, bool)>,
+    /// Admission: the sum of the bandwidths of the configured contexts that
+    /// are not dying.
+    admitted: u64,
+    /// What runs next: the order of entry into the queues.
+    entered: u64,
     /// What the start-up state was built from.
     machine: Machine,
 }
@@ -509,9 +626,8 @@ pub struct Model {
 /// not make yet.
 fn other(call: Call) -> bool {
     use Call::{
-        CoreStart, CoreStatus, CoreStop, DebugWrite, IrqAck, IrqBind, IrqClaim, SchedBind,
-        SchedConfigure, SchedRead, SchedSetCores, SchedUnbind, TaskAttach, TaskExempt, TaskMark,
-        TaskRead, TaskRevoke, TimerCancel, TimerSet, TraceEmit, Yield,
+        CoreStart, CoreStatus, CoreStop, DebugWrite, IrqAck, IrqBind, IrqClaim, TaskAttach,
+        TaskExempt, TaskMark, TaskRead, TaskRevoke, TraceEmit,
     };
     matches!(
         call,
@@ -520,14 +636,6 @@ fn other(call: Call) -> bool {
             | CoreStatus
             | DebugWrite
             | TraceEmit
-            | Yield
-            | SchedConfigure
-            | SchedBind
-            | SchedUnbind
-            | SchedSetCores
-            | SchedRead
-            | TimerSet
-            | TimerCancel
             | IrqClaim
             | IrqBind
             | IrqAck
@@ -584,8 +692,19 @@ impl Model {
     }
 
     /// Applies one call made by `thread`, which must be able to run.
+    ///
+    /// The call is one event of the kernel (What runs next): the time since
+    /// the previous event is charged first, and the choice of what runs
+    /// next is made last.
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
+        let entry = self.begin();
+        let outcome = self.made(thread, call);
+        self.end(entry);
+        outcome
+    }
+
+    fn made(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         live(&mut self.threads, thread).outcome = None;
         let number = match call {
             Syscall::Call { wait, .. }
@@ -700,6 +819,40 @@ impl Model {
                 iospace,
                 device,
             } => self.iospace_attach(thread, iommu, iospace, device),
+            Syscall::SchedConfigure {
+                sched,
+                core,
+                budget,
+                period,
+                class,
+            } => {
+                let parameters = sched::Parameters {
+                    budget,
+                    period,
+                    class,
+                };
+                self.sched_configure(thread, sched, core, parameters)
+            }
+            Syscall::SchedBind {
+                sched,
+                thread: target,
+            } => self.sched_bind(thread, sched, target),
+            Syscall::SchedUnbind(sched) => self.sched_unbind(thread, sched),
+            Syscall::SchedSetCores {
+                sched,
+                core,
+                window,
+                mask,
+            } => self.sched_set_cores(thread, sched, core, (window, mask)),
+            Syscall::SchedRead(sched) => self.sched_read(thread, sched),
+            Syscall::Yield => self.yield_now(thread),
+            Syscall::TimerSet {
+                timer,
+                notify,
+                deadline,
+                tolerance,
+            } => self.timer_set(thread, timer, notify, (deadline, tolerance)),
+            Syscall::TimerCancel(timer) => self.timer_cancel(thread, timer),
             // The calls not yet made by this model, and those of the groups
             // not yet specified (cores, debugging), return `unsupported` as
             // soon as the capability space of the caller is found, before

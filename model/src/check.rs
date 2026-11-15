@@ -41,8 +41,20 @@ pub struct Census {
     pub mappings: usize,
     /// Devices attached to an iospace.
     pub devices: usize,
-    /// Threads that wait on a fault.
+    /// Threads that wait on a fault, and of these, by the kind of their
+    /// fault while it is queued.
     pub faulting: usize,
+    pub fault_kinds: [usize; 9],
+    /// Contexts throttled, lends, armed timers, threads marked as having
+    /// lost their context.
+    pub throttled: usize,
+    pub lends: usize,
+    pub armed: usize,
+    pub lost: usize,
+    /// Whether the core is idle, and whether the running context runs on
+    /// slack.
+    pub idle: bool,
+    pub on_slack: bool,
 }
 
 impl Model {
@@ -101,6 +113,25 @@ impl Model {
                 .count(),
             devices: self.iospaces.values().map(Vec::len).sum(),
             faulting: self.threads.values().filter(|t| t.faulting).count(),
+            fault_kinds: {
+                let mut kinds = [0; 9];
+                for thread in self.threads.values().filter(|t| t.faulting) {
+                    if let Wait::Call { parcel, .. } = &thread.wait {
+                        kinds[(parcel.label as usize).min(8)] += 1;
+                    }
+                }
+                kinds
+            },
+            throttled: self
+                .scheds
+                .values()
+                .filter(|s| s.throttled.is_some())
+                .count(),
+            lends: self.lends.len(),
+            armed: self.timers.values().flatten().count(),
+            lost: self.threads.values().filter(|t| t.lost).count(),
+            idle: self.running.is_none(),
+            on_slack: self.running.is_some_and(|(_, ready)| !ready),
         }
     }
 
@@ -167,7 +198,9 @@ impl Model {
     ///     to a thread if and only if that thread waits to receive with it,
     ///     armed with a thread if and only if that thread waits for a reply
     ///     through it;
-    /// 16. a thread that waits has no outcome yet;
+    /// 16. a thread that waits has no outcome yet, unless it waits on a
+    ///     fault that the kernel raised before it ran again (the outcome of
+    ///     its last call is in its registers);
     /// 30. the outcome of a wait is `gone`, `cancelled`, a word that is not
     ///     zero, or a message with as many words as its header states, or
     ///     with the register words only when it states more;
@@ -213,7 +246,8 @@ impl Model {
         self.check_waits()?;
         self.check_memory()?;
         self.check_spaces()?;
-        self.check_bindings()
+        self.check_bindings()?;
+        self.check_sched()
     }
 
     fn check_tree(&self) -> Check {
@@ -498,7 +532,7 @@ impl Model {
             };
             ensure(agrees, "15: reply object of a thread")?;
             let ready = thread.wait == Wait::None;
-            let waited = ready || thread.outcome.is_none();
+            let waited = ready || thread.outcome.is_none() || thread.faulting;
             ensure(waited, "16: outcome while waiting")?;
             let outcome = match &thread.outcome {
                 None | Some(Err(Error::Gone | Error::Cancelled)) => true,
@@ -639,5 +673,6 @@ impl Model {
 }
 
 mod memory;
+mod sched;
 #[cfg(test)]
 mod tests;

@@ -209,8 +209,11 @@ impl Model {
             self.answer(target, parcel)
         } else {
             // The reply object of the receiver becomes idle: no caller
-            // waits for an answer.
-            self.receiver(target).map(|(server, _, into)| {
+            // waits for an answer. Delivered only if the first receiver has
+            // an own context (D-110).
+            let own = |server: &ObjId| self.threads[server].home.is_some();
+            let receiver = self.receiver(target).filter(|(server, ..)| own(server));
+            receiver.map(|(server, _, into)| {
                 self.unlink(server);
                 let (delivery, flags) = self.deliver(parcel, server, into, 0);
                 self.wake(server, Ok(Output::Message(delivery)));
@@ -236,7 +239,7 @@ impl Model {
     /// Notifications: gives the word of a notify, if it is not zero, to the
     /// first thread that waits on the notify, or else to the first thread
     /// that waits to receive on the bound endpoint, and clears it.
-    fn hand_over(&mut self, id: ObjId) {
+    pub(crate) fn hand_over(&mut self, id: ObjId) {
         let notify = &self.notifies[&id];
         let (word, bound) = (notify.word, notify.endpoint);
         if word == 0 {
@@ -245,7 +248,10 @@ impl Model {
         if let Some(&waiter) = notify.waiters.front() {
             self.unlink(waiter);
             self.wake(waiter, Ok(Output::Word(word)));
-        } else if let Some((server, ..)) = bound.and_then(|bound| self.receiver(bound)) {
+        } else if let Some((server, ..)) = bound
+            .and_then(|bound| self.receiver(bound))
+            .filter(|(server, ..)| self.threads[server].home.is_some())
+        {
             // That thread's reply object becomes idle.
             self.unlink(server);
             self.wake(server, Ok(Output::Message(notification(word))));
@@ -354,7 +360,12 @@ impl Model {
     /// notification of the bound notify, the first caller in the queue,
     /// otherwise the thread waits with the reply object attached.
     fn receive(&mut self, thread: ObjId, endpoint: ObjId, reply: ObjId, window: Window) -> Outcome {
-        if let Some(notify) = self.endpoints[&endpoint].notify {
+        // In order: the lends of the thread and of the reply object are
+        // released; a pending notification only for a thread with an own
+        // context (D-110).
+        self.release_for_receive(thread, reply);
+        let own = self.threads[&thread].home.is_some();
+        if let Some(notify) = self.endpoints[&endpoint].notify.filter(|_| own) {
             let word = std::mem::take(&mut live(&mut self.notifies, notify).word);
             if word != 0 {
                 return Ok(Output::Message(notification(word)));
@@ -391,6 +402,9 @@ impl Model {
             window,
             flags,
         };
+        // The budget follows the call: the delivery lends the caller's
+        // context to a receiver that has none of its own (D-110).
+        self.lend(caller, reply, server);
         live(&mut self.threads, caller).wait = Wait::Reply(reply);
         delivery
     }
