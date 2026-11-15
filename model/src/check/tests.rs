@@ -1647,3 +1647,117 @@ fn fault_message_that_waits_is_accepted() {
     }
     assert_eq!(model.check(), Ok(()));
 }
+
+// The invariants of scheduling and time.
+
+/// The context of the first thread.
+fn first_context(m: &Model, at: At) -> ObjId {
+    m.threads[&at.ready].home.unwrap()
+}
+
+#[test]
+fn context_out_of_its_queue_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.scheds, context).queue = None;
+    });
+    assert_eq!(broken, "41: queue of a context");
+}
+
+#[test]
+fn context_in_the_queue_of_another_key_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        if let Some(queued) = &mut live(&mut m.scheds, context).queue {
+            queued.key += 1;
+        }
+    });
+    assert_eq!(broken, "41: queue of a context");
+}
+
+#[test]
+fn admitted_sum_that_is_not_the_sum_of_the_bandwidths_is_reported() {
+    let broken = spoiled(|m, _| m.admitted -= 1);
+    assert_eq!(broken, "42: admitted sum");
+}
+
+#[test]
+fn context_with_a_budget_below_10_microseconds_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.scheds, context).budget = 9_999;
+    });
+    assert_eq!(broken, "43: parameters and state of a context");
+}
+
+#[test]
+fn throttled_context_with_budget_left_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.scheds, context).throttled = Some((m.now + 1, 1));
+    });
+    // Throttled with its holder runnable: it belongs in a slack queue.
+    assert_eq!(broken, "41: queue of a context");
+}
+
+#[test]
+fn home_that_its_context_does_not_name_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.scheds, context).home = None;
+    });
+    assert_eq!(broken, "41: queue of a context");
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.threads, at.ready).home = None;
+        let _ = context;
+    });
+    assert_eq!(broken, "44: home of a context");
+}
+
+#[test]
+fn lend_whose_reply_object_is_not_in_its_chain_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        m.lends.insert(at.reply, (context, at.waiter));
+    });
+    assert_eq!(broken, "44: lend");
+}
+
+#[test]
+fn marked_thread_that_runs_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.ready).lost = true);
+    assert_eq!(broken, "45: thread that lost its context");
+}
+
+#[test]
+fn running_context_that_is_not_the_choice_is_reported() {
+    let broken = spoiled(|m, _| m.running = None);
+    assert_eq!(broken, "46: running context");
+}
+
+#[test]
+fn armed_timer_its_notify_does_not_list_is_reported() {
+    let broken = spoiled(|m, at| {
+        let boot = at.ready;
+        let own = SlotAddr::own;
+        let retype = Syscall::UntypedRetype {
+            untyped: own(UNTYPED),
+            kind: ObjectKind::Timer,
+            size: 0,
+            page: 0,
+            memory: 0,
+            destination: own(60),
+        };
+        m.apply(boot, retype).unwrap();
+        let set = Syscall::TimerSet {
+            timer: own(60),
+            notify: own(NT),
+            deadline: 1_000_000,
+            tolerance: 0,
+        };
+        m.apply(boot, set).unwrap();
+        live(&mut m.notifies, at.notify).timers.clear();
+    });
+    assert_eq!(broken, "47: armed timer");
+}
