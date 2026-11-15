@@ -12,12 +12,14 @@
 //! So the same code runs all three, and what differs is measured, not
 //! written twice. The cost model is in the README.
 
+mod srv;
+
 use crate::hist::Hist;
 use crate::platform;
-use crate::sync::{Guard, LockKind, MAX_CORES, Msg, Padded, Ring, busy};
+use crate::sync::{Guard, LockKind, MAX_CORES, Msg, Notify, Padded, Ring, Signalled, busy};
 use std::hint::black_box;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,6 +68,15 @@ pub struct Params {
     pub irq: Irq,
     /// Which lock a write takes in a group of several cores.
     pub locks: Locks,
+    /// How a signal applies its bits to the notification object.
+    pub signals: Signals,
+    /// Which lock an unmap takes in a group of several cores.
+    pub unmaps: Unmaps,
+    /// What the kernel does for a caller of a busy passive server (srv).
+    pub policy: Policy,
+    /// User time of the thread waiting on the notify after each wake-up
+    /// (a3n): it sets how often that thread is found waiting.
+    pub rx_ns: u64,
     pub warmup: Duration,
     pub dur: Duration,
 }
@@ -93,6 +104,40 @@ pub enum Locks {
     /// per slot range of a capability space for changes inside one group.
     /// Messages between groups, and every unmap, keep the group lock.
     Fine,
+}
+
+/// How a signal applies its bits (fourth series).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signals {
+    /// `W/2` and two lines under the notify's lock (or the group lock), or
+    /// on the notify's node when the message arrives.
+    Locked,
+    /// One atomic OR on the notify's word; the lock only when its thread
+    /// waits (`sync::Notify`). Candidate 1 applies the message with that OR.
+    Atomic,
+}
+
+/// The lock of an unmap in a group (fourth series).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unmaps {
+    Group,
+    /// The lock of the one range of the address space (of 8) it changes.
+    /// Legal only under the conditions in the README.
+    Range,
+}
+
+/// What the kernel does when a passive server is busy (workload srv).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Policy {
+    /// Nothing: callers queue in order.
+    Fifo,
+    /// A queued caller of a higher class lends its context (budget and
+    /// class) to the thread serving a lower one, which finishes on it and
+    /// serves the lender next.
+    Lend,
+    /// A call whose remaining budget is below the endpoint's longest
+    /// request is refused at once.
+    Refuse,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -128,6 +173,16 @@ pub enum Workload {
     /// d: groups A and B, and one core that moves between them `rate` times
     /// per second (candidate 3 only).
     Move { rate: u64 },
+    /// srv: a passive server of `threads` threads on cores `0..threads`, a
+    /// foreground client on the next core, a background one after it.
+    Server { threads: usize, bg: Bg },
+}
+
+/// Whether the background client of srv runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bg {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,6 +203,9 @@ enum Role {
     User,
     Mobile(u64),
     Grouped,
+    SrvThread,
+    Fg,
+    Bg,
 }
 
 /// Latency classes. Their meaning depends on the workload (README).
@@ -178,6 +236,13 @@ const APPLY: u64 = 2;
 const ACK: u64 = 3;
 const EVENT: u64 = 4;
 const SIGNAL: u64 = 5;
+/// srv: a call to the endpoint, a request handed to a server thread, a
+/// context lent to one, a server thread free again, a reply.
+const CALL: u64 = 6;
+const DISPATCH: u64 = 7;
+const LEND: u64 = 8;
+const FREE: u64 = 9;
+const REPLY: u64 = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Change {
@@ -224,6 +289,8 @@ struct Node {
     /// Lock and sequence counter of each slot range of each process region.
     stripe_locks: Box<[crate::sync::Lock]>,
     stripe_seqs: Box<[Padded<AtomicU64>]>,
+    /// Lock of each range of each process's address space (`Unmaps::Range`).
+    as_locks: Box<[crate::sync::Lock]>,
     state: Box<[Padded<AtomicU64>]>,
     /// Sequence counter of each process region (capability space).
     seqs: Box<[Padded<AtomicU64>]>,
@@ -246,6 +313,17 @@ struct Machine {
     /// The endpoint or notification object each core owns, with its lock.
     obj_locks: Box<[crate::sync::Lock]>,
     obj_state: Box<[Padded<AtomicU64>]>,
+    /// The notify each core owns, for `Signals::Atomic`.
+    notifies: Box<[Notify]>,
+    /// srv: server threads, the endpoint (owned by core 0, so its lock is
+    /// `obj_locks[0]`; the mutex inside only checks that lock), and per core
+    /// the request handed to it, the context lent to it, the reply to it.
+    threads: usize,
+    ep: Padded<Mutex<srv::Ep>>,
+    disp: Box<[Padded<AtomicU64>]>,
+    lent: Box<[Padded<AtomicU64>]>,
+    reply: Box<[Padded<AtomicU64>]>,
+    t0: Instant,
     mbox_tlb: Box<[Padded<AtomicU64>]>,
     mbox_ev: Box<[Padded<AtomicU64>]>,
     waits: Box<[Padded<AtomicU64>]>,
@@ -329,6 +407,10 @@ fn roles(w: Workload, k: usize, n: usize) -> Vec<Role> {
             Workload::Unmap(Initiators::One) => Role::User,
             Workload::Move { rate } if c == n - 1 => Role::Mobile(rate),
             Workload::Move { .. } => Role::Grouped,
+            Workload::Server { threads, .. } if c < threads => Role::SrvThread,
+            Workload::Server { threads, .. } if c == threads => Role::Fg,
+            Workload::Server { bg: Bg::On, .. } => Role::Bg,
+            Workload::Server { bg: Bg::Off, .. } => Role::User,
         })
         .collect()
 }
@@ -342,6 +424,14 @@ impl Machine {
                 "IPC needs an even number of cores"
             );
         }
+        let threads = match w {
+            Workload::Server { threads, .. } => threads,
+            _ => 0,
+        };
+        assert!(
+            threads == 0 || (k == threads && n == threads + 2),
+            "srv layout"
+        );
         let (node_of, locked, proc_of) = layout(w, cand, k, n);
         let nprocs = proc_of.iter().max().map_or(0, |m| m + 1);
         let mut proc_nodes = vec![Vec::new(); nprocs];
@@ -365,6 +455,9 @@ impl Machine {
                 stripe_seqs: (0..PROC_REGIONS * STRIPES)
                     .map(|_| Padded::default())
                     .collect(),
+                as_locks: (0..PROC_REGIONS * STRIPES)
+                    .map(|_| crate::sync::Lock::new(if l { p.lock } else { LockKind::None }))
+                    .collect(),
                 state: (0..PROC_LINES * PROC_REGIONS)
                     .map(|_| Padded::default())
                     .collect(),
@@ -378,19 +471,27 @@ impl Machine {
             })
             .collect();
         let pad = |_| Padded::default();
+        let obj_kind = |c: usize| {
+            if locked[node_of[c]] {
+                p.lock
+            } else {
+                LockKind::None
+            }
+        };
         let obj_locks = (0..n)
-            .map(|c| {
-                crate::sync::Lock::new(if locked[node_of[c]] {
-                    p.lock
-                } else {
-                    LockKind::None
-                })
-            })
+            .map(|c| crate::sync::Lock::new(obj_kind(c)))
             .collect();
         Machine {
             nodes,
             obj_locks,
             obj_state: (0..n * OBJ_LINES).map(pad).collect(),
+            notifies: (0..n).map(|c| Notify::new(obj_kind(c))).collect(),
+            threads,
+            ep: Padded(Mutex::new(srv::Ep::new(threads))),
+            disp: (0..n).map(pad).collect(),
+            lent: (0..n).map(pad).collect(),
+            reply: (0..n).map(pad).collect(),
+            t0: Instant::now(),
             node_of: node_of.into_iter().map(AtomicUsize::new).collect(),
             proc_of,
             proc_nodes,
@@ -561,7 +662,12 @@ impl<'m> Core<'m> {
     fn timed(&mut self, class: usize, op: impl FnOnce(&mut Self)) {
         let t = Instant::now();
         op(self);
-        let ns = t.elapsed().as_nanos() as u64;
+        self.record(class, t);
+    }
+
+    /// Records an operation that began at `since`, in `class`.
+    fn record(&mut self, class: usize, since: Instant) {
+        let ns = since.elapsed().as_nanos() as u64;
         if self.m.phase.load(Ordering::Relaxed) == MEASURE {
             self.out.hist[class].record(ns);
             self.out.ops[class] += 1;
@@ -592,12 +698,25 @@ impl<'m> Core<'m> {
     /// Handles what has reached this core: messages on its node's rings and
     /// invalidation requests. Returns whether anything was found (and, in
     /// interruptible mode, an interrupt charged).
+    ///
+    /// The doorbell is taken before the interrupt is charged, so that one
+    /// message to a group interrupts one of its cores. Until the fourth
+    /// series it was charged first, and every core of a group that saw the
+    /// doorbell during that charge paid an interrupt for the same message
+    /// (README, "Fourth series").
     fn poll(&mut self, mode: Mode) -> bool {
         let m = self.m;
         let node = &m.nodes[self.node];
-        let bell = node.doorbell.load(Ordering::Relaxed) != 0;
-        let tlb = m.mbox_tlb[self.id].load(Ordering::Relaxed) != 0;
-        if !bell && !tlb {
+        let take = |w: &AtomicU64| {
+            if w.load(Ordering::Relaxed) == 0 {
+                0
+            } else {
+                w.swap(0, Ordering::Acquire)
+            }
+        };
+        let bells = take(&node.doorbell);
+        let tlbs = take(&m.mbox_tlb[self.id]);
+        if bells == 0 && tlbs == 0 {
             return false;
         }
         let charged = mode == Mode::Interruptible;
@@ -605,28 +724,24 @@ impl<'m> Core<'m> {
         if charged && !per_message {
             busy(m.p.ipi_ns);
         }
-        if bell {
-            for from in bits(node.doorbell.swap(0, Ordering::Acquire)) {
-                let ring = &node.inbox[from];
-                while ring.ready() {
-                    let _g = self.lock();
-                    // Another core of the node may have taken it.
-                    let Some(msg) = ring.pop() else { break };
-                    if per_message {
-                        busy(m.p.ipi_ns);
-                    }
-                    self.handle(msg);
-                }
-            }
-        }
-        if tlb {
-            for origin in bits(m.mbox_tlb[self.id].swap(0, Ordering::Acquire)) {
+        for from in bits(bells) {
+            let ring = &node.inbox[from];
+            while ring.ready() {
+                let _g = self.lock();
+                // Another core of the node may have taken it.
+                let Some(msg) = ring.pop() else { break };
                 if per_message {
                     busy(m.p.ipi_ns);
                 }
-                busy(m.p.tlb_ns);
-                self.ack(origin, Held::No);
+                self.handle(msg);
             }
+        }
+        for origin in bits(tlbs) {
+            if per_message {
+                busy(m.p.ipi_ns);
+            }
+            busy(m.p.tlb_ns);
+            self.ack(origin, Held::No);
         }
         true
     }
@@ -647,6 +762,12 @@ impl<'m> Core<'m> {
             EVENT => {
                 m.mbox_ev[a].fetch_or(1 << b, Ordering::Release);
             }
+            SIGNAL if m.p.signals == Signals::Atomic => {
+                // Node lock, then the notify's lock if its thread waits.
+                if m.notifies[a].signal(1 << (b % 63)) == Signalled::Wake {
+                    m.mbox_ev[a].fetch_or(1 << b, Ordering::Release);
+                }
+            }
             SIGNAL => {
                 // Node lock, then object lock: the only place both are held
                 // in that order; a sender holding an object lock never
@@ -655,6 +776,7 @@ impl<'m> Core<'m> {
                 self.obj_work(a, LINES / 2, m.p.work_ns / 2);
                 m.mbox_ev[a].fetch_or(1 << b, Ordering::Release);
             }
+            CALL..=REPLY => self.srv_handle(msg),
             _ => unreachable!("message kind {}", msg.kind),
         }
     }
@@ -757,8 +879,12 @@ impl<'m> Core<'m> {
             Change::Unmap => m.proc_cores[pr].len(),
         };
         self.out.changes[pr] += 1;
+        let one_group = m.nodes[self.node].locked && m.proc_nodes[pr].len() == 1;
         if self.fine() && change != Change::Unmap && m.proc_nodes[pr].len() == 1 {
             return self.fine_change(pr);
+        }
+        if change == Change::Unmap && m.p.unmaps == Unmaps::Range && one_group {
+            return self.range_unmap(pr);
         }
         m.waits[self.id].store(expected as u64, Ordering::Relaxed);
         let home = m.proc_home[pr];
@@ -788,6 +914,33 @@ impl<'m> Core<'m> {
         let _gb = (b != a).then(|| locks[region * STRIPES + b].lock());
         self.write_stripes(pr, (a, b), m.p.work_ns);
         m.nodes[self.node].applied[pr].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An unmap inside one group with a lock per range of the address space:
+    /// the lock of the one range it changes, no group lock; the invalidation
+    /// is posted under it, and acknowledged after it is released, as with
+    /// the group lock. Legal only for an unmap inside one range that frees
+    /// no page-table page (README, "Fourth series"). Workload b changes no
+    /// capability, so sharing the range's state lines with `fine_change`
+    /// loses no update.
+    fn range_unmap(&mut self, pr: usize) {
+        let m = self.m;
+        let node = &m.nodes[self.node];
+        m.waits[self.id].store(m.proc_cores[pr].len() as u64, Ordering::Relaxed);
+        {
+            let range = self.rand() as usize % STRIPES;
+            let region = pr % PROC_REGIONS;
+            let _g = node.as_locks[region * STRIPES + range].lock();
+            for j in 0..LINES {
+                let l = &node.state[region * PROC_LINES + range * 2 + j % 2];
+                l.store(l.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            }
+            self.out.touches += LINES as u64;
+            busy(m.p.work_ns);
+            node.applied[pr].fetch_add(1, Ordering::Relaxed);
+            self.apply_tail(self.id, Change::Unmap);
+        }
+        self.wait_acks();
     }
 
     fn wait_acks(&mut self) {
@@ -985,8 +1138,15 @@ impl<'m> Core<'m> {
     /// on the notify's node (message).
     fn producer(&mut self, waiter: usize) {
         let m = self.m;
+        let atomic = m.p.signals == Signals::Atomic
+            && m.nodes[self.node].locked
+            && m.node_of(waiter) == self.node;
         while self.running() {
             self.user(m.p.gap_ns);
+            if atomic {
+                self.atomic_signal(waiter);
+                continue;
+            }
             self.timed(0, |c| {
                 if c.fine() {
                     // The check is a lookup: lock-free. Only the apply takes
@@ -1012,9 +1172,57 @@ impl<'m> Core<'m> {
         }
     }
 
+    /// A signal inside a group with `Signals::Atomic`: the lock-free check,
+    /// then one OR. Class 0 if that was all (no lock), class 1 if the
+    /// notify's thread was waiting, so the lock was taken.
+    fn atomic_signal(&mut self, waiter: usize) {
+        let m = self.m;
+        let t = Instant::now();
+        self.slot_read();
+        busy(m.p.work_ns / 2);
+        let class = match m.notifies[waiter].signal(1 << (self.id % 63)) {
+            Signalled::Fast => 0,
+            Signalled::Wake => {
+                self.deliver(waiter, EVENT, Held::No);
+                1
+            }
+            Signalled::Slow => 1,
+        };
+        self.record(class, t);
+    }
+
     fn waiter(&mut self) {
+        let m = self.m;
+        if m.p.signals == Signals::Atomic {
+            return self.atomic_waiter();
+        }
         while self.wait_event(|c| !c.running()) != 0 {
             self.half_obj(self.id);
+            if m.p.rx_ns > 0 {
+                self.user(m.p.rx_ns);
+            }
+        }
+    }
+
+    /// Takes the bits without a lock when there are some; otherwise
+    /// registers under the notify's lock and sleeps until woken. Its half of
+    /// the operation (`W/2`) runs on state it owns, with no lock.
+    fn atomic_waiter(&mut self) {
+        let m = self.m;
+        let notify = &m.notifies[self.id];
+        while self.running() {
+            if notify.take_or_wait() == 0 {
+                if self.wait_event(|c| !c.running()) == 0 {
+                    break;
+                }
+                if notify.take() == 0 {
+                    continue; // a wake-up with no bit: see `sync::Notify`
+                }
+            }
+            busy(m.p.work_ns / 2);
+            if m.p.rx_ns > 0 {
+                self.user(m.p.rx_ns);
+            }
         }
     }
 
@@ -1104,6 +1312,9 @@ impl<'m> Core<'m> {
                 }
             }
             Role::Mobile(rate) => self.mobile(rate),
+            Role::SrvThread => self.srv_thread(),
+            Role::Fg => self.srv_fg(),
+            Role::Bg => self.srv_bg(),
             Role::Grouped => {
                 while self.running() {
                     self.user(m.p.gap_ns);
@@ -1212,11 +1423,16 @@ fn check(m: &Machine, outs: &[CoreOut]) {
             assert_eq!(applied, issued, "process {pr}: node {n} missed a change");
         }
     }
+    let ep = m.ep.lock().expect("endpoint");
+    ep.check_idle();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Adds, Cand, Initiators, Irq, Locks, Lookup, Params, Workload, run};
+    use super::{
+        Adds, Bg, Cand, Initiators, Irq, Locks, Lookup, Params, Policy, Signals, Unmaps, Workload,
+        run,
+    };
     use crate::sync::LockKind;
     use std::time::Duration;
 
@@ -1234,6 +1450,10 @@ mod tests {
             replica_pct: 25,
             irq: Irq::PerMessage,
             locks: Locks::Fine,
+            signals: Signals::Atomic,
+            unmaps: Unmaps::Range,
+            policy: Policy::Lend,
+            rx_ns: 300,
             warmup: Duration::from_millis(1),
             dur: Duration::from_millis(5),
         }
@@ -1247,6 +1467,10 @@ mod tests {
             replica_pct: 100,
             irq: Irq::PerBatch,
             locks: Locks::Group,
+            signals: Signals::Locked,
+            unmaps: Unmaps::Group,
+            policy: Policy::Fifo,
+            rx_ns: 0,
             ..params(lock)
         }
     }
@@ -1256,6 +1480,9 @@ mod tests {
         Params {
             lookup: Lookup::Seqlock,
             locks: Locks::Group,
+            signals: Signals::Locked,
+            unmaps: Unmaps::Group,
+            policy: Policy::Refuse,
             ..params(lock)
         }
     }
@@ -1292,6 +1519,54 @@ mod tests {
         let mv = Workload::Move { rate: 2000 };
         let r = run(mv, Cand::Sized, 2, 4, params(LockKind::Ttas), &[]);
         assert!(r.ops[1] > 0, "moves measured");
+        // The server, every candidate and layout, every policy; the run's
+        // self-check also finds the endpoint idle at the end.
+        for policy in [Policy::Fifo, Policy::Lend, Policy::Refuse] {
+            for threads in [1, 2] {
+                for cand in [Cand::PerCore, Cand::Sized, Cand::Fixed(4)] {
+                    let p = Params {
+                        policy,
+                        dur: Duration::from_millis(20),
+                        ..params(LockKind::Queue)
+                    };
+                    let w = Workload::Server {
+                        threads,
+                        bg: Bg::On,
+                    };
+                    let r = run(w, cand, threads, threads + 2, p, &[]);
+                    assert!(
+                        r.ops[0] > 0 && r.ops[1] > 0,
+                        "{policy:?} {threads} {cand:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One server thread, held by the background client: when its budget
+    /// runs out mid-request the foreground caller waits for its next period
+    /// too, unless the kernel lends the caller's context or refuses calls
+    /// that cannot finish. The p90 is several times lower with either.
+    #[test]
+    fn lending_and_refusal_shorten_the_foreground_wait() {
+        let p90 = |policy| {
+            let p = Params {
+                policy,
+                ipi_ns: 0,
+                dur: Duration::from_millis(100),
+                ..params(LockKind::Queue)
+            };
+            let w = Workload::Server {
+                threads: 1,
+                bg: Bg::On,
+            };
+            run(w, Cand::PerCore, 1, 3, p, &[]).hist[0].quantile(0.9)
+        };
+        let fifo = p90(Policy::Fifo);
+        for policy in [Policy::Lend, Policy::Refuse] {
+            let other = p90(policy);
+            assert!(2 * other < fifo, "{policy:?} {other} fifo {fifo}");
+        }
     }
 
     /// A lazy derive returns before the other copies have applied it; an

@@ -2,7 +2,7 @@
 //! at the same time? See README.md for the method.
 //!
 //! Usage: dodos-trial-multicore
-//!        [--suites locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf,a1t,a2t,a3t,ct]
+//!        [--suites locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf,a1t,a2t,a3t,ct,a3n,br,srv]
 //!        [--reps N]
 //!        [--ms N] [--max-k N] [--lock ttas|ticket|queue] [--csv FILE]
 
@@ -11,7 +11,11 @@ mod platform;
 mod sim;
 mod sync;
 
-use sim::{Adds, CLASSES, Cand, Initiators, Irq, Locks, Lookup, Params, RunOut, Workload};
+use hist::Hist;
+use sim::{
+    Adds, Bg, CLASSES, Cand, Initiators, Irq, Locks, Lookup, Params, Policy, RunOut, Signals,
+    Unmaps, Workload,
+};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -39,7 +43,7 @@ fn opts(cores: usize) -> Opts {
     let mut o = Opts {
         suites: [
             "locks", "a1", "a2", "a3", "b", "c", "d", "a1f", "a2f", "a3f", "bf", "cf", "a1t",
-            "a2t", "a3t", "ct",
+            "a2t", "a3t", "ct", "a3n", "br", "srv",
         ]
         .map(String::from)
         .to_vec(),
@@ -68,7 +72,7 @@ fn opts(cores: usize) -> Opts {
                     (0..CLASSES).map(|c| format!("c{c}_n,c{c}_p50,c{c}_p99,c{c}_p999,c{c}_max"));
                 let head = "suite,rep,labels,column,workload,k,n,lock,work_ns,gap_ns,ipi_ns,change_pct,migrations,stalls,ops_per_s";
                 let classes: Vec<String> = classes.collect();
-                let tail = "samples,preferred,lookup,adds,replica_pct,irq,retries,locks";
+                let tail = "samples,preferred,lookup,adds,replica_pct,irq,retries,locks,signals,unmaps,policy,rx_ns";
                 writeln!(f, "{head},{},{tail}", classes.join(",")).expect("CSV write");
                 o.csv = Some(f);
             }
@@ -103,6 +107,9 @@ struct Variant {
     replica_pct: u64,
     irq: Irq,
     locks: Locks,
+    signals: Signals,
+    unmaps: Unmaps,
+    policy: Policy,
 }
 
 /// The settings of the first measurement.
@@ -112,6 +119,9 @@ const FIRST: Variant = Variant {
     replica_pct: 100,
     irq: Irq::PerBatch,
     locks: Locks::Group,
+    signals: Signals::Locked,
+    unmaps: Unmaps::Group,
+    policy: Policy::Fifo,
 };
 
 /// Each unfairness of the first measurement removed.
@@ -121,6 +131,7 @@ const FAIR: Variant = Variant {
     replica_pct: 25,
     irq: Irq::PerBatch,
     locks: Locks::Group,
+    ..FIRST
 };
 
 /// The third series: fine locks in a group, and a lock-free read of one
@@ -144,10 +155,12 @@ fn col(name: &str, cand: Cand, lock: LockKind, v: Variant) -> Col {
 enum Metric {
     /// Operations per second over the classes of the mask.
     Rate(u8),
-    /// p50 / p99 / p99.9 of one class, in microseconds.
-    Lat(usize),
+    /// p50 / p99 / p99.9 of the classes of the mask together, in µs.
+    Lat(u8),
     /// Fewest operations of a worker over most.
     Fair,
+    /// Operations of the first mask's classes over the second's, in %.
+    Share(u8, u8),
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -163,16 +176,28 @@ fn si(x: f64) -> String {
     }
 }
 
-fn rate(r: &RunOut, mask: u8) -> f64 {
+fn ops(r: &RunOut, mask: u8) -> u64 {
     (0..CLASSES)
         .filter(|c| mask & (1 << c) != 0)
         .map(|c| r.ops[c])
-        .sum::<u64>() as f64
-        / r.secs
+        .sum()
 }
 
-fn quantiles(r: &RunOut, class: usize) -> [f64; 3] {
-    [0.5, 0.99, 0.999].map(|q| r.hist[class].quantile(q) as f64 / 1000.0)
+fn rate(r: &RunOut, mask: u8) -> f64 {
+    ops(r, mask) as f64 / r.secs
+}
+
+/// The histogram of the classes of the mask together.
+fn merged(r: &RunOut, mask: u8) -> Hist {
+    let mut h = Hist::default();
+    for c in (0..CLASSES).filter(|c| mask & (1 << c) != 0) {
+        h.merge(&r.hist[c]);
+    }
+    h
+}
+
+fn quantiles(h: &Hist) -> [f64; 3] {
+    [0.5, 0.99, 0.999].map(|q| h.quantile(q) as f64 / 1000.0)
 }
 
 fn cell(runs: &[RunOut], m: Metric) -> String {
@@ -185,11 +210,11 @@ fn cell(runs: &[RunOut], m: Metric) -> String {
             );
             format!("{} ({}–{})", si(median(v.clone())), si(lo), si(hi))
         }
-        Metric::Lat(class) => {
-            if runs.iter().all(|r| r.hist[class].n == 0) {
+        Metric::Lat(mask) => {
+            if runs.iter().all(|r| ops(r, mask) == 0) {
                 return "–".into();
             }
-            let q: Vec<[f64; 3]> = runs.iter().map(|r| quantiles(r, class)).collect();
+            let q: Vec<[f64; 3]> = runs.iter().map(|r| quantiles(&merged(r, mask))).collect();
             let med = |i: usize| median(q.iter().map(|x| x[i]).collect());
             let lo = q.iter().map(|x| x[2]).fold(f64::MAX, f64::min);
             let hi = q.iter().map(|x| x[2]).fold(0.0, f64::max);
@@ -210,6 +235,13 @@ fn cell(runs: &[RunOut], m: Metric) -> String {
                 })
                 .collect();
             format!("{:.2}", median(v))
+        }
+        Metric::Share(num, den) => {
+            let v = runs
+                .iter()
+                .map(|r| 100.0 * ops(r, num) as f64 / ops(r, den).max(1) as f64)
+                .collect();
+            format!("{:.1}%", median(v))
         }
     }
 }
@@ -256,8 +288,19 @@ impl Bench {
         let v = col.v;
         let _ = writeln!(
             f,
-            "{line},{},{},{:?},{:?},{},{:?},{},{:?}",
-            r.samples, r.preferred, v.lookup, v.adds, v.replica_pct, v.irq, r.retries, v.locks
+            "{line},{},{},{:?},{:?},{},{:?},{},{:?},{:?},{:?},{:?},{}",
+            r.samples,
+            r.preferred,
+            v.lookup,
+            v.adds,
+            v.replica_pct,
+            v.irq,
+            r.retries,
+            v.locks,
+            v.signals,
+            v.unmaps,
+            v.policy,
+            row.p.rx_ns
         );
     }
 
@@ -291,6 +334,9 @@ impl Bench {
                         replica_pct: col.v.replica_pct,
                         irq: col.v.irq,
                         locks: col.v.locks,
+                        signals: col.v.signals,
+                        unmaps: col.v.unmaps,
+                        policy: col.v.policy,
                         ..row.p
                     };
                     let r = sim::run(row.w, col.cand, row.k, row.n, p, &self.cpus);
@@ -385,6 +431,10 @@ fn base(o: &Opts) -> Params {
         replica_pct: FIRST.replica_pct,
         irq: FIRST.irq,
         locks: FIRST.locks,
+        signals: FIRST.signals,
+        unmaps: FIRST.unmaps,
+        policy: FIRST.policy,
+        rx_ns: 0,
         warmup: Duration::from_millis(20),
         dur: o.dur,
     }
@@ -404,7 +454,7 @@ fn run_suite(b: &mut Bench, name: &str) {
         .collect();
     let even: Vec<usize> = ks.iter().copied().filter(|k| k % 2 == 0).collect();
     let p0 = base(&b.o);
-    let lat = |c| Metric::Lat(c);
+    let lat = |c: usize| Metric::Lat(1 << c);
     let l = b.o.lock;
     match name {
         "locks" => {
@@ -1014,6 +1064,151 @@ fn run_suite(b: &mut Bench, name: &str) {
                 cols,
                 &m,
             );
+        }
+        "a3n" => {
+            // How often the notify's thread is found waiting: as in a3t;
+            // busy (20 µs of its own work per wake-up, so signals pile up);
+            // idle (producers 20 µs apart, so it nearly always waits).
+            let regimes = [
+                ("as a3t", 1000, 0),
+                ("busy", 1000, 20_000),
+                ("idle", 20_000, 0),
+            ];
+            let mut rows = Vec::new();
+            for (regime, gap, rx) in regimes {
+                for ipi in IPIS {
+                    for work in WORKS {
+                        for &k in &even {
+                            let p = Params {
+                                work_ns: work,
+                                ipi_ns: ipi,
+                                gap_ns: gap,
+                                rx_ns: rx,
+                                ..p0
+                            };
+                            let l = vec![
+                                regime.into(),
+                                ipi.to_string(),
+                                work.to_string(),
+                                k.to_string(),
+                            ];
+                            rows.push(row(l, Workload::Signal, k, k, p));
+                        }
+                    }
+                }
+            }
+            let atomic = |v: Variant| Variant {
+                signals: Signals::Atomic,
+                ..v
+            };
+            let cols = vec![
+                col("1 locked apply", Cand::PerCore, l, FAIR),
+                col("1 OR apply", Cand::PerCore, l, atomic(FAIR)),
+                col("3 notify lock", Cand::Sized, l, FINE),
+                col("3 atomic", Cand::Sized, l, atomic(FINE)),
+            ];
+            let m = [
+                (
+                    "Throughput, signals/s, median (min–max)",
+                    Metric::Rate(0b11),
+                ),
+                (
+                    "Signal call latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    Metric::Lat(0b11),
+                ),
+                (
+                    "Signals that found the thread waiting (took the lock), % of signals",
+                    Metric::Share(0b10, 0b11),
+                ),
+            ];
+            let heads = ["regime", "ipi ns", "W ns", "k"];
+            let title = "a3n: k-1 threads signal one notify, notify by one atomic OR";
+            b.suite(title, &heads, rows, cols, &m);
+        }
+        "br" => {
+            let mut rows = Vec::new();
+            for (who, init) in [("one", Initiators::One), ("all", Initiators::All)] {
+                for ipi in IPIS {
+                    for work in WORKS {
+                        for &k in ks.iter().filter(|&&k| k >= 2) {
+                            let p = Params {
+                                work_ns: work,
+                                ipi_ns: ipi,
+                                ..p0
+                            };
+                            let l =
+                                vec![who.into(), ipi.to_string(), work.to_string(), k.to_string()];
+                            rows.push(row(l, Workload::Unmap(init), k, k, p));
+                        }
+                    }
+                }
+            }
+            let range = Variant {
+                unmaps: Unmaps::Range,
+                ..FINE
+            };
+            let cols = vec![
+                col("1 fair", Cand::PerCore, l, FAIR),
+                col("3 group lock", Cand::Sized, l, FINE),
+                col("3 range locks", Cand::Sized, l, range),
+            ];
+            let m = [
+                ("Throughput, unmaps/s, median (min–max)", Metric::Rate(0b1)),
+                (
+                    "Unmap latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(0),
+                ),
+            ];
+            let heads = ["initiators", "ipi ns", "W ns", "k"];
+            b.suite(
+                "br: unmap, lock per address-space range",
+                &heads,
+                rows,
+                cols,
+                &m,
+            );
+        }
+        "srv" => {
+            let mut rows = Vec::new();
+            for threads in [1, 2] {
+                for (bg, on) in [("on", Bg::On), ("off", Bg::Off)] {
+                    for ipi in IPIS {
+                        let p = Params { ipi_ns: ipi, ..p0 };
+                        let l = vec![threads.to_string(), bg.into(), ipi.to_string()];
+                        let w = Workload::Server { threads, bg: on };
+                        rows.push(row(l, w, threads, threads + 2, p));
+                    }
+                }
+            }
+            let mut cols = Vec::new();
+            for (name, policy) in [
+                ("fifo", Policy::Fifo),
+                ("lend", Policy::Lend),
+                ("refuse", Policy::Refuse),
+            ] {
+                let fair = Variant { policy, ..FAIR };
+                let fine = Variant { policy, ..FINE };
+                cols.push(col(&format!("1 {name}"), Cand::PerCore, l, fair));
+                cols.push(col(&format!("3 {name}"), Cand::Sized, l, fine));
+                // A group of 4 covers the 3 or 4 cores: clients and server
+                // share one kernel state.
+                cols.push(col(&format!("3 all {name}"), Cand::Fixed(4), l, fine));
+            }
+            let m = [
+                (
+                    "Foreground call latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(0),
+                ),
+                ("Background calls served/s", Metric::Rate(0b10)),
+                ("Calls refused/s", Metric::Rate(0b100)),
+            ];
+            // Foreground calls are about 4000 per second: runs 4 times
+            // longer give the p99.9 a few samples beyond it.
+            let dur = b.o.dur;
+            b.o.dur = dur * 4;
+            let title = "srv: a passive server shared by a background and a foreground client";
+            b.suite(title, &["threads", "background", "ipi ns"], rows, cols, &m);
+            b.o.dur = dur;
         }
         other => panic!("unknown suite {other}"),
     }

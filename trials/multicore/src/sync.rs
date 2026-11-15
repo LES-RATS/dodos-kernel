@@ -160,6 +160,96 @@ impl Lock {
     }
 }
 
+/// The bit of a notification word that says its thread waits (or is
+/// registering to wait); the other 63 bits are signals.
+const WAITING: u64 = 1 << 63;
+
+/// What a signal had to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signalled {
+    /// One atomic OR: nobody was waiting.
+    Fast,
+    /// The lock was taken and the waiter must now be woken by the caller.
+    Wake,
+    /// The lock was taken, but the waiter had already been woken, or had
+    /// found the bits itself: nothing to wake.
+    Slow,
+}
+
+/// A notification object whose signal is one atomic OR when its thread is
+/// not waiting; only a signal that finds it waiting takes the lock.
+///
+/// No wake-up is lost. Every change of `word` is an atomic read-modify-write,
+/// so they all fall in one total order (the modification order of `word`).
+/// The waiter registers under `lock`: it sets WAITING with a fetch-or and
+/// looks at the bits that same operation returns. A signal's fetch-or is
+/// either before the waiter's in that order, and then the waiter sees the
+/// bit and does not sleep; or after it, and then the signal sees WAITING and
+/// takes `lock`, which it gets only after the waiter has either registered
+/// (`waiter` set) or taken the bits and cleared WAITING, and released it; in
+/// the first case the signal wakes it. WAITING is set only by the waiter
+/// under `lock`, and cleared only under `lock` (by the signal that wakes it,
+/// or by the waiter when it found bits), so a signal that sees it always
+/// finds one of those two states once it holds the lock.
+///
+/// A wake-up may find no bit: two signals see WAITING, the first wakes the
+/// waiter, which takes every bit and registers again before the second gets
+/// the lock; the second then wakes it once more. The waiter treats `take`
+/// returning 0 as "wait again".
+pub struct Notify {
+    word: Padded<AtomicU64>,
+    lock: Lock,
+    /// Whether the thread is registered as asleep; only under `lock`.
+    waiter: Padded<AtomicBool>,
+}
+
+impl Notify {
+    pub fn new(kind: LockKind) -> Notify {
+        Notify {
+            word: Padded::default(),
+            lock: Lock::new(kind),
+            waiter: Padded::default(),
+        }
+    }
+
+    /// Sets `bits` (not bit 63).
+    pub fn signal(&self, bits: u64) -> Signalled {
+        debug_assert!(bits != 0 && bits & WAITING == 0);
+        if self.word.fetch_or(bits, Ordering::AcqRel) & WAITING == 0 {
+            return Signalled::Fast;
+        }
+        let _g = self.lock.lock();
+        if !self.waiter.load(Ordering::Relaxed) {
+            return Signalled::Slow;
+        }
+        self.waiter.store(false, Ordering::Relaxed);
+        self.word.fetch_and(!WAITING, Ordering::Relaxed);
+        Signalled::Wake
+    }
+
+    /// The pending bits; or 0 after registering as asleep, and the caller
+    /// sleeps until a `Wake` reaches it, then calls `take`.
+    pub fn take_or_wait(&self) -> u64 {
+        if self.word.load(Ordering::Relaxed) != 0 {
+            let got = self.take();
+            if got != 0 {
+                return got;
+            }
+        }
+        let _g = self.lock.lock();
+        if self.word.fetch_or(WAITING, Ordering::AcqRel) != 0 {
+            return self.take();
+        }
+        self.waiter.store(true, Ordering::Relaxed);
+        0
+    }
+
+    /// Takes the pending bits (and clears WAITING if the caller had set it).
+    pub fn take(&self) -> u64 {
+        self.word.swap(0, Ordering::Acquire) & !WAITING
+    }
+}
+
 /// A message between kernels: a kind and two words.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Msg {
@@ -261,10 +351,69 @@ impl Ring {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lock, LockKind, Msg, Padded, RING_SLOTS, Ring};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use super::{Lock, LockKind, Msg, Notify, Padded, RING_SLOTS, Ring, Signalled};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Panics if `done` stays false for 10 s: a lost wake-up hangs, it
+    /// does not fail, so the test turns the hang into a failure.
+    fn spin_until(what: &str, done: impl Fn() -> bool) {
+        let since = Instant::now();
+        while !done() {
+            assert!(since.elapsed() < Duration::from_secs(10), "{what}");
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Three producers each signal and wait until the waiter has seen that
+    /// signal, so the waiter keeps going to sleep while signals race with
+    /// its registration. A lost wake-up leaves a signal unseen.
+    #[test]
+    fn notify_loses_no_wake_up() {
+        let rounds = if cfg!(miri) { 50 } else { 20_000 };
+        let n = Notify::new(LockKind::Queue);
+        let woken = AtomicBool::new(false);
+        let seen: [AtomicU64; 3] = Default::default();
+        let wakes = AtomicU64::new(0);
+        let fasts = AtomicU64::new(0);
+        thread::scope(|s| {
+            for (p, mine) in seen.iter().enumerate() {
+                let (n, woken, wakes, fasts) = (&n, &woken, &wakes, &fasts);
+                s.spawn(move || {
+                    for i in 0..rounds {
+                        match n.signal(1 << p) {
+                            Signalled::Wake => {
+                                wakes.fetch_add(1, Ordering::Relaxed);
+                                woken.store(true, Ordering::Release);
+                            }
+                            Signalled::Fast => _ = fasts.fetch_add(1, Ordering::Relaxed),
+                            Signalled::Slow => {}
+                        }
+                        spin_until("signal never seen: lost wake-up", || {
+                            mine.load(Ordering::Acquire) > i
+                        });
+                    }
+                });
+            }
+            while seen.iter().any(|c| c.load(Ordering::Relaxed) < rounds) {
+                let mut got = n.take_or_wait();
+                if got == 0 {
+                    spin_until("asleep with a signal pending: lost wake-up", || {
+                        woken.swap(false, Ordering::Acquire)
+                    });
+                    got = n.take();
+                }
+                for (p, c) in seen.iter().enumerate() {
+                    if got & (1 << p) != 0 {
+                        c.fetch_add(1, Ordering::Release);
+                    }
+                }
+            }
+        });
+        assert!(wakes.load(Ordering::Relaxed) > 0, "the slow path ran");
+        assert!(fasts.load(Ordering::Relaxed) > 0, "the fast path ran");
+    }
 
     /// A plain read then write, not an atomic add: a lost update shows a
     /// broken lock.
