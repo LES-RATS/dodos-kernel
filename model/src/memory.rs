@@ -65,7 +65,7 @@ impl Model {
         }
         aspace.records.push(cap);
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
-        self.count_leaves(frame, mapping, 1);
+        self.count_leaves(cap, frame, mapping, 1);
     }
 
     /// The gate over page tables, G4: the chunks that the leaves of a
@@ -82,8 +82,19 @@ impl Model {
         chunks
     }
 
-    /// G4: adds or takes the leaves of a mapping to the map counts.
-    fn count_leaves(&mut self, frame: crate::Frame, mapping: Mapping, sign: i64) {
+    /// G4: adds or takes the leaves of a mapping to the map counts; the
+    /// leaves of a frame under a grant count in its use entry (G6).
+    fn count_leaves(&mut self, cap: CapId, frame: crate::Frame, mapping: Mapping, sign: i64) {
+        if let Some(remote) = self.remotes.get(&self.caps[&cap].object) {
+            let node = self.node as usize;
+            if let Some(used) = self.table.uses[node].get_mut(&remote.use_entry) {
+                used.leaves = used
+                    .leaves
+                    .checked_add_signed(sign * mapping.count as i64)
+                    .expect("leaves");
+            }
+            return;
+        }
         for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
             let Some(count) = self.table.maps.get_mut(chunk as usize) else {
                 continue;
@@ -105,7 +116,7 @@ impl Model {
         aspace.records.retain(|&other| other != cap);
         live(&mut self.caps, cap).record = Record::Empty;
         let frame = self.frames[&self.caps[&cap].object];
-        self.count_leaves(frame, mapping, -1);
+        self.count_leaves(cap, frame, mapping, -1);
     }
 }
 
@@ -136,6 +147,15 @@ impl Model {
         // then that it is the space's own untyped (`invalid`; any untyped
         // is `invalid` for the start-up aspace, made from none).
         let cap = self.cap(thread, map.frame, Rights::READ)?;
+        // Memory under a grant: the gate maps a frame of another node only
+        // while the grant is live; an invalid remote capability is `gone`
+        // and its slot dead.
+        if let Some(remote) = self.remotes.get(&self.caps[&cap].object).copied()
+            && !self.valid(&remote)
+        {
+            self.remove_leaf_dead(cap);
+            return Err(Error::Gone);
+        }
         self.is(cap, ObjectKind::Frame, Rights::NONE)?;
         let untyped = self.optional(thread, map.untyped, ObjectKind::Untyped, Rights::WRITE)?;
         if untyped.is_some() && untyped != self.objects[&space].from {
@@ -189,10 +209,12 @@ impl Model {
         for chunk in self.leaf_chunks(frame, map.first, map.count) {
             *added.entry(chunk).or_default() += 1;
         }
-        let overflow = added.iter().any(|(&chunk, &leaves)| {
-            let count = self.table.maps.get(chunk as usize).copied().unwrap_or(0);
-            count + leaves > self.machine.map_count_max
-        });
+        let remote = self.remotes.contains_key(&self.caps[&cap].object);
+        let overflow = !remote
+            && added.iter().any(|(&chunk, &leaves)| {
+                let count = self.table.maps.get(chunk as usize).copied().unwrap_or(0);
+                count + leaves > self.machine.map_count_max
+            });
         if overflow {
             return Err(Error::Busy);
         }

@@ -1240,7 +1240,7 @@ fn census_counts_what_the_state_holds() {
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
         // Twenty at start-up, five objects, two copies.
-        capabilities: 39,
+        capabilities: 57,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,

@@ -663,6 +663,9 @@ impl Machine {
             devices: layout.devices.clone(),
             members: vec![live; n],
             roles,
+            grants: vec![Default::default(); n],
+            uses: vec![Default::default(); n],
+            serials: vec![Default::default(); n],
             writes: Default::default(),
         }
     }
@@ -781,7 +784,8 @@ impl Model {
             let place = Place { space, index };
             self.kept_frame(place, base, PageSize::Page, len / page, read_derive);
         }
-        add(self, ObjectKind::Endpoint, 0, START_SLOT_MAILBOX, all);
+        let mailbox = add(self, ObjectKind::Endpoint, 0, START_SLOT_MAILBOX, all);
+        self.mailbox = Some(mailbox);
         let mut index = START_SLOT_FIRST;
         let mut next = || {
             index += 1;
@@ -937,6 +941,7 @@ impl Model {
         // Scheduling: budget 9,843,750 ns, period 10 ms, class 1, the cores
         // set of the node's own core; the recovery reserve holds the rest.
         self.first_context(sched, thread, START_SCHED_BUDGET_NS, START_SCHED_PERIOD_NS);
+        self.build_kernel_space(mailbox);
         thread
     }
 

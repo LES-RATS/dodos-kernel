@@ -32,7 +32,9 @@ mod faults;
 mod ipc;
 mod irq;
 mod memory;
+mod remote;
 mod sched;
+mod system;
 mod table;
 mod tasks;
 mod threads;
@@ -41,6 +43,8 @@ pub use boot::{
     Arch, Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, SIXTEEN_KB, Segment,
 };
 pub use check::Census;
+pub use remote::{Body, Crossing, Granted, Packet};
+pub use system::System;
 
 use dodos_abi::{
     Call, Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
@@ -548,6 +552,14 @@ struct Thread {
     /// Tasks and marks: the task it is attached to, and its own marks word.
     task: Option<ObjId>,
     marks: u64,
+    /// A proxy: the stamp of the thread of another node it stands for, and
+    /// the node, the request and the number of capabilities its message
+    /// lists, which are transferred by grants at delivery.
+    stamp: Option<(u64, u64)>,
+    foreign: Option<(u16, u64, usize)>,
+    /// The outcome is the answer of another node to a forwarded call: any
+    /// outcome that call has.
+    answered: bool,
 }
 
 /// IPC: the states of a thread. `None` is ready.
@@ -571,6 +583,9 @@ enum Wait {
     },
     /// Waiting on a notify, in its queue.
     Notify(ObjId),
+    /// Waiting for another node: the request this node sent (Calls on an
+    /// object of another node).
+    Node(u64),
 }
 
 /// A message on its way. Transfer of capabilities: the kernel remembers the
@@ -823,6 +838,31 @@ pub struct Model {
     last_event: Ephemeral<Option<(sched::EventKind, usize)>>,
     /// What the last event did, for the invariants that judge an event.
     event: Ephemeral<EventLog>,
+    /// Calls on an object of another node: the messages the last event
+    /// sent, the requests this node waits on, the remote objects it holds,
+    /// its kernel space (anchors and proxies) and its proxies with the
+    /// request each stands in, and its requests to each peer, sent and held.
+    outbox: Vec<remote::Packet>,
+    requests: BTreeMap<u64, remote::Request>,
+    next_request: u64,
+    remotes: BTreeMap<ObjId, remote::Remote>,
+    kernel_space: Option<ObjId>,
+    mailbox: Option<ObjId>,
+    /// The thread whose call is the removal in progress, which waits when an
+    /// anchor's grant needs its holder (Grants).
+    remover: Option<ObjId>,
+    /// A transfer between nodes that the current delivery began, and the
+    /// last one an event began.
+    transfer: Option<u64>,
+    last_transfer: Option<u64>,
+    proxies: BTreeMap<ObjId, Option<(u16, u64)>>,
+    /// Other models of the machine share its table (`System`): the map
+    /// counts hold their leaves too.
+    shared: bool,
+    /// The slots that the capabilities moved into anchors came from.
+    moved_from: BTreeMap<u16, Place>,
+    outstanding: BTreeMap<u16, usize>,
+    held_requests: BTreeMap<u16, VecDeque<remote::Body>>,
     /// Interrupts: the claimed entries of the interrupt table.
     irqs: BTreeMap<ObjId, Irq>,
     tasks: BTreeMap<ObjId, Task>,
@@ -986,7 +1026,8 @@ impl Model {
     }
 
     fn made(&mut self, thread: ObjId, call: Syscall) -> Outcome {
-        live(&mut self.threads, thread).outcome = None;
+        let made = live(&mut self.threads, thread);
+        (made.outcome, made.answered) = (None, false);
         let number = match call {
             Syscall::Call { wait, .. }
             | Syscall::Recv { wait, .. }
@@ -1013,6 +1054,9 @@ impl Model {
     }
 
     fn dispatch(&mut self, thread: ObjId, call: Syscall) -> Outcome {
+        if let Some(outcome) = self.forwarded(thread, &call) {
+            return outcome;
+        }
         match call {
             Syscall::CapDerive {
                 source,
@@ -1360,10 +1404,22 @@ impl Model {
     /// answer has its effect on the thread, and a wait that ends without an
     /// answer leaves it suspended with the fault dropped.
     fn wake(&mut self, thread: ObjId, outcome: Outcome) {
+        // A delivery whose capabilities another node grants: the receiver
+        // waits for that node instead.
+        if let Some(id) = self.transfer.take() {
+            if let Ok(Output::Message(delivery)) = outcome {
+                return self.transfer_wait(id, thread, delivery);
+            }
+            self.transfer = Some(id);
+        }
         let woken = live(&mut self.threads, thread);
         woken.number = 0;
         if std::mem::take(&mut woken.faulting) {
             return self.answered(thread, outcome);
+        }
+        // A proxy's call is over: its outcome goes back to its node.
+        if woken.stamp.is_some() {
+            return self.answer_proxy(thread, outcome);
         }
         woken.outcome = Some(outcome);
         self.observe();

@@ -10,14 +10,14 @@ impl Model {
     /// Tasks and marks:
     /// 48. a thread attached to a task is listed once by it, and a task
     ///     lists only threads attached to it;
-    /// 49. task identifiers are of node 0, given out once each, from 1 up
+    /// 49. task identifiers are of this node, given out once each, from 1 up
     ///     to the counter; marks, of tasks and of threads, have no reserved
     ///     bit;
     /// 50. the running thread is not attached to a revoked task.
     pub(super) fn check_tasks(&self) -> Check {
         let mut ids = BTreeSet::new();
         for (&id, task) in &self.tasks {
-            let given = task.id.node() == 0
+            let given = task.id.node() == self.node
                 && (1..=self.task_counter).contains(&task.id.counter())
                 && ids.insert(task.id.raw());
             ensure(given, "49: task identifier")?;

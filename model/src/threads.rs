@@ -136,6 +136,18 @@ impl Model {
         // Threads: a thread whose wait is already over, and that has not run
         // since, does not wait: it keeps the result it has. The result says
         // nothing about what the thread was doing.
+        // Calls on an object of another node: a wait for another node is
+        // not ended here, but a wait on an object of the other node, which a
+        // proxy holds, is ended there; its call returns `cancelled` then.
+        // A request still waiting for a free proxy leaves its list, and the
+        // call returns `cancelled` at once (model choice).
+        if let Wait::Node(id) = cancelled.wait {
+            if ended && self.cancel_remote(id) == Some(true) {
+                self.unlink(target);
+                self.wake(target, Err(Error::Cancelled));
+            }
+            return Ok(Output::Done);
+        }
         if ended && cancelled.wait != Wait::None {
             self.unlink(target);
             self.wake(target, Err(Error::Cancelled));

@@ -72,7 +72,12 @@ impl Model {
         let mut depths = BTreeMap::new();
         for (&id, cap) in &self.caps {
             let above = cap.parent.and_then(|parent| depths.get(&parent));
-            let depth = above.map_or(1, |above| above + 1);
+            // A root remote capability has the depth of its anchor.
+            let top = match self.remotes.get(&cap.object) {
+                Some(remote) if cap.parent.is_none() => remote.depth,
+                _ => 1,
+            };
+            let depth = above.map_or(top, |above| above + 1);
             depths.insert(id, depth);
         }
         depths
@@ -302,7 +307,9 @@ impl Model {
             let read_derive = Rights::READ.union(Rights::DERIVE);
             let row = cap.rights == read_derive || cap.rights == read_derive.union(Rights::EXEC);
             let every = cap.rights.contains(Rights::ALL.without(Rights::EXEC));
-            let rights = if kept { row } else { every };
+            // A root remote capability has the rights of its anchor.
+            let remote = self.remotes.contains_key(&cap.object);
+            let rights = remote || if kept { row } else { every };
             ensure(derived || rights && cap.badge == 0, "3: root capability")?;
             let exec = |cap: &CapId| self.caps[cap].rights.contains(Rights::EXEC);
             let made = cap.parent.filter(|_| !derived);
@@ -424,7 +431,11 @@ impl Model {
                 id.0 < object.root.0,
                 "26: root capability older than its object",
             )?;
+            // A remote object holds no state of its kind on its holder, but
+            // a remote frame, its frame.
+            let remote = self.remotes.contains_key(&id);
             let has_state = match object.kind {
+                _ if remote => object.kind != ObjectKind::Frame || self.frames.contains_key(&id),
                 ObjectKind::Untyped => self.untypeds.contains_key(&id),
                 ObjectKind::CSpace => self.cspaces.contains_key(&id),
                 ObjectKind::Thread => self.threads.contains_key(&id),
@@ -545,7 +556,8 @@ impl Model {
         queued.sort();
         queued.dedup();
         ensure(queued.len() == entries, "14: a thread queued twice")?;
-        let in_queue = |thread: &&Thread| !matches!(thread.wait, Wait::None | Wait::Reply(_));
+        let in_queue =
+            |thread: &&Thread| !matches!(thread.wait, Wait::None | Wait::Reply(_) | Wait::Node(_));
         let waiting = self.threads.values().filter(in_queue).count();
         ensure(waiting == entries, "14: a waiting thread not queued")?;
 
@@ -592,6 +604,7 @@ impl Model {
             let waited = ready || thread.outcome.is_none() || thread.faulting;
             ensure(waited, "16: outcome while waiting")?;
             let outcome = match &thread.outcome {
+                _ if thread.answered => true,
                 None | Some(Err(Error::Gone | Error::Cancelled)) => true,
                 Some(Ok(Output::Word(word))) => *word != 0,
                 Some(Ok(Output::Message(delivery))) => {
@@ -675,7 +688,9 @@ impl Model {
             let device =
                 from.is_some_and(|from| self.untypeds.get(&from).is_some_and(|u| u.device));
             let write_back = frame.memory == MemoryType::WriteBack;
-            ensure(pages && device != write_back, "34: frame")?;
+            // A remote frame is judged on its own node.
+            let remote = self.remotes.contains_key(&id);
+            ensure(pages && (remote || device != write_back), "34: frame")?;
         }
         for cap in self.caps.values() {
             let frame = self.frames.contains_key(&cap.object);

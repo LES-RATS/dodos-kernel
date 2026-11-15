@@ -241,7 +241,10 @@ impl Model {
             // and only `cap_delete` can still use it.
             Some(&Slot::Full(cap)) => {
                 live(&mut self.caps, cap).dying = true;
-                self.remove(cap, Removal::DescendantsThenSelf)
+                self.remover = Some(thread);
+                let outcome = self.remove(cap, Removal::DescendantsThenSelf);
+                self.remover = None;
+                outcome
             }
             Some(Slot::Empty) | None => Err(Error::Invalid),
         }
@@ -249,7 +252,10 @@ impl Model {
 
     pub(crate) fn cap_revoke(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
         let cap = self.cap(thread, slot, Rights::WRITE)?;
-        self.remove(cap, Removal::Descendants)
+        self.remover = Some(thread);
+        let outcome = self.remove(cap, Removal::Descendants);
+        self.remover = None;
+        outcome
     }
 
     pub(crate) fn cap_inspect(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {
@@ -362,7 +368,14 @@ impl Model {
     /// The derivation tree: a start-up capability is at depth 1. The walk
     /// stops at a parent that does not exist, which `check` reports.
     pub(crate) fn depth(&self, cap: CapId) -> usize {
-        std::iter::successors(Some(cap), |cap| self.caps.get(cap)?.parent).count()
+        let chain: Vec<CapId> =
+            std::iter::successors(Some(cap), |cap| self.caps.get(cap)?.parent).collect();
+        // Grants: a root remote capability has the depth of its anchor.
+        let top = chain.last().and_then(|top| self.caps.get(top));
+        let offset = top
+            .and_then(|top| self.remotes.get(&top.object))
+            .map_or(0, |remote| remote.depth - 1);
+        chain.len() + offset
     }
 
     /// The derivation tree, checked with the plain arguments each time a
@@ -662,6 +675,15 @@ impl Model {
                     Undone::Nothing => {}
                 }
             }
+            // Grants: removing an anchor revokes its grant, and may wait for
+            // the holder's node to remove what it holds of it.
+            if self.grant_of(next).is_some() {
+                match self.revoke_anchor(next, self.remover) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(Error::Again),
+                    Err(outcome) => return outcome,
+                }
+            }
             // Slots and addresses: `cap_delete` acts on the slot it names,
             // which becomes empty; a capability removed by someone else
             // leaves a dead slot.
@@ -782,8 +804,9 @@ impl Model {
     fn waiter(&self, cap: CapId) -> Option<ObjId> {
         let object = self.rooted(cap)?;
         match self.objects[&object].kind {
-            ObjectKind::Endpoint => self.endpoints[&object].queue.front().copied(),
-            ObjectKind::Notify => self.notifies[&object].waiters.front().copied(),
+            // A remote object has no queue on its holder.
+            ObjectKind::Endpoint => self.endpoints.get(&object)?.queue.front().copied(),
+            ObjectKind::Notify => self.notifies.get(&object)?.waiters.front().copied(),
             _ => None,
         }
     }
@@ -794,6 +817,11 @@ impl Model {
     fn undo(&mut self, object: ObjId) -> Undone {
         let last = |list: &Vec<ObjId>| list.last().copied();
         let kind = self.objects[&object].kind;
+        // A remote object has no links on its holder: its state is on the
+        // granting node.
+        if self.remotes.contains_key(&object) {
+            return Undone::Nothing;
+        }
         match kind {
             // The threads bound to a `cspace`, an `aspace` or an endpoint (as
             // their fault endpoint) are unbound.
@@ -852,6 +880,20 @@ impl Model {
         self.remove_cap(id, Slot::Empty);
     }
 
+    /// A remote capability whose grant is no longer valid: its slot becomes
+    /// dead. One with descendants of its own stays, `gone` at each use.
+    pub(crate) fn remove_leaf_dead(&mut self, id: CapId) {
+        if self.caps[&id].children.is_empty() {
+            self.remove_cap(id, Slot::Dead);
+        }
+    }
+
+    /// One step of the removal of a capability and its descendants, as
+    /// `cap_delete` makes it, for the holder of a revoking grant.
+    pub(crate) fn remove_root(&mut self, cap: CapId) -> Outcome {
+        self.remove(cap, Removal::DescendantsThenSelf)
+    }
+
     /// Removes a capability that has no descendant, and leaves `left` in
     /// its slot. The derivation tree: the object is destroyed with its root
     /// capability. Removing a frame capability with a full record undoes
@@ -878,6 +920,12 @@ impl Model {
     /// the untyped it came from.
     fn destroy(&mut self, id: ObjId) {
         let object = self.objects.remove(&id).expect("names a live entry");
+        // A remote object holds no state of its kind here: its grant is
+        // released.
+        if self.remotes.contains_key(&id) {
+            self.frames.remove(&id);
+            return self.remote_destroyed(id);
+        }
         match object.kind {
             // Destruction of a block: its words become free (D-114).
             ObjectKind::Untyped => {

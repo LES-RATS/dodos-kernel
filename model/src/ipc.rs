@@ -39,6 +39,10 @@ impl Message {
     /// sender, with an added-marks word that has a reserved bit, or that
     /// needs a message page the thread does not have (D-110), it is
     /// `invalid` before any other capability argument is looked at.
+    pub(crate) fn check_header(&self, page: bool) -> Result<(), Error> {
+        self.check(page)
+    }
+
     fn check(&self, page: bool) -> Result<(), Error> {
         let header = Header::new(self.label, self.words.len(), self.caps.len(), self.flags)?;
         let add_marks = header.flags() == Header::FLAG_ADD_MARKS;
@@ -116,6 +120,19 @@ impl Model {
     ) -> Outcome {
         let held = self.held(thread, endpoint, ObjectKind::Endpoint, message.rights())?;
         let (endpoint, badge) = (held.object, held.badge);
+        self.call_to(thread, endpoint, badge, message, range)
+    }
+
+    /// `call` on an endpoint already judged: the endpoint, or the mailbox
+    /// of this node (badge 0).
+    pub(crate) fn call_to(
+        &mut self,
+        thread: ObjId,
+        endpoint: ObjId,
+        badge: u64,
+        message: Message,
+        range: Range,
+    ) -> Outcome {
         message.check(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
@@ -202,6 +219,19 @@ impl Model {
         };
         let held = self.is(cap, kind, message.rights())?;
         let (target, badge) = (held.object, held.badge);
+        self.send_to(thread, target, kind, badge, message)
+    }
+
+    /// `send` on an object already judged: an endpoint (the mailbox of
+    /// this node too) or a reply object.
+    pub(crate) fn send_to(
+        &mut self,
+        thread: ObjId,
+        target: ObjId,
+        kind: ObjectKind,
+        badge: u64,
+        message: Message,
+    ) -> Outcome {
         // IPC: a reply carries badge 0, the badge of every reply capability.
         message.check(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
@@ -316,6 +346,28 @@ impl Model {
         Ok(Output::Done)
     }
 
+    /// The list of a message as the node of its sender judges it: each
+    /// capability, and the rights of a derivation (`None` for a move).
+    pub(crate) fn listed_for(
+        &self,
+        sender: ObjId,
+        transfers: &[Transfer],
+    ) -> Result<Vec<(CapId, Option<Rights>)>, Error> {
+        let listed = self.listed(sender, transfers)?;
+        Ok(listed
+            .into_iter()
+            .map(|listed| match listed {
+                Listed::Move(cap) => (cap, None),
+                Listed::Derive(cap, rights) => (cap, Some(rights)),
+            })
+            .collect())
+    }
+
+    /// The receive range of a call, judged on the caller's node.
+    pub(crate) fn window_of(&self, thread: ObjId, range: Range) -> Result<Window, Error> {
+        self.window(thread, range)
+    }
+
     /// Transfer of capabilities: the checks of the list of a message, made
     /// when the call is made and again at delivery, against what the slots
     /// of the sender hold then.
@@ -391,6 +443,12 @@ impl Model {
         }
         if let Some((caller, parcel, theirs)) = self.take_caller(endpoint) {
             let delivery = self.serve(caller, parcel, theirs, (thread, reply, window));
+            // A delivery whose capabilities another node grants waits for
+            // that node.
+            if let Some(id) = self.transfer.take() {
+                self.transfer_wait(id, thread, delivery);
+                return Ok(Output::Waits);
+            }
             return Ok(Output::Message(delivery));
         }
         live(&mut self.endpoints, endpoint).queue.push_back(thread);
@@ -428,6 +486,9 @@ impl Model {
             window,
             flags,
         };
+        if let Some(id) = self.transfer {
+            self.transfer_reply(id, reply);
+        }
         // The budget follows the call: the delivery lends the caller's
         // context to a receiver that has none of its own (D-110).
         self.lend(caller, reply, server);
@@ -544,15 +605,24 @@ impl Model {
         // a sender that transferred a capability takes the receiver's marks
         // as they were, unless it is attached to one.
         let sender = parcel.sender;
-        let stamp = self.marks(sender).expect("a live sender").bits() | parcel.marks;
-        let task = self.threads[&sender]
-            .task
-            .map_or(0, |task| self.tasks[&task].id.raw());
+        // A proxy stands for a thread of another node: the stamp is that
+        // thread's, taken when the request left its node.
+        let (task, marks) = match self.threads[&sender].stamp {
+            Some(stamp) => stamp,
+            None => (
+                self.threads[&sender]
+                    .task
+                    .map_or(0, |task| self.tasks[&task].id.raw()),
+                self.marks(sender).expect("a live sender").bits(),
+            ),
+        };
+        let stamp = marks | parcel.marks;
         let before = self.marks(receiver).expect("a live receiver").bits();
         if !self.aware(receiver) {
             self.mark(receiver, stamp);
         }
-        if caps > 0 && !self.aware(sender) {
+        let proxy = self.threads[&sender].stamp.is_some();
+        if caps > 0 && !proxy && !self.aware(sender) {
             self.mark(sender, before);
         }
         let mut received = received(
@@ -564,6 +634,13 @@ impl Model {
             received,
             words: parcel.words,
         };
+        // Grants: the capabilities of a proxy's message are those of the
+        // thread it stands for; the receiver waits while that node grants
+        // them.
+        if self.threads[&sender].foreign.is_some() {
+            let id = self.defer_transfer(receiver, sender, delivery.clone(), window);
+            (self.transfer, self.last_transfer) = (Some(id), Some(id));
+        }
         (delivery, dropped)
     }
 
@@ -609,6 +686,12 @@ impl Model {
                 *live(&mut self.replies, reply) = ReplyState::Idle;
             }
             Wait::Notify(notify) => live(&mut self.notifies, notify).waiters.retain(other),
+            // A wait for another node: the request is forgotten, and a wait
+            // that a proxy holds there is ended there.
+            Wait::Node(id) => {
+                self.cancel_remote(id);
+                self.requests.remove(&id);
+            }
         }
         self.observe();
     }

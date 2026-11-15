@@ -25,7 +25,8 @@ impl Model {
         );
         *self.last_event = None;
         let entry = self.begin();
-        live(&mut self.threads, thread).outcome = None;
+        let raised = live(&mut self.threads, thread);
+        (raised.outcome, raised.answered) = (None, false);
         self.raise(thread, kind, exception);
         self.end(entry);
     }

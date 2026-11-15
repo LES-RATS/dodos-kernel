@@ -33,6 +33,35 @@ impl Model {
     ///     leaves that target its chunk;
     /// 59. the pages of class *table* are exactly the root tables and the
     ///     lower tables of the node's spaces.
+    /// The leaves of this node's translations that target each chunk, as
+    /// invariant 58 counts them (memory under a grant counts in its use
+    /// entry instead).
+    pub(crate) fn chunk_leaves(&self) -> Vec<u64> {
+        let table = &self.table;
+        let shift = table.geometry.chunk_shift();
+        let mut leaves = vec![0u64; table.owners.len()];
+        for space in self.aspaces.values() {
+            for t in space.translations.values() {
+                let object = self.caps[&t.cap].object;
+                if self.remotes.contains_key(&object) {
+                    continue;
+                }
+                let (Some(frame), Some(bytes)) =
+                    (self.frames.get(&object), table.geometry.bytes(t.size))
+                else {
+                    continue;
+                };
+                let start = frame.base + t.page * bytes;
+                for c in start >> shift..(start + bytes).div_ceil(1 << shift) {
+                    if let Some(count) = leaves.get_mut(c as usize) {
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        leaves
+    }
+
     pub(super) fn check_table(&self) -> Check {
         let table = &self.table;
         let shift = table.geometry.chunk_shift();
@@ -74,7 +103,10 @@ impl Model {
                     let dead = owner < table.nodes
                         && table.members[owner as usize].state() == dodos_abi::MemberState::Dead;
                     let allowed = match owner {
-                        o if o == write.writer => state == 1 || g != generation,
+                        o if o == write.writer => {
+                            let writer = table.members[write.writer as usize].generation();
+                            state == 1 || g != writer
+                        }
                         0xFFFF => true,
                         o if (0xFFF0..0xFFF8).contains(&o) => holds(o - 0xFFF0),
                         _ => dead,
@@ -100,14 +132,23 @@ impl Model {
         let page = table.geometry.page();
         let mut leaves = vec![0u64; table.owners.len()];
         let mut targets = Vec::new();
+        let mut granted: BTreeMap<u16, u64> = BTreeMap::new();
         for space in self.aspaces.values() {
             for t in space.translations.values() {
-                let frame = self
-                    .frames
-                    .get(&self.caps[&t.cap].object)
-                    .ok_or("58: frame")?;
+                let object = self.caps[&t.cap].object;
+                let frame = self.frames.get(&object).ok_or("58: frame")?;
                 let bytes = table.geometry.bytes(t.size).ok_or("58: page size")?;
                 let start = frame.base + t.page * bytes;
+                // Memory granted to the node and not revoked (G, class 2):
+                // its leaves count in the use entry of the grant (G6).
+                if let Some(remote) = self.remotes.get(&object) {
+                    let entry = table.grants[remote.node as usize].get(&remote.grant);
+                    let granted_here =
+                        entry.is_some_and(|e| e.serial == remote.serial && e.grantee == node);
+                    ensure(granted_here, "58: translation under no grant")?;
+                    *granted.entry(remote.use_entry).or_default() += 1;
+                    continue;
+                }
                 targets.push((start, start + bytes, t.rights));
                 for c in start >> shift..(start + bytes).div_ceil(1 << shift) {
                     if let Some(count) = leaves.get_mut(c as usize) {
@@ -214,7 +255,17 @@ impl Model {
                 (start / page..end.div_ceil(page)).any(|p| table.classes.contains_key(&p));
             ensure(!table_page, "58: translation to a table page")?;
         }
-        ensure(leaves == table.maps, "58: map count")?;
+        // Alone, the node's leaves are every leaf; on a machine of several
+        // models, the others' count too, and `System::check` sums them.
+        let counted = match self.shared {
+            false => leaves == table.maps,
+            true => leaves.iter().zip(&table.maps).all(|(l, m)| l <= m),
+        };
+        ensure(counted, "58: map count")?;
+        for (&entry, used) in &table.uses[node as usize] {
+            let counted = granted.get(&entry).copied().unwrap_or(0);
+            ensure(used.leaves == counted, "58: leaves of a use entry")?;
+        }
         // 59: the table pages.
         let tables: BTreeSet<u64> = self
             .aspaces

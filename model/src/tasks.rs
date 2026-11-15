@@ -136,7 +136,10 @@ impl Model {
     /// A step of `task_revoke` on one thread: its wait ends with `gone`, it
     /// is suspended and detached, keeping the marks of the task.
     pub(crate) fn stop(&mut self, thread: ObjId) {
-        if self.threads[&thread].wait != Wait::None {
+        // A thread that waits for another node is stopped when its call
+        // returns: its wait is not ended.
+        let wait = &self.threads[&thread].wait;
+        if *wait != Wait::None && !matches!(wait, Wait::Node(_)) {
             self.unlink(thread);
             self.wake(thread, Err(Error::Gone));
         }
@@ -175,6 +178,6 @@ impl Model {
     /// mark-aware nor revoked, no thread.
     pub(crate) fn next_task(&mut self) -> TaskId {
         self.task_counter += 1;
-        TaskId::new(0, self.task_counter)
+        TaskId::new(self.node, self.task_counter)
     }
 }

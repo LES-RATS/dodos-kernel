@@ -18,6 +18,35 @@ pub(crate) struct RoleRecord {
     pub(crate) object: u16,
 }
 
+/// The state of a grant entry (Grants).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantState {
+    Live,
+    Revoking,
+}
+
+/// A grant entry of the granting node: the grantee and its generation,
+/// the serial, the state. Its anchor is a slot of the granting node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GrantEntry {
+    pub(crate) grantee: u16,
+    pub(crate) generation: u32,
+    pub(crate) serial: u32,
+    pub(crate) state: GrantState,
+}
+
+/// A use entry of the holding node: the granting node, the grant, the
+/// serial, the granting node's generation, and the leaves of its tables
+/// under the grant (G6).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct UseEntry {
+    pub(crate) granter: u16,
+    pub(crate) grant: u16,
+    pub(crate) serial: u32,
+    pub(crate) generation: u32,
+    pub(crate) leaves: u64,
+}
+
 /// The class of a page (The gate over page tables, G2). A page of memory a
 /// node holds that is not listed is of class *data*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,6 +95,11 @@ pub(crate) struct Table {
     pub(crate) devices: Vec<DeviceEntry>,
     pub(crate) members: Vec<Member>,
     pub(crate) roles: Vec<RoleWord>,
+    /// The grant table and the use table of each node, by index, and the
+    /// serial of each free grant entry that was used.
+    pub(crate) grants: Vec<BTreeMap<u16, GrantEntry>>,
+    pub(crate) uses: Vec<BTreeMap<u16, UseEntry>>,
+    pub(crate) serials: Vec<BTreeMap<u16, u32>>,
     /// The writes of the current event.
     pub(crate) writes: crate::Ephemeral<Vec<WordWrite>>,
 }
