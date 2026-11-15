@@ -282,6 +282,9 @@ impl System {
         let generation = self.table().generation(node);
         let model = self.model(node);
         model.table.beacons[node as usize].panic = Some((code, generation));
+        // Its record and an entry of code 6, before it parks (reason 1, an
+        // assertion of the kernel).
+        model.failed(1);
         let core = model.table.placed[node as usize];
         self.after(node);
         self.cores[core] = CoreState::Hung { nmi: true };
@@ -337,8 +340,23 @@ impl System {
         match action {
             HwAction::Nmi { core, epoch } => match self.cores[core] {
                 CoreState::Running | CoreState::Hung { nmi: true } => {
-                    // The handler sees its member word in fencing and stops
-                    // in a loop; on the bootstrap core it parks it.
+                    // The handler sees its member word in fencing, writes
+                    // its record (reason 5) unless a committed record of the
+                    // same generation is there, and stops in a loop; on the
+                    // bootstrap core it parks it.
+                    let now = self.now;
+                    let running = self.table().core_beacons[core].running;
+                    if (running as usize) < self.nodes.len() {
+                        let member = self.table().member(running);
+                        let record = crate::debug::Record {
+                            commit: 0,
+                            generation: member.generation(),
+                            reason: 5,
+                            instant: now,
+                            member: member.raw(),
+                        };
+                        self.write_beacon(|t| t.crash.write_record(running, record));
+                    }
                     if booted(self, core) {
                         self.cores[core] = CoreState::Parked;
                         self.write_beacon(|t| t.core_beacons[core].parked = epoch);

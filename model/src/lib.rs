@@ -28,6 +28,7 @@ mod blocks;
 mod boot;
 mod caps;
 mod check;
+mod debug;
 mod faults;
 mod ipc;
 mod irq;
@@ -52,7 +53,7 @@ pub use roles::UnitOp;
 pub use system::{CoreState, System};
 
 use dodos_abi::{
-    Call, Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
+    Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
     SlotAddr, TaskId,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -174,6 +175,39 @@ pub enum Syscall {
         sched: SlotAddr,
         core: SlotAddr,
         mode: u64,
+    },
+    /// Debugging: the text travels as the message words.
+    DebugWrite {
+        debug: SlotAddr,
+        length: u64,
+        words: Vec<u64>,
+    },
+    TraceEmit {
+        debug: SlotAddr,
+        words: [u64; 3],
+    },
+    /// I/O ports.
+    IoportIn {
+        ioports: SlotAddr,
+        port: u64,
+        width: u64,
+    },
+    IoportOut {
+        ioports: SlotAddr,
+        port: u64,
+        width: u64,
+        value: u64,
+    },
+    IoportsIssue {
+        ioports: SlotAddr,
+        destination: SlotAddr,
+        first: u64,
+        last: u64,
+    },
+    /// Entropy: no capability.
+    EntropyRead {
+        length: u64,
+        mix: [u64; 4],
     },
     /// Cores: the `core` capability and the arguments of each call.
     CoreStart {
@@ -347,9 +381,6 @@ pub enum Syscall {
         control: SlotAddr,
         untyped: SlotAddr,
     },
-    /// A call that this model does not make: it returns `Unsupported`. A
-    /// call that has a variant above is refused here with a panic.
-    Other(Call),
 }
 
 /// The arguments of `aspace_map` and `iospace_map`.
@@ -393,6 +424,10 @@ pub enum Output {
     },
     /// `core_status`: the seven words.
     Status([u64; 7]),
+    /// `ioport_in`: the value read.
+    Value(u64),
+    /// `entropy_read`: the bytes, in words.
+    Bytes(Vec<u64>),
     /// `role_claim`, `role_hand`: the epoch.
     Epoch(u32),
     /// `timer_set`, `timer_cancel`: 1 if the timer was armed, 0 otherwise.
@@ -864,6 +899,12 @@ struct EventLog {
     /// The destination threads of `thread_move` placed in the event, with
     /// the effective marks of their source.
     moved: Vec<(ObjId, u64)>,
+    /// Debugging: kernel entries written in the event; the entries of a
+    /// `debug_write` or `trace_emit` (first sequence, count, stamp); the
+    /// ports a port call touched.
+    kernel_entries: u32,
+    user_entries: Option<(u64, u64, (u64, u64))>,
+    ports: Option<(u64, u64)>,
 }
 
 /// The whole state of the kernel of one core.
@@ -966,6 +1007,12 @@ pub struct Model {
     /// What a core enables for a thread: the state features enabled on the
     /// core, as the last switch wrote them.
     enabled: u32,
+    /// Debugging: the rate limit of each code of the kernel ring, and the
+    /// node's random generator (its state is not compared).
+    limits: [debug::Limit; 18],
+    /// The suppressed entries reported by entries of code 3.
+    reported: u64,
+    entropy: Ephemeral<u64>,
     /// The start-up space of the node.
     start_space: Option<ObjId>,
     /// Other models of the machine share its table (`System`): the map
@@ -982,17 +1029,6 @@ pub struct Model {
     task_counter: u64,
     /// What the start-up state was built from.
     machine: Machine,
-}
-
-/// Whether a call is one that `Syscall::Other` stands for: the calls of the
-/// groups not yet specified (cores, debugging), and those this model does
-/// not make yet.
-fn other(call: Call) -> bool {
-    use Call::{DebugWrite, EntropyRead, IoportIn, IoportOut, IoportsIssue, TraceEmit};
-    matches!(
-        call,
-        DebugWrite | TraceEmit | IoportIn | IoportOut | IoportsIssue | EntropyRead
-    )
 }
 
 /// The entry `id` of one of the maps of the state, to change it. Every
@@ -1262,6 +1298,30 @@ impl Model {
                 preference,
             } => self.core_perf(thread, core, (lowest, highest, preference)),
             Syscall::RoleClaim(role) => self.role_claim(thread, role),
+            Syscall::DebugWrite {
+                debug,
+                length,
+                words,
+            } => self.debug_write(thread, debug, length, &words),
+            Syscall::TraceEmit { debug, words } => self.trace_emit(thread, debug, words),
+            Syscall::IoportIn {
+                ioports,
+                port,
+                width,
+            } => self.ioport(thread, ioports, port, width, None),
+            Syscall::IoportOut {
+                ioports,
+                port,
+                width,
+                value,
+            } => self.ioport(thread, ioports, port, width, Some(value)),
+            Syscall::IoportsIssue {
+                ioports,
+                destination,
+                first,
+                last,
+            } => self.ioports_issue(thread, ioports, destination, first, last),
+            Syscall::EntropyRead { length, mix } => self.entropy_read(thread, length, mix),
             Syscall::RoleHand { role, core } => self.role_hand(thread, role, core),
             Syscall::ThreadMove {
                 thread: source,
@@ -1379,17 +1439,6 @@ impl Model {
             } => self.memory_give(thread, control, untyped, node),
             Syscall::MemorySplit { control, untyped } => {
                 self.memory_split(thread, control, untyped)
-            }
-            // The calls not yet made by this model, and those of the groups
-            // not yet specified (cores, debugging), return `unsupported` as
-            // soon as the capability space of the caller is found, before
-            // any argument is looked at. Removal ends: a thread whose
-            // capability space is dying or destroyed gets `gone` from these
-            // calls as from every other.
-            Syscall::Other(call) => {
-                assert!(other(call), "{call:?} has its own variant of `Syscall`");
-                self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
-                Err(Error::Unsupported)
             }
         }
     }

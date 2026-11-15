@@ -1877,14 +1877,6 @@ fn suspended_thread_keeps_its_place_in_its_queue_and_still_gets_its_message() {
     assert!(k.can_run(first));
 }
 
-#[test]
-fn calls_outside_the_one_core_model_are_unsupported() {
-    let mut k = K::new();
-    for call in [Call::EntropyRead, Call::DebugWrite] {
-        k.no(Syscall::Other(call), Error::Unsupported);
-    }
-}
-
 // IPC.
 
 #[test]
@@ -3860,12 +3852,6 @@ fn one_call_wakes_a_thread_of_a_reply_object_at_each_of_its_32_steps() {
     assert_eq!(k.woken(servers[32]), None);
 }
 
-#[test]
-#[should_panic(expected = "has its own variant")]
-fn call_of_the_one_core_reference_is_not_given_as_another_call() {
-    let _ = K::new().go(Syscall::Other(Call::CapInspect));
-}
-
 // The fourth reviews of the model.
 
 #[test]
@@ -4565,12 +4551,6 @@ fn client_cancelled_in_a_call_calls_again_and_the_late_answer_is_dropped() {
         Ok(Output::Sent { flags: 0 })
     );
     assert_eq!(got(k.woken(client).unwrap()).0, 8);
-}
-
-#[test]
-#[should_panic(expected = "has its own variant")]
-fn thread_cancel_is_not_one_of_the_calls_that_are_not_modelled() {
-    let _ = K::new().go(Syscall::Other(Call::ThreadCancel));
 }
 
 // Wait numbers (D-109).

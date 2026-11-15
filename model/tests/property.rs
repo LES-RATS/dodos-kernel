@@ -159,7 +159,7 @@ const MADE: [ObjectKind; 9] = [
 ];
 
 /// The calls, numbered as `name_of` numbers them.
-const NAMES: [&str; 59] = [
+const NAMES: [&str; 64] = [
     "cap_derive",
     "cap_move",
     "cap_delete",
@@ -178,7 +178,7 @@ const NAMES: [&str; 59] = [
     "wait",
     "poll",
     "notify_bind",
-    "other",
+    "debug_write",
     "thread_cancel",
     "aspace_map",
     "iospace_map",
@@ -219,12 +219,16 @@ const NAMES: [&str; 59] = [
     "core_perf",
     "role_claim",
     "role_hand",
+    "trace_emit",
+    "ioport_in",
+    "ioport_out",
+    "ioports_issue",
+    "entropy_read",
 ];
-/// The calls that never succeed on one node: "other" stands for the calls
-/// that are not modelled, `thread_move` needs a destination thread of
-/// another node (its successes are in `tests/cores.rs`), and `core_start`
-/// a dead node (`tests/recovery.rs`).
-const NEVER_ON_ONE_NODE: [&str; 3] = ["other", "thread_move", "core_start"];
+/// The calls that never succeed on one node: `thread_move` needs a
+/// destination thread of another node (its successes are in
+/// `tests/cores.rs`), and `core_start` a dead node (`tests/recovery.rs`).
+const NEVER_ON_ONE_NODE: [&str; 2] = ["thread_move", "core_start"];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
 
@@ -248,7 +252,12 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::Wait(..) => 15,
         Syscall::Poll(_) => 16,
         Syscall::NotifyBind { .. } => 17,
-        Syscall::Other(_) => 18,
+        Syscall::DebugWrite { .. } => 18,
+        Syscall::TraceEmit { .. } => 59,
+        Syscall::IoportIn { .. } => 60,
+        Syscall::IoportOut { .. } => 61,
+        Syscall::IoportsIssue { .. } => 62,
+        Syscall::EntropyRead { .. } => 63,
         Syscall::ThreadCancel(..) => 19,
         Syscall::ASpaceMap(_) => 20,
         Syscall::IoSpaceMap(_) => 21,
@@ -655,6 +664,69 @@ impl Generator<'_> {
         }
     }
 
+    /// A call of debugging, of the I/O ports, or `entropy_read`.
+    fn debug_call(&mut self) -> Syscall {
+        let debug = if self.rng.chance(90) {
+            own(START_SLOT_DEBUG)
+        } else {
+            self.held(OTHER)
+        };
+        let ports = if self.rng.chance(90) {
+            own(START_SLOT_IOPORTS)
+        } else {
+            self.held(OTHER)
+        };
+        let port = match self.rng.below(10) {
+            0 => 0x20,
+            1 => 0xCF8,
+            _ => 0x60 + self.rng.below(16),
+        };
+        let width = self.rng.pick(&[1, 2, 4, 3]);
+        match self.rng.below(12) {
+            0..3 => {
+                let length = match self.rng.below(10) {
+                    0 => 0,
+                    1 => 513,
+                    2 => 100,
+                    _ => self.rng.below(48),
+                };
+                Syscall::DebugWrite {
+                    debug,
+                    length,
+                    words: (0..length.div_ceil(8)).collect(),
+                }
+            }
+            3 | 4 => Syscall::TraceEmit {
+                debug,
+                words: [self.rng.next(), 1, 2],
+            },
+            5 => Syscall::IoportIn {
+                ioports: ports,
+                port,
+                width,
+            },
+            6 => Syscall::IoportOut {
+                ioports: ports,
+                port,
+                width,
+                value: self.rng.below(1 << 9),
+            },
+            7 | 8 => {
+                let first = self.rng.below(0x100);
+                Syscall::IoportsIssue {
+                    ioports: ports,
+                    destination: self.free(OTHER),
+                    first,
+                    last: first + self.rng.below(0x40),
+                }
+            }
+            _ => Syscall::EntropyRead {
+                length: self.rng.below(70),
+                mix: [self.rng.next(), 0, 0, 0],
+            },
+        }
+    }
+
     /// The memory_control of the node, mostly.
     fn control(&mut self) -> SlotAddr {
         if self.rng.chance(95) {
@@ -873,9 +945,17 @@ impl Generator<'_> {
                 thread: self.held(THREAD),
                 block: {
                     let mut block = vec![self.rng.below(1 << 47); x86_64::REGS_WORDS];
-                    match self.rng.below(10) {
+                    // A breakpoint control that enables nothing, and the
+                    // user-interrupt word 0, mostly.
+                    block[x86_64::REG_DR7] = 0;
+                    block[x86_64::REG_UINTR] = 0;
+                    match self.rng.below(14) {
                         0 => block.push(0),
                         1 => block[x86_64::REG_RIP] = 1 << 47,
+                        2 => block[x86_64::REG_DR7] = 1 << 13,
+                        3 => block[x86_64::REG_DR0] = 1 << 63,
+                        4 => block[x86_64::REG_UINTR] = 1,
+                        5 => block[x86_64::REG_DR7] = 0x1 | 0b01 << 16,
                         _ => {}
                     }
                     block
@@ -1061,11 +1141,7 @@ impl Generator<'_> {
                     self.held(ENDPOINT)
                 },
             },
-            _ => Syscall::Other(self.rng.pick(&[
-                Call::EntropyRead,
-                Call::DebugWrite,
-                Call::TraceEmit,
-            ])),
+            _ => self.debug_call(),
         }
     }
 
@@ -1861,6 +1937,71 @@ fn refused_send(model: &mut Model, first: ObjId, reached: &mut Reached) {
     }
 }
 
+/// The directed case of a thread whose capability space is destroyed while
+/// it can run: it gets `gone` from `cap_delete` as from every call. Then
+/// the thread is removed. It uses slots that the scripts never use.
+fn destroyed_space(model: &mut Model, first: ObjId, reached: &mut Reached) {
+    let s = |index: u32| own(4120 + index);
+    let make = |kind: ObjectKind, size: u64, slot: SlotAddr| Syscall::UntypedRetype {
+        untyped: MEMORY,
+        kind,
+        size,
+        page: PageSize::Page as u64,
+        memory: 0,
+        destination: slot,
+    };
+    let setup = [
+        make(ObjectKind::CSpace, 128, s(0)),
+        make(ObjectKind::Thread, 0, s(1)),
+        make(ObjectKind::Sched, 0, s(2)),
+        Syscall::ThreadConfigure {
+            thread: s(1),
+            cspace: s(0),
+            aspace: own(START_SLOT_ASPACE),
+            fault: SlotAddr::NONE,
+            page: SlotAddr::NONE,
+        },
+        Syscall::SchedConfigure {
+            sched: s(2),
+            core: own(CORE_SLOT),
+            budget: 100_000,
+            period: 10_000_000,
+            class: 1,
+        },
+        Syscall::SchedBind {
+            sched: s(2),
+            thread: s(1),
+        },
+        Syscall::ThreadResume(s(1)),
+    ];
+    for call in setup {
+        assert!(model.apply(first, call).is_ok());
+        assert_eq!(model.check(), Ok(()));
+    }
+    let orphan = model.object_at(first, s(1)).expect("the thread");
+    for _ in 0..16 {
+        if model.apply(first, Syscall::CapDelete(s(0))) != Err(Error::Again) {
+            break;
+        }
+        assert_eq!(model.check(), Ok(()));
+    }
+    assert_eq!(
+        model.apply(orphan, Syscall::CapDelete(HERE)),
+        Err(Error::Gone)
+    );
+    assert_eq!(model.check(), Ok(()));
+    reached.destroyed += 1;
+    reached.count(model);
+    for index in [1, 2] {
+        for _ in 0..16 {
+            if model.apply(first, Syscall::CapDelete(s(index))) != Err(Error::Again) {
+                break;
+            }
+        }
+        assert_eq!(model.check(), Ok(()));
+    }
+}
+
 fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let (mut model, first) = start();
@@ -1871,6 +2012,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     let mut walked = false;
     crowd(&mut model, first, reached);
     refused_send(&mut model, first, reached);
+    destroyed_space(&mut model, first, reached);
     for step in 0..STEPS {
         let threads = model.runnable();
         known.extend(&threads);
@@ -2146,11 +2288,11 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps, the smaller of the two geometries: untyped 142,
-    // cspace 8,567, aspace 41, frame 8,738, thread 27, sched 12, endpoint
-    // 13, reply 293, notify 40; a copy under `cap_delete` 325.
+    // Measured, in steps, the smaller of the two geometries: untyped 294,
+    // cspace 11,859, aspace 31, frame 5,074, thread 14, sched 12, endpoint
+    // 897, reply 16, notify 38; a copy under `cap_delete` 325.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [71, 4200, 20, 4300, 13, 6, 6, 146, 20]);
+    at_least(dying, [140, 5900, 15, 2500, 7, 6, 440, 8, 19]);
     at_least([reached.dying_copies], [160]);
 }
 
@@ -2190,9 +2332,11 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.woken_gone,
     ];
     at_least(ends, [15, 2, 1, 7]);
-    // Measured: 14 messages received with four capabilities, and 15 calls
-    // by a thread whose capability space is destroyed.
-    at_least([reached.with_four, reached.destroyed], [7, 7]);
+    // Measured: 9 messages received with four capabilities (the smaller
+    // geometry), and 24 calls by a thread whose capability space is
+    // destroyed, the directed case of each seed (the random calls reached
+    // none once the calls of the cores and debugging were added).
+    at_least([reached.with_four, reached.destroyed], [4, 24]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -2217,9 +2361,9 @@ fn waits_of_every_sort_are_cancelled() {
     // receivers, 18 waiters on a notify; 14 of the ends by a wait number.
     at_least(reached.cancelled, [15, 5, 23, 9]);
     at_least([reached.cancelled_by_number], [7]);
-    // Measured: `call` 7, `recv` 10, `reply_recv` 5 and `wait` 3 returned
-    // `cancelled` at once.
-    at_least(reached.cancelled_at_once, [3, 5, 2, 1]);
+    // Measured, the smaller geometry: `call` 11, `recv` 7, `reply_recv` 1
+    // and `wait` 3 returned `cancelled` at once.
+    at_least(reached.cancelled_at_once, [3, 3, 1, 1]);
 }
 
 #[test]

@@ -2,7 +2,8 @@
 
 use crate::{Model, ObjId, Outcome, Output, Parcel, Wait, Window, live};
 use dodos_abi::x86_64::{
-    REG_RFLAGS, REG_RIP, REG_RSP, REGS_CANONICAL, REGS_WORDS, canonical, rflags,
+    REG_DR0, REG_DR3, REG_DR7, REG_RFLAGS, REG_RIP, REG_RSP, REG_UINTR, REGS_CANONICAL, REGS_WORDS,
+    canonical, dr7_valid, rflags,
 };
 use dodos_abi::{
     Error, FAULT_REPLY_REDIRECT, FAULT_REPLY_RESUME, FaultKind, ObjectKind, Rights, SlotAddr,
@@ -20,8 +21,16 @@ impl Model {
     pub fn fault(&mut self, thread: ObjId, kind: FaultKind, exception: [u64; 3]) {
         assert!(self.runnable().contains(&thread), "{thread:?} does not run");
         assert!(
-            (kind as u32) <= FaultKind::BadCall as u32,
+            (kind as u32) <= FaultKind::BadCall as u32 || kind == FaultKind::HardwareBreakpoint,
             "{kind:?} is the kernel's"
+        );
+        // A hardware breakpoint hits only a thread whose control word
+        // enables one; the exception words are then the bits that hit and
+        // the status word (x86-64: DR6), words 3 and 4 of the fault.
+        assert!(
+            kind != FaultKind::HardwareBreakpoint
+                || self.threads[&thread].regs[REG_DR7] & 0xFF != 0,
+            "no breakpoint is enabled"
         );
         *self.last_event = None;
         let entry = self.begin();
@@ -90,6 +99,9 @@ impl Model {
         let recorded = live(&mut self.threads, thread);
         (recorded.suspended, recorded.recorded) = (true, Some((kind, words)));
         self.observe();
+        // Debugging: code 5, the fault recorded in its thread.
+        let payload = [u64::from(kind), words[0], words[4]];
+        self.trace(dodos_abi::TraceCode::FaultRecorded, Some(thread), payload);
     }
 
     /// Faults, the answer: with label 0 the thread resumes where its fault
@@ -158,8 +170,22 @@ impl Model {
         if block.len() != REGS_WORDS {
             return Err(Error::Invalid);
         }
-        if REGS_CANONICAL.iter().any(|&word| !canonical(block[word])) {
-            return Err(Error::Invalid);
+        // Judged word by word: the canonical addresses, the breakpoint
+        // addresses inside the user range, the breakpoint control within the
+        // user mask (`invalid`), and the user-interrupt word, which must be 0
+        // (`unsupported`, the placed hook).
+        let user_end = self.machine.geometry.user_end;
+        for (index, &word) in block.iter().enumerate() {
+            let bad = match index {
+                i if REGS_CANONICAL.contains(&i) => !canonical(word),
+                REG_DR0..=REG_DR3 => word >= user_end,
+                REG_DR7 => !dr7_valid(word),
+                REG_UINTR if word != 0 => return Err(Error::Unsupported),
+                _ => false,
+            };
+            if bad {
+                return Err(Error::Invalid);
+            }
         }
         let written = live(&mut self.threads, target);
         if !written.suspended || written.wait != Wait::None {

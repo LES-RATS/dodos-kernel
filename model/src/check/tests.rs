@@ -2229,3 +2229,106 @@ fn marks_lost_by_a_move_are_reported() {
     let broken = spoiled(|m, at| m.event.moved.push((at.waiter, 1)));
     assert_eq!(broken, "78: marks lost by a move");
 }
+
+// Debugging.
+
+#[test]
+fn a_ring_entry_out_of_its_place_or_a_wrong_next_sequence_is_reported() {
+    let broken = spoiled(|m, _| m.table.crash.areas[0].next_kernel += 1);
+    assert_eq!(broken, "88: kernel ring");
+    let broken = spoiled(|m, _| {
+        let area = &mut m.table.crash.areas[0];
+        area.user[3] = area.kernel[0];
+        area.user[3].seq = 1;
+    });
+    assert_eq!(broken, "88: user ring");
+}
+
+#[test]
+fn a_code_in_the_wrong_ring_is_reported() {
+    let broken = spoiled(|m, _| m.table.crash.areas[0].kernel[0].word2 |= 16);
+    assert_eq!(broken, "89: a user code in the kernel ring");
+    let broken = spoiled(|m, _| {
+        let area = &mut m.table.crash.areas[0];
+        area.user[0] = area.kernel[0];
+        area.next_user = 2;
+    });
+    assert_eq!(broken, "89: a kernel code in the user ring");
+}
+
+#[test]
+fn a_call_on_debug_that_wrote_a_kernel_entry_or_wrong_entries_is_reported() {
+    let broken = spoiled(|m, _| {
+        m.event.user_entries = Some((1, 0, (0, 0)));
+        m.event.kernel_entries = 1;
+    });
+    assert_eq!(broken, "89: a call on debug wrote a kernel entry");
+    let broken = spoiled(|m, _| m.event.user_entries = Some((1, 1, (0, 0))));
+    assert_eq!(broken, "90: entries of a call on debug");
+}
+
+#[test]
+fn entries_over_the_rate_limit_or_suppressed_entries_not_counted_are_reported() {
+    let broken = spoiled(|m, _| {
+        let entry = m.table.crash.areas[0].kernel[0];
+        for _ in 0..17 {
+            let mut copy = entry;
+            copy.word2 = (copy.word2 & !0xFFFF) | 9;
+            m.table.crash.areas[0].write_raw(false, copy);
+        }
+    });
+    assert_eq!(broken, "91: more than 16 entries of a code in a window");
+    let broken = spoiled(|m, _| m.table.crash.areas[0].suppressed += 1);
+    assert_eq!(broken, "91: suppressed entries not counted once");
+}
+
+#[test]
+fn a_record_of_another_boot_or_a_written_previous_area_is_reported() {
+    let broken = spoiled(|m, _| {
+        m.table.crash.areas[1].record = Some(crate::debug::Record {
+            commit: 7,
+            generation: 1,
+            reason: 1,
+            instant: 0,
+            member: 0,
+        });
+    });
+    assert_eq!(broken, "92: a record committed with another boot");
+    let broken = spoiled(|m, _| m.table.previous = Some(m.table.crash.clone()));
+    assert_eq!(broken, "92: the previous crash area written");
+}
+
+#[test]
+fn an_access_to_a_refused_port_or_a_wide_ioports_child_is_reported() {
+    let broken = spoiled(|m, _| m.event.ports = Some((0x21, 0x22)));
+    assert_eq!(broken, "93: an access to a refused port");
+    let broken = spoiled(|m, _| m.event.ports = Some((0xCFC, 0xCFF)));
+    assert_eq!(broken, "93: an access to a refused port");
+    let broken = spoiled(|m, at| {
+        let ports = m
+            .objects
+            .values()
+            .find(|o| o.kind == ObjectKind::IoPorts)
+            .map(|o| o.root)
+            .unwrap();
+        let all = Rights::ALL.without(Rights::EXEC);
+        let place = |index| Place {
+            space: at.space,
+            index,
+        };
+        m.derive(ports, all, 0x10 | 0x20 << 16, place(4090));
+        let child = *m.caps[&ports].children.last().unwrap();
+        m.derive(child, all, 0x10 | 0x30 << 16, place(4091));
+    });
+    assert_eq!(broken, "93: ioports range outside its parent's");
+}
+
+#[test]
+fn a_breakpoint_word_outside_the_user_range_is_reported() {
+    let broken =
+        spoiled(|m, at| live(&mut m.threads, at.waiter).regs[dodos_abi::x86_64::REG_DR0] = 1 << 63);
+    assert_eq!(broken, "95: breakpoint words of a thread");
+    let broken =
+        spoiled(|m, at| live(&mut m.threads, at.waiter).regs[dodos_abi::x86_64::REG_UINTR] = 1);
+    assert_eq!(broken, "95: breakpoint words of a thread");
+}

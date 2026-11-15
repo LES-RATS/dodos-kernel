@@ -182,6 +182,7 @@ impl Model {
     /// ran from the ready queue, the faults *no context*, every context in
     /// its queue, then the choice.
     pub(crate) fn end(&mut self, entry: Option<(ObjId, bool)>) {
+        self.trace_transitions();
         self.choose(entry);
         self.publish_counters();
         // Instructions retired: when a counted context stops running, the

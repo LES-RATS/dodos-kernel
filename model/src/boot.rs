@@ -152,6 +152,12 @@ pub struct Machine {
     /// bits; `false` where the core has none. The performance capabilities
     /// each core reports.
     pub perf_request: bool,
+    /// The base port of the console's UART, if the image declares one on
+    /// I/O ports; the loader's seed of the boot identifier; the crash area
+    /// of the previous boot, if one is valid.
+    pub console_port: Option<u64>,
+    pub boot_seed: u64,
+    pub previous_crash: Option<crate::debug::CrashArea>,
     pub perf_caps: u64,
     /// The class the processor gives the running code (Intel Thread
     /// Director), as the model's processor reads it when a counted context
@@ -283,6 +289,9 @@ impl Machine {
             replacement: false,
             replacement_reads_sealed: true,
             perf_request: true,
+            console_port: None,
+            boot_seed: 0x005E_ED0F_B007,
+            previous_crash: None,
             perf_caps: 0x0A_1E_28_30,
             classifier: None,
             kernel_devices: vec![(0, 0x00f8)],
@@ -719,6 +728,13 @@ impl Machine {
             fence_epoch: 0,
             rings: vec![vec![(0, 0); n]; n],
             replacement: self.replacement,
+            crash: crate::debug::CrashArea::new(
+                self.boot_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                self.previous_crash.as_ref().map_or(0, |p| p.sequence),
+                n,
+            ),
+            previous: self.previous_crash.clone(),
+            ports: Default::default(),
             stale_ns: u64::from(self.membership.stale_ms) * 1_000_000,
             stuck_ns: u64::from(self.membership.stuck_ms) * 1_000_000,
             sweep_ns: u64::from(self.membership.sweep_ms) * 1_000_000,
@@ -860,7 +876,9 @@ impl Model {
         add(self, ObjectKind::IrqControl, 0, START_SLOT_IRQ_CONTROL, all);
         // I/O ports: slot 7 is empty on other architectures.
         if machine.arch == Arch::X86_64 {
-            add(self, ObjectKind::IoPorts, 0, START_SLOT_IOPORTS, all);
+            let ports = add(self, ObjectKind::IoPorts, 0, START_SLOT_IOPORTS, all);
+            let root = self.objects[&ports].root;
+            live(&mut self.caps, root).badge = dodos_abi::IoPortRange::ALL.raw();
         }
         // The start-up task: identifier 1 of this node, marks 0, mark-aware.
         let task = add(self, ObjectKind::Task, 0, START_SLOT_TASK, all);
@@ -1041,6 +1059,19 @@ impl Model {
         // set of the node's own core; the recovery reserve holds the rest.
         self.first_context(sched, thread, START_SCHED_BUDGET_NS, START_SCHED_PERIOD_NS);
         self.build_kernel_space(mailbox);
+        // Debugging: a node started fresh keeps its debug area if its
+        // header is right, with its generation; otherwise it is cleared.
+        // Its first entry is the text of its start (code 1).
+        let generation = self.table.generation(self.node);
+        let area = &mut self.table.crash.areas[self.node as usize];
+        if area.magic != dodos_abi::DEBUG_AREA_MAGIC
+            || area.version != dodos_abi::DEBUG_AREA_VERSION
+        {
+            *area = crate::debug::DebugArea::new(generation);
+        }
+        area.generation = generation;
+        let text = u64::from_le_bytes(*b"start\0\0\0");
+        self.trace(dodos_abi::TraceCode::Text, None, [text, 0, 0]);
         thread
     }
 

@@ -841,3 +841,42 @@ fn a_firmware_stall_shorter_than_stale_ns_accuses_nobody() {
         (MemberState::Live, MemberState::Live)
     );
 }
+
+#[test]
+fn core_place_refuses_a_core_marked_unusable() {
+    let mut m = three();
+    m.ok(0, stop(2, CORE_STOP_RETIRE));
+    m.run(10 * MS);
+    assert_eq!(m.state(2), MemberState::Dead);
+    m.no(
+        0,
+        Syscall::CorePlace {
+            core: core(1),
+            physical: 2,
+        },
+        Error::Busy,
+    );
+}
+
+#[test]
+fn init_waits_for_the_grace_of_the_nmi() {
+    let mut m = S::new();
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(NMI_GRACE_NS / 2);
+    assert_eq!(m.state(1), MemberState::Fencing);
+    assert_eq!(m.sys.core(1), CoreState::Looping);
+    m.run(NMI_GRACE_NS);
+    assert_eq!(m.sys.core(1), CoreState::Parked);
+}
+
+#[test]
+fn a_node_that_is_not_live_does_not_accuse_the_last_live_node() {
+    let mut m = S::new();
+    // Node 1 seals; node 0 hangs before it takes the unit roles: node 1,
+    // sealing, has evidence, but node 0 is the only live node.
+    m.ok(0, stop(1, CORE_STOP_SEAL));
+    m.sys.hang(0, true);
+    m.run(SWEEP_NS + STALE_NS + 10 * MS);
+    assert_eq!(m.state(0), MemberState::Live);
+    assert_eq!(m.state(1), MemberState::Sealing);
+}

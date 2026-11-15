@@ -190,6 +190,11 @@ pub(crate) struct Table {
     pub(crate) stale_ns: u64,
     pub(crate) stuck_ns: u64,
     pub(crate) sweep_ns: u64,
+    /// Debugging: the crash area of this boot, the previous one (never
+    /// written), and the values the ports hold.
+    pub(crate) crash: crate::debug::CrashArea,
+    pub(crate) previous: Option<crate::debug::CrashArea>,
+    pub(crate) ports: BTreeMap<u16, u8>,
     /// The slot of a replacement kernel image holds an image.
     pub(crate) replacement: bool,
     /// The IOMMU units by their role, and each node's report of what it

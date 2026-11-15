@@ -276,6 +276,7 @@ impl Model {
         self.check_irqs()?;
         self.check_table()?;
         self.check_cores()?;
+        self.check_debug()?;
         self.check_events()
     }
 
@@ -295,8 +296,20 @@ impl Model {
                 derived = above.object == cap.object;
                 let subset = above.rights.contains(cap.rights);
                 ensure(!derived || subset, "3: rights of a derivation")?;
+                // An `ioports` capability carries a range in that word
+                // (8.5, invariant 6 here numbered 93): inside its parent's.
+                let ports = object.kind == ObjectKind::IoPorts;
                 let kept = above.badge == 0 || above.badge == cap.badge;
-                ensure(!derived || kept, "3: badge of a derivation")?;
+                ensure(!derived || ports || kept, "3: badge of a derivation")?;
+                let (outer, inner) = (above.badge, cap.badge);
+                let inside = (outer & 0xFFFF) <= (inner & 0xFFFF)
+                    && (inner >> 16 & 0xFFFF) <= (outer >> 16 & 0xFFFF)
+                    && (inner & 0xFFFF) <= (inner >> 16 & 0xFFFF)
+                    && inner >> 32 == 0;
+                ensure(
+                    !derived || !ports || inside,
+                    "93: ioports range outside its parent's",
+                )?;
             }
             let named = |child: &CapId| self.caps.get(child).is_some_and(|c| c.parent == Some(id));
             ensure(cap.children.iter().all(named), "2: children name it")?;
@@ -311,7 +324,15 @@ impl Model {
             // A root remote capability has the rights of its anchor.
             let remote = self.remotes.contains_key(&cap.object);
             let rights = remote || if kept { row } else { every };
-            ensure(derived || rights && cap.badge == 0, "3: root capability")?;
+            // The root of an `ioports` object holds every port.
+            let root_badge = match object.kind {
+                ObjectKind::IoPorts => 0xFFFF << 16,
+                _ => 0,
+            };
+            ensure(
+                derived || rights && cap.badge == root_badge,
+                "3: root capability",
+            )?;
             let exec = |cap: &CapId| self.caps[cap].rights.contains(Rights::EXEC);
             let made = cap.parent.filter(|_| !derived);
             let device = self.untypeds.get(&cap.object).is_some_and(|u| u.device);
@@ -322,7 +343,11 @@ impl Model {
             let boot = object.boot && !exec(&id);
             let same = irq || boot || made.is_none_or(|from| exec(&from) == exec(&id) || device);
             ensure(same, "3: exec of a root capability")?;
-            let badged = matches!(object.kind, ObjectKind::Endpoint | ObjectKind::Notify);
+            // The word of an `ioports` capability is its range, not a badge.
+            let badged = matches!(
+                object.kind,
+                ObjectKind::Endpoint | ObjectKind::Notify | ObjectKind::IoPorts
+            );
             ensure(badged || cap.badge == 0, "3: badge on another kind")?;
             let device = |id: &ObjId| self.untypeds.get(id).is_some_and(|untyped| untyped.device);
             let on_device = device(&cap.object);
@@ -760,6 +785,7 @@ impl Model {
 }
 
 mod cores;
+mod debug;
 mod memory;
 mod sched;
 mod table;

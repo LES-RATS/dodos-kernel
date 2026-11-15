@@ -471,8 +471,10 @@ impl Model {
             .iter()
             .zip(&self.table.role_records)
             .any(|(w, r)| {
+                // A handing word names the node that hands in its holder
+                // field: the seal waits for the target's step 5.
                 r.kind == RoleKind::Unit
-                    && ((w.state() == RoleState::Held && w.holder() == me)
+                    && ((w.state() != RoleState::Vacant && w.holder() == me)
                         || (w.state() == RoleState::Handing && w.target() == me))
             });
         if named {
