@@ -1179,6 +1179,12 @@ impl Model {
         let Some(entry) = self.table.grants[node].get_mut(&grant) else {
             return Ok(true);
         };
+        // A grant pinned by R3: its frames do not return to their untyped
+        // until the grantee is dead; the removal step returns `again`
+        // until then (model choice).
+        if entry.state == GrantState::Pinned {
+            return Ok(false);
+        }
         entry.state = GrantState::Revoking;
         let (grantee, serial) = (entry.grantee, entry.serial);
         let mapped = self.table.uses[grantee as usize].values().any(|u| {

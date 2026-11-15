@@ -11,7 +11,7 @@ use crate::recovery::HwAction;
 use crate::remote::{Body, Packet};
 use crate::table::GrantState;
 use crate::{Model, ObjId, Outcome, Refusal, Syscall};
-use dodos_abi::{Member, MemberState};
+use dodos_abi::{DRIVER_NONE, Evidence, Member, MemberState, RoleKind, RoleState};
 use std::collections::BTreeSet;
 
 /// The state of a physical core, as the hardware has it.
@@ -48,6 +48,34 @@ pub struct System {
 
 /// `Err` names the invariant that fails.
 type Check = Result<(), String>;
+
+/// 85: the rows of the table of transitions of a member word, read from
+/// the raw fields (not through `member_transition`).
+fn transition(from: Member, to: Member) -> bool {
+    use MemberState::{Dead, Fenced, Fencing, Live, Sealed, Sealing, Starting, Unfenced};
+    let (g, h) = (from.generation(), to.generation());
+    let kept = from.evidence() == to.evidence() && from.driver() == to.driver();
+    let cleared = to.evidence() == Evidence::None && to.driver() == DRIVER_NONE;
+    match (from.state(), to.state()) {
+        (Dead, Starting) => h == g.wrapping_add(1) && cleared,
+        (Sealed, Starting) => h == g && cleared,
+        (Starting, Live) | (Live, Sealing) | (Sealing, Sealed) => h == g && kept,
+        (Fencing, Fenced) | (Fencing, Unfenced) | (Unfenced, Fenced) | (Fenced, Dead) => {
+            h == g && kept
+        }
+        (Starting | Live | Sealing | Sealed, Fencing) => {
+            h == g && to.evidence() != Evidence::None && to.driver() != DRIVER_NONE
+        }
+        (Fencing, Fencing) => {
+            h == g && from.evidence() == to.evidence() && to.driver() != from.driver()
+        }
+        // A node parked on a fenced core whose seal is valid becomes sealed
+        // (After a confirmed stop): a change that the table of transitions
+        // does not list (CONTRACT-GAP, reported).
+        (Starting | Live, Sealed) => h == g,
+        _ => false,
+    }
+}
 
 impl System {
     /// Every node started from its floor and the kept image, with the
@@ -401,7 +429,9 @@ impl System {
     }
 
     /// A node that became dead has no kernel: its model is dropped, and the
-    /// gate clears the map counts of its tables and their page classes.
+    /// gate clears the map counts of its tables, their page classes, and
+    /// its grant and use tables (model choice: the contract does not say
+    /// who clears what a dead node's gate wrote; the serials stay).
     fn drop_dead(&mut self) {
         for node in 0..self.nodes.len() {
             let dead = self.nodes[node]
@@ -422,6 +452,8 @@ impl System {
                     t.classes.remove(page);
                 }
                 t.reports[node].clear();
+                t.grants[node].clear();
+                t.uses[node].clear();
             });
             if matches!(
                 self.cores[core],
@@ -446,8 +478,30 @@ impl System {
     ///     remote object of a live grant with its serial;
     /// 72. a use entry names a grant of another node, and is the use entry
     ///     of exactly one remote object of its node;
-    /// 73. a remote object names a grant of another node, never a slot.
+    /// 73. a remote object names a grant of another node, never a slot;
+    /// and those of cores and roles (8.4, safety):
+    /// 80. no chunk is covered by blocks of two nodes (judged first: on
+    ///     each node, 54 would report it otherwise);
+    /// 81. a context entry of a unit names a node that is not dead, with
+    ///     its current generation (no write of a device reaches memory
+    ///     taken after a death);
+    /// 82. a unit's registers are mapped only by the holder its role word
+    ///     names, and by nobody while the word is handing;
+    /// 83. a unit role is never vacant and never held by a sealed or dead
+    ///     node; a role word changes without its holder's write only when
+    ///     the holder may lose it: fenced, unfenced or dead (reserve: dead),
+    ///     or vacant, or by the target of a hand-over;
+    /// 84. a node becomes dead only when its core is stopped and every
+    ///     node that is starting, live or sealing has acknowledged it or
+    ///     maps nothing of it;
+    /// 85. every member word written follows a row of the table of
+    ///     transitions: a start only from dead (generation + 1) or sealed
+    ///     (the same);
+    /// 86. one node at least is live;
+    /// 87 (audit: every word under a live block of a live node reads taken
+    ///     by it with its generation) is 54 on each node.
     pub fn check(&self) -> Check {
+        self.check_owners()?;
         for (index, node) in self.nodes.iter().enumerate() {
             if let Some(node) = node {
                 node.check()
@@ -515,7 +569,109 @@ impl System {
                 )?;
             }
         }
+        self.check_cores()
+    }
+
+    /// 80: blocks of two nodes on one chunk.
+    fn check_owners(&self) -> Check {
+        let mut covered: BTreeSet<u64> = BTreeSet::new();
+        for node in self.nodes.iter().flatten() {
+            let shift = node.table.geometry.chunk_shift();
+            let own: BTreeSet<u64> = node
+                .untypeds
+                .values()
+                .filter(|u| u.block == Some(crate::Block::Run))
+                .flat_map(|u| u.base >> shift..(u.base + u.bytes) >> shift)
+                .collect();
+            if !covered.is_disjoint(&own) {
+                return Err("80: a chunk under blocks of two nodes".into());
+            }
+            covered.extend(own);
+        }
         Ok(())
+    }
+
+    /// 81 to 86.
+    fn check_cores(&self) -> Check {
+        let ensure = |holds: bool, invariant: &str| match holds {
+            true => Ok(()),
+            false => Err(invariant.to_string()),
+        };
+        let table = self.table();
+        for unit in table.units.values() {
+            for &(node, generation) in unit.entries.values() {
+                let member = table.member(node);
+                let current =
+                    member.state() != MemberState::Dead && member.generation() == generation;
+                ensure(current, "81: context entry of a dead generation")?;
+            }
+        }
+        for (role, unit) in &table.units {
+            let word = table.roles[*role];
+            let mapped = match unit.mapped {
+                None => true,
+                Some(node) => word.state() == RoleState::Held && word.holder() == node,
+            };
+            ensure(
+                mapped,
+                "82: unit mapped by a node its role word does not name",
+            )?;
+        }
+        for (record, word) in table.role_records.iter().zip(&table.roles) {
+            if record.kind != RoleKind::Unit {
+                continue;
+            }
+            ensure(word.state() != RoleState::Vacant, "83: a unit role vacant")?;
+            if word.state() == RoleState::Held {
+                let state = table.member(word.holder()).state();
+                let bad = matches!(state, MemberState::Sealed | MemberState::Dead);
+                ensure(!bad, "83: a unit role held by a sealed or dead node")?;
+            }
+        }
+        for &(role, writer, before, _) in table.role_writes.iter() {
+            let kind = table.role_records[role].kind;
+            let holder = before.holder();
+            let own = before.state() == RoleState::Vacant
+                || holder == writer
+                || (before.state() == RoleState::Handing && before.target() == writer);
+            let lost = |state: MemberState| match kind {
+                RoleKind::Reserve => state == MemberState::Dead,
+                _ => matches!(
+                    state,
+                    MemberState::Fenced | MemberState::Unfenced | MemberState::Dead
+                ),
+            };
+            let target_lost =
+                before.state() == RoleState::Handing && lost(table.member(before.target()).state());
+            ensure(
+                own || lost(table.member(holder).state()) || target_lost,
+                "83: a role taken from its holder",
+            )?;
+        }
+        for &(node, _, from, to) in table.member_writes.iter() {
+            ensure(
+                transition(from, to),
+                "85: a member word written off the table of transitions",
+            )?;
+            if to.state() == MemberState::Dead && from.state() != MemberState::Dead {
+                let core = table.placed[node as usize];
+                let others_here = (0..table.nodes)
+                    .any(|z| z != node && table.placed[z as usize] == core && self.runs(z));
+                let stopped =
+                    matches!(self.cores[core], CoreState::Parked | CoreState::Off) || others_here;
+                ensure(stopped, "84: dead while its core is not stopped")?;
+                let acknowledged = (0..table.nodes)
+                    .filter(|&y| y != node && table.writes(y))
+                    .all(|y| {
+                        let beacon = &table.beacons[y as usize];
+                        beacon.acked[node as usize] == to.generation()
+                            || !beacon.maps_of[node as usize]
+                    });
+                ensure(acknowledged, "84: dead before every node acknowledged it")?;
+            }
+        }
+        let live = (0..table.nodes).any(|n| table.member(n).state() == MemberState::Live);
+        ensure(live, "86: no live node")
     }
 
     /// The bodies in flight, for a test to find the one it wants.
@@ -763,5 +919,137 @@ mod tests {
             remote.node = 1;
         }
         assert_eq!(sys.check(), Err("73: remote object of its own node".into()));
+    }
+
+    // Cores and roles.
+
+    fn live_member(g: u32) -> Member {
+        Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, g)
+    }
+
+    #[test]
+    fn blocks_of_two_nodes_on_a_chunk_are_reported() {
+        let (mut sys, t) = granted();
+        let ram = Machine::example().memory[4].base;
+        let shift = sys.table().geometry.chunk_shift();
+        let take = Syscall::MemoryTake {
+            control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+            kind: 0,
+            place: ram + (8 << shift),
+            size: u64::from(shift),
+            destination: SlotAddr::own(120),
+        };
+        assert_eq!(sys.apply(0, t[0], take), Ok(crate::Output::Done));
+        let block = sys.nodes[0]
+            .as_ref()
+            .unwrap()
+            .untypeds
+            .values()
+            .find(|u| u.block == Some(crate::Block::Run))
+            .unwrap()
+            .clone();
+        sys.nodes[1]
+            .as_mut()
+            .unwrap()
+            .untypeds
+            .insert(crate::ObjId(u32::MAX), block);
+        assert_eq!(
+            sys.check(),
+            Err("80: a chunk under blocks of two nodes".into())
+        );
+    }
+
+    #[test]
+    fn a_context_entry_of_a_dead_generation_is_reported() {
+        let (mut sys, _) = granted();
+        tables(&mut sys, |t| {
+            let unit = t.units.values_mut().next().unwrap();
+            unit.entries.insert(5, (1, 0));
+        });
+        assert_eq!(
+            sys.check(),
+            Err("81: context entry of a dead generation".into())
+        );
+    }
+
+    #[test]
+    fn a_unit_mapped_by_another_node_than_its_holder_is_reported() {
+        let (mut sys, _) = granted();
+        tables(&mut sys, |t| {
+            t.units.values_mut().next().unwrap().mapped = Some(0)
+        });
+        assert_eq!(
+            sys.check(),
+            Err("82: unit mapped by a node its role word does not name".into())
+        );
+    }
+
+    #[test]
+    fn a_vacant_unit_role_or_one_held_by_a_sealed_node_is_reported() {
+        let (mut sys, _) = granted();
+        tables(&mut sys, |t| {
+            t.roles[1] = dodos_abi::RoleWord::vacant(2);
+        });
+        assert_eq!(sys.check(), Err("83: a unit role vacant".into()));
+        let (mut sys, _) = granted();
+        let sealed = Member::new(MemberState::Sealed, Evidence::None, DRIVER_NONE, 1);
+        tables(&mut sys, |t| t.members[1] = sealed);
+        assert_eq!(
+            sys.check(),
+            Err("83: a unit role held by a sealed or dead node".into())
+        );
+    }
+
+    #[test]
+    fn a_role_taken_from_a_live_holder_is_reported() {
+        let (mut sys, _) = granted();
+        let (before, after) = (
+            dodos_abi::RoleWord::held(1, 1),
+            dodos_abi::RoleWord::held(0, 2),
+        );
+        tables(&mut sys, |t| {
+            t.roles[2] = after;
+            t.role_writes.push((2, 0, before, after));
+        });
+        assert_eq!(sys.check(), Err("83: a role taken from its holder".into()));
+    }
+
+    #[test]
+    fn a_node_dead_before_its_stop_or_its_acknowledgements_is_reported() {
+        let (mut sys, _) = granted();
+        let fenced = Member::new(MemberState::Fenced, Evidence::Kill, 0, 1);
+        let dead = Member::new(MemberState::Dead, Evidence::Kill, 0, 1);
+        tables(&mut sys, |t| t.member_writes.push((1, 0, fenced, dead)));
+        assert_eq!(
+            sys.check(),
+            Err("84: dead while its core is not stopped".into())
+        );
+        sys.cores[1] = CoreState::Parked;
+        tables(&mut sys, |t| t.beacons[0].maps_of[1] = true);
+        assert_eq!(
+            sys.check(),
+            Err("84: dead before every node acknowledged it".into())
+        );
+    }
+
+    #[test]
+    fn a_member_word_written_off_the_table_is_reported() {
+        let (mut sys, _) = granted();
+        let starting = Member::new(MemberState::Starting, Evidence::None, DRIVER_NONE, 1);
+        tables(&mut sys, |t| {
+            t.member_writes.push((1, 0, live_member(1), starting))
+        });
+        assert_eq!(
+            sys.check(),
+            Err("85: a member word written off the table of transitions".into())
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_live_node_is_reported() {
+        let (mut sys, _) = granted();
+        let fencing = Member::new(MemberState::Fencing, Evidence::Kill, 0, 1);
+        tables(&mut sys, |t| t.members = vec![fencing; 2]);
+        assert_eq!(sys.check(), Err("86: no live node".into()));
     }
 }

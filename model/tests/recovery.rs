@@ -596,3 +596,248 @@ fn a_request_with_an_old_epoch_is_refused_and_sent_to_the_new_holder() {
     assert_eq!(m.sys.node(1).woken(m.t[1]), Some(&DONE));
     let _ = Frame;
 }
+
+// Reclaim of what crossed nodes.
+
+/// Node `granter` makes a frame in slot 100 and gives node `holder` a copy
+/// in slot 110, which the holder maps at 1 GB.
+fn granted_frame(m: &mut S, granter: u16, holder: u16) {
+    m.ok(granter, retype(Frame, 1, 100));
+    m.ok(holder, retype(Reply, 0, 99));
+    let recv = Syscall::Recv {
+        endpoint: s(START_SLOT_MAILBOX),
+        reply: s(99),
+        range: Range {
+            first: s(110),
+            count: 1,
+        },
+        wait: 0,
+    };
+    assert_eq!(m.on_node(holder, recv), WAITS);
+    let send = Syscall::Send {
+        target: core(holder.into()),
+        message: Message {
+            caps: vec![Transfer::Derive(
+                s(100),
+                Rights::READ.union(Rights::DERIVE).bits(),
+            )],
+            ..Message::default()
+        },
+    };
+    assert_eq!(m.on_node(granter, send), WAITS);
+    m.run(MS / 10);
+    let map = Syscall::ASpaceMap(Map {
+        space: s(START_SLOT_ASPACE),
+        frame: s(110),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    });
+    m.ok(holder, map);
+}
+
+#[test]
+fn a_holder_removes_what_it_maps_of_a_fenced_node_before_it_acknowledges() {
+    let mut m = S::new();
+    granted_frame(&mut m, 0, 1);
+    assert!(m.sys.node(1).translated(m.t[1], 1 << 30).is_some());
+    m.ok(1, stop(0, CORE_STOP_KILL));
+    m.run(5 * MS);
+    // Node 0 was on the bootstrap core: its handler parked it.
+    assert_eq!(m.state(0), MemberState::Dead);
+    assert_eq!(m.sys.node(1).translated(m.t[1], 1 << 30), None);
+}
+
+#[test]
+fn the_frames_granted_to_a_fenced_node_stay_pinned_until_it_is_dead() {
+    let mut m = S::new();
+    granted_frame(&mut m, 0, 1);
+    m.sys.hang(1, false);
+    m.sys.set_vmx(1, true);
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(FENCE_NS + 5 * MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    // The grant is pinned: removing its frame does not finish.
+    m.no(0, Syscall::CapRevoke(s(100)), Error::Again);
+    m.sys.set_vmx(1, false);
+    m.run(SWEEP_NS + 5 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    // Unpinned at its death: the revocation finishes.
+    m.ok(0, Syscall::CapRevoke(s(100)));
+}
+
+/// Three nodes: node 2 on a core of its own, of fence class 2.
+fn three() -> S {
+    let mut machine = Machine::example();
+    let mut third = machine.cores[1];
+    third.hw_id = 4;
+    machine.cores.push(third);
+    let (sys, t) = System::boot(&machine).unwrap();
+    S { sys, t }
+}
+
+#[test]
+fn a_node_parked_on_a_fenced_core_is_accused_host_without_a_valid_seal() {
+    let mut m = three();
+    // Nodes 0 and 1 share core 0: each keeps a tenth of a core.
+    for node in 0..2u16 {
+        m.ok(
+            node,
+            Syscall::SchedConfigure {
+                sched: s(START_SLOT_SCHED),
+                core: core(node.into()),
+                budget: 1_000_000,
+                period: 10_000_000,
+                class: 1,
+            },
+        );
+    }
+    m.ok(
+        0,
+        Syscall::CorePlace {
+            core: core(1),
+            physical: 0,
+        },
+    );
+    // Node 2 kills node 0: when core 0 is stopped, node 1, which ran there
+    // with no valid seal, is fenced with evidence host in the same step.
+    m.ok(2, stop(0, CORE_STOP_KILL));
+    m.run(5 * MS);
+    let member = m.sys.member(1);
+    assert_eq!(member.evidence(), Evidence::Host);
+    m.run(10 * MS);
+    assert_eq!(
+        (m.state(0), m.state(1)),
+        (MemberState::Dead, MemberState::Dead)
+    );
+}
+
+#[test]
+fn a_sealed_node_parked_on_a_fenced_core_stays_sealed() {
+    let mut m = three();
+    for node in 0..2u16 {
+        m.ok(
+            node,
+            Syscall::SchedConfigure {
+                sched: s(START_SLOT_SCHED),
+                core: core(node.into()),
+                budget: 1_000_000,
+                period: 10_000_000,
+                class: 1,
+            },
+        );
+    }
+    m.ok(2, stop(1, CORE_STOP_SEAL));
+    m.run(MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    m.ok(
+        0,
+        Syscall::CorePlace {
+            core: core(1),
+            physical: 0,
+        },
+    );
+    m.ok(2, stop(0, CORE_STOP_KILL));
+    m.run(10 * MS);
+    assert_eq!(
+        (m.state(0), m.state(1)),
+        (MemberState::Dead, MemberState::Sealed)
+    );
+}
+
+#[test]
+fn a_node_dying_while_starting_is_accused_stale_after_start_ns() {
+    let mut m = S::new();
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(10 * MS);
+    m.ok(0, start(1, CORE_START_FRESH));
+    m.sys.hang(1, false);
+    m.run(SWEEP_NS + STALE_NS + 10 * MS);
+    let member = m.sys.member(1);
+    assert!(matches!(
+        member.state(),
+        MemberState::Fenced | MemberState::Dead
+    ));
+    assert_eq!(member.generation(), 2);
+}
+
+#[test]
+fn a_plain_role_of_a_fenced_holder_can_be_claimed_a_reserve_role_only_once_it_is_dead() {
+    let mut m = S::new();
+    assert_eq!(
+        m.on_node(1, Syscall::RoleClaim(s(PLATFORM))),
+        Ok(Output::Epoch(1))
+    );
+    assert_eq!(
+        m.on_node(1, Syscall::RoleClaim(s(RESERVE))),
+        Ok(Output::Epoch(1))
+    );
+    m.sys.hang(1, false);
+    m.sys.set_vmx(1, true);
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(FENCE_NS + MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    assert_eq!(
+        m.on_node(0, Syscall::RoleClaim(s(PLATFORM))),
+        Ok(Output::Epoch(2))
+    );
+    m.no(0, Syscall::RoleClaim(s(RESERVE)), Error::Busy);
+    m.sys.set_vmx(1, false);
+    m.run(SWEEP_NS + 5 * MS);
+    // At its death the reserve role became vacant.
+    assert_eq!(m.sys.role(2).state(), RoleState::Vacant);
+    assert_eq!(
+        m.on_node(0, Syscall::RoleClaim(s(RESERVE))),
+        Ok(Output::Epoch(3))
+    );
+}
+
+#[test]
+fn a_fence_whose_driver_dies_is_driven_again_by_another_node() {
+    // Node 0 kills node 2 and is then killed by node 1 before the fence of
+    // node 2 ends.
+    let mut m = three();
+    m.sys.hang(2, false);
+    m.sys.set_vmx(2, true);
+    m.ok(0, stop(2, CORE_STOP_KILL));
+    m.ok(1, stop(0, CORE_STOP_KILL));
+    m.run(MS);
+    // Node 1 drives the fence of node 2 now.
+    assert_eq!(m.sys.member(2).driver(), 1);
+    m.sys.set_vmx(2, false);
+    m.run(SWEEP_NS + 20 * MS);
+    assert_eq!(
+        (m.state(0), m.state(2)),
+        (MemberState::Dead, MemberState::Dead)
+    );
+    assert_eq!(m.state(1), MemberState::Live);
+}
+
+// Detection never accuses a node that beats.
+
+#[test]
+fn nodes_that_beat_and_consume_their_rings_are_never_accused() {
+    let mut m = S::new();
+    // Node 1 idle with no timer: the sweep pings it, and it consumes the
+    // pings.
+    m.ok(1, Syscall::ThreadSuspend(s(START_SLOT_THREAD)));
+    m.run(3 * SWEEP_NS);
+    assert_eq!(
+        (m.state(0), m.state(1)),
+        (MemberState::Live, MemberState::Live)
+    );
+}
+
+#[test]
+fn a_firmware_stall_shorter_than_stale_ns_accuses_nobody() {
+    let mut m = S::new();
+    m.run(SWEEP_NS + MS);
+    m.sys.stall(STALE_NS / 2);
+    m.run(SWEEP_NS);
+    assert_eq!(
+        (m.state(0), m.state(1)),
+        (MemberState::Live, MemberState::Live)
+    );
+}

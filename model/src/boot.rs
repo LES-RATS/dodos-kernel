@@ -719,6 +719,9 @@ impl Machine {
             fence_epoch: 0,
             rings: vec![vec![(0, 0); n]; n],
             replacement: self.replacement,
+            stale_ns: u64::from(self.membership.stale_ms) * 1_000_000,
+            stuck_ns: u64::from(self.membership.stuck_ms) * 1_000_000,
+            sweep_ns: u64::from(self.membership.sweep_ms) * 1_000_000,
             units: layout
                 .roles
                 .iter()

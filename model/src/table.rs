@@ -185,6 +185,11 @@ pub(crate) struct Table {
     pub(crate) fences: Vec<FenceRecord>,
     pub(crate) fence_epoch: u64,
     pub(crate) rings: Vec<Vec<(u64, u64)>>,
+    /// `STALE_NS`, `STUCK_NS` and `SWEEP_NS`, as the boot image states them
+    /// in `BootMembership`.
+    pub(crate) stale_ns: u64,
+    pub(crate) stuck_ns: u64,
+    pub(crate) sweep_ns: u64,
     /// The slot of a replacement kernel image holds an image.
     pub(crate) replacement: bool,
     /// The IOMMU units by their role, and each node's report of what it

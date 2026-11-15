@@ -19,7 +19,7 @@ use dodos_abi::{
     IDLE_ENTRY_WORDS, IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_HALT, IDLE_METHOD_MWAIT,
     IDLE_METHOD_PSCI, IDLE_METHOD_SBI, IDLE_STATES_MAX, Member, MemberState, NMI_GRACE_NS,
     OBSERVATION_LIFE, OBSERVATIONS_MAX, ObjectKind, Rights, RoleKind, RoleState, SETTLE_NS,
-    STALE_NS, STUCK_NS, SWEEP_NS, kind_covers,
+    kind_covers,
 };
 
 /// What a node asks of the hardware: the steps of a fence on a physical
@@ -404,8 +404,8 @@ impl Model {
             match observation.watched {
                 Watched::Heartbeat { core: c, heartbeat } if c == core => {
                     let stale = beacon.heartbeat.0 == heartbeat
-                        && now >= observation.at + STALE_NS
-                        && now > beacon.idle_until.0.saturating_add(STALE_NS);
+                        && now >= observation.at + self.table.stale_ns
+                        && now > beacon.idle_until.0.saturating_add(self.table.stale_ns);
                     // A node that does not beat within `START_NS` of its start.
                     let starting = member.state() == MemberState::Starting
                         && beacon.heartbeat.0 == heartbeat
@@ -416,7 +416,10 @@ impl Model {
                 }
                 Watched::Ring { consumed } => {
                     let ring = self.table.rings[self.node as usize][node as usize];
-                    if ring.1 == consumed && ring.0 > consumed && now >= observation.at + STUCK_NS {
+                    if ring.1 == consumed
+                        && ring.0 > consumed
+                        && now >= observation.at + self.table.stuck_ns
+                    {
                         return Some(Evidence::Stuck);
                     }
                 }
@@ -451,11 +454,11 @@ impl Model {
     }
 
     /// Observations: the gate opens one per needed node, at most 8, each
-    /// expiring after 4 × `STALE_NS`.
+    /// expiring after 4 × `self.table.stale_ns`.
     fn observe_needed(&mut self) {
         let now = self.now;
         let me = self.node as usize;
-        let life = OBSERVATION_LIFE * STALE_NS;
+        let life = OBSERVATION_LIFE * self.table.stale_ns;
         self.table.beacons[me]
             .observations
             .retain(|o| now < o.at + life);
@@ -504,7 +507,7 @@ impl Model {
             }
         }
         if swept {
-            self.next_sweep = now + SWEEP_NS;
+            self.next_sweep = now + self.table.sweep_ns;
             // A successor idle with no armed timer gets a ping, which becomes
             // stuck evidence if it is not consumed.
             let n = self.table.nodes;
@@ -688,8 +691,8 @@ impl Model {
             self.table.write_member(self.node, node, unfenced);
             return true;
         }
-        // An unfenced node: the driver tries again every `SWEEP_NS`.
-        if member.state() == MemberState::Unfenced && now >= fence.last_try + SWEEP_NS {
+        // An unfenced node: the driver tries again every `self.table.sweep_ns`.
+        if member.state() == MemberState::Unfenced && now >= fence.last_try + self.table.sweep_ns {
             self.begin_fence(node);
             return true;
         }
@@ -716,6 +719,10 @@ impl Model {
         for z in hosted {
             let state = self.table.member(z).state();
             if matches!(state, MemberState::Dead | MemberState::Fenced) {
+                continue;
+            }
+            let sealed = self.table.beacons[z as usize].save_seal;
+            if state == MemberState::Sealed && sealed {
                 continue;
             }
             let g = self.table.generation(z);
@@ -1028,7 +1035,7 @@ impl Model {
             self.table.beacons[me as usize].panic = Some((1, member.generation()));
             self.hw_out.push(HwAction::ParkSelf { node: me });
         }
-        self.next_sweep = self.now + SWEEP_NS;
+        self.next_sweep = self.now + self.table.sweep_ns;
         self.observe_watched();
         self.end(entry);
     }

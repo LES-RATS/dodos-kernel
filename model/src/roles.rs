@@ -336,12 +336,9 @@ impl Model {
                 return true;
             }
             // Take-over: the node the role waits for is no longer live.
+            // After step 4 the role waits for the target (step 5); if the
+            // target dies, its successor takes over with a rebuild.
             let waited = match word.state() {
-                RoleState::Handing
-                    if self.table.member(word.holder()).state() == MemberState::Live =>
-                {
-                    continue;
-                }
                 RoleState::Handing => word.target(),
                 _ => word.holder(),
             };
@@ -350,11 +347,6 @@ impl Model {
                 state,
                 MemberState::Live | MemberState::Starting | MemberState::Sealing
             ) {
-                continue;
-            }
-            if word.state() == RoleState::Handing
-                && matches!(self.table.member(word.holder()).state(), MemberState::Live)
-            {
                 continue;
             }
             let classes: Vec<u8> = (0..self.table.nodes)
