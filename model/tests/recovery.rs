@@ -900,3 +900,152 @@ fn a_sealed_node_that_acknowledged_a_death_does_not_delay_the_next_one() {
     m.run(10 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
 }
+
+// Take-over of unit roles.
+
+#[test]
+fn a_unit_role_is_taken_over_settle_ns_after_the_stop_is_confirmed() {
+    let mut m = S::new();
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(NMI_GRACE_NS + MS / 5);
+    assert_eq!(m.state(1), MemberState::Fenced);
+    assert_eq!(m.sys.role(0).holder(), 1);
+    m.run(SETTLE_NS + MS / 5);
+    assert_eq!(m.sys.role(0).holder(), 0);
+}
+
+#[test]
+fn an_unfenced_holder_keeps_its_unit_roles_for_fence_ns_and_settle_ns() {
+    let mut m = S::new();
+    m.sys.hang(1, false);
+    m.sys.set_vmx(1, true);
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(FENCE_NS + MS / 5);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    assert_eq!(m.sys.role(0).holder(), 1);
+    m.run(SETTLE_NS);
+    assert_eq!(m.sys.role(0).holder(), 0);
+}
+
+#[test]
+fn the_successor_of_a_unit_role_is_the_next_live_node_of_the_best_class() {
+    // Unit role 0 is node 1's; node 2, of class 2, comes before node 0, of
+    // class 1.
+    let mut m = three();
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    assert_eq!(m.sys.role(0).holder(), 2);
+}
+
+#[test]
+fn the_rebuild_of_a_unit_keeps_only_the_entries_of_live_nodes() {
+    // Node 0 attaches a device through node 1, holder of the IOMMU role;
+    // node 2 then stops both: its rebuild drops node 0's entry, which
+    // invariant 81 would find once node 0 is dead.
+    let mut m = three();
+    m.ok(0, retype(ObjectKind::IoSpace, 0, 100));
+    let attach = Syscall::IoSpaceAttach {
+        iommu: s(19),
+        iospace: s(100),
+        device: 0x10,
+    };
+    assert_eq!(m.on_node(0, attach), WAITS);
+    m.run(MS);
+    assert_eq!(m.sys.node(0).woken(m.t[0]), Some(&DONE));
+    m.sys.hang(0, true);
+    m.ok(2, stop(1, CORE_STOP_KILL));
+    m.ok(2, stop(0, CORE_STOP_KILL));
+    m.run(20 * MS);
+    assert_eq!(
+        (m.state(0), m.state(1)),
+        (MemberState::Dead, MemberState::Dead)
+    );
+    assert_eq!(m.sys.role(0).holder(), 2);
+}
+
+#[test]
+fn a_holder_refuses_a_request_of_another_epoch_even_when_it_holds_the_role_again() {
+    let mut machine = Machine::example();
+    machine.cores[1].fence = 1;
+    let mut m = S::on(&machine);
+    // The IOMMU role is node 0's. Node 1 asks it; before the request
+    // arrives the role goes to node 1 and back to node 0.
+    m.ok(1, retype(ObjectKind::IoSpace, 0, 100));
+    let attach = Syscall::IoSpaceAttach {
+        iommu: s(18),
+        iospace: s(100),
+        device: 0x10,
+    };
+    assert_eq!(m.on_node(1, attach), WAITS);
+    let request = m
+        .sys
+        .find(|b| matches!(b, Body::UnitRequest { .. }))
+        .unwrap();
+    let held = m.sys.pending()[request].clone();
+    let hand = |n| Syscall::RoleHand {
+        role: s(IOMMU_ROLE),
+        core: core(n),
+    };
+    m.on_node(0, hand(1)).unwrap();
+    // Node 1 completes the hand-over, then hands it back.
+    for _ in 0..8 {
+        let Some(i) = m.sys.find(|b| matches!(b, Body::Handed { .. })) else {
+            break;
+        };
+        m.sys.deliver(i);
+    }
+    m.sys.recover(16);
+    // Node 1, holder now, served its own request.
+    assert_eq!(m.sys.node(1).woken(m.t[1]), Some(&DONE));
+    m.on_node(1, hand(0)).unwrap();
+    for _ in 0..8 {
+        let Some(i) = m.sys.find(|b| matches!(b, Body::Handed { .. })) else {
+            break;
+        };
+        m.sys.deliver(i);
+    }
+    m.sys.recover(16);
+    assert_eq!(m.sys.role(0).holder(), 0);
+    // The old request arrives: refused for its epoch.
+    let index = m.sys.pending().iter().position(|p| *p == held).unwrap();
+    m.sys.deliver(index);
+    assert!(
+        m.sys
+            .find(|b| matches!(b, Body::UnitAnswer { done: false, .. }))
+            .is_some()
+    );
+    m.run(MS);
+}
+
+#[test]
+fn the_nmi_handler_leaves_vmx_root_operation_so_init_stops_the_core() {
+    let mut m = S::new();
+    m.sys.set_vmx(1, true);
+    m.ok(0, stop(1, CORE_STOP_KILL));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+}
+
+#[test]
+fn a_message_of_a_node_that_is_no_longer_live_is_refused() {
+    let mut m = S::new();
+    m.ok(0, retype(Reply, 0, 99));
+    let recv = Syscall::Recv {
+        endpoint: s(START_SLOT_MAILBOX),
+        reply: s(99),
+        range: Range::NONE,
+        wait: 0,
+    };
+    assert_eq!(m.on_node(0, recv), WAITS);
+    let send = Syscall::Send {
+        target: core(0),
+        message: Message::default(),
+    };
+    assert_eq!(m.on_node(1, send), WAITS);
+    // Node 1 fails before its message arrives: node 0 accuses it, and
+    // refuses its message.
+    m.sys.panic(1, 2);
+    m.run(MS);
+    assert_eq!(m.sys.node(0).woken(m.t[0]), None);
+}

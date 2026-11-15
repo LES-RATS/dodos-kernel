@@ -920,7 +920,16 @@ impl Model {
                             && word.holder() != node
                             && word.target() != node)
                 });
-        if !dodos_abi::barrier(g, &views, units_clear) {
+        // CONTRACT-GAP (reported): the barrier does not say that the
+        // context entries of the node must be gone; when the holder of a
+        // unit is itself fenced, nobody has blocked them (R1) until its
+        // successor rebuilds the unit. The model waits for that too.
+        let blocked = self.table.units.values().all(|unit| {
+            unit.entries
+                .values()
+                .all(|&(n, generation)| n != node || generation != g)
+        });
+        if !blocked || !dodos_abi::barrier(g, &views, units_clear) {
             return false;
         }
         let dead = Member::new(MemberState::Dead, member.evidence(), member.driver(), g);
