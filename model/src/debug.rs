@@ -277,6 +277,11 @@ impl Model {
         self.table.crash.areas[self.node as usize].suppressed
     }
 
+    /// The generation in the header of a node's debug area.
+    pub fn area_generation(&self, node: u16) -> u32 {
+        self.table.crash.areas[node as usize].generation
+    }
+
     /// The record of a node a reader accepts: (generation, reason).
     pub fn crash_record(&self, node: u16) -> Option<(u32, u32)> {
         self.table
@@ -493,4 +498,20 @@ impl Model {
 /// bits 16-31.
 pub(crate) fn range_of(badge: u64) -> IoPortRange {
     IoPortRange::new(badge & 0xFFFF, badge >> 16 & 0xFFFF).unwrap_or(IoPortRange::ALL)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Machine, Model};
+
+    #[test]
+    fn failures_are_never_held_back_by_the_rate_limit() {
+        let (mut m, _) = Model::boot(&Machine::example()).unwrap();
+        for _ in 0..20 {
+            m.failed(1);
+            assert_eq!(m.check(), Ok(()));
+        }
+        let failures = m.ring(false).iter().filter(|e| e.code() == 6).count();
+        assert_eq!((failures, m.suppressed()), (20, 0));
+    }
 }

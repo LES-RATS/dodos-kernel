@@ -159,6 +159,16 @@ fn debug_write_is_judged_rights_then_length_then_the_message_page() {
     let other = k.m.object_at(k.t, s(101)).unwrap();
     assert_eq!(k.m.apply(other, write(48)), DONE);
     assert_eq!(k.m.apply(other, write(49)), Err(Error::Invalid));
+    // `entropy_read` likewise: 6 words in the registers.
+    let entropy = |length| Syscall::EntropyRead {
+        length,
+        mix: [0; 4],
+    };
+    assert!(matches!(
+        k.m.apply(other, entropy(48)),
+        Ok(Output::Bytes(_))
+    ));
+    assert_eq!(k.m.apply(other, entropy(49)), Err(Error::Invalid));
 }
 
 #[test]
@@ -536,6 +546,7 @@ fn a_node_started_fresh_keeps_its_rings_and_goes_on_from_their_sequences() {
         .map(|e| e.generation())
         .collect();
     assert_eq!(starts, vec![1, 2]);
+    assert_eq!(sys.node(1).area_generation(1), 2);
     assert_eq!(sys.node(0).crash_record(1), Some((1, 5)));
     let _ = (Endpoint, Task);
 }
@@ -683,4 +694,19 @@ fn calls_on_debug_and_ioports_of_another_node_run_on_the_callers_node() {
     assert_eq!(sys.apply(1, t[1], port), DONE);
     assert_eq!(sys.pending().len(), before);
     assert_eq!(sys.check(), Ok(()));
+}
+
+#[test]
+fn a_change_of_a_role_word_is_traced_by_the_node_that_made_it() {
+    let mut k = K::new();
+    assert!(matches!(
+        k.go(Syscall::RoleClaim(s(23))),
+        Ok(Output::Epoch(_))
+    ));
+    let last = *k.kernel().last().unwrap();
+    assert_eq!((last.code(), last.payload[2]), (9, 1));
+    assert_eq!(
+        dodos_abi::RoleWord::from_raw(last.payload[1]).map(|w| w.holder()),
+        Some(0)
+    );
 }
