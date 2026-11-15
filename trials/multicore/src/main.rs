@@ -1,7 +1,8 @@
 //! Measured trial for the DodOS kernel: may a node run on more than one core
 //! at the same time? See README.md for the method.
 //!
-//! Usage: dodos-trial-multicore [--suites locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf]
+//! Usage: dodos-trial-multicore
+//!        [--suites locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf,a1t,a2t,a3t,ct]
 //!        [--reps N]
 //!        [--ms N] [--max-k N] [--lock ttas|ticket|queue] [--csv FILE]
 
@@ -10,7 +11,7 @@ mod platform;
 mod sim;
 mod sync;
 
-use sim::{Adds, CLASSES, Cand, Initiators, Irq, Lookup, Params, RunOut, Workload};
+use sim::{Adds, CLASSES, Cand, Initiators, Irq, Locks, Lookup, Params, RunOut, Workload};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -37,7 +38,8 @@ fn parse_lock(s: &str) -> LockKind {
 fn opts(cores: usize) -> Opts {
     let mut o = Opts {
         suites: [
-            "locks", "a1", "a2", "a3", "b", "c", "d", "a1f", "a2f", "a3f", "bf", "cf",
+            "locks", "a1", "a2", "a3", "b", "c", "d", "a1f", "a2f", "a3f", "bf", "cf", "a1t",
+            "a2t", "a3t", "ct",
         ]
         .map(String::from)
         .to_vec(),
@@ -66,7 +68,7 @@ fn opts(cores: usize) -> Opts {
                     (0..CLASSES).map(|c| format!("c{c}_n,c{c}_p50,c{c}_p99,c{c}_p999,c{c}_max"));
                 let head = "suite,rep,labels,column,workload,k,n,lock,work_ns,gap_ns,ipi_ns,change_pct,migrations,stalls,ops_per_s";
                 let classes: Vec<String> = classes.collect();
-                let tail = "samples,preferred,lookup,adds,replica_pct,irq,retries";
+                let tail = "samples,preferred,lookup,adds,replica_pct,irq,retries,locks";
                 writeln!(f, "{head},{},{tail}", classes.join(",")).expect("CSV write");
                 o.csv = Some(f);
             }
@@ -100,6 +102,7 @@ struct Variant {
     adds: Adds,
     replica_pct: u64,
     irq: Irq,
+    locks: Locks,
 }
 
 /// The settings of the first measurement.
@@ -108,6 +111,7 @@ const FIRST: Variant = Variant {
     adds: Adds::Eager,
     replica_pct: 100,
     irq: Irq::PerBatch,
+    locks: Locks::Group,
 };
 
 /// Each unfairness of the first measurement removed.
@@ -116,6 +120,15 @@ const FAIR: Variant = Variant {
     adds: Adds::Lazy,
     replica_pct: 25,
     irq: Irq::PerBatch,
+    locks: Locks::Group,
+};
+
+/// The third series: fine locks in a group, and a lock-free read of one
+/// slot. Candidate 1 keeps `FIRST` and `FAIR` (it has no lock).
+const FINE: Variant = Variant {
+    lookup: Lookup::Slot,
+    locks: Locks::Fine,
+    ..FAIR
 };
 
 fn col(name: &str, cand: Cand, lock: LockKind, v: Variant) -> Col {
@@ -243,8 +256,8 @@ impl Bench {
         let v = col.v;
         let _ = writeln!(
             f,
-            "{line},{},{},{:?},{:?},{},{:?},{}",
-            r.samples, r.preferred, v.lookup, v.adds, v.replica_pct, v.irq, r.retries
+            "{line},{},{},{:?},{:?},{},{:?},{},{:?}",
+            r.samples, r.preferred, v.lookup, v.adds, v.replica_pct, v.irq, r.retries, v.locks
         );
     }
 
@@ -277,6 +290,7 @@ impl Bench {
                         adds: col.v.adds,
                         replica_pct: col.v.replica_pct,
                         irq: col.v.irq,
+                        locks: col.v.locks,
                         ..row.p
                     };
                     let r = sim::run(row.w, col.cand, row.k, row.n, p, &self.cpus);
@@ -370,6 +384,7 @@ fn base(o: &Opts) -> Params {
         adds: FIRST.adds,
         replica_pct: FIRST.replica_pct,
         irq: FIRST.irq,
+        locks: FIRST.locks,
         warmup: Duration::from_millis(20),
         dur: o.dur,
     }
@@ -833,6 +848,167 @@ fn run_suite(b: &mut Bench, name: &str) {
             ];
             b.suite(
                 "cf: k-thread process beside single-thread ones, first and fair settings",
+                &["n", "W ns", "k"],
+                rows,
+                cols,
+                &m,
+            );
+        }
+        "a1t" => {
+            let mut rows = Vec::new();
+            for change in [1, 10] {
+                for ipi in IPIS {
+                    for w in WORKS {
+                        for &k in ks.iter().filter(|&&k| k >= 2) {
+                            let p = Params {
+                                work_ns: w,
+                                ipi_ns: ipi,
+                                change_pct: change,
+                                ..p0
+                            };
+                            let l = vec![
+                                change.to_string(),
+                                ipi.to_string(),
+                                w.to_string(),
+                                k.to_string(),
+                            ];
+                            rows.push(row(l, Workload::CapOps, k, k, p));
+                        }
+                    }
+                }
+            }
+            let slot = Variant {
+                lookup: Lookup::Slot,
+                ..FAIR
+            };
+            let cols = vec![
+                col("1 first", Cand::PerCore, l, FIRST),
+                col("1 fair", Cand::PerCore, l, FAIR),
+                col("2/2 fair", Cand::Fixed(2), l, FAIR),
+                col("2/2 fine", Cand::Fixed(2), l, FINE),
+                col("2/4 fair", Cand::Fixed(4), l, FAIR),
+                col("2/4 fine", Cand::Fixed(4), l, FINE),
+                col("3 fair", Cand::Sized, l, FAIR),
+                col("3 slot read", Cand::Sized, l, slot),
+                col("3 fine", Cand::Sized, l, FINE),
+            ];
+            let m = [
+                (
+                    "Throughput, operations/s, median (min–max)",
+                    Metric::Rate(0b1011),
+                ),
+                (
+                    "Lookup latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(0),
+                ),
+                ("Delete (removal) latency, µs", lat(1)),
+                ("Derive (addition) latency, µs", lat(3)),
+            ];
+            let heads = ["change %", "ipi ns", "W ns", "k"];
+            b.suite(
+                "a1t: capability operations, fine group locks",
+                &heads,
+                rows,
+                cols,
+                &m,
+            );
+        }
+        "a2t" | "a3t" => {
+            let w = if name == "a2t" {
+                Workload::Ipc
+            } else {
+                Workload::Signal
+            };
+            let mut rows = Vec::new();
+            for ipi in IPIS {
+                for work in WORKS {
+                    for &k in &even {
+                        let p = Params {
+                            work_ns: work,
+                            ipi_ns: ipi,
+                            ..p0
+                        };
+                        rows.push(row(
+                            vec![ipi.to_string(), work.to_string(), k.to_string()],
+                            w,
+                            k,
+                            k,
+                            p,
+                        ));
+                    }
+                }
+            }
+            let per_msg = Variant {
+                irq: Irq::PerMessage,
+                ..FAIR
+            };
+            let cols = vec![
+                col("1 batched", Cand::PerCore, l, FAIR),
+                col("1 irq/msg", Cand::PerCore, l, per_msg),
+                col("2/2 group lock", Cand::Fixed(2), l, FAIR),
+                col("2/2 fine", Cand::Fixed(2), l, FINE),
+                col("2/4 group lock", Cand::Fixed(4), l, FAIR),
+                col("2/4 fine", Cand::Fixed(4), l, FINE),
+                col("3 group lock", Cand::Sized, l, FAIR),
+                col("3 fine", Cand::Sized, l, FINE),
+            ];
+            let (title, what) = if name == "a2t" {
+                ("a2t: IPC call and reply, lock per endpoint", "Round trip")
+            } else {
+                (
+                    "a3t: k-1 threads signal one notify, lock per notify",
+                    "Signal call",
+                )
+            };
+            let lt = format!("{what} latency, µs: p50 / p99 / p99.9 (p99.9 min–max)");
+            let m = [
+                (
+                    "Throughput, operations/s, median (min–max)",
+                    Metric::Rate(0b1),
+                ),
+                (lt.as_str(), lat(0)),
+            ];
+            b.suite(title, &["ipi ns", "W ns", "k"], rows, cols, &m);
+        }
+        "ct" => {
+            let mut rows = Vec::new();
+            let big = b.o.max_k;
+            for n in [4.min(big), big] {
+                for work in [200, 1000] {
+                    for k in [1, 2, 3, 5, 6].into_iter().filter(|&k| k < n) {
+                        let p = Params {
+                            work_ns: work,
+                            ..p0
+                        };
+                        rows.push(row(
+                            vec![n.to_string(), work.to_string(), k.to_string()],
+                            Workload::Mixed,
+                            k,
+                            n,
+                            p,
+                        ));
+                    }
+                }
+            }
+            let cols = vec![
+                col("1 first", Cand::PerCore, l, FIRST),
+                col("1 fair", Cand::PerCore, l, FAIR),
+                col("2/2 fair", Cand::Fixed(2), l, FAIR),
+                col("2/2 fine", Cand::Fixed(2), l, FINE),
+                col("2/4 fair", Cand::Fixed(4), l, FAIR),
+                col("2/4 fine", Cand::Fixed(4), l, FINE),
+                col("3 fair", Cand::Sized, l, FAIR),
+                col("3 fine", Cand::Sized, l, FINE),
+            ];
+            let m = [
+                (
+                    "Independent processes: lookup latency, µs: p50 / p99 / p99.9 (p99.9 min–max)",
+                    lat(2),
+                ),
+                ("The k-thread process: operations/s", Metric::Rate(0b1011)),
+            ];
+            b.suite(
+                "ct: k-thread process beside single-thread ones, fine group locks",
                 &["n", "W ns", "k"],
                 rows,
                 cols,

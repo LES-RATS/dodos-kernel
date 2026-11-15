@@ -18,15 +18,15 @@ runs (`--csv` output) are in `data/`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--suites` | `locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf` | Which workloads to run (the `f` suites are the second measurement, below) |
+| `--suites` | `locks,a1,a2,a3,b,c,d,a1f,a2f,a3f,bf,cf,a1t,a2t,a3t,ct` | Which workloads to run (`f`: second measurement, `t`: third, below) |
 | `--reps` | 5 | Repetitions of every cell; the tables give the median and the range |
 | `--ms` | 150 | Measured time of one run (after 20 ms of warm-up) |
 | `--max-k` | cores - 2 | Largest number of cores given to the multithreaded process |
 | `--lock` | `queue` | Lock of the group candidates: `ttas`, `ticket` or `queue` |
 | `--csv` | none | One line per run, every class, for later analysis |
 
-A full run takes about 40 minutes on 10 cores (15 for the first seven
-suites, 23 for the `f` suites). Markdown goes to standard
+A full run takes about 55 minutes on 10 cores (15 for the first seven
+suites, 23 for the `f` suites, 16 for the `t` suites). Markdown goes to standard
 output, progress to standard error.
 
 On Linux the bench pins worker `i` to the `i`-th physical core (the first
@@ -175,6 +175,29 @@ pass ("first" = as in the first measurement, "fair" = every switch on).
    switch adds the pessimistic setting, one `ipi` per message, to show what
    batching is worth.
 
+## Switches (third measurement): finer locks in a group
+
+The second measurement left every write of a group under one lock. The
+third adds the locks a real group kernel would plausibly have, as one more
+switch (`Locks::Fine`), and shortens the lock-free lookup to one slot read
+(`Lookup::Slot`). Candidate 1 keeps its first and fair settings unchanged
+(it has no lock to refine). Each fine lock is legal only if the kernel
+guarantees what is listed with it; the bench assumes these guarantees, it
+does not check them.
+
+| Lock | Used by | What a real kernel must guarantee for it to be legal |
+|---|---|---|
+| One per endpoint | IPC: both halves of a call and of a reply take the lock of the server's endpoint, and work on its own lines | The endpoint lock covers its queue of callers and receivers and the reply objects armed through it; a thread waits on one object at a time, and its state is changed only under that object's lock or by its own core; run queues are per core, and a wake-up of another core goes through a lock-free mailbox and an interrupt; the capability lookup before the call is lock-free (below); destroying an endpoint drains its queues under its lock; lock order is object, then group lock (taken only to send a message to another group) |
+| One per notification object | Signals: the check half is a lock-free slot read plus `W/2` with no lock; the apply half and the waiter's half take the notify's lock | As for endpoints; and the receive path on a node takes the group lock before the notify lock (the only place both are held in that order), so no sender may wait for a group lock while it holds a notify lock; binding a notify to an endpoint must take both locks in a fixed order |
+| One per slot range of a capability space (8 ranges) | Capability changes inside one group: a change takes the locks of the two ranges it writes, in index order, and no group lock | A change writes only those two ranges: a derive (source and destination slots, and the derivation link between them) and a delete of a capability with no descendants; a delete or revoke of a subtree crosses ranges without bound and needs a lock of the whole space (or hand-over-hand locking along the tree), which is not measured; a transfer of capabilities by IPC between two spaces takes their range locks in a global order; slots are type-stable memory so a lock-free reader never follows a freed slot |
+| Lock-free read of one slot | Lookups, and the check half of a signal | The read is a seqlock on the slot's range: the writer makes the counter odd, writes, makes it even; the reader rereads if the counter was odd or moved. The rest of the call's `W` runs after the read, on state the calling thread owns |
+
+Unchanged with `Locks::Fine`: an unmap (it changes the page tables of the
+whole address space and keeps the group lock; `b` is therefore not rerun),
+and a capability change of a process spread over several groups (candidate
+2 with k larger than the group), whose protocol between groups keeps the
+group lock.
+
 Latency classes since the second measurement: 0 lookups; 1 deletes (and, in
 `b`, unmaps); 2 lookups of the independent processes (`c`); 3 derives.
 
@@ -191,6 +214,7 @@ Latency classes since the second measurement: 0 lookups; 1 deletes (and, in
 | `d` | Candidate 3: group A (core 0) and group B (core 1), and core 2 that moves from one to the other 0, 100, 1000 or 10 000 times per second; 1 % of operations are unmaps inside the group | Move latency (class 1), first operation after a move (class 2), other operations (class 0), total throughput | What a move costs and how often it can be afforded. A and B alternate between one and two cores, so the load is the same with and without moves |
 | `a1f`, `bf`, `cf` | As `a1`, `b`, `c` (k ≥ 2 for `a1f`), each candidate with the first and the fair settings; `a1f` also turns each switch of candidate 1 on alone | As above, plus repeated seqlock reads | Whether the conclusions survive removing the unfair points |
 | `a2f`, `a3f` | As `a2`, `a3`; candidate 1 with interrupts per batch and per message | As above | Only the interrupt switch applies to IPC and signals |
+| `a1t`, `a2t`, `a3t`, `ct` | As the `f` suites; groups with the group lock and with fine locks, candidate 1 with its first and fair settings | As above | Whether finer locks change the rows candidate 1 kept |
 
 Latencies are per operation, from the caller's side, in µs: p50 / p99 /
 p99.9, the median over the repetitions, with the range of the p99.9 over the

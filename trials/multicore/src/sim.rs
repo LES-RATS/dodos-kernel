@@ -64,6 +64,8 @@ pub struct Params {
     pub replica_pct: u64,
     /// How interrupts are charged to a core reached while in user code.
     pub irq: Irq,
+    /// Which lock a write takes in a group of several cores.
+    pub locks: Locks,
     pub warmup: Duration,
     pub dur: Duration,
 }
@@ -75,8 +77,22 @@ pub enum Lookup {
     Locked,
     /// No lock: a sequence counter per capability space, which writers make
     /// odd while they change it; a reader that sees it odd, or changed when
-    /// it has finished, reads again.
+    /// it has finished, reads again. The read section is the whole `W`.
     Seqlock,
+    /// No lock, and the read section is one slot: a sequence counter per
+    /// slot range; the rest of the call's `W` runs after the read.
+    Slot,
+}
+
+/// The locks of a group kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Locks {
+    /// One lock per group for every write.
+    Group,
+    /// A lock per endpoint or notification object for IPC and signals, and
+    /// per slot range of a capability space for changes inside one group.
+    /// Messages between groups, and every unmap, keep the group lock.
+    Fine,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,6 +157,10 @@ const LINES: usize = 4;
 /// Lines of node state per process, and processes whose lines are distinct.
 const PROC_LINES: usize = 16;
 const PROC_REGIONS: usize = 4;
+/// Slot ranges of a capability space: each owns 2 of its 16 lines.
+const STRIPES: usize = 8;
+/// Lines of an endpoint or notification object.
+const OBJ_LINES: usize = 4;
 /// A user gap is cut in slices, with a poll (an interrupt) between slices.
 const SLICE_NS: u64 = 100;
 /// A wait longer than this is a bug of the simulation, never a result.
@@ -200,6 +220,10 @@ enum Copy {
 
 struct Node {
     lock: crate::sync::Lock,
+    locked: bool,
+    /// Lock and sequence counter of each slot range of each process region.
+    stripe_locks: Box<[crate::sync::Lock]>,
+    stripe_seqs: Box<[Padded<AtomicU64>]>,
     state: Box<[Padded<AtomicU64>]>,
     /// Sequence counter of each process region (capability space).
     seqs: Box<[Padded<AtomicU64>]>,
@@ -219,6 +243,9 @@ struct Machine {
     proc_cores: Vec<Vec<usize>>,
     proc_home: Vec<usize>,
     roles: Vec<Role>,
+    /// The endpoint or notification object each core owns, with its lock.
+    obj_locks: Box<[crate::sync::Lock]>,
+    obj_state: Box<[Padded<AtomicU64>]>,
     mbox_tlb: Box<[Padded<AtomicU64>]>,
     mbox_ev: Box<[Padded<AtomicU64>]>,
     waits: Box<[Padded<AtomicU64>]>,
@@ -331,6 +358,13 @@ impl Machine {
             .enumerate()
             .map(|(i, &l)| Node {
                 lock: crate::sync::Lock::new(if l { p.lock } else { LockKind::None }),
+                locked: l,
+                stripe_locks: (0..PROC_REGIONS * STRIPES)
+                    .map(|_| crate::sync::Lock::new(if l { p.lock } else { LockKind::None }))
+                    .collect(),
+                stripe_seqs: (0..PROC_REGIONS * STRIPES)
+                    .map(|_| Padded::default())
+                    .collect(),
                 state: (0..PROC_LINES * PROC_REGIONS)
                     .map(|_| Padded::default())
                     .collect(),
@@ -344,8 +378,19 @@ impl Machine {
             })
             .collect();
         let pad = |_| Padded::default();
+        let obj_locks = (0..n)
+            .map(|c| {
+                crate::sync::Lock::new(if locked[node_of[c]] {
+                    p.lock
+                } else {
+                    LockKind::None
+                })
+            })
+            .collect();
         Machine {
             nodes,
+            obj_locks,
+            obj_state: (0..n * OBJ_LINES).map(pad).collect(),
             node_of: node_of.into_iter().map(AtomicUsize::new).collect(),
             proc_of,
             proc_nodes,
@@ -434,6 +479,83 @@ impl<'m> Core<'m> {
         }
         self.out.touches += lines as u64;
         busy(ns);
+    }
+
+    /// Whether this core's writes take the fine locks: only in a group.
+    fn fine(&self) -> bool {
+        self.m.p.locks == Locks::Fine && self.m.nodes[self.node].locked
+    }
+
+    /// The lock of the object `owner` owns (its endpoint or notify), or the
+    /// group lock with coarse locks.
+    fn obj_lock(&self, owner: usize) -> Guard<'m> {
+        if self.fine() {
+            self.m.obj_locks[owner].lock()
+        } else {
+            self.lock()
+        }
+    }
+
+    /// Work on the object `owner` owns: its own lines with fine locks, the
+    /// node state of its process with coarse ones (as in earlier series).
+    fn obj_work(&mut self, owner: usize, lines: usize, ns: u64) {
+        if !self.fine() {
+            return self.work(self.m.proc_of[owner], lines, ns);
+        }
+        let start = self.rand() as usize;
+        for j in 0..lines {
+            let l = &self.m.obj_state[owner * OBJ_LINES + (start + j) % OBJ_LINES];
+            l.store(l.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
+        self.out.touches += lines as u64;
+        busy(ns);
+    }
+
+    /// Half an IPC or signal operation on `owner`'s object, under its lock.
+    fn half_obj(&mut self, owner: usize) {
+        let _g = self.obj_lock(owner);
+        self.obj_work(owner, LINES / 2, self.m.p.work_ns / 2);
+    }
+
+    /// How a send is made: under the group lock already held (coarse), or
+    /// taking it for the ring only (fine: an object lock is held instead).
+    fn held(&self) -> Held {
+        if self.fine() { Held::No } else { Held::Yes }
+    }
+
+    /// Two slot ranges, in lock order (one if both are the same).
+    fn stripes(&mut self) -> (usize, usize) {
+        let a = self.rand() as usize % STRIPES;
+        let b = self.rand() as usize % STRIPES;
+        (a.min(b), a.max(b))
+    }
+
+    /// Writes two slot ranges of `pr`'s capability space on this node
+    /// (2 lines each), inside the write side of both seqlocks: the one of
+    /// the space and the one of each range. The caller holds the locks.
+    fn write_stripes(&mut self, pr: usize, (a, b): (usize, usize), ns: u64) {
+        let node = &self.m.nodes[self.node];
+        let region = pr % PROC_REGIONS;
+        let seqs = [
+            Some(&node.seqs[region]),
+            Some(&node.stripe_seqs[region * STRIPES + a]),
+            (b != a).then(|| &node.stripe_seqs[region * STRIPES + b]),
+        ];
+        for q in seqs.iter().flatten() {
+            q.store(q.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
+        fence(Ordering::Release);
+        for st in [a, b] {
+            for j in 0..2 {
+                let l = &node.state[region * PROC_LINES + st * 2 + j];
+                l.store(l.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            }
+        }
+        self.out.touches += LINES as u64;
+        busy(ns);
+        for q in seqs.iter().flatten() {
+            q.store(q.load(Ordering::Relaxed) + 1, Ordering::Release);
+        }
     }
 
     fn timed(&mut self, class: usize, op: impl FnOnce(&mut Self)) {
@@ -526,7 +648,11 @@ impl<'m> Core<'m> {
                 m.mbox_ev[a].fetch_or(1 << b, Ordering::Release);
             }
             SIGNAL => {
-                self.work(m.proc_of[b], LINES / 2, m.p.work_ns / 2);
+                // Node lock, then object lock: the only place both are held
+                // in that order; a sender holding an object lock never
+                // waits for this node's lock while holding a notify's.
+                let _g = self.fine().then(|| m.obj_locks[a].lock());
+                self.obj_work(a, LINES / 2, m.p.work_ns / 2);
                 m.mbox_ev[a].fetch_or(1 << b, Ordering::Release);
             }
             _ => unreachable!("message kind {}", msg.kind),
@@ -572,12 +698,8 @@ impl<'m> Core<'m> {
             Copy::Home => m.p.work_ns,
             Copy::Replica => m.p.work_ns * m.p.replica_pct / 100,
         };
-        let seq = &m.nodes[self.node].seqs[pr % PROC_REGIONS];
-        let s = seq.load(Ordering::Relaxed);
-        seq.store(s + 1, Ordering::Relaxed);
-        fence(Ordering::Release);
-        self.work(pr, LINES, ns);
-        seq.store(s + 2, Ordering::Release);
+        let st = self.stripes();
+        self.write_stripes(pr, st, ns);
         m.nodes[self.node].applied[pr].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -634,8 +756,11 @@ impl<'m> Core<'m> {
             Change::CapAdd | Change::CapRemove => m.proc_nodes[pr].len(),
             Change::Unmap => m.proc_cores[pr].len(),
         };
-        m.waits[self.id].store(expected as u64, Ordering::Relaxed);
         self.out.changes[pr] += 1;
+        if self.fine() && change != Change::Unmap && m.proc_nodes[pr].len() == 1 {
+            return self.fine_change(pr);
+        }
+        m.waits[self.id].store(expected as u64, Ordering::Relaxed);
         let home = m.proc_home[pr];
         if self.node == home {
             let _g = self.lock();
@@ -651,6 +776,20 @@ impl<'m> Core<'m> {
         self.wait_acks();
     }
 
+    /// A capability change inside one group with fine locks: the locks of
+    /// the two slot ranges it writes, in order, and no group lock. Legal
+    /// only if the change touches nothing outside those ranges (below).
+    fn fine_change(&mut self, pr: usize) {
+        let m = self.m;
+        let (a, b) = self.stripes();
+        let locks = &m.nodes[self.node].stripe_locks;
+        let region = pr % PROC_REGIONS;
+        let _ga = locks[region * STRIPES + a].lock();
+        let _gb = (b != a).then(|| locks[region * STRIPES + b].lock());
+        self.write_stripes(pr, (a, b), m.p.work_ns);
+        m.nodes[self.node].applied[pr].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn wait_acks(&mut self) {
         let since = Instant::now();
         while self.m.waits[self.id].load(Ordering::Acquire) != 0 {
@@ -660,11 +799,42 @@ impl<'m> Core<'m> {
     }
 
     fn lookup(&mut self) {
-        if self.m.p.lookup == Lookup::Seqlock {
-            return self.read_lookup();
+        match self.m.p.lookup {
+            Lookup::Locked => {
+                let _g = self.lock();
+                self.work(self.proc, LINES, self.m.p.work_ns);
+            }
+            Lookup::Seqlock => self.read_lookup(),
+            Lookup::Slot => {
+                self.slot_read();
+                busy(self.m.p.work_ns);
+            }
         }
-        let _g = self.lock();
-        self.work(self.proc, LINES, self.m.p.work_ns);
+    }
+
+    /// One slot read under the seqlock of its range: the lock-free read of
+    /// a capability, retried if a writer of that range came in.
+    fn slot_read(&mut self) {
+        let m = self.m;
+        let node = &m.nodes[self.node];
+        let region = self.proc % PROC_REGIONS;
+        let st = self.rand() as usize % STRIPES;
+        let seq = &node.stripe_seqs[region * STRIPES + st];
+        loop {
+            let s = seq.load(Ordering::Acquire);
+            if !s.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            black_box(node.state[region * PROC_LINES + st * 2].load(Ordering::Relaxed));
+            fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == s {
+                return;
+            }
+            if m.phase.load(Ordering::Relaxed) == MEASURE {
+                self.out.retries += 1;
+            }
+        }
     }
 
     /// A lookup that takes no lock: it only reads its lines, and pays what
@@ -730,8 +900,8 @@ impl<'m> Core<'m> {
         }
     }
 
-    /// Makes `target` runnable with an event from this core; lock held.
-    fn deliver(&self, target: usize, kind: u64) {
+    /// Makes `target` runnable with an event from this core.
+    fn deliver(&self, target: usize, kind: u64, held: Held) {
         let m = self.m;
         let to = m.node_of(target);
         if to == self.node {
@@ -742,7 +912,10 @@ impl<'m> Core<'m> {
                 a: target as u64,
                 b: self.id as u64,
             };
-            self.push(to, msg);
+            match held {
+                Held::Yes => self.push(to, msg),
+                Held::No => self.send(to, msg),
+            }
         }
     }
 
@@ -768,11 +941,6 @@ impl<'m> Core<'m> {
         }
     }
 
-    fn half_op(&mut self) {
-        let _g = self.lock();
-        self.work(self.proc, LINES / 2, self.m.p.work_ns / 2);
-    }
-
     fn cap_op(&mut self) {
         if self.rand() % 100 < self.m.p.change_pct {
             if self.rand().is_multiple_of(2) {
@@ -791,12 +959,12 @@ impl<'m> Core<'m> {
             self.user(m.p.gap_ns);
             self.timed(0, |c| {
                 {
-                    let _g = c.lock();
-                    c.work(c.proc, LINES / 2, m.p.work_ns / 2);
-                    c.deliver(server, EVENT);
+                    let _g = c.obj_lock(server);
+                    c.obj_work(server, LINES / 2, m.p.work_ns / 2);
+                    c.deliver(server, EVENT, c.held());
                 }
                 c.wait_event(|_| false);
-                c.half_op();
+                c.half_obj(server);
             });
         }
         m.bye[server].store(true, Ordering::Release);
@@ -805,11 +973,11 @@ impl<'m> Core<'m> {
     fn server(&mut self, client: usize) {
         let m = self.m;
         while self.wait_event(|c| m.bye[c.id].load(Ordering::Acquire)) != 0 {
-            self.half_op();
+            self.half_obj(self.id);
             self.user(m.p.gap_ns);
-            let _g = self.lock();
-            self.work(self.proc, LINES / 2, m.p.work_ns / 2);
-            self.deliver(client, EVENT);
+            let _g = self.obj_lock(self.id);
+            self.obj_work(self.id, LINES / 2, m.p.work_ns / 2);
+            self.deliver(client, EVENT, self.held());
         }
     }
 
@@ -820,19 +988,33 @@ impl<'m> Core<'m> {
         while self.running() {
             self.user(m.p.gap_ns);
             self.timed(0, |c| {
+                if c.fine() {
+                    // The check is a lookup: lock-free. Only the apply takes
+                    // the notify's lock.
+                    c.slot_read();
+                    busy(m.p.work_ns / 2);
+                    if m.node_of(waiter) == c.node {
+                        let _g = c.obj_lock(waiter);
+                        c.obj_work(waiter, LINES / 2, m.p.work_ns / 2);
+                        c.deliver(waiter, SIGNAL, Held::No);
+                    } else {
+                        c.deliver(waiter, SIGNAL, Held::No);
+                    }
+                    return;
+                }
                 let _g = c.lock();
                 c.work(c.proc, LINES / 2, m.p.work_ns / 2);
                 if m.node_of(waiter) == c.node {
                     c.work(c.proc, LINES / 2, m.p.work_ns / 2);
                 }
-                c.deliver(waiter, SIGNAL);
+                c.deliver(waiter, SIGNAL, Held::Yes);
             });
         }
     }
 
     fn waiter(&mut self) {
         while self.wait_event(|c| !c.running()) != 0 {
-            self.half_op();
+            self.half_obj(self.id);
         }
     }
 
@@ -1019,6 +1201,7 @@ fn check(m: &Machine, outs: &[CoreOut]) {
         .nodes
         .iter()
         .flat_map(|n| n.state.iter())
+        .chain(m.obj_state.iter())
         .map(|l| l.load(Ordering::Relaxed))
         .sum();
     assert_eq!(touched, counted, "a lock let two cores in");
@@ -1033,7 +1216,7 @@ fn check(m: &Machine, outs: &[CoreOut]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adds, Cand, Initiators, Irq, Lookup, Params, Workload, run};
+    use super::{Adds, Cand, Initiators, Irq, Locks, Lookup, Params, Workload, run};
     use crate::sync::LockKind;
     use std::time::Duration;
 
@@ -1046,10 +1229,11 @@ mod tests {
             switch_ns: 100,
             change_pct: 30,
             lock,
-            lookup: Lookup::Seqlock,
+            lookup: Lookup::Slot,
             adds: Adds::Lazy,
             replica_pct: 25,
             irq: Irq::PerMessage,
+            locks: Locks::Fine,
             warmup: Duration::from_millis(1),
             dur: Duration::from_millis(5),
         }
@@ -1062,6 +1246,16 @@ mod tests {
             adds: Adds::Eager,
             replica_pct: 100,
             irq: Irq::PerBatch,
+            locks: Locks::Group,
+            ..params(lock)
+        }
+    }
+
+    /// The second series' fair settings: whole-call seqlock, group locks.
+    fn second(lock: LockKind) -> Params {
+        Params {
+            lookup: Lookup::Seqlock,
+            locks: Locks::Group,
             ..params(lock)
         }
     }
@@ -1078,7 +1272,7 @@ mod tests {
             Workload::Unmap(Initiators::One),
             Workload::Unmap(Initiators::All),
         ];
-        for make in [first, params] {
+        for make in [first, second, params] {
             for w in works {
                 for cand in [Cand::PerCore, Cand::Fixed(2), Cand::Sized] {
                     let r = run(w, cand, 4, 4, make(LockKind::Queue), &[]);
