@@ -99,3 +99,13 @@ pub fn map(i: u64, phys: u64, flags: u64) {
     unsafe { window_pte(i).write_volatile(phys & ADDR | flags) };
     x86::invlpg(window_va(i));
 }
+
+/// A cleared 4 KB frame from the heap (identity mapped: its address is its
+/// physical address), never freed.
+pub fn frame() -> u64 {
+    let l = core::alloc::Layout::from_size_align(4096, 4096).expect("layout");
+    // SAFETY: a non-zero layout; the frame is leaked on purpose.
+    let p = unsafe { alloc::alloc::alloc_zeroed(l) };
+    assert!(!p.is_null(), "out of frames");
+    p as u64
+}

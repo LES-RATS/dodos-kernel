@@ -22,7 +22,7 @@ $mt mmd -i "$out/stick.img" ::/EFI ::/EFI/BOOT ::/DODOS
 $mt mcopy -i "$out/stick.img" "$here/image/target/x86_64-unknown-uefi/release/dodos-trial-desktop.efi" ::/EFI/BOOT/BOOTX64.EFI
 $mt mcopy -i "$out/stick.img" "$config" ::/DODOS/CONFIG.TXT
 cp "$share/edk2-i386-vars.fd" "$out/vars.fd"
-"$qemu" -machine q35 -cpu max -smp "${SMP:-12,sockets=1,cores=6,threads=2}" -m 2G \
+"$qemu" -machine q35 -cpu "${CPU:-max,vendor=GenuineIntel,+pcid,+invpcid,+tsc-deadline}" -smp "${SMP:-12,sockets=1,cores=6,threads=2}" -m 2G \
 	-drive if=pflash,format=raw,readonly=on,file="$share/edk2-x86_64-code.fd" \
 	-drive if=pflash,format=raw,file="$out/vars.fd" \
 	-drive file="$out/stick.img",format=raw,media=disk \

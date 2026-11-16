@@ -176,6 +176,7 @@ fn write_all(f: *mut File, bytes: &[u8]) -> bool {
 /// Prints a line on the screen and the serial port and queues it for the
 /// results file.
 pub fn line(s: &str) {
+    assert!(crate::run::is_bsp(), "con::line called on another core: {s}");
     let mut con = CON.lock().expect("console");
     let Some(c) = con.as_mut() else { return };
     c.screen(s);

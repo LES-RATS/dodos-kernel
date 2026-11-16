@@ -11,8 +11,10 @@ extern crate alloc;
 
 mod acpi;
 mod apic;
+mod clock;
 mod con;
 mod efi;
+mod gate;
 mod heap;
 mod identity;
 mod idt;

@@ -156,19 +156,22 @@ pub fn safe_rdmsr(msr: u32) -> Result<u64, Fault> {
 pub unsafe fn safe_wrmsr(msr: u32, v: u64) -> Result<(), Fault> {
     let f: u64;
     // SAFETY: as `safe_rdmsr`; the caller vouches for the write's effect.
+    // The recovery address goes through a scratch register: EAX and EDX
+    // already hold the value.
     unsafe {
         asm!(
             "mov qword ptr gs:[{fv}], 0",
-            "lea rax, [rip + 2f]",
-            "mov gs:[{fr}], rax",
+            "lea {t}, [rip + 2f]",
+            "mov gs:[{fr}], {t}",
             "wrmsr",
             "2:",
             "mov qword ptr gs:[{fr}], 0",
             "mov {f}, gs:[{fv}]",
             fr = const crate::percpu::FIXUP_RIP,
             fv = const crate::percpu::FIXUP_VECTOR,
+            t = out(reg) _,
             f = out(reg) f,
-            in("ecx") msr, inout("eax") v as u32 => _, in("edx") (v >> 32) as u32,
+            in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32,
             options(nostack)
         )
     };

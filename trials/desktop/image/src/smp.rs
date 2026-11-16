@@ -103,6 +103,9 @@ struct Ctl {
     done: AtomicU64,
     job_data: AtomicUsize,
     job_vtable: AtomicUsize,
+    /// The last progress mark of the core's job (a `&'static str`).
+    mark_ptr: AtomicUsize,
+    mark_len: AtomicUsize,
     panic: [AtomicU64; 32],
 }
 
@@ -113,6 +116,8 @@ static CTL: [Ctl; MAX_CORES] = [const {
         done: AtomicU64::new(0),
         job_data: AtomicUsize::new(0),
         job_vtable: AtomicUsize::new(0),
+        mark_ptr: AtomicUsize::new(0),
+        mark_len: AtomicUsize::new(0),
         panic: [const { AtomicU64::new(0) }; 32],
     }
 }; MAX_CORES];
@@ -245,6 +250,39 @@ pub fn serve(i: usize) -> ! {
     }
 }
 
+/// Records where the calling core's job is; a timeout reports it.
+/// With `debug=1`, each mark is also written to COM1 directly (safe from
+/// any core, unlike the console), to find where a core stops.
+pub static DEBUG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn mark(what: &'static str) {
+    let i = percpu::my_index();
+    if DEBUG.load(Ordering::Relaxed) {
+        // No allocation here: the heap lock could be the problem.
+        for b in b"[core ".iter().chain(&[b'0' + (i / 10) as u8, b'0' + (i % 10) as u8, b':', b' ']) {
+            con::serial_byte(*b);
+        }
+        for b in what.bytes().chain(*b"]\r\n") {
+            con::serial_byte(b);
+        }
+    }
+    let c = &CTL[i];
+    c.mark_len.store(what.len(), Ordering::Relaxed);
+    c.mark_ptr.store(what.as_ptr() as usize, Ordering::Release);
+}
+
+fn mark_of(i: usize) -> &'static str {
+    let c = &CTL[i];
+    let p = c.mark_ptr.load(Ordering::Acquire);
+    if p == 0 {
+        return "none";
+    }
+    // SAFETY: `mark` stores the parts of a `&'static str`; a torn pair
+    // could only come from two marks of different lengths racing, which
+    // one core does not do; the text is printed, never trusted.
+    unsafe { core::str::from_utf8(core::slice::from_raw_parts(p as *const u8, c.mark_len.load(Ordering::Relaxed))).unwrap_or("?") }
+}
+
 fn post(i: usize, f: &(dyn Fn(usize) + Sync)) {
     // SAFETY: splits the fat pointer; `wait` keeps `f` alive until done.
     let (d, v) = unsafe { core::mem::transmute::<&(dyn Fn(usize) + Sync), (usize, usize)>(f) };
@@ -258,6 +296,8 @@ fn post(i: usize, f: &(dyn Fn(usize) + Sync)) {
 /// was lost, or `limit_ms` passed.
 pub fn wait(on: &[usize], limit_ms: u64) -> Result<(), String> {
     let end = x86::rdtsc() + tsc::ns_to_ticks(limit_ms * 1_000_000);
+    let every = tsc::ns_to_ticks(10_000_000_000);
+    let mut next_note = x86::rdtsc() + every;
     for &i in on {
         let c = &CTL[i];
         loop {
@@ -269,8 +309,15 @@ pub fn wait(on: &[usize], limit_ms: u64) -> Result<(), String> {
                 LOST => return Err(alloc::format!("core {i} lost")),
                 _ => {}
             }
+            if run::is_bsp() && x86::rdtsc() > next_note {
+                next_note += every;
+                con::line(&alloc::format!("I waiting core={i} mark=\"{}\"", mark_of(i)));
+            }
             if x86::rdtsc() > end {
-                return Err(alloc::format!("core {i} did not finish within {limit_ms} ms"));
+                return Err(alloc::format!(
+                    "core {i} did not finish within {limit_ms} ms, last mark {}",
+                    mark_of(i)
+                ));
             }
             x86::pause();
         }
