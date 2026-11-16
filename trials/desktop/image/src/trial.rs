@@ -40,7 +40,12 @@ static CPU_OF: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static E_CORES: AtomicUsize = AtomicUsize::new(0);
 
 fn trial_job(core: usize) {
-    let pos = ORDER.lock().expect("order").iter().position(|&c| c == core).expect("core in order");
+    let pos = ORDER
+        .lock()
+        .expect("order")
+        .iter()
+        .position(|&c| c == core)
+        .expect("core in order");
     // SAFETY: the fat pointer stored by `start`, alive until `wait` returns.
     let f: &(dyn Fn(usize) + Sync) = unsafe {
         core::mem::transmute::<(usize, usize), &(dyn Fn(usize) + Sync)>((
@@ -79,7 +84,11 @@ fn interrupt() {
 }
 
 fn current_cpu() -> Option<usize> {
-    CPU_OF.lock().expect("cpus").get(percpu::my_index()).copied()
+    CPU_OF
+        .lock()
+        .expect("cpus")
+        .get(percpu::my_index())
+        .copied()
 }
 
 fn describe() -> String {
@@ -106,8 +115,16 @@ static HOST: Host = Host {
 fn install() {
     let w = smp::workers();
     let mut cpu_of = vec![usize::MAX; smp::cores().len()];
-    let es: Vec<usize> = w.iter().copied().filter(|&i| smp::kind(i) == CoreKind::E).collect();
-    let rest: Vec<usize> = w.iter().copied().filter(|&i| smp::kind(i) != CoreKind::E).collect();
+    let es: Vec<usize> = w
+        .iter()
+        .copied()
+        .filter(|&i| smp::kind(i) == CoreKind::E)
+        .collect();
+    let rest: Vec<usize> = w
+        .iter()
+        .copied()
+        .filter(|&i| smp::kind(i) != CoreKind::E)
+        .collect();
     for (n, &c) in es.iter().chain(&rest).enumerate() {
         cpu_of[c] = n;
     }
@@ -124,8 +141,16 @@ fn install() {
 /// The cores in `order`: "pfirst", "efirst" or "alternate".
 fn order(name: &str) -> Vec<usize> {
     let w = smp::workers();
-    let p: Vec<usize> = w.iter().copied().filter(|&i| smp::kind(i) != CoreKind::E).collect();
-    let e: Vec<usize> = w.iter().copied().filter(|&i| smp::kind(i) == CoreKind::E).collect();
+    let p: Vec<usize> = w
+        .iter()
+        .copied()
+        .filter(|&i| smp::kind(i) != CoreKind::E)
+        .collect();
+    let e: Vec<usize> = w
+        .iter()
+        .copied()
+        .filter(|&i| smp::kind(i) == CoreKind::E)
+        .collect();
     match name {
         "efirst" => e.iter().chain(&p).copied().collect(),
         "alternate" => {
@@ -154,7 +179,10 @@ fn run_order(cx: &Ctx, name: &str, suites: &str) -> Result<(), String> {
     o.max_k = (cx.num("trial_max_k", 6) as usize).min(cores.len());
     o.ipis = vec![0, 1000, IPI_REAL];
     let csv_name = alloc::format!("TRIAL-{}.CSV", name.to_ascii_uppercase());
-    con::append_file(&csv_name, alloc::format!("{}\n", bench::csv_head()).as_bytes());
+    con::append_file(
+        &csv_name,
+        alloc::format!("{}\n", bench::csv_head()).as_bytes(),
+    );
     let mut csv = String::new();
     let mut emit = |s: &str| {
         for l in s.lines() {
@@ -172,19 +200,28 @@ fn run_order(cx: &Ctx, name: &str, suites: &str) -> Result<(), String> {
     };
     let mut progress = |s: &str| con::line(&alloc::format!("I trial {s}"));
     let kinds: String = cores.iter().map(|&c| smp::kind(c).name()).collect();
-    con::line(&alloc::format!("I trial order={name} cores={kinds} suites={suites}"));
+    con::line(&alloc::format!(
+        "I trial order={name} cores={kinds} suites={suites}"
+    ));
     bench::run(
         o,
         vec![None; cores.len()],
         &alloc::format!("one worker per core, order {name} ({kinds})"),
-        Sinks { out: &mut emit, csv: Some(&mut add_csv), progress: &mut progress },
+        Sinks {
+            out: &mut emit,
+            csv: Some(&mut add_csv),
+            progress: &mut progress,
+        },
     );
     con::append_file(&csv_name, csv.as_bytes());
     Ok(())
 }
 
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
-    let suites = cx.get("trial_suites").unwrap_or("locks,a1t,a2t,a3t,ct,a3n,br").to_string();
+    let suites = cx
+        .get("trial_suites")
+        .unwrap_or("locks,a1t,a2t,a3t,ct,a3n,br")
+        .to_string();
     run_order(cx, "pfirst", &suites)
 }
 

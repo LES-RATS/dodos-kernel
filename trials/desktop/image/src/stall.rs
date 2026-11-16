@@ -23,7 +23,9 @@ struct Gaps {
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
     let secs = cx.num("stall_seconds", if cx.flag("quick") { 1 } else { 30 });
     let on = smp::workers();
-    let res: Vec<Mutex<Gaps>> = (0..smp::cores().len()).map(|_| Mutex::new(Gaps::default())).collect();
+    let res: Vec<Mutex<Gaps>> = (0..smp::cores().len())
+        .map(|_| Mutex::new(Gaps::default()))
+        .collect();
     let limits = [10_000, 100_000, 1_000_000].map(tsc::ns_to_ticks);
     let span = tsc::ns_to_ticks(secs * 1_000_000_000);
     smp::run_on(&on, secs * 1000 + 30_000, &|i| {
@@ -60,7 +62,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
             g.over[0],
             g.over[1],
             g.over[2],
-            g.smi.map_or("none".into(), |(a, b)| alloc::format!("{}", b.wrapping_sub(a)))
+            g.smi.map_or("none".into(), |(a, b)| alloc::format!(
+                "{}",
+                b.wrapping_sub(a)
+            ))
         );
     }
     Ok(())

@@ -92,7 +92,10 @@ fn victim(_core: usize) {
         }
     }
     if v == Victim::Smi as u32 {
-        let (port, value) = (SMI_PORT.load(Ordering::Relaxed) as u16, SMI_VALUE.load(Ordering::Relaxed) as u8);
+        let (port, value) = (
+            SMI_PORT.load(Ordering::Relaxed) as u16,
+            SMI_VALUE.load(Ordering::Relaxed) as u8,
+        );
         let smi0 = x86::safe_rdmsr(x86::MSR_SMI_COUNT).unwrap_or(0);
         READY.fetch_add(1, Ordering::AcqRel);
         loop {
@@ -102,7 +105,7 @@ fn victim(_core: usize) {
                 unsafe { x86::outb(port, value) };
             }
             let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-            if c % 64 == 0 {
+            if c.is_multiple_of(64) {
                 let smi = x86::safe_rdmsr(x86::MSR_SMI_COUNT).unwrap_or(0);
                 SMI_SEEN.store(smi.wrapping_sub(smi0), Ordering::Relaxed);
             }
@@ -144,7 +147,11 @@ fn wait_parked(targets: &[usize], reqs: &[u64], limit_ns: u64) -> Option<u64> {
     let t0 = x86::rdtsc();
     let end = t0 + tsc::ns_to_ticks(limit_ns);
     loop {
-        if targets.iter().zip(reqs).all(|(&t, &r)| percpu::of(t).parked.load(Ordering::Acquire) == r) {
+        if targets
+            .iter()
+            .zip(reqs)
+            .all(|(&t, &r)| percpu::of(t).parked.load(Ordering::Acquire) == r)
+        {
             return Some(x86::rdtsc());
         }
         if x86::rdtsc() > end {
@@ -192,21 +199,43 @@ fn direct(t: usize, d_init_ns: u64, sipis: Sipis, vector: u8, state: Victim) -> 
     let t0 = init_sipi(&[t], d_init_ns, sipis, vector);
     if let Some(t1) = wait_parked(&[t], &[req], 100_000_000) {
         let e = percpu::of(t).restart_tsc.load(Ordering::Acquire);
-        return Outcome { ok: true, entry: e.wrapping_sub(t0), parked: t1 - t0, recoveries: 0 };
+        return Outcome {
+            ok: true,
+            entry: e.wrapping_sub(t0),
+            parked: t1 - t0,
+            recoveries: 0,
+        };
     }
     for k in 1..=3 {
         let req = raise(t);
         init_sipi(&[t], 10_000_000, Sipis::Two(200_000), vector);
         if wait_parked(&[t], &[req], 200_000_000).is_some() {
-            return Outcome { ok: false, entry: 0, parked: 0, recoveries: k };
+            return Outcome {
+                ok: false,
+                entry: 0,
+                parked: 0,
+                recoveries: k,
+            };
         }
     }
     smp::set_state(t, smp::LOST);
-    Outcome { ok: false, entry: 0, parked: 0, recoveries: 4 }
+    Outcome {
+        ok: false,
+        entry: 0,
+        parked: 0,
+        recoveries: 4,
+    }
 }
 
 /// One stop and restart of `t` directed by `d`.
-pub fn cycle(d: usize, t: usize, state: Victim, d_init_ns: u64, sipis: Sipis, vector: u8) -> Result<Outcome, String> {
+pub fn cycle(
+    d: usize,
+    t: usize,
+    state: Victim,
+    d_init_ns: u64,
+    sipis: Sipis,
+    vector: u8,
+) -> Result<Outcome, String> {
     READY.store(0, Ordering::Release);
     VICTIM.store(state as u32, Ordering::Release);
     smp::start_on(&[t], &victim);
@@ -227,7 +256,11 @@ fn summary(name: &str, keys: &str, outs: &[Outcome]) {
     let lost = outs.iter().any(|o| o.recoveries > 3);
     let mut entry: Vec<u64> = outs.iter().filter(|o| o.ok).map(|o| o.entry).collect();
     let mut parked: Vec<u64> = outs.iter().filter(|o| o.ok).map(|o| o.parked).collect();
-    out!("R {name}.count {keys} n={} failures={failures} lost={}", outs.len(), u8::from(lost));
+    out!(
+        "R {name}.count {keys} n={} failures={failures} lost={}",
+        outs.len(),
+        u8::from(lost)
+    );
     if !entry.is_empty() {
         stats::report_ticks(&alloc::format!("{name}.entry"), keys, &mut entry);
         stats::report_ticks(&alloc::format!("{name}.parked"), keys, &mut parked);
@@ -250,7 +283,11 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
     for kind in [CoreKind::P, CoreKind::E, CoreKind::Unknown] {
         let Some((d, t)) = pick(kind) else { continue };
         for d_init_us in [10_000u64, 1000, 100, 10, 0] {
-            for (sipi_name, sipis) in [("2x200us", Sipis::Two(200_000)), ("2x10us", Sipis::Two(10_000)), ("1", Sipis::One)] {
+            for (sipi_name, sipis) in [
+                ("2x200us", Sipis::Two(200_000)),
+                ("2x10us", Sipis::Two(10_000)),
+                ("1", Sipis::One),
+            ] {
                 let mut outs = Vec::with_capacity(reps);
                 for _ in 0..reps {
                     if smp::state(t) == smp::LOST {
@@ -279,7 +316,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                 }
                 outs.push(cycle(d, t, state, sdm.0, sdm.1, vector)?);
             }
-            let k = alloc::format!("target={t} kind={} director={d} state={state:?} d_init_us=10000 sipi=2x200us", kind.name());
+            let k = alloc::format!(
+                "target={t} kind={} director={d} state={state:?} d_init_us=10000 sipi=2x200us",
+                kind.name()
+            );
             summary("init.state", &k, &outs);
         }
         if vmx::available() && smp::state(t) != smp::LOST {
@@ -358,7 +398,14 @@ fn fences(cx: &Ctx, vector: u8) -> Result<(), String> {
                     break;
                 }
                 READY.store(0, Ordering::Release);
-                VICTIM.store(if by_init { Victim::NmiBlocked } else { Victim::Spin } as u32, Ordering::Release);
+                VICTIM.store(
+                    if by_init {
+                        Victim::NmiBlocked
+                    } else {
+                        Victim::Spin
+                    } as u32,
+                    Ordering::Release,
+                );
                 smp::start_on(targets, &victim);
                 let res: Mutex<Option<u64>> = Mutex::new(None);
                 smp::run_on(&[d], 10_000, &|_| {
@@ -405,7 +452,11 @@ fn fences(cx: &Ctx, vector: u8) -> Result<(), String> {
                         }
                     }
                 }
-                let alive: Vec<usize> = targets.iter().copied().filter(|&t| smp::state(t) != smp::LOST).collect();
+                let alive: Vec<usize> = targets
+                    .iter()
+                    .copied()
+                    .filter(|&t| smp::state(t) != smp::LOST)
+                    .collect();
                 smp::wait(&alive, 2_000)?;
             }
             let kinds: String = targets.iter().map(|&t| smp::kind(t).name()).collect();
@@ -426,7 +477,9 @@ fn fences(cx: &Ctx, vector: u8) -> Result<(), String> {
 /// stops its SMIs and is restarted by INIT and SIPI.
 fn smm(cx: &Ctx, vector: u8) -> Result<(), String> {
     let Some(cmd) = cx.get("smi_cmd").and_then(crate::run::parse_num) else {
-        out!("I init.smm not run: no smi_cmd in CONFIG.TXT (an unknown SMI command may do anything)");
+        out!(
+            "I init.smm not run: no smi_cmd in CONFIG.TXT (an unknown SMI command may do anything)"
+        );
         return Ok(());
     };
     let Some((port, reserved)) = crate::acpi::smi_cmd() else {
@@ -437,7 +490,9 @@ fn smm(cx: &Ctx, vector: u8) -> Result<(), String> {
         out!("I init.smm not run: smi_cmd={cmd:#x} is one of the FADT's own commands {reserved:?}");
         return Ok(());
     }
-    let Some((d, t)) = pick(CoreKind::P).or_else(|| pick(CoreKind::Unknown)) else { return Ok(()) };
+    let Some((d, t)) = pick(CoreKind::P).or_else(|| pick(CoreKind::Unknown)) else {
+        return Ok(());
+    };
     SMI_PORT.store(port, Ordering::Relaxed);
     SMI_VALUE.store(cmd as u32, Ordering::Relaxed);
     let (mut taken, mut lost, mut smis) = (0u32, 0u32, 0u64);

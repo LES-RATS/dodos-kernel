@@ -74,7 +74,13 @@ pub fn serial_byte(b: u8) {
 fn utf16(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s
         .chars()
-        .map(|c| if (c as u32) < 0x10000 { c as u16 } else { b'?'.into() })
+        .map(|c| {
+            if (c as u32) < 0x10000 {
+                c as u16
+            } else {
+                b'?'.into()
+            }
+        })
         .collect();
     v.push(0);
     v
@@ -125,8 +131,7 @@ pub unsafe fn init(st: *mut SystemTable, image: efi::Handle) {
         let mut root: *mut File = null_mut();
         if ((*bs).handle_protocol)(image, &efi::LOADED_IMAGE_GUID, &mut li) == efi::SUCCESS {
             let dev = (*li.cast::<efi::LoadedImage>()).device_handle;
-            if ((*bs).handle_protocol)(dev, &efi::SIMPLE_FILE_SYSTEM_GUID, &mut fs)
-                == efi::SUCCESS
+            if ((*bs).handle_protocol)(dev, &efi::SIMPLE_FILE_SYSTEM_GUID, &mut fs) == efi::SUCCESS
             {
                 let fs = fs.cast::<SimpleFileSystem>();
                 if ((*fs).open_volume)(fs, &mut root) == efi::SUCCESS {
@@ -178,7 +183,10 @@ fn write_all(f: *mut File, bytes: &[u8]) -> bool {
 /// Prints a line on the screen and the serial port and queues it for the
 /// results file.
 pub fn line(s: &str) {
-    assert!(crate::run::is_bsp(), "con::line called on another core: {s}");
+    assert!(
+        crate::run::is_bsp(),
+        "con::line called on another core: {s}"
+    );
     let mut con = CON.lock().expect("console");
     let Some(c) = con.as_mut() else { return };
     c.screen(s);
@@ -202,7 +210,10 @@ pub fn flush() {
 }
 
 pub fn has_volume() -> bool {
-    CON.lock().expect("console").as_ref().is_some_and(|c| !c.dir.is_null())
+    CON.lock()
+        .expect("console")
+        .as_ref()
+        .is_some_and(|c| !c.dir.is_null())
 }
 
 /// Reads a whole file of the image's directory.
@@ -293,7 +304,10 @@ pub fn copy_to_serial(on: bool) {
 }
 
 fn st() -> *mut SystemTable {
-    CON.lock().expect("console").as_ref().map_or(null_mut(), |c| c.st)
+    CON.lock()
+        .expect("console")
+        .as_ref()
+        .map_or(null_mut(), |c| c.st)
 }
 
 /// The key pressed, if any (a printable character, upper-cased).
@@ -305,7 +319,11 @@ pub fn key() -> Option<char> {
     };
     // SAFETY: ConIn is valid while boot services run.
     let r = unsafe { ((*(*st).con_in).read_key_stroke)((*st).con_in, &mut k) };
-    (r == efi::SUCCESS).then(|| char::from_u32(u32::from(k.unicode_char)).unwrap_or('?').to_ascii_uppercase())
+    (r == efi::SUCCESS).then(|| {
+        char::from_u32(u32::from(k.unicode_char))
+            .unwrap_or('?')
+            .to_ascii_uppercase()
+    })
 }
 
 /// Waits up to `ms` for a key.

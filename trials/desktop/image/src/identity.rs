@@ -10,10 +10,10 @@
 //! EDX[18] CET_SSS (21-25); leaf 1AH EAX[31:24] core type (21-63); leaf 05H
 //! MWAIT sub-states (21-15); leaf 80000001H EDX[26] 1 GB pages.
 
+use crate::out;
 use crate::run::Ctx;
 use crate::smp::{self, CoreKind, Role};
 use crate::x86::{self, bit, cpuid};
-use crate::out;
 use alloc::string::String;
 use alloc::vec::Vec;
 use dodos_trial_multicore::rt::Mutex;
@@ -80,9 +80,19 @@ fn try_enable(features: (bool, bool)) -> (&'static str, &'static str) {
 
 fn read_id() -> Id {
     let max = cpuid(0, 0).eax;
-    let leaf = |l: u32, s: u32| if max >= l { cpuid(l, s) } else { x86::Cpuid::default() };
+    let leaf = |l: u32, s: u32| {
+        if max >= l {
+            cpuid(l, s)
+        } else {
+            x86::Cpuid::default()
+        }
+    };
     let l7 = leaf(7, 0);
-    let l71 = if l7.eax >= 1 { leaf(7, 1) } else { x86::Cpuid::default() };
+    let l71 = if l7.eax >= 1 {
+        leaf(7, 1)
+    } else {
+        x86::Cpuid::default()
+    };
     let (cet_on, pks_on) = try_enable((bit(l7.ecx, 7), bit(l7.ecx, 31)));
     Id {
         sig: cpuid(1, 0).eax,
@@ -118,7 +128,10 @@ fn brand() -> String {
             b.extend_from_slice(&w.to_le_bytes());
         }
     }
-    String::from_utf8_lossy(&b).trim_matches(char::from(0)).trim().replace(' ', "_")
+    String::from_utf8_lossy(&b)
+        .trim_matches(char::from(0))
+        .trim()
+        .replace(' ', "_")
 }
 
 fn hex(v: Option<u64>) -> String {
@@ -144,14 +157,19 @@ pub fn run(_cx: &mut Ctx) -> Result<(), String> {
         *ids[i].lock().expect("id") = Some(read_id());
     })?;
     let sig = cpuid(1, 0).eax;
-    let (family, model) = ((sig >> 8 & 0xF) + (sig >> 20 & 0xFF), (sig >> 4 & 0xF) | (sig >> 12 & 0xF0));
+    let (family, model) = (
+        (sig >> 8 & 0xF) + (sig >> 20 & 0xFF),
+        (sig >> 4 & 0xF) | (sig >> 12 & 0xF0),
+    );
     out!(
         "I cpu brand={} signature={sig:#x} family={family:#x} model={model:#x} stepping={} cores={n}",
         brand(),
         sig & 0xF
     );
     for &i in &on {
-        let Some(id) = ids[i].lock().expect("id").clone() else { continue };
+        let Some(id) = ids[i].lock().expect("id").clone() else {
+            continue;
+        };
         let b = |v: u32, k: u32| u8::from(bit(v, k));
         out!(
             "I features core={i} apic={} kind={} sig={:#x} native_model={:#x} cet_ss={} ibt={} cet_sss={} pks={} pku={} fred={} lkgs={} wrmsrns={} x2apic={} invpcid={} pcid={} tsc_deadline={} vmx={} monitor={} hybrid={} uintr={} lass={} hreset={} page1g={} cet_enable={} pks_enable={}",
@@ -184,7 +202,8 @@ pub fn run(_cx: &mut Ctx) -> Result<(), String> {
         out!(
             "I msrs core={i} apic_base={} bsp_flag={} feature_control={} hwp_caps={} pat={} tsc_adjust={} smi_count={} pkg_cst_config={} mwait_substates={:#x} mwait_ext={:#x} thermal_power={:#x}",
             hex(id.apic_base),
-            id.apic_base.map_or(2, |v| u8::from(v & x86::APIC_BASE_BSP != 0)),
+            id.apic_base
+                .map_or(2, |v| u8::from(v & x86::APIC_BASE_BSP != 0)),
             hex(id.feature_control),
             hex(id.hwp_caps),
             hex(id.pat),
@@ -220,9 +239,15 @@ pub fn assign_kinds(cx: &Ctx) -> Result<(), String> {
     })?;
     let mut kinds: Vec<CoreKind> = found.iter().map(|k| *k.lock().expect("kind")).collect();
     if kinds.iter().all(|&k| k == CoreKind::Unknown) && cx.flag("fake_kinds") {
-        let w: Vec<usize> = (0..n).filter(|&i| smp::cores()[i].role == Role::Worker).collect();
+        let w: Vec<usize> = (0..n)
+            .filter(|&i| smp::cores()[i].role == Role::Worker)
+            .collect();
         for (k, &i) in w.iter().enumerate() {
-            kinds[i] = if k < w.len().div_ceil(2) { CoreKind::P } else { CoreKind::E };
+            kinds[i] = if k < w.len().div_ceil(2) {
+                CoreKind::P
+            } else {
+                CoreKind::E
+            };
         }
         kinds[0] = CoreKind::P;
         out!("I kinds faked=1 (fake_kinds=1): first half of the workers P, the rest E");

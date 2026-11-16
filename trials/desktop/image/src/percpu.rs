@@ -42,7 +42,6 @@ pub struct PerCpu {
 
 pub const FIXUP_RIP: usize = offset_of!(PerCpu, fixup_rip);
 pub const FIXUP_VECTOR: usize = offset_of!(PerCpu, fixup_vector);
-pub const FIXUP_CR2: usize = offset_of!(PerCpu, fixup_cr2);
 pub const IRQ_COUNT: usize = offset_of!(PerCpu, irq_count);
 pub const IRQ_TSC: usize = offset_of!(PerCpu, irq_tsc);
 pub const PONG_DEST: usize = offset_of!(PerCpu, pong_dest);
@@ -53,27 +52,25 @@ pub const TIMER_COUNT: usize = offset_of!(PerCpu, timer_count);
 pub const SSP_ENTRY: usize = offset_of!(PerCpu, ssp_entry);
 pub const STACK_TOP: usize = offset_of!(PerCpu, stack_top);
 
-const ZERO: AtomicU64 = AtomicU64::new(0);
-
 pub static mut CPUS: [PerCpu; MAX_CORES] = [const {
     PerCpu {
         self_ptr: 0,
-        fixup_rip: ZERO,
-        fixup_vector: ZERO,
-        fixup_cr2: ZERO,
-        irq_count: ZERO,
-        irq_tsc: ZERO,
-        pong_dest: ZERO,
+        fixup_rip: AtomicU64::new(0),
+        fixup_vector: AtomicU64::new(0),
+        fixup_cr2: AtomicU64::new(0),
+        irq_count: AtomicU64::new(0),
+        irq_tsc: AtomicU64::new(0),
+        pong_dest: AtomicU64::new(0),
         index: 0,
-        nmi_count: ZERO,
-        nmi_tsc: ZERO,
-        nmi_park: ZERO,
-        parked: ZERO,
-        park_request: ZERO,
-        start_request: ZERO,
-        timer_count: ZERO,
-        ssp_entry: ZERO,
-        restart_tsc: ZERO,
+        nmi_count: AtomicU64::new(0),
+        nmi_tsc: AtomicU64::new(0),
+        nmi_park: AtomicU64::new(0),
+        parked: AtomicU64::new(0),
+        park_request: AtomicU64::new(0),
+        start_request: AtomicU64::new(0),
+        timer_count: AtomicU64::new(0),
+        ssp_entry: AtomicU64::new(0),
+        restart_tsc: AtomicU64::new(0),
         stack_top: 0,
         idt: [0; 256],
     }
@@ -83,7 +80,7 @@ pub static mut CPUS: [PerCpu; MAX_CORES] = [const {
 pub fn of(i: usize) -> &'static PerCpu {
     // SAFETY: shared access to atomics and to fields written once before
     // the core starts (`index`, `stack_top`, `idt` while it is not loaded).
-    unsafe { &(*(&raw const CPUS))[i] }
+    unsafe { &*(&raw const CPUS).cast::<PerCpu>().add(i) }
 }
 
 /// The block of the calling core.
@@ -104,7 +101,7 @@ pub fn install(i: usize, stack_top: u64) {
     // SAFETY: block `i` belongs to the calling core from now on; nothing
     // else writes these two fields.
     unsafe {
-        let b = &raw mut (*(&raw mut CPUS))[i];
+        let b = (&raw mut CPUS).cast::<PerCpu>().add(i);
         (*b).self_ptr = b as u64;
         (*b).index = i as u64;
         if stack_top != 0 {

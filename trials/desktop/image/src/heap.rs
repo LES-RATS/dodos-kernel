@@ -32,13 +32,12 @@ pub fn init(base: usize, len: usize) {
     h.end = base + len;
 }
 
-pub fn used() -> (usize, usize) {
-    let h = HEAP.0.lock().expect("heap");
-    (h.next, h.end)
-}
-
 fn class(l: Layout) -> u32 {
-    l.size().max(l.align()).max(16).next_power_of_two().trailing_zeros()
+    l.size()
+        .max(l.align())
+        .max(16)
+        .next_power_of_two()
+        .trailing_zeros()
 }
 
 // SAFETY: blocks never overlap: a block is either on one free list or cut

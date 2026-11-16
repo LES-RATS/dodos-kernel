@@ -70,7 +70,10 @@ fn vmx_ok(flags: u64) -> Result<(), String> {
         return Err("VMfailInvalid".into());
     }
     if flags & 0x40 != 0 {
-        return Err(alloc::format!("VMfailValid error {}", vmread(0x4400).unwrap_or(u64::MAX)));
+        return Err(alloc::format!(
+            "VMfailValid error {}",
+            vmread(0x4400).unwrap_or(u64::MAX)
+        ));
     }
     Ok(())
 }
@@ -92,7 +95,8 @@ pub fn on() -> Result<(), String> {
         let basic = x86::rdmsr(IA32_VMX_BASIC);
         (region as *mut u32).write_volatile(basic as u32 & 0x7FFF_FFFF);
         let cr0 = (x86::cr0() | x86::rdmsr(IA32_VMX_CR0_FIXED0)) & x86::rdmsr(IA32_VMX_CR0_FIXED1);
-        let cr4 = (x86::cr4() | x86::CR4_VMXE | x86::rdmsr(IA32_VMX_CR4_FIXED0)) & x86::rdmsr(IA32_VMX_CR4_FIXED1);
+        let cr4 = (x86::cr4() | x86::CR4_VMXE | x86::rdmsr(IA32_VMX_CR4_FIXED0))
+            & x86::rdmsr(IA32_VMX_CR4_FIXED1);
         x86::set_cr0(cr0);
         x86::set_cr4(cr4);
         let flags: u64;
@@ -114,15 +118,23 @@ pub fn off() {
 fn vmwrite(field: u64, v: u64) -> Result<(), String> {
     let flags: u64;
     // SAFETY: a VMCS is current; a write to a field of it.
-    unsafe { asm!("vmwrite {f}, {v}", "pushfq", "pop {r}", f = in(reg) field, v = in(reg) v, r = out(reg) flags) };
+    unsafe {
+        asm!("vmwrite {f}, {v}", "pushfq", "pop {r}", f = in(reg) field, v = in(reg) v, r = out(reg) flags)
+    };
     vmx_ok(flags).map_err(|e| alloc::format!("vmwrite {field:#x}: {e}"))
 }
 
 fn vmread(field: u64) -> Result<u64, String> {
     let (v, flags): (u64, u64);
     // SAFETY: a VMCS is current; a read of a field of it.
-    unsafe { asm!("vmread {v}, {f}", "pushfq", "pop {r}", f = in(reg) field, v = out(reg) v, r = out(reg) flags) };
-    if flags & 0x41 != 0 { Err(alloc::format!("vmread {field:#x} failed")) } else { Ok(v) }
+    unsafe {
+        asm!("vmread {v}, {f}", "pushfq", "pop {r}", f = in(reg) field, v = out(reg) v, r = out(reg) flags)
+    };
+    if flags & 0x41 != 0 {
+        Err(alloc::format!("vmread {field:#x} failed"))
+    } else {
+        Ok(v)
+    }
 }
 
 /// A control value: wanted bits, forced to what the capability MSR allows.
@@ -137,7 +149,10 @@ fn control(msr: u32, true_msr: u32, want: u32) -> Result<u32, String> {
     };
     let (must, may) = (cap as u32, (cap >> 32) as u32);
     if want & !may != 0 {
-        return Err(alloc::format!("control bits {:#x} not allowed by MSR {msr:#x}", want & !may));
+        return Err(alloc::format!(
+            "control bits {:#x} not allowed by MSR {msr:#x}",
+            want & !may
+        ));
     }
     Ok(want | must)
 }
@@ -152,7 +167,12 @@ fn ram_ranges() -> Vec<(u64, u64)> {
     let mut v: Vec<(u64, u64)> = crate::warm::memory_map_pub()
         .iter()
         .filter(|d| is_ram(d.kind))
-        .map(|d| (d.physical_start, d.physical_start + d.number_of_pages * 4096))
+        .map(|d| {
+            (
+                d.physical_start,
+                d.physical_start + d.number_of_pages * 4096,
+            )
+        })
         .collect();
     v.sort_unstable();
     v
@@ -161,8 +181,17 @@ fn ram_ranges() -> Vec<(u64, u64)> {
 /// How much of [s, s + len) is RAM: 0 none, 1 part, 2 all.
 fn cover(ram: &[(u64, u64)], s: u64, len: u64) -> u8 {
     let e = s + len;
-    let got: u64 = ram.iter().map(|&(a, b)| b.min(e).saturating_sub(a.max(s))).sum();
-    if got == 0 { 0 } else if got >= len { 2 } else { 1 }
+    let got: u64 = ram
+        .iter()
+        .map(|&(a, b)| b.min(e).saturating_sub(a.max(s)))
+        .sum();
+    if got == 0 {
+        0
+    } else if got >= len {
+        2
+    } else {
+        1
+    }
 }
 
 const EPT_RWX: u64 = 0b111;
@@ -230,7 +259,14 @@ struct Work {
     out_sum: u64,
 }
 
-static WORK: Mutex<Work> = Mutex::new(Work { kind: 0, base: 0, pages: 0, hops: 0, out_ticks: 0, out_sum: 0 });
+static WORK: Mutex<Work> = Mutex::new(Work {
+    kind: 0,
+    base: 0,
+    pages: 0,
+    hops: 0,
+    out_ticks: 0,
+    out_sum: 0,
+});
 static WORK_PTR: AtomicU64 = AtomicU64::new(0);
 
 fn workload(w: &mut Work) {
@@ -304,7 +340,11 @@ fn run_guest(eptp: u64, guest_stack: u64, tss: u64) -> Result<u64, String> {
     }
     vmx_ok(flags)?;
     let pin = control(IA32_VMX_PINBASED_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, 0)?;
-    let proc1 = control(IA32_VMX_PROCBASED_CTLS, IA32_VMX_TRUE_PROCBASED_CTLS, 1 << 31)?;
+    let proc1 = control(
+        IA32_VMX_PROCBASED_CTLS,
+        IA32_VMX_TRUE_PROCBASED_CTLS,
+        1 << 31,
+    )?;
     let proc2 = control(IA32_VMX_PROCBASED_CTLS2, 0, 1 << 1)?;
     let exit = control(IA32_VMX_EXIT_CTLS, IA32_VMX_TRUE_EXIT_CTLS, 1 << 9)?;
     let entry = control(IA32_VMX_ENTRY_CTLS, IA32_VMX_TRUE_ENTRY_CTLS, 1 << 9)?;
@@ -331,7 +371,7 @@ fn run_guest(eptp: u64, guest_stack: u64, tss: u64) -> Result<u64, String> {
         (0x6006, x86::cr4()),
         (0x681A, 0x400),
         (0x681C, guest_stack),
-        (0x681E, dodos_guest_entry as usize as u64),
+        (0x681E, dodos_guest_entry as *const () as u64),
         (0x6820, 0x2),
         (0x0802, cs),
         (0x4802, 0xFFFF_FFFF),
@@ -497,7 +537,9 @@ fn prepare() -> u64 {
 
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
     if !available() {
-        crate::out!("I ept present=0: VMX absent or disabled by the firmware (IA32_FEATURE_CONTROL)");
+        crate::out!(
+            "I ept present=0: VMX absent or disabled by the firmware (IA32_FEATURE_CONTROL)"
+        );
         return Ok(());
     }
     // SAFETY: capability MSR present with VMX.
@@ -530,7 +572,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
             x86::without_interrupts(|| {
                 let on_ok = on();
                 if let Err(e) = &on_ok {
-                    lines.lock().expect("l").push((alloc::format!("F ept core={i} vmxon={e}"), Vec::new()));
+                    lines
+                        .lock()
+                        .expect("l")
+                        .push((alloc::format!("F ept core={i} vmxon={e}"), Vec::new()));
                     return;
                 }
                 let stack = alloc::vec![0u8; 64 << 10].leak().as_ptr() as u64 + (64 << 10);
@@ -540,11 +585,21 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                         let mut v = Vec::new();
                         for _ in 0..=runs {
                             let mut w = WORK.lock().expect("work");
-                            *w = Work { kind: kind as u64, base: start, pages: BUFFER_PAGES, hops: 1 << 20, out_ticks: 0, out_sum: 0 };
+                            *w = Work {
+                                kind: kind as u64,
+                                base: start,
+                                pages: BUFFER_PAGES,
+                                hops: 1 << 20,
+                                out_ticks: 0,
+                                out_sum: 0,
+                            };
                             match eptp {
                                 None => workload(&mut w),
                                 Some(e) => {
-                                    WORK_PTR.store(core::ptr::from_mut(&mut *w) as u64, Ordering::Release);
+                                    WORK_PTR.store(
+                                        core::ptr::from_mut(&mut *w) as u64,
+                                        Ordering::Release,
+                                    );
                                     match run_guest(*e, stack, tss) {
                                         Ok(18) => {}
                                         Ok(r) => {
@@ -555,7 +610,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                                             return;
                                         }
                                         Err(e) => {
-                                            lines.lock().expect("l").push((alloc::format!("F ept core={i} mode={mode} {e}"), Vec::new()));
+                                            lines.lock().expect("l").push((
+                                                alloc::format!("F ept core={i} mode={mode} {e}"),
+                                                Vec::new(),
+                                            ));
                                             off();
                                             return;
                                         }
@@ -566,7 +624,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                         }
                         v.remove(0);
                         let k = alloc::format!("core={i} kind={} mode={mode}", smp::kind(i).name());
-                        lines.lock().expect("l").push((alloc::format!("{name}|{k}"), v));
+                        lines
+                            .lock()
+                            .expect("l")
+                            .push((alloc::format!("{name}|{k}"), v));
                     }
                 }
                 off();

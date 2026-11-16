@@ -2,9 +2,6 @@
 //! `trials/desktop/README.md`, "Results").
 
 use crate::tsc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::fmt::Write;
 
 /// Sorts `v` and returns n, min, p50, p99, p99.9, max and the mean. A
 /// quantile q is the value of rank ceil(q × n).
@@ -16,7 +13,15 @@ pub fn summary(v: &mut [u64]) -> [u64; 7] {
     let n = v.len();
     let q = |num: usize, den: usize| v[(n * num).div_ceil(den).max(1) - 1];
     let mean = v.iter().map(|&x| u128::from(x)).sum::<u128>() / n as u128;
-    [n as u64, v[0], q(50, 100), q(99, 100), q(999, 1000), v[n - 1], mean as u64]
+    [
+        n as u64,
+        v[0],
+        q(50, 100),
+        q(99, 100),
+        q(999, 1000),
+        v[n - 1],
+        mean as u64,
+    ]
 }
 
 /// Prints `R <name> <keys> n= min= p50= p99= p999= max= mean= unit=ns` from
@@ -50,21 +55,4 @@ pub fn report_unit(name: &str, keys: &str, v: &mut [u64], unit: &str) {
         s[5],
         s[6]
     );
-}
-
-/// `key=value` pairs joined by spaces.
-pub fn keys(pairs: &[(&str, String)]) -> String {
-    let mut s = String::new();
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if i > 0 {
-            s.push(' ');
-        }
-        let _ = write!(s, "{k}={v}");
-    }
-    s
-}
-
-/// A fixed-capacity sample buffer, allocated before a measurement.
-pub fn samples(n: usize) -> Vec<u64> {
-    Vec::with_capacity(n)
 }

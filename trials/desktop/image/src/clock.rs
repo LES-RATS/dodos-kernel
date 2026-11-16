@@ -55,7 +55,11 @@ pub fn now(pmu: bool) -> (u64, u64) {
 
 /// Measures `f` `samples` times; returns the TSC ticks and core cycles of
 /// each run.
-pub fn sample(samples: usize, pmu: bool, mut f: impl FnMut()) -> (alloc::vec::Vec<u64>, alloc::vec::Vec<u64>) {
+pub fn sample(
+    samples: usize,
+    pmu: bool,
+    mut f: impl FnMut(),
+) -> (alloc::vec::Vec<u64>, alloc::vec::Vec<u64>) {
     let mut t = alloc::vec::Vec::with_capacity(samples);
     let mut c = alloc::vec::Vec::with_capacity(samples);
     f();

@@ -97,7 +97,13 @@ pub fn smi_cmd() -> Option<(u32, [u8; 5])> {
     (port != 0).then(|| {
         (
             port,
-            [rd8(f + 52), rd8(f + 53), rd8(f + 54), rd8(f + 55), rd8(f + 95)],
+            [
+                rd8(f + 52),
+                rd8(f + 53),
+                rd8(f + 54),
+                rd8(f + 55),
+                rd8(f + 95),
+            ],
         )
     })
 }
@@ -136,4 +142,3 @@ pub fn ecam() -> Vec<(u64, u16, u8, u8)> {
         })
         .collect()
 }
-

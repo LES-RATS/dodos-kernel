@@ -195,31 +195,40 @@ pub fn entry(i: usize) -> &'static Entry {
 /// every core: the firmware state saved by `smp::save_fw` and a fresh
 /// stack (the bootstrap core gets one for its resume path only).
 pub fn install(page: u64) {
-    assert!(page < 0x10_0000 && page & 0xFFF == 0, "trampoline page not below 1 MB");
-    // SAFETY: addresses of the assembly above, one block of code.
-    let (start, pm32, lm64, end) = unsafe {
-        (
-            &raw const dodos_tramp_start as u64,
-            &raw const dodos_tramp_pm32 as u64,
-            &raw const dodos_tramp_lm64 as u64,
-            &raw const dodos_tramp_end as u64,
-        )
-    };
+    assert!(
+        page < 0x10_0000 && page & 0xFFF == 0,
+        "trampoline page not below 1 MB"
+    );
+    // Addresses of the assembly above, one block of code.
+    let (start, pm32, lm64, end) = (
+        &raw const dodos_tramp_start as u64,
+        &raw const dodos_tramp_pm32 as u64,
+        &raw const dodos_tramp_lm64 as u64,
+        &raw const dodos_tramp_end as u64,
+    );
     let len = (end - start) as usize;
     assert!(len < TR_GDT, "trampoline code too long");
     let n = smp::cores().len();
     let mut table: Vec<Entry> = Vec::with_capacity(MAX_CORES);
     for i in 0..MAX_CORES {
         // SAFETY: FW entries are plain data written by the cores.
-        let f = unsafe { (*(&raw const FW))[i] };
+        let f = unsafe { *(&raw const FW).cast::<smp::FwState>().add(i) };
         let mut gdtr = [0u8; 16];
         gdtr[..2].copy_from_slice(&{ f.gdt.limit }.to_le_bytes());
         gdtr[2..10].copy_from_slice(&{ f.gdt.base }.to_le_bytes());
-        let stack = if i < n { alloc::vec![0u8; 64 << 10].leak().as_ptr() as u64 + (64 << 10) } else { 0 };
+        let stack = if i < n {
+            alloc::vec![0u8; 64 << 10].leak().as_ptr() as u64 + (64 << 10)
+        } else {
+            0
+        };
         table.push(Entry {
             apic: smp::cores().get(i).map_or(u32::MAX, |c| c.apic),
             index: i as u32,
-            stack_top: if i == 0 { stack } else { percpu::of(i).stack_top.max(stack) },
+            stack_top: if i == 0 {
+                stack
+            } else {
+                percpu::of(i).stack_top.max(stack)
+            },
             tsc: 0,
             cr0: f.cr0,
             cr4: f.cr4,
@@ -253,7 +262,7 @@ pub fn install(page: u64) {
         w64(TR_CR3, crate::paging::root());
         w64(TR_TABLE, t);
         w32(TR_COUNT, MAX_CORES as u32);
-        w64(TR_ENTRY, restart_entry as usize as u64);
+        w64(TR_ENTRY, restart_entry as *const () as u64);
     }
     PAGE.store(page, Ordering::Relaxed);
 }
@@ -267,13 +276,17 @@ extern "sysv64" fn restart_entry(e: &Entry) -> ! {
     }
     percpu::install(i, 0);
     let me = percpu::me();
-    let idt = x86::DescriptorPtr { limit: 256 * 16 - 1, base: me.idt.as_ptr() as u64 };
+    let idt = x86::DescriptorPtr {
+        limit: 256 * 16 - 1,
+        base: me.idt.as_ptr() as u64,
+    };
     // SAFETY: this core's IDT, built at its first start.
     unsafe { x86::lidt(&idt) };
     smp::ap_local_setup();
     me.restart_tsc.store(e.tsc, Ordering::Release);
     me.nmi_park.store(0, Ordering::Relaxed);
-    me.parked.store(me.park_request.load(Ordering::Relaxed), Ordering::Release);
+    me.parked
+        .store(me.park_request.load(Ordering::Relaxed), Ordering::Release);
     smp::forget_job(i);
     smp::serve(i)
 }

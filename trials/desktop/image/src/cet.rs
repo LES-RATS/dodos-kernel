@@ -32,12 +32,12 @@
 //! its accessed and dirty bits, and takes a new entry written by WRSSQ),
 //! and that ordinary stores to shadow-stack pages fault.
 
+use crate::clock;
 use crate::gate::{self, Sample};
 use crate::paging::{self, A, D, P, RW};
 use crate::run::Ctx;
 use crate::smp;
 use crate::x86::{self, bit, cpuid};
-use crate::clock;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -202,7 +202,9 @@ fn plain_store(va: u64) -> Option<x86::Fault> {
 }
 
 fn fault_text(f: Option<x86::Fault>) -> String {
-    f.map_or("none".into(), |f| alloc::format!("v{}e{:#x}", f.vector, f.error))
+    f.map_or("none".into(), |f| {
+        alloc::format!("v{}e{:#x}", f.vector, f.error)
+    })
 }
 
 struct Setup {
@@ -217,7 +219,17 @@ impl Setup {
         // SAFETY: the token frame is ours; identity mapped and writable.
         unsafe { ((self.token_frame + 0xFF8) as *mut u64).write_volatile(self.token) };
     }
-    fn window(&self, mode: u64, a: u64, b: u64, n: u64, pmu: bool, cet: u64, ss: bool) -> (Window, Option<x86::Fault>) {
+    #[allow(clippy::too_many_arguments)] // one field each of `Window`
+    fn window(
+        &self,
+        mode: u64,
+        a: u64,
+        b: u64,
+        n: u64,
+        pmu: bool,
+        cet: u64,
+        ss: bool,
+    ) -> (Window, Option<x86::Fault>) {
         let mut w = Window {
             token: self.token,
             mode,
@@ -255,7 +267,10 @@ fn measure(core: usize, samples: usize, out: &Mutex<Vec<Sample>>) {
     let target = paging::frame();
     paging::map(10, token_frame, P | A | D);
     paging::map(11, target, P | A | D);
-    let s = Setup { token: paging::window_va(10) + 0xFF8, token_frame };
+    let s = Setup {
+        token: paging::window_va(10) + 0xFF8,
+        token_frame,
+    };
     s.reset_token();
     let cr4 = x86::cr4();
     // SAFETY: WP is set (checked); nothing is enabled in IA32_S_CET yet.
@@ -292,12 +307,15 @@ fn measure(core: usize, samples: usize, out: &Mutex<Vec<Sample>>) {
             cycles: c,
         });
     };
-    let mut run = |name: &'static str, extra: String, mode: u64, n: u64, cet: u64, ss: bool| {
+    let run = |name: &'static str, extra: String, mode: u64, n: u64, cet: u64, ss: bool| {
         let (mut t, mut c) = (Vec::with_capacity(samples), Vec::with_capacity(samples));
         for _ in 0..=samples {
             let (w, f) = s.window(mode, paging::window_va(11), 1, n, pmu, cet, ss);
             if f.is_some() {
-                info(alloc::format!("F {name} core={core}{extra} fault={}", fault_text(f)));
+                info(alloc::format!(
+                    "F {name} core={core}{extra} fault={}",
+                    fault_text(f)
+                ));
                 return;
             }
             t.push(w.t1 - w.t0);
@@ -316,7 +334,14 @@ fn measure(core: usize, samples: usize, out: &Mutex<Vec<Sample>>) {
     if bit(cpuid(7, 0).edx, 20) {
         smp::mark("cet indirect");
         run("cet.indirect", " ops=64 ibt=0".into(), 3, 64, 0, false);
-        run("cet.indirect", " ops=64 ibt=1".into(), 3, 64, x86::CET_ENDBR_EN, false);
+        run(
+            "cet.indirect",
+            " ops=64 ibt=1".into(),
+            3,
+            64,
+            x86::CET_ENDBR_EN,
+            false,
+        );
     }
     // SAFETY: CR4 as found; IA32_S_CET is 0 after every window.
     unsafe { x86::set_cr4(cr4) };
@@ -352,16 +377,19 @@ fn walk(core: usize, s: &Setup, out: &Mutex<Vec<Sample>>) {
     // SAFETY: window page 20 now maps `fb`.
     let second = unsafe { (va as *const u64).read_volatile() };
     let pt_store = plain_store(entry);
-    gate::info(out, alloc::format!(
-        "I cet.walk core={core} wrss_faults={}/{} walk_first={} accessed={} dirty={} walk_after_rewrite={} ordinary_store_to_table={}",
-        fault_text(f1),
-        fault_text(f2),
-        u8::from(first == 0xAAAA),
-        u8::from(accessed),
-        u8::from(dirty),
-        u8::from(second == 0xBBBB),
-        fault_text(pt_store)
-    ));
+    gate::info(
+        out,
+        alloc::format!(
+            "I cet.walk core={core} wrss_faults={}/{} walk_first={} accessed={} dirty={} walk_after_rewrite={} ordinary_store_to_table={}",
+            fault_text(f1),
+            fault_text(f2),
+            u8::from(first == 0xAAAA),
+            u8::from(accessed),
+            u8::from(dirty),
+            u8::from(second == 0xBBBB),
+            fault_text(pt_store)
+        ),
+    );
     // SAFETY: clears the test entries through the table's identity
     // mapping.
     unsafe {
@@ -380,7 +408,9 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
     let samples = cx.reps(2000, 50);
     let results: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
     for core in gate::one_per_kind() {
-        smp::run_on(&[core], 30_000, &|i| x86::without_interrupts(|| measure(i, samples, &results)))?;
+        smp::run_on(&[core], 30_000, &|i| {
+            x86::without_interrupts(|| measure(i, samples, &results))
+        })?;
         gate::report(&results);
     }
     Ok(())

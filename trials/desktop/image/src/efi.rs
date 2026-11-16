@@ -15,8 +15,6 @@ pub type Status = usize;
 
 pub const SUCCESS: Status = 0;
 const ERROR_BIT: usize = 1 << 63;
-pub const NOT_READY: Status = ERROR_BIT | 6;
-pub const BUFFER_TOO_SMALL: Status = ERROR_BIT | 5;
 pub const NOT_FOUND: Status = ERROR_BIT | 14;
 
 #[repr(C)]

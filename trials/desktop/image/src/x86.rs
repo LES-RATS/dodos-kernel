@@ -12,13 +12,9 @@ pub const IA32_APIC_BASE: u32 = 0x1B;
 pub const APIC_BASE_BSP: u64 = 1 << 8;
 pub const APIC_BASE_EXTD: u64 = 1 << 10;
 pub const APIC_BASE_EN: u64 = 1 << 11;
-pub const IA32_MPERF: u32 = 0xE7;
-pub const IA32_APERF: u32 = 0xE8;
 pub const IA32_PAT: u32 = 0x277;
-pub const IA32_FIXED_CTR1: u32 = 0x30A;
 pub const IA32_FIXED_CTR_CTRL: u32 = 0x38D;
 pub const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
-pub const IA32_U_CET: u32 = 0x6A0;
 pub const IA32_S_CET: u32 = 0x6A2;
 pub const IA32_PL0_SSP: u32 = 0x6A4;
 pub const IA32_PKRS: u32 = 0x6E1;
@@ -280,13 +276,6 @@ pub unsafe fn inl(port: u16) -> u32 {
     v
 }
 
-/// # Safety
-/// As `outb`.
-pub unsafe fn outl(port: u16, v: u32) {
-    // SAFETY: the caller's guarantee.
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack)) };
-}
-
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct DescriptorPtr {
@@ -313,13 +302,6 @@ pub fn sgdt() -> DescriptorPtr {
 pub unsafe fn lidt(p: &DescriptorPtr) {
     // SAFETY: the caller's guarantee.
     unsafe { asm!("lidt [{}]", in(reg) p, options(nostack)) };
-}
-
-/// # Safety
-/// `p` must describe a valid GDT holding the current selectors.
-pub unsafe fn lgdt(p: &DescriptorPtr) {
-    // SAFETY: the caller's guarantee.
-    unsafe { asm!("lgdt [{}]", in(reg) p, options(nostack)) };
 }
 
 pub fn cs() -> u16 {

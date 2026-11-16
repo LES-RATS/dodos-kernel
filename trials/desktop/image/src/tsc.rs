@@ -70,13 +70,21 @@ fn against_stall() -> u64 {
 
 pub fn calibrate() {
     let max = x86::cpuid(0, 0).eax;
-    let l15 = if max >= 0x15 { x86::cpuid(0x15, 0) } else { x86::Cpuid::default() };
+    let l15 = if max >= 0x15 {
+        x86::cpuid(0x15, 0)
+    } else {
+        x86::Cpuid::default()
+    };
     let cpuid_hz = if l15.eax != 0 && l15.ebx != 0 && l15.ecx != 0 {
         u64::from(l15.ecx) * u64::from(l15.ebx) / u64::from(l15.eax)
     } else {
         0
     };
-    let base_mhz = if max >= 0x16 { x86::cpuid(0x16, 0).eax & 0xFFFF } else { 0 };
+    let base_mhz = if max >= 0x16 {
+        x86::cpuid(0x16, 0).eax & 0xFFFF
+    } else {
+        0
+    };
     let pm = acpi::pm_timer_port().map(against_pm);
     let stall = against_stall();
     let used = pm.unwrap_or(stall);

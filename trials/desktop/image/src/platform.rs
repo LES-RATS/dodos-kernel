@@ -64,7 +64,14 @@ fn functions() -> Vec<Function> {
                         }
                         continue;
                     }
-                    out.push(Function { bus, dev, func, base: b, vendor: id, class: rd32(b + 8) >> 8 });
+                    out.push(Function {
+                        bus,
+                        dev,
+                        func,
+                        base: b,
+                        vendor: id,
+                        class: rd32(b + 8) >> 8,
+                    });
                     if func == 0 && rd8(b + 0x0E) & 0x80 == 0 {
                         break;
                     }
@@ -77,7 +84,11 @@ fn functions() -> Vec<Function> {
 
 fn bar64(f: &Function) -> u64 {
     let lo = rd32(f.base + 0x10);
-    let hi = if lo & 0b110 == 0b100 { rd32(f.base + 0x14) } else { 0 };
+    let hi = if lo & 0b110 == 0b100 {
+        rd32(f.base + 0x14)
+    } else {
+        0
+    };
     (u64::from(hi) << 32 | u64::from(lo)) & !0xF
 }
 
@@ -128,7 +139,10 @@ fn ioapic_version(base: u64) -> u32 {
 }
 
 pub fn run(_cx: &mut Ctx) -> Result<(), String> {
-    let sigs: Vec<String> = acpi::signatures().iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+    let sigs: Vec<String> = acpi::signatures()
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
     out!("I acpi tables={}", sigs.join(","));
     out!(
         "R debug.serial com1={} spcr={} dbg2={}",
@@ -162,7 +176,10 @@ pub fn run(_cx: &mut Ctx) -> Result<(), String> {
             }
             0x0C0320 => {
                 let caps = pci_caps(f);
-                out!("R debug.ehci at={at} id={id} debug_port={}", u8::from(caps.contains(&0x0A)));
+                out!(
+                    "R debug.ehci at={at} id={id} debug_port={}",
+                    u8::from(caps.contains(&0x0A))
+                );
             }
             _ => {}
         }

@@ -257,11 +257,7 @@ unsafe extern "C" {
 
 fn gate(handler: u64, cs: u16) -> u128 {
     let h = u128::from(handler);
-    (h & 0xFFFF)
-        | u128::from(cs) << 16
-        | 0x8E << 40
-        | (h >> 16 & 0xFFFF) << 48
-        | (h >> 32) << 64
+    (h & 0xFFFF) | u128::from(cs) << 16 | 0x8E << 40 | (h >> 16 & 0xFFFF) << 48 | (h >> 32) << 64
 }
 
 /// Builds the calling core's IDT in its per-core block, from the IDT the
@@ -282,8 +278,8 @@ pub fn install() {
                 (*idt)[v] = src.add(v).read_unaligned();
             }
         }
-        for v in 0..32 {
-            (*idt)[v] = gate(dodos_exc_table[v], cs);
+        for (v, &h) in dodos_exc_table.iter().enumerate() {
+            (*idt)[v] = gate(h, cs);
         }
         let ours: [(u8, unsafe extern "C" fn()); 6] = [
             (V_FLAG, dodos_irq_flag),

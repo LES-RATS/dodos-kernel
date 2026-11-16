@@ -34,40 +34,74 @@ pub fn memory_map_pub() -> Vec<MemoryDescriptor> {
 }
 
 fn memory_map() -> Vec<MemoryDescriptor> {
-    let st = con::CON.lock().expect("console").as_ref().expect("console").st;
+    let st = con::CON
+        .lock()
+        .expect("console")
+        .as_ref()
+        .expect("console")
+        .st;
     let mut size = 0usize;
     let (mut key, mut dsize, mut ver) = (0usize, 0usize, 0u32);
     // SAFETY: boot services are valid; the first call asks for the size,
     // the second fills a buffer larger than it.
     unsafe {
         let bs = (*st).boot_services;
-        ((*bs).get_memory_map)(&mut size, core::ptr::null_mut(), &mut key, &mut dsize, &mut ver);
+        ((*bs).get_memory_map)(
+            &mut size,
+            core::ptr::null_mut(),
+            &mut key,
+            &mut dsize,
+            &mut ver,
+        );
         size += 16 * dsize.max(48);
         let mut buf = alloc::vec![0u8; size];
-        if ((*bs).get_memory_map)(&mut size, buf.as_mut_ptr().cast(), &mut key, &mut dsize, &mut ver)
-            != efi::SUCCESS
+        if ((*bs).get_memory_map)(
+            &mut size,
+            buf.as_mut_ptr().cast(),
+            &mut key,
+            &mut dsize,
+            &mut ver,
+        ) != efi::SUCCESS
             || dsize == 0
         {
             return Vec::new();
         }
         (0..size / dsize)
-            .map(|k| buf.as_ptr().add(k * dsize).cast::<MemoryDescriptor>().read_unaligned())
+            .map(|k| {
+                buf.as_ptr()
+                    .add(k * dsize)
+                    .cast::<MemoryDescriptor>()
+                    .read_unaligned()
+            })
             .collect()
     }
 }
 
 /// Four regions of free memory, taken from the firmware.
 fn take_regions() -> Vec<u64> {
-    let st = con::CON.lock().expect("console").as_ref().expect("console").st;
+    let st = con::CON
+        .lock()
+        .expect("console")
+        .as_ref()
+        .expect("console")
+        .st;
     let free: Vec<(u64, u64)> = memory_map()
         .iter()
         .filter(|d| d.kind == efi::CONVENTIONAL_MEMORY && d.number_of_pages * 4096 >= 2 * REGION)
-        .map(|d| (d.physical_start, d.physical_start + d.number_of_pages * 4096))
+        .map(|d| {
+            (
+                d.physical_start,
+                d.physical_start + d.number_of_pages * 4096,
+            )
+        })
         .collect();
     let top = free.iter().map(|r| r.1).max().unwrap_or(0);
     let mut out = Vec::new();
     for want in [16u64 << 20, 1 << 30, 4 << 30, top.saturating_sub(64 << 20)] {
-        let Some(&(s, e)) = free.iter().find(|r| r.1 >= want + REGION && r.1 - r.0.max(want) >= REGION) else {
+        let Some(&(s, e)) = free
+            .iter()
+            .find(|r| r.1 >= want + REGION && r.1 - r.0.max(want) >= REGION)
+        else {
             continue;
         };
         let mut a = ((s.max(want)) + 0xFFFFF) & !0xFFFFF;
@@ -80,7 +114,12 @@ fn take_regions() -> Vec<u64> {
         let mut got = a;
         // SAFETY: boot services are valid; asks for exactly these pages.
         let r = unsafe {
-            ((*(*st).boot_services).allocate_pages)(efi::ALLOCATE_ADDRESS, efi::LOADER_DATA, (REGION / 4096) as usize, &mut got)
+            ((*(*st).boot_services).allocate_pages)(
+                efi::ALLOCATE_ADDRESS,
+                efi::LOADER_DATA,
+                (REGION / 4096) as usize,
+                &mut got,
+            )
         };
         if r == efi::SUCCESS {
             out.push(a);
@@ -110,19 +149,29 @@ fn check(nonce: u64, r: u64) -> u64 {
 }
 
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
 }
 
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
     let reps = cx.reps(2, 1) as u32;
     let armed: Vec<String> = cx.records("wr ").iter().map(|s| String::from(*s)).collect();
-    let done: Vec<String> = cx.records("wr-done ").iter().map(|s| String::from(*s)).collect();
+    let done: Vec<String> = cx
+        .records("wr-done ")
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
     // A reset armed in an earlier boot and not yet read back.
     if let Some(last) = armed.last() {
-        let (m, r) = (field(last, "method").unwrap_or("?"), field(last, "rep").unwrap_or("?"));
+        let (m, r) = (
+            field(last, "method").unwrap_or("?"),
+            field(last, "rep").unwrap_or("?"),
+        );
         let tag = alloc::format!("wr-done method={m} rep={r}");
         if !done.iter().any(|d| d == &tag) {
-            let nonce = field(last, "nonce").and_then(crate::run::parse_num).unwrap_or(0);
+            let nonce = field(last, "nonce")
+                .and_then(crate::run::parse_num)
+                .unwrap_or(0);
             let regions: Vec<u64> = field(last, "regions")
                 .unwrap_or("")
                 .split(',')
@@ -152,7 +201,11 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
             cx.record(&tag);
         }
     }
-    let done: Vec<String> = cx.records("wr-done ").iter().map(|s| String::from(*s)).collect();
+    let done: Vec<String> = cx
+        .records("wr-done ")
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
     for m in METHODS {
         for r in 0..reps {
             let tag = alloc::format!("wr-done method={m} rep={r}");
@@ -172,7 +225,9 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                 cx.boot
             ));
             cx.record(&alloc::format!("resume warm-reset {}", cx.boot));
-            out!("I warm.reset arming method={m} rep={r}: the machine resets now and the image starts again");
+            out!(
+                "I warm.reset arming method={m} rep={r}: the machine resets now and the image starts again"
+            );
             con::flush();
             con::stall_us(1_000_000);
             match m {

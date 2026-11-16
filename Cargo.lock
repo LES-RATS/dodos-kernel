@@ -7,5 +7,9 @@ name = "dodos-abi"
 version = "0.0.0"
 
 [[package]]
+name = "dodos-trial-desktop-tables"
+version = "0.0.0"
+
+[[package]]
 name = "dodos-trial-multicore"
 version = "0.0.0"

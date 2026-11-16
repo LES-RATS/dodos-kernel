@@ -44,12 +44,6 @@ fn page_below_4g(st: *mut SystemTable) -> u64 {
     a
 }
 
-/// A page below 4 GB taken from the firmware, cleared (also used by the
-/// trampoline and the measures).
-pub fn low_page(st: *mut SystemTable) -> u64 {
-    page_below_4g(st)
-}
-
 fn entry(table: u64, i: u64) -> *mut u64 {
     (table + i * 8) as *mut u64
 }

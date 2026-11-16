@@ -94,13 +94,20 @@ pub static RESUME_CORE: AtomicU64 = AtomicU64::new(u64::MAX);
 pub fn resumed(i: usize, tsc: u64) -> ! {
     percpu::install(i, 0);
     let me = percpu::me();
-    let idt = x86::DescriptorPtr { limit: 256 * 16 - 1, base: me.idt.as_ptr() as u64 };
+    let idt = x86::DescriptorPtr {
+        limit: 256 * 16 - 1,
+        base: me.idt.as_ptr() as u64,
+    };
     // SAFETY: this core's IDT; the page tables it used before INIT (the
     // firmware's on the bootstrap core, saved by `smp::save_fw` in
     // `setup`; the image's on a worker).
     unsafe {
         x86::lidt(&idt);
-        x86::set_cr3(if i == 0 { (*(&raw const smp::FW))[0].cr3 } else { paging::root() });
+        x86::set_cr3(if i == 0 {
+            (*(&raw const smp::FW).cast::<smp::FwState>()).cr3
+        } else {
+            paging::root()
+        });
     }
     if apic::x2() {
         apic::enter_x2apic_local();
@@ -112,8 +119,24 @@ pub fn resumed(i: usize, tsc: u64) -> ! {
         for &(r, v) in &(*s).apic {
             apic::write(r, v);
         }
+        // A timer in TSC-deadline mode (LVT bits 18:17 = 10b) is armed by a
+        // write of IA32_TSC_DEADLINE, which INIT leaves as it was (vol. 3A
+        // table 12-1) but which may have passed: arm it 1 ms from now so
+        // that the firmware's tick comes back and re-arms itself.
+        let lvt = (*s)
+            .apic
+            .iter()
+            .find(|(r, _)| *r == apic::LVT_TIMER)
+            .map_or(0, |&(_, v)| v);
+        if i == 0 && lvt >> 17 & 0b11 == 0b10 && lvt >> 16 & 1 == 0 {
+            x86::wrmsr(
+                x86::IA32_TSC_DEADLINE,
+                x86::rdtsc() + tsc::ns_to_ticks(1_000_000),
+            );
+        }
         (*s).resumed_tsc.store(tsc, Ordering::Release);
-        me.parked.store(me.park_request.load(Ordering::Relaxed), Ordering::Release);
+        me.parked
+            .store(me.park_request.load(Ordering::Relaxed), Ordering::Release);
         asm!(
             "mov rsp, [{s} + 16]",
             "mov rbp, [{s} + 8]",
@@ -190,7 +213,11 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
             stop.store(1, Ordering::Release);
         }
     })?;
-    stats::report_ticks("bsp.nmi", "director=0 from=worker", &mut lat.lock().expect("lat"));
+    stats::report_ticks(
+        "bsp.nmi",
+        "director=0 from=worker",
+        &mut lat.lock().expect("lat"),
+    );
     crate::con::flush();
     // Park without INIT, woken by NMI and the start request.
     let wake: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -207,7 +234,8 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                         x86::pause();
                     }
                     let s0 = me.start_request.load(Ordering::Acquire);
-                    me.parked.store(me.park_request.load(Ordering::Acquire), Ordering::Release);
+                    me.parked
+                        .store(me.park_request.load(Ordering::Acquire), Ordering::Release);
                     while me.start_request.load(Ordering::Acquire) == s0 {
                         x86::hlt();
                     }
@@ -247,7 +275,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
             *wake.lock().expect("wake") = v;
         }
     })?;
-    let k = alloc::format!("wake=nmi+start_request resends={}", RESENDS.load(Ordering::Relaxed));
+    let k = alloc::format!(
+        "wake=nmi+start_request resends={}",
+        RESENDS.load(Ordering::Relaxed)
+    );
     stats::report_ticks("bsp.park", &k, &mut wake.lock().expect("wake"));
     crate::con::flush();
     // Can the BSP flag be cleared?
@@ -321,7 +352,10 @@ fn rehearsal(cx: &Ctx, d: usize) -> Result<(), String> {
         times.push(r.wrapping_sub(sent.load(Ordering::Acquire)));
     }
     RESUME_CORE.store(u64::MAX, Ordering::Release);
-    let k = alloc::format!("core={w} kind={} d_init_us=10000 sipi=2x200us", smp::kind(w).name());
+    let k = alloc::format!(
+        "core={w} kind={} d_init_us=10000 sipi=2x200us",
+        smp::kind(w).name()
+    );
     stats::report_ticks("bsp.rehearsal", &k, &mut times);
     crate::con::flush();
     Ok(())
@@ -375,7 +409,16 @@ fn init_runs(cx: &Ctx, d: usize) -> Result<(), String> {
         times.push(r.wrapping_sub(sent.load(Ordering::Acquire)));
         let _ = req;
     }
-    out!("R bsp.init.count n={} restarted={} flag_restored=1", times.len(), times.len());
+    out!(
+        "R bsp.init.count n={} restarted={} flag_restored=1 firmware_timer_after={}",
+        times.len(),
+        times.len(),
+        if crate::setup::firmware_timer_runs() {
+            "runs"
+        } else {
+            "stopped"
+        }
+    );
     stats::report_ticks("bsp.init.entry", "d_init_us=10000 sipi=2x200us", &mut times);
     if cx.flag("bsp_init_flag_set") {
         out!("I bsp.init_flag_set: INIT to the bootstrap core with its flag set; expect a reset");

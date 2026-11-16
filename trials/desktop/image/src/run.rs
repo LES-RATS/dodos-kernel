@@ -111,7 +111,12 @@ pub fn main() -> ! {
         .map(|b| parse_config(&String::from_utf8_lossy(&b)))
         .unwrap_or_default();
     let mut state: Vec<String> = con::read_file("STATE.TXT")
-        .map(|b| String::from_utf8_lossy(&b).lines().map(String::from).collect())
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
     let boot = 1 + state
         .iter()
@@ -120,11 +125,21 @@ pub fn main() -> ! {
         .max()
         .unwrap_or(0);
     con::copy_to_serial(config.get("serial").is_none_or(|v| v != "0"));
-    crate::smp::DEBUG.store(config.get("debug").is_some_and(|v| v == "1"), Ordering::Relaxed);
-    END_HALT.store(config.get("panic").is_some_and(|v| v == "halt"), Ordering::Relaxed);
-    out!("I image name=dodos-trial-desktop boot={boot} volume={}", con::has_volume());
-    con::line("DodOS desktop measurements. Keys in the next 5 s: S skip the risky steps,");
-    con::line("R forget the progress and start over, Q stop now, any other key go on.");
+    crate::smp::DEBUG.store(
+        config.get("debug").is_some_and(|v| v == "1"),
+        Ordering::Relaxed,
+    );
+    END_HALT.store(
+        config.get("panic").is_some_and(|v| v == "halt"),
+        Ordering::Relaxed,
+    );
+    out!(
+        "I image name=dodos-trial-desktop boot={boot} volume={}",
+        con::has_volume()
+    );
+    con::line("DodOS desktop measurements. Keys in the next 5 s:");
+    con::line("  S: skip the risky steps; R: forget the progress and start over;");
+    con::line("  Q: stop now; any other key: go on at once.");
     let k = con::wait_key(5000);
     if k == Some('R') {
         con::replace_file("STATE.TXT", b"");
@@ -170,7 +185,12 @@ fn status(cx: &Ctx, name: &str) -> Option<&'static str> {
 }
 
 fn run_step(cx: &mut Ctx, s: &Step) {
-    let skipped: Vec<&str> = cx.get("skip").unwrap_or("").split(',').map(str::trim).collect();
+    let skipped: Vec<&str> = cx
+        .get("skip")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .collect();
     if skipped.contains(&s.name) {
         out!("I step {} skipped by configuration", s.name);
         return;
@@ -186,7 +206,10 @@ fn run_step(cx: &mut Ctx, s: &Step) {
                 return;
             }
             Some("start") => {
-                out!("F {} hung in an earlier boot (started, never finished); skipped", s.name);
+                out!(
+                    "F {} hung in an earlier boot (started, never finished); skipped",
+                    s.name
+                );
                 cx.record(&alloc::format!("failed {} {}", s.name, cx.boot));
                 con::flush();
                 return;
@@ -199,7 +222,10 @@ fn run_step(cx: &mut Ctx, s: &Step) {
             out!("I step {} skipped by key S", s.name);
             return;
         }
-        con::line(&alloc::format!("Next: {} (can hang the machine). Any key within 3 s skips it.", s.name));
+        con::line(&alloc::format!(
+            "Next: {} (can hang the machine). Any key within 3 s skips it.",
+            s.name
+        ));
         if con::wait_key(3000).is_some() {
             out!("I step {} skipped by key", s.name);
             cx.record(&alloc::format!("done {} {}", s.name, cx.boot));
@@ -263,7 +289,10 @@ pub fn panicked(info: &PanicInfo) -> ! {
         let _ = write!(msg, " at {}:{}", l.file(), l.line());
     }
     let step = CURRENT.try_lock().ok().and_then(|g| *g).unwrap_or("none");
-    out!("F panic step={step} message=\"{}\"", msg.0.replace('"', "'"));
+    out!(
+        "F panic step={step} message=\"{}\"",
+        msg.0.replace('"', "'")
+    );
     con::flush();
     if step != "none" {
         con::append_file("STATE.TXT", alloc::format!("failed {step} 0\n").as_bytes());

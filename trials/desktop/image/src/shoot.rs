@@ -38,7 +38,15 @@ enum Send {
 fn shoot(targets: &[u32], send: Send, frames: (u64, u64), k: u64) -> u64 {
     let n = targets.len() as u64;
     let va = paging::window_va(30);
-    paging::map(30, if k % 2 == 0 { frames.0 } else { frames.1 }, P | RW | A | D);
+    paging::map(
+        30,
+        if k.is_multiple_of(2) {
+            frames.0
+        } else {
+            frames.1
+        },
+        P | RW | A | D,
+    );
     DODOS_SHOOT_VA.store(va, Ordering::Relaxed);
     DODOS_SHOOT_ACKS.store(0, Ordering::Release);
     let t0 = x86::tsc_begin();
@@ -64,13 +72,22 @@ fn shoot(targets: &[u32], send: Send, frames: (u64, u64), k: u64) -> u64 {
     }
     let end = t0 + tsc::ns_to_ticks(100_000_000);
     while DODOS_SHOOT_ACKS.load(Ordering::Acquire) < n {
-        assert!(x86::rdtsc() < end, "shootdown not acknowledged within 100 ms");
+        assert!(
+            x86::rdtsc() < end,
+            "shootdown not acknowledged within 100 ms"
+        );
         x86::pause();
     }
     x86::tsc_end() - t0
 }
 
-fn measure(init: usize, targets: &[usize], idle: bool, send: Send, n: usize) -> Result<Vec<u64>, String> {
+fn measure(
+    init: usize,
+    targets: &[usize],
+    idle: bool,
+    send: Send,
+    n: usize,
+) -> Result<Vec<u64>, String> {
     DONE.store(0, Ordering::Release);
     let out: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let apics: Vec<u32> = targets.iter().map(|&t| smp::cores()[t].apic).collect();
@@ -135,13 +152,30 @@ fn measure(init: usize, targets: &[usize], idle: bool, send: Send, n: usize) -> 
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
     let n = cx.reps(5_000, 50);
     let w = smp::workers();
-    let of = |k: CoreKind| w.iter().copied().filter(|&i| smp::kind(i) == k).collect::<Vec<_>>();
+    let of = |k: CoreKind| {
+        w.iter()
+            .copied()
+            .filter(|&i| smp::kind(i) == k)
+            .collect::<Vec<_>>()
+    };
     let (p, e) = (of(CoreKind::P), of(CoreKind::E));
     let init = *w.first().ok_or("no worker")?;
     let others: Vec<usize> = w.iter().copied().filter(|&i| i != init).collect();
-    let same: Vec<usize> = others.iter().copied().filter(|&i| smp::kind(i) == smp::kind(init)).collect();
-    let other_kind: Vec<usize> = others.iter().copied().filter(|&i| smp::kind(i) != smp::kind(init)).collect();
-    let sends = if apic::x2() { &[Send::Unicast, Send::Logical][..] } else { &[Send::Unicast][..] };
+    let same: Vec<usize> = others
+        .iter()
+        .copied()
+        .filter(|&i| smp::kind(i) == smp::kind(init))
+        .collect();
+    let other_kind: Vec<usize> = others
+        .iter()
+        .copied()
+        .filter(|&i| smp::kind(i) != smp::kind(init))
+        .collect();
+    let sends = if apic::x2() {
+        &[Send::Unicast, Send::Logical][..]
+    } else {
+        &[Send::Unicast][..]
+    };
     let mut cases: Vec<(&str, Vec<usize>)> = Vec::new();
     for k in [1usize, 2, 5, 13] {
         if same.len() >= k {
@@ -178,7 +212,11 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                     smp::kind(init).name(),
                     targets.len(),
                     if idle { "idle" } else { "busy" },
-                    if send == Send::Unicast { "unicast" } else { "logical" },
+                    if send == Send::Unicast {
+                        "unicast"
+                    } else {
+                        "logical"
+                    },
                     u8::from(targets.contains(&0))
                 );
                 stats::report_ticks("shoot", &k, &mut v);

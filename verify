@@ -5,3 +5,11 @@ cd "$(dirname "$0")"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# The desktop measurement image (trials/desktop/image): its own workspace,
+# built only for x86_64-unknown-uefi, so it is checked and built here.
+(
+	cd trials/desktop/image
+	cargo fmt --check
+	cargo clippy --release -- -D warnings
+	cargo build --release
+)

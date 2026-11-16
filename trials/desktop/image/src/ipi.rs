@@ -109,27 +109,27 @@ fn wait_count(c: &AtomicU64, from: u64) {
 fn rtt(b: usize, t: Target, n: usize, gap_ns: u64) -> Vec<u64> {
     let me = percpu::me();
     let b_apic = smp::cores()[b].apic;
-    percpu::of(b).pong_dest.store(u64::from(apic::id()), Ordering::Relaxed);
+    percpu::of(b)
+        .pong_dest
+        .store(u64::from(apic::id()), Ordering::Relaxed);
     let mut v = Vec::with_capacity(n);
     for k in 0..=n {
         tsc::spin_ns(gap_ns);
-        let t0;
-        let t1;
-        if t == Target::Mem {
+        let (t0, t1) = if t == Target::Mem {
             let seq = k as u64 + 1;
-            t0 = x86::tsc_begin();
+            let t0 = x86::tsc_begin();
             FLAG.store(seq, Ordering::Release);
             while ACK.load(Ordering::Acquire) != seq {
                 x86::pause();
             }
-            t1 = x86::tsc_end();
+            (t0, x86::tsc_end())
         } else {
             let c0 = me.irq_count.load(Ordering::Acquire);
-            t0 = x86::tsc_begin();
+            let t0 = x86::tsc_begin();
             apic::send(b_apic, apic::FIXED, V_PONG);
             wait_count(&me.irq_count, c0);
-            t1 = x86::tsc_end();
-        }
+            (t0, x86::tsc_end())
+        };
         if k > 0 {
             v.push(t1 - t0);
         }
@@ -154,9 +154,17 @@ fn oneway(b: usize, n: usize) -> Vec<u64> {
 
 /// One pair measurement: B runs `t`, A measures; returns A's samples and,
 /// for MWAIT, the C6 and C7 residency changes on B.
-fn pair(a: usize, b: usize, t: Target, n: usize, gap_ns: u64, oneway_too: bool) -> Result<(Vec<u64>, Vec<u64>, String), String> {
+fn pair(
+    a: usize,
+    b: usize,
+    t: Target,
+    n: usize,
+    gap_ns: u64,
+    oneway_too: bool,
+) -> Result<(Vec<u64>, Vec<u64>, String), String> {
     STOP.store(0, Ordering::Release);
-    let out: Mutex<(Vec<u64>, Vec<u64>, String)> = Mutex::new((Vec::new(), Vec::new(), String::new()));
+    let out: Mutex<(Vec<u64>, Vec<u64>, String)> =
+        Mutex::new((Vec::new(), Vec::new(), String::new()));
     let ready = AtomicU64::new(0);
     smp::run_on(&[a, b], 120_000, &|i| {
         if i == b {
@@ -165,9 +173,14 @@ fn pair(a: usize, b: usize, t: Target, n: usize, gap_ns: u64, oneway_too: bool) 
             ready.store(1, Ordering::Release);
             target_loop(t);
             let r1 = [x86::safe_rdmsr(0x3FD).ok(), x86::safe_rdmsr(0x3FE).ok()];
-            let d = |k: usize| r0[k].zip(r1[k]).map_or("none".into(), |(x, y)| alloc::format!("{}", y.wrapping_sub(x)));
+            let d = |k: usize| {
+                r0[k].zip(r1[k]).map_or("none".into(), |(x, y)| {
+                    alloc::format!("{}", y.wrapping_sub(x))
+                })
+            };
             if matches!(t, Target::Mwait(_)) {
-                out.lock().expect("out").2 = alloc::format!(" c6_residency={} c7_residency={}", d(0), d(1));
+                out.lock().expect("out").2 =
+                    alloc::format!(" c6_residency={} c7_residency={}", d(0), d(1));
             }
         } else {
             smp::mark("ipi initiator");
@@ -202,7 +215,11 @@ pub fn mwait_hints() -> Vec<u32> {
     if !x86::bit(x86::cpuid(1, 0).ecx, 3) {
         return Vec::new();
     }
-    let l5 = if x86::cpuid(0, 0).eax >= 5 { x86::cpuid(5, 0) } else { x86::Cpuid::default() };
+    let l5 = if x86::cpuid(0, 0).eax >= 5 {
+        x86::cpuid(5, 0)
+    } else {
+        x86::Cpuid::default()
+    };
     let mut h = Vec::new();
     if l5.ecx & 1 == 1 {
         for n in 1..8u32 {
@@ -220,7 +237,12 @@ pub fn mwait_hints() -> Vec<u32> {
 /// Representative pairs: P→P, E→E, P→E, E→P (two cores of each kind).
 pub fn pairs() -> Vec<(usize, usize)> {
     let w = smp::workers();
-    let of = |k: CoreKind| w.iter().copied().filter(|&i| smp::kind(i) == k).collect::<Vec<_>>();
+    let of = |k: CoreKind| {
+        w.iter()
+            .copied()
+            .filter(|&i| smp::kind(i) == k)
+            .collect::<Vec<_>>()
+    };
     let (p, e, u) = (of(CoreKind::P), of(CoreKind::E), of(CoreKind::Unknown));
     let mut out = Vec::new();
     if p.len() >= 2 {

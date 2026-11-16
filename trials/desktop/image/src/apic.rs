@@ -12,7 +12,6 @@ use core::sync::atomic::Ordering;
 pub const ID: u32 = 0x20;
 pub const VERSION: u32 = 0x30;
 pub const TPR: u32 = 0x80;
-pub const LDR: u32 = 0xD0;
 pub const SVR: u32 = 0xF0;
 pub const LVT_TIMER: u32 = 0x320;
 pub const LVT_THERMAL: u32 = 0x330;
@@ -74,7 +73,10 @@ pub fn send(dest: u32, mode: u32, vector: u8) {
 /// Sends to every core whose logical ID matches `mask` in `cluster`
 /// (x2APIC logical mode only, vol. 3A 13.12.10.2).
 pub fn send_logical(cluster: u32, mask: u32, vector: u8) {
-    send_icr(cluster << 16 | mask, FIXED | LEVEL_ASSERT | LOGICAL | u32::from(vector));
+    send_icr(
+        cluster << 16 | mask,
+        FIXED | LEVEL_ASSERT | LOGICAL | u32::from(vector),
+    );
 }
 
 fn send_icr(dest: u32, low: u32) {
@@ -100,16 +102,6 @@ pub fn self_ipi(vector: u8) {
     } else {
         // Shorthand "self" (bits 19:18 = 01), fixed, edge.
         send_icr(0, 1 << 18 | LEVEL_ASSERT | u32::from(vector));
-    }
-}
-
-pub fn eoi() {
-    if x2() {
-        // SAFETY: writing 0 to the EOI register ends the interrupt.
-        unsafe { x86::wrmsr(0x80B, 0) };
-    } else {
-        // SAFETY: as `read`.
-        unsafe { mmio(0xB0).write_volatile(0) };
     }
 }
 

@@ -137,7 +137,12 @@ struct Boot {
     index: u64,
 }
 
-static mut BOOT: [Boot; MAX_CORES] = [const { Boot { stack_top: 0, index: 0 } }; MAX_CORES];
+static mut BOOT: [Boot; MAX_CORES] = [const {
+    Boot {
+        stack_top: 0,
+        index: 0,
+    }
+}; MAX_CORES];
 
 const STACK_BYTES: usize = 256 << 10;
 
@@ -188,7 +193,7 @@ pub fn save_fw(i: usize) {
     // SAFETY: entry `i` belongs to the calling core; EFER exists in long
     // mode.
     unsafe {
-        let f = &raw mut FW[i];
+        let f = (&raw mut FW).cast::<FwState>().add(i);
         (*f).cr0 = x86::cr0();
         (*f).cr3 = x86::cr3();
         (*f).cr4 = x86::cr4();
@@ -206,7 +211,7 @@ pub fn save_fw(i: usize) {
 extern "sysv64" fn ap_start(i: usize) -> ! {
     save_fw(i);
     // SAFETY: core `i`'s boot record, written before StartupThisAP.
-    let top = unsafe { (*(&raw const BOOT))[i].stack_top };
+    let top = unsafe { (*(&raw const BOOT).cast::<Boot>().add(i)).stack_top };
     percpu::install(i, top);
     idt::install();
     // SAFETY: the image's page tables map all memory as the firmware's did
@@ -267,7 +272,10 @@ pub fn mark(what: &'static str) {
     let i = percpu::my_index();
     if DEBUG.load(Ordering::Relaxed) {
         // No allocation here: the heap lock could be the problem.
-        for b in b"[core ".iter().chain(&[b'0' + (i / 10) as u8, b'0' + (i % 10) as u8, b':', b' ']) {
+        for b in b"[core "
+            .iter()
+            .chain(&[b'0' + (i / 10) as u8, b'0' + (i % 10) as u8, b':', b' '])
+        {
             con::serial_byte(*b);
         }
         for b in what.bytes().chain(*b"]\r\n") {
@@ -288,7 +296,13 @@ fn mark_of(i: usize) -> &'static str {
     // SAFETY: `mark` stores the parts of a `&'static str`; a torn pair
     // could only come from two marks of different lengths racing, which
     // one core does not do; the text is printed, never trusted.
-    unsafe { core::str::from_utf8(core::slice::from_raw_parts(p as *const u8, c.mark_len.load(Ordering::Relaxed))).unwrap_or("?") }
+    unsafe {
+        core::str::from_utf8(core::slice::from_raw_parts(
+            p as *const u8,
+            c.mark_len.load(Ordering::Relaxed),
+        ))
+        .unwrap_or("?")
+    }
 }
 
 fn post(i: usize, f: &(dyn Fn(usize) + Sync)) {
@@ -319,7 +333,11 @@ pub fn wait(on: &[usize], limit_ms: u64) -> Result<(), String> {
             }
             if run::is_bsp() && x86::rdtsc() > next_note {
                 next_note += every;
-                con::line(&alloc::format!("I waiting core={i} mark=\"{}\"", mark_of(i)));
+                con::line(&alloc::format!(
+                    "I waiting core={i} mark=\"{}\"",
+                    mark_of(i)
+                ));
+                con::flush();
             }
             if x86::rdtsc() > end {
                 return Err(alloc::format!(
@@ -357,7 +375,8 @@ pub fn start_on(on: &[usize], f: &(dyn Fn(usize) + Sync)) {
 /// afresh, so the job counts as done.
 pub fn forget_job(i: usize) {
     let c = &CTL[i];
-    c.done.store(c.seq.load(Ordering::Relaxed), Ordering::Release);
+    c.done
+        .store(c.seq.load(Ordering::Relaxed), Ordering::Release);
 }
 
 fn panic_text(i: usize) -> String {
@@ -410,7 +429,8 @@ pub fn core_panicked(info: &PanicInfo) -> ! {
 /// jobs again. The interrupted job is abandoned.
 pub extern "sysv64" fn park_after_nmi() -> ! {
     let me = percpu::me();
-    me.parked.store(me.park_request.load(Ordering::Relaxed), Ordering::Release);
+    me.parked
+        .store(me.park_request.load(Ordering::Relaxed), Ordering::Release);
     let start = me.start_request.load(Ordering::Acquire);
     while me.start_request.load(Ordering::Acquire) == start {
         x86::cli();
@@ -458,7 +478,11 @@ pub fn start(st: *mut efi::SystemTable) -> Result<usize, String> {
     let found = unsafe { ((*bs).locate_protocol)(&efi::MP_SERVICES_GUID, null_mut(), &mut mp) };
     let mut list = Vec::new();
     let bsp_apic = x86::apic_id_cpuid();
-    let shift = if x86::cpuid(0, 0).eax >= 0xB { x86::cpuid(0xB, 0).eax & 0x1F } else { 0 };
+    let shift = if x86::cpuid(0, 0).eax >= 0xB {
+        x86::cpuid(0xB, 0).eax & 0x1F
+    } else {
+        0
+    };
     list.push(Core {
         mp: usize::MAX,
         apic: bsp_apic,
@@ -489,7 +513,11 @@ pub fn start(st: *mut efi::SystemTable) -> Result<usize, String> {
                 apic,
                 thread,
                 kind: CoreKind::Unknown,
-                role: if thread == 0 { Role::Worker } else { Role::Sibling },
+                role: if thread == 0 {
+                    Role::Worker
+                } else {
+                    Role::Sibling
+                },
             });
         }
     } else {
@@ -511,7 +539,7 @@ pub fn start(st: *mut efi::SystemTable) -> Result<usize, String> {
         let top = stack.as_ptr() as u64 + STACK_BYTES as u64;
         // SAFETY: core `i`'s boot record, read by it after the call below.
         unsafe {
-            let b = &raw mut (*(&raw mut BOOT))[i];
+            let b = (&raw mut BOOT).cast::<Boot>().add(i);
             (*b).stack_top = top;
             (*b).index = i as u64;
         }
@@ -526,12 +554,15 @@ pub fn start(st: *mut efi::SystemTable) -> Result<usize, String> {
                 cores()[i].mp,
                 ev,
                 0,
-                (&raw mut (*(&raw mut BOOT))[i]).cast(),
+                (&raw mut BOOT).cast::<Boot>().add(i).cast(),
                 null_mut(),
             )
         };
         if r != efi::SUCCESS {
-            out!("F smp core={i} apic={} startup_status={r:#x}", cores()[i].apic);
+            out!(
+                "F smp core={i} apic={} startup_status={r:#x}",
+                cores()[i].apic
+            );
             continue;
         }
         let end = x86::rdtsc() + tsc::ns_to_ticks(2_000_000_000);
@@ -541,7 +572,10 @@ pub fn start(st: *mut efi::SystemTable) -> Result<usize, String> {
         if state(i) == IDLE {
             started += 1;
         } else {
-            out!("F smp core={i} apic={} did not reach the image within 2 s", cores()[i].apic);
+            out!(
+                "F smp core={i} apic={} did not reach the image within 2 s",
+                cores()[i].apic
+            );
             set_state(i, LOST);
         }
     }
@@ -558,11 +592,6 @@ pub fn set_kinds(kinds: &[CoreKind]) {
             c.kind = *k;
         }
     }
-}
-
-/// Whether the bootstrap core is the caller (for modules shared by both).
-pub fn on_bsp() -> bool {
-    run::is_bsp()
 }
 
 use alloc::boxed::Box;

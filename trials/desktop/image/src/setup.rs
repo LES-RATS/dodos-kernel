@@ -14,12 +14,17 @@ use crate::{apic, con, efi, idt, out, paging, percpu, smp, tsc, x86};
 use alloc::string::String;
 
 fn st() -> *mut efi::SystemTable {
-    con::CON.lock().expect("console").as_ref().expect("console").st
+    con::CON
+        .lock()
+        .expect("console")
+        .as_ref()
+        .expect("console")
+        .st
 }
 
 /// Whether a firmware timer event still fires (EVT_TIMER, TimerRelative,
 /// 10 ms) within 500 ms.
-fn firmware_timer_runs() -> bool {
+pub fn firmware_timer_runs() -> bool {
     let st = st();
     // SAFETY: boot services are valid; the event is closed after.
     unsafe {
@@ -81,7 +86,14 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
     // pages 01H to FFH; the firmware keeps the lowest pages).
     let mut low: u64 = 0x9_F000;
     // SAFETY: boot services are valid; one page below 640 KB.
-    let r = unsafe { ((*(*st()).boot_services).allocate_pages)(efi::ALLOCATE_MAX_ADDRESS, efi::LOADER_DATA, 1, &mut low) };
+    let r = unsafe {
+        ((*(*st()).boot_services).allocate_pages)(
+            efi::ALLOCATE_MAX_ADDRESS,
+            efi::LOADER_DATA,
+            1,
+            &mut low,
+        )
+    };
     if r == efi::SUCCESS {
         crate::sipi::install(low);
         out!("I trampoline page={low:#x} vector={:#x}", low >> 12);
