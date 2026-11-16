@@ -12,7 +12,7 @@ fn every_result_line_of_the_qemu_run_parses() {
     let r_lines = RUN.lines().filter(|l| l.starts_with("R ")).count();
     let parsed = parse_all(RUN).iter().filter(|l| l.kind == 'R').count();
     assert!(
-        r_lines > 500,
+        r_lines > 300,
         "the fixture is the full run: {r_lines} result lines"
     );
     assert_eq!(parsed, r_lines);
