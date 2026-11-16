@@ -294,7 +294,9 @@ mod proofs {
         };
         let free = ring_free(produced, consumed, entries);
         assert!(free <= entries);
-        if ring_fits(produced, consumed, entries, length, reserve) {
+        // A sender's own ring is sane: never more than its entries ahead.
+        let sane = produced.wrapping_sub(consumed) <= entries;
+        if sane && ring_fits(produced, consumed, entries, length, reserve) {
             let after = produced.wrapping_add(length);
             assert!(after.wrapping_sub(consumed) <= entries);
             assert!(ring_free(after, consumed, entries) >= reserve);

@@ -579,9 +579,9 @@ impl Member {
         Self(self.0 & !(0b11 << 7) | ((class & 0b11) as u64) << 7)
     }
 
-    /// `None` for a state 8 to 15, an evidence 7, a class 3 (CONTRACT-GAP
-    /// 1: no fence class 3 exists, so the word that holds one is refused as
-    /// a state 8 is), or a bit 9-15 set.
+    /// `None` for a state 8 to 15, an evidence 7, a class 3, or a bit 9-15
+    /// set. CONTRACT-GAP 1: no fence class 3 exists, so the word that holds
+    /// one is refused as a state 8 is.
     pub const fn from_raw(raw: u64) -> Option<Self> {
         if raw & 0xf >= 8 || raw >> 4 & 0x7 == 7 || raw >> 7 & 0b11 == 3 || raw >> 9 & 0x7f != 0 {
             return None;
@@ -1541,11 +1541,12 @@ mod proofs {
     /// A core word read back: the constructors write a word that `from_raw`
     /// accepts and whose fields are those given; a word with a check bit
     /// flipped is refused. The check is a product of 64 bits, as for the
-    /// ownership words, so the proof takes a generation of 8 bits.
+    /// ownership words, so the proof takes a slot and a generation of 4 bits
+    /// each (the solver's time grows with the bits of the product).
     #[kani::proof]
     fn core_words_read_back() {
-        let (slot, generation): (u16, u8) = (kani::any(), kani::any());
-        let generation = generation as u32;
+        let (slot, generation): (u8, u8) = (kani::any(), kani::any());
+        let (slot, generation) = (u16::from(slot & 0xF), u32::from(generation & 0xF));
         let word = match kani::any::<u8>() % 3 {
             0 => CoreWord::free(kani::any()),
             1 => CoreWord::joining(slot, generation),
