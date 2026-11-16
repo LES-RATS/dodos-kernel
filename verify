@@ -18,7 +18,7 @@ geometry() {
 		--test adversarial_nodes --test blocks --test boot --test calls \
 		--test debug --test faults --test gate_attack --test gate_classes \
 		--test gate_words --test generations --test memory --test nodes \
-		--test property
+		--test property --test verify7_deepseek
 }
 geometry 16k &
 sixteen=$!

@@ -936,3 +936,42 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
 }
+
+/// Argon section 2.3 of the seventh review: survivors #066, #067, #069,
+/// #070, #072 and #083 (the continuation of a partial mapping, the budget of
+/// a gate call, the bound of a protect).
+#[test]
+fn r7_aspace_map_partial_and_gate_chunks_boundaries() {
+    let mut machine = Machine::example();
+    machine.gate_chunks = 1;
+    let mut k = K::on(&machine);
+    k.retype(UT, ASpace, 0, 30);
+    k.retype(UT, ASpace, 0, 31);
+    k.small(2, 40);
+    // #072: mapping 1 page (cost 1 == gate_chunks 1) completes in 1 call (Done)
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    // #066: completed mapping (partial == false, count == 1 < 2) cannot be continued as count: 2
+    k.no(map(30, 40, UT, AT, 0, 2, R), Error::Busy);
+    // #083: aspace_protect on 1 chunk (touched == 1 == gate_chunks) succeeds
+    k.ok(protect(30, 40, rw()));
+    k.ok(Syscall::ASpaceUnmap(s(40)));
+
+    // 2-page device frame (cost = 1 per page, so count: 2 takes 2 steps with gate_chunks = 1)
+    k.frame(DEV, PageSize::Page, 3, MemoryType::Uncached, 41);
+    assert_eq!(k.go(map(30, 41, UT, AT, 0, 2, R)), Err(Error::Again));
+    // #067: continuing on another aspace (31) returns Busy
+    k.no(map(31, 41, UT, AT, 0, 2, R), Error::Busy);
+    // #069: continuing with another first page (1) returns Busy
+    k.no(map(30, 41, UT, AT, 1, 2, R), Error::Busy);
+    // #070: continuing with different rights (rw()) returns Busy
+    k.no(map(30, 41, UT, AT, 0, 2, rw()), Error::Busy);
+    // Matching continuation finishes with Done
+    k.ok(map(30, 41, UT, AT, 0, 2, R));
+    // #072: with gate_chunks = 2, mapping 2 device pages (spent + c == 2 == budget at step 1) finishes in 1 call (Done)!
+    let mut m2 = Machine::example();
+    m2.gate_chunks = 2;
+    let mut k2 = K::on(&m2);
+    k2.retype(UT, ASpace, 0, 30);
+    k2.frame(DEV, PageSize::Page, 2, MemoryType::Uncached, 41);
+    k2.ok(map(30, 41, UT, AT, 0, 2, R));
+}

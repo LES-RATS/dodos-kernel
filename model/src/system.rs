@@ -744,6 +744,10 @@ impl System {
 mod units_tests;
 
 #[cfg(test)]
+#[path = "survivors_tests.rs"]
+mod survivors_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::table::{GrantEntry, UseEntry};

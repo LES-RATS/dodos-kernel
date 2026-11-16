@@ -1875,3 +1875,49 @@ fn values_of_unlike_cores_ports_debug_and_modules_that_no_test_pinned() {
     // #168: DEBUG_AREA_MAGIC is b"DoDb"
     assert_eq!(DEBUG_AREA_MAGIC, 0x6244_6F44);
 }
+
+/// Argon section 2.3 of the seventh review: the survivors of the abi.
+#[test]
+fn r7_abi_survivors() {
+    // #002: START_MEMORY_UNFENCED_ACCEPTED == 1 << 4
+    assert_eq!(START_MEMORY_UNFENCED_ACCEPTED, 1 << 4);
+    // #015: the user range end leaves the root entry of the reserved slot
+    // (turned from Argon's "accepts the half", which pass 14 refuses: Opus N1
+    // of the verification of the new findings).
+    let g = Geometry {
+        page_shift: [12, 21, 30, 0],
+        entries: 512,
+        levels: 4,
+        user_end: (1u64 << 47) - (1 << 39),
+    };
+    assert!(g.valid());
+    assert!(
+        !Geometry {
+            user_end: 1 << 47,
+            ..g
+        }
+        .valid()
+    );
+    // #016: SLOT_RECORD_PARTIAL == 1 << 5
+    assert_eq!(SLOT_RECORD_PARTIAL, 1 << 5);
+    // #017: PageClass::table(8) == Some(PageClass(24))
+    assert!(PageClass::table(8).is_some());
+    assert_ne!(PageClass::table(8), PageClass::table(7));
+    // #023: PageClass::GLOBAL_READ_ONLY refuses device_type leaves
+    assert!(!PageClass::GLOBAL_READ_ONLY.permits(Leaf {
+        write: false,
+        exec: false,
+        device_type: true,
+    }));
+    // #027: GateWord::from_raw rejects bit 45 set
+    assert_eq!(GateWord::from_raw((1u64 << 45) | (1u64 << 32)), None);
+    // #030: member_transition HostSealed requires cleared == true
+    let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);
+    let sealed_bad = Member::new(MemberState::Sealed, Evidence::Host, 0, 1);
+    let sealed_ok = Member::new(MemberState::Sealed, Evidence::None, DRIVER_NONE, 1);
+    assert_eq!(member_transition(live, sealed_bad), None);
+    assert_eq!(
+        member_transition(live, sealed_ok),
+        Some(Transition::HostSealed)
+    );
+}
