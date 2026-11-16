@@ -133,7 +133,9 @@ impl Model {
     fn check_choice(&self) -> Check {
         let mut running = BTreeSet::new();
         for (position, core) in self.cores.iter().enumerate() {
-            if core.silent {
+            // A silent core takes no event; during a start or a resume no
+            // thread runs before the node is ready.
+            if core.silent || !self.ready {
                 continue;
             }
             let first = |queue: Queue| {

@@ -41,9 +41,11 @@ impl Model {
             false => Some(self.message_page(thread, bindings.page)?),
         };
         let bound = &self.threads[&target];
-        // Threads: the thread must be suspended and must not wait: a wait
-        // holds a receive range of the old capability space.
-        if !bound.suspended || bound.wait != Wait::None {
+        // Threads: the thread must be suspended, must not wait and must not
+        // be marked *leaving its core*: a wait holds a receive range of the
+        // old capability space, and a marked thread's registers are still on
+        // another core.
+        if !bound.suspended || bound.wait != Wait::None || bound.leaving {
             return Err(Error::Busy);
         }
         // Then the record of the message page's capability must be empty,
@@ -99,11 +101,17 @@ impl Model {
 
     /// Threads: suspending a suspended thread succeeds, a thread bound to no
     /// space too, and suspending a thread that waits leaves its wait as it
-    /// is.
+    /// is. On a thread running on another core of the node it sets the
+    /// flag, marks the thread *leaving its core*, sends that core the leave
+    /// interrupt and returns `again`; any suspend returns `again` while the
+    /// mark is set, so one that succeeds has a thread that executes nothing.
     pub(crate) fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         locked(&mut self.threads, &self.locks, target).suspended = true;
         self.observe();
+        if self.mark_leaving(target) || self.threads[&target].leaving {
+            return Err(Error::Again);
+        }
         Ok(Output::Done)
     }
 

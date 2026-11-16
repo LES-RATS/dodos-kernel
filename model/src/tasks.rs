@@ -121,6 +121,17 @@ impl Model {
         let cap = self.cap(thread, task, Rights::READ)?;
         let task = self.is(cap, ObjectKind::Task, Rights::MANAGE)?.object;
         locked(&mut self.tasks, &self.locks, task).revoked = true;
+        // A node of several cores: each thread of the task that runs on
+        // another core is marked *leaving its core* and its core sent the
+        // leave interrupt; every call returns `again` while one is marked,
+        // and a marked thread is detached only once it has left.
+        let mut marked = false;
+        for attached in self.tasks[&task].threads.clone() {
+            marked |= self.mark_leaving(attached) || self.threads[&attached].leaving;
+        }
+        if marked {
+            return Err(Error::Again);
+        }
         for _ in 0..dodos_abi::REMOVAL_STEP {
             let Some(&attached) = self.tasks[&task].threads.last() else {
                 return Ok(Output::Done);

@@ -323,6 +323,10 @@ pub(crate) struct Table {
     /// writer: (node, before, after) and (role, writer, before, after).
     pub(crate) member_writes: crate::Ephemeral<Vec<(u16, u16, Member, Member)>>,
     pub(crate) role_writes: crate::Ephemeral<Vec<(usize, u16, RoleWord, RoleWord)>>,
+    /// Whether the current event made a gate call that writes no word of
+    /// the machine table: an entry of a translation table, or a gate word
+    /// (Gate over page tables).
+    pub(crate) gated: crate::Ephemeral<bool>,
 }
 
 impl Table {
@@ -419,6 +423,7 @@ impl Table {
         let count = u32::try_from(count).expect("a map count fits 32 bits");
         let word = GateWord::new(count, word.not_data()).expect("a gate word");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
+        self.gated.0 = true;
     }
 
     /// The gate writes the map count of a chunk (G13: 0 at a take; R6: 0).
@@ -426,6 +431,7 @@ impl Table {
         let word = self.gate_word(chunk);
         let word = GateWord::new(count, word.not_data()).expect("a gate word");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
+        self.gated.0 = true;
     }
 
     /// The gate writes the class of a page of ordinary memory, by page
@@ -445,6 +451,7 @@ impl Table {
         let not_data = u16::try_from(i32::from(word.not_data()) + delta).expect("pages of a chunk");
         let word = GateWord::new(word.map_count(), not_data).expect("at most E pages");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
+        self.gated.0 = true;
     }
 
     /// Whether `node` holds the role of reserve `j`.

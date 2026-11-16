@@ -601,7 +601,7 @@ impl Model {
     }
 
     /// The evidence that holds against a node now, as the gate checks it.
-    fn evidence(&self, node: u16) -> Option<Evidence> {
+    pub(crate) fn evidence(&self, node: u16) -> Option<Evidence> {
         let member = self.table.member(node);
         let g = member.generation();
         let beacon = &self.table.beacons[node as usize];
@@ -1535,6 +1535,12 @@ impl Model {
             )
             .with_class(member.class());
             self.table.write_member(me, me, live);
+            // Threads run again: every other core of the node chooses again
+            // (this core chooses at the end of its event).
+            let at = *self.at;
+            for core in (0..self.width()).filter(|&c| c != at) {
+                self.post(core, crate::Ipi::Reschedule);
+            }
             any = true;
         }
         any
@@ -1654,11 +1660,15 @@ impl Model {
         for hand in self.handing.values() {
             instants.push(hand.started + dodos_abi::IOMMU_WAIT_NS);
         }
+        // The reserve is a context of period 10 ms: its next step comes at
+        // the latest one period after its last one, an instant that does
+        // not move with the clock.
+        let period = (self.steps_at.0 + RECOVERY_PERIOD_NS).max(now);
         instants
             .into_iter()
             .filter(|&at| at > now)
             .min()
-            .map(|at| at.min(now + RECOVERY_PERIOD_NS))
+            .map(|at| at.min(period))
     }
 
     /// Whether another node slot exists that runs (the sweep has someone to

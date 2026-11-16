@@ -236,6 +236,8 @@ impl Model {
 
     pub(crate) fn submit_for(&mut self, role: usize, op: UnitOp, requester: (u16, u32)) -> u64 {
         let now = self.now;
+        let word = self.table.roles[role];
+        self.submitted.0.push((role, word));
         let unit = self.table.units.entry(role).or_default();
         unit.next += 1;
         let serial = unit.next;

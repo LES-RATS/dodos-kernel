@@ -554,12 +554,13 @@ impl Model {
                 self.notifies.insert(id, Notify::default());
             }
             // Scheduling contexts: a new one is not configured, has no
-            // home, class 2, and the cores set of the kernel that holds it.
+            // home, class 2, the cores set of every core of the node that
+            // holds it, and is placed on the node's first core.
             ObjectKind::Sched => {
-                let node = u64::from(self.node);
                 let sched = Sched {
                     class: 2,
-                    cores: (node / 64, 1 << (node % 64)),
+                    cores: self.cores_set(),
+                    core: 0,
                     ..Sched::default()
                 };
                 self.scheds.insert(id, sched);
@@ -889,10 +890,16 @@ impl Model {
             }
             // A thread: first its place on a core, if it runs on another
             // core of its node; that core is asked to leave it, and the step
-            // returns `again` until it has.
-            ObjectKind::Thread if self.mark_leaving(object) || self.threads[&object].leaving => {
+            // returns `again` until it has. CONTRACT-GAP 14: the contract
+            // does not say what keeps the core from choosing the thread
+            // again once it has left; the step that marks it also suspends
+            // it (the thread never runs again: it is being destroyed).
+            ObjectKind::Thread if self.running_core(object).is_some_and(|c| c != *self.at) => {
+                locked(&mut self.threads, &self.locks, object).suspended = true;
+                self.mark_leaving(object);
                 return Undone::Wait;
             }
+            ObjectKind::Thread if self.threads[&object].leaving => return Undone::Wait,
             // A block of a run: its map counts must be 0 (the step returns
             // `again` while translations are removed), then the run is
             // unmapped from the kernel's own space and that invalidated on

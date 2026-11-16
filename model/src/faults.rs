@@ -156,7 +156,7 @@ impl Model {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::READ)?;
         self.page_of(thread)?;
         let read = &self.threads[&target];
-        if !read.suspended {
+        if !read.suspended || read.leaving {
             return Err(Error::Busy);
         }
         // The register block, then the fault record: its kind in the low
@@ -201,7 +201,9 @@ impl Model {
             }
         }
         let written = locked(&mut self.threads, &self.locks, target);
-        if !written.suspended || written.wait != Wait::None {
+        // A node of several cores: a thread marked *leaving its core* has
+        // its registers still on another core.
+        if !written.suspended || written.wait != Wait::None || written.leaving {
             return Err(Error::Busy);
         }
         written.regs = block;

@@ -153,6 +153,9 @@ impl Model {
         self.table.begin_journal();
         self.table.member_writes.clear();
         self.table.role_writes.clear();
+        self.table.gated.0 = false;
+        self.submitted.0.clear();
+        self.applied.0.clear();
         self.begin_locks();
         let at = *self.at;
         // A core that wakes from idle clears its idle word, and its beacon's
@@ -644,6 +647,7 @@ impl Model {
         if late {
             self.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
         }
+        self.watch_own_cores();
         // The recovery reserve runs on the node's first core.
         if at == 0 {
             self.reserve_step();

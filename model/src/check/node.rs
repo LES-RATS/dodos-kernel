@@ -13,7 +13,47 @@ impl Model {
         self.check_requests()?;
         self.check_marks()?;
         self.check_locks()?;
-        self.check_credits()
+        self.check_credits()?;
+        self.check_crossing()
+    }
+
+    /// Roles: "the holder serves a request only if the role word reads
+    /// held by its own node with that epoch and it has not begun a
+    /// hand-over" (SERVED); What crosses between nodes: no message acts on
+    /// a later generation of its receiver (RECEIVER), and none of a
+    /// generation that is over is applied, a signal included (SENDER).
+    fn check_crossing(&self) -> Check {
+        for &(role, word) in self.submitted.iter() {
+            ensure(
+                word.state() == dodos_abi::RoleState::Held && word.holder() == self.node,
+                "SERVED: a unit operation submitted by a node the role word does not name as holder",
+            )?;
+            ensure(
+                !self.handing.contains_key(&role),
+                "SERVED: a unit operation submitted after step 1 of a hand-over",
+            )?;
+        }
+        for (header, sender) in self.applied.iter() {
+            ensure(
+                header.receiver_generation == self.table.generation(self.node),
+                "RECEIVER: a message acted on a generation of its receiver it was not sent to",
+            )?;
+            // The sender's member word as the receiver read it when it
+            // applied the message.
+            let current = sender.generation() == header.sender_generation
+                && matches!(
+                    sender.state(),
+                    dodos_abi::MemberState::Starting
+                        | dodos_abi::MemberState::Live
+                        | dodos_abi::MemberState::Sealing
+                        | dodos_abi::MemberState::Sealed
+                );
+            ensure(
+                current,
+                "SENDER: a message of a generation that is over was applied",
+            )?;
+        }
+        Ok(())
     }
 
     /// TLB: "when a call returns success, no thread on any core of the

@@ -330,11 +330,27 @@ impl Model {
                 None => {}
             }
         }
-        // 57: the kernel maps exactly the chunks it holds.
+        // 57: the kernel maps exactly the chunks it holds, except a run it
+        // gave or destroyed whose words wait for the invalidation of the
+        // kernel's own space on its other cores (G5, D-131): no longer
+        // mapped, still held until the request completes.
         let word = |c: &u64| table.owners.get(*c as usize).copied();
         let runs = self.kernel_runs.iter().all(|c| word(c).is_some_and(mine));
+        let waiting: BTreeSet<u64> = self
+            .cores
+            .iter()
+            .filter_map(|c| c.request.as_ref())
+            .filter_map(|r| match &r.completes {
+                crate::cores::Completes::Run(freed) if freed.block == Block::Run => {
+                    Some(freed.chunks(shift))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let held_waiting = waiting.iter().all(|c| word(c).is_some_and(mine));
         ensure(
-            runs && held == self.kernel_runs.len(),
+            runs && held_waiting && held == self.kernel_runs.len() + waiting.len(),
             "57: kernel space and ownership",
         )?;
         // 56: the words none are those of machine start-up.

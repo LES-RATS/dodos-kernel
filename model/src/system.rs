@@ -77,6 +77,11 @@ pub struct System {
     layout: Layout,
     /// The machine stopped with a stop record (containment violated).
     pub stopped: bool,
+    /// Every action the hardware carried out, in order, with its instant
+    /// and the node that asked for it.
+    pub sent: Vec<(u64, u16, HwAction)>,
+    /// Whether a park request was ever written lower than it was.
+    pub(crate) park_went_back: bool,
     /// The common clock.
     now: u64,
 }
@@ -117,6 +122,8 @@ impl System {
             machine: machine.clone(),
             layout,
             stopped: false,
+            sent: Vec::new(),
+            park_went_back: false,
             now: 0,
         };
         system.share(table);
@@ -196,6 +203,15 @@ impl System {
 
     /// Every model reads the table one of them wrote.
     fn share(&mut self, table: crate::table::Table) {
+        if let Some(before) = self.nodes.iter().flatten().next() {
+            let back = before
+                .table
+                .park_requests
+                .iter()
+                .zip(&table.park_requests)
+                .any(|(old, new)| new < old);
+            self.park_went_back |= back;
+        }
         for model in self.nodes.iter_mut().flatten() {
             model.table = table.clone();
         }
@@ -365,6 +381,22 @@ impl System {
         }
     }
 
+    /// A parked core is in the park stub between its read of the start
+    /// request and its halt (a test's input): a wake that reaches it now
+    /// is lost.
+    pub fn set_window(&mut self, core: usize) {
+        assert!(matches!(self.hardware[core], Hardware::Stub { .. }));
+        self.hardware[core] = Hardware::Stub { window: true };
+    }
+
+    /// A core enters or leaves VMX root operation (a test's input), as its
+    /// core beacon shows it.
+    pub fn set_vmx(&mut self, core: usize, vmx: bool) {
+        let mut table = self.table().clone();
+        table.core_beacons[core].vmx = vmx;
+        self.share(table);
+    }
+
     /// A node finds a failure in itself, on its core at `position`.
     pub fn fail(&mut self, node: u16, position: usize) {
         let model = self.model(node);
@@ -397,6 +429,26 @@ impl System {
         self.interrupt(to, crate::Ipi::Ring);
     }
 
+    /// A sender writes a whole message at the head of its ring to `to` (a
+    /// test's input: a faulty, late or forged message that the receiver
+    /// must judge like any other).
+    pub fn inject(&mut self, from: u16, to: u16, message: crate::rings::Message) {
+        let user = message.body.kind().ring() == dodos_abi::Ring::User;
+        let entries = message.body.entries();
+        let mut table = self.table().clone();
+        let pair = &mut std::sync::Arc::make_mut(&mut table.rings)[from as usize][to as usize];
+        let ring = if user {
+            &mut pair.user
+        } else {
+            &mut pair.kernel
+        };
+        let at = ring.produced;
+        ring.set(at, crate::table::RingEntry::Message(message));
+        ring.produced += entries;
+        self.share(table);
+        self.interrupt(to, crate::Ipi::Ring);
+    }
+
     /// The unit of a role stops confirming (a test's input).
     pub fn break_unit(&mut self, role: usize) {
         for model in self.nodes.iter_mut().flatten() {
@@ -406,6 +458,7 @@ impl System {
 
     /// The hardware carries out an action.
     fn act(&mut self, from: u16, action: HwAction) {
+        self.sent.push((self.now, from, action));
         match action {
             HwAction::Stop { core } => self.stop(core),
             HwAction::Start { core } => self.wake(core),
@@ -414,7 +467,6 @@ impl System {
             HwAction::Interrupt { node } => self.interrupt(node, crate::Ipi::Reschedule),
             HwAction::StopMachine => self.stopped = true,
         }
-        let _ = from;
     }
 
     /// An interrupt to the first core of a node that runs.
@@ -481,16 +533,19 @@ impl System {
                 Arch::X86_64,
                 Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Stub { .. },
             ) => {
+                // The handler leaves VMX root operation if it is in it.
                 self.fence_record(core);
+                self.set_vmx(core, false);
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Stub { window: false };
             }
-            // INIT (not to the bootstrap core), then the SIPIs to the park
-            // stub, which writes `parked`.
+            // INIT (not to the bootstrap core, and blocked in VMX root
+            // operation), then the SIPIs to the park stub, which writes
+            // `parked`.
             (
                 Arch::X86_64,
                 Hardware::Hung { nmi: false } | Hardware::WaitSipi | Hardware::Entering,
-            ) if !booted => {
+            ) if !booted && !self.table().core_beacons[core].vmx => {
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Stub { window: false };
             }

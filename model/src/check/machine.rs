@@ -21,6 +21,10 @@ fn ensure(holds: bool, invariant: &str) -> Check {
 impl System {
     /// Every invariant: each node's (`Model::check`), then the machine's.
     pub fn check(&self) -> Check {
+        // R-1 of the second verification: a park request only grows, so
+        // that a confirmation of an earlier request is never taken for one
+        // of a later stop.
+        ensure(!self.park_went_back, "fence: a park request went back")?;
         // A node that is accused runs nothing, and its memory is being
         // reclaimed: its kernel's state is not judged against the table.
         for (slot, model) in self.models().filter(|(slot, _)| self.running_node(*slot)) {
@@ -56,6 +60,24 @@ impl System {
                     "core word: a free word names a node",
                 )?;
             }
+            // The fence: "the driver raises p's park request, then marks
+            // p's word, then stops p": a stop is never in flight under a
+            // word that is not marked (the first verification's Test 4: a
+            // stop under an unmarked word landed after another node had
+            // taken the core), and a marked word has its park request
+            // raised.
+            let stopping = self
+                .actions()
+                .iter()
+                .any(|(_, a)| *a == crate::nodes::HwAction::Stop { core });
+            ensure(
+                !stopping || word.is_marked(),
+                "fence: a stop in flight under a word that is not marked",
+            )?;
+            ensure(
+                !word.is_marked() || table.park_requests[core] != 0,
+                "fence: a word marked before its park request was raised",
+            )?;
             if self.hardware(core) != Hardware::Running {
                 continue;
             }
@@ -192,8 +214,14 @@ impl System {
                     let answer = self.in_ring(y, x, index as u8, credit.serial);
                     let served = self.served(y, x, index as u8);
                     let kept = matches!(credit.completes, Completes::Unit { .. }) && served;
+                    // A `Release` of the grant in flight or pending ends a
+                    // revocation too: the `Revoke` it crossed is refused.
+                    let released = match credit.completes {
+                        Completes::Revoke { grant } => self.released(y, x, grant),
+                        _ => false,
+                    };
                     ensure(
-                        request || answer || kept,
+                        request || answer || kept || released,
                         "CREDIT: a credit in use with neither its request nor its answer in flight",
                     )?;
                 }
@@ -227,6 +255,24 @@ impl System {
                     _ => false,
                 })
             })
+    }
+
+    /// Whether the holder `from` has a `Release` of grant `grant` of `to`
+    /// in its kernel ring to `to`, or pending in its use entry.
+    fn released(&self, from: u16, to: u16, grant: u16) -> bool {
+        let table = self.canonical();
+        let ring = &table.rings[from as usize][to as usize].kernel;
+        let start = table.beacons[to as usize].consumed[from as usize].0;
+        let in_ring = (start..ring.produced).any(|at| match ring.at(at) {
+            Some(RingEntry::Message(m)) => {
+                matches!(m.body, crate::rings::Body::Release { grant: g, .. } if g == grant)
+            }
+            _ => false,
+        });
+        let pending = table.uses[from as usize]
+            .values()
+            .any(|u| u.granter == to && u.grant == grant && u.release_pending);
+        in_ring || pending
     }
 
     /// Whether node `holder` keeps the unit request of `from` with this

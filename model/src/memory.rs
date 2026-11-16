@@ -62,6 +62,7 @@ impl Model {
                 rights: mapping.rights,
             };
             aspace.translations.insert(at, translation);
+            self.table.gated.0 = true;
         }
         aspace.records.push(cap);
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
@@ -226,6 +227,7 @@ impl Model {
             .map(|(&at, _)| at)
             .collect();
         aspace.translations.retain(|_, t| t.cap != cap);
+        self.table.gated.0 = true;
         live(&mut self.caps, cap).record = Record::Unmapping(mapping);
         self.rehook(mapping.space);
         Some(addresses)
@@ -621,6 +623,7 @@ impl Model {
                 rights: mapping.rights,
             };
             aspace.translations.insert(at, translation);
+            self.table.gated.0 = true;
         }
         let added = Mapping {
             first: mapping.first + mapping.count,

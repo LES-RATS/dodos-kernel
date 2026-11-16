@@ -122,6 +122,9 @@ pub(crate) struct CorePart {
     pub(crate) kernel_tlb: BTreeSet<u64>,
     /// A core that stopped answering (a test's input): it takes no event.
     pub(crate) silent: bool,
+    /// The heartbeat of this core as the node's other cores last saw it
+    /// move, and the instant they saw it (A node of several cores).
+    pub(crate) watched: Ephemeral<(u64, u64)>,
     /// Idle, slack and kernel time, published in its core beacon.
     pub(crate) idle_ns: Ephemeral<u64>,
     pub(crate) slack_ns: Ephemeral<u64>,
@@ -581,6 +584,34 @@ impl Model {
         true
     }
 
+    /// A node of several cores watches its own cores at their events: "if
+    /// ... its heartbeat goes stale while it is not idle, the node accuses
+    /// itself (evidence self)". A core whose heartbeat has not moved for
+    /// `STALE_NS` and that is not idle (now − `STALE_NS` past its
+    /// `idle_until`, as for stale evidence) is a failure of the node. Not
+    /// before the node is ready: its cores enter one by one.
+    pub(crate) fn watch_own_cores(&mut self) {
+        if self.width() == 1 || !self.ready {
+            return;
+        }
+        let (now, stale, at) = (self.now, self.table.stale_ns, *self.at);
+        let mut silent = false;
+        for position in (0..self.width()).filter(|&p| p != at) {
+            let number = self.cores[position].number as usize;
+            let beacon = &self.table.core_beacons[number];
+            let (heartbeat, idle_until) = (beacon.heartbeat.0, beacon.idle_until.0);
+            let watched = &mut self.cores[position].watched.0;
+            if watched.0 != heartbeat || watched.1 == 0 {
+                *watched = (heartbeat, now.max(1));
+                continue;
+            }
+            silent |= now >= watched.1 + stale && now - stale > idle_until;
+        }
+        if silent {
+            self.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
+        }
+    }
+
     /// The interrupts pending on the node's cores, as `System` sees them.
     pub fn pending_ipis(&self) -> Vec<(usize, Ipi)> {
         let pending = self
@@ -691,6 +722,7 @@ impl Model {
             self.table
                 .write_core(number, before, CoreWordOf::owned(self.node, generation));
         }
+        self.enter_idle(position);
         if self.ready {
             return;
         }
@@ -713,6 +745,18 @@ impl Model {
         }
         if !fresh && position == 0 {
             self.stalled = None;
+        }
+    }
+
+    /// A core that enters with nothing to run goes idle: it loads the
+    /// kernel's own root and sets its idle mark (not on a node of one
+    /// core, which has none).
+    pub(crate) fn enter_idle(&mut self, position: usize) {
+        let several = self.width() > 1;
+        let part = &mut self.cores[position];
+        part.loaded = None;
+        if several && part.thread.is_none() {
+            part.idle.mark = true;
         }
     }
 

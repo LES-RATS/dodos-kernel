@@ -235,7 +235,8 @@ impl crate::Model {
         let mut steps = Vec::new();
         let gate = !self.table.writes.is_empty()
             || !self.table.member_writes.is_empty()
-            || !self.table.role_writes.is_empty();
+            || !self.table.role_writes.is_empty()
+            || *self.table.gated;
         match self.machine.locking {
             Locking::L1 => {
                 let woke = self.locks.steps.iter().any(|s| matches!(s, Step::Wait(_)));

@@ -465,6 +465,7 @@ impl Model {
             // moves the consumer index to the producer minus the entries.
             let start = ring_resync(produced, consumed, size);
             if start != consumed {
+                self.refused.0 += 1;
                 self.trace(TraceCode::Refused, None, [u64::from(from), 0, 0]);
                 consumed = start;
             }
@@ -487,6 +488,7 @@ impl Model {
                 Some(message) => match self.refused(&message) {
                     None => self.receive_message(message),
                     Some(named) => {
+                        self.refused.0 += 1;
                         let who =
                             u64::from(from) | u64::from(message.header.sender_generation) << 32;
                         self.trace(
@@ -497,6 +499,7 @@ impl Model {
                     }
                 },
                 None => {
+                    self.refused.0 += 1;
                     self.trace(TraceCode::Refused, None, [u64::from(from), 0, 0]);
                 }
             }
@@ -577,6 +580,8 @@ impl Model {
 
     /// A message that passed the check.
     fn receive_message(&mut self, message: Message) {
+        let sender = self.table.member(message.header.sender);
+        self.applied.0.push((message.header, sender));
         let from = message.header.sender;
         let credit = message.header.credit();
         match message.body {

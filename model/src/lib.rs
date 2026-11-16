@@ -39,6 +39,8 @@ mod memory;
 mod nodes;
 mod rings;
 mod roles;
+#[cfg(test)]
+mod scenarios;
 mod sched;
 mod system;
 mod table;
@@ -1100,6 +1102,15 @@ pub struct Model {
     unit_order: u64,
     revoking: bool,
     stalled: Option<u64>,
+    /// The messages refused by the one check, or unreadable, since start:
+    /// each is also an entry of code 11 in the trace, which may be rate
+    /// limited.
+    refused: Ephemeral<u64>,
+    /// What the current event did that the checks of crossing judge: each
+    /// submission to a unit with the role word it read, and each message
+    /// applied with its header.
+    submitted: Ephemeral<Vec<(usize, dodos_abi::RoleWord)>>,
+    applied: Ephemeral<Vec<(dodos_abi::RingHeader, dodos_abi::Member)>>,
     steps_at: Ephemeral<u64>,
     steps_now: Ephemeral<u64>,
     built: u32,
@@ -1387,11 +1398,19 @@ impl Model {
     }
 
     /// The slots of the invalid remote capabilities found since the last
-    /// call become dead.
+    /// call become dead. CONTRACT-GAP 15: a capability whose record holds
+    /// a mapping keeps its slot until a removal reaches it (the step of a
+    /// `Revoke`, R2, or a removal by its holder): made dead at once, its
+    /// mapping would go without the invalidations of the node's cores
+    /// (TLB) or of its units, which only a removal step starts.
     pub(crate) fn bury_stale(&mut self) {
         let stale = std::mem::take(&mut *self.stale.0.borrow_mut());
         for cap in stale {
-            if self.caps.contains_key(&cap) {
+            let mapped = self
+                .caps
+                .get(&cap)
+                .is_some_and(|c| matches!(c.record, Record::Mapping(_) | Record::Unmapping(_)));
+            if self.caps.contains_key(&cap) && !mapped {
                 self.remove_leaf_dead(cap);
             }
         }

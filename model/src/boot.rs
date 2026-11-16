@@ -941,6 +941,7 @@ impl Machine {
                 })
                 .collect(),
             member_writes: Default::default(),
+            gated: Default::default(),
             role_writes: Default::default(),
             owners: std::sync::Arc::new(layout.owners.clone()),
             gate_words: std::sync::Arc::new(vec![0; layout.owners.len()]),
@@ -1269,8 +1270,12 @@ impl Model {
         first.regs[REG_RIP] = machine.entry;
         first.regs[REG_RDI] = 2 * page;
         // Scheduling: budget 9,843,750 ns, period 10 ms, class 1, the cores
-        // set of the node's own core; the recovery reserve holds the rest.
+        // set of every core of the node; the recovery reserve holds the
+        // rest. The node's other cores have nothing to run: they are idle.
         self.first_context(sched, thread, START_SCHED_BUDGET_NS, START_SCHED_PERIOD_NS);
+        for position in 1..self.width() {
+            self.enter_idle(position);
+        }
         self.build_kernel_space();
         self.peers = (0..self.table.nodes)
             .map(|_| crate::rings::Peer::new())
