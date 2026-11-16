@@ -762,6 +762,29 @@ impl FaultKind {
     }
 }
 
+/// What an exception taken from a user thread is (Faults), as the tables of
+/// each architecture classify it (`aarch64::ec_use`, `riscv64::cause_use`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExceptionUse {
+    /// A fault of this kind, delivered on the thread's fault endpoint.
+    Fault(FaultKind),
+    /// A system call: a call if it comes from the kernel-supplied code page,
+    /// a fault *bad call* otherwise.
+    Call,
+    /// An access to the state of feature `bit` of the architecture's list
+    /// (Unlike cores): an undefined instruction, with word 4 = 1 + `bit`,
+    /// when the thread's mask lacks the feature; otherwise the kernel's own
+    /// (it loads the state and the thread resumes).
+    Feature(u32),
+    /// The kernel's own: the thread resumes, as for the vector state on
+    /// x86-64 (#NM).
+    Own,
+    /// No exception of the thread: a bug of the kernel (it accuses itself,
+    /// evidence self) or a hardware error, handled by the recovery of the
+    /// node.
+    NotThread,
+}
+
 /// Words of a fault message.
 pub const FAULT_WORDS: usize = 5;
 /// Labels of the answer to a fault: resume at word 0 of the fault, or with
@@ -1051,6 +1074,22 @@ impl NodeGen {
 /// Proofs checked by Kani for every input, not for chosen examples.
 #[cfg(kani)]
 mod proofs {
+    #[kani::proof]
+    fn an_arm64_class_is_classified_exactly_when_the_architecture_defines_it() {
+        let ec: u8 = kani::any::<u8>() & 0x3F;
+        let syndrome = (ec as u64) << crate::aarch64::ESR_EC_SHIFT;
+        let defined = crate::aarch64::EXCEPTION_CLASSES.contains(&ec);
+        // Status code 0 of an abort is an address size fault: classified.
+        assert!(crate::aarch64::exception_use(syndrome).is_some() == defined);
+    }
+
+    #[kani::proof]
+    fn a_riscv_cause_is_classified_exactly_when_the_specification_defines_it() {
+        let scause: u64 = kani::any();
+        let defined = crate::riscv64::CAUSES.contains(&scause);
+        assert!(crate::riscv64::exception_use(scause).is_some() == defined);
+    }
+
     use super::*;
 
     #[kani::proof]

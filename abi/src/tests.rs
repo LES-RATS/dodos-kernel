@@ -1921,3 +1921,186 @@ fn r7_abi_survivors() {
         Some(Transition::HostSealed)
     );
 }
+
+/// The exception classes of ARM64 (`ESR_ELx.EC`) against Linux's
+/// `arch/arm64/include/asm/esr.h` at commit c03c1a1 (tag v7.3, 18 October
+/// 2026, github.com/torvalds/linux): each of Linux's `ESR_ELx_EC_*` values,
+/// copied here by hand with its name, is the value of the class `abi/`
+/// names. Linux names no constant for 0x14 (FEAT_SYSREG128), 0x1B
+/// (FEAT_TME), 0x1E (FEAT_RME) and 0x3D (FEAT_EBEP), which Arm DDI 0487
+/// K.a defines: they are listed apart.
+#[test]
+fn arm64_exception_classes_agree_with_linux() {
+    use crate::aarch64::*;
+    let linux: [(&str, u8, u8); 45] = [
+        ("UNKNOWN", 0x00, EC_UNKNOWN),
+        ("WFx", 0x01, EC_WFX),
+        ("CP15_32", 0x03, EC_CP15_MCR_MRC),
+        ("CP15_64", 0x04, EC_CP15_MCRR_MRRC),
+        ("CP14_MR", 0x05, EC_CP14_MCR_MRC),
+        ("CP14_LS", 0x06, EC_CP14_LDC_STC),
+        ("FP_ASIMD", 0x07, EC_FP_SIMD),
+        ("CP10_ID", 0x08, EC_CP10_VMRS),
+        ("PAC", 0x09, EC_PAC_TRAP),
+        ("OTHER", 0x0A, EC_LD64B),
+        ("CP14_64", 0x0C, EC_CP14_MRRC),
+        ("BTI", 0x0D, EC_BTI),
+        ("ILL", 0x0E, EC_ILLEGAL_STATE),
+        ("SVC32", 0x11, EC_SVC32),
+        ("HVC32", 0x12, EC_HVC32),
+        ("SMC32", 0x13, EC_SMC32),
+        ("SVC64", 0x15, EC_SVC64),
+        ("HVC64", 0x16, EC_HVC64),
+        ("SMC64", 0x17, EC_SMC64),
+        ("SYS64", 0x18, EC_SYS64),
+        ("SVE", 0x19, EC_SVE),
+        ("ERET", 0x1a, EC_ERET),
+        ("FPAC", 0x1C, EC_PAC_FAIL),
+        ("SME", 0x1D, EC_SME),
+        ("IMP_DEF", 0x1f, EC_IMPDEF_EL3),
+        ("IABT_LOW", 0x20, EC_IABT_LOWER),
+        ("IABT_CUR", 0x21, EC_IABT_SAME),
+        ("PC_ALIGN", 0x22, EC_PC_ALIGN),
+        ("DABT_LOW", 0x24, EC_DABT_LOWER),
+        ("DABT_CUR", 0x25, EC_DABT_SAME),
+        ("SP_ALIGN", 0x26, EC_SP_ALIGN),
+        ("MOPS", 0x27, EC_MOPS),
+        ("FP_EXC32", 0x28, EC_FP_TRAP32),
+        ("FP_EXC64", 0x2C, EC_FP_TRAP64),
+        ("GCS", 0x2D, EC_GCS),
+        ("SERROR", 0x2F, EC_SERROR),
+        ("BREAKPT_LOW", 0x30, EC_BREAKPOINT_LOWER),
+        ("BREAKPT_CUR", 0x31, EC_BREAKPOINT_SAME),
+        ("SOFTSTP_LOW", 0x32, EC_STEP_LOWER),
+        ("SOFTSTP_CUR", 0x33, EC_STEP_SAME),
+        ("WATCHPT_LOW", 0x34, EC_WATCHPOINT_LOWER),
+        ("WATCHPT_CUR", 0x35, EC_WATCHPOINT_SAME),
+        ("BKPT32", 0x38, EC_BKPT32),
+        ("VECTOR32", 0x3A, EC_VECTOR_CATCH32),
+        ("BRK64", 0x3C, EC_BRK64),
+    ];
+    for (name, value, ours) in linux {
+        assert_eq!(value, ours, "ESR_ELx_EC_{name}");
+        assert!(EXCEPTION_CLASSES.contains(&ours), "{name}");
+    }
+    let only_arm = [EC_SYS128, EC_TSTART, EC_GPC, EC_PMU];
+    assert_eq!(only_arm, [0x14, 0x1B, 0x1E, 0x3D]);
+    let mut all: Vec<u8> = linux.iter().map(|l| l.1).chain(only_arm).collect();
+    all.sort();
+    let mut ours = EXCEPTION_CLASSES.to_vec();
+    ours.sort();
+    assert_eq!(
+        all, ours,
+        "abi defines exactly Linux's classes and Arm's four others"
+    );
+    assert_eq!((ESR_EC_SHIFT, ESR_EC_MASK >> ESR_EC_SHIFT), (26, 0x3F));
+}
+
+/// The exception codes of RISC-V against Linux's
+/// `arch/riscv/include/asm/csr.h` at commit c03c1a1 (tag v7.3): each of
+/// Linux's `EXC_*` values, copied by hand with its name. Linux names no
+/// constant for code 19, the hardware error of the privileged
+/// specification (Supervisor-Level ISA 1.13).
+#[test]
+fn riscv_exception_codes_agree_with_linux() {
+    use crate::riscv64::*;
+    let linux: [(&str, u64, u64); 19] = [
+        ("INST_MISALIGNED", 0, CAUSE_INSTRUCTION_MISALIGNED),
+        ("INST_ACCESS", 1, CAUSE_INSTRUCTION_ACCESS),
+        ("INST_ILLEGAL", 2, CAUSE_ILLEGAL_INSTRUCTION),
+        ("BREAKPOINT", 3, CAUSE_BREAKPOINT),
+        ("LOAD_MISALIGNED", 4, CAUSE_LOAD_MISALIGNED),
+        ("LOAD_ACCESS", 5, CAUSE_LOAD_ACCESS),
+        ("STORE_MISALIGNED", 6, CAUSE_STORE_MISALIGNED),
+        ("STORE_ACCESS", 7, CAUSE_STORE_ACCESS),
+        ("SYSCALL", 8, CAUSE_ECALL_U),
+        ("HYPERVISOR_SYSCALL", 9, CAUSE_ECALL_S),
+        ("SUPERVISOR_SYSCALL", 10, CAUSE_ECALL_VS),
+        ("INST_PAGE_FAULT", 12, CAUSE_INSTRUCTION_PAGE),
+        ("LOAD_PAGE_FAULT", 13, CAUSE_LOAD_PAGE),
+        ("STORE_PAGE_FAULT", 15, CAUSE_STORE_PAGE),
+        ("SOFTWARE_CHECK", 18, CAUSE_SOFTWARE_CHECK),
+        ("INST_GUEST_PAGE_FAULT", 20, CAUSE_INSTRUCTION_GUEST_PAGE),
+        ("LOAD_GUEST_PAGE_FAULT", 21, CAUSE_LOAD_GUEST_PAGE),
+        ("VIRTUAL_INST_FAULT", 22, CAUSE_VIRTUAL_INSTRUCTION),
+        ("STORE_GUEST_PAGE_FAULT", 23, CAUSE_STORE_GUEST_PAGE),
+    ];
+    for (name, value, ours) in linux {
+        assert_eq!(value, ours, "EXC_{name}");
+    }
+    let mut all: Vec<u64> = linux
+        .iter()
+        .map(|l| l.1)
+        .chain([CAUSE_HARDWARE_ERROR])
+        .collect();
+    all.sort();
+    let mut ours = CAUSES.to_vec();
+    ours.sort();
+    assert_eq!(all, ours);
+    assert_eq!(CAUSE_HARDWARE_ERROR, 19);
+    // CAUSE_IRQ_FLAG of Linux on RV64.
+    assert_eq!(SCAUSE_INTERRUPT, 1 << 63);
+}
+
+/// The classification of Faults on ARM64 and RISC-V, for what a user
+/// thread can raise (the two architectures' rows of the table of kinds).
+#[test]
+fn arm64_and_riscv_exceptions_map_to_the_kinds_of_faults() {
+    use crate::ExceptionUse::{Call, Fault, Feature, NotThread, Own};
+    use crate::FaultKind::*;
+    use crate::{aarch64 as a, riscv64 as r};
+    let esr = |ec: u8, iss: u64| (ec as u64) << a::ESR_EC_SHIFT | iss;
+    let arm = [
+        (esr(a::EC_DABT_LOWER, 0x07), Fault(Page)),
+        (esr(a::EC_IABT_LOWER, 0x2B), Fault(Page)),
+        (esr(a::EC_DABT_LOWER, 0x0F), Fault(Page)),
+        (esr(a::EC_DABT_LOWER, 0x21), Fault(Protection)),
+        (esr(a::EC_DABT_LOWER, 0x10), Fault(Protection)),
+        (esr(a::EC_DABT_LOWER, 0x09), NotThread),
+        (esr(a::EC_DABT_LOWER, 0x18), NotThread),
+        (esr(a::EC_PC_ALIGN, 0), Fault(Protection)),
+        (esr(a::EC_SP_ALIGN, 0), Fault(Protection)),
+        (esr(a::EC_BTI, 0), Fault(Protection)),
+        (esr(a::EC_UNKNOWN, 0), Fault(Undefined)),
+        (esr(a::EC_SYS64, 0), Fault(Undefined)),
+        (esr(a::EC_SVE, 0), Feature(a::SVE)),
+        (esr(a::EC_SME, 0), Feature(a::SME)),
+        (esr(a::EC_FP_SIMD, 0), Own),
+        (esr(a::EC_FP_TRAP64, 0), Fault(Arithmetic)),
+        (esr(a::EC_SVC64, 0), Call),
+        (esr(a::EC_BRK64, 0), Fault(Debug)),
+        (esr(a::EC_STEP_LOWER, 0), Fault(Debug)),
+        (esr(a::EC_BREAKPOINT_LOWER, 0), Fault(HardwareBreakpoint)),
+        (esr(a::EC_WATCHPOINT_LOWER, 0), Fault(HardwareBreakpoint)),
+        (esr(a::EC_DABT_SAME, 0x07), NotThread),
+        (esr(a::EC_SERROR, 0), NotThread),
+        (esr(a::EC_SVC32, 0), NotThread),
+    ];
+    for (syndrome, wanted) in arm {
+        assert_eq!(a::exception_use(syndrome), Some(wanted), "{syndrome:#x}");
+    }
+    assert_eq!(a::exception_use(esr(0x02, 0)), None);
+    assert_eq!(a::exception_use(esr(a::EC_DABT_LOWER, 0x3F)), None);
+    let riscv = [
+        (r::CAUSE_LOAD_PAGE, Fault(Page)),
+        (r::CAUSE_STORE_PAGE, Fault(Page)),
+        (r::CAUSE_INSTRUCTION_PAGE, Fault(Page)),
+        (r::CAUSE_LOAD_ACCESS, Fault(Protection)),
+        (r::CAUSE_STORE_ACCESS, Fault(Protection)),
+        (r::CAUSE_INSTRUCTION_ACCESS, Fault(Protection)),
+        (r::CAUSE_LOAD_MISALIGNED, Fault(Protection)),
+        (r::CAUSE_SOFTWARE_CHECK, Fault(Protection)),
+        (r::CAUSE_ILLEGAL_INSTRUCTION, Fault(Undefined)),
+        (r::CAUSE_BREAKPOINT, Fault(Debug)),
+        (r::CAUSE_ECALL_U, Call),
+        (r::CAUSE_ECALL_S, NotThread),
+        (r::CAUSE_HARDWARE_ERROR, NotThread),
+        (r::CAUSE_LOAD_GUEST_PAGE, NotThread),
+    ];
+    for (scause, wanted) in riscv {
+        assert_eq!(r::exception_use(scause), Some(wanted), "{scause}");
+    }
+    assert_eq!(r::exception_use(11), None);
+    assert_eq!(r::exception_use(24), None);
+    assert_eq!(r::exception_use(r::SCAUSE_INTERRUPT | 5), None);
+}
