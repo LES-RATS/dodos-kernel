@@ -109,3 +109,30 @@ pub fn frame() -> u64 {
     assert!(!p.is_null(), "out of frames");
     p as u64
 }
+
+/// Maps `len` bytes at `phys` with 4 KB pages at the start of PML4 entry
+/// `slot` (each entry covers 512 GB) and returns the virtual address. The
+/// tables come from the heap; the range must fit one page directory
+/// pointer table (512 GB).
+pub fn map_4k_range(slot: u64, phys: u64, len: u64) -> u64 {
+    let pml4 = root();
+    let pdpt = frame();
+    // SAFETY: our own tables, identity mapped; the slot was empty.
+    unsafe {
+        *entry(pml4, slot) = pdpt | P | RW;
+        let pages = len.div_ceil(4096);
+        for p in 0..pages {
+            let (i3, i2, i1) = (p >> 18 & 511, p >> 9 & 511, p & 511);
+            if *entry(pdpt, i3) == 0 {
+                *entry(pdpt, i3) = frame() | P | RW;
+            }
+            let pd = *entry(pdpt, i3) & ADDR;
+            if *entry(pd, i2) == 0 {
+                *entry(pd, i2) = frame() | P | RW;
+            }
+            let pt = *entry(pd, i2) & ADDR;
+            *entry(pt, i1) = (phys + p * 4096) | P | RW;
+        }
+    }
+    slot << 39
+}

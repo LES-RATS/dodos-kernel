@@ -169,6 +169,8 @@ pub struct FwState {
     pub efer: u64,
     pub gdt: x86::DescriptorPtr,
     pub cs: u16,
+    pub ds: u16,
+    pub pat: u64,
 }
 
 pub static mut FW: [FwState; MAX_CORES] = [FwState {
@@ -178,6 +180,8 @@ pub static mut FW: [FwState; MAX_CORES] = [FwState {
     efer: 0,
     gdt: x86::DescriptorPtr { limit: 0, base: 0 },
     cs: 0,
+    ds: 0,
+    pat: 0,
 }; MAX_CORES];
 
 pub fn save_fw(i: usize) {
@@ -191,6 +195,10 @@ pub fn save_fw(i: usize) {
         (*f).efer = x86::rdmsr(x86::IA32_EFER);
         (*f).gdt = x86::sgdt();
         (*f).cs = x86::cs();
+        let ds: u16;
+        core::arch::asm!("mov {0:x}, ds", out(reg) ds, options(nomem, nostack));
+        (*f).ds = ds;
+        (*f).pat = x86::rdmsr(x86::IA32_PAT);
     }
 }
 

@@ -22,7 +22,8 @@ pub struct PerCpu {
     pub index: u64,
     pub nmi_count: AtomicU64,
     pub nmi_tsc: AtomicU64,
-    /// 1: the next NMI parks this core (the fence's NMI handler).
+    /// 1: the next NMI parks this core (the fence's NMI handler); 2: the
+    /// next NMI spins in the handler (NMIs blocked).
     pub nmi_park: AtomicU64,
     /// The park request this core last confirmed (the contract's `parked`).
     pub parked: AtomicU64,
@@ -31,6 +32,8 @@ pub struct PerCpu {
     pub timer_count: AtomicU64,
     /// SSP read at the entry of the last exception (0 without shadow stacks).
     pub ssp_entry: AtomicU64,
+    /// TSC at the first instruction of the trampoline after the last SIPI.
+    pub restart_tsc: AtomicU64,
     /// Top of this core's stack, for a restart.
     pub stack_top: u64,
     /// The interrupt descriptor table of this core.
@@ -70,6 +73,7 @@ pub static mut CPUS: [PerCpu; MAX_CORES] = [const {
         start_request: ZERO,
         timer_count: ZERO,
         ssp_entry: ZERO,
+        restart_tsc: ZERO,
         stack_top: 0,
         idt: [0; 256],
     }

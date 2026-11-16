@@ -203,6 +203,14 @@ global_asm!(
     "pop rdx", "pop rcx", "pop rax",
     "iretq",
     "71:",
+    // Mode 2: spin inside the handler with NMIs blocked (a kernel too
+    // damaged to park itself); only INIT gets the core out.
+    "cmp qword ptr gs:[{nmi_park}], 2",
+    "jne 72f",
+    "73:",
+    "pause",
+    "jmp 73b",
+    "72:",
     "mov qword ptr gs:[{nmi_park}], 0",
     "pop rdx", "pop rcx", "pop rax",
     "lea rax, [rip + dodos_park_from_nmi]",

@@ -45,6 +45,7 @@ fn firmware_timer_runs() -> bool {
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
     percpu::install(0, 0);
     idt::install();
+    smp::save_fw(0);
     apic::detect();
     tsc::calibrate();
     let can_x2 = x86::bit(x86::cpuid(1, 0).ecx, 21);
@@ -76,6 +77,17 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
     );
     paging::build(st());
     let n = smp::start(st())?;
+    // The page of the start-up trampoline, below 1 MB (SIPI vectors name
+    // pages 01H to FFH; the firmware keeps the lowest pages).
+    let mut low: u64 = 0x9_F000;
+    // SAFETY: boot services are valid; one page below 640 KB.
+    let r = unsafe { ((*(*st()).boot_services).allocate_pages)(efi::ALLOCATE_MAX_ADDRESS, efi::LOADER_DATA, 1, &mut low) };
+    if r == efi::SUCCESS {
+        crate::sipi::install(low);
+        out!("I trampoline page={low:#x} vector={:#x}", low >> 12);
+    } else {
+        out!("F trampoline no page below 1 MB (status {r:#x}): INIT tests cannot restart a core");
+    }
     out!("I smp started={n} cores={}", smp::cores().len());
     crate::identity::assign_kinds(cx)?;
     for (i, c) in smp::cores().iter().enumerate() {
