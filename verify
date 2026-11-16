@@ -7,16 +7,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 # The page size is a value of the machine (D-121): the tests whose rules
 # involve the page run again on two more geometries, 16 KB pages (three
-# levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). The tests of
-# membership, roles, scheduling, interrupts, tasks and debugging do not
+# levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). Debugging is among
+# them: its breakpoint words are judged against the user range end. The
+# tests of membership, roles, scheduling, interrupts and tasks do not
 # depend on the page and run once, above.
 # The two runs share the binaries the first run built (the page is read at
 # run time), so they run side by side; each must pass.
 geometry() {
 	DODOS_PAGE=$1 cargo test -p dodos-model --lib \
 		--test adversarial_nodes --test blocks --test boot --test calls \
-		--test faults --test gate_attack --test gate_words --test memory \
-		--test nodes --test property
+		--test debug --test faults --test gate_attack --test gate_classes \
+		--test gate_words --test generations --test memory --test nodes \
+		--test property
 }
 geometry 16k &
 sixteen=$!

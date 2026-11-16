@@ -424,17 +424,16 @@ fn memory_split_is_busy_when_no_entry_is_unused_and_unclaimed() {
         .unwrap() as u64;
     let mut work = vec![big];
     let mut splits = 0;
-    // The invariants are checked every 512 splits and at the last two (a
-    // check after each of the 8,192 setup splits made the test quadratic).
+    // The invariants are checked after every split (Argon b2 of the seventh
+    // review: a check every 512 splits let a wrong write between two of them
+    // pass).
     while splits < DEVICE_TABLE_SPARE {
         let entry = work.pop().expect("halves left to split");
         assert_eq!(k.m.apply(k.t, take(1, entry, 0, 40)), Ok(Output::Done));
         let Ok(Output::Index(upper)) = k.m.apply(k.t, split(40)) else {
             panic!("split {splits}");
         };
-        if splits % 512 == 0 || splits + 2 >= DEVICE_TABLE_SPARE {
-            assert_eq!(k.m.check(), Ok(()));
-        }
+        assert_eq!(k.m.check(), Ok(()));
         work.insert(0, entry);
         work.insert(0, upper);
         splits += 1;

@@ -246,10 +246,33 @@ impl K {
 
     #[track_caller]
     fn ok(&mut self, call: Syscall) {
-        // A creation clears its memory 64 KB per call: with large pages it
-        // may take several (rules of `untyped_retype`).
-        if matches!(call, Syscall::UntypedRetype { .. }) {
-            return self.made_in(call, 64);
+        // A creation clears its memory 64 KB per call, from the clean mark
+        // to the end of the new object, padding included: it takes exactly
+        // one call per step of clearing (rules of `untyped_retype`; Argon b4
+        // of the seventh review). A child untyped and device memory are not
+        // cleared: one call.
+        if let Syscall::UntypedRetype { untyped, kind, .. } = call {
+            let marks = self.m.untyped_marks(self.t, untyped);
+            // The invariants are checked once at the end: the journal of
+            // writes is kept until that check.
+            let mut calls = 0;
+            loop {
+                calls += 1;
+                match self.m.apply(self.t, call.clone()) {
+                    DONE => break,
+                    Err(Error::Again) if calls < 40_000 => {}
+                    other => panic!("{call:?}: {other:?}"),
+                }
+            }
+            assert_eq!(self.m.check(), Ok(()));
+            let (_, clean, device) = marks.expect("an untyped");
+            let (end, _, _) = self.m.untyped_marks(self.t, untyped).expect("an untyped");
+            let steps = match device || kind == Untyped {
+                true => 1,
+                false => clear_steps(clean, end),
+            };
+            assert_eq!(calls, steps, "{call:?}");
+            return;
         }
         assert_eq!(self.go(call), DONE);
     }

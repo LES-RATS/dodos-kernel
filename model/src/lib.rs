@@ -1151,6 +1151,15 @@ impl Model {
         self.table.owners[chunk as usize]
     }
 
+    /// The watermark and the clean mark of an untyped, as offsets from its
+    /// first byte, and whether it is device memory (rules of
+    /// `untyped_retype`).
+    pub fn untyped_marks(&self, thread: ObjId, slot: SlotAddr) -> Option<(u64, u64, bool)> {
+        let object = self.object_at(thread, slot)?;
+        let untyped = self.untypeds.get(&object)?;
+        Some((untyped.watermark, untyped.clean, untyped.device))
+    }
+
     /// The map count of a chunk (G4): bits 0-31 of its gate word.
     pub fn map_count(&self, chunk: u64) -> u64 {
         self.table.map_count(chunk)
