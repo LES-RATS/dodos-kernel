@@ -515,7 +515,7 @@ impl Model {
             dodos_abi::Owner::Node(self.node),
             self.table.generation(self.node),
         );
-        self.table.identifiers.insert(key, taken.raw());
+        self.table.write_identifier(self.node, key, Some(taken));
         live(&mut self.iospaces, iospace).push((iommu, device));
         let unit = live(&mut self.iommus, iommu);
         unit.attached.insert(device, iospace);
@@ -561,7 +561,7 @@ impl Model {
     fn detach_local(&mut self, iommu: ObjId, device: u16) {
         let index = self.iommus[&iommu].unit;
         let key = self.identifier_key(index, device);
-        self.table.identifiers.remove(&key);
+        self.table.write_identifier(self.node, key, None);
         self.table.reports[self.node as usize].retain(|&r| r != (index, device));
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);

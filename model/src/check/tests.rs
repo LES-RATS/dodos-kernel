@@ -1941,13 +1941,29 @@ fn take_of_a_word_the_rules_of_taking_refuse_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
         let before = Ownership::free(Owner::Node(1)).raw();
         let after = Ownership::taken(Owner::Node(0), 1).raw();
-        m.table.writes.push(crate::table::WordWrite {
-            chunk: Some(chunk),
-            entry: None,
-            writer: 0,
-            before,
-            after,
-        });
+        let write = m.table.journal(0, crate::table::Word::Chunk(chunk), before, after);
+        m.table.writes.push(write);
+    });
+    assert_eq!(broken, "52: write of an ownership word");
+}
+
+/// Argon b1 of the seventh review: the journal of writes is kept until the
+/// next check of the invariants, so a write that is wrong inside an event
+/// is reported even when the check comes after later events.
+#[test]
+fn a_wrong_write_is_reported_by_a_check_made_after_later_events() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        // An event starts the journal (the check before it judged the old
+        // one); the wrong write is made in it; two more events follow.
+        let thread = *m.threads.keys().next().expect("a thread");
+        let _ = m.apply(thread, Syscall::Yield);
+        let before = Ownership::free(Owner::Node(1)).raw();
+        let after = Ownership::taken(Owner::Node(0), 1).raw();
+        let write = m.table.journal(0, crate::table::Word::Chunk(chunk), before, after);
+        m.table.writes.push(write);
+        for _ in 0..2 {
+            let _ = m.apply(thread, Syscall::Yield);
+        }
     });
     assert_eq!(broken, "52: write of an ownership word");
 }
@@ -1957,13 +1973,8 @@ fn release_of_a_word_the_writer_did_not_hold_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
         let before = Ownership::taken(Owner::Node(1), 1).raw();
         let after = Ownership::free(Owner::Node(0)).raw();
-        m.table.writes.push(crate::table::WordWrite {
-            chunk: Some(chunk),
-            entry: None,
-            writer: 0,
-            before,
-            after,
-        });
+        let write = m.table.journal(0, crate::table::Word::Chunk(chunk), before, after);
+        m.table.writes.push(write);
     });
     assert_eq!(broken, "52: write of an ownership word");
 }

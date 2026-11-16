@@ -405,16 +405,21 @@ impl Ownership {
     }
 
     /// Who may take a word: whether node `node`, of current generation
-    /// `generation`, may write *taken* into this word. `owner_dead` is
-    /// whether the member word of the owner, when it is a node, is dead;
+    /// `generation`, may write *taken* into this word. `owner` is the member
+    /// word of the owner, when the owner is a node (ignored otherwise);
     /// `holds_reserve` whether `node` holds the role of the reserve, when the
     /// owner is one. Rules 1 to 4 of taking; any other owner is refused, and
-    /// so is a word *none*.
+    /// so is a word *none*. Rule 3: the owner is dead, or the word is
+    /// *taken* by a generation of its owner that is over (the owner's
+    /// member word names another generation): a node gets a new generation
+    /// only after it was dead, past the barrier and R6. A *free* word with a
+    /// node as owner is memory released or given to that node, and stays
+    /// that node's while it is not dead.
     pub const fn may_take(
         self,
         node: u16,
         generation: u32,
-        owner_dead: bool,
+        owner: Member,
         holds_reserve: bool,
     ) -> bool {
         let state = self.state();
@@ -422,10 +427,13 @@ impl Ownership {
             return false;
         }
         match self.owner() {
-            Owner::Node(owner) if owner == node => {
+            Owner::Node(o) if o == node => {
                 matches!(state, OwnState::Free) || self.generation() != generation
             }
-            Owner::Node(_) => owner_dead,
+            Owner::Node(_) => {
+                matches!(owner.state(), MemberState::Dead)
+                    || matches!(state, OwnState::Taken) && owner.generation() != self.generation()
+            }
             Owner::Unclaimed => true,
             Owner::Reserve(_) => holds_reserve,
         }
@@ -1152,14 +1160,19 @@ mod proofs {
         };
         let (node, generation): (u16, u32) = (kani::any(), kani::any());
         kani::assume((node as usize) < NODES_MAX);
-        let (dead, holds): (bool, bool) = (kani::any(), kani::any());
-        let accepted = word.may_take(node, generation, dead, holds);
+        let Some(owner) = Member::from_raw(kani::any()) else {
+            return;
+        };
+        let holds: bool = kani::any();
+        let accepted = word.may_take(node, generation, owner, holds);
         let free = matches!(word.state(), OwnState::Free);
         let taken = matches!(word.state(), OwnState::Taken);
+        let dead = matches!(owner.state(), MemberState::Dead);
+        let over = taken && owner.generation() != word.generation();
         let expected = match word.owner() {
             _ if !free && !taken => false,
             Owner::Node(o) if o == node => free || word.generation() != generation,
-            Owner::Node(_) => dead,
+            Owner::Node(_) => dead || over,
             Owner::Unclaimed => true,
             Owner::Reserve(_) => holds,
         };

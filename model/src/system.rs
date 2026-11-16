@@ -434,6 +434,16 @@ impl System {
             model.table = table;
             model.table.beacons[node as usize].save_seal = false;
         } else {
+            // A fresh start writes the node's beacon anew: nothing of the
+            // generation that is over stays in it (its failure, what it
+            // acknowledged, whom it mapped, what it observed).
+            let mut table = table;
+            let nodes = table.nodes as usize;
+            table.beacons[node as usize] = crate::table::NodeBeacon {
+                acked: vec![0; nodes],
+                maps_of: vec![false; nodes],
+                ..Default::default()
+            };
             let (mut model, _) =
                 Model::start(&self.machine, &self.layout, table, node).expect("started once");
             model.shared = true;
@@ -771,6 +781,38 @@ mod tests {
         assert_eq!(sys.check(), Ok(()));
         assert_eq!(sys.nodes[1].as_mut().unwrap().remotes.len(), 1);
         (sys, t)
+    }
+
+    /// A fresh start leaves nothing of the generation that is over in the
+    /// node's beacon: no failure, no acknowledgement, no dependency, no
+    /// observation (pass 14, words of a generation that no longer exists).
+    #[test]
+    fn a_fresh_start_writes_the_node_beacon_anew() {
+        let (mut sys, t) = System::boot(&Machine::example()).unwrap();
+        sys.panic(1, 7);
+        let mut at = 0;
+        while sys.member(1).state() != MemberState::Dead {
+            at += 100_000;
+            sys.run(at, 100_000);
+            assert!(at < 50_000_000, "node 1 dies");
+        }
+        assert!(sys.table().beacons[1].panic.is_some());
+        tables(&mut sys, |table| {
+            table.beacons[1].acked[0] = 9;
+            table.beacons[1].maps_of[0] = true;
+        });
+        let start = Syscall::CoreStart {
+            core: SlotAddr::own(17),
+            mode: dodos_abi::CORE_START_FRESH,
+            image: 0,
+            module: 0,
+        };
+        assert_eq!(sys.apply(0, t[0], start), Ok(crate::Output::Done));
+        let beacon = &sys.table().beacons[1];
+        assert_eq!(beacon.panic, None);
+        assert_eq!((beacon.acked[0], beacon.maps_of[0]), (0, false));
+        assert!(beacon.observations.is_empty());
+        assert_eq!(sys.check(), Ok(()));
     }
 
     /// Changes the machine table of every node the same way.

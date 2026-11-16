@@ -827,6 +827,7 @@ impl Machine {
             uses: vec![Default::default(); n],
             serials: vec![Default::default(); n],
             writes: Default::default(),
+            checked: Default::default(),
         }
     }
 }

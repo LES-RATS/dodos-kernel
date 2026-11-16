@@ -1091,20 +1091,31 @@ fn ownership_words_carry_their_check() {
 #[test]
 fn may_take_follows_rules_1_to_4() {
     let (x, g) = (2, 5);
+    let live = |generation| Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, generation);
+    let dead = |generation| Member::new(MemberState::Dead, Evidence::None, DRIVER_NONE, generation);
+    let any = live(g);
     // 1. Its own word: free, or taken by another generation.
-    assert!(Ownership::free(Owner::Node(x)).may_take(x, g, false, false));
-    assert!(Ownership::taken(Owner::Node(x), g - 1).may_take(x, g, false, false));
-    assert!(!Ownership::taken(Owner::Node(x), g).may_take(x, g, false, false));
+    assert!(Ownership::free(Owner::Node(x)).may_take(x, g, any, false));
+    assert!(Ownership::taken(Owner::Node(x), g - 1).may_take(x, g, any, false));
+    assert!(!Ownership::taken(Owner::Node(x), g).may_take(x, g, any, false));
     // 2. Unclaimed, free or taken.
-    assert!(Ownership::free(Owner::Unclaimed).may_take(x, g, false, false));
-    // 3. A dead node's word, whatever its state.
-    assert!(Ownership::taken(Owner::Node(1), 3).may_take(x, g, true, false));
-    assert!(!Ownership::taken(Owner::Node(1), 3).may_take(x, g, false, false));
-    assert!(!Ownership::free(Owner::Node(1)).may_take(x, g, false, true));
+    assert!(Ownership::free(Owner::Unclaimed).may_take(x, g, any, false));
+    // 3. A dead node's word, whatever its state and generation.
+    assert!(Ownership::taken(Owner::Node(1), 3).may_take(x, g, dead(3), false));
+    assert!(Ownership::free(Owner::Node(1)).may_take(x, g, dead(3), false));
+    assert!(!Ownership::taken(Owner::Node(1), 3).may_take(x, g, live(3), false));
+    assert!(!Ownership::free(Owner::Node(1)).may_take(x, g, live(3), true));
+    // 3. A word taken by a generation that is over: its owner started
+    // again (Argon 1.1 of the seventh review, and S1, S2); a free word
+    // given to a live node stays that node's.
+    assert!(Ownership::taken(Owner::Node(1), 3).may_take(x, g, live(4), false));
+    let starting = Member::new(MemberState::Starting, Evidence::None, DRIVER_NONE, 4);
+    assert!(Ownership::taken(Owner::Node(1), 3).may_take(x, g, starting, false));
+    assert!(!Ownership::free(Owner::Node(1)).may_take(x, g, live(4), false));
     // 4. A reserve only by the holder of its role.
-    assert!(Ownership::free(Owner::Reserve(0)).may_take(x, g, false, true));
-    assert!(!Ownership::free(Owner::Reserve(0)).may_take(x, g, true, false));
-    assert!(!Ownership::none().may_take(x, g, true, true));
+    assert!(Ownership::free(Owner::Reserve(0)).may_take(x, g, any, true));
+    assert!(!Ownership::free(Owner::Reserve(0)).may_take(x, g, dead(1), false));
+    assert!(!Ownership::none().may_take(x, g, dead(1), true));
 }
 
 #[test]

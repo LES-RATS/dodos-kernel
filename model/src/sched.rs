@@ -95,7 +95,7 @@ impl Model {
     /// to its budget if it ran from the ready queue. The kernel's own time
     /// is taken as zero. Returns the context running at the entry.
     pub(crate) fn begin(&mut self) -> Option<(ObjId, bool)> {
-        self.table.writes.clear();
+        self.table.begin_journal();
         self.table.member_writes.clear();
         self.table.role_writes.clear();
         // The core beacon's heartbeat: one more at every event.

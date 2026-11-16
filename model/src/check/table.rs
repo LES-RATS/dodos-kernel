@@ -13,6 +13,66 @@ fn read(raw: u64) -> Option<(u64, u16, u32)> {
     Ownership::from_raw(raw).map(|_| (raw & 3, (raw >> 16) as u16, (raw >> 32) as u32))
 }
 
+/// Invariant 52: a write of an ownership or identifier word, judged with
+/// what the writer's gate read when it wrote (recorded with the write), so
+/// that a journal kept over several events is judged event by event.
+fn judge_write(write: &crate::table::WordWrite) -> Check {
+    let ensure_write = |holds: bool| ensure(holds, "52: write of an ownership word");
+    let before = read(write.before);
+    let Some((after_state, after_owner, after_g)) = read(write.after) else {
+        return ensure_write(false);
+    };
+    let Some((state, owner, g)) = before else {
+        return ensure_write(false);
+    };
+    let writer = write.writer;
+    let reserve = (0xFFF0..0xFFF8).contains(&owner);
+    // The word as its writer held it: taken by its generation, or by a
+    // reserve whose role it held.
+    let held = state == 2 && g == write.generation && (owner == writer || reserve && write.holds);
+    match after_state {
+        // A take: the word was free or taken, and the rules of taking give
+        // it to the writer (its own, unclaimed, of a node that is dead or
+        // whose generation in the word is over, or of a reserve it holds),
+        // with the writer's current generation.
+        2 => {
+            let allowed = match owner {
+                o if o == writer => state == 1 || g != write.generation,
+                0xFFFF => true,
+                _ if reserve => write.holds,
+                _ => write.owner.is_some_and(|m| {
+                    m.state() == dodos_abi::MemberState::Dead || state == 2 && m.generation() != g
+                }),
+            };
+            let named = after_owner == writer || after_owner == owner;
+            ensure_write(state != 0 && allowed && named && after_g == write.generation)
+        }
+        // A release or a give: the word was held by the writer; or
+        // `memory_split` claims an unused entry that is unclaimed, free with
+        // the writer as owner; or R6 frees a reserve word taken by the holder
+        // that role names, fenced or dead, with its generation.
+        1 => {
+            let claimed = matches!(write.word, crate::table::Word::Entry(_))
+                && state == 1
+                && owner == 0xFFFF
+                && after_owner == writer;
+            let cleared = state == 2
+                && reserve
+                && owner == after_owner
+                && write.holder.is_some_and(|m| {
+                    matches!(
+                        m.state(),
+                        dodos_abi::MemberState::Fenced | dodos_abi::MemberState::Dead
+                    ) && m.generation() == g
+                });
+            // An identifier word is detached to free, unclaimed.
+            let identifier = matches!(write.word, crate::table::Word::Identifier(_));
+            ensure_write((held && (!identifier || after_owner == 0xFFFF)) || claimed || cleared)
+        }
+        _ => ensure_write(false),
+    }
+}
+
 impl Model {
     /// Memory between nodes (8.2) and the gate over page tables:
     /// 52. every ownership word written in the event was written by a node
@@ -85,64 +145,9 @@ impl Model {
                 && (owner == node || (0xFFF0..0xFFF8).contains(&owner) && holds(owner - 0xFFF0))
         };
         let mine = |raw: u64| read(raw).is_some_and(|(state, owner, g)| mine_read(state, owner, g));
+        table.checked.set(true);
         for write in table.writes.iter() {
-            let before = read(write.before);
-            let after = read(write.after);
-            let ensure_write = |holds: bool| ensure(holds, "52: write of an ownership word");
-            let Some((after_state, after_owner, _)) = after else {
-                return ensure_write(false);
-            };
-            match after_state {
-                // A take: the word was free or taken, and the writer may
-                // take it (its own, unclaimed, of a dead node, or of a
-                // reserve it holds).
-                2 => {
-                    let Some((state, owner, g)) = before else {
-                        return ensure_write(false);
-                    };
-                    let dead = owner < table.nodes
-                        && table.members[owner as usize].state() == dodos_abi::MemberState::Dead;
-                    let allowed = match owner {
-                        o if o == write.writer => {
-                            let writer = table.members[write.writer as usize].generation();
-                            state == 1 || g != writer
-                        }
-                        0xFFFF => true,
-                        o if (0xFFF0..0xFFF8).contains(&o) => holds(o - 0xFFF0),
-                        _ => dead,
-                    };
-                    let named = after_owner == write.writer || after_owner == owner;
-                    ensure_write(state != 0 && allowed && named)?;
-                }
-                // A release or a give: the word was held by the writer; or
-                // `memory_split` claims an unused entry that is unclaimed,
-                // free with the writer as owner.
-                1 => {
-                    let unused = write.entry.is_some();
-                    let claimed = unused
-                        && before.is_some_and(|(state, owner, _)| state == 1 && owner == 0xFFFF)
-                        && after_owner == write.writer;
-                    // R6: a reserve word taken by a holder that died in this
-                    // event, with its generation, freed with the reserve's code.
-                    let cleared = before.is_some_and(|(state, owner, g)| {
-                        state == 2
-                            && owner == after_owner
-                            && (0xFFF0..0xFFF8).contains(&owner)
-                            && table.role_writes.iter().any(|&(role, _, was, _)| {
-                                let record = table.role_records[role];
-                                let holder = table.members.get(was.holder() as usize);
-                                record.kind == dodos_abi::RoleKind::Reserve
-                                    && record.object == owner - 0xFFF0
-                                    && holder.is_some_and(|m| {
-                                        m.state() == dodos_abi::MemberState::Dead
-                                            && m.generation() == g
-                                    })
-                            })
-                    });
-                    ensure_write(mine(write.before) || claimed || cleared)?
-                }
-                _ => ensure_write(false)?,
-            }
+            judge_write(write)?;
         }
         // The chunks of the blocks and the leaves of the translations, for
         // invariant 55, judged before the others so that it can fail alone.

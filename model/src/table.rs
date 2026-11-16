@@ -129,13 +129,31 @@ pub(crate) enum PageClass {
     Table,
 }
 
-/// One write of the living part, kept until the end of the event so that
-/// the invariants can judge who wrote what (8.2, invariant 1).
+/// Which word of the living part a write names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Word {
+    /// The ownership word of a chunk.
+    Chunk(u64),
+    /// The ownership word of an entry of the device table.
+    Entry(usize),
+    /// The identifier word of a device, by segment << 16 | identifier.
+    Identifier(u32),
+}
+
+/// One write of the living part, kept until the next check of the
+/// invariants so that they can judge who wrote what (8.2, invariant 52),
+/// with what the writer's gate read when it wrote: its own generation, the
+/// member word of the word's owner when a node owns it, whether it held the
+/// role of the word's reserve, and the member word of the holder that role
+/// names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WordWrite {
-    pub(crate) chunk: Option<u64>,
-    pub(crate) entry: Option<usize>,
+    pub(crate) word: Word,
     pub(crate) writer: u16,
+    pub(crate) generation: u32,
+    pub(crate) owner: Option<Member>,
+    pub(crate) holds: bool,
+    pub(crate) holder: Option<Member>,
     pub(crate) before: u64,
     pub(crate) after: u64,
 }
@@ -213,8 +231,11 @@ pub(crate) struct Table {
     /// physical cores the hardware reports off (ARM64 `AFFINITY_INFO`).
     pub(crate) admitted: Vec<u64>,
     pub(crate) off: Vec<bool>,
-    /// The writes of the current event.
+    /// The writes of ownership and identifier words since the last check of
+    /// the invariants, and whether that check has run since (the next event
+    /// then starts a new journal).
     pub(crate) writes: crate::Ephemeral<Vec<WordWrite>>,
+    pub(crate) checked: crate::Ephemeral<std::cell::Cell<bool>>,
     /// The member and role words written in the current event, with their
     /// writer: (node, before, after) and (role, writer, before, after).
     pub(crate) member_writes: crate::Ephemeral<Vec<(u16, u16, Member, Member)>>,
@@ -278,15 +299,62 @@ impl Table {
 
     /// Who may take a word (rules 1 to 4 of taking), for `node`.
     pub(crate) fn may_take(&self, word: Ownership, node: u16) -> bool {
-        let dead = match word.owner() {
-            Owner::Node(owner) => owner < self.nodes && self.dead(owner),
-            _ => false,
+        // The member word of a node owner. A code beyond the nodes of the
+        // machine is refused, as a live owner of the word's generation.
+        let owner = match word.owner() {
+            Owner::Node(owner) if owner < self.nodes => self.member(owner),
+            _ => Member::new(
+                MemberState::Live,
+                dodos_abi::Evidence::None,
+                dodos_abi::DRIVER_NONE,
+                word.generation(),
+            ),
         };
         let holds = match word.owner() {
             Owner::Reserve(j) => self.holds_reserve(node, j),
             _ => false,
         };
-        word.may_take(node, self.generation(node), dead, holds)
+        word.may_take(node, self.generation(node), owner, holds)
+    }
+
+    /// The record of a write of `word` by `writer`, with what its gate read.
+    pub(crate) fn journal(&self, writer: u16, word: Word, before: u64, after: u64) -> WordWrite {
+        let read = Ownership::from_raw(before);
+        let owner = read.and_then(|w| match w.owner() {
+            Owner::Node(o) if o < self.nodes => Some(self.member(o)),
+            _ => None,
+        });
+        let reserve = read.and_then(|w| match w.owner() {
+            Owner::Reserve(j) => Some(j),
+            _ => None,
+        });
+        let holder = reserve.and_then(|j| {
+            self.role_records
+                .iter()
+                .zip(&self.roles)
+                .find(|(record, _)| record.kind == RoleKind::Reserve && record.object == j)
+                .filter(|(_, word)| word.state() != RoleState::Vacant)
+                .and_then(|(_, word)| self.members.get(word.holder() as usize).copied())
+        });
+        WordWrite {
+            word,
+            writer,
+            generation: self.generation(writer),
+            owner,
+            holds: reserve.is_some_and(|j| self.holds_reserve(writer, j)),
+            holder,
+            before,
+            after,
+        }
+    }
+
+    /// Starts the journal of an event: the writes of earlier events stay
+    /// until a check of the invariants has judged them.
+    pub(crate) fn begin_journal(&mut self) {
+        if self.checked.get() {
+            self.writes.clear();
+            self.checked.set(false);
+        }
     }
 
     /// The write gate: writes an ownership word by compare-and-swap, after
@@ -302,14 +370,9 @@ impl Table {
         if !self.member(writer).writes() || self.owners[chunk as usize] != before {
             return false;
         }
+        let write = self.journal(writer, Word::Chunk(chunk), before, after.raw());
         Arc::make_mut(&mut self.owners)[chunk as usize] = after.raw();
-        self.writes.push(WordWrite {
-            chunk: Some(chunk),
-            entry: None,
-            writer,
-            before,
-            after: after.raw(),
-        });
+        self.writes.push(write);
         true
     }
 
@@ -319,14 +382,24 @@ impl Table {
             return false;
         }
         let before = self.devices[index].owner.raw();
+        let write = self.journal(writer, Word::Entry(index), before, entry.owner.raw());
         Arc::make_mut(&mut self.devices)[index] = entry;
-        self.writes.push(WordWrite {
-            chunk: None,
-            entry: Some(index),
-            writer,
-            before,
-            after: entry.owner.raw(),
-        });
+        self.writes.push(write);
         true
+    }
+
+    /// The write gate on the identifier word of a device: *taken* by the
+    /// writer's generation, or `None` for *free*, unclaimed (a word not
+    /// listed).
+    pub(crate) fn write_identifier(&mut self, writer: u16, key: u32, after: Option<Ownership>) {
+        let unclaimed = Ownership::free(Owner::Unclaimed).raw();
+        let before = self.identifiers.get(&key).copied().unwrap_or(unclaimed);
+        let after_raw = after.map_or(unclaimed, Ownership::raw);
+        let write = self.journal(writer, Word::Identifier(key), before, after_raw);
+        match after {
+            Some(word) => self.identifiers.insert(key, word.raw()),
+            None => self.identifiers.remove(&key),
+        };
+        self.writes.push(write);
     }
 }
