@@ -11,7 +11,7 @@
 
 use crate::remote::Request;
 use crate::table::{FenceRecord, GrantState, Observation, Watched};
-use crate::{Model, ObjId, Outcome, Output, Slot, SlotAddr, Wait, live};
+use crate::{Model, ObjId, Outcome, Output, SlotAddr, Wait, live};
 use dodos_abi::{
     CORE_IMAGE_BOOT, CORE_IMAGE_REPLACEMENT, CORE_START_FRESH, CORE_START_RESUME,
     CORE_STATUS_FENCE_SHIFT, CORE_STATUS_PARKED, CORE_STATUS_UNUSABLE, CORE_STOP_KILL,
@@ -1204,13 +1204,6 @@ impl Model {
             live(&mut self.caps, root).dying = true;
             while self.remove_root(root) == Err(Error::Again) {}
         }
-    }
-
-    /// A start-up space slot, to reach the kernel space in tests.
-    #[allow(dead_code)]
-    pub(crate) fn kernel_slot(&self, index: u32) -> Option<Slot> {
-        let space = self.kernel_space?;
-        self.cspaces[&space].slots.get(index as usize).copied()
     }
 }
 
