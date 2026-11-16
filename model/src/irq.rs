@@ -1,22 +1,27 @@
-//! Interrupts: the entries of the interrupt table of the node, their claim,
-//! binding and acknowledgement, and the arrival of an interrupt.
+//! Interrupts: the entries of the interrupt table of each physical core of
+//! the node (D-129), their claim, binding and acknowledgement, and the
+//! arrival of an interrupt on its core. An entry is guarded by its core's
+//! lock word under variant L2 (D-131).
 
 use crate::caps::Placing;
-use crate::{Irq, IrqState, Model, ObjId, Outcome, Output, live};
+use crate::{Irq, IrqState, Model, ObjId, Outcome, Output, live, locked};
 use dodos_abi::x86_64::{
-    IRQ_MAX_NODES_REMAPPED, IRQ_TABLE_ENTRIES, IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST,
+    IRQ_MAX_CORES_REMAPPED, IRQ_TABLE_ENTRIES, IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST,
 };
 use dodos_abi::{Error, IrqSource, ObjectKind, Rights, SlotAddr};
 
 impl Model {
-    /// `irq_claim`: one vector of the node, bound to one source. Returns the
-    /// address and the data a device must be given for an MSI (0 and 0 for
-    /// a line).
+    /// `irq_claim`: one vector of one physical core of the node, bound to
+    /// one source. Returns the address and the data a device must be given
+    /// for an MSI (0 and 0 for a line). A line's redirection entry is
+    /// programmed by the holder of the IOAPIC's role, and a remapping entry
+    /// is followed by the invalidation of the interrupt entry cache by the
+    /// holder of the unit's role: unit requests, which the call waits for.
     pub(crate) fn irq_claim(
         &mut self,
         thread: ObjId,
         control: SlotAddr,
-        (source, vector): (u64, u64),
+        (source, core, vector): (u64, u64, u64),
         destination: SlotAddr,
     ) -> Outcome {
         let cap = self.cap(thread, control, Rights::READ)?;
@@ -35,16 +40,18 @@ impl Model {
         if source.is_line() && !served(source.id()) {
             return Err(Error::Invalid);
         }
+        // Then a core number that is not a core of the irq_control's node.
+        let position = self.position(core).ok_or(Error::Invalid)?;
         let vector = u8::try_from(vector)
             .ok()
             .filter(|vector| (IRQ_VECTOR_FIRST..=IRQ_VECTOR_LAST).contains(vector));
         let vector = vector.ok_or(Error::Invalid)?;
         // `unsupported` if this machine cannot deliver the source to the
         // core: without remapping, an APIC ID above 255; with remapping, a
-        // node of index 341 or more.
-        let apic = self.machine.core_list()[self.node as usize].hw_id;
-        let remapped_node = u32::from(self.node) >= IRQ_MAX_NODES_REMAPPED;
-        if !self.machine.remapping && apic > 255 || self.machine.remapping && remapped_node {
+        // core of number 341 or more.
+        let apic = self.machine.core_list()[core as usize].hw_id;
+        let remapped_core = core >= u64::from(IRQ_MAX_CORES_REMAPPED);
+        if !self.machine.remapping && apic > 255 || self.machine.remapping && remapped_core {
             return Err(Error::Unsupported);
         }
         // Unlike cores: without such an event, kind 3 is `unsupported`.
@@ -57,7 +64,7 @@ impl Model {
         // the destination.
         let claimed =
             |vector_or_line: &dyn Fn(&Irq) -> bool| self.irqs.values().any(vector_or_line);
-        if claimed(&|irq| irq.vector == vector) {
+        if claimed(&|irq| irq.core == position && irq.vector == vector) {
             return Err(Error::Busy);
         }
         if source.is_line()
@@ -66,13 +73,25 @@ impl Model {
             return Err(Error::Busy);
         }
         self.vacant(place)?;
+        // The unit requests the claim needs, and a free entry of the unit
+        // request table for them (`again` with nothing changed).
+        let role = match (source.is_line(), self.machine.remapping) {
+            (true, _) => self.ioapic_role(source.id()),
+            (false, true) if !self.machine.iommus.is_empty() => Some(self.unit_role(0)),
+            (false, _) => None,
+        };
+        if role.is_some() && self.unit_requests.iter().all(Option::is_some) {
+            return Err(Error::Again);
+        }
         // The new `irq` is idle, with pending 0; its root capability is a
         // child of the `irq_control` capability, with every right, and it
         // takes no memory from an untyped.
         let root = self.create(ObjectKind::Irq, 0, Some(cap), Rights::ALL, place);
         let id = self.caps[&root].object;
         live(&mut self.objects, id).from = None;
+        self.touch_core(position);
         let irq = Irq {
+            core: position,
             vector,
             source,
             state: IrqState::Idle,
@@ -80,9 +99,10 @@ impl Model {
             notify: None,
         };
         self.irqs.insert(id, irq);
-        // The fixed remapping entry of the vector on this node.
+        // The fixed remapping entry of the vector on that core: handle
+        // core number × 192 + (vector − 48), written by this node's gate.
         let entry = u64::from(vector - IRQ_VECTOR_FIRST);
-        let handle = u64::from(self.node) * IRQ_TABLE_ENTRIES as u64 + entry;
+        let handle = core * IRQ_TABLE_ENTRIES as u64 + entry;
         let (address, data) = match (source.is_line(), self.machine.remapping) {
             (true, _) => (0, 0),
             (false, true) => (dodos_abi::x86_64::msi_remapped(handle), 0),
@@ -91,7 +111,28 @@ impl Model {
             }
         };
         assert!(entry < IRQ_TABLE_ENTRIES as u64);
-        Ok(Output::Msi { address, data })
+        let Some(role) = role else {
+            return Ok(Output::Msi { address, data });
+        };
+        let generation = self.table.generation(self.node);
+        let op = match source.is_line() {
+            true => crate::rings::UnitOp::Redirection {
+                gsi: source.id(),
+                claimed: true,
+            },
+            false => {
+                self.table
+                    .units
+                    .entry(role)
+                    .or_default()
+                    .remap
+                    .insert(handle as u32, (self.node, generation));
+                crate::rings::UnitOp::InterruptCache
+            }
+        };
+        let waiter = crate::units::Waiter::Thread(Some(thread));
+        self.unit_request_with(role, op, waiter, None, Some((address, data)))?;
+        Ok(Output::Waits)
     }
 
     /// `irq_bind`: notify 0 unbinds; otherwise `send` on the notify, and
@@ -109,9 +150,15 @@ impl Model {
         if self.irqs[&irq].notify.is_some() {
             return Err(Error::Busy);
         }
+        if self.remotes.contains_key(&notify) {
+            return Err(Error::Invalid);
+        }
         let bits = if badge == 0 { 1 } else { badge };
+        self.touch_core(self.irqs[&irq].core);
         live(&mut self.irqs, irq).notify = Some((notify, bits));
-        live(&mut self.notifies, notify).irqs.push(irq);
+        locked(&mut self.notifies, &self.locks, notify)
+            .irqs
+            .push(irq);
         let entry = live(&mut self.irqs, irq);
         if std::mem::take(&mut entry.pending) {
             entry.state = IrqState::Fired;
@@ -131,6 +178,7 @@ impl Model {
         let dying = self.irqs[&irq]
             .notify
             .is_some_and(|(notify, _)| self.dying(notify));
+        self.touch_core(self.irqs[&irq].core);
         let entry = live(&mut self.irqs, irq);
         match entry.state {
             _ if dying => return Err(Error::Busy),
@@ -154,9 +202,18 @@ impl Model {
     /// ignored. The masking of a level source and the end of interrupt are
     /// the hardware's; an arrival is an event of the kernel.
     pub fn interrupt(&mut self, vector: u8) {
+        self.interrupt_on(0, vector);
+    }
+
+    /// An arrival on the core at `position` of the node.
+    pub fn interrupt_on(&mut self, position: usize, vector: u8) {
         *self.last_event = None;
-        let entry = self.begin();
-        let found = self.irqs.iter().find(|(_, irq)| irq.vector == vector);
+        let entry = self.begin_on(position);
+        self.touch_core(position);
+        let found = self
+            .irqs
+            .iter()
+            .find(|(_, irq)| irq.core == position && irq.vector == vector);
         if let Some((&id, _)) = found {
             let dying = self.irqs[&id]
                 .notify
@@ -174,15 +231,11 @@ impl Model {
             }
         }
         self.end(entry);
-    }
-
-    /// `signal`, with the bits of a capability's badge.
-    pub(crate) fn signal_bits_pub(&mut self, notify: ObjId, bits: u64) {
-        self.signal_bits(notify, bits)
+        self.auto_deliver();
     }
 
     fn signal_bits(&mut self, notify: ObjId, bits: u64) {
-        live(&mut self.notifies, notify).word |= bits;
+        locked(&mut self.notifies, &self.locks, notify).word |= bits;
         self.hand_over(notify);
     }
 
@@ -191,7 +244,7 @@ impl Model {
         let entry = live(&mut self.irqs, irq);
         entry.state = IrqState::Idle;
         if let Some((notify, _)) = entry.notify.take() {
-            live(&mut self.notifies, notify)
+            locked(&mut self.notifies, &self.locks, notify)
                 .irqs
                 .retain(|&other| other != irq);
         }
@@ -211,6 +264,8 @@ impl Model {
     /// dropped, and its vector can be claimed again.
     pub(crate) fn irq_destroyed(&mut self, irq: ObjId) {
         self.unbind_irq(irq);
-        self.irqs.remove(&irq);
+        if let Some(entry) = self.irqs.remove(&irq) {
+            self.touch_core(entry.core);
+        }
     }
 }

@@ -1,6 +1,6 @@
-//! Debugging (8.5): the debug area of each node in the crash area of this
-//! boot, its two trace rings and the rate limit of the kernel ring, the
-//! node record and the stop record, `debug_write` and `trace_emit`; the
+//! Debugging (8.5): the debug area of each physical core in the crash area
+//! of this boot (D-129), its two trace rings and the rate limit of the
+//! kernel ring, counted per core, the core record and the stop record, `debug_write` and `trace_emit`; the
 //! I/O ports of x86-64; `entropy_read`.
 //!
 //! What the kernel traces in the model: its start (code 1), a fault
@@ -18,12 +18,14 @@ use dodos_abi::{
     ioport_check, ports_meet, trace_index,
 };
 
-/// The debug area of a node: its header's fields, its record, its rings.
+/// The debug area of a physical core: its header's fields (the node slot
+/// and generation of the node it last ran), its record, its rings.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DebugArea {
     pub(crate) magic: u32,
     pub(crate) version: u16,
     pub(crate) generation: u32,
+    pub(crate) slot: u16,
     pub(crate) next_kernel: u64,
     pub(crate) next_user: u64,
     pub(crate) suppressed: u64,
@@ -60,6 +62,7 @@ impl DebugArea {
             magic: DEBUG_AREA_MAGIC,
             version: DEBUG_AREA_VERSION,
             generation,
+            slot: 0,
             next_kernel: 1,
             next_user: 1,
             suppressed: 0,
@@ -94,30 +97,29 @@ impl DebugArea {
 
 impl CrashArea {
     /// The crash area of this boot: cleared, its sequence one more than the
-    /// previous area's, every debug area starting at sequence 1.
-    pub(crate) fn new(boot_id: u64, previous: u64, nodes: usize) -> Self {
+    /// previous area's, the debug area of every physical core starting at
+    /// sequence 1.
+    pub(crate) fn new(boot_id: u64, previous: u64, cores: usize) -> Self {
         Self {
             boot_id,
             sequence: previous + 1,
             stop: None,
-            areas: (0..nodes).map(|_| DebugArea::new(1)).collect(),
+            areas: (0..cores).map(|_| DebugArea::new(1)).collect(),
         }
     }
 
-    /// The node record a reader accepts: one whose commit is this area's
+    /// The core record a reader accepts: one whose commit is this area's
     /// boot identifier.
-    pub(crate) fn accepted(&self, node: u16) -> Option<Record> {
-        self.areas[node as usize]
-            .record
-            .filter(|r| r.commit == self.boot_id)
+    pub(crate) fn accepted(&self, core: usize) -> Option<Record> {
+        self.areas[core].record.filter(|r| r.commit == self.boot_id)
     }
 
-    /// The record of a node: commit 0, the rest, then commit. The fence
+    /// The record of a core: commit 0, the rest, then commit. The fence
     /// handler (reason 5) writes only if the area holds no committed record
     /// of the same generation.
-    pub(crate) fn write_record(&mut self, node: u16, record: Record) {
+    pub(crate) fn write_record(&mut self, core: usize, record: Record) {
         let boot_id = self.boot_id;
-        let area = &mut self.areas[node as usize];
+        let area = &mut self.areas[core];
         let held = area
             .record
             .is_some_and(|r| r.commit == boot_id && r.generation == record.generation);
@@ -161,10 +163,11 @@ impl Model {
         payload: [u64; 3],
     ) -> TraceEntry {
         let generation = self.table.generation(self.node);
+        let continued = flags & dodos_abi::TRACE_FLAG_CONTINUED != 0;
         TraceEntry {
             seq: 0,
             instant: self.now,
-            word2: u64::from(code as u16) | flags | u64::from(generation) << 32,
+            word2: TraceEntry::word2_of(code as u16, continued, self.node, generation),
             task,
             marks,
             payload,
@@ -178,9 +181,9 @@ impl Model {
         let stamp = self.stamp(thread);
         let index = code as usize;
         let now = self.now;
-        let me = self.node as usize;
+        let me = self.here().number as usize;
         if code != TraceCode::Failure {
-            let mut limit = self.limits[index];
+            let mut limit = self.here().limits[index];
             if limit.window.is_none_or(|at| now >= at + TRACE_BURST_NS) {
                 limit.window = Some(now);
                 limit.count = 0;
@@ -192,18 +195,18 @@ impl Model {
                         [index as u64, limit.suppressed, 0],
                     );
                     std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(false, report);
-                    self.reported += limit.suppressed;
+                    self.here_mut().reported += limit.suppressed;
                     limit.suppressed = 0;
                 }
             }
             if limit.count >= TRACE_BURST {
                 limit.suppressed += 1;
                 std::sync::Arc::make_mut(&mut self.table.crash).areas[me].suppressed += 1;
-                self.limits[index] = limit;
+                self.here_mut().limits[index] = limit;
                 return;
             }
             limit.count += 1;
-            self.limits[index] = limit;
+            self.here_mut().limits[index] = limit;
         }
         let entry = self.entry(code, 0, stamp, payload);
         std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(false, entry);
@@ -236,7 +239,8 @@ impl Model {
         }
     }
 
-    /// A failure the node found in itself: its record, an entry of code 6.
+    /// A failure the node found in itself: the record of the core that
+    /// found it, an entry of code 6.
     pub(crate) fn fail(&mut self, reason: u32) {
         let member = self.table.member(self.node);
         let record = Record {
@@ -246,21 +250,40 @@ impl Model {
             instant: self.now,
             member: member.raw(),
         };
-        std::sync::Arc::make_mut(&mut self.table.crash).write_record(self.node, record);
+        let core = self.here().number as usize;
+        std::sync::Arc::make_mut(&mut self.table.crash).write_record(core, record);
         self.trace(TraceCode::Failure, None, [u64::from(reason), 0, 0]);
     }
 
-    /// A failure found by the node, as an event of the node.
-    pub(crate) fn failed(&mut self, reason: u32) {
-        *self.last_event = None;
-        let entry = self.begin();
-        self.fail(reason);
-        self.end(entry);
+    /// Each core that starts in the node keeps its debug area if the
+    /// header's magic and version are right, with the node slot and the
+    /// generation, and goes on from the next sequences found there;
+    /// otherwise it clears the area and starts at 1.
+    pub(crate) fn enter_debug_areas(&mut self) {
+        let generation = self.table.generation(self.node);
+        for core in self
+            .cores
+            .iter()
+            .map(|c| c.number as usize)
+            .collect::<Vec<_>>()
+        {
+            let area = &mut std::sync::Arc::make_mut(&mut self.table.crash).areas[core];
+            if area.magic != DEBUG_AREA_MAGIC || area.version != DEBUG_AREA_VERSION {
+                *area = DebugArea::new(generation);
+            }
+            (area.generation, area.slot) = (generation, self.node);
+        }
     }
 
-    /// A trace ring of this node, oldest entry first, as a reader keeps it.
+    /// A trace ring of the node's first core, oldest entry first, as a
+    /// reader keeps it.
     pub fn ring(&self, user: bool) -> Vec<TraceEntry> {
-        let area = &self.table.crash.areas[self.node as usize];
+        self.trace_ring(self.cores[0].number as usize, user)
+    }
+
+    /// A trace ring of a physical core, by core number.
+    pub fn trace_ring(&self, core: usize, user: bool) -> Vec<TraceEntry> {
+        let area = &self.table.crash.areas[core];
         let (ring, next, entries) = match user {
             true => (&area.user, area.next_user, TRACE_USER_ENTRIES),
             false => (&area.kernel, area.next_kernel, TRACE_KERNEL_ENTRIES),
@@ -274,19 +297,20 @@ impl Model {
     /// The kernel entries suppressed by the rate limit since machine
     /// start, as the header counts them.
     pub fn suppressed(&self) -> u64 {
-        self.table.crash.areas[self.node as usize].suppressed
+        self.table.crash.areas[self.cores[0].number as usize].suppressed
     }
 
-    /// The generation in the header of a node's debug area.
-    pub fn area_generation(&self, node: u16) -> u32 {
-        self.table.crash.areas[node as usize].generation
+    /// The generation and node slot in the header of a core's debug area.
+    pub fn area_generation(&self, core: usize) -> (u32, u16) {
+        let area = &self.table.crash.areas[core];
+        (area.generation, area.slot)
     }
 
-    /// The record of a node a reader accepts: (generation, reason).
-    pub fn crash_record(&self, node: u16) -> Option<(u32, u32)> {
+    /// The record of a core a reader accepts: (generation, reason).
+    pub fn crash_record(&self, core: usize) -> Option<(u32, u32)> {
         self.table
             .crash
-            .accepted(node)
+            .accepted(core)
             .map(|r| (r.generation, r.reason))
     }
 
@@ -313,7 +337,7 @@ impl Model {
         let entries = length.div_ceil(TRACE_TEXT_BYTES) as usize;
         bytes.resize(entries * TRACE_TEXT_BYTES as usize, 0);
         let stamp = self.stamp(Some(thread));
-        let me = self.node as usize;
+        let me = self.here().number as usize;
         let first = std::sync::Arc::make_mut(&mut self.table.crash).areas[me].next_user;
         for (i, chunk) in bytes.chunks(TRACE_TEXT_BYTES as usize).enumerate() {
             let word =
@@ -344,7 +368,7 @@ impl Model {
     ) -> Outcome {
         self.object(thread, debug, ObjectKind::Debug, Rights::WRITE)?;
         let stamp = self.stamp(Some(thread));
-        let me = self.node as usize;
+        let me = self.here().number as usize;
         let first = std::sync::Arc::make_mut(&mut self.table.crash).areas[me].next_user;
         let entry = self.entry(TraceCode::UserEmit, 0, stamp, payload);
         std::sync::Arc::make_mut(&mut self.table.crash).areas[me].write(true, entry);
@@ -470,7 +494,7 @@ impl Model {
         if words > REG_WORDS && self.threads[&thread].page.is_none() {
             return Err(Error::Invalid);
         }
-        let generator = &mut self.entropy.0;
+        let generator = &mut self.here_mut().entropy.0;
         for word in mix {
             *generator ^= word;
             *generator = generator
@@ -508,7 +532,9 @@ mod tests {
     fn failures_are_never_held_back_by_the_rate_limit() {
         let (mut m, _) = Model::boot(&Machine::example()).unwrap();
         for _ in 0..20 {
-            m.failed(1);
+            let entry = m.begin_on(0);
+            m.fail(1);
+            m.end(entry);
             assert_eq!(m.check(), Ok(()));
         }
         let failures = m.ring(false).iter().filter(|e| e.code() == 6).count();
@@ -552,7 +578,7 @@ mod tests {
         use crate::boot::Arch;
         use dodos_abi::{Error, ObjectKind, Rights, START_SLOT_ASPACE, START_SLOT_SCHED};
         let mut machine = Machine::example();
-        machine.arch = Arch::Other;
+        machine.arch = Arch::Aarch64;
         let (mut m, boot) = Model::boot(&machine).unwrap();
         let own = crate::SlotAddr::own;
         let make = |kind, size, slot| crate::Syscall::UntypedRetype {
@@ -577,7 +603,8 @@ mod tests {
             // The start-up context fills the node's sum: lowered first.
             crate::Syscall::SchedConfigure {
                 sched: own(START_SLOT_SCHED),
-                core: own(16),
+                node: own(16),
+                core: 0,
                 budget: 5_000_000,
                 period: 10_000_000,
                 class: 1,
@@ -591,7 +618,8 @@ mod tests {
             },
             crate::Syscall::SchedConfigure {
                 sched: own(102),
-                core: own(16),
+                node: own(16),
+                core: 0,
                 budget: 1_000_000,
                 period: 10_000_000,
                 class: 1,

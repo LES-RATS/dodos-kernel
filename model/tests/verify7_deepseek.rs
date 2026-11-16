@@ -175,6 +175,14 @@ impl TwoNodeHarness {
         for _ in 0..40_000 {
             match self.call(node, call.clone()) {
                 Ok(Output::Done) => return,
+                // A call that waits for a unit (node 1 holds the unit role of
+                // the machine) ends at the unit's confirmation.
+                Ok(Output::Waits) => {
+                    self.settle();
+                    let woken = self.sys.node(node).woken(self.t[node as usize]);
+                    assert_eq!(woken, Some(&Ok(Output::Done)));
+                    return;
+                }
                 Err(Error::Again) => {}
                 other => panic!("node {node} expected Done/Again, got {other:?}"),
             }
@@ -189,14 +197,8 @@ impl TwoNodeHarness {
 
     #[track_caller]
     fn settle(&mut self) {
-        for _ in 0..64 {
-            if self.sys.pending().is_empty() {
-                return;
-            }
-            self.sys.deliver(0);
-            assert_eq!(self.sys.check(), Ok(()));
-        }
-        panic!("messages did not settle");
+        self.sys.settle(100_000);
+        assert_eq!(self.sys.check(), Ok(()));
     }
 }
 

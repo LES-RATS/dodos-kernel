@@ -1,10 +1,9 @@
 //! IPC, transfer of capabilities and notifications.
 
 use crate::caps::Placing;
-use crate::remote::Request;
 use crate::{
     CapId, Delivery, Message, Model, ObjId, Outcome, Output, Parcel, Place, Range, ReplyState,
-    Slot, Transfer, Wait, Window, live,
+    Slot, Transfer, Wait, Window, locked,
 };
 use dodos_abi::{
     Error, Header, Marks, ObjectKind, REG_WORDS, Received, Rights, SlotAddr, TREE_DEPTH,
@@ -88,7 +87,7 @@ fn notification(word: u64) -> Delivery {
 
 /// What the kernel sets on a received message: the stamp comes from the
 /// delivery; a notification carries marks 0 and task 0.
-fn received(header: Header, badge: u64) -> Received {
+pub(crate) fn received(header: Header, badge: u64) -> Received {
     Received {
         header,
         badge,
@@ -155,8 +154,10 @@ impl Model {
             }
             // IPC: the caller joins the queue of the endpoint.
             None => {
-                live(&mut self.endpoints, endpoint).queue.push_back(thread);
-                live(&mut self.threads, thread).wait = Wait::Call {
+                locked(&mut self.endpoints, &self.locks, endpoint)
+                    .queue
+                    .push_back(thread);
+                locked(&mut self.threads, &self.locks, thread).wait = Wait::Call {
                     endpoint,
                     parcel,
                     window,
@@ -263,7 +264,7 @@ impl Model {
         let held = self.held(thread, notify, ObjectKind::Notify, Rights::SEND)?;
         let (id, badge) = (held.object, held.badge);
         // Notifications: the bits of the badge, or bit 0 without a badge.
-        live(&mut self.notifies, id).word |= if badge == 0 { 1 } else { badge };
+        locked(&mut self.notifies, &self.locks, id).word |= if badge == 0 { 1 } else { badge };
         self.hand_over(id);
         Ok(Output::Done)
     }
@@ -290,22 +291,24 @@ impl Model {
         } else {
             return;
         }
-        live(&mut self.notifies, id).word = 0;
+        locked(&mut self.notifies, &self.locks, id).word = 0;
     }
 
     /// `wait` and `poll`.
     pub(crate) fn wait(&mut self, thread: ObjId, notify: SlotAddr, if_zero: IfZero) -> Outcome {
         let id = self.object(thread, notify, ObjectKind::Notify, Rights::RECV)?;
         // Notifications: returns the word and clears it.
-        let word = std::mem::take(&mut live(&mut self.notifies, id).word);
+        let word = std::mem::take(&mut locked(&mut self.notifies, &self.locks, id).word);
         if word != 0 {
             return Ok(Output::Word(word));
         }
         if let IfZero::WouldWait = if_zero {
             return Err(Error::WouldWait);
         }
-        live(&mut self.notifies, id).waiters.push_back(thread);
-        live(&mut self.threads, thread).wait = Wait::Notify(id);
+        locked(&mut self.notifies, &self.locks, id)
+            .waiters
+            .push_back(thread);
+        locked(&mut self.threads, &self.locks, thread).wait = Wait::Notify(id);
         self.observe();
         Ok(Output::Waits)
     }
@@ -327,7 +330,7 @@ impl Model {
             // if there is none.
             None => {
                 if let Some(bound) = bound {
-                    live(&mut self.endpoints, bound).notify = None;
+                    locked(&mut self.endpoints, &self.locks, bound).notify = None;
                 }
             }
             // Notifications: one notify per endpoint, one endpoint per
@@ -337,36 +340,14 @@ impl Model {
                 if bound.is_some() || self.endpoints[&endpoint].notify.is_some() {
                     return Err(Error::Busy);
                 }
-                live(&mut self.endpoints, endpoint).notify = Some(notify);
+                locked(&mut self.endpoints, &self.locks, endpoint).notify = Some(notify);
             }
         }
-        live(&mut self.notifies, notify).endpoint = endpoint;
+        locked(&mut self.notifies, &self.locks, notify).endpoint = endpoint;
         // Notifications: a pending word is delivered at once to a thread
         // that already waits to receive.
         self.hand_over(notify);
         Ok(Output::Done)
-    }
-
-    /// The list of a message as the node of its sender judges it: each
-    /// capability, and the rights of a derivation (`None` for a move).
-    pub(crate) fn listed_for(
-        &self,
-        sender: ObjId,
-        transfers: &[Transfer],
-    ) -> Result<Vec<(CapId, Option<Rights>)>, Error> {
-        let listed = self.listed(sender, transfers)?;
-        Ok(listed
-            .into_iter()
-            .map(|listed| match listed {
-                Listed::Move(cap) => (cap, None),
-                Listed::Derive(cap, rights) => (cap, Some(rights)),
-            })
-            .collect())
-    }
-
-    /// The receive range of a call, judged on the caller's node.
-    pub(crate) fn window_of(&self, thread: ObjId, range: Range) -> Result<Window, Error> {
-        self.window(thread, range)
     }
 
     /// Transfer of capabilities: the checks of the list of a message, made
@@ -421,7 +402,7 @@ impl Model {
         self.release_for_receive(thread, reply);
         let own = self.threads[&thread].home.is_some();
         if let Some(notify) = self.endpoints[&endpoint].notify.filter(|_| own) {
-            let word = std::mem::take(&mut live(&mut self.notifies, notify).word);
+            let word = std::mem::take(&mut locked(&mut self.notifies, &self.locks, notify).word);
             if word != 0 {
                 return Ok(Output::Message(notification(word)));
             }
@@ -438,24 +419,20 @@ impl Model {
         {
             let words: [u64; 5] = parcel.words[..].try_into().expect("five words");
             self.unlink(first);
-            let first_thread = live(&mut self.threads, first);
+            let first_thread = locked(&mut self.threads, &self.locks, first);
             (first_thread.faulting, first_thread.raised) = (false, None);
             self.record(first, dodos_abi::FaultKind::NoContext as u32, words);
             return Err(Error::Again);
         }
         if let Some((caller, parcel, theirs)) = self.take_caller(endpoint) {
             let delivery = self.serve(caller, parcel, theirs, (thread, reply, window));
-            // A delivery whose capabilities another node grants waits for
-            // that node.
-            if let Some(id) = self.transfer.take() {
-                self.transfer_wait(id, thread, delivery);
-                return Ok(Output::Waits);
-            }
             return Ok(Output::Message(delivery));
         }
-        live(&mut self.endpoints, endpoint).queue.push_back(thread);
-        *live(&mut self.replies, reply) = ReplyState::Attached(thread);
-        live(&mut self.threads, thread).wait = Wait::Recv {
+        locked(&mut self.endpoints, &self.locks, endpoint)
+            .queue
+            .push_back(thread);
+        *locked(&mut self.replies, &self.locks, reply) = ReplyState::Attached(thread);
+        locked(&mut self.threads, &self.locks, thread).wait = Wait::Recv {
             endpoint,
             reply,
             window,
@@ -483,18 +460,15 @@ impl Model {
         // Transfer of capabilities: the reply will tell the caller if its
         // capabilities were dropped.
         let (delivery, flags) = self.deliver(parcel, server, into, 0);
-        *live(&mut self.replies, reply) = ReplyState::Armed {
+        *locked(&mut self.replies, &self.locks, reply) = ReplyState::Armed {
             caller,
             window,
             flags,
         };
-        if let Some(id) = self.transfer {
-            self.transfer_reply(id, reply);
-        }
         // The budget follows the call: the delivery lends the caller's
         // context to a receiver that has none of its own (D-110).
         self.lend(caller, reply, server);
-        live(&mut self.threads, caller).wait = Wait::Reply(reply);
+        locked(&mut self.threads, &self.locks, caller).wait = Wait::Reply(reply);
         self.observe();
         delivery
     }
@@ -520,7 +494,7 @@ impl Model {
     }
 
     /// Bindings: whether a thread has a message page.
-    fn has_page(&self, thread: ObjId) -> bool {
+    pub(crate) fn has_page(&self, thread: ObjId) -> bool {
         self.threads[&thread].page.is_some()
     }
 
@@ -607,24 +581,18 @@ impl Model {
         // a sender that transferred a capability takes the receiver's marks
         // as they were, unless it is attached to one.
         let sender = parcel.sender;
-        // A proxy stands for a thread of another node: the stamp is that
-        // thread's, taken when the request left its node.
-        let (task, marks) = match self.threads[&sender].stamp {
-            Some(stamp) => stamp,
-            None => (
-                self.threads[&sender]
-                    .task
-                    .map_or(0, |task| self.tasks[&task].id.raw()),
-                self.marks(sender).expect("a live sender").bits(),
-            ),
-        };
+        let (task, marks) = (
+            self.threads[&sender]
+                .task
+                .map_or(0, |task| self.tasks[&task].id.raw()),
+            self.marks(sender).expect("a live sender").bits(),
+        );
         let stamp = marks | parcel.marks;
         let before = self.marks(receiver).expect("a live receiver").bits();
         if !self.aware(receiver) {
             self.mark(receiver, stamp);
         }
-        let proxy = self.threads[&sender].stamp.is_some();
-        if caps > 0 && !proxy && !self.aware(sender) {
+        if caps > 0 && !self.aware(sender) {
             self.mark(sender, before);
         }
         let mut received = received(
@@ -636,13 +604,6 @@ impl Model {
             received,
             words: parcel.words,
         };
-        // Grants: the capabilities of a proxy's message are those of the
-        // thread it stands for; the receiver waits while that node grants
-        // them.
-        if self.threads[&sender].foreign.is_some() {
-            let id = self.defer_transfer(receiver, sender, delivery.clone(), window);
-            (self.transfer, self.last_transfer) = (Some(id), Some(id));
-        }
         (delivery, dropped)
     }
 
@@ -675,47 +636,38 @@ impl Model {
     /// kernel this is one step. The scan of the queue here is a property of
     /// the model, whose queues are vectors.
     pub(crate) fn unlink(&mut self, thread: ObjId) {
-        let wait = std::mem::take(&mut live(&mut self.threads, thread).wait);
+        let wait = std::mem::take(&mut locked(&mut self.threads, &self.locks, thread).wait);
         let other = |&queued: &ObjId| queued != thread;
         match wait {
             Wait::None => {}
-            Wait::Call { endpoint, .. } => live(&mut self.endpoints, endpoint).queue.retain(other),
-            Wait::Reply(reply) => *live(&mut self.replies, reply) = ReplyState::Idle,
+            Wait::Call { endpoint, .. } => locked(&mut self.endpoints, &self.locks, endpoint)
+                .queue
+                .retain(other),
+            Wait::Reply(reply) => *locked(&mut self.replies, &self.locks, reply) = ReplyState::Idle,
             Wait::Recv {
                 endpoint, reply, ..
             } => {
-                live(&mut self.endpoints, endpoint).queue.retain(other);
-                *live(&mut self.replies, reply) = ReplyState::Idle;
+                locked(&mut self.endpoints, &self.locks, endpoint)
+                    .queue
+                    .retain(other);
+                *locked(&mut self.replies, &self.locks, reply) = ReplyState::Idle;
             }
-            Wait::Notify(notify) => live(&mut self.notifies, notify).waiters.retain(other),
-            // A wait for another node: the request is forgotten, and a wait
-            // that a proxy holds there is ended there.
-            Wait::Node(id) => match self.requests.get_mut(&id) {
-                // A move goes on without the thread that left: its answer
-                // still ends the other's wait.
-                Some(Request::Move { caller, .. }) => {
-                    if *caller == Some(thread) {
-                        *caller = None;
-                    }
+            Wait::Notify(notify) => locked(&mut self.notifies, &self.locks, notify)
+                .waiters
+                .retain(other),
+            // The three waits that hold no queue (IPC): the answer, the
+            // unit's confirmation or the completion of the request, when it
+            // comes, finds no thread to wake; its effect on grants, records,
+            // counts and credits is applied as if the thread still waited
+            // (D-131).
+            Wait::Node { peer, credit } => self.forget_sender(thread, peer, credit),
+            Wait::Unit(entry) => self.forget_unit_waiter(thread, entry),
+            Wait::Cores(_) => self.forget_waiter(thread),
+            Wait::Hand(role) => {
+                if let Some(hand) = self.handing.get_mut(&role) {
+                    hand.caller = None;
                 }
-                // Grants that arrive for a destroyed receiver are refused,
-                // and a revocation step completes without its thread; so
-                // does a request to the holder of a unit role, which holds
-                // no wait there: an attach or a detach is done on the unit
-                // whatever became of the thread (Calls on an object of
-                // another node).
-                Some(Request::Transfer { receiver, .. }) => *receiver = None,
-                Some(Request::Revoke {
-                    thread: waiting, ..
-                })
-                | Some(Request::Unit {
-                    thread: waiting, ..
-                }) => *waiting = None,
-                _ => {
-                    self.cancel_remote(id);
-                    self.requests.remove(&id);
-                }
-            },
+            }
         }
         self.observe();
     }

@@ -5,19 +5,19 @@
 use crate::caps::Clearing;
 use crate::memory::hooked;
 use crate::table::{RoleRecord, Table};
-use crate::{CapId, Frame, Iommu, Mapping, Model, ObjId, Place, live};
+use crate::{CapId, Frame, Iommu, Mapping, Model, ObjId, Place, live, locked};
 use dodos_abi::x86_64::{REG_RDI, REG_RIP};
 use dodos_abi::{
-    BootFloors, BootMembership, CSPACE_SEGMENT_SLOTS, DEBUG_AREA_BYTES, DEVICE_TABLE_SPARE,
-    DRIVER_NONE, DeviceEntry, Evidence, Geometry, Governs, Kind, Member, MemberState, MemoryType,
-    NODES_MAX, ObjectKind, Owner, Ownership, PageSize, RESERVES_MAX, RESERVES_MIN, ROLES_PLAIN_MAX,
-    Rights, RoleKind, RoleWord, STALE_RANGE_NS, START_FREE_SLOTS, START_PAGE_MAX_PAGES,
-    START_SCHED_BUDGET_NS, START_SCHED_PERIOD_NS, START_SLOT_ASPACE, START_SLOT_CSPACE,
-    START_SLOT_DEBUG, START_SLOT_FIRST, START_SLOT_IOPORTS, START_SLOT_IRQ_CONTROL,
-    START_SLOT_MACHINE_FIXED, START_SLOT_MACHINE_LIVING, START_SLOT_MAILBOX,
-    START_SLOT_MEMORY_CONTROL, START_SLOT_MESSAGE_PAGE, START_SLOT_MESSAGE_PAGE_MAP,
-    START_SLOT_SCHED, START_SLOT_START_PAGE, START_SLOT_TASK, START_SLOT_THREAD, SWEEP_RANGE_NS,
-    TaskId, floors, module_frames,
+    BootFloors, BootMembership, CORE_ANSWER_RANGE_NS, CORES_PER_KERNEL_MAX, CSPACE_SEGMENT_SLOTS,
+    CoreWord, DEBUG_AREA_BYTES, DEVICE_TABLE_SPARE, DRIVER_NONE, DeviceEntry, Evidence, Geometry,
+    Governs, Kind, Member, MemberState, MemoryType, NODES_MAX, ObjectKind, Owner, Ownership,
+    PageSize, RESERVES_MAX, RESERVES_MIN, ROLES_PLAIN_MAX, Rights, RoleKind, RoleWord,
+    SEAL_RANGE_NS, STALE_RANGE_NS, START_FREE_SLOTS, START_PAGE_MAX_PAGES, START_SCHED_BUDGET_NS,
+    START_SCHED_PERIOD_NS, START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_DEBUG,
+    START_SLOT_FIRST, START_SLOT_IOPORTS, START_SLOT_IRQ_CONTROL, START_SLOT_MACHINE_FIXED,
+    START_SLOT_MACHINE_LIVING, START_SLOT_MAILBOX, START_SLOT_MEMORY_CONTROL,
+    START_SLOT_MESSAGE_PAGE, START_SLOT_MESSAGE_PAGE_MAP, START_SLOT_SCHED, START_SLOT_START_PAGE,
+    START_SLOT_TASK, START_SLOT_THREAD, SWEEP_RANGE_NS, TaskId, floors, module_frames,
 };
 use std::collections::BTreeSet;
 
@@ -88,13 +88,16 @@ pub struct File {
     pub name: u32,
 }
 
-/// The architecture: only x86-64 has I/O ports.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// The architecture: only x86-64 has I/O ports; ARM64 invalidates
+/// translations on the cores of a node by a broadcast in the call, x86-64
+/// and RISC-V by the request of the calling core (TLB); each confirms a
+/// park its own way (Node slots and core words).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Arch {
     #[default]
     X86_64,
-    /// ARM64 or RISC-V, as far as this model can tell them apart.
-    Other,
+    Aarch64,
+    Riscv64,
 }
 
 /// What the start-up state is determined by: the machine, the boot image,
@@ -174,6 +177,18 @@ pub struct Machine {
     pub membership: BootMembership,
     /// Whether the boot image declares a console (a unit role).
     pub console: bool,
+    /// `BootNodes`: the number of node slots and the nodes the machine
+    /// start-up starts, each as the window and mask of its cores; `None`
+    /// for the default, one node per usable core.
+    pub boot_nodes: Option<(u16, Vec<(u64, u64)>)>,
+    /// The cores per node the kernel image supports (entry `Node`).
+    pub cores_supported: u32,
+    /// The longest hold of a node's lock measured for the image, *H*: the
+    /// machine start-up refuses a `CORE_ANSWER_NS` not above (N − 1) × H
+    /// for the largest N the image supports (D-131).
+    pub hold_ns: u64,
+    /// The lock discipline of a node of several cores.
+    pub locking: crate::Locking,
     /// The image declares the hardening monitor: every core is of fence
     /// class 2.
     pub monitor: bool,
@@ -340,9 +355,15 @@ impl Machine {
                 stale_ms: 100,
                 stuck_ms: 100,
                 sweep_ms: 1000,
-                reserved: [0; 3],
+                seal_ms: 1000,
+                core_answer_ms: 10,
+                reserved: 0,
             },
             console: false,
+            boot_nodes: None,
+            cores_supported: CORES_PER_KERNEL_MAX as u32,
+            hold_ns: 10_000,
+            locking: crate::Locking::L1,
             monitor: false,
             accept_unfenced: false,
             processor_entropy: true,
@@ -351,31 +372,71 @@ impl Machine {
         }
     }
 
-    /// The nodes: one per usable core; but a machine with a core of fence
-    /// class 0, which no other core can stop, runs one node unless the image
-    /// declares the hardening monitor or accepts an unfenced core (The
-    /// fence: D-116, D-117).
-    pub fn nodes(&self) -> usize {
+    /// A machine with a core of fence class 0, which no other core can
+    /// stop, runs one node unless the image declares the hardening monitor
+    /// or accepts an unfenced core (The fence: D-116, D-117).
+    fn single(&self) -> bool {
         let unstoppable = self.cores.iter().any(|core| core.fence == 0);
-        match unstoppable && !self.monitor && !self.accept_unfenced {
-            true => 1,
-            false => self.cores.len(),
+        unstoppable && !self.monitor && !self.accept_unfenced
+    }
+
+    /// The node slots: `BootNodes`'s number, by default one per usable
+    /// core; one on a machine that runs one node.
+    pub fn nodes(&self) -> usize {
+        match (&self.boot_nodes, self.single()) {
+            (_, true) => 1,
+            (Some((slots, _)), false) => usize::from(*slots),
+            (None, false) => self.cores.len(),
         }
     }
 
-    /// Unlike cores: the own kind of a node, the kind of its core in the
-    /// core list.
-    pub fn own_kind(&self, node: u16) -> dodos_abi::Kind {
-        self.kinds[usize::from(self.core_list()[usize::from(node)].kind)]
+    /// The nodes the machine start-up starts, each as the core numbers of
+    /// its cores in position order: `BootNodes`'s layout, by default one
+    /// node per usable core. A machine that runs one node runs it on every
+    /// usable core if the image supports that many, otherwise on the core
+    /// firmware booted.
+    pub fn initial_nodes(&self) -> Vec<Vec<usize>> {
+        let count = self.cores.len();
+        if self.single() {
+            if count <= self.cores_supported as usize {
+                return vec![(0..count).collect()];
+            }
+            let booted = self.core_list().iter().position(|c| c.booted).unwrap_or(0);
+            return vec![vec![booted]];
+        }
+        match &self.boot_nodes {
+            Some((_, nodes)) => nodes
+                .iter()
+                .map(|&(window, mask)| {
+                    (0..64)
+                        .filter(|i| mask >> i & 1 == 1)
+                        .map(|i| (64 * window + i) as usize)
+                        .collect()
+                })
+                .collect(),
+            None => (0..count).map(|core| vec![core]).collect(),
+        }
     }
 
-    /// The features the architecture lists (ARM64's for the other
-    /// architectures, which this model does not tell apart).
+    /// Unlike cores: the kind of a core, by core number.
+    pub fn kind_of(&self, core: usize) -> dodos_abi::Kind {
+        self.kinds[usize::from(self.core_list()[core].kind)]
+    }
+
+    /// The features the architecture lists.
     pub fn features(&self) -> dodos_abi::FeatureList {
         match self.arch {
             Arch::X86_64 => dodos_abi::x86_64::FEATURES,
-            Arch::Other => dodos_abi::aarch64::FEATURES,
+            Arch::Aarch64 => dodos_abi::aarch64::FEATURES,
+            Arch::Riscv64 => dodos_abi::riscv64::FEATURES,
         }
+    }
+
+    /// The state features and vector length of a core's kind: what the
+    /// cores of one node must share (Unlike cores, D-129).
+    pub fn state_kind(&self, core: usize) -> (u32, u32) {
+        let kind = self.kind_of(core);
+        (kind.features as u32, kind.vector_bytes)
     }
 
     /// The cores by core number: sorted by hardware identifier.
@@ -405,6 +466,11 @@ pub enum Refusal {
     /// *E* would be more than 4,096, or the values of the machine are out
     /// of range, or there are more usable cores than `NODES_MAX`.
     MachineValues,
+    /// The number of node slots is more than `NODES_MAX` or than the number
+    /// of usable cores, or `BootNodes` names a core twice, a core that does
+    /// not exist, more cores in one node than the image supports, or two
+    /// cores of different state features or vector lengths in one node.
+    Nodes,
     /// The loader hands no entropy seed and the kernel can read no
     /// processor source (Entropy).
     NoEntropy,
@@ -472,11 +538,13 @@ pub(crate) struct Layout {
     none: Vec<u64>,
     devices: Vec<DeviceEntry>,
     roles: Vec<RoleRecord>,
+    /// The nodes of the initial layout, each as its core numbers.
+    pub(crate) nodes: Vec<Vec<usize>>,
 }
 
 /// The start-up page: a header, a table of entries, then their contents,
 /// each on an 8-byte boundary. Its bytes, from the counts it lists.
-fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64) -> u64 {
+fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u64) -> u64 {
     let modules = (machine.segments.len() + machine.files.len()) as u64;
     let names: u64 = machine
         .segments
@@ -498,12 +566,12 @@ fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64) -> u64 {
         40,
         40,
         40 * modules + names,
-        16,
+        24 + 4 * cores,
         24 * floors,
         16 + 8 * machine.ioapics.len() as u64,
         16 * kept,
         56,
-        64,
+        80,
         8 * layout.roles.len() as u64,
         24 * reserves,
         48,
@@ -546,8 +614,26 @@ impl Machine {
     pub(crate) fn layout(&self) -> Result<Layout, Refusal> {
         let geometry = self.geometry;
         let n = self.nodes() as u64;
-        if !geometry.valid() || n == 0 || n as usize > NODES_MAX {
+        if !geometry.valid() || self.cores.is_empty() || self.cores.len() > NODES_MAX {
             return Err(Refusal::MachineValues);
+        }
+        // BootNodes: at most NODES_MAX slots and one per usable core; each
+        // core in at most one node; a node no larger than the image
+        // supports, its cores of one set of state features and lengths.
+        let nodes = self.initial_nodes();
+        let mut named = BTreeSet::new();
+        let fits = nodes.iter().all(|cores| {
+            let alike = cores
+                .iter()
+                .all(|&c| c < self.cores.len() && self.state_kind(c) == self.state_kind(cores[0]));
+            !cores.is_empty()
+                && cores.len() <= self.cores_supported as usize
+                && alike
+                && cores.iter().all(|&c| named.insert(c))
+        });
+        let slots_ok = n >= 1 && n as usize <= NODES_MAX && n as usize <= self.cores.len();
+        if !slots_ok || nodes.len() > n as usize || !fits {
+            return Err(Refusal::Nodes);
         }
         if self.boot_seed == 0 && !self.processor_entropy {
             return Err(Refusal::NoEntropy);
@@ -594,7 +680,9 @@ impl Machine {
             at += len.next_multiple_of(page);
         }
         let image = (self.image_base, at);
-        let crash_len = (4096 + n * DEBUG_AREA_BYTES as u64).next_multiple_of(chunk);
+        // A debug area per physical core (D-129).
+        let cores = self.cores.len() as u64;
+        let crash_len = (4096 + cores * DEBUG_AREA_BYTES as u64).next_multiple_of(chunk);
         // Ordinary memory: usable RAM without what is kept, shrunk inwards
         // to pages, then cut into chunks; the parts of a range smaller than
         // a chunk are left out.
@@ -622,9 +710,17 @@ impl Machine {
         };
         let in_range =
             |ms: u32, (low, high): (u64, u64)| (low..=high).contains(&(u64::from(ms) * 1_000_000));
+        // CORE_ANSWER_NS must stay above (N − 1) × H for the largest N the
+        // image supports (D-131).
+        let answer = u64::from(self.membership.core_answer_ms) * 1_000_000;
+        let largest = u64::from(self.cores_supported.min(self.cores.len() as u32));
+        let held = largest.saturating_sub(1).saturating_mul(self.hold_ns);
         let timed = in_range(self.membership.stale_ms, STALE_RANGE_NS)
             && in_range(self.membership.stuck_ms, STALE_RANGE_NS)
-            && in_range(self.membership.sweep_ms, SWEEP_RANGE_NS);
+            && in_range(self.membership.sweep_ms, SWEEP_RANGE_NS)
+            && in_range(self.membership.seal_ms, SEAL_RANGE_NS)
+            && in_range(self.membership.core_answer_ms, CORE_ANSWER_RANGE_NS)
+            && answer > held;
         let ordinary_bytes: u64 = ordinary.iter().map(|(s, e)| e - s).sum();
         let sizes = floors(ordinary_bytes, n, self.floors, chunk)
             .filter(|sizes| sizes.total <= chunks.len() as u64 * chunk);
@@ -720,15 +816,19 @@ impl Machine {
             none,
             devices,
             roles,
+            nodes,
         })
     }
 
-    /// The machine table, as the machine start-up writes it: every member
-    /// word live with generation 1 once the node start-ups are done, unit
-    /// role j held by node j mod n among the nodes whose cores have the
-    /// best fence class, the reserve and plain roles vacant.
+    /// The machine table, as the machine start-up writes it: every node of
+    /// the initial layout live with generation 1 and its class once the
+    /// node start-ups are done, its cores owned; the other node slots dead
+    /// and never started (generation 0), the other cores free; unit role j
+    /// held by node j mod m among the m nodes of the layout whose fence
+    /// class is the best; the reserve and plain roles vacant.
     pub(crate) fn table(&self, layout: &Layout) -> Table {
         let n = self.nodes();
+        let cores = self.cores.len();
         // Under the hardening monitor every core is of class 2.
         let fence: Vec<u8> = self
             .core_list()
@@ -736,9 +836,11 @@ impl Machine {
             .map(|core| if self.monitor { 2 } else { core.fence })
             .collect();
         let booted: Vec<bool> = self.core_list().iter().map(|core| core.booted).collect();
-        let best = fence.iter().copied().max().unwrap_or(0);
-        let best_nodes: Vec<u16> = (0..n as u16)
-            .filter(|&i| fence[i as usize] == best)
+        let class = |node: &Vec<usize>| node.iter().map(|&c| fence[c]).min().unwrap_or(0);
+        let classes: Vec<u8> = layout.nodes.iter().map(class).collect();
+        let best = classes.iter().copied().max().unwrap_or(0);
+        let best_nodes: Vec<u16> = (0..layout.nodes.len() as u16)
+            .filter(|&i| classes[i as usize] == best)
             .collect();
         let mut units = 0;
         let roles: Vec<RoleWord> = layout
@@ -753,7 +855,32 @@ impl Machine {
                 _ => RoleWord::vacant(0),
             })
             .collect();
-        let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);
+        let mut members = vec![Member::never(); n];
+        let mut core_words = vec![CoreWord::free(false).raw(); cores];
+        for (node, cores_of) in layout.nodes.iter().enumerate() {
+            let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);
+            members[node] = live.with_class(classes[node]);
+            for &core in cores_of {
+                core_words[core] = CoreWord::owned(node as u16, 1).raw();
+            }
+        }
+        let ring = || crate::table::RingPair {
+            kernel: crate::table::Ring::new(dodos_abi::RING_KERNEL_ENTRIES),
+            user: crate::table::Ring::new(dodos_abi::RING_USER_ENTRIES),
+        };
+        let mut core_beacons = vec![
+            crate::table::CoreBeacon {
+                idle_until: crate::Ephemeral(u64::MAX),
+                ran: (dodos_abi::CORE_NO_SLOT, 0),
+                ..Default::default()
+            };
+            cores
+        ];
+        for (node, cores_of) in layout.nodes.iter().enumerate() {
+            for &core in cores_of {
+                core_beacons[core].ran = (node as u16, 1);
+            }
+        }
         Table {
             geometry: self.geometry,
             nodes: n as u16,
@@ -764,56 +891,55 @@ impl Machine {
             none: std::sync::Arc::new(layout.none.iter().copied().collect()),
             fence,
             booted,
+            state_kinds: (0..cores).map(|c| self.state_kind(c)).collect(),
+            cores_supported: self.cores_supported,
             beacons: vec![
                 crate::table::NodeBeacon {
                     acked: vec![0; n],
                     maps_of: vec![false; n],
+                    consumed: vec![(0, 0); n],
                     ..Default::default()
                 };
                 n
             ],
-            core_beacons: (0..n)
-                .map(|core| crate::table::CoreBeacon {
-                    running: core as u16,
-                    idle_until: crate::Ephemeral(u64::MAX),
-                    ..Default::default()
-                })
-                .collect(),
-            placed: (0..n).collect(),
-            unusable: vec![false; n],
+            core_beacons,
+            core_words,
+            park_requests: vec![0; cores],
+            stopped: vec![u64::MAX; cores],
+            start_requests: vec![0; cores],
             fences: vec![Default::default(); n],
-            fence_epoch: 0,
-            rings: vec![vec![(0, 0); n]; n],
+            rings: std::sync::Arc::new((0..n).map(|_| (0..n).map(|_| ring()).collect()).collect()),
             replacement: self.replacement,
+            resume_replacement: vec![false; n],
             crash: std::sync::Arc::new(crate::debug::CrashArea::new(
                 self.boot_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
                 self.previous_crash.as_ref().map_or(0, |p| p.sequence),
-                n,
+                cores,
             )),
             previous: self.previous_crash.clone(),
             ports: Default::default(),
             stale_ns: u64::from(self.membership.stale_ms) * 1_000_000,
             stuck_ns: u64::from(self.membership.stuck_ms) * 1_000_000,
             sweep_ns: u64::from(self.membership.sweep_ms) * 1_000_000,
+            seal_ns: u64::from(self.membership.seal_ms) * 1_000_000,
+            core_answer_ns: u64::from(self.membership.core_answer_ms) * 1_000_000,
             units: layout
                 .roles
                 .iter()
                 .zip(&roles)
                 .enumerate()
                 .filter(|(_, (record, _))| {
-                    record.kind == RoleKind::Unit && record.governs == Governs::IommuUnit
+                    record.kind == RoleKind::Unit
+                        && matches!(record.governs, Governs::IommuUnit | Governs::IoApic)
                 })
                 .map(|(role, (_, word))| {
                     let unit = crate::table::UnitState {
-                        entries: Default::default(),
-                        mapped: Some(word.holder()),
+                        mapped: [word.holder()].into_iter().collect(),
+                        ..Default::default()
                     };
                     (role, unit)
                 })
                 .collect(),
-            reports: vec![Vec::new(); n],
-            admitted: vec![0; n],
-            off: vec![false; n],
             member_writes: Default::default(),
             role_writes: Default::default(),
             owners: std::sync::Arc::new(layout.owners.clone()),
@@ -822,7 +948,7 @@ impl Machine {
             devices: std::sync::Arc::new(layout.devices.clone()),
             device_leaves: std::sync::Arc::new(vec![0; layout.devices.len()]),
             identifiers: Default::default(),
-            members: vec![live; n],
+            members,
             roles: roles.clone(),
             grants: vec![Default::default(); n],
             uses: vec![Default::default(); n],
@@ -836,12 +962,13 @@ impl Machine {
 impl Model {
     /// The state of node 0 at start-up, and its first thread, which can
     /// run: built from the machine and the boot image by the rules of
-    /// Start-up state. The other nodes of the machine are phantoms: their
-    /// member words say live, and nothing else of them is modelled here.
+    /// Start-up state, on the cores the layout gives node 0. The other node
+    /// slots hold phantom nodes: their member words say live, and nothing
+    /// else of them is modelled here; they hold no core.
     ///
     /// Node 0 runs alone: it holds every unit role, as on a machine of one
-    /// core (model choice: a unit role held by a phantom would leave every
-    /// request to it unanswered).
+    /// node (Roles: a unit role held by a phantom would leave every request
+    /// to it unanswered).
     pub fn boot(machine: &Machine) -> Result<(Self, ObjId), Refusal> {
         let layout = machine.layout()?;
         let mut table = machine.table(&layout);
@@ -851,32 +978,54 @@ impl Model {
             }
         }
         for unit in table.units.values_mut() {
-            unit.mapped = Some(0);
+            unit.mapped = [0].into_iter().collect();
         }
-        Self::start(machine, &layout, table, 0)
+        let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);
+        let class = table.members[0].class();
+        for member in table.members.iter_mut().skip(1) {
+            *member = live.with_class(class);
+        }
+        for word in table.core_words.iter_mut() {
+            if CoreWord::from_raw(*word).is_some_and(|w| w.slot() != 0) {
+                *word = CoreWord::free(false).raw();
+            }
+        }
+        let cores = layout.nodes[0].clone();
+        Self::start(machine, &layout, table, 0, &cores)
     }
 
-    /// The node start-up of `node`, with the machine table it shares.
+    /// The node start-up of `node` on `cores` (core numbers, in position
+    /// order), with the machine table it shares.
     pub(crate) fn start(
         machine: &Machine,
         layout: &Layout,
         table: Table,
         node: u16,
+        cores: &[usize],
     ) -> Result<(Self, ObjId), Refusal> {
         let page = machine.geometry.page();
         let untypeds: Vec<(u64, u64)> = layout.floors[node as usize]
             .iter()
             .flat_map(|&range| blocks(range))
             .collect();
-        let start_bytes = start_page_bytes(machine, layout, untypeds.len() as u64);
+        let start_bytes =
+            start_page_bytes(machine, layout, untypeds.len() as u64, cores.len() as u64);
         let start_pages = start_bytes.div_ceil(page);
         if start_pages > START_PAGE_MAX_PAGES {
             return Err(Refusal::StartPage);
         }
+        let parts = cores
+            .iter()
+            .map(|&number| crate::cores::CorePart {
+                number: number as u32,
+                ..Default::default()
+            })
+            .collect();
         let mut model = Self {
             machine: machine.clone(),
             node,
             table,
+            cores: parts,
             ..Self::default()
         };
         let thread = model.build(layout, &untypeds, start_pages);
@@ -942,7 +1091,7 @@ impl Model {
         }
         // The start-up task: identifier 1 of this node, marks 0, mark-aware.
         let task = add(self, ObjectKind::Task, 0, START_SLOT_TASK, all);
-        let start = live(&mut self.tasks, task);
+        let start = locked(&mut self.tasks, &self.locks, task);
         (start.id, start.aware) = (TaskId::new(self.node, 1), true);
         self.task_counter = 1;
         // The memory_control has every right, `exec` included (rule 8).
@@ -968,10 +1117,10 @@ impl Model {
             index += 1;
             index - 1
         };
-        // One root `core` capability per node, in index order.
-        for node in 0..machine.nodes() {
-            let core = add(self, ObjectKind::Core, 0, next(), all);
-            self.cores.insert(core, node as u32);
+        // One root `node` capability per node slot, in index order.
+        for slot in 0..machine.nodes() {
+            let node = add(self, ObjectKind::Node, 0, next(), all);
+            self.nodes.insert(node, slot as u16);
         }
         for unit in 0..machine.iommus.len() {
             let iommu = add(self, ObjectKind::Iommu, 0, next(), all);
@@ -1103,35 +1252,37 @@ impl Model {
         // The address space was built with the tables these mappings need
         // and the reserve of free tables the boot image states.
         let hooked = hooked(&self.aspaces[&aspace], geometry.levels, geometry);
-        live(&mut self.aspaces, aspace).tables = hooked + machine.reserve_tables;
+        locked(&mut self.aspaces, &self.locks, aspace).tables = hooked + machine.reserve_tables;
         // The first thread: bound to the space in slot 1, the address space
         // in slot 2 and the message page in slot 10; not suspended.
         self.bind_space(thread, Some(space));
         self.bind_aspace(thread, Some(aspace));
         self.bind_page(thread, Some(message_page));
-        live(&mut self.tasks, task).threads.push(thread);
-        live(&mut self.threads, thread).task = Some(task);
+        locked(&mut self.tasks, &self.locks, task)
+            .threads
+            .push(thread);
+        locked(&mut self.threads, &self.locks, thread).task = Some(task);
         // Registers: the entry point, and the address of the start-up page
         // in the first argument register; the others 0, the flags fixed.
-        let first = live(&mut self.threads, thread);
+        let first = locked(&mut self.threads, &self.locks, thread);
         first.suspended = false;
         first.regs[REG_RIP] = machine.entry;
         first.regs[REG_RDI] = 2 * page;
         // Scheduling: budget 9,843,750 ns, period 10 ms, class 1, the cores
         // set of the node's own core; the recovery reserve holds the rest.
         self.first_context(sched, thread, START_SCHED_BUDGET_NS, START_SCHED_PERIOD_NS);
-        self.build_kernel_space(mailbox);
-        // Debugging: a node started fresh keeps its debug area if its
-        // header is right, with its generation; otherwise it is cleared.
-        // Its first entry is the text of its start (code 1).
-        let generation = self.table.generation(self.node);
-        let area = &mut std::sync::Arc::make_mut(&mut self.table.crash).areas[self.node as usize];
-        if area.magic != dodos_abi::DEBUG_AREA_MAGIC
-            || area.version != dodos_abi::DEBUG_AREA_VERSION
-        {
-            *area = crate::debug::DebugArea::new(generation);
-        }
-        area.generation = generation;
+        self.build_kernel_space();
+        self.peers = (0..self.table.nodes)
+            .map(|_| crate::rings::Peer::new())
+            .collect();
+        self.unit_requests = vec![None; dodos_abi::UNIT_REQUESTS];
+        self.built = self.table.generation(self.node);
+        self.ready = true;
+        // Debugging: each core that starts in a node keeps its debug area
+        // if its header is right, with the node slot and generation;
+        // otherwise it is cleared. The first entry of the core at position
+        // 0 is the text of the node's start (code 1).
+        self.enter_debug_areas();
         let text = u64::from_le_bytes(*b"start\0\0\0");
         self.trace(dodos_abi::TraceCode::Text, None, [text, 0, 0]);
         thread

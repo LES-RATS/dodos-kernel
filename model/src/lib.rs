@@ -28,30 +28,34 @@ mod blocks;
 mod boot;
 mod caps;
 mod check;
+mod cores;
 mod debug;
 mod faults;
+mod grants;
 mod ipc;
 mod irq;
+mod locks;
 mod memory;
-mod moves;
-mod recovery;
-mod remote;
+mod nodes;
+mod rings;
 mod roles;
 mod sched;
 mod system;
 mod table;
 mod tasks;
 mod threads;
+mod units;
 
 pub use boot::{
     Arch, Core, File, IoApic, IommuUnit, Machine, Refusal, Region, RegionKind, SIXTEEN_KB, Segment,
     THIRTY_TWO_KB,
 };
 pub use check::Census;
-pub use recovery::HwAction;
-pub use remote::{Body, Carried, Crossing, Granted, Packet};
-pub use roles::UnitOp;
-pub use system::{CoreState, System};
+pub use cores::Ipi;
+pub use locks::{LockId, Locking, Step};
+pub use nodes::HwAction;
+pub use rings::Message as RingMessage;
+pub use system::{Hardware, System};
 
 use dodos_abi::{
     Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
@@ -171,10 +175,10 @@ pub enum Syscall {
         thread: SlotAddr,
         mask: u64,
     },
-    /// The context, the `core` capability of its node, and the mode.
+    /// The context, the `node` capability of its node, and the mode.
     SchedCount {
         sched: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
         mode: u64,
     },
     /// Debugging: the text travels as the message words.
@@ -210,56 +214,62 @@ pub enum Syscall {
         length: u64,
         mix: [u64; 4],
     },
-    /// Cores: the `core` capability and the arguments of each call.
-    CoreStart {
-        core: SlotAddr,
+    /// Nodes (Cores, The calls): the `node` capability and the arguments of
+    /// each call. `node_start`: the mode, the kernel image, the module, and
+    /// the cores window and mask.
+    NodeStart {
+        node: SlotAddr,
         mode: u64,
         image: u64,
         module: u64,
+        window: u64,
+        mask: u64,
     },
-    CoreStop {
-        core: SlotAddr,
+    /// The mode, and for mode retire the core number to mark unusable.
+    NodeStop {
+        node: SlotAddr,
         mode: u64,
+        core: u64,
     },
-    CoreStatus(SlotAddr),
-    /// The table travels as the message words.
-    CoreIdle {
-        core: SlotAddr,
+    /// A core number.
+    NodeStatus {
+        node: SlotAddr,
+        core: u64,
+    },
+    /// A core number; the table travels as the message words.
+    NodeIdle {
+        node: SlotAddr,
+        core: u64,
         words: Vec<u64>,
     },
-    CoreWatch {
-        core: SlotAddr,
+    NodeWatch {
+        node: SlotAddr,
         index: u64,
         notify: SlotAddr,
     },
-    CorePlace {
-        core: SlotAddr,
-        physical: u64,
-    },
-    CorePerf {
-        core: SlotAddr,
+    NodePerf {
+        node: SlotAddr,
+        core: u64,
         lowest: u64,
         highest: u64,
         preference: u64,
     },
     RoleClaim(SlotAddr),
-    /// The role and the `core` capability of the target; none vacates.
+    /// The role and the `node` capability of the target; none vacates.
     RoleHand {
         role: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
     },
-    /// `thread_move`: the thread, the destination thread and sched (remote
-    /// capabilities of the destination node), its `core` capability, and
-    /// the parameters (all 0: the context's own).
-    ThreadMove {
-        thread: SlotAddr,
-        destination: SlotAddr,
-        sched: SlotAddr,
-        core: SlotAddr,
-        budget: u64,
-        period: u64,
-        class: u64,
+    /// Calls between nodes: the stamped send into another node's mailbox,
+    /// with a doorbell (a notify of the caller's node, or none) for the
+    /// grants of the frames its message lists.
+    NodeSend {
+        node: SlotAddr,
+        message: Message,
+        doorbell: SlotAddr,
     },
+    /// The doorbell of a grant, through its remote frame capability.
+    GrantSignal(SlotAddr),
     /// `wait`, here and below, is the wait number of the call; 0 is none.
     Call {
         endpoint: SlotAddr,
@@ -309,9 +319,12 @@ pub enum Syscall {
         iospace: SlotAddr,
         device: u64,
     },
+    /// The context, the `node` capability of its node, the core number to
+    /// place it on, and its parameters.
     SchedConfigure {
         sched: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
+        core: u64,
         budget: u64,
         period: u64,
         class: u64,
@@ -323,7 +336,7 @@ pub enum Syscall {
     SchedUnbind(SlotAddr),
     SchedSetCores {
         sched: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
         window: u64,
         mask: u64,
     },
@@ -336,10 +349,12 @@ pub enum Syscall {
         tolerance: u64,
     },
     TimerCancel(SlotAddr),
-    /// The irq_control, the source word, the vector and the destination.
+    /// The irq_control, the source word, the core number, the vector and
+    /// the destination.
     IrqClaim {
         control: SlotAddr,
         source: u64,
+        core: u64,
         vector: u64,
         destination: SlotAddr,
     },
@@ -423,7 +438,7 @@ pub enum Output {
         /// The instructions retired while counted.
         instructions: u64,
     },
-    /// `core_status`: the seven words.
+    /// `node_status`: the seven words.
     Status([u64; 7]),
     /// `ioport_in`: the value read.
     Value(u64),
@@ -442,7 +457,8 @@ pub enum Output {
         flags: u64,
         threads: u64,
     },
-    /// `send`: 0, or `Header::FLAG_CAPS_DROPPED`.
+    /// `send`, and `node_send` once delivered: 0, or
+    /// `Header::FLAG_CAPS_DROPPED`.
     Sent { flags: u32 },
     /// `recv`, `reply_recv`: a message or a notification. `call`: the reply.
     Message(Delivery),
@@ -480,6 +496,10 @@ enum Record {
     Mapping(Mapping),
     /// Bindings: the message page of this thread.
     Binding(ObjId),
+    /// A mapping whose entries are cleared and whose invalidation on other
+    /// cores of the node, or by an IOMMU unit, is not complete (D-131): its
+    /// leaves still count.
+    Unmapping(Mapping),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -624,6 +644,14 @@ struct ASpace {
     root: Option<u64>,
     hooked: BTreeMap<(u32, u64), u64>,
     free: Vec<u64>,
+    /// A node of several cores: the set of the node's cores that loaded its
+    /// tag since it was last invalidated on them, by position (TLB).
+    cores: u64,
+    /// Destruction: the first step's invalidation of the whole tag is
+    /// complete on every core.
+    flushed: bool,
+    /// An iospace: the IOMMU units whose devices it served.
+    units: std::collections::BTreeSet<usize>,
 }
 
 impl ASpace {
@@ -686,18 +714,27 @@ struct Thread {
     /// Tasks and marks: the task it is attached to, and its own marks word.
     task: Option<ObjId>,
     marks: u64,
-    /// A proxy: the stamp of the thread of another node it stands for, and
-    /// the node, the request and the number of capabilities its message
-    /// lists, which are transferred by grants at delivery.
-    stamp: Option<(u64, u64)>,
-    foreign: Option<(u16, u64, usize)>,
     /// Unlike cores: the feature mask, and the bytes of the thread as it
     /// was made, which fix its save area.
     mask: u64,
     area: u64,
-    /// The outcome is the answer of another node to a forwarded call: any
-    /// outcome that call has.
+    /// A node of several cores: the thread is marked *leaving its core*;
+    /// the core that runs it saves its registers and clears the mark.
+    leaving: bool,
+    /// The outcome is the end of a bounded wait (for another node, a unit,
+    /// its node's cores, a hand-over): any outcome its call has.
     answered: bool,
+}
+
+impl Thread {
+    /// A bounded wait that holds no queue of an object: for another node,
+    /// for a unit, for its node's cores, or for a hand-over's drain.
+    pub(crate) fn bounded(&self) -> bool {
+        matches!(
+            self.wait,
+            Wait::Node { .. } | Wait::Unit(_) | Wait::Cores(_) | Wait::Hand(_)
+        )
+    }
 }
 
 /// IPC: the states of a thread. `None` is ready.
@@ -721,9 +758,18 @@ enum Wait {
     },
     /// Waiting on a notify, in its queue.
     Notify(ObjId),
-    /// Waiting for another node: the request this node sent (Calls on an
-    /// object of another node).
-    Node(u64),
+    /// Waiting for another node (IPC): the answer of a `node_send` or of a
+    /// revocation step, by the peer and the credit of the request.
+    Node { peer: u16, credit: u8 },
+    /// Waiting for a unit: the confirmation of the entry of the unit
+    /// request table.
+    Unit(usize),
+    /// Waiting for its node's cores: the completion of the invalidation
+    /// request of the core at this position.
+    Cores(usize),
+    /// Waiting for a unit: the drain of the queue of the unit of this role,
+    /// for a planned hand-over (`role_hand`).
+    Hand(usize),
 }
 
 /// A message on its way. Transfer of capabilities: the kernel remembers the
@@ -781,11 +827,17 @@ struct Notify {
     timers: Vec<ObjId>,
     /// Interrupts: the irqs bound to it, the most recently bound last.
     irqs: Vec<ObjId>,
+    /// Grants: the grant entries whose doorbell it is, the most recently
+    /// made last.
+    doorbells: Vec<u16>,
 }
 
-/// Interrupts: one entry of the interrupt table of the node.
+/// Interrupts: one entry of the interrupt table of a physical core of the
+/// node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Irq {
+    /// The position of its core in the node.
+    core: usize,
     vector: u8,
     source: IrqSource,
     state: IrqState,
@@ -828,6 +880,9 @@ struct Sched {
     class: u64,
     /// The cores where the context may be placed: a window and a mask.
     cores: (u64, u64),
+    /// A node of several cores: the position of the core of its node where
+    /// it is placed, admitted and queued.
+    core: usize,
     /// Signed nanoseconds left in the current period.
     remaining: i64,
     deadline: u64,
@@ -875,6 +930,9 @@ struct Armed {
     notify: ObjId,
     bits: u64,
     entered: u64,
+    /// The position of the core whose timer queue holds it: the core that
+    /// ran `timer_set`.
+    core: usize,
 }
 
 /// Bookkeeping of the current or last event: what the invariants read to
@@ -923,9 +981,6 @@ struct EventLog {
     /// The consumed time and the instruction count of each context at the
     /// start of the event.
     counts: BTreeMap<ObjId, (u64, u64, bool)>,
-    /// The destination threads of `thread_move` placed in the event, with
-    /// the effective marks of their source.
-    moved: Vec<(ObjId, u64)>,
     /// Debugging: kernel entries written in the event; the entries of a
     /// `debug_write` or `trace_emit` (first sequence, count, stamp); the
     /// ports a port call touched.
@@ -934,7 +989,8 @@ struct EventLog {
     ports: Option<(u64, u64)>,
 }
 
-/// The whole state of the kernel of one core.
+/// The whole state of the kernel of one node: its shared state, and the
+/// part of each of its physical cores (A node of several cores).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
     next_id: u32,
@@ -951,18 +1007,19 @@ pub struct Model {
     /// The derivation tree: the longest walk so far to the next capability
     /// to remove, in capabilities. The contract says: shorter than 192.
     longest_walk: usize,
-    /// The `core` objects, with their node index.
-    cores: BTreeMap<ObjId, u32>,
+    /// The `node` objects, with their node slot.
+    nodes: BTreeMap<ObjId, u16>,
     /// The `role` objects, with the index of their role.
     roles: BTreeMap<ObjId, usize>,
-    /// The index of this node, and the machine table it shares with the
+    /// The slot of this node, and the machine table it shares with the
     /// other nodes.
     node: u16,
     table: table::Table,
     /// The write gate: the chunks the node maps in its kernel space.
     kernel_runs: std::collections::BTreeSet<u64>,
     /// IOMMU: the devices each `iospace` serves, the most recently attached
-    /// last, each by its `iommu` and its identifier.
+    /// last, each by its `iommu` and its identifier: the node's own list of
+    /// its devices on each unit (D-131).
     iospaces: BTreeMap<ObjId, Vec<(ObjId, u16)>>,
     iommus: BTreeMap<ObjId, Iommu>,
     scheds: BTreeMap<ObjId, Sched>,
@@ -971,21 +1028,17 @@ pub struct Model {
     /// The budget follows the call: the lends, by the reply object that
     /// records each, with its context and its receiver.
     lends: BTreeMap<ObjId, (ObjId, ObjId)>,
-    /// Clock: the instant of the clock, which only `Model::advance` moves,
-    /// and the instant of the previous event.
+    /// Clock: the instant of the clock, which only `Model::advance` moves.
     now: u64,
-    previous: u64,
-    /// What runs next: the context that runs, and whether from the ready
-    /// queue (not from a slack queue).
-    running: Option<(ObjId, bool)>,
-    /// Admission: the sum of the bandwidths of the configured contexts that
-    /// are not dying.
-    admitted: u64,
+    /// The part of each physical core of the node, by its position.
+    cores: Vec<cores::CorePart>,
+    /// The position of the core the current event runs on.
+    at: Ephemeral<usize>,
     /// What runs next: the order of entry into the queues.
     entered: u64,
     /// Order inside an event: what each context was at the start of the
     /// event (eligible, remaining, throttled, queue and key), the change
-    /// list of the node, and its no-context list.
+    /// list, and the no-context list.
     snapshot: Ephemeral<BTreeMap<ObjId, sched::Snap>>,
     change_list: Ephemeral<Vec<ObjId>>,
     no_context_list: Ephemeral<Vec<ObjId>>,
@@ -994,62 +1047,74 @@ pub struct Model {
     last_event: Ephemeral<Option<(sched::EventKind, usize)>>,
     /// What the last event did, for the invariants that judge an event.
     event: Ephemeral<EventLog>,
-    /// Calls on an object of another node: the messages the last event
-    /// sent, the requests this node waits on, the remote objects it holds,
-    /// its kernel space (anchors and proxies) and its proxies with the
-    /// request each stands in, and its requests to each peer, sent and held.
-    outbox: Vec<remote::Packet>,
-    requests: BTreeMap<u64, remote::Request>,
-    next_request: u64,
-    remotes: BTreeMap<ObjId, remote::Remote>,
+    /// The locks the last event took and the waits it entered, for the
+    /// checks of the two variants (A node of several cores).
+    locks: Ephemeral<locks::Trace>,
+    /// Under variant L2: the objects as they were before the event.
+    before: Ephemeral<Option<Box<locks::Snapshot>>>,
+    /// The pending interrupts of the cores are delivered by the caller
+    /// (`System`), which interleaves them, rather than at the end of each
+    /// event.
+    manual: bool,
+    /// Grants: the remote objects this node holds, its kernel space (the
+    /// anchors of its grants), its mailbox.
+    remotes: BTreeMap<ObjId, grants::Remote>,
     kernel_space: Option<ObjId>,
     mailbox: Option<ObjId>,
     /// The thread whose call is the removal in progress, which waits when an
     /// anchor's grant needs its holder (Grants).
     remover: Option<ObjId>,
-    /// A transfer between nodes that the current delivery began, and the
-    /// last one an event began.
-    transfer: Option<u64>,
-    last_transfer: Option<u64>,
-    proxies: BTreeMap<ObjId, Option<(u16, u64)>>,
     /// Remote capabilities found invalid during the call, whose slots
     /// become dead when it ends.
     stale: Ephemeral<std::cell::RefCell<Vec<CapId>>>,
-    /// Cores (8.4): the fences this node drives, its reclaim of each node,
-    /// what it asks of the hardware, its watch slots, the member and role
-    /// words it last processed, its idle table and performance request,
-    /// the instant of its next sweep, its idle and slack time, and the
-    /// events of its core (its heartbeat).
-    fences: BTreeMap<u16, recovery::Fence>,
-    reclaims: BTreeMap<u16, recovery::Reclaim>,
-    hw_out: Vec<recovery::HwAction>,
+    /// What crosses between nodes: this node's credits toward each node
+    /// slot, the messages the last event wrote into its rings (the rings
+    /// themselves are in the machine table), its unit request table, its
+    /// unit service table, and the cursor of each rebuild it runs.
+    peers: Vec<rings::Peer>,
+    unit_requests: Vec<Option<units::UnitEntry>>,
+    unit_service: BTreeMap<(u16, u8), units::Served>,
+    rebuilds: BTreeMap<usize, units::Rebuild>,
+    /// Cores: the fences this node drives, its reclaim of each node, what
+    /// it asks of the machine (stops, starts, interrupts to other nodes),
+    /// its watch slots, the member and role words it last processed, the
+    /// instant of its next sweep.
+    fences: BTreeMap<u16, nodes::Fence>,
+    reclaims: BTreeMap<u16, nodes::Reclaim>,
+    hw_out: Vec<nodes::HwAction>,
     watchers: [Option<(ObjId, u64)>; 4],
     seen: (Vec<dodos_abi::Member>, Vec<dodos_abi::RoleWord>),
-    idle_table: Vec<[u64; 4]>,
-    perf: Option<(u64, u64, u64)>,
     next_sweep: u64,
-    idle_ns: Ephemeral<u64>,
-    slack_ns: Ephemeral<u64>,
-    events: Ephemeral<u64>,
-    /// What a core enables for a thread: the state features enabled on the
-    /// core, as the last switch wrote them.
-    enabled: u32,
-    /// Debugging: the rate limit of each code of the kernel ring, and the
-    /// node's random generator (its state is not compared).
-    limits: [debug::Limit; 18],
-    /// The suppressed entries reported by entries of code 3.
-    reported: u64,
-    entropy: Ephemeral<u64>,
+    /// The seal of this node, its step; whether the node consumes and
+    /// runs threads (false while it resumes); the starts it drives, and the
+    /// image and module of the last `node_start`; the planned hand-overs it
+    /// runs; the order of its unit requests; whether the current removal
+    /// step is done for a `Revoke`; the instant its recovery reserve last
+    /// made no progress; the generation it was built for.
+    seal: Option<nodes::SealStep>,
+    ready: bool,
+    resuming: bool,
+    starts: BTreeMap<usize, nodes::Starting>,
+    start_image: (bool, u64),
+    handing: BTreeMap<usize, roles::Handover>,
+    unit_order: u64,
+    revoking: bool,
+    stalled: Option<u64>,
+    steps_at: Ephemeral<u64>,
+    steps_now: Ephemeral<u64>,
+    built: u32,
+    /// IOMMU: counts of leaves whose invalidation a failed unit never
+    /// confirmed, which are never lowered (IOMMU): by chunk, and by entry
+    /// of the device table.
+    frozen: BTreeMap<u64, u64>,
+    frozen_entries: BTreeMap<usize, u64>,
     /// The start-up space of the node.
     start_space: Option<ObjId>,
     /// Other models of the machine share its table (`System`): the map
     /// counts hold their leaves too.
     shared: bool,
-    /// The slots that the capabilities moved into anchors came from.
-    moved_from: BTreeMap<u16, Place>,
-    outstanding: BTreeMap<u16, usize>,
-    held_requests: BTreeMap<u16, VecDeque<remote::Body>>,
-    /// Interrupts: the claimed entries of the interrupt table.
+    /// Interrupts: the claimed entries of the interrupt tables of the
+    /// node's cores.
     irqs: BTreeMap<ObjId, Irq>,
     tasks: BTreeMap<ObjId, Task>,
     /// Tasks and marks: the counter of the identifiers of the node.
@@ -1061,6 +1126,19 @@ pub struct Model {
 /// The entry `id` of one of the maps of the state, to change it. Every
 /// identity the state holds names a live entry (`Model::check`).
 fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
+    map.get_mut(&id).expect("names a live entry")
+}
+
+/// The entry of an object that has a lock word under variant L2, to change
+/// it: the event records that it touched the object's lock.
+fn locked<'a, T: locks::Locked>(
+    map: &'a mut BTreeMap<ObjId, T>,
+    trace: &locks::Trace,
+    id: ObjId,
+) -> &'a mut T {
+    if let Some(lock) = T::lock(id) {
+        trace.touch(lock);
+    }
     map.get_mut(&id).expect("names a live entry")
 }
 
@@ -1084,10 +1162,10 @@ impl Model {
         self.machine.geometry.page()
     }
 
-    /// The threads that can run: not suspended and not waiting. A call can
-    /// be applied for any of them.
+    /// The threads that can run: not suspended, not waiting, and not marked
+    /// *leaving its core*. A call can be applied for any of them.
     pub fn runnable(&self) -> Vec<ObjId> {
-        let ready = |thread: &&Thread| !thread.suspended && thread.wait == Wait::None;
+        let ready = |thread: &&Thread| Self::runnable_thread(thread);
         let ids = self.threads.iter().filter(|(_, thread)| ready(thread));
         ids.map(|(&id, _)| id).collect()
     }
@@ -1102,10 +1180,10 @@ impl Model {
         }
     }
 
-    /// Unlike cores: the state features the core enables, as the last
-    /// switch wrote them.
+    /// Unlike cores: the state features the node's first core enables, as
+    /// the last switch wrote them.
     pub fn enabled(&self) -> u32 {
-        self.enabled
+        self.cores[0].enabled
     }
 
     /// The outcome of the call in which `thread` waited, once it is over and
@@ -1249,6 +1327,9 @@ impl Model {
     /// The call is one event of the kernel (What runs next): the time since
     /// the previous event is charged first, and the choice of what runs
     /// next is made last.
+    ///
+    /// The call is an event of the core the thread's events run on: the
+    /// core that runs it, else the core of its context.
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
         let kind = match call {
@@ -1257,14 +1338,19 @@ impl Model {
             _ => sched::EventKind::Call,
         };
         *self.last_event = Some((kind, 0));
-        let entry = self.begin();
+        let core = self.core_of(thread);
+        assert!(!self.cores[core].silent, "core {core} does not answer");
+        let entry = self.begin_on(core);
+        self.locks.bound = Some(locks::bound(&call));
+        self.locks.lock_free = matches!(call, Syscall::Signal(_));
         let outcome = self.made(thread, call);
         self.end(entry);
+        self.auto_deliver();
         outcome
     }
 
     fn made(&mut self, thread: ObjId, call: Syscall) -> Outcome {
-        let made = live(&mut self.threads, thread);
+        let made = locked(&mut self.threads, &self.locks, thread);
         (made.outcome, made.answered) = (None, false);
         let number = match call {
             Syscall::Call { wait, .. }
@@ -1281,7 +1367,7 @@ impl Model {
         // object it armed is idle again. A call that ends without waiting
         // does not look at the word.
         if outcome == Output::Waits {
-            let waiting = live(&mut self.threads, thread);
+            let waiting = locked(&mut self.threads, &self.locks, thread);
             if number != 0 && number <= waiting.cancelled_up_to {
                 self.unlink(thread);
                 return Err(Error::Cancelled);
@@ -1312,9 +1398,6 @@ impl Model {
     }
 
     fn dispatch_call(&mut self, thread: ObjId, call: Syscall) -> Outcome {
-        if let Some(outcome) = self.forwarded(thread, &call) {
-            return outcome;
-        }
         match call {
             Syscall::CapDerive {
                 source,
@@ -1368,30 +1451,38 @@ impl Model {
                 thread: target,
                 mask,
             } => self.thread_set_features(thread, target, mask),
-            Syscall::SchedCount { sched, core, mode } => {
-                self.sched_count(thread, sched, core, mode)
+            Syscall::SchedCount { sched, node, mode } => {
+                self.sched_count(thread, sched, node, mode)
             }
-            Syscall::CoreStart {
-                core,
+            Syscall::NodeStart {
+                node,
                 mode,
                 image,
                 module,
-            } => self.core_start(thread, core, mode, image, module),
-            Syscall::CoreStop { core, mode } => self.core_stop(thread, core, mode),
-            Syscall::CoreStatus(core) => self.core_status(thread, core),
-            Syscall::CoreIdle { core, words } => self.core_idle(thread, core, &words),
-            Syscall::CoreWatch {
-                core,
+                window,
+                mask,
+            } => self.node_start(thread, node, (mode, image, module), (window, mask)),
+            Syscall::NodeStop { node, mode, core } => self.node_stop(thread, node, mode, core),
+            Syscall::NodeStatus { node, core } => self.node_status(thread, node, core),
+            Syscall::NodeIdle { node, core, words } => self.node_idle(thread, node, core, &words),
+            Syscall::NodeWatch {
+                node,
                 index,
                 notify,
-            } => self.core_watch(thread, core, index, notify),
-            Syscall::CorePlace { core, physical } => self.core_place(thread, core, physical),
-            Syscall::CorePerf {
+            } => self.node_watch(thread, node, index, notify),
+            Syscall::NodePerf {
+                node,
                 core,
                 lowest,
                 highest,
                 preference,
-            } => self.core_perf(thread, core, (lowest, highest, preference)),
+            } => self.node_perf(thread, node, core, (lowest, highest, preference)),
+            Syscall::NodeSend {
+                node,
+                message,
+                doorbell,
+            } => self.node_send(thread, node, message, doorbell),
+            Syscall::GrantSignal(frame) => self.grant_signal(thread, frame),
             Syscall::RoleClaim(role) => self.role_claim(thread, role),
             Syscall::DebugWrite {
                 debug,
@@ -1417,21 +1508,7 @@ impl Model {
                 last,
             } => self.ioports_issue(thread, ioports, destination, first, last),
             Syscall::EntropyRead { length, mix } => self.entropy_read(thread, length, mix),
-            Syscall::RoleHand { role, core } => self.role_hand(thread, role, core),
-            Syscall::ThreadMove {
-                thread: source,
-                destination,
-                sched,
-                core,
-                budget,
-                period,
-                class,
-            } => self.thread_move(
-                thread,
-                source,
-                (destination, sched, core),
-                (budget, period, class),
-            ),
+            Syscall::RoleHand { role, node } => self.role_hand(thread, role, node),
             Syscall::Call {
                 endpoint,
                 message,
@@ -1472,6 +1549,7 @@ impl Model {
             } => self.iospace_attach(thread, iommu, iospace, device),
             Syscall::SchedConfigure {
                 sched,
+                node,
                 core,
                 budget,
                 period,
@@ -1482,7 +1560,7 @@ impl Model {
                     period,
                     class,
                 };
-                self.sched_configure(thread, sched, core, parameters)
+                self.sched_configure(thread, sched, node, core, parameters)
             }
             Syscall::SchedBind {
                 sched,
@@ -1491,10 +1569,10 @@ impl Model {
             Syscall::SchedUnbind(sched) => self.sched_unbind(thread, sched),
             Syscall::SchedSetCores {
                 sched,
-                core,
+                node,
                 window,
                 mask,
-            } => self.sched_set_cores(thread, sched, core, (window, mask)),
+            } => self.sched_set_cores(thread, sched, node, (window, mask)),
             Syscall::SchedRead(sched) => self.sched_read(thread, sched),
             Syscall::Yield => self.yield_now(thread),
             Syscall::TimerSet {
@@ -1507,9 +1585,10 @@ impl Model {
             Syscall::IrqClaim {
                 control,
                 source,
+                core,
                 vector,
                 destination,
-            } => self.irq_claim(thread, control, (source, vector), destination),
+            } => self.irq_claim(thread, control, (source, core, vector), destination),
             Syscall::IrqBind { irq, notify } => self.irq_bind(thread, irq, notify),
             Syscall::IrqAck(irq) => self.irq_ack(thread, irq),
             Syscall::TaskExempt { task, aware } => self.task_exempt(thread, task, aware),
@@ -1723,6 +1802,13 @@ impl Model {
         })
     }
 
+    /// Ends a bounded wait (one that holds no queue): its outcome may be
+    /// any outcome of its call.
+    pub(crate) fn end_bounded(&mut self, thread: ObjId) {
+        let ended = locked(&mut self.threads, &self.locks, thread);
+        (ended.wait, ended.answered) = (Wait::None, true);
+    }
+
     /// Ends the wait of a thread that `unlink` took out of what it waited
     /// on: `outcome` is the outcome of the call it waited in. The wait
     /// number goes with the wait. A caller that a server receives is taken
@@ -1733,23 +1819,11 @@ impl Model {
     /// answer has its effect on the thread, and a wait that ends without an
     /// answer leaves it suspended with the fault dropped.
     fn wake(&mut self, thread: ObjId, outcome: Outcome) {
-        // A delivery whose capabilities another node grants: the receiver
-        // waits for that node instead.
-        if let Some(id) = self.transfer.take() {
-            if let Ok(Output::Message(delivery)) = outcome {
-                return self.transfer_wait(id, thread, delivery);
-            }
-            self.transfer = Some(id);
-        }
-        let woken = live(&mut self.threads, thread);
+        let woken = locked(&mut self.threads, &self.locks, thread);
         woken.number = 0;
         if std::mem::take(&mut woken.faulting) {
             woken.raised = None;
             return self.answered(thread, outcome);
-        }
-        // A proxy's call is over: its outcome goes back to its node.
-        if woken.stamp.is_some() {
-            return self.answer_proxy(thread, outcome);
         }
         woken.outcome = Some(outcome);
         self.observe();

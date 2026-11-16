@@ -4,8 +4,8 @@
 //! machine; a node that runs alone holds it.
 
 use dodos_abi::{
-    DeviceEntry, GateWord, Geometry, Governs, Member, MemberState, Owner, Ownership, PageClass,
-    RoleKind, RoleState, RoleWord,
+    CoreState, CoreWord, DeviceEntry, GateWord, Geometry, Governs, Member, MemberState, NodeGen,
+    Owner, Ownership, PageClass, RoleKind, RoleState, RoleWord,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -19,23 +19,23 @@ pub(crate) struct RoleRecord {
     pub(crate) object: u16,
 }
 
-/// The state of a grant entry (Grants).
+/// The state of a grant entry (Grants); a free entry is not listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantState {
     Live,
     Revoking,
-    /// Freed by step R3 of a reclaim, its grantee fenced: the frames stay
-    /// pinned until the grantee is dead (model choice: the entry stays
-    /// used, so that its anchor keeps its place).
+    /// Marked by step R3 of a reclaim, its grantee fencing: the entry stays
+    /// used and its frames pinned until the grantee's generation is over.
     Pinned,
 }
 
 /// What an observation records (Detection): a core's heartbeat, or the
-/// consumer index of a ring from the observing node to another.
+/// consumer index of one of the two rings from the observing node to
+/// another (`user` for the user ring).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Watched {
     Heartbeat { core: usize, heartbeat: u64 },
-    Ring { consumed: u64 },
+    Ring { user: bool, consumed: u64 },
 }
 
 /// An observation of a node, written by the gate only, stamped with the
@@ -47,78 +47,154 @@ pub(crate) struct Observation {
     pub(crate) at: u64,
 }
 
-/// A node beacon, written only by the kernel that runs that node.
+/// A node beacon, written only by the kernel of that node, on any of its
+/// cores.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct NodeBeacon {
-    /// The code of a failure the node found in itself, with its
-    /// generation.
-    pub(crate) panic: Option<(u64, u32)>,
-    pub(crate) save_seal: bool,
+    /// The code of a failure the node found in itself, with its generation
+    /// and the number of the core that found it.
+    pub(crate) panic: Option<(u64, u32, u32)>,
+    /// The instant of its seal.
+    pub(crate) sealed_at: Option<u64>,
     /// For each node, the generation whose reclaim this node finished.
     pub(crate) acked: Vec<u32>,
     /// For each node, set before the first translation to its memory.
     pub(crate) maps_of: Vec<bool>,
     pub(crate) observations: Vec<Observation>,
-    /// The idle, slack, kernel and recovery time, as last published:
-    /// bookkeeping of time, equal in any two states.
+    /// The consumer index of the kernel ring and of the user ring from each
+    /// other node.
+    pub(crate) consumed: Vec<(u64, u64)>,
+}
+
+/// A core beacon, one page per physical core, written only by that core
+/// (its `parked` by the park stub and the fence signal's handler).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CoreBeacon {
+    /// Written at the exit of every event, and the instant of the next
+    /// timer when idle: equal in any two states, as the time counters are.
+    pub(crate) heartbeat: crate::Ephemeral<u64>,
+    pub(crate) idle_until: crate::Ephemeral<u64>,
+    /// Set while the core is in VMX root operation (x86-64).
+    pub(crate) vmx: bool,
+    /// The park request the park stub or the fence handler last read.
+    pub(crate) parked: u64,
+    /// The start request the park stub took when it left for the entry
+    /// stub, 0 when it parks (CONTRACT-GAP 8): what the starter waits for.
+    pub(crate) started: u64,
+    /// The node slot and generation it last ran, for readers.
+    pub(crate) ran: (u16, u32),
+    /// Its idle, slack, kernel and recovery time, as last published.
     pub(crate) counters: crate::Ephemeral<[u64; 4]>,
 }
 
-/// A core beacon, written only by that core.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct CoreBeacon {
-    /// Written at every event, and the instant of the next timer when idle:
-    /// equal in any two states, as the time counters are.
-    pub(crate) heartbeat: crate::Ephemeral<u64>,
-    pub(crate) idle_until: crate::Ephemeral<u64>,
-    /// The node whose block it runs.
-    pub(crate) running: u16,
-    pub(crate) vmx: bool,
-    /// The fence epoch written by the park stub.
-    pub(crate) parked: u64,
+/// One message in a ring, as the model carries it: the header the sender
+/// wrote and the words after it, or bytes the receiver cannot read.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RingEntry {
+    /// The first entry of a message; the next `length − 1` entries are its
+    /// continuation.
+    Message(crate::rings::Message),
+    Continued,
+    /// A raw header, as a faulty or dying sender may leave it (a test's
+    /// input): the receiver checks it like any other.
+    Raw(dodos_abi::RingHeader),
 }
 
-/// The node field of a core beacon while the core switches between parked
-/// nodes, or runs none.
-pub(crate) const NO_NODE: u16 = 0xFFFF;
+/// One ring: its producer index, in its header, written by the sender only;
+/// its entries. The consumer index is in the receiver's node beacon.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Ring {
+    pub(crate) produced: u64,
+    pub(crate) entries: Vec<Option<RingEntry>>,
+}
+
+impl Ring {
+    pub(crate) fn new(entries: u64) -> Self {
+        Self {
+            produced: 0,
+            entries: vec![None; entries as usize],
+        }
+    }
+
+    /// The entry at index `at` of the ring (a 64-bit count).
+    pub(crate) fn at(&self, at: u64) -> Option<&RingEntry> {
+        self.entries[(at % self.entries.len() as u64) as usize].as_ref()
+    }
+
+    pub(crate) fn set(&mut self, at: u64, entry: RingEntry) {
+        let len = self.entries.len() as u64;
+        self.entries[(at % len) as usize] = Some(entry);
+    }
+}
+
+/// The two rings of an ordered pair of node slots, kept memory.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RingPair {
+    pub(crate) kernel: Ring,
+    pub(crate) user: Ring,
+}
 
 /// The state of an IOMMU unit as its hardware holds it: the context entry
-/// of each device, naming the node (and generation) whose iospace it uses,
-/// and the node whose gate maps the unit's registers.
+/// of each device (by identifier: the node, its generation and the root of
+/// the iospace), its remapping entries (by handle), the operations
+/// submitted and not yet confirmed (each with its submission instant and
+/// whether the unit will confirm it), and the node whose gate maps the
+/// unit's registers.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct UnitState {
     pub(crate) entries: BTreeMap<u16, (u16, u32)>,
-    pub(crate) mapped: Option<u16>,
+    pub(crate) remap: BTreeMap<u32, (u16, u32)>,
+    pub(crate) queue: Vec<(u64, u64)>,
+    pub(crate) mapped: BTreeSet<u16>,
+    /// An IOAPIC: the redirection entry of each line claimed, by GSI.
+    pub(crate) lines: BTreeMap<u32, (u16, u32)>,
+    /// A test's input: the unit never confirms again.
+    pub(crate) broken: bool,
+    /// The serial of the next submission.
+    pub(crate) next: u64,
 }
 
 /// The fence of a node, as every node reads it: the instant of its first
-/// action and of the confirmed stop.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// action, of the confirmed stop, and of the last stop sent to each of its
+/// cores. CONTRACT-GAP 6: the contract judges take-overs and R6 on these
+/// instants without saying where they are kept; the model keeps them in
+/// the living part, as every node reads them.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct FenceRecord {
     pub(crate) started: Option<u64>,
     pub(crate) confirmed: Option<u64>,
+    pub(crate) last_stop: BTreeMap<usize, u64>,
 }
 
 /// A grant entry of the granting node: the grantee and its generation,
-/// the serial, the state. Its anchor is a slot of the granting node.
+/// the serial, the state, the use index and the bit *answered* written
+/// from the `SendAnswer`, and the doorbell (a notify of the granting node
+/// and the bits it sets). Its anchor is a slot of the granting node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GrantEntry {
     pub(crate) grantee: u16,
     pub(crate) generation: u32,
     pub(crate) serial: u32,
     pub(crate) state: GrantState,
+    pub(crate) use_index: Option<u16>,
+    pub(crate) answered: bool,
+    pub(crate) doorbell: Option<(crate::ObjId, u64)>,
 }
 
 /// A use entry of the holding node: the granting node, the grant, the
-/// serial, the granting node's generation, and the leaves of its tables
-/// under the grant (G6).
+/// serial, the granting node's generation, the root remote capability on
+/// this node (its object), the leaves of its tables under the grant (G6),
+/// and the flags *release pending* and *signal pending*.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct UseEntry {
     pub(crate) granter: u16,
     pub(crate) grant: u16,
     pub(crate) serial: u32,
     pub(crate) generation: u32,
+    pub(crate) root: crate::ObjId,
     pub(crate) leaves: u64,
+    pub(crate) release_pending: bool,
+    pub(crate) signal_pending: bool,
 }
 
 /// Which word of the living part a write names.
@@ -170,10 +246,14 @@ pub(crate) struct Table {
     /// The chunks whose word is *none*, fixed at machine start-up (8.2,
     /// invariant 5).
     pub(crate) none: Arc<BTreeSet<u64>>,
-    /// The fence class of each physical core, by core number, and whether
-    /// firmware booted it.
+    /// The fence class of each physical core, by core number, whether
+    /// firmware booted it, and its kind's state features and vector
+    /// length (what `node_start` compares).
     pub(crate) fence: Vec<u8>,
     pub(crate) booted: Vec<bool>,
+    pub(crate) state_kinds: Vec<(u32, u32)>,
+    /// The cores per node the kernel image supports (entry `Node`).
+    pub(crate) cores_supported: u32,
     // The living part.
     /// The ownership words, one per chunk, as raw words: a stray write is a
     /// word that fails its check.
@@ -201,36 +281,39 @@ pub(crate) struct Table {
     pub(crate) grants: Vec<BTreeMap<u16, GrantEntry>>,
     pub(crate) uses: Vec<BTreeMap<u16, UseEntry>>,
     pub(crate) serials: Vec<BTreeMap<u16, u32>>,
-    /// Cores: the beacons, the physical core each node is placed on, the
-    /// cores marked unusable, the fences, the last fence epoch, and the
-    /// rings between nodes as (produced, consumed).
+    /// Cores: the beacons of the node slots and of the physical cores, the
+    /// core word, park request and start request of each physical core (a
+    /// start request names a node and its generation as `NodeGen`, or is
+    /// 0), and the fences.
     pub(crate) beacons: Vec<NodeBeacon>,
     pub(crate) core_beacons: Vec<CoreBeacon>,
-    pub(crate) placed: Vec<usize>,
-    pub(crate) unusable: Vec<bool>,
+    pub(crate) core_words: Vec<u64>,
+    pub(crate) park_requests: Vec<u64>,
+    /// Not the living part: what the machine answers about a core that is
+    /// off (ARM64 `AFFINITY_INFO` OFF, RISC-V STOPPED or the stop
+    /// extension), as the park request it answers, with no start since.
+    pub(crate) stopped: Vec<u64>,
+    pub(crate) start_requests: Vec<u64>,
     pub(crate) fences: Vec<FenceRecord>,
-    pub(crate) fence_epoch: u64,
-    pub(crate) rings: Vec<Vec<(u64, u64)>>,
-    /// `STALE_NS`, `STUCK_NS` and `SWEEP_NS`, as the boot image states them
-    /// in `BootMembership`.
+    /// The rings of each ordered pair of node slots, [from][to].
+    pub(crate) rings: Arc<Vec<Vec<RingPair>>>,
+    /// The times of `BootMembership`.
     pub(crate) stale_ns: u64,
     pub(crate) stuck_ns: u64,
     pub(crate) sweep_ns: u64,
+    pub(crate) seal_ns: u64,
+    pub(crate) core_answer_ns: u64,
     /// Debugging: the crash area of this boot, the previous one (never
     /// written), and the values the ports hold.
     pub(crate) crash: Arc<crate::debug::CrashArea>,
     pub(crate) previous: Option<crate::debug::CrashArea>,
     pub(crate) ports: BTreeMap<u16, u8>,
-    /// The slot of a replacement kernel image holds an image.
+    /// The slot of a replacement kernel image holds an image, and the node
+    /// slots last resumed with it.
     pub(crate) replacement: bool,
-    /// The IOMMU units by their role, and each node's report of what it
-    /// attached: (unit, device).
+    pub(crate) resume_replacement: Vec<bool>,
+    /// The units of the unit roles, as their hardware holds them, by role.
     pub(crate) units: BTreeMap<usize, UnitState>,
-    pub(crate) reports: Vec<Vec<(usize, u16)>>,
-    /// The admitted bandwidth of each node, as it publishes it, and the
-    /// physical cores the hardware reports off (ARM64 `AFFINITY_INFO`).
-    pub(crate) admitted: Vec<u64>,
-    pub(crate) off: Vec<bool>,
     /// The writes of ownership and identifier words since the last check of
     /// the invariants, and whether that check has run since (the next event
     /// then starts a new journal).
@@ -251,9 +334,38 @@ impl Table {
         self.member(node).generation()
     }
 
-    /// The fence class of the core a node is placed on.
-    pub(crate) fn fence_of(&self, node: u16) -> u8 {
-        self.fence[self.placed[node as usize]]
+    /// The core word of a physical core, `None` if it fails its check.
+    pub(crate) fn core_word(&self, core: usize) -> Option<CoreWord> {
+        CoreWord::from_raw(self.core_words[core])
+    }
+
+    /// The physical cores whose words name a node with a generation (owned
+    /// or joining).
+    pub(crate) fn cores_of(&self, node: u16, generation: u32) -> Vec<usize> {
+        (0..self.core_words.len())
+            .filter(|&c| self.core_word(c).is_some_and(|w| w.names(node, generation)))
+            .collect()
+    }
+
+    /// The gate writes a core word by compare-and-swap; it refuses the
+    /// reserved state *leaving*.
+    pub(crate) fn write_core(&mut self, core: usize, before: u64, after: CoreWord) -> bool {
+        if after.state() == CoreState::Leaving || self.core_words[core] != before {
+            return false;
+        }
+        self.core_words[core] = after.raw();
+        true
+    }
+
+    /// A start request naming a node of a generation: `NodeGen` with bit 63
+    /// set, so that 0 names none.
+    pub(crate) fn start_request(node: u16, generation: u32) -> u64 {
+        1 << 63 | NodeGen::new(node, generation).raw()
+    }
+
+    /// The node a start request names, if any.
+    pub(crate) fn started_node(raw: u64) -> Option<(u16, u32)> {
+        (raw >> 63 == 1).then_some(((raw >> 32) as u16, raw as u32))
     }
 
     /// Whether a node's member word lets it write: starting, live or
@@ -333,11 +445,6 @@ impl Table {
         let not_data = u16::try_from(i32::from(word.not_data()) + delta).expect("pages of a chunk");
         let word = GateWord::new(word.map_count(), not_data).expect("at most E pages");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
-    }
-
-    /// Whether a node's member word is dead.
-    pub(crate) fn dead(&self, node: u16) -> bool {
-        self.member(node).state() == MemberState::Dead
     }
 
     /// Whether `node` holds the role of reserve `j`.
@@ -430,6 +537,24 @@ impl Table {
         Arc::make_mut(&mut self.owners)[chunk as usize] = after.raw();
         self.writes.push(write);
         true
+    }
+
+    /// Step R6: a write by the node that clears a dead generation's word,
+    /// to its cleared value only, which the gate allows to a node that is
+    /// not the owner.
+    pub(crate) fn write_owner_cleared(
+        &mut self,
+        writer: u16,
+        chunk: u64,
+        before: u64,
+        after: Ownership,
+    ) {
+        if self.owners[chunk as usize] != before {
+            return;
+        }
+        let write = self.journal(writer, Word::Chunk(chunk), before, after.raw());
+        Arc::make_mut(&mut self.owners)[chunk as usize] = after.raw();
+        self.writes.push(write);
     }
 
     /// The write gate on the ownership word of a device entry.

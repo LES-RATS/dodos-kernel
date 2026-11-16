@@ -31,7 +31,9 @@ impl Model {
     pub(super) fn check_spaces(&self) -> Check {
         let mut named: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (&id, cap) in &self.caps {
-            if let Record::Mapping(mapping) = cap.record {
+            // A record unmapping stays in its space's list until its
+            // invalidation is complete (D-131).
+            if let Record::Mapping(mapping) | Record::Unmapping(mapping) = cap.record {
                 named.entry(mapping.space).or_default().push(id);
             }
         }

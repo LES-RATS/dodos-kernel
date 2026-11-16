@@ -80,18 +80,22 @@ fn recv(first: u32) -> Syscall {
 }
 
 fn stop(n: u32, mode: u64) -> Syscall {
-    Syscall::CoreStop {
-        core: core(n),
+    Syscall::NodeStop {
+        node: core(n),
         mode,
+        core: 0,
     }
 }
 
+/// A fresh start of node `n` on core `n`, the core it held.
 fn start(n: u32, mode: u64) -> Syscall {
-    Syscall::CoreStart {
-        core: core(n),
+    Syscall::NodeStart {
+        node: core(n),
         mode,
         image: 0,
         module: 0,
+        window: 0,
+        mask: 1 << n,
     }
 }
 
@@ -124,7 +128,9 @@ impl S {
                 node,
                 Syscall::SchedConfigure {
                     sched: SlotAddr::own(START_SLOT_SCHED),
-                    core: core(node.into()),
+                    node: core(node.into()),
+                    // Node n runs on core n.
+                    core: node.into(),
                     budget: 5_000_000,
                     period: 10_000_000,
                     class: 1,
@@ -157,21 +163,12 @@ impl S {
         assert_eq!(self.on_node(node, call), Err(error));
     }
 
-    #[track_caller]
-    fn deliver(&mut self, index: usize) {
-        self.sys.deliver(index);
-        assert_eq!(self.sys.check(), Ok(()));
-    }
-
+    /// What can happen at this instant happens: interrupts, steps of the
+    /// recovery reserves, the messages of the rings.
     #[track_caller]
     fn settle(&mut self) {
-        for _ in 0..64 {
-            if self.sys.pending().is_empty() {
-                return;
-            }
-            self.deliver(0);
-        }
-        panic!("messages without end");
+        self.sys.settle(100_000);
+        assert_eq!(self.sys.check(), Ok(()));
     }
 
     #[track_caller]
@@ -179,7 +176,7 @@ impl S {
         let to = self.sys.now() + ns;
         while self.sys.now() < to {
             let at = (self.sys.now() + 100_000).min(to);
-            self.sys.run(at, 100_000);
+            self.sys.advance(at);
             assert_eq!(self.sys.check(), Ok(()));
         }
     }
@@ -192,17 +189,19 @@ impl S {
         self.sys.node(node).woken(self.t[node as usize])
     }
 
-    /// Node 1 waits on the mailbox; node 0 sends it a message that lists
-    /// `caps`; every message settles.
+    /// Node 1 waits on its mailbox; node 0 grants it the frames `caps`
+    /// lists by `node_send`; every message settles.
     #[track_caller]
     fn transfer(&mut self, caps: Vec<Transfer>) {
         assert_eq!(self.on_node(1, recv(GOT)), WAITS);
-        let send = Syscall::Send {
-            target: core(1),
+        let send = Syscall::NodeSend {
+            node: core(1),
             message: msg(7, caps),
+            doorbell: SlotAddr::NONE,
         };
         assert_eq!(self.on_node(0, send), WAITS);
         self.settle();
+        assert_eq!(self.woken(0), Some(&Ok(Output::Sent { flags: 0 })));
     }
 
     /// The page size, the number of pages and the physical base of a frame.
@@ -235,7 +234,7 @@ fn the_holder_of_a_grant_loses_its_mapping_when_the_granter_is_accused() {
         Some(Rights::READ.union(Rights::WRITE))
     );
     // Node 1 kills node 0; the machine runs to the end of the reclaim.
-    m.ok(1, stop(0, CORE_STOP_KILL));
+    m.ok(1, stop(0, NODE_STOP_KILL));
     m.run(5 * MS);
     assert_eq!(m.state(0), MemberState::Dead);
     // R2 removed the holder's root remote capability and its mapping.
@@ -243,7 +242,11 @@ fn the_holder_of_a_grant_loses_its_mapping_when_the_granter_is_accused() {
     m.no(1, Syscall::CapInspect(s(GOT)), Error::Invalid);
     // And the next generation of node 0 takes the chunk without a trace of
     // the holder's leaf: the map count is 0 after R6.
-    m.ok(1, start(0, CORE_START_FRESH));
+    m.ok(1, start(0, NODE_START_FRESH));
+    // Node 1 starts core 0 in its recovery reserve; the core passes the
+    // entry stub and the node becomes live.
+    m.run(MS);
+    assert_eq!(m.state(0), MemberState::Live);
     let thread = m.sys.node(0).object_at_start(START_SLOT_THREAD);
     m.t[0] = thread;
     let geometry = m.geometry(0);
@@ -355,7 +358,10 @@ fn a_node_cannot_attach_or_detach_a_device_whose_identifier_another_node_holds()
     // Detached by node 0, the identifier is free: node 1 attaches it.
     assert_eq!(m.on_node(0, attach(SlotAddr::NONE)), WAITS);
     m.settle();
-    m.ok(1, attach(s(221)));
+    // Node 1 holds the unit role: its attach waits for its own unit.
+    assert_eq!(m.on_node(1, attach(s(221))), WAITS);
+    m.settle();
+    assert_eq!(m.woken(1), Some(&DONE));
     assert_eq!(m.sys.check(), Ok(()));
 }
 
@@ -378,7 +384,7 @@ fn a_node_that_dies_with_an_attached_device_leaves_no_context_entry() {
     m.settle();
     // Node 1 kills node 0, whose iospace serves a device: the unit's context
     // entry names node 0's generation, which R1 must clear.
-    m.ok(1, stop(0, CORE_STOP_KILL));
+    m.ok(1, stop(0, NODE_STOP_KILL));
     m.run(5 * MS);
     assert_eq!(m.state(0), MemberState::Dead);
 }

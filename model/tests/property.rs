@@ -150,7 +150,7 @@ const KINDS: [(ObjectKind, u32, u64); 12] = [
 /// untyped.
 const NOT_MADE: [ObjectKind; 9] = [
     ObjectKind::IoPorts,
-    ObjectKind::Core,
+    ObjectKind::Node,
     ObjectKind::Debug,
     ObjectKind::Vcpu,
     ObjectKind::Irq,
@@ -228,17 +228,17 @@ const NAMES: [&str; 64] = [
     "task_read",
     "thread_set_features",
     "sched_count",
-    "thread_move",
+    "node_send",
     "memory_take",
     "memory_give",
     "memory_split",
-    "core_start",
-    "core_stop",
-    "core_status",
-    "core_idle",
-    "core_watch",
-    "core_place",
-    "core_perf",
+    "node_start",
+    "node_stop",
+    "node_status",
+    "node_idle",
+    "node_watch",
+    "grant_signal",
+    "node_perf",
     "role_claim",
     "role_hand",
     "trace_emit",
@@ -247,10 +247,10 @@ const NAMES: [&str; 64] = [
     "ioports_issue",
     "entropy_read",
 ];
-/// The calls that never succeed on one node: `thread_move` needs a
-/// destination thread of another node (its successes are in
-/// `tests/cores.rs`), and `core_start` a dead node (`tests/recovery.rs`).
-const NEVER_ON_ONE_NODE: [&str; 2] = ["thread_move", "core_start"];
+/// The calls that never succeed on one node beside phantom nodes:
+/// `grant_signal` needs a remote frame, which only another node that runs
+/// grants, and `node_start` a dead node (both in `tests/machine.rs`).
+const NEVER_ON_ONE_NODE: [&str; 2] = ["grant_signal", "node_start"];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
 
@@ -307,17 +307,17 @@ fn name_of(call: &Syscall) -> usize {
         Syscall::TaskRead(_) => 43,
         Syscall::ThreadSetFeatures { .. } => 44,
         Syscall::SchedCount { .. } => 45,
-        Syscall::ThreadMove { .. } => 46,
+        Syscall::NodeSend { .. } => 46,
         Syscall::MemoryTake { .. } => 47,
         Syscall::MemoryGive { .. } => 48,
         Syscall::MemorySplit { .. } => 49,
-        Syscall::CoreStart { .. } => 50,
-        Syscall::CoreStop { .. } => 51,
-        Syscall::CoreStatus(_) => 52,
-        Syscall::CoreIdle { .. } => 53,
-        Syscall::CoreWatch { .. } => 54,
-        Syscall::CorePlace { .. } => 55,
-        Syscall::CorePerf { .. } => 56,
+        Syscall::NodeStart { .. } => 50,
+        Syscall::NodeStop { .. } => 51,
+        Syscall::NodeStatus { .. } => 52,
+        Syscall::NodeIdle { .. } => 53,
+        Syscall::NodeWatch { .. } => 54,
+        Syscall::GrantSignal(_) => 55,
+        Syscall::NodePerf { .. } => 56,
         Syscall::RoleClaim(_) => 57,
         Syscall::RoleHand { .. } => 58,
     }
@@ -635,24 +635,29 @@ impl Generator<'_> {
     /// of the phantom node. Seldom a stop: it ends what the phantom node
     /// can show.
     fn core_call(&mut self) -> Syscall {
-        let core = match self.rng.below(10) {
+        let node = match self.rng.below(10) {
             0..6 => own(CORE_SLOT),
             6..9 => own(CORE_SLOT + 1),
             _ => self.held(OTHER),
         };
+        let core = self.rng.below(3);
         match self.rng.below(20) {
-            0 => Syscall::CoreStart {
-                core,
+            0 => Syscall::NodeStart {
+                node,
                 mode: self.rng.below(3),
                 image: self.rng.below(3),
                 module: self.rng.below(3),
+                window: self.rng.below(2),
+                mask: self.rng.below(4),
             },
-            1 if self.rng.chance(10) => Syscall::CoreStop {
-                core,
+            1 if self.rng.chance(10) => Syscall::NodeStop {
+                node,
                 mode: self.rng.below(4),
+                core: self.rng.below(2),
             },
-            1 | 2 => Syscall::CoreStatus(core),
-            3..6 => Syscall::CoreIdle {
+            1 | 2 => Syscall::NodeStatus { node, core },
+            3..6 => Syscall::NodeIdle {
+                node,
                 core,
                 words: match self.rng.below(4) {
                     0 => Vec::new(),
@@ -661,8 +666,8 @@ impl Generator<'_> {
                     _ => vec![self.rng.below(5), 0, self.rng.below(4), self.rng.below(3)],
                 },
             },
-            6..12 => Syscall::CoreWatch {
-                core,
+            6..12 => Syscall::NodeWatch {
+                node,
                 index: self.rng.below(5),
                 notify: if self.rng.chance(30) {
                     SlotAddr::NONE
@@ -670,13 +675,11 @@ impl Generator<'_> {
                     self.held(NOTIFY)
                 },
             },
-            12..15 => Syscall::CorePlace {
-                core,
-                physical: self.rng.below(3),
-            },
+            12..15 => Syscall::GrantSignal(self.held(OTHER)),
             _ => {
                 let lowest = self.rng.below(300);
-                Syscall::CorePerf {
+                Syscall::NodePerf {
+                    node,
                     core,
                     lowest,
                     highest: lowest + self.rng.below(100),
@@ -990,7 +993,8 @@ impl Generator<'_> {
             },
             48 => Syscall::SchedConfigure {
                 sched: self.held(OTHER),
-                core: own(CORE_SLOT + self.rng.chance(5) as u32),
+                node: own(CORE_SLOT + self.rng.chance(5) as u32),
+                core: 0,
                 budget: self.duration(),
                 period: self.duration() * 4,
                 class: self.rng.below(4),
@@ -1002,7 +1006,7 @@ impl Generator<'_> {
             50 => Syscall::SchedUnbind(self.held(OTHER)),
             51 => Syscall::SchedSetCores {
                 sched: self.held(OTHER),
-                core: own(CORE_SLOT),
+                node: own(CORE_SLOT),
                 window: self.rng.chance(5) as u64,
                 mask: self.rng.below(4),
             },
@@ -1028,6 +1032,7 @@ impl Generator<'_> {
                     }
                     _ => self.rng.next(),
                 },
+                core: 0,
                 vector: if self.rng.chance(95) {
                     48 + self.rng.below(12)
                 } else {
@@ -1076,7 +1081,7 @@ impl Generator<'_> {
             },
             65 => Syscall::SchedCount {
                 sched: self.held(OTHER),
-                core: own(CORE_SLOT + self.rng.chance(5) as u32),
+                node: own(CORE_SLOT + self.rng.chance(5) as u32),
                 mode: self.rng.below(100).saturating_sub(95).min(2) + self.rng.chance(50) as u64,
             },
             66 => {
@@ -1123,21 +1128,23 @@ impl Generator<'_> {
                     self.find(UNTYPED, Wanted::Full)
                 },
             },
-            69 => Syscall::ThreadMove {
-                thread: self.held(THREAD),
-                destination: self.held(THREAD),
-                sched: self.held(OTHER),
-                core: own(CORE_SLOT + self.rng.chance(80) as u32),
-                budget: 0,
-                period: 0,
-                class: 0,
+            // Seldom to the phantom node, whose mailbox no kernel serves: the
+            // caller waits for an answer that never comes.
+            69 => Syscall::NodeSend {
+                node: own(CORE_SLOT + self.rng.chance(3) as u32),
+                message: Message::default(),
+                doorbell: if self.rng.chance(50) {
+                    SlotAddr::NONE
+                } else {
+                    self.held(NOTIFY)
+                },
             },
             70 => self.core_call(),
             71 => self.core_call(),
             72 => Syscall::RoleClaim(self.role()),
             73 => Syscall::RoleHand {
                 role: self.role(),
-                core: match self.rng.below(10) {
+                node: match self.rng.below(10) {
                     0 => SlotAddr::NONE,
                     1..6 => own(CORE_SLOT),
                     _ => own(CORE_SLOT + 1),
@@ -1340,7 +1347,8 @@ impl Generator<'_> {
                 calls.push(retype(ObjectKind::Sched, 0, sched));
                 calls.push(Syscall::SchedConfigure {
                     sched,
-                    core: own(CORE_SLOT),
+                    node: own(CORE_SLOT),
+                    core: 0,
                     budget: SCHED_MIN_BUDGET_NS,
                     period: 10_000_000,
                     class: self.rng.below(3),
@@ -1826,7 +1834,8 @@ fn start() -> (Model, ObjId) {
     let (mut model, first) = Model::boot(&Machine::example()).unwrap();
     let half = Syscall::SchedConfigure {
         sched: own(START_SLOT_SCHED),
-        core: own(CORE_SLOT),
+        node: own(CORE_SLOT),
+        core: 0,
         budget: 5_000_000,
         period: 10_000_000,
         class: 1,
@@ -1906,7 +1915,8 @@ fn refused_send(model: &mut Model, first: ObjId, reached: &mut Reached) {
         },
         Syscall::SchedConfigure {
             sched: s(4),
-            core: own(CORE_SLOT),
+            node: own(CORE_SLOT),
+            core: 0,
             budget: 100_000,
             period: 10_000_000,
             class: 1,
@@ -1990,7 +2000,8 @@ fn destroyed_space(model: &mut Model, first: ObjId, reached: &mut Reached) {
         },
         Syscall::SchedConfigure {
             sched: s(2),
-            core: own(CORE_SLOT),
+            node: own(CORE_SLOT),
+            core: 0,
             budget: 100_000,
             period: 10_000_000,
             class: 1,
@@ -2185,6 +2196,12 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             .filter_map(|&thread| Some((thread, model.marks(thread)?)))
             .collect();
         let outcome = model.apply(thread, call);
+        // A call that waits for a unit ends at the unit's confirmation, at
+        // the next step of the recovery reserve of node 0, which holds every
+        // unit role: what is due at this instant runs.
+        if outcome == Ok(Output::Waits) {
+            model.settle();
+        }
         // Tasks and marks: the effective marks of a thread never lose a bit
         // while the thread lives.
         for (thread, before) in marks {
@@ -2275,9 +2292,10 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
 
 /// The directed stop of the phantom node, to name it.
 fn stop_call() -> Syscall {
-    Syscall::CoreStop {
-        core: own(CORE_SLOT + 1),
-        mode: CORE_STOP_KILL,
+    Syscall::NodeStop {
+        node: own(CORE_SLOT + 1),
+        mode: NODE_STOP_KILL,
+        core: 0,
     }
 }
 
@@ -2446,12 +2464,16 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps, the smaller of the two geometries: untyped 294,
-    // cspace 11,859, aspace 31, frame 5,074, thread 14, sched 12, endpoint
-    // 897, reply 16, notify 38; a copy under `cap_delete` 325.
+    // Measured, in steps, the smaller of the two geometries: untyped 27,
+    // cspace 9,438, aspace 39, frame 9,509, thread 141, sched 13, endpoint
+    // 13, reply 920, notify 472. Pass 15 changed the generator (the calls
+    // of nodes); the larger counts of untyped and endpoint before it came
+    // each from one seed in which one object stayed dying for hundreds of
+    // steps. A copy under `cap_delete` 32 (325 before, 954 of them from
+    // three seeds).
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [140, 5900, 15, 2500, 7, 6, 440, 8, 19]);
-    at_least([reached.dying_copies], [160]);
+    at_least(dying, [13, 4700, 19, 4700, 70, 6, 6, 460, 236]);
+    at_least([reached.dying_copies], [16]);
 }
 
 #[test]
@@ -2515,9 +2537,10 @@ fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 31 queued callers, 10 callers that wait for the reply, 47
-    // receivers, 18 waiters on a notify; 14 of the ends by a wait number.
-    at_least(reached.cancelled, [15, 5, 23, 9]);
+    // Measured: 31 queued callers, 3 callers that wait for the reply (10
+    // before the generator of pass 15), 25 receivers, 13 waiters on a
+    // notify; the ends by a wait number below.
+    at_least(reached.cancelled, [15, 1, 12, 6]);
     at_least([reached.cancelled_by_number], [7]);
     // Measured, the smaller geometry: `call` 11, `recv` 7, `reply_recv` 1
     // and `wait` 3 returned `cancelled` at once.

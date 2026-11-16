@@ -142,7 +142,8 @@ impl K {
 fn configure(slot: u32, budget: u64, period: u64, class: u64) -> Syscall {
     Syscall::SchedConfigure {
         sched: s(slot),
-        core: s(CORE),
+        node: s(CORE),
+        core: 0,
         budget,
         period,
         class,
@@ -231,7 +232,8 @@ fn sched_configure_needs_manage_on_the_sched_and_write_on_the_core() {
     }
     let weak = |sched, core| Syscall::SchedConfigure {
         sched: s(sched),
-        core: s(core),
+        node: s(core),
+        core: 0,
         budget: 10 * US,
         period: 10 * MS,
         class: 1,
@@ -243,7 +245,8 @@ fn sched_configure_needs_manage_on_the_sched_and_write_on_the_core() {
     // before arguments that are wrong too.
     let other = Syscall::SchedConfigure {
         sched: s(40),
-        core: s(OTHER_CORE),
+        node: s(OTHER_CORE),
+        core: 0,
         budget: 1,
         period: 0,
         class: 9,
@@ -381,7 +384,7 @@ fn sched_set_cores_takes_a_window_and_a_mask_that_hold_the_core_of_the_kernel() 
     let mut k = K::new();
     let set = |core, window, mask| Syscall::SchedSetCores {
         sched: s(FIRST),
-        core: s(core),
+        node: s(core),
         window,
         mask,
     };

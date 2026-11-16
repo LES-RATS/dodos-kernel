@@ -46,7 +46,10 @@ impl K {
     }
 
     fn go(&mut self, call: Syscall) -> Outcome {
-        let outcome = self.m.apply(self.t, call);
+        // A call that waits for a unit (an attach, an unmap of an iospace
+        // that serves devices) ends at the unit's confirmation, which node 0,
+        // the holder of every unit role, checks at its next step.
+        let outcome = self.m.apply_settled(self.t, call);
         assert_eq!(self.m.check(), Ok(()));
         outcome
     }
@@ -770,24 +773,23 @@ fn dying_iospace_is_gone_for_map_and_attach_and_its_devices_detach() {
     k.ok(attach(0, 0x10));
 }
 
+/// D-131 (the eighth review's N5): the `iommu` object, a machine object,
+/// keeps no list; removing its root removes its descendants and destroys
+/// nothing, and the node keeps its own devices attached.
 #[test]
-fn destroying_the_iommu_object_detaches_its_list_most_recent_first() {
+fn removing_the_iommu_root_destroys_nothing_and_keeps_the_devices() {
     let mut k = K::new();
     for slot in 30..33 {
         k.retype(UT, IoSpace, 0, slot);
     }
-    // 40 devices over three iospaces, 0x10 first.
     for n in 0..40u64 {
         k.ok(attach(30 + (n / 16) as u32, 0x10 + n));
     }
-    // 32 detached in the first step, the most recently attached: the eight
-    // first stay, in the first iospace.
-    k.no(Syscall::CapDelete(s(IOMMU)), Error::Again);
-    assert_eq!(k.m.census().devices, 8);
-    // They are those of the first iospace: destroying it leaves none.
-    k.ok(Syscall::CapDelete(s(30)));
-    assert_eq!(k.m.census().devices, 0);
     k.ok(Syscall::CapDelete(s(IOMMU)));
+    assert_eq!(k.m.census().devices, 40);
+    // Destroying an iospace still detaches its devices.
+    k.ok(Syscall::CapDelete(s(32)));
+    assert_eq!(k.m.census().devices, 32);
 }
 
 #[test]

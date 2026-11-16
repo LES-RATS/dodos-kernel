@@ -226,7 +226,8 @@ impl K {
         let mut k = Self { m, t, spare: 4000 };
         k.ok(Syscall::SchedConfigure {
             sched: SlotAddr::own(START_SLOT_SCHED),
-            core: CORE,
+            node: CORE,
+            core: 0,
             budget: 5_000_000,
             period: 10_000_000,
             class: 1,
@@ -346,7 +347,8 @@ impl K {
         self.make(ObjectKind::Sched, sched);
         self.ok(Syscall::SchedConfigure {
             sched: s(sched),
-            core: CORE,
+            node: CORE,
+            core: 0,
             budget: 10_000,
             period: 10_000_000,
             class: 1,
@@ -668,7 +670,7 @@ fn segments_go_back_to_the_untyped_when_the_cspace_is_destroyed() {
     // The directory at 0, the segment at 8 KB, directories of 8 KB to the
     // end.
     for slot in 0..(bytes - 16384) / 8192 {
-        k.ok(retype(s(31), CSpace, 1024 * 128, s(1000 + slot as u32)));
+        k.ok(retype(s(31), CSpace, 512 * 128, s(1000 + slot as u32)));
     }
     k.no(retype(s(31), Endpoint, 0, s(40)), Error::NoMemory);
     for slot in 0..(bytes - 16384) / 8192 {
@@ -1616,13 +1618,13 @@ fn the_reserved_kind_is_unsupported() {
 #[test]
 fn kinds_never_made_from_an_untyped_are_invalid() {
     let mut k = K::new();
-    use ObjectKind::{Core, Debug, IoPorts, Iommu, Irq, IrqControl, MemoryControl, Role};
+    use ObjectKind::{Debug, IoPorts, Iommu, Irq, IrqControl, MemoryControl, Node, Role};
     for kind in [
         Irq,
         IrqControl,
         Iommu,
         MemoryControl,
-        Core,
+        Node,
         Role,
         Debug,
         IoPorts,
@@ -1716,7 +1718,7 @@ fn memory_is_aligned_on_the_size_of_the_object() {
     // which leaves room for a directory of a page at three, and nothing
     // after it.
     k.ok(retype(s(30), ASpace, 0, s(32)));
-    k.ok(retype(s(30), CSpace, page / 8 * 128, s(34)));
+    k.ok(retype(s(30), CSpace, page / 16 * 128, s(34)));
     k.no(retype(s(30), Endpoint, 0, s(33)), Error::NoMemory);
 }
 
@@ -1749,12 +1751,13 @@ fn kernel_object_larger_than_a_page_is_aligned_on_a_page() {
 #[test]
 fn cspace_directory_is_rounded_up_to_a_power_of_two() {
     let mut k = K::new();
-    // An untyped of a page, at least 8 KB, filled by directories of 513
-    // segments: 4,104 bytes each, rounded up to 8 KB.
+    // An untyped of a page, at least 8 KB, filled by directories of 257
+    // segments: 4,112 bytes each (16 bytes a segment since D-129), rounded
+    // up to 8 KB.
     let bytes = k.m.geometry().page().max(8192);
     k.ok(retype(UT, Untyped, bytes, s(30)));
     for slot in 0..bytes / 8192 {
-        k.ok(retype(s(30), CSpace, 513 * 128, s(31 + slot as u32)));
+        k.ok(retype(s(30), CSpace, 257 * 128, s(31 + slot as u32)));
     }
     k.no(retype(s(30), Endpoint, 0, s(29)), Error::NoMemory);
 }
@@ -3054,7 +3057,7 @@ fn segment_is_aligned_on_8_kb() {
     k.ok(retype(s(31), CSpace, 128, s(30)));
     k.go(grow_from(30, s(31))).unwrap();
     for slot in 0..(bytes - 16384) / 8192 {
-        k.ok(retype(s(31), CSpace, 1024 * 128, s(1000 + slot as u32)));
+        k.ok(retype(s(31), CSpace, 512 * 128, s(1000 + slot as u32)));
     }
     k.no(retype(s(31), Endpoint, 0, s(34)), Error::NoMemory);
 }
@@ -3554,11 +3557,12 @@ fn endpoint_reply_and_notify_take_64_bytes() {
 }
 
 #[test]
-fn directory_of_one_segment_takes_8_bytes() {
+fn directory_of_one_segment_takes_16_bytes() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    // Eight directories in the first 64 bytes, then endpoints.
-    for slot in 40..48 {
+    // Four directories in the first 64 bytes (16 bytes each since D-129: a
+    // segment's address and its sequence word), then endpoints.
+    for slot in 40..44 {
         k.ok(retype(s(30), CSpace, 128, s(slot)));
     }
     let fit = (k.m.geometry().page() / 64) as u32 - 1;
@@ -3572,11 +3576,11 @@ fn directory_of_one_segment_takes_8_bytes() {
 fn directory_is_aligned_on_its_size() {
     let mut k = K::new();
     k.make(Untyped, 30);
-    // 8 bytes at 0, then directories of half a page from half a page:
+    // 16 bytes at 0, then directories of half a page from half a page:
     // nothing is left.
     let half = k.m.geometry().page() / 2;
     k.ok(retype(s(30), CSpace, 128, s(40)));
-    k.ok(retype(s(30), CSpace, half / 8 * 128, s(41)));
+    k.ok(retype(s(30), CSpace, half / 16 * 128, s(41)));
     k.no(retype(s(30), Endpoint, 0, s(42)), Error::NoMemory);
 }
 
@@ -3898,7 +3902,7 @@ fn numbers_of_the_contract_are_those_of_the_interface() {
     assert_eq!((TREE_DEPTH, LONGEST_WALK), (64, 191));
     assert_eq!((REMOVAL_STEP, REMOVAL_SLOTS), (32, 128));
     assert_eq!((CSPACE_SEGMENT_SLOTS, CSPACE_MAX_SLOTS), (128, 1 << 20));
-    assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (64, 8));
+    assert_eq!((SLOT_BYTES, CSPACE_DIRECTORY_BYTES), (64, 16));
     assert_eq!((ENDPOINT_BYTES, REPLY_BYTES, NOTIFY_BYTES), (64, 64, 64));
     assert_eq!(
         (SCHED_BYTES, THREAD_FIXED_BYTES, x86_64::ASPACE_BYTES),

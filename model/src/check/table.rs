@@ -150,6 +150,54 @@ impl Model {
                 }
             }
         }
+        // A record *unmapping* counts its leaves until its invalidation is
+        // complete, and a failed unit's are kept for ever (D-131).
+        for cap in self.caps.values() {
+            let crate::Record::Unmapping(m) = cap.record else {
+                continue;
+            };
+            if self.remotes.contains_key(&cap.object) {
+                continue;
+            }
+            let Some(&frame) = self.frames.get(&cap.object) else {
+                continue;
+            };
+            let Some(bytes) = table.geometry.bytes(frame.page) else {
+                continue;
+            };
+            for page in m.first..m.first + m.count {
+                let start = frame.base + page * bytes;
+                let end = start + bytes;
+                if frame.memory != dodos_abi::MemoryType::WriteBack {
+                    let entry = table.devices.iter().position(|entry| {
+                        let base = entry.base();
+                        entry.is_used() && base <= start && end <= base + (1 << entry.log2())
+                    });
+                    if let Some(entry) = entry {
+                        entries[entry] += 1;
+                    }
+                    continue;
+                }
+                if frame.kept || table.kept.iter().any(|&(s, e)| s <= start && end <= e) {
+                    continue;
+                }
+                for c in start >> shift..end.div_ceil(1 << shift) {
+                    if let Some(count) = leaves.get_mut(c as usize) {
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        for (&chunk, &frozen) in &self.frozen {
+            if let Some(count) = leaves.get_mut(chunk as usize) {
+                *count += frozen;
+            }
+        }
+        for (&entry, &frozen) in &self.frozen_entries {
+            if let Some(count) = entries.get_mut(entry) {
+                *count += frozen;
+            }
+        }
         (leaves, entries)
     }
 
@@ -208,6 +256,15 @@ impl Model {
                         *count += 1;
                     }
                 }
+            }
+        }
+        // A record *unmapping* still counts its leaves until its
+        // invalidation is complete (G4, G6, D-131).
+        for cap in self.caps.values() {
+            if let crate::Record::Unmapping(m) = cap.record
+                && let Some(remote) = self.remotes.get(&cap.object)
+            {
+                *granted.entry(remote.use_entry).or_default() += m.count;
             }
         }
         let block_chunks: BTreeSet<u64> = self

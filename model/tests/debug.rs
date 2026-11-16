@@ -11,6 +11,9 @@ const UT: SlotAddr = SlotAddr::own(25);
 const DEBUG: SlotAddr = SlotAddr::own(START_SLOT_DEBUG);
 const PORTS: SlotAddr = SlotAddr::own(START_SLOT_IOPORTS);
 const MS: u64 = 1_000_000;
+/// An address no space of the node translates: a page fault on a translated
+/// address with the access asked is spurious and sends nothing (D-129).
+const UNMAPPED: u64 = 0x10_0000_0000;
 
 const fn s(index: u32) -> SlotAddr {
     SlotAddr::own(index)
@@ -139,14 +142,16 @@ fn debug_write_is_judged_rights_then_length_then_the_message_page() {
     k.ok(retype(Sched, 0, 102));
     k.ok(Syscall::SchedConfigure {
         sched: SlotAddr::own(START_SLOT_SCHED),
-        core: SlotAddr::own(16),
+        node: SlotAddr::own(16),
+        core: 0,
         budget: 5 * MS,
         period: 10 * MS,
         class: 1,
     });
     k.ok(Syscall::SchedConfigure {
         sched: s(102),
-        core: SlotAddr::own(16),
+        node: SlotAddr::own(16),
+        core: 0,
         budget: MS,
         period: 10 * MS,
         class: 1,
@@ -224,14 +229,16 @@ impl K {
         self.ok(retype(Sched, 0, 102));
         self.ok(Syscall::SchedConfigure {
             sched: SlotAddr::own(START_SLOT_SCHED),
-            core: SlotAddr::own(16),
+            node: SlotAddr::own(16),
+            core: 0,
             budget: 5 * MS,
             period: 10 * MS,
             class: 1,
         });
         self.ok(Syscall::SchedConfigure {
             sched: s(102),
-            core: SlotAddr::own(16),
+            node: SlotAddr::own(16),
+            core: 0,
             budget: MS,
             period: 10 * MS,
             class: 1,
@@ -251,7 +258,7 @@ fn a_fault_recorded_in_its_thread_is_traced_and_the_rate_limit_counts_the_rest()
     let b = k.spawn();
     // The thread has no fault endpoint: each fault is recorded in it.
     for _ in 0..20 {
-        k.m.fault(b, FaultKind::Page, [14, 2, 0x1000]);
+        k.m.fault(b, FaultKind::Page, [14, 2, UNMAPPED]);
         assert_eq!(k.m.check(), Ok(()));
         k.ok(Syscall::ThreadResume(s(101)));
     }
@@ -260,7 +267,7 @@ fn a_fault_recorded_in_its_thread_is_traced_and_the_rate_limit_counts_the_rest()
     assert_eq!(k.m.suppressed(), 4);
     // The first entry of a new window is preceded by code 3 with the count.
     k.m.advance(k.m.now() + 2 * MS);
-    k.m.fault(b, FaultKind::Page, [14, 2, 0x1000]);
+    k.m.fault(b, FaultKind::Page, [14, 2, UNMAPPED]);
     assert_eq!(k.m.check(), Ok(()));
     let ring = k.kernel();
     let n = ring.len();
@@ -271,7 +278,7 @@ fn a_fault_recorded_in_its_thread_is_traced_and_the_rate_limit_counts_the_rest()
     assert_eq!(ring[n - 1].code(), 5);
     // Its words: the kind, word 0 and word 4 of the fault.
     assert_eq!(ring[n - 1].payload[0], FaultKind::Page as u64);
-    assert_eq!(ring[n - 1].payload[2], 0x1000);
+    assert_eq!(ring[n - 1].payload[2], UNMAPPED);
 }
 
 // Hardware breakpoints and the user-interrupt word.
@@ -442,7 +449,7 @@ fn ioports_issue_narrows_the_range_and_inspect_returns_it() {
 #[test]
 fn port_calls_are_unsupported_off_x86_64() {
     let mut machine = Machine::example();
-    machine.arch = Arch::Other;
+    machine.arch = Arch::Aarch64;
     let mut k = K::on(&machine);
     k.no(port_in(s(4000), 0x70, 1), Error::Unsupported);
     k.no(port_out(s(4000), 0x70, 1, 0), Error::Unsupported);
@@ -491,7 +498,8 @@ fn entropy_read_changes_no_state_but_the_generators_and_pads_the_last_word() {
 #[test]
 fn a_failure_writes_a_committed_record_and_the_fence_does_not_overwrite_it() {
     let (mut sys, _) = System::boot(&Machine::example()).unwrap();
-    sys.panic(1, 3);
+    // Node 1 finds a failure in itself on its core (core number 1).
+    sys.fail(1, 0);
     let record = sys.node(0).crash_record(1);
     assert_eq!(record, Some((1, 1)));
     let failure = sys.node(1).ring(false).iter().any(|e| e.code() == 6);
@@ -505,9 +513,10 @@ fn a_failure_writes_a_committed_record_and_the_fence_does_not_overwrite_it() {
 #[test]
 fn the_fence_handler_writes_a_record_of_reason_5() {
     let (mut sys, t) = System::boot(&Machine::example()).unwrap();
-    let kill = Syscall::CoreStop {
-        core: SlotAddr::own(17),
-        mode: CORE_STOP_KILL,
+    let kill = Syscall::NodeStop {
+        node: SlotAddr::own(17),
+        mode: NODE_STOP_KILL,
+        core: 0,
     };
     assert_eq!(sys.apply(0, t[0], kill), DONE);
     sys.run(MS, MS / 10);
@@ -524,19 +533,23 @@ fn the_fence_handler_writes_a_record_of_reason_5() {
 #[test]
 fn a_node_started_fresh_keeps_its_rings_and_goes_on_from_their_sequences() {
     let (mut sys, t) = System::boot(&Machine::example()).unwrap();
-    let kill = Syscall::CoreStop {
-        core: SlotAddr::own(17),
-        mode: CORE_STOP_KILL,
+    let kill = Syscall::NodeStop {
+        node: SlotAddr::own(17),
+        mode: NODE_STOP_KILL,
+        core: 0,
     };
     assert_eq!(sys.apply(0, t[0], kill), DONE);
     sys.run(20 * MS, MS / 10);
-    let start = Syscall::CoreStart {
-        core: SlotAddr::own(17),
+    let start = Syscall::NodeStart {
+        node: SlotAddr::own(17),
         mode: 0,
         image: 0,
         module: 0,
+        window: 0,
+        mask: 1 << 1,
     };
     assert_eq!(sys.apply(0, t[0], start), DONE);
+    sys.run(sys.now() + MS, MS / 10);
     let ring = sys.node(1).ring(false);
     // Two entries of the start, one of each generation, and the record of
     // the dead generation is still there.
@@ -546,7 +559,7 @@ fn a_node_started_fresh_keeps_its_rings_and_goes_on_from_their_sequences() {
         .map(|e| e.generation())
         .collect();
     assert_eq!(starts, vec![1, 2]);
-    assert_eq!(sys.node(1).area_generation(1), 2);
+    assert_eq!(sys.node(1).area_generation(1), (2, 1));
     assert_eq!(sys.node(0).crash_record(1), Some((1, 5)));
     let _ = (Endpoint, Task);
 }
@@ -645,58 +658,6 @@ fn destroying_a_thread_with_every_link_takes_one_step_of_at_most_8_units() {
 }
 
 #[test]
-fn calls_on_debug_and_ioports_of_another_node_run_on_the_callers_node() {
-    let (mut sys, t) = System::boot(&Machine::example()).unwrap();
-    // Node 0 gives node 1 copies of its `debug` and `ioports` capabilities.
-    let reply = retype(ObjectKind::Reply, 0, 99);
-    assert_eq!(sys.apply(1, t[1], reply), DONE);
-    let recv = Syscall::Recv {
-        endpoint: s(START_SLOT_MAILBOX),
-        reply: s(99),
-        range: Range {
-            first: s(110),
-            count: 2,
-        },
-        wait: 0,
-    };
-    assert_eq!(sys.apply(1, t[1], recv), Ok(Output::Waits));
-    let send = Syscall::Send {
-        target: SlotAddr::own(17),
-        message: Message {
-            caps: vec![
-                Transfer::Derive(DEBUG, Rights::ALL.without(Rights::EXEC).bits()),
-                Transfer::Derive(PORTS, Rights::ALL.without(Rights::EXEC).bits()),
-            ],
-            ..Message::default()
-        },
-    };
-    assert_eq!(sys.apply(0, t[0], send), Ok(Output::Waits));
-    sys.settle(16);
-    let before = sys.pending().len();
-    let emit = Syscall::TraceEmit {
-        debug: s(110),
-        words: [7, 8, 9],
-    };
-    assert_eq!(sys.apply(1, t[1], emit), DONE);
-    // No message between kernels; the entry is in node 1's own ring.
-    assert_eq!(sys.pending().len(), before);
-    assert_eq!(
-        sys.node(1).ring(true).last().map(|e| e.payload),
-        Some([7, 8, 9])
-    );
-    assert!(sys.node(0).ring(true).is_empty());
-    let port = Syscall::IoportOut {
-        ioports: s(111),
-        port: 0x80,
-        width: 1,
-        value: 5,
-    };
-    assert_eq!(sys.apply(1, t[1], port), DONE);
-    assert_eq!(sys.pending().len(), before);
-    assert_eq!(sys.check(), Ok(()));
-}
-
-#[test]
 fn a_change_of_a_role_word_is_traced_by_the_node_that_made_it() {
     let mut k = K::new();
     assert!(matches!(
@@ -724,12 +685,12 @@ fn debug_port_and_entropy_rules_that_no_test_pinned() {
     let b = k.spawn();
     let t0 = k.m.now();
     for _ in 0..17 {
-        k.m.fault(b, FaultKind::Page, [14, 2, 0x1000]);
+        k.m.fault(b, FaultKind::Page, [14, 2, UNMAPPED]);
         k.ok(Syscall::ThreadResume(s(101)));
     }
     assert_eq!(k.m.suppressed(), 1);
     k.m.advance(t0 + TRACE_BURST_NS);
-    k.m.fault(b, FaultKind::Page, [14, 2, 0x1000]);
+    k.m.fault(b, FaultKind::Page, [14, 2, UNMAPPED]);
     let ring = k.kernel();
     assert_eq!(ring[ring.len() - 2].code(), 3);
 

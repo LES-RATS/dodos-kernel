@@ -2,7 +2,7 @@
 
 use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
-    Place, Record, ReplyState, Sched, Slot, Sweep, Task, Thread, Untyped, live,
+    Place, Record, ReplyState, Sched, Slot, Sweep, Task, Thread, Untyped, live, locked,
 };
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
@@ -69,6 +69,10 @@ enum Undone {
     Unit,
     /// Nothing is left to undo.
     Nothing,
+    /// The step must end with `again`: a thread to leave another core, an
+    /// invalidation of other cores or of a unit in flight, a count not yet
+    /// 0, or no entry of the unit request table free.
+    Wait,
 }
 
 /// What `cap_delete` and `cap_revoke` remove.
@@ -147,7 +151,7 @@ fn footprint(
         | ObjectKind::IrqControl
         | ObjectKind::Iommu
         | ObjectKind::MemoryControl
-        | ObjectKind::Core
+        | ObjectKind::Node
         | ObjectKind::Role
         | ObjectKind::Debug
         | ObjectKind::IoPorts => return Err(Error::Invalid),
@@ -240,11 +244,6 @@ impl Model {
             // Removal ends: from the first step the capability is dying,
             // and only `cap_delete` can still use it.
             Some(&Slot::Full(cap)) => {
-                // `thread_move`: the root of a thread or a context in a move
-                // in flight is removed only after the answer.
-                if self.rooted(cap).is_some_and(|object| self.in_move(object)) {
-                    return Err(Error::Again);
-                }
                 live(&mut self.caps, cap).dying = true;
                 self.remover = Some(thread);
                 let outcome = self.remove(cap, Removal::DescendantsThenSelf);
@@ -329,7 +328,7 @@ impl Model {
         // table page.
         if self.aspaces.contains_key(&id) {
             let class = self.root_class(id);
-            live(&mut self.aspaces, id).root = Some(base);
+            locked(&mut self.aspaces, &self.locks, id).root = Some(base);
             let page = base / self.machine.geometry.page();
             self.table.set_class(page, Some(class));
         }
@@ -369,7 +368,8 @@ impl Model {
     /// judged on the node's own kind (`invalid`, then `unsupported`); the
     /// thread's bytes follow from it.
     pub(crate) fn thread_size(&self, mask: u64) -> Result<u64, Error> {
-        let (list, kind) = (self.machine.features(), self.machine.own_kind(self.node));
+        let kind = self.machine.kind_of(self.cores[0].number as usize);
+        let list = self.machine.features();
         let mask = FeatureMask::from_raw(mask);
         mask.check(list, &kind)?;
         thread_bytes(mask, list, &kind).ok_or(Error::Unsupported)
@@ -684,8 +684,21 @@ impl Model {
             if let Some(object) = self.rooted(next) {
                 match self.undo(object) {
                     Undone::Unit => continue,
+                    Undone::Wait => return Err(Error::Again),
                     Undone::Nothing => {}
                 }
+            }
+            // A removal step never waits: a record whose invalidation needs
+            // other cores or a unit is cleared, its invalidation started,
+            // and the step returns `again`; a capability whose record is
+            // unmapping is not removed until it is empty.
+            match self.caps[&next].record {
+                Record::Unmapping(_) => return Err(Error::Again),
+                Record::Mapping(_) => match self.begin_unmap(next, None) {
+                    Ok(crate::memory::Unmapped::Done) => {}
+                    _ => return Err(Error::Again),
+                },
+                _ => {}
             }
             // Grants: removing an anchor revokes its grant, and may wait for
             // the holder's node to remove what it holds of it.
@@ -733,11 +746,6 @@ impl Model {
             );
             self.longest_walk = self.longest_walk.max(walk);
             if let Some(object) = self.rooted(cap) {
-                // `thread_move`: the thread and its context are frozen until
-                // the answer; the step returns `again`, changing nothing.
-                if self.in_move(object) {
-                    return None;
-                }
                 live(&mut self.caps, cap).dying = true;
                 if self.scheds.get(&object).is_some_and(|sched| !sched.retired) {
                     self.sched_dying(object);
@@ -849,12 +857,55 @@ impl Model {
             // Destruction of an address space: first the record of each
             // capability in its list is emptied, most recently mapped first,
             // then each thread is unbound.
+            // Its first step invalidates every translation tagged for it on
+            // every core that loaded the tag, by the request of its core when
+            // that takes acknowledgements; the step returns `again` until the
+            // request is complete. A record still unmapping by an earlier
+            // unmap is waited for.
             ObjectKind::ASpace => {
+                // The invalidation is not one of the 32 units of a step.
+                if !self.aspaces[&object].flushed {
+                    if self.request_free().is_err() {
+                        return Undone::Wait;
+                    }
+                    let flush = crate::cores::Flush::Tag(object);
+                    let completes = crate::cores::Completes::Destroy(object);
+                    match self.start_request(flush, completes, None) {
+                        crate::cores::Started::Complete => {
+                            locked(&mut self.aspaces, &self.locks, object).flushed = true;
+                        }
+                        _ => return Undone::Wait,
+                    }
+                }
                 let aspace = &self.aspaces[&object];
                 match (aspace.records.last().copied(), last(&aspace.threads)) {
-                    (Some(cap), _) => self.empty_mapping(cap),
+                    (Some(cap), _) => match self.caps[&cap].record {
+                        Record::Unmapping(_) => return Undone::Wait,
+                        _ => self.empty_mapping(cap),
+                    },
                     (None, Some(thread)) => self.bind_aspace(thread, None),
                     (None, None) => return Undone::Nothing,
+                }
+            }
+            // A thread: first its place on a core, if it runs on another
+            // core of its node; that core is asked to leave it, and the step
+            // returns `again` until it has.
+            ObjectKind::Thread if self.mark_leaving(object) || self.threads[&object].leaving => {
+                return Undone::Wait;
+            }
+            // A block of a run: its map counts must be 0 (the step returns
+            // `again` while translations are removed), then the run is
+            // unmapped from the kernel's own space and that invalidated on
+            // every core of the node, idle ones included, before any word is
+            // written (G5).
+            ObjectKind::Untyped if self.untypeds[&object].block.is_some() => {
+                if self.mapped_block(object) {
+                    return Undone::Wait;
+                }
+                match self.unmap_block(object) {
+                    Some(true) => return Undone::Unit,
+                    Some(false) => return Undone::Wait,
+                    None => return Undone::Nothing,
                 }
             }
             ObjectKind::Endpoint => match last(&self.endpoints[&object].threads) {
@@ -870,27 +921,45 @@ impl Model {
             ObjectKind::Notify
                 if self.disarm_one(object)
                     || self.unbind_one_irq(object)
-                    || self.unwatch_one(object) => {}
+                    || self.unwatch_one(object)
+                    || self.undoorbell_one(object) => {}
             ObjectKind::Task if self.detach_one(object) => {}
             // IOMMU: the destruction of an iospace first detaches each of its
             // devices, most recently attached first, then empties each record
             // of its list, most recently mapped first.
+            // Once its devices are detached, it serves none, and its records
+            // are emptied with their counts lowered once the detaches are
+            // confirmed; a unit that failed keeps the counts.
             ObjectKind::IoSpace => {
                 let device = self.iospaces[&object].last().copied();
                 match (device, self.aspaces[&object].records.last().copied()) {
-                    (Some((iommu, device)), _) => self.detach(iommu, device),
-                    (None, Some(cap)) => self.empty_mapping(cap),
+                    (Some((iommu, device)), _) => {
+                        if self.detach(iommu, device).is_err() {
+                            return Undone::Wait;
+                        }
+                    }
+                    (None, Some(cap)) => {
+                        let units = self.aspaces[&object].units.clone();
+                        let roles: Vec<usize> = units.iter().map(|&u| self.unit_role(u)).collect();
+                        let pending = self.unit_requests.iter().flatten().any(|e| {
+                            roles.contains(&e.role)
+                                && matches!(e.op, crate::rings::UnitOp::Detach { .. })
+                        });
+                        if pending {
+                            return Undone::Wait;
+                        }
+                        match self.caps[&cap].record {
+                            Record::Unmapping(_) => return Undone::Wait,
+                            _ if roles.iter().any(|&r| self.unit_failed(r)) => {
+                                self.clear_mapping_pub(cap);
+                                self.freeze_unmapping(cap);
+                            }
+                            _ => self.empty_mapping(cap),
+                        }
+                    }
                     (None, None) => return Undone::Nothing,
                 }
             }
-            // IOMMU: an `iommu` keeps the list of the devices attached
-            // through it; destroying it detaches them in the order of that
-            // list, most recently attached first, one unit each. With no
-            // device attached it is destroyed in one step.
-            ObjectKind::Iommu => match self.iommus[&object].order.last() {
-                Some(&device) => self.detach(object, device),
-                None => return Undone::Nothing,
-            },
             _ => return Undone::Nothing,
         }
         Undone::Unit
@@ -923,7 +992,7 @@ impl Model {
         match self.caps[&id].record {
             Record::Binding(thread) => self.bind_page(thread, None),
             Record::Mapping(_) => self.empty_mapping(id),
-            Record::Empty => {}
+            Record::Unmapping(_) | Record::Empty => {}
         }
         let cap = self.caps.remove(&id).expect("names a live entry");
         if let Some(parent) = cap.parent {
@@ -994,13 +1063,14 @@ impl Model {
                     self.release(untyped);
                 }
             }
-            ObjectKind::Iommu => {
-                self.iommus.remove(&id);
-            }
+            // A machine object is destroyed by no removal: removing its root
+            // removes its descendants. The node keeps its own list of its
+            // devices on the unit.
+            ObjectKind::Iommu | ObjectKind::Node | ObjectKind::Role => {}
             ObjectKind::Endpoint => {
                 let endpoint = self.endpoints.remove(&id).expect("names a live entry");
                 if let Some(notify) = endpoint.notify {
-                    live(&mut self.notifies, notify).endpoint = None;
+                    locked(&mut self.notifies, &self.locks, notify).endpoint = None;
                 }
             }
             // The budget follows the call: destroying a reply object takes
@@ -1018,7 +1088,7 @@ impl Model {
             ObjectKind::Notify => {
                 let notify = self.notifies.remove(&id).expect("names a live entry");
                 if let Some(endpoint) = notify.endpoint {
-                    live(&mut self.endpoints, endpoint).notify = None;
+                    locked(&mut self.endpoints, &self.locks, endpoint).notify = None;
                 }
             }
             _ => {}

@@ -33,10 +33,17 @@ pub const SLOT_FRAME_DEVICE: u64 = 1 << 29;
 pub const SLOT_FRAME_PAGES_SHIFT: u32 = 30;
 pub const SLOT_FRAME_FIRST_SHIFT: u32 = 42;
 /// A frame, word 2: the kind of the record (bits 0-1: 0 empty, 1 mapping,
-/// 2 message page binding) and the rights of a mapping (2-4).
+/// 2 message page binding, 3 unmapping) and the rights of a mapping (2-4).
 pub const SLOT_RECORD_EMPTY: u64 = 0;
 pub const SLOT_RECORD_MAPPING: u64 = 1;
 pub const SLOT_RECORD_BINDING: u64 = 2;
+/// Record kind 3, *unmapping*: a mapping whose entries are cleared and
+/// whose invalidation on other cores of the node, or by an IOMMU unit, is
+/// not complete (D-131).
+pub const SLOT_RECORD_UNMAPPING: u64 = 3;
+/// An `irq`, word 1: the number of its core in bits 16-31, the index of its
+/// entry in that core's interrupt table in bits 0-15 (D-129).
+pub const SLOT_IRQ_CORE_SHIFT: u32 = 16;
 pub const SLOT_RECORD_RIGHTS_SHIFT: u32 = 2;
 /// An untyped, in word 0: the log2 of its size (25-30), device memory (31),
 /// a clean mark (32), a block (33), the block is a device entry (34), the
@@ -221,9 +228,6 @@ impl GateWord {
 }
 pub const GRANT_ENTRY_BYTES: usize = 128;
 pub const USE_ENTRY_BYTES: usize = 32;
-/// Proxies each node keeps for each other node, and their bytes.
-pub const PROXIES_PER_PEER: usize = 16;
-pub const PROXY_BYTES: usize = 1024;
 /// Unused entries of the device table, for splits.
 pub const DEVICE_TABLE_SPARE: usize = 8192;
 /// Reserves, from 2 to 8 (1 on a machine with one usable core), and plain
@@ -233,7 +237,7 @@ pub const RESERVES_MAX: u32 = 8;
 pub const ROLES_PLAIN_MAX: u32 = 64;
 /// The watch slots of a node, the entries of an idle table, the open
 /// observations of a node.
-pub const CORE_WATCH_SLOTS: u64 = 4;
+pub const NODE_WATCH_SLOTS: u64 = 4;
 pub const IDLE_STATES_MAX: usize = 15;
 pub const OBSERVATIONS_MAX: usize = 8;
 /// Words of one entry of an idle table.
@@ -247,9 +251,22 @@ pub const STALE_RANGE_NS: (u64, u64) = (10_000_000, 1_000_000_000);
 pub const SWEEP_NS: u64 = 1_000_000_000;
 pub const SWEEP_RANGE_NS: (u64, u64) = (100_000_000, 60_000_000_000);
 pub const NMI_GRACE_NS: u64 = 1_000_000;
-pub const FENCE_NS: u64 = 10_000_000;
+/// 20 ms since D-129 (it was 10 ms, less than the SDM's example of INIT and
+/// SIPI alone), within 10 ms to 1 s.
+pub const FENCE_NS: u64 = 20_000_000;
+pub const FENCE_RANGE_NS: (u64, u64) = (10_000_000, 1_000_000_000);
 pub const SETTLE_NS: u64 = 1_000_000;
 pub const START_NS: u64 = 1_000_000_000;
+/// The time a node may stay sealed before evidence seal accuses it.
+pub const SEAL_NS: u64 = 1_000_000_000;
+pub const SEAL_RANGE_NS: (u64, u64) = (10_000_000, 60_000_000_000);
+/// The time a core of a node may take to release a lock of the node or to
+/// acknowledge a request of another core of its node; beyond it the node
+/// accuses itself (A node of several cores).
+pub const CORE_ANSWER_NS: u64 = 10_000_000;
+pub const CORE_ANSWER_RANGE_NS: (u64, u64) = (1_000_000, 100_000_000);
+/// Cores of one node at most: the bitmaps of a node's cores are 64 bits.
+pub const CORES_PER_KERNEL_MAX: usize = 64;
 /// Observations expire after this many times `STALE_NS`.
 pub const OBSERVATION_LIFE: u64 = 4;
 /// The recovery reserve: 1/64 of a core in the units of admission, period
@@ -257,22 +274,24 @@ pub const OBSERVATION_LIFE: u64 = 4;
 pub const RECOVERY_BANDWIDTH: u64 = 1 << 26;
 pub const RECOVERY_PERIOD_NS: u64 = 10_000_000;
 
-// The calls of the cores.
-pub const CORE_START_FRESH: u64 = 0;
-pub const CORE_START_RESUME: u64 = 1;
-/// Kernel images of `core_start`: the boot kernel and the replacement slot.
-pub const CORE_IMAGE_BOOT: u64 = 0;
-pub const CORE_IMAGE_REPLACEMENT: u64 = 1;
-pub const CORE_STOP_KILL: u64 = 0;
-pub const CORE_STOP_SEAL: u64 = 1;
-pub const CORE_STOP_RETIRE: u64 = 2;
-/// Word 1 of `core_status`: the physical core in bits 0-31, then these.
-pub const CORE_STATUS_PARKED: u64 = 1 << 32;
-pub const CORE_STATUS_UNUSABLE: u64 = 1 << 33;
-pub const CORE_STATUS_FENCE_SHIFT: u32 = 34;
-/// Words of the result of `core_status`.
-pub const CORE_STATUS_WORDS: usize = 7;
-/// Methods and flags of an idle table (`core_idle`).
+// The calls of the nodes.
+pub const NODE_START_FRESH: u64 = 0;
+pub const NODE_START_RESUME: u64 = 1;
+/// Kernel images of `node_start`: the boot kernel and the replacement slot.
+pub const NODE_IMAGE_BOOT: u64 = 0;
+pub const NODE_IMAGE_REPLACEMENT: u64 = 1;
+pub const NODE_STOP_KILL: u64 = 0;
+pub const NODE_STOP_SEAL: u64 = 1;
+pub const NODE_STOP_RETIRE: u64 = 2;
+/// Word 1 of `node_status`: the number of cores whose words name the node
+/// (bits 0-15), its fence class (bits 16-17), and bit 18 set if the core
+/// asked is unusable.
+pub const NODE_STATUS_CORES_MASK: u64 = 0xFFFF;
+pub const NODE_STATUS_CLASS_SHIFT: u32 = 16;
+pub const NODE_STATUS_UNUSABLE: u64 = 1 << 18;
+/// Words of the result of `node_status`.
+pub const NODE_STATUS_WORDS: usize = 7;
+/// Methods and flags of an idle table (`node_idle`).
 pub const IDLE_METHOD_HALT: u64 = 0;
 pub const IDLE_METHOD_MWAIT: u64 = 1;
 pub const IDLE_METHOD_PSCI: u64 = 2;
@@ -525,14 +544,17 @@ pub enum Evidence {
     Stuck = 3,
     Kill = 4,
     Retire = 5,
-    Host = 6,
+    /// The node is sealed, and the instant of its seal is older than
+    /// `SEAL_NS` (D-129, in place of the evidence host).
+    Seal = 6,
 }
 
 /// The driver field of a member word with no driver.
 pub const DRIVER_NONE: u16 = 0xFFFF;
 
-/// The member word of a node: state (0-3), evidence (4-6), zero (7-15),
-/// driver (16-31), generation (32-63).
+/// The member word of a node: state (0-3), evidence (4-6), the node's fence
+/// class (7-8, the lowest class of its cores, written when it starts), zero
+/// (9-15), driver (16-31), generation (32-63).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Member(u64);
@@ -552,12 +574,24 @@ impl Member {
         Self::new(MemberState::Dead, Evidence::None, DRIVER_NONE, 0)
     }
 
-    /// `None` for a state 8 to 15, an evidence 7, or a bit 7-15 set.
+    /// The same word with the fence class `class` (0 to 2) in bits 7-8.
+    pub const fn with_class(self, class: u8) -> Self {
+        Self(self.0 & !(0b11 << 7) | ((class & 0b11) as u64) << 7)
+    }
+
+    /// `None` for a state 8 to 15, an evidence 7, a class 3 (CONTRACT-GAP
+    /// 1: no fence class 3 exists, so the word that holds one is refused as
+    /// a state 8 is), or a bit 9-15 set.
     pub const fn from_raw(raw: u64) -> Option<Self> {
-        if raw & 0xf >= 8 || raw >> 4 & 0x7 == 7 || raw >> 7 & 0x1ff != 0 {
+        if raw & 0xf >= 8 || raw >> 4 & 0x7 == 7 || raw >> 7 & 0b11 == 3 || raw >> 9 & 0x7f != 0 {
             return None;
         }
         Some(Self(raw))
+    }
+
+    /// The node's fence class, bits 7-8.
+    pub const fn class(self) -> u8 {
+        (self.0 >> 7 & 0b11) as u8
     }
 
     pub const fn raw(self) -> u64 {
@@ -585,7 +619,7 @@ impl Member {
             3 => Evidence::Stuck,
             4 => Evidence::Kill,
             5 => Evidence::Retire,
-            _ => Evidence::Host,
+            _ => Evidence::Seal,
         }
     }
 
@@ -610,19 +644,20 @@ impl Member {
 /// node). The gate checks the condition of each row besides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transition {
-    /// dead (g) → starting (g + 1), by `core_start` mode fresh.
+    /// dead (g) → starting (g + 1), by `node_start` mode fresh, with the
+    /// class of the cores named.
     Start,
-    /// sealed (g) → starting (g), by `core_start` mode resume.
+    /// sealed (g) → starting (g), by `node_start` mode resume.
     Resume,
     /// starting (g) → live (g), by the node itself.
     Up,
-    /// live (g) → sealing (g), by `core_stop` mode seal.
+    /// live (g) → sealing (g), by `node_stop` mode seal.
     Seal,
     /// sealing (g) → sealed (g), by the node itself.
     Sealed,
-    /// starting, live (g) → sealed (g), by the driver of the fence of
-    /// another node placed on the same core, after a confirmed stop.
-    HostSealed,
+    /// sealing (g) → live (g), by the node itself when no other node is
+    /// live (D-131).
+    Abandon,
     /// starting, live, sealing, sealed (g) → fencing (g), with evidence.
     Accuse,
     /// fencing or unfenced (g), driver D → the same state, driver E.
@@ -641,11 +676,13 @@ pub enum Transition {
 /// `from` into `to`, `None` if none does. Evidence and driver must be what
 /// the row writes: an accusation names evidence other than none and a
 /// driver; every other row keeps both, except a start, which clears them,
-/// and a change of driver, which keeps the evidence.
+/// and a change of driver, which keeps the evidence. The fence class is
+/// written by a fresh start only, and every other row keeps it: a node's
+/// cores do not change while it lives.
 pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
     use MemberState::{Dead, Fenced, Fencing, Live, Sealed, Sealing, Starting, Unfenced};
     let (g, h) = (from.generation(), to.generation());
-    let same = g == h;
+    let same = g == h && from.class() == to.class();
     let kept = from.evidence() as u8 == to.evidence() as u8 && from.driver() == to.driver();
     let cleared = matches!(to.evidence(), Evidence::None) && to.driver() == DRIVER_NONE;
     let accused = !matches!(to.evidence(), Evidence::None) && to.driver() != DRIVER_NONE;
@@ -655,7 +692,7 @@ pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
         (Starting, Live) if same && kept => Some(Transition::Up),
         (Live, Sealing) if same && kept => Some(Transition::Seal),
         (Sealing, Sealed) if same && kept => Some(Transition::Sealed),
-        (Starting | Live, Sealed) if same && cleared => Some(Transition::HostSealed),
+        (Sealing, Live) if same && kept => Some(Transition::Abandon),
         (Starting | Live | Sealing | Sealed, Fencing) if same && accused => {
             Some(Transition::Accuse)
         }
@@ -677,16 +714,27 @@ pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
 
 /// The successor of a unit role whose holder is no longer live (Roles): the
 /// first node after `holder` in cyclic index order among the live nodes
-/// whose core has the highest fence class found among live nodes. `classes`
-/// gives the fence class of the core of each node. `None` when no node is
-/// live.
-pub fn successor(members: &[Member], classes: &[u8], holder: usize) -> Option<usize> {
-    let n = members.len().min(classes.len());
+/// whose fence class, in their member word, is the highest found among live
+/// nodes. `None` when no node is live.
+pub fn successor(members: &[Member], holder: usize) -> Option<usize> {
+    let n = members.len();
     let live = |i: usize| matches!(members[i].state(), MemberState::Live);
-    let best = (0..n).filter(|&i| live(i)).map(|i| classes[i]).max()?;
+    let best = (0..n)
+        .filter(|&i| live(i))
+        .map(|i| members[i].class())
+        .max()?;
     (1..=n)
         .map(|step| (holder + step) % n)
-        .find(|&i| live(i) && classes[i] == best)
+        .find(|&i| live(i) && members[i].class() == best)
+}
+
+/// The best fence class among live nodes, read from their member words;
+/// `None` when no node is live.
+pub fn best_class(members: &[Member]) -> Option<u8> {
+    let live = members
+        .iter()
+        .filter(|m| matches!(m.state(), MemberState::Live));
+    live.map(|m| m.class()).max()
 }
 
 /// What the reclaim barrier reads of one node *Y* ≠ *X* (The reclaim
@@ -716,6 +764,129 @@ pub fn barrier(generation: u32, others: &[BarrierView], unit_roles_clear: bool) 
             MemberState::Fenced => !y.maps || y.acknowledged_by_all,
             MemberState::Dead => true,
         })
+}
+
+// Node slots and core words.
+
+/// The state of a core word, bits 0-1.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreState {
+    /// No node holds the core; it executes no kernel.
+    Free = 0,
+    /// The core runs the node the word names.
+    Owned = 1,
+    /// Reserved for nodes that give cores at run time: no rule of the
+    /// contract writes it, and the gate refuses to.
+    Leaving = 2,
+    /// The node the word names is starting on the core.
+    Joining = 3,
+}
+
+/// Bit 2 of a core word: the driver of the fence of the node the word
+/// names has asked the core to stop.
+pub const CORE_MARK: u64 = 1 << 2;
+/// Bit 3 of a core word: the core is not started again before the machine
+/// restarts.
+pub const CORE_UNUSABLE: u64 = 1 << 3;
+/// The node slot field of a core word that names no node.
+pub const CORE_NO_SLOT: u16 = 0xFFFF;
+
+/// The core word of a physical core (Node slots and core words): state
+/// (0-1), the fence mark (2), unusable (3), the check (4-15: the top 12
+/// bits of the product by `CHECK_MUL` of the word with its check bits 0),
+/// the node slot (16-31, 0xFFFF for none), the node's generation (32-63, 0
+/// when free).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreWord(u64);
+
+impl CoreWord {
+    const CHECK: u64 = 0xfff << 4;
+
+    const fn checked(v: u64) -> Self {
+        let v = v & !Self::CHECK;
+        Self(v | (v.wrapping_mul(CHECK_MUL) >> 52) << 4)
+    }
+
+    const fn make(state: CoreState, slot: u16, generation: u32, flags: u64) -> Self {
+        Self::checked(
+            state as u64
+                | flags & (CORE_MARK | CORE_UNUSABLE)
+                | (slot as u64) << 16
+                | (generation as u64) << 32,
+        )
+    }
+
+    /// Free: no slot, generation 0, the flag unusable as given.
+    pub const fn free(unusable: bool) -> Self {
+        let flags = if unusable { CORE_UNUSABLE } else { 0 };
+        Self::make(CoreState::Free, CORE_NO_SLOT, 0, flags)
+    }
+
+    /// Joining (N, g): node slot N of generation g is starting on the core.
+    pub const fn joining(slot: u16, generation: u32) -> Self {
+        Self::make(CoreState::Joining, slot, generation, 0)
+    }
+
+    /// Owned (N, g): the core runs node slot N of generation g.
+    pub const fn owned(slot: u16, generation: u32) -> Self {
+        Self::make(CoreState::Owned, slot, generation, 0)
+    }
+
+    /// The same word with the fence mark.
+    pub const fn marked(self) -> Self {
+        Self::checked(self.0 | CORE_MARK)
+    }
+
+    /// The same word with the flag unusable.
+    pub const fn unusable(self) -> Self {
+        Self::checked(self.0 | CORE_UNUSABLE)
+    }
+
+    /// The word, or `None` if its check fails: such a word counts as held
+    /// by another live node (the reader traces it, code 10).
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        let word = Self::checked(raw);
+        if word.0 == raw { Some(word) } else { None }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn state(self) -> CoreState {
+        match self.0 & 0b11 {
+            0 => CoreState::Free,
+            1 => CoreState::Owned,
+            2 => CoreState::Leaving,
+            _ => CoreState::Joining,
+        }
+    }
+
+    pub const fn is_marked(self) -> bool {
+        self.0 & CORE_MARK != 0
+    }
+
+    pub const fn is_unusable(self) -> bool {
+        self.0 & CORE_UNUSABLE != 0
+    }
+
+    pub const fn slot(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Whether the word names node slot `slot` with generation `generation`
+    /// (owned or joining).
+    pub const fn names(self, slot: u16, generation: u32) -> bool {
+        matches!(self.state(), CoreState::Owned | CoreState::Joining)
+            && self.slot() == slot
+            && self.generation() == generation
+    }
 }
 
 // Roles.
@@ -758,9 +929,15 @@ pub enum Governs {
 pub const ROLE_PLAIN_PLATFORM: u16 = 0;
 /// The holder and target fields with nobody.
 pub const ROLE_NOBODY: u16 = 0xFFFF;
+/// The epoch of a role word: 29 bits, compared for equality only.
+pub const ROLE_EPOCH_MASK: u32 = (1 << 29) - 1;
+/// Bit 63 of a role word: the unit failed.
+pub const ROLE_FAILED: u64 = 1 << 63;
 
 /// The role word: state (0-1), holder (2-17; for handing, the node that
-/// hands), target (18-33; handing only, otherwise 0xFFFF), epoch (34-63).
+/// hands), target (18-33; handing only, otherwise 0xFFFF), epoch (34-62),
+/// and bit 63, for a unit role, *failed*: the unit did not confirm within
+/// `IOMMU_WAIT_NS` (D-131).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoleWord(u64);
@@ -771,8 +948,24 @@ impl RoleWord {
             state as u64
                 | (holder as u64) << 2
                 | (target as u64) << 18
-                | ((epoch & 0x3fff_ffff) as u64) << 34,
+                | ((epoch & ROLE_EPOCH_MASK) as u64) << 34,
         )
+    }
+
+    /// The same word with the bit *failed*, which its holder's gate writes
+    /// once and which stays until the machine restarts.
+    pub const fn failed_now(self) -> Self {
+        Self(self.0 | ROLE_FAILED)
+    }
+
+    /// Bit 63: the unit failed.
+    pub const fn failed(self) -> bool {
+        self.0 & ROLE_FAILED != 0
+    }
+
+    /// The same word with the fields given, keeping the bit *failed*.
+    pub const fn keeping_failed(self, next: Self) -> Self {
+        Self(next.0 | self.0 & ROLE_FAILED)
     }
 
     pub const fn vacant(epoch: u32) -> Self {
@@ -820,9 +1013,9 @@ impl RoleWord {
         (self.0 >> 18) as u16
     }
 
-    /// 30 bits; one more at every change, modulo 2^30.
+    /// 29 bits; one more at every change, modulo 2^29.
     pub const fn epoch(self) -> u32 {
-        (self.0 >> 34) as u32
+        (self.0 >> 34) as u32 & ROLE_EPOCH_MASK
     }
 }
 
@@ -840,14 +1033,37 @@ pub struct BootFloors {
     pub plain_roles: u32,
 }
 
-/// The record `BootMembership` of the boot image (24 bytes).
+/// The record `BootMembership` of the boot image (24 bytes): the times of
+/// Detection in milliseconds, then `SEAL_NS` and `CORE_ANSWER_NS` in
+/// milliseconds (D-129).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BootMembership {
     pub stale_ms: u32,
     pub stuck_ms: u32,
     pub sweep_ms: u32,
-    pub reserved: [u32; 3],
+    pub seal_ms: u32,
+    pub core_answer_ms: u32,
+    pub reserved: u32,
+}
+
+/// The record `BootNodes` of the boot image (8 bytes), followed by one
+/// `BootNode` per node the machine start-up starts: the number of node
+/// slots and the number of nodes of the initial layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootNodes {
+    pub slots: u32,
+    pub nodes: u32,
+}
+
+/// One node of the initial layout (16 bytes): its cores as a window and a
+/// mask, the cores whose number is 64 × window + i for each bit i set.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootNode {
+    pub window: u64,
+    pub mask: u64,
 }
 
 /// The sizes of the floors and the reserves (Start-up state, rule 4).
@@ -1213,8 +1429,10 @@ mod proofs {
                 member.evidence(),
                 member.driver(),
                 member.generation(),
-            );
+            )
+            .with_class(member.class());
             assert!(again == member);
+            assert!(member.class() < 3);
         }
         if let Some(role) = RoleWord::from_raw(raw) {
             let again = match role.state() {
@@ -1222,10 +1440,11 @@ mod proofs {
                 RoleState::Held => RoleWord::held(role.holder(), role.epoch()),
                 RoleState::Handing => RoleWord::handing(role.holder(), role.target(), role.epoch()),
             };
-            assert!(again == role);
+            assert!(role.keeping_failed(again) == role);
+            assert!(again.failed_now().failed() && !again.failed());
         }
         let (holder, epoch): (u16, u32) = (kani::any(), kani::any());
-        kani::assume(epoch < 1 << 30);
+        kani::assume(epoch <= ROLE_EPOCH_MASK);
         let held = RoleWord::held(holder, epoch);
         assert!(RoleWord::from_raw(held.raw()) == Some(held));
         assert!(held.holder() == holder && held.epoch() == epoch);
@@ -1258,8 +1477,8 @@ mod proofs {
                 assert!(from.writes() || from.state() == Sealed);
                 assert!(to.state() == Fencing && same && to.evidence() != Evidence::None);
             }
-            Some(Transition::HostSealed) => {
-                assert!(matches!(from.state(), Starting | Live) && to.state() == Sealed && same)
+            Some(Transition::Abandon) => {
+                assert!(from.state() == Sealing && to.state() == Live && same)
             }
             Some(Transition::Redrive) => {
                 assert!(matches!(from.state(), Fencing | Unfenced) && to.state() == from.state());
@@ -1298,28 +1517,49 @@ mod proofs {
             _ => MemberState::Unfenced,
         };
         Member::new(state, Evidence::None, DRIVER_NONE, kani::any::<u8>() as u32)
+            .with_class(kani::any::<u8>() % 3)
     }
 
     #[kani::proof]
     #[kani::unwind(5)]
     fn successor_is_a_live_node_of_the_best_class() {
         let members = [any_member(), any_member(), any_member()];
-        let classes: [u8; 3] = [
-            kani::any::<u8>() % 3,
-            kani::any::<u8>() % 3,
-            kani::any::<u8>() % 3,
-        ];
         let holder = kani::any::<usize>() % 3;
         let live = |i: usize| members[i].state() == MemberState::Live;
-        match successor(&members, &classes, holder) {
+        match successor(&members, holder) {
             Some(s) => {
                 assert!(s < 3 && live(s));
+                assert!(best_class(&members) == Some(members[s].class()));
                 for i in 0..3 {
-                    assert!(!live(i) || classes[i] <= classes[s]);
+                    assert!(!live(i) || members[i].class() <= members[s].class());
                 }
             }
             None => assert!(!live(0) && !live(1) && !live(2)),
         }
+    }
+
+    /// A core word read back: the constructors write a word that `from_raw`
+    /// accepts and whose fields are those given; a word with a check bit
+    /// flipped is refused. The check is a product of 64 bits, as for the
+    /// ownership words, so the proof takes a generation of 8 bits.
+    #[kani::proof]
+    fn core_words_read_back() {
+        let (slot, generation): (u16, u8) = (kani::any(), kani::any());
+        let generation = generation as u32;
+        let word = match kani::any::<u8>() % 3 {
+            0 => CoreWord::free(kani::any()),
+            1 => CoreWord::joining(slot, generation),
+            _ => CoreWord::owned(slot, generation),
+        };
+        let word = if kani::any() { word.marked() } else { word };
+        assert!(CoreWord::from_raw(word.raw()) == Some(word));
+        if word.state() != CoreState::Free {
+            assert!(word.slot() == slot && word.generation() == generation);
+            assert!(word.names(slot, generation));
+        }
+        let bit: u32 = kani::any();
+        kani::assume(bit >= 4 && bit < 16);
+        assert!(CoreWord::from_raw(word.raw() ^ 1 << bit).is_none());
     }
 
     #[kani::proof]

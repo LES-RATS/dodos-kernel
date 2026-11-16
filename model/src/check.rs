@@ -139,8 +139,8 @@ impl Model {
             lends: self.lends.len(),
             armed: self.timers.values().flatten().count(),
             lost: self.threads.values().filter(|t| t.lost).count(),
-            idle: self.running.is_none(),
-            on_slack: self.running.is_some_and(|(_, ready)| !ready),
+            idle: self.cores[0].running.is_none(),
+            on_slack: self.cores[0].running.is_some_and(|(_, ready)| !ready),
             irqs: self.irqs.len(),
             fired: self
                 .irqs
@@ -277,6 +277,7 @@ impl Model {
         self.check_table()?;
         self.check_identifiers()?;
         self.check_cores()?;
+        self.check_node()?;
         self.check_debug()?;
         self.check_events()
     }
@@ -553,7 +554,12 @@ impl Model {
                 .keys()
                 .all(|id| is(ObjectKind::ASpace)(id) || is(ObjectKind::IoSpace)(id))
             && self.iospaces.keys().all(is(ObjectKind::IoSpace))
-            && self.iommus.keys().all(is(ObjectKind::Iommu))
+            // A machine object outlives its root on this node: the node keeps
+            // its own list of its devices on the unit (D-131).
+            && self
+                .iommus
+                .keys()
+                .all(|id| !self.objects.contains_key(id) || is(ObjectKind::Iommu)(id))
             && self.tasks.keys().all(is(ObjectKind::Task))
             && self.irqs.keys().all(is(ObjectKind::Irq))
             && self.scheds.keys().all(is(ObjectKind::Sched))
@@ -610,8 +616,9 @@ impl Model {
         queued.sort();
         queued.dedup();
         ensure(queued.len() == entries, "14: a thread queued twice")?;
-        let in_queue =
-            |thread: &&Thread| !matches!(thread.wait, Wait::None | Wait::Reply(_) | Wait::Node(_));
+        let in_queue = |thread: &&Thread| {
+            !matches!(thread.wait, Wait::None | Wait::Reply(_)) && !thread.bounded()
+        };
         let waiting = self.threads.values().filter(in_queue).count();
         ensure(waiting == entries, "14: a waiting thread not queued")?;
 
@@ -669,7 +676,7 @@ impl Model {
             let waited = ready || thread.outcome.is_none() || raised;
             ensure(waited, "16: outcome while waiting")?;
             let outcome = match &thread.outcome {
-                _ if thread.answered => true,
+                _ if thread.bounded() || thread.answered => true,
                 None | Some(Err(Error::Gone | Error::Cancelled)) => true,
                 Some(Ok(Output::Word(word))) => *word != 0,
                 Some(Ok(Output::Message(delivery))) => {
@@ -825,7 +832,9 @@ impl Model {
 
 mod cores;
 mod debug;
+mod machine;
 mod memory;
+mod node;
 mod sched;
 mod table;
 mod tasks;

@@ -2,7 +2,7 @@
 
 use crate::caps::Clearing;
 use crate::{
-    ASpace, CapId, Map, Mapping, Model, ObjId, Outcome, Output, Record, Translation, live,
+    ASpace, CapId, Map, Mapping, Model, ObjId, Outcome, Output, Record, Translation, live, locked,
 };
 use dodos_abi::{
     Error, Geometry, IOSPACE_MAX_DEVICES, ObjectKind, PageSize, Rights, SlotAddr,
@@ -52,7 +52,7 @@ impl Model {
         let frame = self.frames[&self.caps[&cap].object];
         let size = frame.page;
         let bytes = self.bytes(size);
-        let aspace = live(&mut self.aspaces, space);
+        let aspace = locked(&mut self.aspaces, &self.locks, space);
         for page in mapping.first..mapping.first + mapping.count {
             let at = mapping.address + (page - mapping.first) * bytes;
             let translation = Translation {
@@ -168,7 +168,7 @@ impl Model {
             .filter(|key| !aspace.hooked.contains_key(key))
             .copied()
             .collect();
-        let aspace = live(&mut self.aspaces, space);
+        let aspace = locked(&mut self.aspaces, &self.locks, space);
         for key in gone.iter().rev() {
             let page = aspace.hooked.remove(key).expect("hooked");
             aspace.free.push(page);
@@ -202,19 +202,140 @@ impl Model {
     }
 
     /// Mapping records: empties the record of a frame capability that holds
-    /// a mapping, and removes its translations and its place in the list.
+    /// a mapping, in one gate call: its entries are cleared, its leaves'
+    /// counts lowered, and it leaves the space's list. For a node of one
+    /// core, for ARM64, and for a space whose tag no other core loaded.
     pub(crate) fn empty_mapping(&mut self, cap: CapId) {
+        if self.clear_mapping(cap).is_some() {
+            self.finish_unmapping(cap);
+        }
+    }
+
+    /// The entries of a mapping record are cleared and the tables left
+    /// empty unhooked; the record is *unmapping*, its leaves still counted.
+    /// Returns the addresses of its pages.
+    fn clear_mapping(&mut self, cap: CapId) -> Option<Vec<u64>> {
         let Record::Mapping(mapping) = self.caps[&cap].record else {
+            return None;
+        };
+        let aspace = locked(&mut self.aspaces, &self.locks, mapping.space);
+        let addresses: Vec<u64> = aspace
+            .translations
+            .iter()
+            .filter(|(_, t)| t.cap == cap)
+            .map(|(&at, _)| at)
+            .collect();
+        aspace.translations.retain(|_, t| t.cap != cap);
+        live(&mut self.caps, cap).record = Record::Unmapping(mapping);
+        self.rehook(mapping.space);
+        Some(addresses)
+    }
+
+    /// `clear_mapping` for the destruction of an iospace whose unit failed.
+    pub(crate) fn clear_mapping_pub(&mut self, cap: CapId) {
+        self.clear_mapping(cap);
+    }
+
+    /// The completion of an unmapping: through the gate the counts of its
+    /// leaves are lowered (G4, G6), the record is emptied and it leaves the
+    /// space's list.
+    pub(crate) fn finish_unmapping(&mut self, cap: CapId) {
+        let Some(Record::Unmapping(mapping)) = self.caps.get(&cap).map(|c| c.record) else {
             return;
         };
-        let aspace = live(&mut self.aspaces, mapping.space);
-        aspace.translations.retain(|_, t| t.cap != cap);
-        aspace.records.retain(|&other| other != cap);
+        if let Some(aspace) = self.aspaces.get_mut(&mapping.space) {
+            aspace.records.retain(|&other| other != cap);
+        }
         live(&mut self.caps, cap).record = Record::Empty;
         let frame = self.frames[&self.caps[&cap].object];
         self.count_leaves(cap, frame, mapping, -1);
-        self.rehook(mapping.space);
     }
+
+    /// An unmapping a failed unit never confirmed: the record is emptied
+    /// with its counts kept, which are never lowered (IOMMU).
+    pub(crate) fn freeze_unmapping(&mut self, cap: CapId) {
+        let Some(Record::Unmapping(mapping)) = self.caps.get(&cap).map(|c| c.record) else {
+            return;
+        };
+        if let Some(aspace) = self.aspaces.get_mut(&mapping.space) {
+            aspace.records.retain(|&other| other != cap);
+        }
+        live(&mut self.caps, cap).record = Record::Empty;
+        let frame = self.frames[&self.caps[&cap].object];
+        if self.remotes.contains_key(&self.caps[&cap].object) {
+            return;
+        }
+        match self.leaf_target(frame) {
+            Target::Chunks => {
+                for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
+                    *self.frozen.entry(chunk).or_default() += 1;
+                }
+            }
+            Target::Entry(index) => *self.frozen_entries.entry(index).or_default() += mapping.count,
+            Target::Nothing => {}
+        }
+    }
+
+    /// The unmapping of a record (`aspace_unmap`, `iospace_unmap`, a
+    /// removal, a `Revoke`'s step, R2): its entries cleared, and their
+    /// invalidation on every core of the node that may hold them (TLB) or
+    /// by the unit of an iospace that serves devices (IOMMU). `waiter` is
+    /// the thread of a call, which waits; a step has none. `Again` with
+    /// nothing changed when the request of the core, or an entry of the
+    /// unit request table, is not free.
+    pub(crate) fn begin_unmap(
+        &mut self,
+        cap: CapId,
+        waiter: Option<ObjId>,
+    ) -> Result<Unmapped, Error> {
+        let Record::Mapping(mapping) = self.caps[&cap].record else {
+            return Ok(Unmapped::Done);
+        };
+        let space = mapping.space;
+        // A dying aspace whose tag is invalidated on every core: its records
+        // are emptied with their counts lowered at once.
+        if self.aspaces[&space].flushed {
+            self.empty_mapping(cap);
+            return Ok(Unmapped::Done);
+        }
+        if let Some(served) = self.iospaces.get(&space) {
+            let Some(&(iommu, _)) = served.first() else {
+                self.empty_mapping(cap);
+                return Ok(Unmapped::Done);
+            };
+            if self.unit_requests.iter().all(Option::is_some) {
+                return Err(Error::Again);
+            }
+            let role = self.unit_role(self.iommus[&iommu].unit);
+            self.clear_mapping(cap);
+            let who = match waiter {
+                Some(thread) => crate::units::Waiter::Thread(Some(thread)),
+                None => crate::units::Waiter::Record(cap),
+            };
+            self.unit_request(role, crate::rings::UnitOp::Invalidate, who, Some(cap))?;
+            return Ok(Unmapped::Waits);
+        }
+        self.request_free()?;
+        let addresses = self.clear_mapping(cap).expect("a mapping");
+        let flush = crate::cores::Flush::Range { space, addresses };
+        match self.start_request(flush, crate::cores::Completes::Record(cap), waiter) {
+            crate::cores::Started::Complete => {
+                self.finish_unmapping(cap);
+                Ok(Unmapped::Done)
+            }
+            crate::cores::Started::Asked => Ok(Unmapped::Waits),
+            crate::cores::Started::InUse => unreachable!("judged free"),
+        }
+    }
+}
+
+/// What `begin_unmap` did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Unmapped {
+    /// The record is empty, its counts lowered.
+    Done,
+    /// The record is unmapping; the waiter waits, or the step ends.
+    Waits,
 }
 
 /// What the leaves of a frame are counted in (G4).
@@ -301,6 +422,7 @@ impl Model {
         // page, page count and rights (G3).
         let done = match self.caps[&cap].record {
             Record::Empty => 0,
+            Record::Unmapping(_) => return Err(Error::Busy),
             Record::Mapping(m)
                 if m.partial
                     && m.space == space
@@ -396,8 +518,18 @@ impl Model {
             return Err(Error::NoMemory);
         }
         // The barrier's dependency: bit X of `maps_of` is set through the
-        // gate before the first translation to memory of node X.
-        if let Some(remote) = self.remotes.get(&self.caps[&cap].object) {
+        // gate before the first translation to memory of node X. Under a
+        // grant, the use entry's count is raised before the grant entry is
+        // read again; a grant no longer live with its serial undoes the
+        // count and refuses (`gone`).
+        if let Some(remote) = self.remotes.get(&self.caps[&cap].object).copied() {
+            let entry = self.table.grants[remote.node as usize].get(&remote.grant);
+            let live_grant = entry.is_some_and(|e| {
+                e.state == crate::table::GrantState::Live && e.serial == remote.serial
+            });
+            if !live_grant {
+                return Err(Error::Gone);
+            }
             let granter = remote.node as usize;
             self.table.beacons[self.node as usize].maps_of[granter] = true;
         }
@@ -412,9 +544,9 @@ impl Model {
             // G2: the page goes to the free list; the gate gives it the
             // class of the level it is hooked at (`rehook`).
             let at = self.untypeds[&untyped].base + taken.at;
-            live(&mut self.aspaces, space).free.push(at);
+            locked(&mut self.aspaces, &self.locks, space).free.push(at);
         }
-        live(&mut self.aspaces, space).tables += missing;
+        locked(&mut self.aspaces, &self.locks, space).tables += missing;
         let partial = done + step < map.count;
         if done > 0 {
             self.extend_mapping(cap, step, partial);
@@ -479,7 +611,7 @@ impl Model {
         };
         let frame = self.frames[&self.caps[&cap].object];
         let bytes = self.bytes(frame.page);
-        let aspace = live(&mut self.aspaces, mapping.space);
+        let aspace = locked(&mut self.aspaces, &self.locks, mapping.space);
         for page in mapping.first + mapping.count..mapping.first + mapping.count + more {
             let at = mapping.address + (page - mapping.first) * bytes;
             let translation = Translation {
@@ -511,14 +643,31 @@ impl Model {
         let cap = self.cap(thread, frame, Rights::READ)?;
         self.is(cap, ObjectKind::Frame, Rights::NONE)?;
         match self.caps[&cap].record {
-            Record::Empty => return Ok(Output::Done),
-            Record::Binding(_) => return Err(Error::Busy),
+            Record::Empty => Ok(Output::Done),
+            Record::Binding(_) | Record::Unmapping(_) => Err(Error::Busy),
             Record::Mapping(mapping) if self.objects[&mapping.space].kind != kind => {
-                return Err(Error::Busy);
+                Err(Error::Busy)
             }
-            Record::Mapping(_) => self.empty_mapping(cap),
+            // The unit of an iospace that serves devices has failed: `busy`,
+            // and the record is emptied with its counts kept.
+            Record::Mapping(mapping)
+                if self
+                    .iospaces
+                    .get(&mapping.space)
+                    .and_then(|s| s.first())
+                    .is_some_and(|&(iommu, _)| {
+                        self.unit_failed(self.unit_role(self.iommus[&iommu].unit))
+                    }) =>
+            {
+                self.clear_mapping(cap);
+                self.freeze_unmapping(cap);
+                Err(Error::Busy)
+            }
+            Record::Mapping(_) => match self.begin_unmap(cap, Some(thread))? {
+                Unmapped::Done => Ok(Output::Done),
+                Unmapped::Waits => Ok(Output::Waits),
+            },
         }
-        Ok(Output::Done)
     }
 
     /// `aspace_protect`: replaces the rights of the whole mapping.
@@ -542,6 +691,7 @@ impl Model {
         if mapping.space != space || mapping.partial {
             return Err(Error::Busy);
         }
+        let reduced = !rights.contains(mapping.rights);
         // G3: the class reads of a protect follow the bound: a mapping that
         // touches more chunks than one call of the gate checks is `busy`;
         // then the class of each page must allow the new rights (`denied`).
@@ -566,13 +716,32 @@ impl Model {
         {
             return Err(Error::Denied);
         }
+        // A reduction is invalidated on the cores that may hold it, the
+        // caller waiting for its core's request; `again` with nothing
+        // changed if that request is in use. Asking for the rights the
+        // mapping already has changes nothing.
+        if mapping.rights == rights {
+            return Ok(Output::Done);
+        }
+        if reduced {
+            self.request_free()?;
+        }
         mapping.rights = rights;
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
-        let aspace = live(&mut self.aspaces, space);
-        for translation in aspace.translations.values_mut().filter(|t| t.cap == cap) {
+        let aspace = locked(&mut self.aspaces, &self.locks, space);
+        let mut addresses = Vec::new();
+        for (&at, translation) in aspace.translations.iter_mut().filter(|(_, t)| t.cap == cap) {
             translation.rights = rights;
+            addresses.push(at);
         }
-        Ok(Output::Done)
+        if !reduced {
+            return Ok(Output::Done);
+        }
+        let flush = crate::cores::Flush::Range { space, addresses };
+        match self.start_request(flush, crate::cores::Completes::Protect, Some(thread)) {
+            crate::cores::Started::Asked => Ok(Output::Waits),
+            _ => Ok(Output::Done),
+        }
     }
 
     /// `iospace_attach`: attaches a device of the unit to an iospace, or
@@ -600,13 +769,28 @@ impl Model {
                 return Err(Error::Denied);
             }
             if attached.is_some() {
-                let unit = self.iommus[&iommu].unit;
-                self.detach_local(iommu, device);
-                return self.unit_request(Some(thread), unit, crate::roles::UnitOp::Detach(device));
+                let role = self.unit_role(self.iommus[&iommu].unit);
+                if self.unit_failed(role) {
+                    return Err(Error::Busy);
+                }
+                if self.unit_requests.iter().all(Option::is_some) {
+                    return Err(Error::Again);
+                }
+                self.detach_local(iommu, device, true);
+                let op = crate::rings::UnitOp::Detach { device };
+                let waiter = crate::units::Waiter::Thread(Some(thread));
+                self.unit_request(role, op, waiter, None)?;
+                return Ok(Output::Waits);
             }
             return Ok(Output::Done);
         };
-        // The state, in this order.
+        // The state, in this order. CONTRACT-GAP 11: a unit that has failed
+        // makes `iospace_attach` `busy`; the contract does not place this
+        // check among the others, and the model judges it first.
+        let role = self.unit_role(unit.unit);
+        if self.unit_failed(role) {
+            return Err(Error::Busy);
+        }
         if self.machine.kernel_devices.contains(&(unit.unit, device)) {
             return Err(Error::Busy);
         }
@@ -635,6 +819,11 @@ impl Model {
         if served.is_empty() && domains >= limit {
             return Err(Error::Busy);
         }
+        // A call that finds no free entry of the unit request table returns
+        // `again` with nothing changed.
+        if self.unit_requests.iter().all(Option::is_some) {
+            return Err(Error::Again);
+        }
         let taken = dodos_abi::Ownership::taken(
             dodos_abi::Owner::Node(self.node),
             self.table.generation(self.node),
@@ -645,18 +834,34 @@ impl Model {
         unit.attached.insert(device, iospace);
         unit.order.push(device);
         let unit = unit.unit;
-        // The node's report, and the context entry, written by the holder
-        // of the unit's role.
-        self.table.reports[self.node as usize].push((unit, device));
-        self.unit_request(Some(thread), unit, crate::roles::UnitOp::Attach(device))
+        locked(&mut self.aspaces, &self.locks, iospace)
+            .units
+            .insert(unit);
+        // The context entry, written by the holder of the unit's role: a
+        // unit request, which the thread waits for.
+        let role = self.unit_role(unit);
+        let op = crate::rings::UnitOp::Attach { device };
+        self.unit_request(role, op, crate::units::Waiter::Thread(Some(thread)), None)?;
+        Ok(Output::Waits)
     }
 
-    /// IOMMU: the context entry of a device is cleared, and the device
-    /// leaves the header of its iospace.
-    pub(crate) fn detach(&mut self, iommu: ObjId, device: u16) {
-        let unit = self.iommus[&iommu].unit;
-        self.detach_local(iommu, device);
-        let _ = self.unit_request(None, unit, crate::roles::UnitOp::Detach(device));
+    /// IOMMU, in a removal step: the device leaves the header of its
+    /// iospace, its identifier word becomes free, and its context entry is
+    /// cleared by a unit request no thread waits for. `Again` with nothing
+    /// changed when no entry of the unit request table is free.
+    pub(crate) fn detach(&mut self, iommu: ObjId, device: u16) -> Result<(), Error> {
+        let role = self.unit_role(self.iommus[&iommu].unit);
+        if !self.unit_failed(role) && self.unit_requests.iter().all(Option::is_some) {
+            return Err(Error::Again);
+        }
+        // On a failed unit the identifier word stays taken by this node.
+        let failed = self.unit_failed(role);
+        self.detach_local(iommu, device, !failed);
+        if !failed {
+            let op = crate::rings::UnitOp::Detach { device };
+            self.unit_request(role, op, crate::units::Waiter::Thread(None), None)?;
+        }
+        Ok(())
     }
 
     /// The identifier word of a device of an IOMMU unit: its segment and its
@@ -682,11 +887,12 @@ impl Model {
 
     /// The node's own record of a detach, and its report; the identifier
     /// word becomes free and unclaimed.
-    fn detach_local(&mut self, iommu: ObjId, device: u16) {
+    fn detach_local(&mut self, iommu: ObjId, device: u16, free: bool) {
         let index = self.iommus[&iommu].unit;
         let key = self.identifier_key(index, device);
-        self.table.write_identifier(self.node, key, None);
-        self.table.reports[self.node as usize].retain(|&r| r != (index, device));
+        if free {
+            self.table.write_identifier(self.node, key, None);
+        }
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);
         let iospace = unit.attached.remove(&device);

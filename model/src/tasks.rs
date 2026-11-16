@@ -1,6 +1,6 @@
 //! Tasks and marks: the unit of provenance and of stopping.
 
-use crate::{Model, ObjId, Outcome, Output, Wait, live};
+use crate::{Model, ObjId, Outcome, Output, Wait, locked};
 use dodos_abi::{Error, Marks, ObjectKind, Rights, SlotAddr, TaskFlags, TaskId};
 
 impl Model {
@@ -15,8 +15,8 @@ impl Model {
     /// Adds marks to the effective marks of a thread.
     pub(crate) fn mark(&mut self, thread: ObjId, marks: u64) {
         match self.threads[&thread].task {
-            Some(task) => live(&mut self.tasks, task).marks |= marks,
-            None => live(&mut self.threads, thread).marks |= marks,
+            Some(task) => locked(&mut self.tasks, &self.locks, task).marks |= marks,
+            None => locked(&mut self.threads, &self.locks, thread).marks |= marks,
         }
     }
 
@@ -66,33 +66,33 @@ impl Model {
             // The thread joins the new task, whose marks become marks | m,
             // even when it is mark-aware.
             Some(task) => {
-                let joined = live(&mut self.tasks, task);
+                let joined = locked(&mut self.tasks, &self.locks, task);
                 joined.marks |= marks;
                 joined.threads.push(target);
-                live(&mut self.threads, target).task = Some(task);
+                locked(&mut self.threads, &self.locks, target).task = Some(task);
             }
             // Detaching sets the thread's own word to the marks of the task
             // it leaves; it succeeds on a thread attached to nothing.
-            None => live(&mut self.threads, target).marks |= marks,
+            None => locked(&mut self.threads, &self.locks, target).marks |= marks,
         }
         Ok(Output::Done)
     }
 
     /// The thread leaves its task, keeping the task's marks in its own word.
     pub(crate) fn detach_task(&mut self, thread: ObjId) {
-        let Some(task) = live(&mut self.threads, thread).task.take() else {
+        let Some(task) = locked(&mut self.threads, &self.locks, thread).task.take() else {
             return;
         };
-        let left = live(&mut self.tasks, task);
+        let left = locked(&mut self.tasks, &self.locks, task);
         left.threads.retain(|&other| other != thread);
         let marks = left.marks;
-        live(&mut self.threads, thread).marks |= marks;
+        locked(&mut self.threads, &self.locks, thread).marks |= marks;
     }
 
     pub(crate) fn task_mark(&mut self, thread: ObjId, task: SlotAddr, marks: u64) -> Outcome {
         let task = self.task(thread, task, Rights::WRITE)?;
         let marks = Marks::from_bits(marks)?;
-        live(&mut self.tasks, task).marks |= marks.bits();
+        locked(&mut self.tasks, &self.locks, task).marks |= marks.bits();
         Ok(Output::Done)
     }
 
@@ -109,7 +109,7 @@ impl Model {
         if !self.tasks[&aware].aware {
             return Err(Error::Denied);
         }
-        live(&mut self.tasks, task).aware = true;
+        locked(&mut self.tasks, &self.locks, task).aware = true;
         Ok(Output::Done)
     }
 
@@ -120,7 +120,7 @@ impl Model {
     pub(crate) fn task_revoke(&mut self, thread: ObjId, task: SlotAddr) -> Outcome {
         let cap = self.cap(thread, task, Rights::READ)?;
         let task = self.is(cap, ObjectKind::Task, Rights::MANAGE)?.object;
-        live(&mut self.tasks, task).revoked = true;
+        locked(&mut self.tasks, &self.locks, task).revoked = true;
         for _ in 0..dodos_abi::REMOVAL_STEP {
             let Some(&attached) = self.tasks[&task].threads.last() else {
                 return Ok(Output::Done);
@@ -136,14 +136,14 @@ impl Model {
     /// A step of `task_revoke` on one thread: its wait ends with `gone`, it
     /// is suspended and detached, keeping the marks of the task.
     pub(crate) fn stop(&mut self, thread: ObjId) {
-        // A thread that waits for another node is stopped when its call
-        // returns: its wait is not ended.
+        // A thread that waits for another node, a unit or its node's cores
+        // is stopped when its call returns: its wait is not ended.
         let wait = &self.threads[&thread].wait;
-        if *wait != Wait::None && !matches!(wait, Wait::Node(_)) {
+        if *wait != Wait::None && !self.threads[&thread].bounded() {
             self.unlink(thread);
             self.wake(thread, Err(Error::Gone));
         }
-        live(&mut self.threads, thread).suspended = true;
+        locked(&mut self.threads, &self.locks, thread).suspended = true;
         self.observe();
         self.detach_task(thread);
     }

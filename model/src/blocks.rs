@@ -211,10 +211,62 @@ impl Model {
         if self.mapped_block(object) {
             return Err(Error::Busy);
         }
-        // Nothing is sent to the other node.
-        self.free_block(object, Freed::Given(node as u16));
+        let run = self.untypeds[&object].block == Some(Block::Run);
+        if run {
+            self.request_free()?;
+        }
+        // The capability is removed and the block destroyed; a run is
+        // unmapped from the kernel's own space and that invalidated on every
+        // core of the node, idle ones included, before any word is written
+        // (D-131): the words are written at the completion. Nothing is sent
+        // to the other node.
+        let freed = self.take_block(object, Freed::Given(node as u16), false);
         self.remove_block_cap(cap);
-        Ok(Output::Done)
+        let Some(freed) = freed else {
+            return Ok(Output::Done);
+        };
+        if !run {
+            self.write_freed(freed);
+            return Ok(Output::Done);
+        }
+        let flush = crate::cores::Flush::Kernel(freed.chunks(self.table.geometry.chunk_shift()));
+        match self.start_request(flush, crate::cores::Completes::Run(freed), Some(thread)) {
+            crate::cores::Started::Asked => Ok(Output::Waits),
+            _ => {
+                self.write_freed(freed);
+                Ok(Output::Done)
+            }
+        }
+    }
+
+    /// The destruction of a block, one unit of a removal step: a run is
+    /// unmapped from the kernel's own space and that invalidated on every
+    /// core of the node; on x86-64 and RISC-V in a node of several cores
+    /// the step starts the request of its core and returns `again`, and the
+    /// words are written at the completion. `None` once the words are
+    /// written; `Some(true)` if this unit wrote them, `Some(false)` if the
+    /// step must end with `again`.
+    pub(crate) fn unmap_block(&mut self, object: ObjId) -> Option<bool> {
+        let block = self.untypeds[&object].block?;
+        let in_flight = self.cores.iter().filter_map(|c| c.request.as_ref()).any(
+            |r| matches!(&r.completes, crate::cores::Completes::Run(f) if f.object == Some(object)),
+        );
+        if in_flight || (block == Block::Run && self.request_free().is_err()) {
+            return Some(false);
+        }
+        let freed = self.take_block(object, Freed::Destroyed, true)?;
+        if block != Block::Run {
+            self.write_freed(freed);
+            return Some(true);
+        }
+        let flush = crate::cores::Flush::Kernel(freed.chunks(self.table.geometry.chunk_shift()));
+        match self.start_request(flush, crate::cores::Completes::Run(freed), None) {
+            crate::cores::Started::Complete => {
+                self.write_freed(freed);
+                Some(true)
+            }
+            _ => Some(false),
+        }
     }
 
     /// `memory_split`: cuts the entry of a device block into two halves.
@@ -277,28 +329,54 @@ impl Model {
         }
     }
 
-    /// The destruction of a block, or its give: the run is unmapped from
-    /// the kernel's own space, and each word becomes free, in ascending
-    /// order, through the gate: with the same owner for a destruction (the
-    /// reserve's code for a reserve chunk), with the node named for a give.
+    /// The destruction of a block when nothing is left to invalidate.
     pub(crate) fn free_block(&mut self, object: ObjId, freed: Freed) {
-        let untyped = live(&mut self.untypeds, object);
-        let Some(block) = untyped.block.take() else {
-            return;
+        if let Some(freed) = self.take_block(object, freed, false) {
+            self.write_freed(freed);
+        }
+    }
+
+    /// The run of a block leaves the kernel's own space (the gate unmaps
+    /// it), and what its words become is kept for their write. A block that
+    /// is destroyed by steps keeps its place until the words are written.
+    fn take_block(&mut self, object: ObjId, freed: Freed, keep: bool) -> Option<FreedRun> {
+        self.touch_untyped(object);
+        let untyped = self.untypeds.get_mut(&object)?;
+        let block = match keep {
+            true => untyped.block?,
+            false => untyped.block.take()?,
         };
         let (base, bytes) = (untyped.base, untyped.bytes);
-        let owner = |before: u64| match (freed, Ownership::from_raw(before).map(|w| w.owner())) {
+        let run = FreedRun {
+            object: keep.then_some(object),
+            block,
+            base,
+            bytes,
+            freed,
+        };
+        if block == Block::Run {
+            for chunk in run.chunks(self.table.geometry.chunk_shift()) {
+                self.kernel_runs.remove(&chunk);
+            }
+        }
+        Some(run)
+    }
+
+    /// Each word of a block becomes free, in ascending order, through the
+    /// gate: with the same owner for a destruction (the reserve's code for
+    /// a reserve chunk), with the node named for a give.
+    pub(crate) fn write_freed(&mut self, run: FreedRun) {
+        let owner = |before: u64| match (run.freed, Ownership::from_raw(before).map(|w| w.owner()))
+        {
             (Freed::Given(node), _) => Owner::Node(node),
             (Freed::Destroyed, Some(Owner::Reserve(j))) => Owner::Reserve(j),
             (Freed::Destroyed, _) => Owner::Node(self.node),
         };
-        match block {
+        match run.block {
             Block::Run => {
-                let shift = self.table.geometry.chunk_shift();
-                for chunk in base >> shift..(base + bytes) >> shift {
+                for chunk in run.chunks(self.table.geometry.chunk_shift()) {
                     let before = self.table.owners[chunk as usize];
                     let after = Ownership::free(owner(before));
-                    self.kernel_runs.remove(&chunk);
                     assert!(self.table.write_owner(self.node, chunk, before, after));
                 }
             }
@@ -307,6 +385,11 @@ impl Model {
                 entry.owner = Ownership::free(owner(entry.owner.raw()));
                 assert!(self.table.write_entry(self.node, index, entry));
             }
+        }
+        if let Some(object) = run.object
+            && let Some(untyped) = self.untypeds.get_mut(&object)
+        {
+            untyped.block = None;
         }
     }
 
@@ -318,8 +401,27 @@ impl Model {
 }
 
 /// How the words of a block become free.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Freed {
     Destroyed,
     Given(u16),
+}
+
+/// The words of a block to write free once its run is unmapped from the
+/// kernel's own space on every core: the block (its untyped, while a
+/// destruction keeps it), its place, and what the words become.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FreedRun {
+    pub(crate) object: Option<ObjId>,
+    pub(crate) block: Block,
+    pub(crate) base: u64,
+    pub(crate) bytes: u64,
+    pub(crate) freed: Freed,
+}
+
+impl FreedRun {
+    /// The chunks of its run.
+    pub(crate) fn chunks(&self, shift: u32) -> Vec<u64> {
+        (self.base >> shift..(self.base + self.bytes) >> shift).collect()
+    }
 }

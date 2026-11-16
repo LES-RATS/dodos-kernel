@@ -51,11 +51,13 @@ pub const FEATURES: FeatureList = FeatureList {
 /// The vectors that `irq_claim` accepts; the others are the kernel's.
 pub const IRQ_VECTOR_FIRST: u8 = 48;
 pub const IRQ_VECTOR_LAST: u8 = 239;
-/// Entries of the interrupt table of one node: one per claimable vector.
+/// Entries of the interrupt table of one physical core: one per claimable
+/// vector (D-129).
 pub const IRQ_TABLE_ENTRIES: usize = 192;
-/// With interrupt remapping, a node of this index or more cannot claim: its
-/// handles would not fit in the remapping table.
-pub const IRQ_MAX_NODES_REMAPPED: u32 = 341;
+/// With interrupt remapping, a core of this number or more cannot be
+/// claimed on: its handles (core number × 192 + vector − 48) would not fit
+/// in the remapping table.
+pub const IRQ_MAX_CORES_REMAPPED: u32 = 341;
 
 /// Words of the register block.
 pub const REGS_WORDS: usize = 26;

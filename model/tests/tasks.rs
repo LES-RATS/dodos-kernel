@@ -36,7 +36,8 @@ impl K {
         k.make(Reply, RP);
         k.ok(Syscall::SchedConfigure {
             sched: s(START_SLOT_SCHED),
-            core: s(16),
+            node: s(16),
+            core: 0,
             budget: 5_000_000,
             period: 10_000_000,
             class: 1,
@@ -89,7 +90,8 @@ impl K {
         self.make(Sched, sched);
         self.ok(Syscall::SchedConfigure {
             sched: s(sched),
-            core: s(16),
+            node: s(16),
+            core: 0,
             budget: 10_000,
             period: 10_000_000,
             class: 1,
@@ -415,7 +417,9 @@ fn fault_message_carries_the_marks_of_the_faulting_thread() {
     let thread = k.thread(52, 40);
     // The first thread, mark-aware, handles the faults on EP.
     assert_eq!(k.go(recv()), Ok(Output::Waits));
-    k.m.fault(thread, FaultKind::Page, [14, 2, 0x1000]);
+    // An address no space of the node translates: a fault on a translated
+    // address with the access asked is spurious (D-129).
+    k.m.fault(thread, FaultKind::Page, [14, 2, 0x10_0000_0000]);
     assert_eq!(k.m.check(), Ok(()));
     assert_eq!(stamp(&k, k.t), (U, TaskId::new(0, 2).raw()));
 }
@@ -503,7 +507,8 @@ fn revoked_thread_that_the_choice_would_take_is_suspended() {
     k.make(Sched, 302);
     k.ok(Syscall::SchedConfigure {
         sched: s(302),
-        core: s(16),
+        node: s(16),
+        core: 0,
         budget: 10_000,
         period: 1_000_000,
         class: 1,

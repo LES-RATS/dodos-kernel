@@ -1,13 +1,13 @@
-//! Debugging (call reference): the debug area of a node, the trace rings
-//! and their entries, the crash records, the console.
+//! Debugging (call reference): the debug area of a physical core, the
+//! trace rings and their entries, the crash records, the console.
 
-/// Bytes of the debug area of a node: seventeen blocks of 4,096 bytes, a
-/// byte size that does not change with the page.
+/// Bytes of the debug area of a physical core (D-129): seventeen blocks of
+/// 4,096 bytes, a byte size that does not change with the page.
 pub const DEBUG_AREA_BYTES: usize = 69_632;
-/// The header of a debug area, then the node's crash record.
+/// The header of a debug area, then the core's crash record.
 pub const DEBUG_HEADER_BYTES: usize = 64;
-pub const NODE_CRASH_RECORD_BYTES: usize = 4_032;
-/// The header of a crash area, before the debug area of node 0.
+pub const CORE_CRASH_RECORD_BYTES: usize = 4_032;
+/// The header of a crash area, before the debug area of core 0.
 pub const CRASH_HEADER_BYTES: usize = 4_096;
 /// The trace rings: entries of 64 bytes, 256 in the kernel ring at byte
 /// 4,096 of the area, 768 in the user ring at byte 20,480.
@@ -28,14 +28,16 @@ pub const CONSOLE_STEP_BYTES: usize = 16;
 pub const CONSOLE_TICK_NS: u64 = 1_000_000;
 /// A core that does not stop for the stub within this is shown as running.
 pub const STUB_STOP_NS: u64 = 10_000_000;
-/// Entries of each ring copied into a node record.
+/// Entries of each ring copied into a core record.
 pub const CRASH_RECORD_KERNEL_ENTRIES: usize = 32;
 pub const CRASH_RECORD_USER_ENTRIES: usize = 16;
 /// Magic numbers of a debug area and of a crash area.
 pub const DEBUG_AREA_MAGIC: u32 = u32::from_le_bytes(*b"DoDb");
 pub const CRASH_AREA_MAGIC: u64 = u64::from_le_bytes(*b"DodOScr\0");
-pub const DEBUG_AREA_VERSION: u16 = 1;
-pub const CRASH_AREA_VERSION: u32 = 1;
+/// Version 2 since D-129: the headers hold a core number and the node slot
+/// the core last ran.
+pub const DEBUG_AREA_VERSION: u16 = 2;
+pub const CRASH_AREA_VERSION: u32 = 2;
 
 /// The codes of the trace rings: below 16 the kernel's, 16 and 17 the
 /// user ring's.
@@ -67,6 +69,9 @@ impl TraceCode {
 
 /// Word 2, bit 16: the text goes on in the entry with the next sequence.
 pub const TRACE_FLAG_CONTINUED: u64 = 1 << 16;
+/// Word 2, bits 17-31: the node slot of the node the core ran.
+pub const TRACE_SLOT_SHIFT: u32 = 17;
+pub const TRACE_SLOT_MASK: u64 = 0x7fff;
 
 /// The entry of sequence `seq` (at least 1) sits at index (seq − 1) mod
 /// `entries` of its ring.
@@ -81,7 +86,8 @@ pub struct TraceEntry {
     /// The sequence, at least 1; 0 while the entry is being written.
     pub seq: u64,
     pub instant: u64,
-    /// The code (0-15), the flags (16-31), the generation (32-63).
+    /// The code (0-15), the flag *continued* (16), the node slot of the
+    /// node the core ran (17-31), that node's generation (32-63).
     pub word2: u64,
     pub task: u64,
     pub marks: u64,
@@ -100,18 +106,35 @@ impl TraceEntry {
     pub const fn generation(&self) -> u32 {
         (self.word2 >> 32) as u32
     }
+
+    pub const fn slot(&self) -> u16 {
+        (self.word2 >> TRACE_SLOT_SHIFT & TRACE_SLOT_MASK) as u16
+    }
+
+    /// Word 2 of an entry: its code, the flag *continued*, the node slot
+    /// and the generation.
+    pub const fn word2_of(code: u16, continued: bool, slot: u16, generation: u32) -> u64 {
+        let flag = if continued { TRACE_FLAG_CONTINUED } else { 0 };
+        code as u64
+            | flag
+            | (slot as u64 & TRACE_SLOT_MASK) << TRACE_SLOT_SHIFT
+            | (generation as u64) << 32
+    }
 }
 
-/// The header of a debug area. The fields the contract lists take 56
-/// bytes; the area's header is 64, so 24 reserved bytes end it.
+/// The header of a debug area: magic, version, the core number, the
+/// generation and node slot of the node the core last ran, the next
+/// sequences of the two rings, the suppressed entries. CONTRACT-GAP 2: the
+/// fields the contract lists, with its "16 reserved bytes", take 56 bytes,
+/// and the area's header is 64; 24 reserved bytes end it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DebugAreaHeader {
     pub magic: u32,
     pub version: u16,
-    pub node: u16,
+    pub core: u16,
     pub generation: u32,
-    pub reserved: u32,
+    pub slot: u32,
     pub next_kernel: u64,
     pub next_user: u64,
     pub suppressed: u64,
@@ -130,12 +153,14 @@ pub enum CrashReason {
     UnitTimeout = 6,
     Containment = 7,
     StartRefused = 8,
+    /// Another core of the node did not answer within `CORE_ANSWER_NS`.
+    CoreSilent = 9,
 }
 
-/// The node record, at offset 64 of the debug area (4,032 bytes).
+/// The core record, at offset 64 of the core's debug area (4,032 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NodeCrashRecord {
+pub struct CoreCrashRecord {
     /// The boot identifier of the crash area once complete; 0 while written.
     pub commit: u64,
     pub generation: u32,
@@ -154,7 +179,7 @@ pub struct NodeCrashRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StopRecord {
     pub commit: u64,
-    pub node: u32,
+    pub core: u32,
     pub reason: u32,
     pub instant: u64,
     pub text: [u8; 128],
@@ -166,7 +191,8 @@ pub struct StopRecord {
 pub struct CrashAreaHeader {
     pub magic: u64,
     pub version: u32,
-    pub nodes: u32,
+    /// The number of physical cores.
+    pub cores: u32,
     pub boot_id: u64,
     pub sequence: u64,
     pub area_bytes: u32,

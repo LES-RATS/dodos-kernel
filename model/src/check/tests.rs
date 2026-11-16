@@ -1269,8 +1269,9 @@ fn census_counts_what_the_state_holds() {
     let mut model = state();
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
-        // Twenty at start-up, five objects, two copies.
-        capabilities: 57,
+        // Twenty at start-up, five objects, two copies; the node's kernel
+        // space holds no proxy since D-128.
+        capabilities: 40,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,
@@ -1722,7 +1723,7 @@ fn context_in_the_queue_of_another_key_is_reported() {
 
 #[test]
 fn admitted_sum_that_is_not_the_sum_of_the_bandwidths_is_reported() {
-    let broken = spoiled(|m, _| m.admitted -= 1);
+    let broken = spoiled(|m, _| m.cores[0].admitted -= 1);
     assert_eq!(broken, "42: admitted sum");
 }
 
@@ -1777,7 +1778,10 @@ fn marked_thread_that_runs_is_reported() {
 
 #[test]
 fn running_context_that_is_not_the_choice_is_reported() {
-    let broken = spoiled(|m, _| m.running = None);
+    let broken = spoiled(|m, _| {
+        m.cores[0].running = None;
+        m.cores[0].thread = None;
+    });
     assert_eq!(broken, "46: running context");
 }
 
@@ -1859,10 +1863,11 @@ fn with_irq(m: &mut Model) -> ObjId {
     let claim = Syscall::IrqClaim {
         control: own(dodos_abi::START_SLOT_IRQ_CONTROL),
         source: dodos_abi::IrqSource::msi(0, 1, 0, 0).raw(),
+        core: 0,
         vector: 48,
         destination: own(61),
     };
-    m.apply(boot, claim).unwrap();
+    m.apply_settled(boot, claim).unwrap();
     let bind = Syscall::IrqBind {
         irq: own(61),
         notify: own(NT),
@@ -2221,7 +2226,7 @@ fn device_of_a_unit_missing_from_its_list_is_reported() {
 
 #[test]
 fn enabled_features_other_than_the_running_threads_are_reported() {
-    let broken = spoiled(|m, _| m.enabled ^= 1 << dodos_abi::x86_64::AMX);
+    let broken = spoiled(|m, _| m.cores[0].enabled ^= 1 << dodos_abi::x86_64::AMX);
     assert_eq!(broken, "74: features enabled for the running thread");
 }
 
@@ -2274,12 +2279,6 @@ fn time_charged_without_instructions_is_reported() {
         broken,
         "77: instructions and time charged at different events"
     );
-}
-
-#[test]
-fn marks_lost_by_a_move_are_reported() {
-    let broken = spoiled(|m, at| m.event.moved.push((at.waiter, 1)));
-    assert_eq!(broken, "78: marks lost by a move");
 }
 
 // Debugging.
@@ -2561,7 +2560,10 @@ fn a_use_entry_that_counts_leaves_its_node_does_not_hold_is_reported() {
                 grant: 0,
                 serial: 0,
                 generation: 1,
+                root: crate::ObjId(u32::MAX),
                 leaves: 1,
+                release_pending: false,
+                signal_pending: false,
             },
         );
     });

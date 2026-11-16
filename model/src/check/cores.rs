@@ -7,27 +7,28 @@ use dodos_abi::{FEATURE_USER_INTERRUPTS, FeatureMask, thread_bytes};
 
 impl Model {
     /// Unlike cores:
-    /// 74. the state features enabled on the core are, while a thread
-    ///     runs, the baseline of the node's own kind and the optional
+    /// 74. the state features enabled on each core are, while a thread
+    ///     runs there, the baseline of the node's cores and the optional
     ///     features of the thread's mask;
     /// 76. a thread's area is at least what its mask needs on the node's
     ///     own kind;
     /// 77. the instruction count of a counted context changed in the event
     ///     exactly when its consumed time did (on a machine with a counter;
     ///     without one it stays 0); an uncounted context has count 0 and
-    ///     class 0;
-    /// 78. the destination thread of a `thread_move` placed in the event
-    ///     has effective marks that contain the source's.
+    ///     class 0.
     pub(super) fn check_cores(&self) -> Check {
         let list = self.machine.features();
-        let kind = self.machine.own_kind(self.node);
+        let kind = self.machine.kind_of(self.cores[0].number as usize);
         let baseline =
             (kind.features as u32) & list.state & !list.large & !(1 << FEATURE_USER_INTERRUPTS);
-        if let Some(thread) = self.running() {
+        for core in &self.cores {
+            let Some(thread) = core.thread.filter(|t| self.threads.contains_key(t)) else {
+                continue;
+            };
             let mask = self.threads[&thread].mask as u32;
             let optional = mask & list.state & !(1 << FEATURE_USER_INTERRUPTS);
             ensure(
-                self.enabled == baseline | optional,
+                core.enabled == baseline | optional,
                 "74: features enabled for the running thread",
             )?;
         }
@@ -64,10 +65,6 @@ impl Model {
                 same,
                 "77: instructions and time charged at different events",
             )?;
-        }
-        for &(thread, marks) in &self.event.moved {
-            let effective = self.marks(thread).map_or(0, |m| m.bits());
-            ensure(effective & marks == marks, "78: marks lost by a move")?;
         }
         Ok(())
     }

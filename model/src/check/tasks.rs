@@ -1,7 +1,7 @@
 //! The invariants of tasks and marks, and of interrupts.
 
 use super::{Check, ensure};
-use crate::{IrqState, Model, Wait};
+use crate::{IrqState, Model};
 use dodos_abi::x86_64::{IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST};
 use dodos_abi::{Marks, TaskId};
 use std::collections::BTreeSet;
@@ -42,19 +42,17 @@ impl Model {
                 "49: marks of a thread",
             )?;
         }
-        let running = self.running.and_then(|(context, _)| {
-            let sched = &self.scheds[&context];
-            let home = sched.home.filter(|home| {
-                let thread = &self.threads[home];
-                !thread.suspended && thread.wait == Wait::None
-            });
-            home.or(sched.chain.last().map(|reply| self.lends[reply].1))
-        });
-        let revoked = running.and_then(|thread| self.threads[&thread].task);
-        ensure(
-            revoked.is_none_or(|task| !self.tasks[&task].revoked),
-            "50: running thread of a revoked task",
-        )
+        for core in &self.cores {
+            let revoked = core
+                .thread
+                .and_then(|thread| self.threads.get(&thread)?.task);
+            ensure(
+                revoked.is_none_or(|task| !self.tasks.get(&task).is_some_and(|t| t.revoked))
+                    || core.ipis.contains(&crate::Ipi::Reschedule),
+                "50: running thread of a revoked task",
+            )?;
+        }
+        ensure(true, "50: running thread of a revoked task")
     }
 
     /// Interrupts:

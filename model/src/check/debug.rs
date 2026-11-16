@@ -37,14 +37,25 @@ impl Model {
     ///     the previous window), at most 16 entries of one code other than
     ///     3 and 6; the header counts every suppressed entry, reported by
     ///     an entry of code 3 or still counted in the node block;
-    /// 92. a committed node record of this boot has the boot identifier as
+    /// 92. a committed core record of this boot has the boot identifier as
     ///     its commit; the previous crash area is never written;
     /// 93 (in `check_tree`) and: no port access touched a port refused to
     ///     this node; off x86-64 none succeeds;
     /// 95. a breakpoint word of a thread lies in the user range, its control
     ///     word within the user mask, its user-interrupt word 0.
     pub(super) fn check_debug(&self) -> Check {
-        let area = &self.table.crash.areas[self.node as usize];
+        for position in 0..self.width() {
+            self.check_area(position)?;
+        }
+        self.check_records()
+    }
+
+    /// 88 to 91 for the debug area of the core at `position`; 89 and 90
+    /// for a call on `debug` judge the area of the core the event ran on.
+    fn check_area(&self, position: usize) -> Check {
+        let core = &self.cores[position];
+        let area = &self.table.crash.areas[core.number as usize];
+        let here = position == *self.at;
         ensure(
             ring_holds(&area.kernel, area.next_kernel, TRACE_KERNEL_ENTRIES),
             "88: kernel ring",
@@ -65,7 +76,7 @@ impl Model {
             .filter(|e| e.seq != 0)
             .all(|e| e.code() < 16);
         ensure(kernel_codes, "89: a user code in the kernel ring")?;
-        if let Some((first, count, stamp)) = self.event.user_entries {
+        if let Some((first, count, stamp)) = self.event.user_entries.filter(|_| here) {
             ensure(
                 self.event.kernel_entries == 0,
                 "89: a call on debug wrote a kernel entry",
@@ -106,11 +117,15 @@ impl Model {
                 )?;
             }
         }
-        let pending: u64 = self.limits.iter().map(|l| l.suppressed).sum();
+        let pending: u64 = core.limits.iter().map(|l| l.suppressed).sum();
         ensure(
-            area.suppressed == self.reported + pending,
+            area.suppressed == core.reported + pending,
             "91: suppressed entries not counted once",
-        )?;
+        )
+    }
+
+    /// 92, 93 and 95.
+    fn check_records(&self) -> Check {
         let boot_id = self.table.crash.boot_id;
         for record in self.table.crash.areas.iter().filter_map(|a| a.record) {
             ensure(

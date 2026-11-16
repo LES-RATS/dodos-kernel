@@ -1,7 +1,7 @@
 //! Scheduling and time: the clock, scheduling contexts and their calls,
 //! what runs next, the lends of the budget across `call`, and timers.
 
-use crate::{Armed, Model, ObjId, Outcome, Output, Queue, Queued, Sched, Thread, live};
+use crate::{Armed, Model, ObjId, Outcome, Output, Queue, Queued, Sched, Thread, locked};
 use dodos_abi::RECOVERY_BANDWIDTH;
 use dodos_abi::{
     ADMISSION_WHOLE_CORE, CORE_WINDOWS, Error, FaultKind, ObjectKind, Rights, SCHED_COUNT_OFF,
@@ -68,40 +68,99 @@ impl Model {
         self.now
     }
 
-    /// What runs next: the thread that runs, the holder of the context
-    /// that the last choice took; `None` when the core is idle.
+    /// What runs next: the thread that runs on the node's first core, the
+    /// holder of the context that its last choice took; `None` when that
+    /// core is idle.
     pub fn running(&self) -> Option<ObjId> {
-        let (context, _) = self.running?;
-        self.holder(context)
+        self.running_on(0)
+    }
+
+    /// The thread that runs on the core at `position` of the node.
+    pub fn running_on(&self, position: usize) -> Option<ObjId> {
+        self.cores.get(position)?.thread
+    }
+
+    /// The number of cores of the node.
+    pub fn core_count(&self) -> usize {
+        self.cores.len()
     }
 
     /// Clock: time passes up to `to`. The reference model processes every
-    /// due event at its instant: a timer interrupt is an event at each
-    /// instant the hardware timer is set to, up to `to`.
+    /// due event at its instant: a timer interrupt is an event, on its
+    /// core, at each instant a core's hardware timer is set to, up to `to`;
+    /// at one instant, the cores in position order.
     pub fn advance(&mut self, to: u64) {
         assert!(to >= self.now && to < TIME_LIMIT, "the clock is monotonic");
-        while let Some(instant) = self.hardware().filter(|&instant| instant <= to) {
+        while let Some((instant, core)) = self.next_timer().filter(|&(at, _)| at <= to) {
             self.now = instant.max(self.now);
-            *self.last_event = None;
-            let entry = self.begin();
-            self.due();
-            self.end(entry);
+            self.timer_interrupt(core);
         }
         self.now = to;
     }
 
-    /// Order inside an event, 1: the time since the previous event is
-    /// charged to the context that was running: to its consumed time, and
-    /// to its budget if it ran from the ready queue. The kernel's own time
-    /// is taken as zero. Returns the context running at the entry.
+    /// What is due at the current instant runs: the steps of the recovery
+    /// reserve that can progress, the timers due now.
+    pub fn settle(&mut self) {
+        self.advance(self.now);
+    }
+
+    /// A call, then what is due at its instant: the outcome of the call,
+    /// or, if it waited and its wait ended meanwhile, the outcome it was
+    /// woken with.
+    pub fn apply_settled(&mut self, thread: ObjId, call: crate::Syscall) -> Outcome {
+        let outcome = self.apply(thread, call);
+        if outcome != Ok(Output::Waits) {
+            return outcome;
+        }
+        self.settle();
+        match self.threads.get(&thread) {
+            Some(t) if t.wait == crate::Wait::None => {
+                t.outcome.clone().unwrap_or(Ok(Output::Waits))
+            }
+            _ => Ok(Output::Waits),
+        }
+    }
+
+    /// The earliest instant a core's hardware timer is set to, and the core.
+    pub(crate) fn next_timer(&self) -> Option<(u64, usize)> {
+        (0..self.width())
+            .filter(|&core| !self.cores[core].silent)
+            .filter_map(|core| Some((self.hardware(core)?, core)))
+            .min()
+    }
+
+    /// A timer interrupt on a core: an event that processes its due events.
+    pub(crate) fn timer_interrupt(&mut self, core: usize) {
+        *self.last_event = None;
+        let entry = self.begin_on(core);
+        self.due();
+        self.end(entry);
+        self.auto_deliver();
+    }
+
+    /// The start of an event on a core: the event runs there.
+    pub(crate) fn begin_on(&mut self, core: usize) -> Option<(ObjId, bool)> {
+        *self.at = core;
+        self.begin()
+    }
+
+    /// Order inside an event, 1: the time since the previous event of the
+    /// core is charged to the context that was running there: to its
+    /// consumed time, and to its budget if it ran from the ready queue. The
+    /// kernel's own time is taken as zero. Returns the context running at
+    /// the entry.
     pub(crate) fn begin(&mut self) -> Option<(ObjId, bool)> {
         self.table.begin_journal();
         self.table.member_writes.clear();
         self.table.role_writes.clear();
-        // The core beacon's heartbeat: one more at every event.
-        self.events.0 += 1;
-        if self.shared {
-            self.load_block();
+        self.begin_locks();
+        let at = *self.at;
+        // A core that wakes from idle clears its idle word, and its beacon's
+        // `idle_until` is 0 again at its first event after idle (D-131).
+        if self.cores[at].running.is_none() {
+            self.wake_core();
+            let number = self.cores[at].number as usize;
+            self.table.core_beacons[number].idle_until.0 = 0;
         }
         self.change_list.clear();
         self.no_context_list.clear();
@@ -115,21 +174,21 @@ impl Model {
             params: params.collect(),
             ..crate::EventLog::default()
         };
-        let elapsed = self.now - self.previous;
-        self.previous = self.now;
+        let elapsed = self.now - self.cores[at].previous;
+        self.cores[at].previous = self.now;
         self.event.counts = self
             .scheds
             .iter()
             .map(|(&id, s)| (id, (s.consumed, s.count, s.counted)))
             .collect();
-        // The time counters of `core_status`: idle when nothing ran, slack
+        // The time counters of `node_status`: idle when nothing ran, slack
         // when a context ran from its slack queue.
-        match self.running {
-            None => self.idle_ns.0 += elapsed,
-            Some((_, false)) => self.slack_ns.0 += elapsed,
+        match self.cores[at].running {
+            None => self.cores[at].idle_ns.0 += elapsed,
+            Some((_, false)) => self.cores[at].slack_ns.0 += elapsed,
             Some(_) => {}
         }
-        let (context, ready) = self.running?;
+        let (context, ready) = self.cores[at].running?;
         let counter = self.machine.counter;
         let running = self.scheds.get_mut(&context)?;
         running.consumed = running.consumed.saturating_add(elapsed);
@@ -186,11 +245,15 @@ impl Model {
     /// its queue, then the choice.
     pub(crate) fn end(&mut self, entry: Option<(ObjId, bool)>) {
         self.trace_transitions();
+        // A thread marked *leaving its core* that this core runs: the core
+        // saves its registers and stops running it.
+        self.leave();
         self.choose(entry);
+        let at = *self.at;
         self.publish_counters();
         // Instructions retired: when a counted context stops running, the
         // kernel reads the processor's class of the code it ran.
-        let now = self.running.map(|(context, _)| context);
+        let now = self.cores[at].running.map(|(context, _)| context);
         if let Some((stopped, _)) = entry
             && now != Some(stopped)
             && let Some(sched) = self.scheds.get_mut(&stopped)
@@ -203,14 +266,67 @@ impl Model {
         }
         // What a core enables for a thread: the baseline of the node and the
         // optional features of the thread's mask, written at a switch.
-        if let Some(holder) = self.running() {
-            self.enabled = self.enabled_for(holder);
+        if let Some(holder) = self.cores[at].thread {
+            self.cores[at].enabled = self.enabled_for(holder);
+        }
+        // The root the core runs on (G7), and an idle core's idle word.
+        match self.cores[at].thread {
+            Some(_) => self.load_root(),
+            None => {
+                self.go_idle();
+                self.cache_here();
+            }
+        }
+        // Wake-ups across cores: a context that should take another core
+        // makes this core send that core the reschedule interrupt.
+        self.reschedule_others();
+        self.beat();
+        self.end_locks();
+    }
+
+    /// The core beacon at the exit of every event of a core: its heartbeat,
+    /// and while it goes idle the instant of its next armed timer (the
+    /// largest value if none), so that it need not beat while idle.
+    fn beat(&mut self) {
+        let at = *self.at;
+        self.cores[at].events.0 += 1;
+        let number = self.cores[at].number as usize;
+        let (node, generation) = (self.node, self.table.generation(self.node));
+        let idle_until = match self.cores[at].running {
+            Some(_) => 0,
+            None => self.hardware(at).unwrap_or(u64::MAX),
+        };
+        let beacon = &mut self.table.core_beacons[number];
+        beacon.heartbeat.0 = self.cores[at].events.0;
+        beacon.idle_until.0 = idle_until;
+        beacon.ran = (node, generation);
+    }
+
+    /// After an event on one core, every other core whose choice the event
+    /// changed is sent the reschedule interrupt: it is idle and a context
+    /// placed on it became eligible, or a context placed on it should
+    /// preempt the one it runs, or what it runs is no longer what it would
+    /// choose. Never on a node of one core.
+    fn reschedule_others(&mut self) {
+        let at = *self.at;
+        for core in (0..self.width()).filter(|&c| c != at) {
+            let wanted = self.pick(core);
+            let runs = self.cores[core].running;
+            let holder_moved = runs.is_some_and(|(context, _)| {
+                !self.scheds.contains_key(&context)
+                    || self.holder(context) != self.cores[core].thread
+            });
+            let differs = wanted.map(|w| w.0) != runs.map(|r| r.0);
+            if (differs || holder_moved) && !self.cores[core].ipis.contains(&crate::Ipi::Reschedule)
+            {
+                self.post(core, crate::Ipi::Reschedule);
+            }
         }
     }
 
     /// The state features enabled for a thread on its node's cores.
     pub(crate) fn enabled_for(&self, thread: ObjId) -> u32 {
-        let kind = self.machine.own_kind(self.node);
+        let kind = self.machine.kind_of(self.cores[0].number as usize);
         let list = self.machine.features();
         let optional = self.threads[&thread].mask as u32
             & list.state
@@ -234,11 +350,14 @@ impl Model {
         // after it is suspended. Each round takes one thread out of what can
         // run, so the loop ends.
         let mut entered = 0;
+        let at = *self.at;
         for _ in 0..=self.threads.len() {
             self.no_context();
             entered += self.requeue();
-            self.running = self.pick();
-            let Some(holder) = self.running() else {
+            let picked = self.pick(at);
+            self.cores[at].running = picked;
+            self.cores[at].thread = picked.and_then(|(context, _)| self.holder(context));
+            let Some(holder) = self.cores[at].thread else {
                 *self.last_event = self.last_event.map(|(kind, _)| (kind, entered));
                 return;
             };
@@ -247,7 +366,7 @@ impl Model {
             // is made again.
             let task = self.threads[&holder].task;
             if task.is_some_and(|task| self.tasks[&task].revoked) {
-                live(&mut self.threads, holder).suspended = true;
+                locked(&mut self.threads, &self.locks, holder).suspended = true;
                 self.observe();
                 continue;
             }
@@ -298,13 +417,15 @@ impl Model {
             .or(lent.map(|(context, _)| *context))
     }
 
-    fn runnable_thread(thread: &Thread) -> bool {
-        !thread.suspended && thread.wait == crate::Wait::None
+    /// A thread is runnable when it is not suspended, does not wait, and is
+    /// not marked *leaving its core* (D-131).
+    pub(crate) fn runnable_thread(thread: &Thread) -> bool {
+        !thread.suspended && thread.wait == crate::Wait::None && !thread.leaving
     }
 
     /// The budget follows the call: the holder of a context is its home, if
     /// the home is runnable; otherwise the receiver of the top lend.
-    fn holder(&self, context: ObjId) -> Option<ObjId> {
+    pub(crate) fn holder(&self, context: ObjId) -> Option<ObjId> {
         let sched = &self.scheds[&context];
         let home = sched
             .home
@@ -357,7 +478,8 @@ impl Model {
                 self.wake_up(context);
             }
             let wanted = self.wanted(context);
-            let sched = live(&mut self.scheds, context);
+            self.touch_core(self.scheds[&context].core);
+            let sched = locked(&mut self.scheds, &self.locks, context);
             let same = sched.queue.map(|q| (q.queue, q.key)) == wanted;
             if !same {
                 sched.queue = wanted.map(|(queue, key)| Queued {
@@ -389,7 +511,7 @@ impl Model {
     /// the next reset of the wake-up rule, whichever comes first.
     fn wake_up(&mut self, context: ObjId) {
         let now = self.now;
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         let (b, t) = (u128::from(sched.budget), u128::from(sched.period));
         let r = sched.remaining.max(0) as u128;
         let keeps = sched.deadline > now && r * t <= u128::from(sched.deadline - now) * b;
@@ -406,7 +528,7 @@ impl Model {
     /// Exhaustion: with n = 1 + ⌊−r / B⌋, the replenishment instant is
     /// d + (n − 1) × T; not after now, the context is replenished at once.
     fn exhaust(&mut self, context: ObjId) {
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         let budget = sched.budget.max(1);
         let n = 1 + sched.remaining.unsigned_abs() / budget;
         let instant = sched.deadline + (n - 1) * sched.period;
@@ -426,7 +548,7 @@ impl Model {
     fn replenish(&mut self, context: ObjId, n: u64) {
         let now = self.now;
         self.event.resets.push(context);
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         if let Some((budget, period)) = sched.pending.take() {
             (sched.budget, sched.period) = (budget, period);
         }
@@ -442,14 +564,15 @@ impl Model {
         self.observe();
     }
 
-    /// The choice: the first context of the ready queue; otherwise the
-    /// first of the slack queue of the smallest class number; otherwise
-    /// nothing. Between equal keys, the context that entered first.
-    fn pick(&self) -> Option<(ObjId, bool)> {
+    /// The choice on a core: the first context of its ready queue;
+    /// otherwise the first of its slack queue of the smallest class number;
+    /// otherwise nothing. Between equal keys, the context that entered
+    /// first.
+    pub(crate) fn pick(&self, core: usize) -> Option<(ObjId, bool)> {
         let first = |queue: Queue| {
             let queued = self.scheds.iter().filter_map(|(&id, sched)| {
                 let place = sched.queue.filter(|place| place.queue == queue)?;
-                Some(((place.key, place.entered), id))
+                (sched.core == core).then_some(((place.key, place.entered), id))
             });
             queued.min().map(|(_, id)| id)
         };
@@ -461,23 +584,46 @@ impl Model {
             .map(|context| (context, false))
     }
 
-    /// Due events and the hardware timer: after the choice, the earliest of
-    /// the instant the running context's budget ends, the first
-    /// replenishment instant and the first firing instant.
-    pub(crate) fn hardware(&self) -> Option<u64> {
-        let budget = self.running.and_then(|(context, ready)| {
+    /// Due events and the hardware timer of a core: after the choice, the
+    /// earliest of the instant the running context's budget ends, the
+    /// first replenishment instant of its throttled queues, the first
+    /// firing instant of its timer queue, the due event of its invalidation
+    /// request (`CORE_ANSWER_NS` after its start), and, while the core runs
+    /// a thread, its previous event + `STALE_NS` / 2, an event that only
+    /// beats (D-131). An idle core with nothing armed sets no timer.
+    pub(crate) fn hardware(&self, core: usize) -> Option<u64> {
+        let part = &self.cores[core];
+        let budget = part.running.and_then(|(context, ready)| {
             let sched = self.scheds.get(&context).filter(|_| ready)?;
-            Some(self.now + sched.remaining.max(0) as u64)
+            Some(part.previous + sched.remaining.max(0) as u64)
         });
         let replenished = self
             .scheds
             .values()
+            .filter(|s| s.core == core)
             .filter_map(|s| s.queue.and(s.throttled));
-        let fired = self.timers.values().flatten().map(|armed| armed.instant);
+        let fired = self
+            .timers
+            .values()
+            .flatten()
+            .filter(|armed| armed.core == core)
+            .map(|armed| armed.instant);
+        let answer = part
+            .request
+            .as_ref()
+            .map(|r| r.started + self.table.core_answer_ns);
+        let beat = part
+            .thread
+            .map(|_| part.previous + self.table.stale_ns / 2)
+            .filter(|_| self.table.stale_ns > 0);
+        let reserve = (core == 0).then(|| self.reserve_due()).flatten();
         let instants = replenished
             .map(|(instant, _)| instant)
             .chain(fired)
-            .chain(budget);
+            .chain(budget)
+            .chain(answer)
+            .chain(beat)
+            .chain(reserve);
         instants.min()
     }
 
@@ -487,8 +633,26 @@ impl Model {
     /// then the timers; inside one queue, the order of the queue.
     fn due(&mut self) {
         let now = self.now;
+        let at = *self.at;
+        // The due event of the core's invalidation request: a request not
+        // complete `CORE_ANSWER_NS` after its start is a failure of the
+        // node, which accuses itself (A node of several cores).
+        let late = self.cores[at]
+            .request
+            .as_ref()
+            .is_some_and(|r| r.started + self.table.core_answer_ns <= now);
+        if late {
+            self.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
+        }
+        // The recovery reserve runs on the node's first core.
+        if at == 0 {
+            self.reserve_step();
+        }
         let mut due: Vec<((u64, u64, u64), Due)> = Vec::new();
         for (&id, sched) in &self.scheds {
+            if sched.core != at {
+                continue;
+            }
             let (Some(place), Some((instant, _))) = (sched.queue, sched.throttled) else {
                 continue;
             };
@@ -501,7 +665,7 @@ impl Model {
             }
         }
         for (&id, armed) in &self.timers {
-            if let Some(armed) = armed.filter(|armed| armed.instant <= now) {
+            if let Some(armed) = armed.filter(|armed| armed.instant <= now && armed.core == at) {
                 due.push(((armed.instant, 4, armed.entered), Due::Fire(id)));
             }
         }
@@ -527,66 +691,117 @@ impl Model {
         budget: u64,
         period: u64,
     ) {
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         (sched.configured, sched.budget, sched.period, sched.class) = (true, budget, period, 1);
         (sched.remaining, sched.deadline) = (budget as i64, self.now + period);
         sched.home = Some(thread);
-        live(&mut self.threads, thread).home = Some(context);
-        self.admitted = bandwidth(budget, period) + RECOVERY_BANDWIDTH;
+        // Placed on the node's first core, with the cores set of all its
+        // cores; the recovery reserve is admitted on that core.
+        sched.core = 0;
+        let set = self.cores_set();
+        locked(&mut self.scheds, &self.locks, context).cores = set;
+        locked(&mut self.threads, &self.locks, thread).home = Some(context);
+        self.cores[0].admitted = bandwidth(budget, period) + RECOVERY_BANDWIDTH;
+        *self.at = 0;
         self.end(None);
+    }
+
+    /// The cores set of a new context: every core of its node, as a window
+    /// and a mask. CONTRACT-GAP 7: a set is one window of 64 core numbers,
+    /// and the cores of a node may lie in several windows; the model gives
+    /// the window of the node's first core, with the node's cores in it.
+    pub(crate) fn cores_set(&self) -> (u64, u64) {
+        let window = u64::from(self.cores[0].number) / 64;
+        let mask = self
+            .cores
+            .iter()
+            .filter(|c| u64::from(c.number) / 64 == window)
+            .fold(0, |mask, c| mask | 1 << (c.number % 64));
+        (window, mask)
+    }
+
+    /// Whether a core number lies in a context's cores set.
+    fn in_set(set: (u64, u64), number: u64) -> bool {
+        set.0 == number / 64 && set.1 & 1 << (number % 64) != 0
     }
 
     // The calls of the scheduling contexts.
 
-    /// The `core` capability of a call: `write`, and the core of the kernel
-    /// that holds the context (`invalid`, judged right after its three
-    /// checks). One node: the boot core, node 0.
-    fn own_core(&self, thread: ObjId, core: SlotAddr) -> Result<(), Error> {
-        let core = self.object(thread, core, ObjectKind::Core, Rights::WRITE)?;
-        match self.cores[&core] == u32::from(self.node) {
+    /// The `node` capability of a call on a context: `write`, and it must
+    /// name the node that holds the context (`invalid`, judged right after
+    /// its three checks).
+    fn own_node(&self, thread: ObjId, node: SlotAddr) -> Result<(), Error> {
+        let node = self.object(thread, node, ObjectKind::Node, Rights::WRITE)?;
+        match self.nodes[&node] == self.node {
             true => Ok(()),
             false => Err(Error::Invalid),
         }
     }
 
+    /// `sched_configure`: the parameters, and the core of its node where
+    /// the context is placed (D-129). A core other than the one where it is
+    /// placed moves it there, admitted on the new core; its holder, if it
+    /// runs on another core, is marked *leaving its core*, and runs on the
+    /// new core once the mark is clear (no wait, D-131).
     pub(crate) fn sched_configure(
         &mut self,
         thread: ObjId,
         sched: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
+        core: u64,
         parameters: Parameters,
     ) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
-        self.own_core(thread, core)?;
+        self.own_node(thread, node)?;
         let Parameters {
             budget,
             period,
             class,
         } = parameters;
+        // The core number must be a core of this node and in the context's
+        // cores set.
+        let target = self.position(core).ok_or(Error::Invalid)?;
+        if !Self::in_set(self.scheds[&context].cores, core) {
+            return Err(Error::Invalid);
+        }
         let off = budget == 0 && period == 0;
         let on = SCHED_MIN_BUDGET_NS <= budget && budget <= period && period <= SCHED_MAX_PERIOD_NS;
         if !(off || on) || class > 2 {
             return Err(Error::Invalid);
         }
-        // A context in a move in flight is frozen until the answer.
-        if self.in_move(context) {
-            return Err(Error::Busy);
-        }
-        // Admission: the sum with the new bandwidth in place of the old one
-        // is at most one whole core; removing a configuration never fails.
+        // Admission on the core named: its sum with the new bandwidth in
+        // place of the old one is at most one whole core; a context that
+        // moves leaves the sum of its old core in the same call. Removing
+        // a configuration never fails.
+        let placed = self.scheds[&context].core;
         let before = self.scheds[&context].bandwidth();
-        let sum = self.admitted - before + bandwidth(budget, period);
+        let kept = if placed == target { before } else { 0 };
+        let sum = self.cores[target].admitted - kept + bandwidth(budget, period);
         if sum > ADMISSION_WHOLE_CORE {
             return Err(Error::Budget);
         }
-        self.admitted = sum;
+        self.touch_core(placed);
+        self.touch_core(target);
+        self.cores[placed].admitted -= before;
+        self.cores[target].admitted += bandwidth(budget, period);
+        if placed != target {
+            if let Some(holder) = self.holder(context) {
+                self.mark_leaving(holder);
+            }
+            let sched = locked(&mut self.scheds, &self.locks, context);
+            sched.core = target;
+            sched.queue = None;
+            if !self.change_list.contains(&context) {
+                self.change_list.push(context);
+            }
+        }
         let now = self.now;
         // A configuration from or to the state not configured sets the
         // parameters in force; on a configured context they are pending.
         if off || !self.scheds[&context].configured {
             self.event.resets.push(context);
         }
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         if off {
             sched.configured = false;
             (sched.remaining, sched.deadline, sched.throttled) = (0, 0, None);
@@ -615,15 +830,11 @@ impl Model {
         // `busy` if the context has a home, if the thread has an own
         // context, or if a context is lent to it.
         let lent = self.lends.values().any(|(_, receiver)| *receiver == target);
-        if self.in_move(context)
-            || self.scheds[&context].home.is_some()
-            || self.threads[&target].home.is_some()
-            || lent
-        {
+        if self.scheds[&context].home.is_some() || self.threads[&target].home.is_some() || lent {
             return Err(Error::Busy);
         }
-        live(&mut self.scheds, context).home = Some(target);
-        let bound = live(&mut self.threads, target);
+        locked(&mut self.scheds, &self.locks, context).home = Some(target);
+        let bound = locked(&mut self.threads, &self.locks, target);
         (bound.home, bound.lost) = (Some(context), false);
         self.observe();
         Ok(Output::Done)
@@ -633,39 +844,31 @@ impl Model {
     /// being marked; the lends go on.
     pub(crate) fn sched_unbind(&mut self, thread: ObjId, sched: SlotAddr) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
-        if self.in_move(context) {
-            return Err(Error::Busy);
-        }
-        if let Some(home) = live(&mut self.scheds, context).home.take() {
-            live(&mut self.threads, home).home = None;
+        if let Some(home) = locked(&mut self.scheds, &self.locks, context).home.take() {
+            locked(&mut self.threads, &self.locks, home).home = None;
         }
         self.observe();
         Ok(Output::Done)
     }
 
     /// `sched_set_cores`: the cores 64 × window + i, for each bit i of the
-    /// mask; the set must hold the own core of the node.
-    ///
-    /// A core is numbered by its place in the core list of the start-up
-    /// page (Values of the machine); the own core of node i is core i.
+    /// mask, by core number; the set must contain the core where the
+    /// context is placed.
     pub(crate) fn sched_set_cores(
         &mut self,
         thread: ObjId,
         sched: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
         (window, mask): (u64, u64),
     ) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
-        self.own_core(thread, core)?;
-        let own = u64::from(self.node);
-        let holds = window == own / 64 && mask & 1 << (own % 64) != 0;
+        self.own_node(thread, node)?;
+        let placed = u64::from(self.cores[self.scheds[&context].core].number);
+        let holds = Self::in_set((window, mask), placed);
         if window >= CORE_WINDOWS || mask == 0 || !holds {
             return Err(Error::Invalid);
         }
-        if self.in_move(context) {
-            return Err(Error::Busy);
-        }
-        live(&mut self.scheds, context).cores = (window, mask);
+        locked(&mut self.scheds, &self.locks, context).cores = (window, mask);
         Ok(Output::Done)
     }
 
@@ -703,17 +906,17 @@ impl Model {
         &mut self,
         thread: ObjId,
         sched: SlotAddr,
-        core: SlotAddr,
+        node: SlotAddr,
         mode: u64,
     ) -> Outcome {
         let context = self.object(thread, sched, ObjectKind::Sched, Rights::MANAGE)?;
-        self.own_core(thread, core)?;
+        self.own_node(thread, node)?;
         let on = match mode {
             SCHED_COUNT_OFF => false,
             SCHED_COUNT_ON => true,
             _ => return Err(Error::Invalid),
         };
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         if !on {
             (sched.count, sched.hw_class) = (0, 0);
         }
@@ -734,7 +937,7 @@ impl Model {
         let Some(context) = self.context_of(thread) else {
             return Ok(Output::Done);
         };
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         if !sched.configured {
             return Ok(Output::Done);
         }
@@ -769,13 +972,15 @@ impl Model {
             .context_of(caller)
             .filter(|&context| !self.dying(context));
         let Some(context) = context else {
-            live(&mut self.threads, receiver).lost = true;
+            locked(&mut self.threads, &self.locks, receiver).lost = true;
             self.observe();
             return;
         };
         self.lends.insert(reply, (context, receiver));
-        live(&mut self.scheds, context).chain.push(reply);
-        live(&mut self.threads, receiver).lost = false;
+        locked(&mut self.scheds, &self.locks, context)
+            .chain
+            .push(reply);
+        locked(&mut self.threads, &self.locks, receiver).lost = false;
         self.observe();
     }
 
@@ -817,11 +1022,14 @@ impl Model {
     /// The home is marked when the context of which it is the home becomes
     /// dying, at the first step of its removal.
     pub(crate) fn sched_dying(&mut self, context: ObjId) {
-        let sched = live(&mut self.scheds, context);
+        let sched = locked(&mut self.scheds, &self.locks, context);
         (sched.queue, sched.retired) = (None, true);
-        self.admitted -= sched.bandwidth();
+        let (core, bandwidth) = (sched.core, sched.bandwidth());
+        self.touch_core(core);
+        self.cores[core].admitted -= bandwidth;
+        let sched = locked(&mut self.scheds, &self.locks, context);
         if let Some(home) = sched.home.take() {
-            let thread = live(&mut self.threads, home);
+            let thread = locked(&mut self.threads, &self.locks, home);
             (thread.home, thread.lost) = (None, true);
         }
         self.observe();
@@ -845,15 +1053,21 @@ impl Model {
         let was = self.disarm(timer);
         let instant = firing_instant(deadline, tolerance);
         let bits = if badge == 0 { 1 } else { badge };
+        // Armed timers are kept in the queue of the core that ran
+        // `timer_set`.
         let armed = Armed {
             instant,
             notify,
             bits,
             entered: self.entered,
+            core: *self.at,
         };
+        self.touch_core(*self.at);
         self.entered += 1;
-        *live(&mut self.timers, timer) = Some(armed);
-        live(&mut self.notifies, notify).timers.push(timer);
+        *locked(&mut self.timers, &self.locks, timer) = Some(armed);
+        locked(&mut self.notifies, &self.locks, notify)
+            .timers
+            .push(timer);
         if instant <= self.now {
             self.fire(timer);
         }
@@ -872,10 +1086,10 @@ impl Model {
         if self.timers[&timer].is_some_and(|armed| armed.instant <= self.now) {
             self.fire(timer);
         }
-        let Some(armed) = live(&mut self.timers, timer).take() else {
+        let Some(armed) = locked(&mut self.timers, &self.locks, timer).take() else {
             return 0;
         };
-        live(&mut self.notifies, armed.notify)
+        locked(&mut self.notifies, &self.locks, armed.notify)
             .timers
             .retain(|&t| t != timer);
         1
@@ -885,12 +1099,14 @@ impl Model {
     /// `timer_set`, and the timer becomes idle; a timer whose notify is
     /// dying is disarmed without a signal.
     pub(crate) fn fire(&mut self, timer: ObjId) {
-        let armed = live(&mut self.timers, timer).take().expect("armed");
-        live(&mut self.notifies, armed.notify)
+        let armed = locked(&mut self.timers, &self.locks, timer)
+            .take()
+            .expect("armed");
+        locked(&mut self.notifies, &self.locks, armed.notify)
             .timers
             .retain(|&t| t != timer);
         if !self.dying(armed.notify) {
-            live(&mut self.notifies, armed.notify).word |= armed.bits;
+            locked(&mut self.notifies, &self.locks, armed.notify).word |= armed.bits;
             self.hand_over(armed.notify);
         }
     }
@@ -899,7 +1115,7 @@ impl Model {
     /// of its notify, in one step.
     pub(crate) fn timer_destroyed(&mut self, timer: ObjId) {
         if let Some(Some(armed)) = self.timers.remove(&timer) {
-            live(&mut self.notifies, armed.notify)
+            locked(&mut self.notifies, &self.locks, armed.notify)
                 .timers
                 .retain(|&t| t != timer);
         }
@@ -922,16 +1138,18 @@ impl Model {
         let Some(&timer) = self.notifies[&notify].timers.last() else {
             return false;
         };
-        *live(&mut self.timers, timer) = None;
-        live(&mut self.notifies, notify).timers.pop();
+        *locked(&mut self.timers, &self.locks, timer) = None;
+        locked(&mut self.notifies, &self.locks, notify).timers.pop();
         true
     }
 
     /// Destroying a context, or a thread: what is left of it is unlinked.
     pub(crate) fn sched_destroyed(&mut self, context: ObjId) {
         self.scheds.remove(&context);
-        if self.running.is_some_and(|(running, _)| running == context) {
-            self.running = None;
+        for core in &mut self.cores {
+            if core.running.is_some_and(|(running, _)| running == context) {
+                core.running = None;
+            }
         }
     }
 
@@ -939,7 +1157,7 @@ impl Model {
     /// and its own lend is taken out of the chain in one step.
     pub(crate) fn thread_unscheduled(&mut self, thread: ObjId) {
         if let Some(home) = self.threads[&thread].home {
-            live(&mut self.scheds, home).home = None;
+            locked(&mut self.scheds, &self.locks, home).home = None;
         }
         let own: Vec<ObjId> = self
             .lends

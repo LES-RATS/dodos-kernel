@@ -129,7 +129,7 @@ pub struct StartCore {
 }
 
 /// The previous crash area: flags bit 0 its stop record is valid, bit 1 at
-/// least one node record is valid.
+/// least one core record is valid.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartCrash {
@@ -177,13 +177,22 @@ pub struct StartProcess {
 pub const START_NODE_FRESH: u32 = 1 << 0;
 pub const START_NODE_RESUMED: u32 = 1 << 1;
 
+/// The entry `Node` (24 bytes since D-129), followed by the core numbers
+/// of the node's cores, in position order (u32 each).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartNode {
-    pub index: u32,
-    pub nodes: u32,
+    /// This node's slot.
+    pub slot: u32,
+    /// The number of node slots.
+    pub slots: u32,
     pub generation: u32,
     pub flags: u32,
+    /// The number of its cores.
+    pub cores: u32,
+    /// The number of cores per node the image supports
+    /// (`CORES_PER_KERNEL_MAX` or fewer; 1 for the first kernel).
+    pub cores_supported: u32,
 }
 
 /// A range of a floor (entry `Floors`) or of a reserve (entry `Reserves`,
@@ -327,7 +336,8 @@ pub struct StartIommu {
     pub role: u32,
 }
 
-/// Where the living part lies in the frame of slot 13, and its sizes.
+/// Where the living part lies in the frame of slot 13, and its sizes (80
+/// bytes since D-129).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartMachine {
@@ -349,7 +359,16 @@ pub struct StartMachine {
     /// The offset of the leaf counts of the device entries (G4), one u64
     /// per entry of the device table.
     pub device_leaves: u32,
+    /// The offsets of the core words, of the park requests and of the start
+    /// requests, one u64 per physical core each.
+    pub core_words: u32,
+    pub park_requests: u32,
+    pub start_requests: u32,
+    pub reserved: u32,
 }
+
+/// The layout version of the living part that `StartMachine` describes.
+pub const START_MACHINE_LAYOUT: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,7 +411,8 @@ pub struct StartFeedback {
     pub reserved: u32,
 }
 
-/// The debugging values of the node; the ports refused to it follow, as
+/// The debugging values of the node, its bytes per debug area counting per
+/// physical core; the ports refused to it follow, as
 /// pairs of u16. The fields the contract lists take 52 bytes; the record
 /// is 56, so a reserved word ends it.
 #[repr(C)]

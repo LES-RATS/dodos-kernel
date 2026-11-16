@@ -98,9 +98,10 @@ impl S {
     /// Node 0 kills node 1; the machine runs until node 1 is dead.
     #[track_caller]
     fn kill_1(&mut self) {
-        let stop = Syscall::CoreStop {
-            core: s(17),
-            mode: CORE_STOP_KILL,
+        let stop = Syscall::NodeStop {
+            node: s(17),
+            mode: NODE_STOP_KILL,
+            core: 0,
         };
         assert_eq!(self.call(0, stop), DONE);
         self.run(10 * MS);
@@ -114,13 +115,16 @@ impl S {
     /// Node 0 starts node 1 fresh: generation 2.
     #[track_caller]
     fn restart_1(&mut self) {
-        let start = Syscall::CoreStart {
-            core: s(17),
-            mode: CORE_START_FRESH,
+        let start = Syscall::NodeStart {
+            node: s(17),
+            mode: NODE_START_FRESH,
             image: 0,
             module: 0,
+            window: 0,
+            mask: 1 << 1,
         };
         assert_eq!(self.call(0, start), DONE);
+        self.run(MS);
         let member = self.sys.member(1);
         assert_eq!(
             (member.state(), member.generation()),

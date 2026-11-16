@@ -80,9 +80,9 @@ fn calls_keep_their_place() {
         TaskMark,
         TaskRevoke,
         TaskRead,
-        CoreStart,
-        CoreStop,
-        CoreStatus,
+        NodeStart,
+        NodeStop,
+        NodeStatus,
         DebugWrite,
         TraceEmit,
         ThreadCancel,
@@ -91,19 +91,19 @@ fn calls_keep_their_place() {
         MemoryTake,
         MemoryGive,
         MemorySplit,
-        CoreIdle,
-        CoreWatch,
-        CorePlace,
+        NodeIdle,
+        NodeWatch,
+        NodeSend,
         RoleClaim,
         RoleHand,
         ThreadSetFeatures,
-        ThreadMove,
+        GrantSignal,
         SchedCount,
         IoportIn,
         IoportOut,
         IoportsIssue,
         EntropyRead,
-        CorePerf,
+        NodePerf,
     ];
     assert_eq!(calls.len(), 64);
     for (number, call) in calls.into_iter().enumerate() {
@@ -129,7 +129,7 @@ fn object_kinds_and_page_sizes_have_their_numbers() {
         IoPorts,
         IoSpace,
         Task,
-        Core,
+        Node,
         Debug,
         Vcpu,
         IrqControl,
@@ -409,7 +409,7 @@ fn sizes_and_limits_have_their_values() {
     assert_eq!(SLOT_BYTES * CSPACE_SEGMENT_SLOTS as usize, 8192);
     assert_eq!((REMOVAL_STEP, REMOVAL_SLOTS), (32, 128));
     assert_eq!((TREE_DEPTH, LONGEST_WALK), (64, 191));
-    assert_eq!((CSPACE_MAX_SLOTS, CSPACE_DIRECTORY_BYTES), (1 << 20, 8));
+    assert_eq!((CSPACE_MAX_SLOTS, CSPACE_DIRECTORY_BYTES), (1 << 20, 16));
     assert_eq!(CLEAR_STEP_BYTES, 65_536);
     let small = [
         ENDPOINT_BYTES,
@@ -433,11 +433,10 @@ fn sizes_and_limits_have_their_values() {
 fn numbers_of_the_multi_node_part_have_their_values() {
     assert_eq!((NODES_MAX, GRANTS), (1024, 4096));
     assert_eq!((GRANT_ENTRY_BYTES, USE_ENTRY_BYTES), (128, 32));
-    assert_eq!((PROXIES_PER_PEER, PROXY_BYTES), (16, 1024));
     assert_eq!(DEVICE_TABLE_SPARE, 8192);
     assert_eq!((RESERVES_MIN, RESERVES_MAX, ROLES_PLAIN_MAX), (2, 8, 64));
     assert_eq!(
-        (CORE_WATCH_SLOTS, IDLE_STATES_MAX, OBSERVATIONS_MAX),
+        (NODE_WATCH_SLOTS, IDLE_STATES_MAX, OBSERVATIONS_MAX),
         (4, 15, 8)
     );
     assert_eq!(IDLE_ENTRY_WORDS * IDLE_STATES_MAX, 60);
@@ -448,7 +447,17 @@ fn numbers_of_the_multi_node_part_have_their_values() {
         (1_000_000_000, (100_000_000, 60_000_000_000))
     );
     let fence = [NMI_GRACE_NS, FENCE_NS, SETTLE_NS, START_NS];
-    assert_eq!(fence, [1_000_000, 10_000_000, 1_000_000, 1_000_000_000]);
+    assert_eq!(fence, [1_000_000, 20_000_000, 1_000_000, 1_000_000_000]);
+    assert_eq!(FENCE_RANGE_NS, (10_000_000, 1_000_000_000));
+    assert_eq!(
+        (SEAL_NS, SEAL_RANGE_NS),
+        (1_000_000_000, (10_000_000, 60_000_000_000))
+    );
+    assert_eq!(
+        (CORE_ANSWER_NS, CORE_ANSWER_RANGE_NS),
+        (10_000_000, (1_000_000, 100_000_000))
+    );
+    assert_eq!(CORES_PER_KERNEL_MAX, 64);
     assert_eq!(
         (RECOVERY_BANDWIDTH, RECOVERY_PERIOD_NS),
         (1 << 26, 10_000_000)
@@ -464,18 +473,18 @@ fn numbers_of_the_multi_node_part_have_their_values() {
 }
 
 #[test]
-fn values_of_the_cores_have_their_numbers() {
-    assert_eq!((CORE_START_FRESH, CORE_START_RESUME), (0, 1));
-    assert_eq!((CORE_IMAGE_BOOT, CORE_IMAGE_REPLACEMENT), (0, 1));
+fn values_of_the_nodes_have_their_numbers() {
+    assert_eq!((NODE_START_FRESH, NODE_START_RESUME), (0, 1));
+    assert_eq!((NODE_IMAGE_BOOT, NODE_IMAGE_REPLACEMENT), (0, 1));
     assert_eq!(
-        (CORE_STOP_KILL, CORE_STOP_SEAL, CORE_STOP_RETIRE),
+        (NODE_STOP_KILL, NODE_STOP_SEAL, NODE_STOP_RETIRE),
         (0, 1, 2)
     );
     assert_eq!(
-        (CORE_STATUS_PARKED, CORE_STATUS_UNUSABLE),
-        (1 << 32, 1 << 33)
+        (NODE_STATUS_CORES_MASK, NODE_STATUS_CLASS_SHIFT),
+        (0xFFFF, 16)
     );
-    assert_eq!((CORE_STATUS_FENCE_SHIFT, CORE_STATUS_WORDS), (34, 7));
+    assert_eq!((NODE_STATUS_UNUSABLE, NODE_STATUS_WORDS), (1 << 18, 7));
     let methods = [
         IDLE_METHOD_HALT,
         IDLE_METHOD_MWAIT,
@@ -714,10 +723,10 @@ fn x86_64_values_have_their_numbers() {
     assert_eq!((IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST), (48, 239));
     let claimable = (IRQ_VECTOR_LAST - IRQ_VECTOR_FIRST) as usize + 1;
     assert_eq!((IRQ_TABLE_ENTRIES, claimable), (192, 192));
-    assert_eq!(IRQ_MAX_NODES_REMAPPED, 341);
+    assert_eq!(IRQ_MAX_CORES_REMAPPED, 341);
     // The last node that can claim has handles below 65,536.
-    assert!(IRQ_MAX_NODES_REMAPPED as usize * IRQ_TABLE_ENTRIES - 1 < 1 << 16);
-    assert!((IRQ_MAX_NODES_REMAPPED as usize + 1) * IRQ_TABLE_ENTRIES > 1 << 16);
+    assert!(IRQ_MAX_CORES_REMAPPED as usize * IRQ_TABLE_ENTRIES - 1 < 1 << 16);
+    assert!((IRQ_MAX_CORES_REMAPPED as usize + 1) * IRQ_TABLE_ENTRIES > 1 << 16);
     assert_eq!(REGS_WORDS, 26);
     let order = [REG_RIP, REG_RSP, REG_RFLAGS, REG_RAX, REG_RBX, REG_RCX];
     assert_eq!(order, [0, 1, 2, 3, 4, 5]);
@@ -936,8 +945,37 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, layout),
         offset_of!(StartMachine, identifiers),
         offset_of!(StartMachine, device_leaves),
+        offset_of!(StartMachine, core_words),
+        offset_of!(StartMachine, park_requests),
+        offset_of!(StartMachine, start_requests),
+        offset_of!(StartMachine, reserved),
     ];
-    assert_eq!(machine, [28, 32, 40, 52, 56, 60]);
+    assert_eq!(machine, [28, 32, 40, 52, 56, 60, 64, 68, 72, 76]);
+    assert_eq!(START_MACHINE_LAYOUT, 1);
+    let node = [
+        offset_of!(StartNode, slot),
+        offset_of!(StartNode, slots),
+        offset_of!(StartNode, generation),
+        offset_of!(StartNode, flags),
+        offset_of!(StartNode, cores),
+        offset_of!(StartNode, cores_supported),
+    ];
+    assert_eq!(node, [0, 4, 8, 12, 16, 20]);
+    let membership = [
+        offset_of!(BootMembership, sweep_ms),
+        offset_of!(BootMembership, seal_ms),
+        offset_of!(BootMembership, core_answer_ms),
+    ];
+    assert_eq!(membership, [8, 12, 16]);
+    let ring = [
+        offset_of!(RingHeader, kind),
+        offset_of!(RingHeader, length),
+        offset_of!(RingHeader, sender),
+        offset_of!(RingHeader, sender_generation),
+        offset_of!(RingHeader, receiver_generation),
+        offset_of!(RingHeader, credit),
+    ];
+    assert_eq!(ring, [0, 1, 2, 4, 8, 12]);
     let kind = [
         offset_of!(StartKindRecord, baseline),
         offset_of!(StartKindRecord, id),
@@ -954,33 +992,36 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
     ];
     assert_eq!(debug, [8, 16, 32, 40, 50]);
     let header = [
+        offset_of!(DebugAreaHeader, core),
         offset_of!(DebugAreaHeader, generation),
+        offset_of!(DebugAreaHeader, slot),
         offset_of!(DebugAreaHeader, next_kernel),
         offset_of!(DebugAreaHeader, next_user),
         offset_of!(DebugAreaHeader, suppressed),
     ];
-    assert_eq!(header, [8, 16, 24, 32]);
-    // The node record sits at offset 64 of the debug area.
+    assert_eq!(header, [6, 8, 12, 16, 24, 32]);
+    // The core record sits at offset 64 of the core's debug area.
     let record = [
-        offset_of!(NodeCrashRecord, generation),
-        offset_of!(NodeCrashRecord, instant),
-        offset_of!(NodeCrashRecord, member),
-        offset_of!(NodeCrashRecord, detail),
-        offset_of!(NodeCrashRecord, text),
-        offset_of!(NodeCrashRecord, kernel),
-        offset_of!(NodeCrashRecord, user),
-        offset_of!(NodeCrashRecord, reserved),
+        offset_of!(CoreCrashRecord, generation),
+        offset_of!(CoreCrashRecord, instant),
+        offset_of!(CoreCrashRecord, member),
+        offset_of!(CoreCrashRecord, detail),
+        offset_of!(CoreCrashRecord, text),
+        offset_of!(CoreCrashRecord, kernel),
+        offset_of!(CoreCrashRecord, user),
+        offset_of!(CoreCrashRecord, reserved),
     ];
     let at = record.map(|offset| offset + DEBUG_HEADER_BYTES);
     assert_eq!(at, [72, 80, 88, 96, 352, 480, 2528, 3552]);
     let crash = [
+        offset_of!(CrashAreaHeader, cores),
         offset_of!(CrashAreaHeader, boot_id),
         offset_of!(CrashAreaHeader, sequence),
         offset_of!(CrashAreaHeader, area_bytes),
         offset_of!(CrashAreaHeader, build),
         offset_of!(CrashAreaHeader, stop),
     ];
-    assert_eq!(crash, [16, 24, 32, 36, 48]);
+    assert_eq!(crash, [12, 16, 24, 32, 36, 48]);
     let floors = [
         offset_of!(BootFloors, reserve_per_gib),
         offset_of!(BootFloors, reserves),
@@ -1006,7 +1047,7 @@ fn layouts_are_fixed() {
     assert_eq!(size_of::<StartCrash>(), 32);
     assert_eq!(size_of::<StartModule>(), 40);
     assert_eq!(size_of::<StartProcess>(), 40);
-    assert_eq!(size_of::<StartNode>(), 16);
+    assert_eq!(size_of::<StartNode>(), 24);
     assert_eq!(size_of::<StartShare>(), 24);
     assert_eq!(size_of::<StartKept>(), 16);
     assert_eq!(size_of::<StartIoApic>(), 8);
@@ -1040,7 +1081,7 @@ fn layouts_are_fixed() {
     assert_eq!(ranges, [0, 1, 2, 3, 4]);
     assert_eq!(size_of::<StartMemory>(), 56);
     assert_eq!(size_of::<StartIommu>(), 16);
-    assert_eq!(size_of::<StartMachine>(), 64);
+    assert_eq!(size_of::<StartMachine>(), 80);
     assert_eq!(size_of::<StartRole>(), 8);
     assert_eq!(size_of::<StartImage>(), 48);
     assert_eq!(size_of::<StartKindRecord>(), 56);
@@ -1048,11 +1089,15 @@ fn layouts_are_fixed() {
     assert_eq!(size_of::<StartDebug>(), 56);
     assert_eq!(size_of::<BootFloors>(), 32);
     assert_eq!(size_of::<BootMembership>(), 24);
+    assert_eq!(size_of::<BootNodes>(), 8);
+    assert_eq!(size_of::<BootNode>(), 16);
+    assert_eq!(size_of::<RingHeader>(), RING_HEADER_BYTES);
+    assert_eq!(size_of::<CoreWord>(), 8);
     assert_eq!(size_of::<ClockPage>(), 40);
     assert_eq!(size_of::<DeviceEntry>(), 16);
     assert_eq!(size_of::<TraceEntry>(), TRACE_ENTRY_BYTES);
     assert_eq!(size_of::<DebugAreaHeader>(), DEBUG_HEADER_BYTES);
-    assert_eq!(size_of::<NodeCrashRecord>(), NODE_CRASH_RECORD_BYTES);
+    assert_eq!(size_of::<CoreCrashRecord>(), CORE_CRASH_RECORD_BYTES);
     assert_eq!(size_of::<CrashAreaHeader>(), CRASH_HEADER_BYTES);
     assert_eq!(size_of::<Ownership>(), 8);
     assert_eq!(size_of::<Member>(), 8);
@@ -1153,8 +1198,15 @@ fn slot_layout_has_its_bits() {
     // The number of pages − 1 and the first page have 12 bits: E ≤ 4,096.
     assert_eq!(SLOT_FRAME_FIRST_SHIFT - SLOT_FRAME_PAGES_SHIFT, 12);
     assert_eq!(1 << 12, TABLE_ENTRIES_MAX);
-    let record = [SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_BINDING];
-    assert_eq!((record, SLOT_RECORD_RIGHTS_SHIFT), ([0, 1, 2], 2));
+    let record = [
+        SLOT_RECORD_EMPTY,
+        SLOT_RECORD_MAPPING,
+        SLOT_RECORD_BINDING,
+        SLOT_RECORD_UNMAPPING,
+    ];
+    assert_eq!((record, SLOT_RECORD_RIGHTS_SHIFT), ([0, 1, 2, 3], 2));
+    // An irq names its core in bits 16-31 of word 1 (D-129).
+    assert_eq!(SLOT_IRQ_CORE_SHIFT, 16);
     // A partial mapping: the mark in word 2, the count asked − 1 in the 12
     // low bits of word 1, which the smallest page (4 KB) leaves 0.
     assert_eq!(
@@ -1276,9 +1328,14 @@ fn member_words_read_back_and_refuse_what_is_never_written() {
         (MemberState::Fencing, Evidence::Stale, 4, 9)
     );
     assert_eq!(Member::never().raw(), 0xFFFF << 16);
-    for raw in [8, 15, 7 << 4, 1 << 7, 1 << 15] {
+    for raw in [8, 15, 7 << 4, 3 << 7, 1 << 9, 1 << 15] {
         assert_eq!(Member::from_raw(raw), None, "{raw:#x}");
     }
+    // Bits 7-8 hold the node's fence class (D-129), 0 to 2.
+    let classed = word.with_class(2);
+    assert_eq!(classed.raw(), word.raw() | 2 << 7);
+    assert_eq!(Member::from_raw(classed.raw()), Some(classed));
+    assert_eq!((classed.class(), classed.with_class(1).class()), (2, 1));
     assert!(Member::new(MemberState::Sealing, Evidence::None, DRIVER_NONE, 1).writes());
     assert!(!Member::new(MemberState::Sealed, Evidence::None, DRIVER_NONE, 1).writes());
 }
@@ -1295,8 +1352,12 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
         (none(Starting, 3), none(Live, 3), Transition::Up),
         (none(Live, 3), none(Sealing, 3), Transition::Seal),
         (none(Sealing, 3), none(Sealed, 3), Transition::Sealed),
-        (none(Live, 3), none(Sealed, 3), Transition::HostSealed),
-        (none(Starting, 3), none(Sealed, 3), Transition::HostSealed),
+        (none(Sealing, 3), none(Live, 3), Transition::Abandon),
+        (
+            none(Dead, 3),
+            none(Starting, 4).with_class(2),
+            Transition::Start,
+        ),
         (
             kill(Unfenced, 3),
             m(Unfenced, Evidence::Kill, 2, 3),
@@ -1329,6 +1390,12 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
         (none(Live, 3), none(Sealed, 4)),
         (kill(Unfenced, 3), kill(Unfenced, 3)),
         (kill(Fenced, 3), m(Fenced, Evidence::Kill, 2, 3)),
+        // No row lets another node seal a live node (the co-hosting row of
+        // D-123 is gone with D-128), and only a fresh start writes a class.
+        (none(Live, 3), none(Sealed, 3)),
+        (none(Starting, 3), none(Sealed, 3)),
+        (none(Live, 3).with_class(2), none(Sealing, 3).with_class(1)),
+        (none(Sealed, 3).with_class(2), none(Starting, 3)),
     ];
     for (from, to) in refused {
         assert_eq!(member_transition(from, to), None, "{from:?} {to:?}");
@@ -1338,14 +1405,20 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
 #[test]
 fn the_successor_is_the_next_live_node_of_the_best_class() {
     use MemberState::*;
-    let at = |state| Member::new(state, Evidence::None, DRIVER_NONE, 1);
-    let members = [at(Live), at(Live), at(Fenced), at(Live)];
-    assert_eq!(successor(&members, &[2, 1, 2, 2], 2), Some(3));
-    assert_eq!(successor(&members, &[2, 1, 2, 2], 3), Some(0));
-    assert_eq!(successor(&members, &[1, 2, 2, 1], 2), Some(1));
-    assert_eq!(successor(&members, &[1, 1, 1, 1], 0), Some(1));
-    let gone = [at(Dead), at(Sealed), at(Fencing), at(Unfenced)];
-    assert_eq!(successor(&gone, &[2; 4], 0), None);
+    let at = |state, class| Member::new(state, Evidence::None, DRIVER_NONE, 1).with_class(class);
+    let classed = |classes: [u8; 4]| {
+        let states = [Live, Live, Fenced, Live];
+        [0, 1, 2, 3].map(|i| at(states[i], classes[i]))
+    };
+    // The class is read from the member words (D-129).
+    assert_eq!(successor(&classed([2, 1, 2, 2]), 2), Some(3));
+    assert_eq!(successor(&classed([2, 1, 2, 2]), 3), Some(0));
+    assert_eq!(successor(&classed([1, 2, 2, 1]), 2), Some(1));
+    assert_eq!(successor(&classed([1, 1, 1, 1]), 0), Some(1));
+    assert_eq!(best_class(&classed([1, 2, 2, 1])), Some(2));
+    let gone = [at(Dead, 2), at(Sealed, 2), at(Fencing, 2), at(Unfenced, 2)];
+    assert_eq!(successor(&gone, 0), None);
+    assert_eq!(best_class(&gone), None);
 }
 
 #[test]
@@ -1385,7 +1458,17 @@ fn role_words_read_back() {
     assert_eq!(RoleWord::from_raw(3), None);
     assert_eq!(RoleWord::from_raw(1 | 7 << 18), None);
     assert_eq!(RoleWord::from_raw(7 << 2), None);
-    assert_eq!(RoleWord::held(0, 1 << 30).epoch(), 0);
+    // The epoch has 29 bits (34-62) since D-131; bit 63 is *failed*.
+    assert_eq!(ROLE_EPOCH_MASK, (1 << 29) - 1);
+    assert_eq!(RoleWord::held(0, 1 << 29).epoch(), 0);
+    assert_eq!(RoleWord::held(0, ROLE_EPOCH_MASK).raw() >> 63, 0);
+    let failed = RoleWord::held(2, 9).failed_now();
+    assert_eq!((failed.raw() >> 63, ROLE_FAILED), (1, 1 << 63));
+    assert!(failed.failed() && !RoleWord::held(2, 9).failed());
+    assert_eq!(RoleWord::from_raw(failed.raw()), Some(failed));
+    assert_eq!((failed.epoch(), failed.holder()), (9, 2));
+    let next = failed.keeping_failed(RoleWord::held(4, 10));
+    assert!(next.failed() && next.holder() == 4 && next.epoch() == 10);
     assert_eq!(
         [
             RoleKind::Unit as u8,
@@ -1596,13 +1679,13 @@ fn debug_values_have_their_numbers() {
         (
             DEBUG_AREA_BYTES,
             DEBUG_HEADER_BYTES,
-            NODE_CRASH_RECORD_BYTES
+            CORE_CRASH_RECORD_BYTES
         ),
         (69_632, 64, 4_032)
     );
     assert_eq!(DEBUG_AREA_BYTES, 17 * 4096);
     assert_eq!(
-        DEBUG_HEADER_BYTES + NODE_CRASH_RECORD_BYTES,
+        DEBUG_HEADER_BYTES + CORE_CRASH_RECORD_BYTES,
         TRACE_KERNEL_OFFSET
     );
     assert_eq!(
@@ -1647,6 +1730,19 @@ fn debug_values_have_their_numbers() {
     assert_eq!((UserText as u16, UserEmit as u16), (16, 17));
     assert!(UserText.user() && UserEmit.user());
     assert_eq!(TRACE_FLAG_CONTINUED, 1 << 16);
+    // Bits 17-31 of word 2 hold the node slot the core ran (D-129).
+    assert_eq!((TRACE_SLOT_SHIFT, TRACE_SLOT_MASK), (17, 0x7fff));
+    let word = TraceEntry::word2_of(5, true, 300, 7);
+    assert_eq!(word, 5 | 1 << 16 | 300 << 17 | 7 << 32);
+    let traced = TraceEntry {
+        word2: word,
+        ..TraceEntry::default()
+    };
+    assert_eq!((traced.slot(), traced.generation()), (300, 7));
+    assert_eq!(
+        (DEBUG_AREA_VERSION, CRASH_AREA_VERSION, DEBUG_AREA_BYTES),
+        (2, 2, 69_632)
+    );
     assert_eq!(
         (
             trace_index(1, 256),
@@ -1667,8 +1763,9 @@ fn debug_values_have_their_numbers() {
         CrashReason::Assertion as u32,
         CrashReason::Fenced as u32,
         CrashReason::StartRefused as u32,
+        CrashReason::CoreSilent as u32,
     ];
-    assert_eq!(reasons, [1, 5, 8]);
+    assert_eq!(reasons, [1, 5, 8, 9]);
     use ConsoleKind as C;
     assert_eq!(
         [
@@ -1936,14 +2033,17 @@ fn r7_abi_survivors() {
     }));
     // #027: GateWord::from_raw rejects bit 45 set
     assert_eq!(GateWord::from_raw((1u64 << 45) | (1u64 << 32)), None);
-    // #030: member_transition HostSealed requires cleared == true
+    // #030 (restated for D-128, which removed the co-hosting row): a
+    // sealed word is reached only from sealing, keeping evidence and driver.
     let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);
-    let sealed_bad = Member::new(MemberState::Sealed, Evidence::Host, 0, 1);
+    let sealing = Member::new(MemberState::Sealing, Evidence::None, DRIVER_NONE, 1);
+    let sealed_bad = Member::new(MemberState::Sealed, Evidence::Seal, 0, 1);
     let sealed_ok = Member::new(MemberState::Sealed, Evidence::None, DRIVER_NONE, 1);
-    assert_eq!(member_transition(live, sealed_bad), None);
+    assert_eq!(member_transition(live, sealed_ok), None);
+    assert_eq!(member_transition(sealing, sealed_bad), None);
     assert_eq!(
-        member_transition(live, sealed_ok),
-        Some(Transition::HostSealed)
+        member_transition(sealing, sealed_ok),
+        Some(Transition::Sealed)
     );
 }
 
@@ -2149,4 +2249,159 @@ fn interrupt_ranges_of_arm64_and_riscv() {
         (a::IRQ_TABLE_ENTRIES, r::IRQ_TABLE_ENTRIES),
         (crate::x86_64::IRQ_TABLE_ENTRIES, 192)
     );
+}
+
+#[test]
+fn the_evidence_seal_has_the_number_of_host() {
+    let evidence = [
+        Evidence::None,
+        Evidence::SelfReported,
+        Evidence::Stale,
+        Evidence::Stuck,
+        Evidence::Kill,
+        Evidence::Retire,
+        Evidence::Seal,
+    ];
+    for (number, e) in evidence.into_iter().enumerate() {
+        assert_eq!(e as u8, number as u8);
+        let word = Member::new(MemberState::Fencing, e, 1, 1);
+        assert_eq!(Member::from_raw(word.raw()).map(Member::evidence), Some(e));
+    }
+}
+
+#[test]
+fn core_words_have_their_bits_and_refuse_a_bad_check() {
+    let states = [
+        CoreState::Free as u8,
+        CoreState::Owned as u8,
+        CoreState::Leaving as u8,
+        CoreState::Joining as u8,
+    ];
+    assert_eq!(states, [0, 1, 2, 3]);
+    assert_eq!(
+        (CORE_MARK, CORE_UNUSABLE, CORE_NO_SLOT),
+        (1 << 2, 1 << 3, 0xFFFF)
+    );
+    let word = CoreWord::owned(5, 9);
+    let fields = word.raw() & !(0xfff << 4);
+    assert_eq!(fields, 1 | 5 << 16 | 9 << 32);
+    // The check: the top 12 bits of the word with check 0 times CHECK_MUL.
+    assert_eq!(
+        word.raw() >> 4 & 0xfff,
+        fields.wrapping_mul(CHECK_MUL) >> 52
+    );
+    assert_eq!(CoreWord::from_raw(word.raw()), Some(word));
+    assert_eq!(CoreWord::from_raw(word.raw() ^ 1 << 4), None);
+    assert_eq!(CoreWord::from_raw(word.raw() ^ 1 << 16), None);
+    let marked = CoreWord::joining(5, 9).marked();
+    assert!(marked.is_marked() && marked.names(5, 9) && !marked.names(5, 8));
+    assert_eq!(marked.state(), CoreState::Joining);
+    let free = CoreWord::free(true);
+    assert!(free.is_unusable() && free.state() == CoreState::Free);
+    assert_eq!((free.slot(), free.generation()), (CORE_NO_SLOT, 0));
+    assert!(!free.names(CORE_NO_SLOT, 0));
+    assert!(word.unusable().is_unusable() && word.unusable().names(5, 9));
+}
+
+#[test]
+fn the_twelve_kinds_of_message_have_their_numbers_and_rings() {
+    for (number, kind) in NodeMessage::ALL.into_iter().enumerate() {
+        assert_eq!(kind as u8, number as u8 + 1);
+        assert_eq!(NodeMessage::from_raw(kind as u8), Some(kind));
+        let user = matches!(kind, NodeMessage::Send | NodeMessage::Signal);
+        assert_eq!(kind.ring() == Ring::User, user, "{kind:?}");
+    }
+    assert_eq!(NodeMessage::from_raw(0), None);
+    assert_eq!(NodeMessage::from_raw(13), None);
+    use NodeMessage::*;
+    let requests: [_; 3] = [Revoke, UnitRequest, ReportAsk];
+    let answers = [RevokeStep, UnitAnswer, Report, SendAnswer];
+    for kind in NodeMessage::ALL {
+        assert_eq!(kind.is_request(), requests.contains(&kind));
+        assert_eq!(kind.is_answer(), answers.contains(&kind));
+    }
+    assert_eq!(
+        answers.map(NodeMessage::answers),
+        [Some(Revoke), Some(UnitRequest), Some(ReportAsk), Some(Send)]
+    );
+}
+
+#[test]
+fn values_of_the_rings_have_their_numbers() {
+    assert_eq!(RING_ENTRY_BYTES, 64);
+    assert_eq!((RING_KERNEL_ENTRIES, RING_USER_ENTRIES), (64, 64));
+    assert_eq!(RING_MESSAGE_ENTRIES_MAX, 11);
+    assert_eq!((REQUESTS_PER_PEER, SENDS_PER_PEER), (16, 8));
+    assert_eq!((SENDS_RESERVED_FOR_MANAGE, SEND_GRANTS_MAX), (2, 4));
+    assert_eq!((RING_USER_STEP, PENDING_STEP), (16, 32));
+    assert_eq!((UNIT_REQUESTS, RING_ANSWER_RESERVE), (64, 34));
+    // The reserve: one entry per credit and the rest of one Report.
+    assert_eq!(
+        RING_ANSWER_RESERVE as usize,
+        REQUESTS_PER_PEER + SENDS_PER_PEER + RING_MESSAGE_ENTRIES_MAX - 1
+    );
+    // Eight KB per ordered pair.
+    let pair = (RING_KERNEL_ENTRIES + RING_USER_ENTRIES) as usize * RING_ENTRY_BYTES;
+    assert_eq!(pair, 8192);
+    let results = [
+        UnitResult::Done as u8,
+        UnitResult::Elsewhere as u8,
+        UnitResult::Failed as u8,
+    ];
+    assert_eq!(results, [0, 1, 2]);
+    assert_eq!(REPORT_END, u64::MAX);
+    assert_eq!((CREDIT_NONE, CREDIT_SERIAL_MASK), (31, (1 << 27) - 1));
+}
+
+#[test]
+fn a_ring_header_holds_its_credit_and_judges_its_length() {
+    let header = RingHeader::new(NodeMessage::Send, 10, (3, 7), 2, Some((17, 99)));
+    assert_eq!(
+        (
+            header.kind,
+            header.length,
+            header.sender,
+            header.sender_generation
+        ),
+        (11, 10, 3, 7)
+    );
+    assert_eq!(
+        (header.receiver_generation, header.credit),
+        (2, 17 | 99 << 5)
+    );
+    assert_eq!(header.credit(), Some((17, 99)));
+    let ping = RingHeader::new(NodeMessage::Ping, 1, (3, 7), 2, None);
+    assert_eq!((ping.credit, ping.credit()), (31, None));
+    assert!(header.readable(10) && !header.readable(9));
+    let zero = RingHeader {
+        length: 0,
+        ..header
+    };
+    let long = RingHeader {
+        length: 12,
+        ..header
+    };
+    let unknown = RingHeader { kind: 13, ..header };
+    assert!(!zero.readable(64) && !long.readable(64) && !unknown.readable(64));
+    // The words of the largest messages fit eleven entries.
+    assert_eq!(message_entries(0), 1);
+    assert_eq!(message_entries(3 + SEND_GRANTS_MAX + MAX_WORDS), 10);
+    assert_eq!(message_entries(6), 1);
+    assert_eq!(message_entries(7), 2);
+}
+
+#[test]
+fn ring_indices_count_free_entries_and_resynchronise() {
+    let n = RING_KERNEL_ENTRIES;
+    assert_eq!(ring_free(10, 10, n), 64);
+    assert_eq!(ring_free(74, 10, n), 0);
+    assert_eq!(ring_free(80, 10, n), 0);
+    // Counts that never go back: the difference wraps.
+    assert_eq!(ring_free(3, u64::MAX - 1, n), 59);
+    assert!(ring_fits(10, 10, n, 30, RING_ANSWER_RESERVE));
+    assert!(!ring_fits(10, 10, n, 31, RING_ANSWER_RESERVE));
+    assert!(ring_fits(10, 10, n, 64, 0));
+    assert!(!ring_fits(0, 0, n, u64::MAX, 1));
+    assert_eq!(ring_resync(100, 10, n), 36);
+    assert_eq!(ring_resync(74, 10, n), 10);
 }

@@ -15,9 +15,9 @@ cargo test --workspace
 # run time), so they run side by side; each must pass.
 geometry() {
 	DODOS_PAGE=$1 cargo test -p dodos-model --lib \
-		--test adversarial_nodes --test blocks --test boot --test calls \
+		--test blocks --test boot --test calls \
 		--test debug --test faults --test gate_attack --test gate_classes \
-		--test gate_words --test generations --test memory --test nodes \
+		--test gate_words --test generations --test memory \
 		--test property --test verify7_deepseek
 }
 geometry 16k &

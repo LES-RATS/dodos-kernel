@@ -1,6 +1,6 @@
 //! Threads: configuration, bindings, resumption, suspension, cancellation.
 
-use crate::{CapId, Model, ObjId, Outcome, Output, Record, Wait, live};
+use crate::{CapId, Model, ObjId, Outcome, Output, Record, Wait, live, locked};
 use dodos_abi::{Error, MemoryType, ObjectKind, PageSize, Rights, SlotAddr};
 
 /// The four bindings that `thread_configure` replaces at once.
@@ -88,7 +88,7 @@ impl Model {
         self.bound_space(target).or(Err(Error::Busy))?;
         // Register calls: resuming a suspended thread clears its fault
         // record.
-        let resumed = live(&mut self.threads, target);
+        let resumed = locked(&mut self.threads, &self.locks, target);
         if resumed.suspended {
             resumed.recorded = None;
         }
@@ -102,7 +102,7 @@ impl Model {
     /// is.
     pub(crate) fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        live(&mut self.threads, target).suspended = true;
+        locked(&mut self.threads, &self.locks, target).suspended = true;
         self.observe();
         Ok(Output::Done)
     }
@@ -127,7 +127,7 @@ impl Model {
         number: u64,
     ) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        let cancelled = live(&mut self.threads, target);
+        let cancelled = locked(&mut self.threads, &self.locks, target);
         cancelled.cancelled_up_to = cancelled.cancelled_up_to.max(number);
         let ended = match number {
             0 => true,
@@ -136,16 +136,10 @@ impl Model {
         // Threads: a thread whose wait is already over, and that has not run
         // since, does not wait: it keeps the result it has. The result says
         // nothing about what the thread was doing.
-        // Calls on an object of another node: a wait for another node is
-        // not ended here, but a wait on an object of the other node, which a
-        // proxy holds, is ended there; its call returns `cancelled` then.
-        // A request still waiting for a free proxy leaves its list, and the
-        // call returns `cancelled` at once (model choice).
-        if let Wait::Node(id) = cancelled.wait {
-            if ended && self.cancel_remote(id) == Some(true) {
-                self.unlink(target);
-                self.wake(target, Err(Error::Cancelled));
-            }
+        // IPC: `thread_cancel` ends none of the three waits that hold no
+        // queue (for another node, for a unit, for its node's cores), nor
+        // the wait of a hand-over: each is bounded.
+        if cancelled.bounded() {
             return Ok(Output::Done);
         }
         if ended && cancelled.wait != Wait::None {
@@ -173,7 +167,7 @@ impl Model {
         if needed > changed.area {
             return Err(Error::NoMemory);
         }
-        live(&mut self.threads, target).mask = mask;
+        locked(&mut self.threads, &self.locks, target).mask = mask;
         Ok(Output::Done)
     }
 
@@ -182,7 +176,10 @@ impl Model {
     // end of the vector) after it leaves the list of what it was bound to.
 
     pub(crate) fn bind_space(&mut self, thread: ObjId, space: Option<ObjId>) {
-        let old = std::mem::replace(&mut live(&mut self.threads, thread).cspace, space);
+        let old = std::mem::replace(
+            &mut locked(&mut self.threads, &self.locks, thread).cspace,
+            space,
+        );
         if let Some(old) = old {
             leave(&mut live(&mut self.cspaces, old).threads, thread);
         }
@@ -192,29 +189,48 @@ impl Model {
     }
 
     pub(crate) fn bind_aspace(&mut self, thread: ObjId, aspace: Option<ObjId>) {
-        let old = std::mem::replace(&mut live(&mut self.threads, thread).aspace, aspace);
+        let old = std::mem::replace(
+            &mut locked(&mut self.threads, &self.locks, thread).aspace,
+            aspace,
+        );
         if let Some(old) = old {
-            leave(&mut live(&mut self.aspaces, old).threads, thread);
+            leave(
+                &mut locked(&mut self.aspaces, &self.locks, old).threads,
+                thread,
+            );
         }
         if let Some(aspace) = aspace {
-            live(&mut self.aspaces, aspace).threads.push(thread);
+            locked(&mut self.aspaces, &self.locks, aspace)
+                .threads
+                .push(thread);
         }
     }
 
     pub(crate) fn bind_fault(&mut self, thread: ObjId, fault: Option<(ObjId, u64)>) {
-        let old = std::mem::replace(&mut live(&mut self.threads, thread).fault, fault);
+        let old = std::mem::replace(
+            &mut locked(&mut self.threads, &self.locks, thread).fault,
+            fault,
+        );
         if let Some((old, _)) = old {
-            leave(&mut live(&mut self.endpoints, old).threads, thread);
+            leave(
+                &mut locked(&mut self.endpoints, &self.locks, old).threads,
+                thread,
+            );
         }
         if let Some((endpoint, _)) = fault {
-            live(&mut self.endpoints, endpoint).threads.push(thread);
+            locked(&mut self.endpoints, &self.locks, endpoint)
+                .threads
+                .push(thread);
         }
     }
 
     /// Bindings: the message page is bound through the record of the frame
     /// capability given; the thread names the capability.
     pub(crate) fn bind_page(&mut self, thread: ObjId, page: Option<CapId>) {
-        let old = std::mem::replace(&mut live(&mut self.threads, thread).page, page);
+        let old = std::mem::replace(
+            &mut locked(&mut self.threads, &self.locks, thread).page,
+            page,
+        );
         if let Some(old) = old {
             live(&mut self.caps, old).record = Record::Empty;
         }

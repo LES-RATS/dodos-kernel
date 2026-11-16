@@ -35,7 +35,9 @@ impl K {
     }
 
     fn go(&mut self, call: Syscall) -> Outcome {
-        let outcome = self.m.apply(self.t, call);
+        // A claim waits for the unit request of its remapping entry or of
+        // its line, which node 0, the holder of every unit role, serves.
+        let outcome = self.m.apply_settled(self.t, call);
         assert_eq!(self.m.check(), Ok(()));
         outcome
     }
@@ -79,6 +81,7 @@ fn claim(source: IrqSource, vector: u64, slot: u32) -> Syscall {
     Syscall::IrqClaim {
         control: s(CONTROL),
         source: source.raw(),
+        core: 0,
         vector,
         destination: s(slot),
     }
@@ -153,6 +156,7 @@ fn irq_claim_needs_manage_on_an_irq_control() {
     let weak = |control| Syscall::IrqClaim {
         control: s(control),
         source: msi().raw(),
+        core: 0,
         vector: 48,
         destination: s(40),
     };
@@ -166,6 +170,7 @@ fn source_then_vector_are_judged_after_the_destination() {
     let raw = |source: u64, vector, slot| Syscall::IrqClaim {
         control: s(CONTROL),
         source,
+        core: 0,
         vector,
         destination: s(slot),
     };
@@ -212,6 +217,7 @@ fn irq_claim_checks_the_depth_last() {
     let deep = |vector| Syscall::IrqClaim {
         control: s(162),
         source: msi().raw(),
+        core: 0,
         vector,
         destination: s(40),
     };
@@ -232,6 +238,7 @@ fn revoking_the_control_capability_releases_its_vectors() {
     let through = Syscall::IrqClaim {
         control: s(31),
         source: msi().raw(),
+        core: 0,
         vector: 48,
         destination: s(40),
     };
@@ -370,7 +377,8 @@ fn arrival_on_a_dying_notify_is_handled_as_on_an_idle_irq() {
     k.make(Reply, 34);
     k.ok(Syscall::SchedConfigure {
         sched: s(START_SLOT_SCHED),
-        core: s(16),
+        node: s(16),
+        core: 0,
         budget: 5_000_000,
         period: 10_000_000,
         class: 1,
@@ -378,7 +386,8 @@ fn arrival_on_a_dying_notify_is_handled_as_on_an_idle_irq() {
     k.make(Sched, 35);
     k.ok(Syscall::SchedConfigure {
         sched: s(35),
-        core: s(16),
+        node: s(16),
+        core: 0,
         budget: 10_000,
         period: 10_000_000,
         class: 1,

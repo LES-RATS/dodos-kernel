@@ -3,7 +3,7 @@
 //! geometry of the run (both geometries give the same slots).
 
 use dodos_abi::ObjectKind::{
-    ASpace, CSpace, Core, Debug, Endpoint, Frame, IoPorts, Iommu, IrqControl, MemoryControl, Role,
+    ASpace, CSpace, Debug, Endpoint, Frame, IoPorts, Iommu, IrqControl, MemoryControl, Node, Role,
     Sched, Task, Thread, Untyped,
 };
 use dodos_abi::*;
@@ -113,7 +113,7 @@ fn start_up_space_holds_the_slots_of_the_table_in_their_order() {
     // floor, the copied writable segment, the kept frames of the three
     // modules, the two crash areas; then empty slots.
     let machine = [
-        Core, Core, Iommu, Role, Role, Role, Role, Role, Untyped, Untyped, Frame, Frame, Frame,
+        Node, Node, Iommu, Role, Role, Role, Role, Role, Untyped, Untyped, Frame, Frame, Frame,
         Frame, Frame, Frame,
     ];
     for (slot, wanted) in (16..).zip(machine) {
@@ -596,7 +596,7 @@ fn kernel_refuses_machine_values_out_of_range() {
 
 #[test]
 fn ports_exist_only_on_x86_64() {
-    let other = with(|m| m.arch = Arch::Other);
+    let other = with(|m| m.arch = Arch::Aarch64);
     let (mut m, t) = boot(&other);
     assert_eq!(kind(&mut m, t, START_SLOT_IOPORTS), Err(Error::Invalid));
 }
