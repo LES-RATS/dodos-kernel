@@ -16,7 +16,7 @@
         default = pkgs.mkShell {
           packages = [
             ((rust-overlay.lib.mkRustBin { } pkgs).stable."1.100.0".default.override {
-              targets = [ "x86_64-unknown-none" ];
+              targets = [ "x86_64-unknown-none" "x86_64-unknown-uefi" ];
             })
           ];
         };

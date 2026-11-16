@@ -129,7 +129,17 @@ one group; the other suites use the queue lock (the reason is in the results).
 
 **Unsafe code** is confined to `src/platform.rs`: the foreign calls that set
 the QoS class (macOS), pin a thread (`sched_setaffinity`, Linux) and read the
-current CPU. Every other file is safe Rust. The crate cannot carry
+current CPU; and, without the `std` feature only, to the spin mutex of
+`src/rt.rs`. Every other file is safe Rust.
+
+**Bare metal.** The crate is also a library (`src/lib.rs`): with
+`default-features = false` it builds without the standard library, and the
+host (clock, one closure per core, a real interrupt) is given by the
+bare-metal image of `trials/desktop` through `rt::install`. The workloads
+(`src/sim.rs`, `src/sim/srv.rs`) and the suites (`src/bench.rs`, moved out
+of `main.rs` unchanged) are the same code; the only addition is the value
+`platform::IPI_REAL` of `ipi_ns`, shown as `real` in the tables, which takes
+a real interrupt where the model charges a busy wait of `ipi_ns`. The crate cannot carry
 `#![forbid(unsafe_code)]` for that reason; its tests never call the foreign
 functions, so Miri and the sanitizer run them.
 

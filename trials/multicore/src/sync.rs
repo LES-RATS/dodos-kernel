@@ -2,10 +2,11 @@
 //! locks a group kernel could use, the ring between kernels, and the
 //! busy wait that stands for kernel work.
 
-use std::hint::{black_box, spin_loop};
-use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use crate::rt::{Duration, Instant};
+use alloc::boxed::Box;
+use core::hint::{black_box, spin_loop};
+use core::ops::Deref;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// One value alone in its cache line. 128 bytes: the line of Apple cores, and
 /// two lines on x86-64, whose adjacent-line prefetcher pairs lines anyway.

@@ -16,12 +16,13 @@ mod srv;
 
 use crate::hist::Hist;
 use crate::platform;
+use crate::rt::{self, Barrier, Duration, Instant, Mutex};
 use crate::sync::{Guard, LockKind, MAX_CORES, Msg, Notify, Padded, Ring, Signalled, busy};
-use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
-use std::sync::{Barrier, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use alloc::{format, string::String, vec};
+use core::hint::black_box;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cand {
@@ -529,7 +530,7 @@ struct Core<'m> {
 }
 
 fn bits(mut mask: u64) -> impl Iterator<Item = usize> {
-    std::iter::from_fn(move || {
+    core::iter::from_fn(move || {
         (mask != 0).then(|| {
             let b = mask.trailing_zeros() as usize;
             mask &= mask - 1;
@@ -728,7 +729,7 @@ impl<'m> Core<'m> {
                 }
                 claimed = true;
             }
-            busy(m.p.ipi_ns);
+            platform::interrupt(m.p.ipi_ns);
         }
         let bells = if bell {
             node.doorbell.swap(0, Ordering::Acquire)
@@ -745,7 +746,7 @@ impl<'m> Core<'m> {
                 // Another core of the node may have taken it.
                 let Some(msg) = ring.pop() else { break };
                 if per_message {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 self.handle(msg);
             }
@@ -753,7 +754,7 @@ impl<'m> Core<'m> {
         if tlb {
             for origin in bits(m.mbox_tlb[self.id].swap(0, Ordering::Acquire)) {
                 if per_message {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 busy(m.p.tlb_ns);
                 self.ack(origin, Held::No);
@@ -992,7 +993,7 @@ impl<'m> Core<'m> {
         loop {
             let s = seq.load(Ordering::Acquire);
             if !s.is_multiple_of(2) {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
             black_box(node.state[region * PROC_LINES + st * 2].load(Ordering::Relaxed));
@@ -1018,7 +1019,7 @@ impl<'m> Core<'m> {
             let s = seq.load(Ordering::Acquire);
             if !s.is_multiple_of(2) {
                 // A writer is in: wait for it (the time is in the latency).
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
             for j in 0..LINES {
@@ -1099,7 +1100,7 @@ impl<'m> Core<'m> {
             let got = m.mbox_ev[self.id].swap(0, Ordering::Acquire);
             if got != 0 {
                 if !charged {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 return got;
             }
@@ -1370,33 +1371,26 @@ pub fn run(
 ) -> RunOut {
     let m = Machine::new(w, cand, k, n, p);
     let start = Barrier::new(n + 1);
-    let (outs, secs) = thread::scope(|s| {
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let (m, start) = (&m, &start);
-                let cpu = cpus.get(i).copied().flatten();
-                s.spawn(move || {
-                    platform::prepare_worker(cpu);
-                    let mut core = Core::new(m, i);
-                    start.wait();
-                    core.run(m.roles[i]);
-                    core.out
-                })
-            })
-            .collect();
-        start.wait();
-        thread::sleep(p.warmup);
-        m.phase.store(MEASURE, Ordering::Relaxed);
-        let t = Instant::now();
-        thread::sleep(p.dur);
-        m.phase.store(STOP, Ordering::Relaxed);
-        let secs = t.elapsed().as_secs_f64();
-        let outs: Vec<CoreOut> = handles
-            .into_iter()
-            .map(|h| h.join().expect("worker panicked"))
-            .collect();
-        (outs, secs)
-    });
+    let (m_ref, start_ref) = (&m, &start);
+    let (outs, secs) = rt::scope(
+        n,
+        |i| {
+            platform::prepare_worker(cpus.get(i).copied().flatten());
+            let mut core = Core::new(m_ref, i);
+            start_ref.wait();
+            core.run(m_ref.roles[i]);
+            core.out
+        },
+        || {
+            start_ref.wait();
+            rt::sleep(p.warmup);
+            m_ref.phase.store(MEASURE, Ordering::Relaxed);
+            let t = Instant::now();
+            rt::sleep(p.dur);
+            m_ref.phase.store(STOP, Ordering::Relaxed);
+            t.elapsed().as_secs_f64()
+        },
+    );
     check(&m, &outs);
     let mut r = RunOut {
         secs,
