@@ -27,6 +27,13 @@ why IMPDEF kernel.md#the-write-gate-mechanisms "implementation-defined system re
 why Q-RAS question -- an error record selected by ERRSELR_EL1 may be shared by cores of several nodes (code 7 of the crash record reads them): may any kernel clear or configure it, or only the gate?
 why Q-CDDI question -- GIC CDDI deactivates an interrupt named by its ID (Linux v7.3 calls it at the end of every interrupt): kernel.md says the GICv3 CPU interface acts on the calling core only; does that hold for GICv5's CDDI, or must it be gate?
 
+# Outside the automatic domain (the open package omits the pseudocode that
+# says which load or store is privileged), classified by hand: the stores
+# to Guarded Control Stack pages, which mechanism 3 of the gate uses to
+# write page tables (kernel.md).
+insn GCSSTR_64_ldst_gcs gate GCS
+insn GCSSTTR_64_ldst_gcs gate GCS
+
 insn AUTIA1716_HI_hints kernel
 insn AUTIASP_HI_hints kernel
 insn AUTIAZ_HI_hints kernel
