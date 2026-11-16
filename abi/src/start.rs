@@ -35,7 +35,8 @@ pub const START_SLOT_FIRST: u32 = 16;
 /// The first process always has at least this many empty slots.
 pub const START_FREE_SLOTS: u32 = 4096;
 
-pub const START_VERSION: u32 = 2;
+/// Version 3: the entries of the neutral hand-over (D-125).
+pub const START_VERSION: u32 = 3;
 pub const START_MAGIC: u64 = u64::from_le_bytes(*b"DodOSst\0");
 /// Pages of the start-up page, at most.
 pub const START_PAGE_MAX_PAGES: u64 = 63;
@@ -66,8 +67,8 @@ pub enum StartKind {
     ObjectSizes = 0,
     Untyped = 1,
     Cores = 2,
-    AcpiRoot = 3,
-    UefiMemoryMap = 4,
+    FirmwareTables = 3,
+    MemoryRanges = 4,
     Framebuffer = 5,
     EntropySeed = 6,
     BootTimes = 7,
@@ -235,15 +236,61 @@ pub struct StartFramebuffer {
     pub format: u32,
 }
 
+/// The counter at the events of the start, and the first stage that built
+/// the hand-over block (D-125).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartBootTimes {
     pub frequency: u64,
-    pub loader: u64,
-    pub exit_boot_services: u64,
+    pub stage_entry: u64,
+    pub firmware_end: u64,
     pub kernel: u64,
     pub first_thread: u64,
+    /// `START_STAGE_*`.
+    pub stage: u32,
+    pub stage_version: u32,
 }
+
+/// The kind of first stage (D-125).
+pub const START_STAGE_UEFI: u32 = 0;
+pub const START_STAGE_DEVICE_TREE: u32 = 1;
+pub const START_STAGE_UBIOS: u32 = 2;
+pub const START_STAGE_LIMINE: u32 = 3;
+pub const START_STAGE_OTHER: u32 = 4;
+
+/// One firmware table of the hand-over block (`FirmwareTables`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartFirmwareTable {
+    /// `START_TABLE_*`.
+    pub kind: u32,
+    pub reserved: u32,
+    pub address: u64,
+    pub len: u64,
+}
+
+pub const START_TABLE_ACPI_ROOT: u32 = 1;
+pub const START_TABLE_DEVICE_TREE: u32 = 2;
+pub const START_TABLE_UBIOS: u32 = 3;
+pub const START_TABLE_SMBIOS: u32 = 4;
+
+/// One memory range of the hand-over block, with a DodOS type
+/// (`MemoryRanges`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartMemoryRange {
+    pub base: u64,
+    pub len: u64,
+    /// `START_RANGE_*`.
+    pub kind: u32,
+    pub reserved: u32,
+}
+
+pub const START_RANGE_USABLE: u32 = 0;
+pub const START_RANGE_KEPT_BY_STAGE: u32 = 1;
+pub const START_RANGE_FIRMWARE: u32 = 2;
+pub const START_RANGE_UNUSABLE: u32 = 3;
+pub const START_RANGE_DEVICE: u32 = 4;
 
 /// Flags of `StartMemory`.
 pub const START_MEMORY_MAP_THROUGH_ROLE: u32 = 1 << 0;

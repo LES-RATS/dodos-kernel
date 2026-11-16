@@ -794,7 +794,7 @@ fn start_up_slots_and_layout_have_their_values() {
     ];
     assert_eq!(slots, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     assert_eq!((START_SLOT_FIRST, START_FREE_SLOTS), (16, 4096));
-    assert_eq!((START_VERSION, START_PAGE_MAX_PAGES), (2, 63));
+    assert_eq!((START_VERSION, START_PAGE_MAX_PAGES), (3, 63));
     assert_eq!(START_UNTYPED_DEVICE, 1);
     assert_eq!((START_CORE_BOOTED, START_CORE_FENCE_SHIFT), (1, 1));
     let module = [
@@ -829,8 +829,8 @@ fn start_up_page_has_its_magic_and_kinds() {
         ObjectSizes,
         Untyped,
         Cores,
-        AcpiRoot,
-        UefiMemoryMap,
+        FirmwareTables,
+        MemoryRanges,
         Framebuffer,
         EntropySeed,
         BootTimes,
@@ -1012,7 +1012,32 @@ fn layouts_are_fixed() {
     assert_eq!(size_of::<StartIoApic>(), 8);
     assert_eq!(size_of::<StartInterrupts>(), 16);
     assert_eq!(size_of::<StartFramebuffer>(), 32);
-    assert_eq!(size_of::<StartBootTimes>(), 40);
+    assert_eq!(size_of::<StartBootTimes>(), 48);
+    assert_eq!(size_of::<StartFirmwareTable>(), 24);
+    assert_eq!(size_of::<StartMemoryRange>(), 24);
+    let stages = [
+        START_STAGE_UEFI,
+        START_STAGE_DEVICE_TREE,
+        START_STAGE_UBIOS,
+        START_STAGE_LIMINE,
+        START_STAGE_OTHER,
+    ];
+    assert_eq!(stages, [0, 1, 2, 3, 4]);
+    let tables = [
+        START_TABLE_ACPI_ROOT,
+        START_TABLE_DEVICE_TREE,
+        START_TABLE_UBIOS,
+        START_TABLE_SMBIOS,
+    ];
+    assert_eq!(tables, [1, 2, 3, 4]);
+    let ranges = [
+        START_RANGE_USABLE,
+        START_RANGE_KEPT_BY_STAGE,
+        START_RANGE_FIRMWARE,
+        START_RANGE_UNUSABLE,
+        START_RANGE_DEVICE,
+    ];
+    assert_eq!(ranges, [0, 1, 2, 3, 4]);
     assert_eq!(size_of::<StartMemory>(), 56);
     assert_eq!(size_of::<StartIommu>(), 16);
     assert_eq!(size_of::<StartMachine>(), 64);
@@ -2103,4 +2128,25 @@ fn arm64_and_riscv_exceptions_map_to_the_kinds_of_faults() {
     assert_eq!(r::exception_use(11), None);
     assert_eq!(r::exception_use(24), None);
     assert_eq!(r::exception_use(r::SCAUSE_INTERRUPT | 5), None);
+}
+
+/// Seventh review (Mistral, as judged by Hydrogen): the GIC's ranges, with
+/// the extended PPIs 1056-1119 and the extended SPIs from 4096; the IMSIC's
+/// identities 1 to 2,047.
+#[test]
+fn interrupt_ranges_of_arm64_and_riscv() {
+    use crate::{aarch64 as a, riscv64 as r};
+    assert_eq!(
+        (a::GIC_PRIVATE_LAST, a::GIC_SPI_FIRST, a::GIC_SPI_LAST_MAX),
+        (31, 32, 1019)
+    );
+    assert_eq!((a::GIC_EPPI_FIRST, a::GIC_EPPI_LAST), (1056, 1119));
+    assert_eq!(a::GIC_EPPI_LAST - a::GIC_EPPI_FIRST + 1, 64);
+    assert_eq!((a::GIC_ESPI_FIRST, a::GIC_ESPI_LAST_MAX), (4096, 5119));
+    assert_eq!(a::GIC_LPI_FIRST, 8192);
+    assert_eq!((r::IMSIC_IDENTITY_FIRST, r::IMSIC_IDENTITY_MAX), (1, 2047));
+    assert_eq!(
+        (a::IRQ_TABLE_ENTRIES, r::IRQ_TABLE_ENTRIES),
+        (crate::x86_64::IRQ_TABLE_ENTRIES, 192)
+    );
 }

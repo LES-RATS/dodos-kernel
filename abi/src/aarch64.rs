@@ -239,3 +239,23 @@ pub const fn abort_use(fsc: u8) -> Option<ExceptionUse> {
         _ => return None,
     })
 }
+
+// Interrupts (GICv3 and GICv3.1, Arm IHI 0069): the identifiers that are
+// never claimable and the bases of the claimable ranges, whose ends the
+// distributor reports (`GICD_TYPER`).
+
+/// SGIs 0-15 and PPIs 16-31, per core: never claimable.
+pub const GIC_PRIVATE_LAST: u32 = 31;
+/// The first SPI, and the last that any distributor implements.
+pub const GIC_SPI_FIRST: u32 = 32;
+pub const GIC_SPI_LAST_MAX: u32 = 1019;
+/// Extended PPIs, per core: never claimable.
+pub const GIC_EPPI_FIRST: u32 = 1056;
+pub const GIC_EPPI_LAST: u32 = 1119;
+/// Extended SPIs (when `GICD_TYPER.ESPI` is 1), at most 1,024 of them.
+pub const GIC_ESPI_FIRST: u32 = 4096;
+pub const GIC_ESPI_LAST_MAX: u32 = 5119;
+/// The first LPI.
+pub const GIC_LPI_FIRST: u32 = 8192;
+/// Entries of the interrupt table of one node, as on x86-64.
+pub const IRQ_TABLE_ENTRIES: usize = 192;

@@ -112,3 +112,11 @@ pub const fn exception_use(scause: u64) -> Option<ExceptionUse> {
         _ => return None,
     })
 }
+
+// Interrupts (the AIA): the identities of a supervisor-level IMSIC
+// interrupt file, 1 to the number it implements, at most 2,047; identity 0
+// is never valid.
+pub const IMSIC_IDENTITY_FIRST: u32 = 1;
+pub const IMSIC_IDENTITY_MAX: u32 = 2047;
+/// Entries of the interrupt table of one node, as on x86-64.
+pub const IRQ_TABLE_ENTRIES: usize = 192;
