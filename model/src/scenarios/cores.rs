@@ -57,6 +57,19 @@ fn two_threads(arch: Arch, n: usize) -> (N, ObjId) {
 // What is per physical core, and placement inside a node.
 
 #[test]
+fn a_node_whose_cores_lie_in_two_windows_is_reported() {
+    let mut k = N::on(&one_node(Arch::X86_64, 2));
+    assert_eq!(k.m.check(), Ok(()));
+    assert_eq!(k.m.cores_set(), (0, 0b11));
+    // Core numbers 0 and 64: no window and mask can name both.
+    k.m.cores[1].number = 64;
+    assert_eq!(
+        k.m.check(),
+        Err("WINDOW: a node whose cores lie in two windows of 64 core numbers")
+    );
+}
+
+#[test]
 fn a_node_of_n_cores_has_one_part_per_core_in_the_order_of_core_numbers() {
     for n in [1, 2, 4] {
         let k = N::on(&one_node(Arch::X86_64, n));

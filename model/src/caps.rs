@@ -890,10 +890,9 @@ impl Model {
             }
             // A thread: first its place on a core, if it runs on another
             // core of its node; that core is asked to leave it, and the step
-            // returns `again` until it has. CONTRACT-GAP 14: the contract
-            // does not say what keeps the core from choosing the thread
-            // again once it has left; the step that marks it also suspends
-            // it (the thread never runs again: it is being destroyed).
+            // returns `again` until it has; the step "sets the thread's
+            // suspended flag, so that its core does not choose it again once
+            // it has left" (A node of several cores, gap 14).
             ObjectKind::Thread if self.running_core(object).is_some_and(|c| c != *self.at) => {
                 locked(&mut self.threads, &self.locks, object).suspended = true;
                 self.mark_leaving(object);

@@ -127,10 +127,9 @@ impl Model {
                 if self.table.member(target).class() < best || self.vmx(target) {
                     return Err(Error::Busy);
                 }
-                // CONTRACT-GAP 13: a phantom node of a model of one node
-                // runs nothing and could take no role; as for `node_stop`, it
-                // does not count as a live node, and a hand-over to it is
-                // `busy`.
+                // "or it is a phantom node (it runs no kernel that could take
+                // step 5, as `node_stop` already holds)" (The calls,
+                // `role_hand`, gap 13).
                 if !self.real(target) {
                     return Err(Error::Busy);
                 }

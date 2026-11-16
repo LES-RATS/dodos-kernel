@@ -599,8 +599,9 @@ impl Model {
     /// `STALE_NS` and that is not idle (now − `STALE_NS` past its
     /// `idle_until`, as for stale evidence) is a failure of the node. Not
     /// before the node is ready: its cores enter one by one.
-    /// CONTRACT-GAP 16: the contract does not say which core watches, nor
-    /// when; every core does, at its due events.
+    /// "Each core of the node compares, at each of its timer events, the
+    /// heartbeats of the node's other cores with what it last saw" (A node
+    /// of several cores, gap 16).
     pub(crate) fn watch_own_cores(&mut self) {
         if self.width() == 1 || !self.ready {
             return;

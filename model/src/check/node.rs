@@ -14,7 +14,19 @@ impl Model {
         self.check_marks()?;
         self.check_locks()?;
         self.check_credits()?;
-        self.check_crossing()
+        self.check_crossing()?;
+        self.check_window()
+    }
+
+    /// The calls, `node_start`: "The cores a node starts on lie in one
+    /// window of 64 core numbers" (gap 7), so a context's cores set, a
+    /// window and a mask, holds every core of its node.
+    fn check_window(&self) -> Check {
+        let window = self.cores[0].number / 64;
+        ensure(
+            self.cores.iter().all(|c| c.number / 64 == window),
+            "WINDOW: a node whose cores lie in two windows of 64 core numbers",
+        )
     }
 
     /// Roles: "the holder serves a request only if the role word reads

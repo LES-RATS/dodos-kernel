@@ -17,7 +17,7 @@ use dodos_abi::{
     IDLE_METHOD_SBI, IDLE_STATES_MAX, Member, MemberState, NODE_START_FRESH, NODE_START_RESUME,
     NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL, NODE_WATCH_SLOTS, OBSERVATION_LIFE,
     OBSERVATIONS_MAX, ObjectKind, RECOVERY_PERIOD_NS, REMOVAL_STEP, Rights, RoleKind, RoleState,
-    SETTLE_NS, START_NS, SlotAddr,
+    SETTLE_NS, START_NS, START_RETRY_NS, SlotAddr,
 };
 
 /// What a node asks of the machine.
@@ -95,9 +95,6 @@ pub(crate) struct Starting {
     pub(crate) since: u64,
 }
 
-/// The wake of a parked core is sent again every millisecond until the stub
-/// confirms it (the correction of the park stub's lost wake-up).
-pub(crate) const START_RETRY_NS: u64 = 1_000_000;
 /// The fence repeats its stops every millisecond for a core not confirmed.
 pub(crate) const FENCE_RETRY_NS: u64 = 1_000_000;
 

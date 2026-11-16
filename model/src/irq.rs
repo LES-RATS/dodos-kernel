@@ -75,13 +75,16 @@ impl Model {
         self.vacant(place)?;
         // The unit requests the claim needs, and a free entry of the unit
         // request table for them (`again` with nothing changed).
+        // An MSI's remapping entry is followed by the invalidation of the
+        // interrupt entry cache of each unit that serves the source's
+        // segment, one after another (Devices and shared hardware, several
+        // remapping units, gap 12): the first unit is asked here, the next
+        // ones at the done of the one before.
+        let units = self.segment_roles(source.segment());
         let role = match (source.is_line(), self.machine.remapping) {
             (true, _) => self.ioapic_role(source.id()),
-            // CONTRACT-GAP 12: the invalidation of the interrupt entry cache
-            // goes to the holder of the first IOMMU unit's role, as if the
-            // machine had one remapping unit; the call has one wait.
-            (false, true) if !self.machine.iommus.is_empty() => Some(self.unit_role(0)),
-            (false, _) => None,
+            (false, true) => units.first().copied(),
+            (false, false) => None,
         };
         if role.is_some() && self.unit_requests.iter().all(Option::is_some) {
             return Err(Error::Again);
@@ -124,17 +127,20 @@ impl Model {
                 claimed: true,
             },
             false => {
-                self.table
-                    .units
-                    .entry(role)
-                    .or_default()
-                    .remap
-                    .insert(handle as u32, (self.node, generation));
+                for &unit in &units {
+                    let remap = &mut self.table.units.entry(unit).or_default().remap;
+                    remap.insert(handle as u32, (self.node, generation));
+                }
                 crate::rings::UnitOp::InterruptCache
             }
         };
         let waiter = crate::units::Waiter::Thread(Some(thread));
-        self.unit_request_with(role, op, waiter, None, Some((address, data)))?;
+        let entry = self.unit_request_with(role, op, waiter, None, Some((address, data)))?;
+        if !source.is_line()
+            && let Some(e) = self.unit_requests[entry].as_mut()
+        {
+            e.segment = Some(source.segment());
+        }
         Ok(Output::Waits)
     }
 

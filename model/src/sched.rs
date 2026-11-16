@@ -711,15 +711,14 @@ impl Model {
     }
 
     /// The cores set of a new context: every core of its node, as a window
-    /// and a mask. CONTRACT-GAP 7: a set is one window of 64 core numbers,
-    /// and the cores of a node may lie in several windows; the model gives
-    /// the window of the node's first core, with the node's cores in it.
+    /// and a mask. "The cores a node starts on lie in one window of 64 core
+    /// numbers" (The calls, `node_start`, gap 7), which `check_window`
+    /// checks, so one window holds them all.
     pub(crate) fn cores_set(&self) -> (u64, u64) {
         let window = u64::from(self.cores[0].number) / 64;
         let mask = self
             .cores
             .iter()
-            .filter(|c| u64::from(c.number) / 64 == window)
             .fold(0, |mask, c| mask | 1 << (c.number % 64));
         (window, mask)
     }
@@ -933,9 +932,9 @@ impl Model {
     /// throttled enters its slack queue again, behind the contexts with the
     /// same instant.
     ///
-    /// CONTRACT-GAP (`yield`): a caller with no context does not run in a
-    /// kernel; the model lets any runnable thread call, and then `yield`
-    /// changes nothing.
+    /// "A thread that has no context never runs, so it never makes this
+    /// call" (What runs next, `yield`); the model lets any runnable thread
+    /// call, and then `yield` changes nothing.
     pub(crate) fn yield_now(&mut self, thread: ObjId) -> Outcome {
         self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
         let Some(context) = self.context_of(thread) else {

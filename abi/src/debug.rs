@@ -124,9 +124,8 @@ impl TraceEntry {
 
 /// The header of a debug area: magic, version, the core number, the
 /// generation and node slot of the node the core last ran, the next
-/// sequences of the two rings, the suppressed entries. CONTRACT-GAP 2: the
-/// fields the contract lists, with its "16 reserved bytes", take 56 bytes,
-/// and the area's header is 64; 24 reserved bytes end it.
+/// sequences of the two rings, the suppressed entries, "then 24 reserved
+/// bytes, 0" (The trace rings, the header of a debug area, gap 2).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DebugAreaHeader {

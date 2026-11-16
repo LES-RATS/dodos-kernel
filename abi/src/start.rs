@@ -364,11 +364,14 @@ pub struct StartMachine {
     pub core_words: u32,
     pub park_requests: u32,
     pub start_requests: u32,
-    pub reserved: u32,
+    /// The offset of the fence records, one `FenceRecord` per node slot
+    /// (The fence: the fence record; layout 2).
+    pub fence_records: u32,
 }
 
 /// The layout version of the living part that `StartMachine` describes.
-pub const START_MACHINE_LAYOUT: u32 = 1;
+/// 2 since the fence records (pass 16), 1 since D-129.
+pub const START_MACHINE_LAYOUT: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

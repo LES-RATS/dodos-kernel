@@ -948,10 +948,10 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, core_words),
         offset_of!(StartMachine, park_requests),
         offset_of!(StartMachine, start_requests),
-        offset_of!(StartMachine, reserved),
+        offset_of!(StartMachine, fence_records),
     ];
     assert_eq!(machine, [28, 32, 40, 52, 56, 60, 64, 68, 72, 76]);
-    assert_eq!(START_MACHINE_LAYOUT, 1);
+    assert_eq!(START_MACHINE_LAYOUT, 2);
     let node = [
         offset_of!(StartNode, slot),
         offset_of!(StartNode, slots),
@@ -1041,6 +1041,8 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
 fn layouts_are_fixed() {
     assert_eq!(size_of::<Received>(), 32);
     assert_eq!(size_of::<StartHeader>(), 16);
+    assert_eq!(size_of::<FenceRecord>(), FENCE_RECORD_BYTES);
+    assert_eq!(FENCE_RECORD_BYTES, 544);
     assert_eq!(size_of::<StartEntry>(), 24);
     assert_eq!(size_of::<StartUntyped>(), 16);
     assert_eq!(size_of::<StartCore>(), 32);

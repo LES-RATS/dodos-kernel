@@ -79,7 +79,8 @@ pub(crate) struct CoreBeacon {
     /// The park request the park stub or the fence handler last read.
     pub(crate) parked: u64,
     /// The start request the park stub took when it left for the entry
-    /// stub, 0 when it parks (CONTRACT-GAP 8): what the starter waits for.
+    /// stub, 0 when it parks: what the starter waits for (Beacons, the core
+    /// beacon, gap 8).
     pub(crate) started: u64,
     /// The node slot and generation it last ran, for readers.
     pub(crate) ran: (u16, u32),
@@ -156,9 +157,10 @@ pub(crate) struct UnitState {
 
 /// The fence of a node, as every node reads it: the instant of its first
 /// action, of the confirmed stop, and of the last stop sent to each of its
-/// cores. CONTRACT-GAP 6: the contract judges take-overs and R6 on these
-/// instants without saying where they are kept; the model keeps them in
-/// the living part, as every node reads them.
+/// cores: the fence record of the node slot in the living part, written by
+/// the driver's gate (The fence, the fence record, gap 6; its layout is
+/// `dodos_abi::FenceRecord`, whose last stops are by the core's position,
+/// kept here by core number).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct FenceRecord {
     pub(crate) started: Option<u64>,

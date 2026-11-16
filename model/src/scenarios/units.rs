@@ -225,6 +225,78 @@ fn a_unit_that_does_not_confirm_within_iommu_wait_ns_has_failed() {
     }
 }
 
+/// Three nodes of one core each on a machine with two IOMMU units on PCI
+/// segment 0: the unit roles go to nodes 1 and 2, so node 0's requests
+/// travel to both.
+fn two_units() -> S {
+    let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    let first = machine.iommus[0];
+    machine.iommus.push(first);
+    S::on(&machine)
+}
+
+/// The claim of an MSI of segment 0 on node 0's core.
+fn claim_msi() -> Syscall {
+    Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::msi(0, 3, 1, 0).raw(),
+        core: 0,
+        vector: 48,
+        destination: s(210),
+    }
+}
+
+/// The operations submitted to the unit of a role so far.
+fn submissions(m: &S, role: usize) -> u64 {
+    m.sys.node(0).table.units.get(&role).map_or(0, |u| u.next)
+}
+
+#[test]
+fn the_claim_of_an_msi_asks_each_remapping_unit_of_its_segment_one_after_another() {
+    let mut m = two_units();
+    let roles = m.sys.node(0).segment_roles(0);
+    assert_eq!(roles.len(), 2);
+    let before = (submissions(&m, roles[0]), submissions(&m, roles[1]));
+    assert_eq!(m.call(0, claim_msi()), WAITS);
+    // One wait and one entry of the unit request table, for the first unit
+    // only: the second is not asked before the first has answered.
+    let entries: Vec<usize> = m
+        .sys
+        .node(0)
+        .unit_requests
+        .iter()
+        .flatten()
+        .map(|e| e.role)
+        .collect();
+    assert_eq!(entries, vec![roles[0]]);
+    assert_eq!(submissions(&m, roles[1]), before.1);
+    m.run(30 * MS);
+    // Both units invalidated their interrupt entry cache, and the call
+    // ends with its message words once the last has answered.
+    assert!(matches!(m.woken(0), Some(Ok(crate::Output::Msi { .. }))));
+    assert_eq!(submissions(&m, roles[0]), before.0 + 1);
+    assert_eq!(submissions(&m, roles[1]), before.1 + 1);
+    assert!(m.sys.node(0).unit_requests.iter().all(Option::is_none));
+}
+
+#[test]
+fn a_claim_whose_second_remapping_unit_has_failed_ends_busy_and_the_first_keeps_its_invalidation() {
+    let mut m = two_units();
+    let roles = m.sys.node(0).segment_roles(0);
+    let before = submissions(&m, roles[0]);
+    m.sys.break_unit(roles[1]);
+    assert_eq!(m.call(0, claim_msi()), WAITS);
+    m.run(IOMMU_WAIT_NS + 30 * MS);
+    // The second unit did not confirm: it has failed, and the call ends
+    // with `busy`; the first unit's invalidation stays done, and its unit
+    // has not failed.
+    assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
+    assert!(m.sys.role(roles[1]).failed());
+    assert!(!m.sys.role(roles[0]).failed());
+    assert_eq!(submissions(&m, roles[0]), before + 1);
+    assert!(m.sys.node(0).unit_requests.iter().all(Option::is_none));
+}
+
 // Roles: plain and reserve.
 
 #[test]

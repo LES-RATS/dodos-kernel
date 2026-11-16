@@ -2,19 +2,18 @@
 //! message, the two rings of each ordered pair of node slots, the header
 //! at the start of a message's first entry, the credits and the bounds.
 //!
-//! The contract fixes the header and the counts; it gives no layout of the
-//! words that follow the header. CONTRACT-GAP 3: each kind's words are
-//! fixed here, as the documentation of [`NodeMessage`] lists them, so that
-//! the room a message takes in its ring is a function of the contract's
-//! values.
+//! The words that follow the header of each kind are the contract's table
+//! "The words after the header, by kind" (What crosses between nodes,
+//! gap 3), as the documentation of [`NodeMessage`] lists them, so that the
+//! room a message takes in its ring is a function of the contract's values.
 
 /// Bytes of one entry of a ring.
 pub const RING_ENTRY_BYTES: usize = 64;
 /// Entries of the kernel ring and of the user ring of an ordered pair.
 pub const RING_KERNEL_ENTRIES: u64 = 64;
 pub const RING_USER_ENTRIES: u64 = 64;
-/// Entries one message takes at most (a `Send` of 64 words with 4 grants
-/// takes the most).
+/// Entries one message takes at most (a `Report` of 28 items takes the
+/// most; a `Send` of 64 words with 4 grants takes 10).
 pub const RING_MESSAGE_ENTRIES_MAX: usize = 11;
 /// Request credits and send credits of a node toward each peer.
 pub const REQUESTS_PER_PEER: usize = 16;
@@ -52,7 +51,7 @@ pub enum Ring {
 }
 
 /// The twelve kinds of message between nodes, and nothing else. The words
-/// after the header, by kind (CONTRACT-GAP 3):
+/// after the header, by kind (What crosses between nodes, gap 3):
 ///
 /// - `Revoke`: the grant index (bits 0-11), its serial (12-41) and the use
 ///   index (42-53), one word.
@@ -258,7 +257,8 @@ pub enum UnitResult {
 }
 
 /// The operations of a unit request (Devices and shared hardware), each
-/// idempotent. CONTRACT-GAP 3: the contract lists them without numbers.
+/// idempotent, numbered as the contract numbers them (Devices and shared
+/// hardware, gap 3).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitOperation {
@@ -351,13 +351,13 @@ mod proofs {
         }
     }
 
-    /// The largest messages fit: a `Send` of 64 words with 4 grants and a
-    /// `Report` of the most items take at most eleven entries.
+    /// The largest messages fit: a `Send` of 64 words with 4 grants takes
+    /// ten entries and a `Report` of the most items eleven.
     #[kani::proof]
     fn the_largest_messages_fit_eleven_entries() {
         let words: usize = kani::any();
         kani::assume(words <= 64);
-        assert!(message_entries(3 + SEND_GRANTS_MAX + words) <= RING_MESSAGE_ENTRIES_MAX);
+        assert!(message_entries(3 + SEND_GRANTS_MAX + words) <= 10);
         assert!(message_entries(1 + 3 * 28) <= RING_MESSAGE_ENTRIES_MAX);
         assert!(message_entries(0) == 1);
     }

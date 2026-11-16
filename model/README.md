@@ -53,9 +53,15 @@ pair.
 ## Where the contract is silent
 
 A behaviour the contract does not fix is marked `CONTRACT-GAP` and a number
-in the code, and written in
-`research/drafts/model-15-contract-gaps.md` of the documentation
-repository with the reading implemented and the text proposed.
+in the code, and written in a draft of the documentation repository with
+the reading implemented and the text proposed. None is open: the sixteen of
+pass 15 (`research/drafts/model-15-contract-gaps.md`) are settled in the
+contract since pass 16 (D-133), and each branch that applies one names the
+contract's sentence and "gap *n*". Two were settled otherwise than the
+model first read them, and the model follows: a node's cores lie in one
+window of 64 core numbers (gap 7, checked after every step), and the claim
+of an MSI asks every IOMMU unit of the source's segment, one after another
+(gap 12).
 
 ## What it does not model
 

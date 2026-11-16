@@ -789,9 +789,8 @@ impl Model {
             }
             return Ok(Output::Done);
         };
-        // The state, in this order. CONTRACT-GAP 11: a unit that has failed
-        // makes `iospace_attach` `busy`; the contract does not place this
-        // check among the others, and the model judges it first.
+        // The state, in this order, "the unit has failed (`busy`" first
+        // (IOMMU, rules of `iospace_attach`, gap 11).
         let role = self.unit_role(unit.unit);
         if self.unit_failed(role) {
             return Err(Error::Busy);

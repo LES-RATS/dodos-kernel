@@ -257,6 +257,32 @@ pub const FENCE_NS: u64 = 20_000_000;
 pub const FENCE_RANGE_NS: (u64, u64) = (10_000_000, 1_000_000_000);
 pub const SETTLE_NS: u64 = 1_000_000;
 pub const START_NS: u64 = 1_000_000_000;
+/// The period at which the node that starts a core sends its wake again
+/// until the park stub's `started` equals its start request (Node slots and
+/// core words, the start request).
+pub const START_RETRY_NS: u64 = 1_000_000;
+
+/// The cores of a node a fence record holds the last stop of, by position.
+pub const FENCE_RECORD_CORES: usize = 64;
+/// Bytes of one fence record.
+pub const FENCE_RECORD_BYTES: usize = 544;
+
+/// The fence record of a node slot, in the living part, written by the gate
+/// of the node's fence driver (The fence: the fence record): the generation
+/// it concerns, the instant of the first fence action, the instant the fence
+/// was confirmed, and for each position of the node's cores the instant of
+/// the last stop sent to that core. An instant of 0 means none. The delays
+/// of a take-over (Roles) and of R6 are measured from these instants.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FenceRecord {
+    pub generation: u32,
+    pub reserved: u32,
+    pub first_action: u64,
+    pub confirmed: u64,
+    pub reserved2: u64,
+    pub last_stop: [u64; FENCE_RECORD_CORES],
+}
 /// The time a node may stay sealed before evidence seal accuses it.
 pub const SEAL_NS: u64 = 1_000_000_000;
 pub const SEAL_RANGE_NS: (u64, u64) = (10_000_000, 60_000_000_000);
@@ -580,8 +606,8 @@ impl Member {
     }
 
     /// `None` for a state 8 to 15, an evidence 7, a class 3, or a bit 9-15
-    /// set. CONTRACT-GAP 1: no fence class 3 exists, so the word that holds
-    /// one is refused as a state 8 is.
+    /// set: "a word with 3 fails its check, as a state 8 to 15 does" (The
+    /// states of a node, the member word, gap 1).
     pub const fn from_raw(raw: u64) -> Option<Self> {
         if raw & 0xf >= 8 || raw >> 4 & 0x7 == 7 || raw >> 7 & 0b11 == 3 || raw >> 9 & 0x7f != 0 {
             return None;

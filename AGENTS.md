@@ -38,9 +38,9 @@ of several nodes and their physical cores, and the whole check runs after
 every step. The scenarios of the shape of nodes are in
 `model/src/scenarios/`; a seeded exploration replays one seed with
 `DODOS_SEED=<n>`. A behaviour the contract does not fix is marked
-`CONTRACT-GAP` and a number, and written in
-`research/drafts/model-15-contract-gaps.md` of the documentation
-repository.
+`CONTRACT-GAP` and a number, and written in a draft of the documentation
+repository (`research/drafts/model-15-contract-gaps.md` held the sixteen of
+pass 15, all settled by the contract since pass 16; none is open).
 
 ## Rust
 

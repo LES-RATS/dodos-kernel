@@ -17,9 +17,11 @@
 //!   (`live`), taken in the order of `LockId` before the event changes
 //!   anything, and released at its exit.
 //!
-//! CONTRACT-GAP 5: the contract fixes neither the order by kind nor the
-//! bound *k* of each call. The order is that of `LockId`'s variants; the
-//! bound of a call is `bound`.
+//! The order by kind is the contract's ("The order of L2 and its bound",
+//! A node of several cores, gap 5): that of `LockId`'s variants, objects of
+//! one kind by identity as by address. The bound *k* of a call is `bound`,
+//! an upper bound of the objects and slots its rules name, the cores whose
+//! queues it may change and the gate lock.
 //!
 //! The checks (`Model::check_locks`): a node of one core takes no lock and
 //! pays no cost of several cores; under L1 every lock is the node lock or
@@ -154,7 +156,7 @@ locked!(crate::Task, Task);
 locked!(crate::ASpace, ASpace);
 
 /// The bound *k* of a call under L2: the locks its rules can make it take,
-/// the gate lock counted (CONTRACT-GAP 5). A step of a removal undoes at
+/// the gate lock counted (gap 5). A step of a removal undoes at
 /// most 32 links and wakes at most 64 threads, each with its object, its
 /// context and its core; a step of `task_revoke` stops 32 threads.
 pub(crate) fn bound(call: &crate::Syscall) -> usize {

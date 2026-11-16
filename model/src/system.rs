@@ -9,7 +9,7 @@
 //! The park stub's lost wake-up (16 November 2026): an NMI that reaches the
 //! stub between its read of the start request and its halt starts nothing;
 //! the starter sends the wake again every millisecond until the stub
-//! confirms (`nodes::START_RETRY_NS`).
+//! confirms (`dodos_abi::START_RETRY_NS`).
 
 use crate::boot::{Layout, Machine};
 use crate::nodes::HwAction;
@@ -644,7 +644,8 @@ impl System {
             };
             return;
         }
-        // The stub confirms the start (CONTRACT-GAP 8).
+        // The stub writes the start request it takes into `started` of its
+        // core beacon (Node slots and core words, the start request, gap 8).
         let mut table = self.table().clone();
         table.core_beacons[core].started = request;
         self.share(table);

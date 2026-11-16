@@ -20,7 +20,9 @@
 //! is never entered); and the groups not specified (cores, debugging,
 //! `ioports`), whose calls return `unsupported`.
 //!
-//! `CONTRACT-GAP` marks a behaviour that the contract does not fix.
+//! `CONTRACT-GAP` marks a behaviour that the contract does not fix; none is
+//! left since the contract settled the sixteen of pass 15 (pass 16, D-133),
+//! and each such branch names the contract's sentence, "gap *n*".
 
 #![forbid(unsafe_code)]
 
@@ -1179,9 +1181,9 @@ impl Model {
 
     /// The threads that can run: not suspended, not waiting, and not marked
     /// *leaving its core*. A call can be applied for any of them.
-    /// CONTRACT-GAP 4: a marked thread that enters the kernel before its
-    /// core took the leave interrupt makes no call: a core takes its pending
-    /// interrupts at each entry, before the call.
+    /// "A core takes its pending interrupts at each entry into its kernel
+    /// before it carries out a call, so a marked thread that enters the
+    /// kernel leaves its core there" (A node of several cores, gap 4).
     pub fn runnable(&self) -> Vec<ObjId> {
         let ready = |thread: &&Thread| Self::runnable_thread(thread);
         let ids = self.threads.iter().filter(|(_, thread)| ready(thread));
@@ -1405,11 +1407,10 @@ impl Model {
     }
 
     /// The slots of the invalid remote capabilities found since the last
-    /// call become dead. CONTRACT-GAP 15: a capability whose record holds
-    /// a mapping keeps its slot until a removal reaches it (the step of a
-    /// `Revoke`, R2, or a removal by its holder): made dead at once, its
-    /// mapping would go without the invalidations of the node's cores
-    /// (TLB) or of its units, which only a removal step starts.
+    /// call become dead, "unless its record holds a mapping: then the slot
+    /// stays until a removal reaches it (the step of a `Revoke`, R2, or a
+    /// removal by its holder), which undoes the mapping with its
+    /// invalidations" (Grants, a remote frame capability, gap 15).
     pub(crate) fn bury_stale(&mut self) {
         let stale = std::mem::take(&mut *self.stale.0.borrow_mut());
         for cap in stale {

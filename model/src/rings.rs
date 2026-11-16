@@ -61,8 +61,9 @@ impl Item {
 /// The items of one `Report` at most, so that it fits eleven entries.
 pub(crate) const REPORT_ITEMS: usize = 28;
 
-/// What a message carries after its header (CONTRACT-GAP 3: the words are
-/// those `dodos_abi::NodeMessage` documents).
+/// What a message carries after its header: the words of the contract's
+/// table by kind (What crosses between nodes, gap 3), which
+/// `dodos_abi::NodeMessage` documents.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Body {
     Revoke {

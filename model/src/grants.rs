@@ -73,11 +73,9 @@ impl Model {
 
     /// Whether a remote object is valid: its grant entry is live with its
     /// serial, and the granting node's member word names the generation
-    /// recorded in the use entry. CONTRACT-GAP 10: the contract says "live
-    /// with the generation"; a granting node that seals for a replacement
-    /// keeps its grants, so the model takes starting, live, sealing and
-    /// sealed with that generation as valid, and only a generation that is
-    /// over (accused, dead or started again) as invalid.
+    /// recorded in the use entry "in a state starting, live, sealing or
+    /// sealed" (Grants, a remote frame capability, gap 10): a generation
+    /// that is over (accused, dead or started again) makes it invalid.
     pub(crate) fn valid(&self, remote: &Remote) -> bool {
         let entry = self.table.grants[remote.node as usize].get(&remote.grant);
         let used = self.table.uses[self.node as usize].get(&remote.use_entry);
@@ -154,8 +152,8 @@ impl Model {
     ) -> Outcome {
         // The node: slot, kind, `send` (and `grant` if the header lists
         // frames, judged with the capability the call acts on, as for every
-        // message: Order of checks, step 2; CONTRACT-GAP 9: the call's own
-        // text names `grant` after the list). `invalid` if it names the
+        // message: Order of checks, step 2; "`send`, and `grant` when the
+        // header lists frames", `node_send`, gap 9). `invalid` if it names the
         // caller's own node; `gone` if that node is not live.
         let need = match message.caps.is_empty() {
             true => Rights::SEND,

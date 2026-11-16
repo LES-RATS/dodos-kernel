@@ -51,6 +51,11 @@ pub(crate) struct UnitEntry {
     /// The result a done gives the waiting call, if not none: the message
     /// words of `irq_claim`.
     pub(crate) words: Option<(u64, u64)>,
+    /// For the claim of an MSI, the PCI segment whose units are asked one
+    /// after another: at a done, the entry is used again for the next unit
+    /// of that segment (Devices and shared hardware, several remapping
+    /// units, gap 12).
+    pub(crate) segment: Option<u16>,
 }
 
 /// An entry of the unit service table: a request of another node that the
@@ -123,6 +128,7 @@ impl Model {
         record: Option<CapId>,
     ) -> Result<(), Error> {
         self.unit_request_with(role, op, waiter, record, None)
+            .map(|_| ())
     }
 
     /// A unit request whose done gives the waiting call these result words
@@ -134,7 +140,7 @@ impl Model {
         waiter: Waiter,
         record: Option<CapId>,
         words: Option<(u64, u64)>,
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
         let free = self.unit_requests.iter().position(Option::is_none);
         let Some(index) = free else {
             return Err(Error::Again);
@@ -149,6 +155,7 @@ impl Model {
             record,
             order: self.unit_order,
             words,
+            segment: None,
         });
         if let Waiter::Thread(Some(thread)) = waiter {
             locked(&mut self.threads, &self.locks, thread).wait = Wait::Unit(index);
@@ -156,7 +163,41 @@ impl Model {
             self.observe();
         }
         self.unit_send_queued();
-        Ok(())
+        Ok(index)
+    }
+
+    /// The IOMMU units that serve a PCI segment, by role, in the order of
+    /// the units.
+    pub(crate) fn segment_roles(&self, segment: u16) -> Vec<usize> {
+        let units = self.machine.iommus.iter().enumerate();
+        let serving = units.filter(|(_, unit)| unit.segment == segment);
+        serving.map(|(unit, _)| self.unit_role(unit)).collect()
+    }
+
+    /// At the done of a unit of a claim, the next unit of its segment: "it
+    /// waits for the answer of one before it sends the next, so the thread
+    /// holds one wait and one entry of the unit request table at a time"
+    /// (Devices and shared hardware, gap 12). Returns whether the entry was
+    /// used again.
+    fn next_unit(&mut self, index: usize, entry: UnitEntry) -> bool {
+        let Some(segment) = entry.segment else {
+            return false;
+        };
+        let roles = self.segment_roles(segment);
+        let after = roles.iter().position(|&r| r == entry.role).map(|i| i + 1);
+        let Some(&role) = after.and_then(|i| roles.get(i)) else {
+            return false;
+        };
+        self.unit_order += 1;
+        self.unit_requests[index] = Some(UnitEntry {
+            role,
+            epoch: self.table.roles[role].epoch(),
+            stage: Stage::Queued,
+            order: self.unit_order,
+            ..entry
+        });
+        self.unit_send_queued();
+        true
     }
 
     /// The entries of the unit request table, served oldest first: an entry
@@ -362,6 +403,9 @@ impl Model {
         let Some(entry) = self.unit_requests[index].take() else {
             return;
         };
+        if result == UnitResult::Done && self.next_unit(index, entry) {
+            return;
+        }
         let record = match entry.waiter {
             Waiter::Record(cap) => Some(cap),
             Waiter::Thread(_) => entry.record,
