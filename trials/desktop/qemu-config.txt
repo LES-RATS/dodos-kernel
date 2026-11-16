@@ -1,0 +1,5 @@
+quick=1
+fake_kinds=1
+end=shutdown
+panic=halt
+serial=0

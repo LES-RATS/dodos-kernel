@@ -1,0 +1,112 @@
+//! The per-core block, reached through GS (IA32_GS_BASE) by the assembly
+//! handlers. The first words have fixed offsets that the stubs of `idt` use.
+
+use crate::x86;
+use core::mem::offset_of;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+pub const MAX_CORES: usize = 64;
+
+#[repr(C, align(4096))]
+pub struct PerCpu {
+    pub self_ptr: u64,
+    /// Where a fault resumes while armed (0: not armed).
+    pub fixup_rip: AtomicU64,
+    /// Bit 63 set when a fault was taken, vector bits 0-7, error code 8-39.
+    pub fixup_vector: AtomicU64,
+    pub fixup_cr2: AtomicU64,
+    pub irq_count: AtomicU64,
+    pub irq_tsc: AtomicU64,
+    /// APIC ID answered by the pong vector.
+    pub pong_dest: AtomicU64,
+    pub index: u64,
+    pub nmi_count: AtomicU64,
+    pub nmi_tsc: AtomicU64,
+    /// 1: the next NMI parks this core (the fence's NMI handler).
+    pub nmi_park: AtomicU64,
+    /// The park request this core last confirmed (the contract's `parked`).
+    pub parked: AtomicU64,
+    pub park_request: AtomicU64,
+    pub start_request: AtomicU64,
+    pub timer_count: AtomicU64,
+    /// SSP read at the entry of the last exception (0 without shadow stacks).
+    pub ssp_entry: AtomicU64,
+    /// Top of this core's stack, for a restart.
+    pub stack_top: u64,
+    /// The interrupt descriptor table of this core.
+    pub idt: [u128; 256],
+}
+
+pub const FIXUP_RIP: usize = offset_of!(PerCpu, fixup_rip);
+pub const FIXUP_VECTOR: usize = offset_of!(PerCpu, fixup_vector);
+pub const FIXUP_CR2: usize = offset_of!(PerCpu, fixup_cr2);
+pub const IRQ_COUNT: usize = offset_of!(PerCpu, irq_count);
+pub const IRQ_TSC: usize = offset_of!(PerCpu, irq_tsc);
+pub const PONG_DEST: usize = offset_of!(PerCpu, pong_dest);
+pub const NMI_COUNT: usize = offset_of!(PerCpu, nmi_count);
+pub const NMI_TSC: usize = offset_of!(PerCpu, nmi_tsc);
+pub const NMI_PARK: usize = offset_of!(PerCpu, nmi_park);
+pub const TIMER_COUNT: usize = offset_of!(PerCpu, timer_count);
+pub const SSP_ENTRY: usize = offset_of!(PerCpu, ssp_entry);
+pub const STACK_TOP: usize = offset_of!(PerCpu, stack_top);
+
+const ZERO: AtomicU64 = AtomicU64::new(0);
+
+pub static mut CPUS: [PerCpu; MAX_CORES] = [const {
+    PerCpu {
+        self_ptr: 0,
+        fixup_rip: ZERO,
+        fixup_vector: ZERO,
+        fixup_cr2: ZERO,
+        irq_count: ZERO,
+        irq_tsc: ZERO,
+        pong_dest: ZERO,
+        index: 0,
+        nmi_count: ZERO,
+        nmi_tsc: ZERO,
+        nmi_park: ZERO,
+        parked: ZERO,
+        park_request: ZERO,
+        start_request: ZERO,
+        timer_count: ZERO,
+        ssp_entry: ZERO,
+        stack_top: 0,
+        idt: [0; 256],
+    }
+}; MAX_CORES];
+
+/// The block of core `i` (the image's own numbering, `smp::CORES`).
+pub fn of(i: usize) -> &'static PerCpu {
+    // SAFETY: shared access to atomics and to fields written once before
+    // the core starts (`index`, `stack_top`, `idt` while it is not loaded).
+    unsafe { &(*(&raw const CPUS))[i] }
+}
+
+/// The block of the calling core.
+pub fn me() -> &'static PerCpu {
+    let p: u64;
+    // SAFETY: GS base points at this core's block (`install`).
+    unsafe { core::arch::asm!("mov {}, gs:[0]", out(reg) p, options(nostack, readonly)) };
+    // SAFETY: `p` is the block's own address, set by `install`.
+    unsafe { &*(p as *const PerCpu) }
+}
+
+pub fn my_index() -> usize {
+    me().index as usize
+}
+
+/// Points GS at block `i` on the calling core and fills its fixed words.
+pub fn install(i: usize, stack_top: u64) {
+    // SAFETY: block `i` belongs to the calling core from now on; nothing
+    // else writes these two fields.
+    unsafe {
+        let b = &raw mut (*(&raw mut CPUS))[i];
+        (*b).self_ptr = b as u64;
+        (*b).index = i as u64;
+        if stack_top != 0 {
+            (*b).stack_top = stack_top;
+        }
+        x86::wrmsr(x86::IA32_GS_BASE, b as u64);
+    }
+    me().fixup_rip.store(0, Ordering::Relaxed);
+}
