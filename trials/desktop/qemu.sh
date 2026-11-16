@@ -26,6 +26,7 @@ cp "$share/edk2-i386-vars.fd" "$out/vars.fd"
 	-drive if=pflash,format=raw,readonly=on,file="$share/edk2-x86_64-code.fd" \
 	-drive if=pflash,format=raw,file="$out/vars.fd" \
 	-drive file="$out/stick.img",format=raw,media=disk \
+	-device qemu-xhci -device pci-serial,chardev=null0 -chardev null,id=null0 \
 	-serial file:"$out/serial.log" -display none -monitor none \
 	"$@"
 # Copy the results out of the disk image.

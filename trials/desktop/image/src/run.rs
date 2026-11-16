@@ -119,6 +119,7 @@ pub fn main() -> ! {
         .filter_map(|n| n.trim().parse::<u32>().ok())
         .max()
         .unwrap_or(0);
+    con::copy_to_serial(config.get("serial").is_none_or(|v| v != "0"));
     crate::smp::DEBUG.store(config.get("debug").is_some_and(|v| v == "1"), Ordering::Relaxed);
     END_HALT.store(config.get("panic").is_some_and(|v| v == "halt"), Ordering::Relaxed);
     out!("I image name=dodos-trial-desktop boot={boot} volume={}", con::has_volume());

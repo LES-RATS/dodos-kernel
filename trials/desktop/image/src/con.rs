@@ -108,9 +108,11 @@ impl Con {
 /// # Safety
 /// `st` and `image` are the arguments the firmware gave the image.
 pub unsafe fn init(st: *mut SystemTable, image: efi::Handle) {
+    let found = probe_serial();
+    SERIAL_FOUND.store(found, core::sync::atomic::Ordering::Relaxed);
     let mut c = Con {
         st,
-        serial: probe_serial(),
+        serial: found,
         dir: null_mut(),
         results: null_mut(),
         pending: String::new(),
@@ -272,6 +274,22 @@ pub fn replace_file(name: &str, bytes: &[u8]) -> bool {
         }
     }
     ok
+}
+
+/// Whether a 16550 answered at COM1 at start.
+pub fn serial_present() -> bool {
+    SERIAL_FOUND.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+static SERIAL_FOUND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stops the copy of the screen on COM1 (`serial=0`: when the firmware's
+/// console already goes there, as under QEMU, lines would appear twice).
+pub fn copy_to_serial(on: bool) {
+    let mut con = CON.lock().expect("console");
+    if let Some(c) = con.as_mut() {
+        c.serial = on && serial_present();
+    }
 }
 
 fn st() -> *mut SystemTable {
