@@ -491,6 +491,11 @@ struct Mapping {
     rights: Rights,
     /// Made in steps and not finished (G3): `count` pages written so far.
     partial: bool,
+    /// The page count the call that made it asked for: a partial mapping
+    /// goes on only by the same call, page count included (G3; held in the
+    /// low 12 bits of word 1 of the slot, which a frame's page-aligned
+    /// address leaves 0).
+    asked: u64,
 }
 
 /// One translation of a space: a page of the frame of the capability whose

@@ -545,7 +545,10 @@ fn canonical_words_follow_the_address_bits_whatever_the_user_range_end() {
     let mut block = k.regs(40);
     block[REG_RIP] = (1 << (bits - 1)) - 0x1000;
     block[REG_RSP] = u64::MAX << (bits - 1);
-    k.ok(Syscall::ThreadWriteRegs { thread: s(40), block });
+    k.ok(Syscall::ThreadWriteRegs {
+        thread: s(40),
+        block,
+    });
 }
 
 #[test]

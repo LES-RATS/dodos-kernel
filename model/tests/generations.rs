@@ -105,7 +105,10 @@ impl S {
         assert_eq!(self.call(0, stop), DONE);
         self.run(10 * MS);
         let member = self.sys.member(1);
-        assert_eq!((member.state(), member.generation()), (MemberState::Dead, 1));
+        assert_eq!(
+            (member.state(), member.generation()),
+            (MemberState::Dead, 1)
+        );
     }
 
     /// Node 0 starts node 1 fresh: generation 2.
@@ -119,7 +122,10 @@ impl S {
         };
         assert_eq!(self.call(0, start), DONE);
         let member = self.sys.member(1);
-        assert_eq!((member.state(), member.generation()), (MemberState::Live, 2));
+        assert_eq!(
+            (member.state(), member.generation()),
+            (MemberState::Live, 2)
+        );
         self.t[1] = self.sys.node(1).object_at_start(START_SLOT_THREAD);
         self.run(MS);
     }

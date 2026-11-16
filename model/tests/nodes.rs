@@ -174,7 +174,11 @@ impl S {
             .filter(|p| p.from == from && p.to == to)
             .count();
         for _ in 0..=older {
-            let first = self.sys.pending().iter().position(|p| p.from == from && p.to == to);
+            let first = self
+                .sys
+                .pending()
+                .iter()
+                .position(|p| p.from == from && p.to == to);
             self.deliver(first.expect("a message of the ring"));
         }
     }

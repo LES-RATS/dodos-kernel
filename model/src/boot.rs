@@ -1095,6 +1095,7 @@ impl Model {
                 count,
                 rights,
                 partial: false,
+                asked: count,
             };
             self.record_mapping(cap, aspace, mapping);
         }

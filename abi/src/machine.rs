@@ -108,6 +108,11 @@ pub const IDENTIFIERS_PER_SEGMENT: usize = 65_536;
 /// Bit 5 of word 2 of a frame slot: the mapping its record holds is partial,
 /// made in steps (G3).
 pub const SLOT_RECORD_PARTIAL: u64 = 1 << 5;
+/// Word 1 of a frame slot whose record is a partial mapping, bits 0-11: the
+/// page count the call asked for, − 1 (G3: the call goes on only with the
+/// same count). The frame's address is page-aligned, so these bits are
+/// otherwise 0.
+pub const SLOT_FRAME_ASKED_MASK: u64 = 0xfff;
 
 /// The class of a page (The gate over page tables, G2), one byte per page
 /// of ordinary memory: 0 data, 1 gate, 2 global read-only, 3 device, 4

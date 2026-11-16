@@ -1129,6 +1129,13 @@ fn slot_layout_has_its_bits() {
     assert_eq!(1 << 12, TABLE_ENTRIES_MAX);
     let record = [SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_BINDING];
     assert_eq!((record, SLOT_RECORD_RIGHTS_SHIFT), ([0, 1, 2], 2));
+    // A partial mapping: the mark in word 2, the count asked − 1 in the 12
+    // low bits of word 1, which the smallest page (4 KB) leaves 0.
+    assert_eq!(
+        (SLOT_RECORD_PARTIAL, SLOT_FRAME_ASKED_MASK),
+        (1 << 5, 0xfff)
+    );
+    assert_eq!(SLOT_FRAME_ASKED_MASK + 1, 4096);
     let untyped = [
         SLOT_UNTYPED_DEVICE,
         SLOT_UNTYPED_CLEAN,

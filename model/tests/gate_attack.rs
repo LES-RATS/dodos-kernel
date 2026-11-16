@@ -526,6 +526,53 @@ fn a_mapping_beyond_the_budget_of_a_gate_call_is_written_in_steps() {
     assert_eq!(m.sys.check(), Ok(()));
 }
 
+/// DeepSeek F2 and Hydrogen N2 of the seventh review: a partial mapping
+/// goes on only by the same call, page count included, for `aspace_map`
+/// and `iospace_map` alike; another count is `busy`, and the record keeps
+/// the count it started with.
+#[test]
+fn a_partial_mapping_goes_on_only_with_the_page_count_it_started_with() {
+    let mut machine = Machine::example();
+    machine.gate_chunks = 1;
+    let mut m = S::on(&machine);
+    let page = m.geometry(0).page();
+    m.ok(0, retype(IoSpace, 0, 210));
+    for frame in [200, 211] {
+        m.ok(0, retype(Frame, 4, frame));
+    }
+    let io_map = |count| {
+        Syscall::IoSpaceMap(Map {
+            space: s(210),
+            frame: s(211),
+            untyped: UT,
+            address: AT,
+            first: 0,
+            count,
+            rights: Rights::READ.bits(),
+        })
+    };
+    let aspace_map = |count| map(200, count, Rights::READ);
+    for call in [aspace_map as fn(u64) -> Syscall, io_map] {
+        m.no(0, call(4), Error::Again);
+        for other in [1, 2, 3] {
+            m.no(0, call(other), Error::Busy);
+        }
+        // The same call goes on, and ends with the four pages it asked.
+        let mut outcome = Err(Error::Again);
+        for _ in 0..8 {
+            outcome = m.on_node(0, call(4));
+            if outcome != Err(Error::Again) {
+                break;
+            }
+        }
+        assert_eq!(outcome, DONE);
+        m.no(0, call(4), Error::Busy);
+    }
+    for n in 0..4 {
+        assert!(m.sys.node(0).translated(m.t[0], AT + n * page).is_some());
+    }
+}
+
 #[test]
 fn a_protect_within_the_budget_of_a_gate_call_succeeds() {
     let mut m = S::new();

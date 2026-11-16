@@ -191,6 +191,8 @@ impl Model {
         // (`denied`, G3); a map count would pass its maximum (`busy`, G4);
         // the tables needed are more than the free list and the untyped
         // supply (`no_memory`), and nothing is taken.
+        // The same call is the same frame capability, space, address, first
+        // page, page count and rights (G3).
         let done = match self.caps[&cap].record {
             Record::Empty => 0,
             Record::Mapping(m)
@@ -198,8 +200,8 @@ impl Model {
                     && m.space == space
                     && m.address == map.address
                     && m.first == map.first
-                    && m.rights == rights
-                    && m.count < map.count =>
+                    && m.asked == map.count
+                    && m.rights == rights =>
             {
                 m.count
             }
@@ -311,6 +313,7 @@ impl Model {
                 count: step,
                 rights,
                 partial,
+                asked: map.count,
             };
             self.record_mapping(cap, space, mapping);
         }

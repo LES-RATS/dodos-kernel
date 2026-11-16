@@ -1941,7 +1941,9 @@ fn take_of_a_word_the_rules_of_taking_refuse_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
         let before = Ownership::free(Owner::Node(1)).raw();
         let after = Ownership::taken(Owner::Node(0), 1).raw();
-        let write = m.table.journal(0, crate::table::Word::Chunk(chunk), before, after);
+        let write = m
+            .table
+            .journal(0, crate::table::Word::Chunk(chunk), before, after);
         m.table.writes.push(write);
     });
     assert_eq!(broken, "52: write of an ownership word");
@@ -1959,7 +1961,9 @@ fn a_wrong_write_is_reported_by_a_check_made_after_later_events() {
         let _ = m.apply(thread, Syscall::Yield);
         let before = Ownership::free(Owner::Node(1)).raw();
         let after = Ownership::taken(Owner::Node(0), 1).raw();
-        let write = m.table.journal(0, crate::table::Word::Chunk(chunk), before, after);
+        let write = m
+            .table
+            .journal(0, crate::table::Word::Chunk(chunk), before, after);
         m.table.writes.push(write);
         for _ in 0..2 {
             let _ = m.apply(thread, Syscall::Yield);
@@ -1973,7 +1977,9 @@ fn release_of_a_word_the_writer_did_not_hold_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
         let before = Ownership::taken(Owner::Node(1), 1).raw();
         let after = Ownership::free(Owner::Node(0)).raw();
-        let write = m.table.journal(0, crate::table::Word::Chunk(chunk), before, after);
+        let write = m
+            .table
+            .journal(0, crate::table::Word::Chunk(chunk), before, after);
         m.table.writes.push(write);
     });
     assert_eq!(broken, "52: write of an ownership word");
