@@ -385,14 +385,14 @@ impl Model {
             .all(|c| c.raw() != 0 && dodos_abi::PageClass::stored(c.raw()).is_some());
         ensure(stored_only, "59: page classes")?;
         let pages = table.geometry.chunk() / page;
-        for chunk in 0..table.gate_words.len() as u64 {
-            let stored = table
-                .classes
-                .range(chunk * pages..(chunk + 1) * pages)
-                .count();
-            let word = table.gate_word(chunk);
+        let mut stored: BTreeMap<u64, u64> = BTreeMap::new();
+        for &at in table.classes.keys() {
+            *stored.entry(at / pages).or_default() += 1;
+        }
+        for (chunk, &raw) in table.gate_words.iter().enumerate() {
+            let counted = stored.get(&(chunk as u64)).copied().unwrap_or(0);
             ensure(
-                usize::from(word.not_data()) == stored,
+                raw >> 32 == counted,
                 "59: pages not of class data in a gate word",
             )?;
         }
