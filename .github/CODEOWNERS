@@ -1,0 +1,18 @@
+# The paths an agent may not change without the owners: the workflows, the
+# verification command and its pinned environment, the agent instructions
+# and skills, and the tests (plan/verification.md, "CI is authoritative").
+# @Vehicoule alone for now; the second owner is added when he joins.
+# Code owner review is not required by the ruleset yet: one owner cannot
+# approve a pull request opened from the same account.
+/.github/      @Vehicoule
+/verify        @Vehicoule
+/flake.nix     @Vehicoule
+/flake.lock    @Vehicoule
+/AGENTS.md     @Vehicoule
+/CLAUDE.md     @Vehicoule
+/.agents/      @Vehicoule
+/.claude/      @Vehicoule
+/Cargo.toml    @Vehicoule
+/abi/          @Vehicoule
+/model/        @Vehicoule
+tests/         @Vehicoule
