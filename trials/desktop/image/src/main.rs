@@ -31,6 +31,7 @@ mod shoot;
 mod smp;
 mod stall;
 mod stats;
+mod trial;
 mod tsc;
 mod x86;
 

@@ -1,7 +1,7 @@
 //! The steps of the run, in order (README, "The plan").
 
 use crate::run::{Kind, Step};
-use crate::{cet, gate, identity, ipi, platform, setup, shoot, stall};
+use crate::{cet, gate, identity, ipi, platform, setup, shoot, stall, trial};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -15,5 +15,8 @@ pub fn steps() -> Vec<Step> {
         Step { name: "cet", kind: Kind::Measure, limit_s: 300, run: cet::run },
         Step { name: "ipi", kind: Kind::Measure, limit_s: 900, run: ipi::run },
         Step { name: "shoot", kind: Kind::Measure, limit_s: 900, run: shoot::run },
+        Step { name: "trial", kind: Kind::Measure, limit_s: 7200, run: trial::run },
+        Step { name: "trial-efirst", kind: Kind::Measure, limit_s: 1800, run: trial::run_efirst },
+        Step { name: "trial-alternate", kind: Kind::Measure, limit_s: 1800, run: trial::run_alternate },
     ]
 }
