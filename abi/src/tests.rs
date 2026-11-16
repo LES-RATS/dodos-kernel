@@ -276,6 +276,106 @@ fn canonical_addresses_follow_the_address_bits_of_the_geometry() {
     }
 }
 
+/// DeepSeek F1 of the seventh review: the canonical boundary is the
+/// architecture's (the address bits of the geometry), not the user range
+/// end: a machine whose user range ends at 2^(bits − 2) still accepts every
+/// address of both halves.
+#[test]
+fn the_canonical_boundary_follows_the_address_bits_and_not_the_user_range_end() {
+    let x86 = x86_64::GEOMETRY;
+    let sixteen = Geometry {
+        page_shift: [14, 25, 36, 0],
+        entries: 2048,
+        levels: 3,
+        user_end: (1 << 46) - (1 << 36),
+    };
+    for g in [x86, sixteen] {
+        let bits = g.address_bits();
+        let low = Geometry {
+            user_end: 1 << (bits - 2),
+            ..g
+        };
+        assert!(low.valid());
+        for address in [(1 << (bits - 1)) - 0x1000, u64::MAX << (bits - 1), u64::MAX] {
+            assert!(low.canonical(address), "{address:#x}");
+            assert_eq!(low.canonical(address), g.canonical(address));
+        }
+        assert!(!low.canonical(1 << (bits - 1)));
+        assert!(!low.canonical(1 << 63));
+    }
+    for address in [(1 << 47) - 1, 0xffff_8000_0000_0000, 1 << 47, 1 << 46] {
+        let low = Geometry {
+            user_end: 1 << 46,
+            ..x86
+        };
+        assert_eq!(low.canonical(address), x86_64::canonical(address));
+    }
+}
+
+/// Hydrogen N1 and Opus N1 of the seventh review: the user range leaves the
+/// whole root entry of the reserved slot below the half; neither the half
+/// nor the half less one chunk is a user range end.
+#[test]
+fn the_user_range_end_leaves_the_root_entry_of_the_reserved_slot() {
+    for g in [
+        x86_64::GEOMETRY,
+        Geometry {
+            page_shift: [14, 25, 36, 0],
+            entries: 2048,
+            levels: 3,
+            user_end: (1 << 46) - (1 << 36),
+        },
+    ] {
+        let half = 1u64 << (g.address_bits() - 1);
+        assert_eq!(g.user_end, half - g.root_entry());
+        assert!(g.valid());
+        for user_end in [half, half - g.chunk(), half - g.root_entry() + g.chunk()] {
+            assert!(!Geometry { user_end, ..g }.valid(), "{user_end:#x}");
+        }
+    }
+    assert_eq!(x86_64::GEOMETRY.root_entry(), 512 << 30);
+}
+
+/// Hydrogen N5 and DeepSeek F10 of the seventh review: page sizes are one
+/// per level (each log2 E above the one before), and none is larger than
+/// E chunks, so that one leaf fits one call of the gate (G3).
+#[test]
+fn page_sizes_are_one_per_level_and_at_most_e_chunks() {
+    let one_per_level = Geometry {
+        page_shift: [12, 18, 28, 0],
+        entries: 512,
+        levels: 3,
+        user_end: (1 << 38) - (1 << 30),
+    };
+    assert!(!one_per_level.valid());
+    let chunk_off = Geometry {
+        page_shift: [12, 20, 0, 0],
+        ..x86_64::GEOMETRY
+    };
+    assert!(!chunk_off.valid());
+    // A third large page of 512 GB: 2^18 chunks in one leaf.
+    let large3 = Geometry {
+        page_shift: [12, 21, 30, 39],
+        ..x86_64::GEOMETRY
+    };
+    assert!(!large3.valid());
+    // A large page whose leaf would be the root's on two levels.
+    let two_levels = Geometry {
+        page_shift: [12, 21, 30, 0],
+        levels: 2,
+        user_end: (1 << 29) - (1 << 21),
+        ..x86_64::GEOMETRY
+    };
+    assert!(!two_levels.valid());
+    assert!(
+        Geometry {
+            page_shift: [12, 21, 0, 0],
+            ..two_levels
+        }
+        .valid()
+    );
+}
+
 #[test]
 fn memory_types_have_their_numbers_and_suit_one_kind_of_memory() {
     use MemoryType::*;

@@ -440,33 +440,54 @@ impl Geometry {
         self.page_shift[0] as u32 + self.levels * self.entries.trailing_zeros()
     }
 
-    /// Whether an address is canonical: it lies in the lower half, below
-    /// the power of two at or above the user range end, or in the upper
-    /// half that mirrors it (x86-64: bits 47-63 equal on four levels).
+    /// The bytes one entry of the root table maps: the reserved slot is the
+    /// range of one such entry (Address spaces and their tables).
+    pub const fn root_entry(&self) -> u64 {
+        1 << (self.page_shift[0] as u32 + (self.levels - 1) * self.entries.trailing_zeros())
+    }
+
+    /// Whether an address is canonical: its bits from the top bit the
+    /// tables translate (`address_bits` − 1) to bit 63 are all equal
+    /// (x86-64: bits 47-63 on four levels). It depends on the address bits
+    /// of the geometry, never on the user range end (DeepSeek F1 of the
+    /// seventh review).
     pub const fn canonical(&self, address: u64) -> bool {
-        let half = self.user_end.next_power_of_two();
-        address < half || address >= half.wrapping_neg()
+        let top = address >> (self.address_bits() - 1);
+        top == 0 || top == u64::MAX >> (self.address_bits() - 1)
     }
 
     /// Whether the values are ones the kernel starts with (Values of the
-    /// machine, Start-up state): a page of at least 4 KB, a chunk above it
-    /// (a second page size is required), larger page sizes in increasing
-    /// order with none after a missing one; *E* the entries of one table
-    /// page of 8-byte entries, at most 4,096 (so a 64 KB granule, 8,192
-    /// entries, is refused); *L* at least 2; a user range end that is a
-    /// multiple of the chunk and lies in the lower half of the address bits
-    /// the tables translate.
+    /// machine, Start-up state): a page of at least 4 KB; *E* the entries
+    /// of one table page of 8-byte entries, at most 4,096 (so a 64 KB
+    /// granule, 8,192 entries, is refused); *L* from 2 to 8; page sizes one
+    /// per level, each the size one entry of the next level up maps
+    /// (log2 *E* above the one before), with none after a missing one, a
+    /// chunk (the second size) required, and none larger than *E* chunks,
+    /// so that one leaf fits one call of the gate (G3); a page size of
+    /// index *i* is a leaf of level *i* + 1, so *i* < *L*; a user range end
+    /// that is a multiple of the chunk and leaves, below the half of the
+    /// address bits the tables translate, the whole root entry of the
+    /// reserved slot.
     pub const fn valid(&self) -> bool {
         let s = self.page_shift;
-        let mut ordered = s[0] >= 12 && s[1] > s[0] && s[1] < 48;
+        if s[0] < 12 || s[0] > 32 || self.entries == 0 || !self.entries.is_power_of_two() {
+            return false;
+        }
+        let per_level = self.entries.trailing_zeros() as u8;
+        let mut sizes = s[1] == s[0] + per_level && self.levels > 1;
         let mut i = 2;
         while i < 4 {
-            if s[i] != 0 && (s[i] <= s[i - 1] || s[i - 1] == 0 || s[i] >= 48) {
-                ordered = false;
+            // Present only after a present size, one level up, below the
+            // level of the root, and at most E chunks (index 2 at most).
+            if s[i] != 0 && (s[i - 1] == 0 || s[i] != s[i - 1] + per_level || i > 2) {
+                sizes = false;
+            }
+            if s[i] != 0 && i as u32 >= self.levels {
+                sizes = false;
             }
             i += 1;
         }
-        ordered
+        sizes
             && self.entries as u64 == 1 << (s[0] - 3)
             && self.entries <= TABLE_ENTRIES_MAX
             && self.levels >= LEVELS_MIN
@@ -474,7 +495,7 @@ impl Geometry {
             && self.address_bits() <= 64
             && self.user_end != 0
             && self.user_end.is_multiple_of(self.chunk())
-            && self.user_end <= 1 << (self.address_bits() - 1)
+            && self.user_end <= (1 << (self.address_bits() - 1)) - self.root_entry()
     }
 }
 

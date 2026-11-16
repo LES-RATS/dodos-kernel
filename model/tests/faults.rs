@@ -32,6 +32,15 @@ impl K {
         k
     }
 
+    /// The same on another machine.
+    fn on_machine(machine: &Machine) -> Self {
+        let (m, t) = Model::boot(machine).unwrap();
+        let mut k = Self { m, t };
+        k.make(Endpoint, EP);
+        k.make(Reply, RP);
+        k
+    }
+
     fn on(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         let outcome = self.m.apply(thread, call);
         assert_eq!(self.m.check(), Ok(()));
@@ -314,8 +323,9 @@ fn answer_with_label_1_and_two_words_redirects_the_thread() {
 
 #[test]
 fn answer_with_another_label_or_a_redirect_that_cannot_be_leaves_it_suspended() {
-    // The first address that is not canonical on the machine's geometry.
-    let far = Machine::example().geometry.user_end.next_power_of_two();
+    // The first address that is not canonical on the machine's geometry:
+    // the half of the address bits its tables translate.
+    let far = 1 << (Machine::example().geometry.address_bits() - 1);
     for (label, words) in [
         (2, vec![0x40_2000, 0x8000]),
         (1, vec![0x40_2000]),
@@ -506,7 +516,7 @@ fn thread_write_regs_checks_the_size_then_the_canonical_words_then_the_state() {
     assert_eq!(k.go(write(good[..19].to_vec())), Err(Error::Invalid));
     for word in [REG_RIP, REG_RSP, 18, 19] {
         let mut wrong = good.clone();
-        wrong[word] = Machine::example().geometry.user_end.next_power_of_two();
+        wrong[word] = 1 << (Machine::example().geometry.address_bits() - 1);
         assert_eq!(k.go(write(wrong)), Err(Error::Invalid), "word {word}");
     }
     // Other words may hold anything.
@@ -517,6 +527,25 @@ fn thread_write_regs_checks_the_size_then_the_canonical_words_then_the_state() {
     k.ok(Syscall::ThreadResume(s(40)));
     assert_eq!(k.go(write(good[..3].to_vec())), Err(Error::Invalid));
     assert_eq!(k.go(write(free)), Err(Error::Busy));
+}
+
+/// DeepSeek F1 of the seventh review: on a machine whose user range ends
+/// at 2^(bits − 2), an address just below the half of the address bits is
+/// still canonical, and a redirect to it is accepted.
+#[test]
+fn canonical_words_follow_the_address_bits_whatever_the_user_range_end() {
+    let geometry = Machine::example().geometry;
+    let bits = geometry.address_bits();
+    let low = Geometry {
+        user_end: 1 << (bits - 2),
+        ..geometry
+    };
+    let mut k = K::on_machine(&Machine::example_on(low));
+    k.thread(40, 0, false);
+    let mut block = k.regs(40);
+    block[REG_RIP] = (1 << (bits - 1)) - 0x1000;
+    block[REG_RSP] = u64::MAX << (bits - 1);
+    k.ok(Syscall::ThreadWriteRegs { thread: s(40), block });
 }
 
 #[test]
