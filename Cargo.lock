@@ -16,3 +16,10 @@ version = "0.0.0"
 dependencies = [
  "dodos-abi",
 ]
+
+[[package]]
+name = "dodos-regs"
+version = "0.0.0"
+dependencies = [
+ "dodos-classifier",
+]
