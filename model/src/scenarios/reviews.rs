@@ -395,6 +395,9 @@ fn deepseek_4_an_untyped_is_guarded_by_its_segments_lock_and_an_interrupt_entry_
     machine.locking = Locking::L2;
     let mut k = N::on(&machine);
     k.ok(k.retype(ObjectKind::Notify, 0, 200));
+    let untyped = k.m.object_at(k.t, s(k.ut)).unwrap();
+    let place = k.m.caps[&k.m.objects[&untyped].root].place;
+    let segment = LockId::Segment(place.space, place.index / dodos_abi::CSPACE_SEGMENT_SLOTS);
     let locks = |k: &N| -> Vec<LockId> {
         k.m.locks
             .steps
@@ -405,7 +408,13 @@ fn deepseek_4_an_untyped_is_guarded_by_its_segments_lock_and_an_interrupt_entry_
             })
             .collect()
     };
-    assert!(locks(&k).iter().any(|l| matches!(l, LockId::Segment(..))));
+    // The untyped's watermark is guarded by the lock of the segment of its
+    // root capability's slot, not only the destination's.
+    assert_ne!(
+        place.index / dodos_abi::CSPACE_SEGMENT_SLOTS,
+        200 / dodos_abi::CSPACE_SEGMENT_SLOTS
+    );
+    assert!(locks(&k).contains(&segment));
     // A claim of an interrupt writes the interrupt table of a core: that
     // core's lock word.
     let irq_control = s(dodos_abi::START_SLOT_IRQ_CONTROL);

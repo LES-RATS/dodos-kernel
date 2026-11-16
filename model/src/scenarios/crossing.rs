@@ -382,6 +382,36 @@ fn a_release_that_crosses_a_revoke_ends_the_revocation() {
     assert!(m.woken(0).is_some());
 }
 
+#[test]
+fn a_mapped_remote_frame_whose_grant_is_revoking_keeps_its_slot_until_a_removal_reaches_it() {
+    // Node 1 of two cores, both of which have its space loaded.
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    let reply = m.retype(1, ObjectKind::Reply, 0, REPLY);
+    m.ok(1, reply);
+    let frame = m.retype(0, ObjectKind::Frame, 1, OBJ);
+    m.ok(0, frame);
+    m.ok(1, super::place_first(1, 1));
+    m.thread_on(1, 300, 2);
+    m.settle();
+    assert_eq!(m.call(1, recv(GOT)), WAITS);
+    let call = send(
+        1,
+        vec![Transfer::Derive(s(OBJ), frame_rights())],
+        SlotAddr::NONE,
+    );
+    assert_eq!(m.call(0, call), WAITS);
+    m.settle();
+    map_got(&mut m);
+    assert_eq!(m.call(0, Syscall::CapRevoke(s(OBJ))), WAITS);
+    // Before the `Revoke` is consumed, the holder uses its capability: the
+    // call is `gone`, and the slot keeps the mapping (checked by the TLB
+    // invariant: a slot made dead at once would drop the mapping without
+    // the other core's invalidation).
+    assert_eq!(m.call(1, Syscall::ASpaceUnmap(s(GOT))), Err(Error::Gone));
+    m.run(30 * MS);
+    assert!(m.sys.node(0).grant_entries().is_empty() || m.woken(0).is_some());
+}
+
 // The one check on every message received.
 
 fn refused_count(m: &S, node: u16) -> u64 {
@@ -495,19 +525,25 @@ fn a_release_or_a_signal_that_names_a_grant_entry_of_another_grantee_or_serial_i
 }
 
 #[test]
-fn a_handed_that_does_not_name_the_current_epoch_and_this_node_as_target_is_refused() {
-    let mut m = two();
-    let before = refused_count(&m, 0);
-    let handed = message(
-        dodos_abi::NodeMessage::Handed,
-        (1, 1),
-        1,
-        None,
-        Body::Handed { role: 0, epoch: 77 },
-    );
-    m.sys.inject(1, 0, handed);
-    m.run(20 * MS);
-    assert_eq!(refused_count(&m, 0), before + 1);
+fn a_handed_that_does_not_name_the_current_epoch_the_holder_and_this_node_as_target_is_refused() {
+    let mut k = N::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    // The role word reads handing, from node 1 to this node 0, epoch 5.
+    k.m.table.roles[0] = dodos_abi::RoleWord::handing(1, 0, 5);
+    let handed = |sender: u16, epoch: u32| {
+        message(
+            dodos_abi::NodeMessage::Handed,
+            (sender, 1),
+            1,
+            None,
+            Body::Handed { role: 0, epoch },
+        )
+    };
+    assert_eq!(k.m.refused(&handed(1, 5)), None);
+    assert!(k.m.refused(&handed(1, 6)).is_some());
+    assert!(k.m.refused(&handed(2, 5)).is_some());
+    // A word that does not name this node as target.
+    k.m.table.roles[0] = dodos_abi::RoleWord::handing(1, 2, 5);
+    assert!(k.m.refused(&handed(1, 5)).is_some());
 }
 
 #[test]
@@ -567,12 +603,17 @@ fn a_producer_index_too_far_ahead_is_read_as_a_failure_of_the_sender_and_resynch
         receiver_generation: 1,
         credit: u32::from(dodos_abi::CREDIT_NONE),
     };
+    let before = refused_count(&m, 1);
     m.sys
         .inject_raw(0, 1, false, header, 10 * dodos_abi::RING_KERNEL_ENTRIES);
-    m.settle();
+    m.run(30 * MS);
     let consumed = m.sys.canonical().beacons[1].consumed[0].0;
     let produced = m.sys.canonical().rings[0][1].kernel.produced;
     assert_eq!(consumed, produced);
+    // The consumer index moved to the producer minus the ring's entries in
+    // one step, traced once; the entries left were read one by one.
+    let refused = refused_count(&m, 1) - before;
+    assert!(refused <= 1 + dodos_abi::RING_KERNEL_ENTRIES, "{refused}");
 }
 
 // What ends with a generation, a fresh start and a resume.
@@ -644,34 +685,74 @@ fn a_fresh_start_consumes_nothing_sent_to_its_earlier_generation() {
 #[test]
 fn a_resume_keeps_its_consumer_indices_and_consumes_the_answers_that_waited() {
     let mut m = two();
-    m.ok(
-        0,
-        Syscall::NodeStop {
-            node: node_cap(1),
-            mode: NODE_STOP_SEAL,
-            core: 0,
-        },
-    );
-    m.run(2 * MS);
-    assert_eq!(m.state(1), MemberState::Sealed);
-    // A send to a sealed node is gone (nothing is sent to it); a message
-    // written before the seal waits.
-    m.no(0, send(1, vec![], SlotAddr::NONE), Error::Gone);
-    let before = m.sys.canonical().beacons[1].consumed.clone();
-    m.ok(
-        0,
-        Syscall::NodeStart {
-            node: node_cap(1),
-            mode: NODE_START_RESUME,
-            image: 0,
-            module: 0,
-            window: 0,
-            mask: 0,
-        },
-    );
-    m.run(2 * MS);
-    assert_eq!(m.state(1), MemberState::Live);
-    assert_eq!(m.sys.canonical().beacons[1].consumed, before);
+    // Node 0's thread sends to node 1, whose mailbox has no receiver. Node
+    // 0 holds no unit role, so its seal needs nothing of node 1.
+    let call = Syscall::NodeSend {
+        node: node_cap(1),
+        message: msg(1, vec![]),
+        doorbell: SlotAddr::NONE,
+    };
+    assert_eq!(m.call(0, call), WAITS);
+    m.ok(1, seal_of(0));
+    // Only node 0 moves until it is sealed: node 1 has not answered yet.
+    for _ in 0..100_000 {
+        if m.state(0) == MemberState::Sealed {
+            break;
+        }
+        let events = m.sys.events();
+        let mine = events.iter().copied().find(|e| match *e {
+            crate::system::Event::Ipi { node, .. } | crate::system::Event::Timer { node, .. } => {
+                node == 0
+            }
+            crate::system::Event::Action(i) => m.sys.actions()[i].0 == 0,
+            crate::system::Event::StubHalt { .. } | crate::system::Event::CpuOff { .. } => true,
+        });
+        match mine {
+            Some(event) => {
+                m.sys.fire(event);
+                assert_eq!(m.sys.check(), Ok(()));
+            }
+            None => {
+                let next = m.sys.now() + 100_000;
+                m.sys.move_clock(next);
+            }
+        }
+    }
+    assert_eq!(m.state(0), MemberState::Sealed);
+    // Node 1 answers: the answer waits in the ring of a sealed node.
+    m.run(20 * MS);
+    let ring = &m.sys.canonical().rings[1][0].kernel;
+    let consumed = m.sys.canonical().beacons[0].consumed[1].0;
+    assert!(ring.produced > consumed, "the answer waits");
+    assert!(matches!(
+        m.sys.node(0).threads[&m.t[0]].wait,
+        Wait::Node { peer: 1, .. }
+    ));
+    m.ok(1, resume_of(0));
+    m.run(20 * MS);
+    assert_eq!(m.state(0), MemberState::Live);
+    // The resume kept the consumer index and consumed the answer: the wait
+    // ended with it.
+    assert_eq!(m.woken(0), Some(&Err(Error::WouldWait)));
+}
+
+fn seal_of(n: u16) -> Syscall {
+    Syscall::NodeStop {
+        node: node_cap(n),
+        mode: NODE_STOP_SEAL,
+        core: 0,
+    }
+}
+
+fn resume_of(n: u16) -> Syscall {
+    Syscall::NodeStart {
+        node: node_cap(n),
+        mode: NODE_START_RESUME,
+        image: 0,
+        module: 0,
+        window: 0,
+        mask: 0,
+    }
 }
 
 #[test]

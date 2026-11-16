@@ -105,6 +105,7 @@ impl Model {
                     // with page classes data and map counts 0.
                     // G13: its gate word and page classes are reset.
                     self.kernel_runs.insert(index);
+                    self.added.0 += 1;
                     self.table.set_map_count(index, 0);
                     let pages = self.table.geometry.chunk() / self.table.geometry.page();
                     let stored: Vec<u64> = self

@@ -77,6 +77,9 @@ impl Model {
         // request table for them (`again` with nothing changed).
         let role = match (source.is_line(), self.machine.remapping) {
             (true, _) => self.ioapic_role(source.id()),
+            // CONTRACT-GAP 12: the invalidation of the interrupt entry cache
+            // goes to the holder of the first IOMMU unit's role, as if the
+            // machine had one remapping unit; the call has one wait.
             (false, true) if !self.machine.iommus.is_empty() => Some(self.unit_role(0)),
             (false, _) => None,
         };

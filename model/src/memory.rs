@@ -63,6 +63,7 @@ impl Model {
             };
             aspace.translations.insert(at, translation);
             self.table.gated.0 = true;
+            self.added.0 += 1;
         }
         aspace.records.push(cap);
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
@@ -624,6 +625,7 @@ impl Model {
             };
             aspace.translations.insert(at, translation);
             self.table.gated.0 = true;
+            self.added.0 += 1;
         }
         let added = Mapping {
             first: mapping.first + mapping.count,

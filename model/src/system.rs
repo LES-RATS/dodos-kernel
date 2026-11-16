@@ -31,6 +31,9 @@ pub enum Hardware {
     WaitSipi,
     /// Off: ARM64 `CPU_OFF`, RISC-V STOPPED.
     Off,
+    /// ARM64: the fence's handler completed the event and its core calls
+    /// `CPU_OFF`; firmware answers OFF once the call is done.
+    Parking,
     /// Started for a node whose first core has not built its state yet.
     Entering,
 }
@@ -46,6 +49,9 @@ pub enum Event {
     Action(usize),
     /// The park stub halts after a read that found no start request.
     StubHalt { core: usize },
+    /// ARM64: `CPU_OFF` of a core whose handler completed the fence's
+    /// event; from then `AFFINITY_INFO` answers OFF.
+    CpuOff { core: usize },
 }
 
 /// A deterministic generator (xorshift64*), seeded by the tests.
@@ -272,6 +278,9 @@ impl System {
             if hw == (Hardware::Stub { window: true }) {
                 events.push(Event::StubHalt { core });
             }
+            if hw == Hardware::Parking {
+                events.push(Event::CpuOff { core });
+            }
         }
         events
     }
@@ -295,6 +304,12 @@ impl System {
                 self.act(node, action);
             }
             Event::StubHalt { core } => self.hardware[core] = Hardware::Stub { window: false },
+            Event::CpuOff { core } => {
+                let mut table = self.table().clone();
+                table.stopped[core] = table.park_requests[core];
+                self.share(table);
+                self.hardware[core] = Hardware::Off;
+            }
         }
     }
 
@@ -360,6 +375,12 @@ impl System {
         while self.now < to && !self.stopped {
             self.advance((self.now + step.max(1)).min(to));
         }
+    }
+
+    /// Time passes to `to` and nothing is taken: the events due become
+    /// events that can happen now (a test's input, to choose among them).
+    pub fn move_clock(&mut self, to: u64) {
+        self.set_clock(to.max(self.now));
     }
 
     fn set_clock(&mut self, now: u64) {
@@ -552,10 +573,22 @@ impl System {
             (Arch::X86_64, _) => {}
             // ARM64: SDEI event 0 to a core whose kernel registered its
             // handler, which completes the event and calls `CPU_OFF`.
-            (Arch::Aarch64, Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Off) => {
+            // ARM64: SDEI event 0 to a core whose kernel registered its
+            // handler; the handler writes `parked` and completes the event
+            // to the park routine, which calls `CPU_OFF` (a later event).
+            // The fence is confirmed by OFF after the request, never by the
+            // handler's own write.
+            (Arch::Aarch64, Hardware::Running | Hardware::Hung { nmi: true }) => {
                 self.fence_record(core);
-                self.write_parked(core, true);
-                self.hardware[core] = Hardware::Off;
+                self.write_parked(core, false);
+                self.hardware[core] = Hardware::Parking;
+            }
+            // A core already off answers OFF to the new request at once (no
+            // `CPU_ON` was sent since).
+            (Arch::Aarch64, Hardware::Off) => {
+                let mut table = self.table().clone();
+                table.stopped[core] = table.park_requests[core];
+                self.share(table);
             }
             (Arch::Aarch64, _) => {}
             // RISC-V: the stop extension stops the hart whatever it does.

@@ -414,6 +414,56 @@ fn a_request_not_acknowledged_within_core_answer_ns_makes_the_node_accuse_itself
     );
 }
 
+#[test]
+fn a_core_whose_heartbeat_goes_stale_while_it_is_not_idle_makes_its_node_accuse_itself() {
+    // Node 0 of cores 0 and 1, each running a thread; node 1 of core 2.
+    let mut sys = S::on(&machine(Arch::X86_64, 3, &[&[0, 1], &[2]]));
+    sys.ok(0, super::place_first(0, 0));
+    let other = sys.thread_on(0, 300, 1);
+    sys.settle();
+    assert_eq!(sys.sys.node(0).cores[1].thread, Some(other));
+    // Core 1 stops answering while it runs: no request is in flight, but
+    // its heartbeat no longer moves. Core 0 sees it at its own events.
+    sys.sys.hang(1, true);
+    sys.run_by(dodos_abi::STALE_NS / 2, MS);
+    assert_eq!(sys.state(0), MemberState::Live);
+    sys.run_by(dodos_abi::STALE_NS / 2 + 60 * MS, MS);
+    let member = sys.sys.member(0);
+    assert_eq!(member.evidence(), dodos_abi::Evidence::SelfReported);
+    let record = sys.sys.canonical().crash.areas[0].record;
+    assert_eq!(
+        record.map(|r| r.reason),
+        Some(CrashReason::CoreSilent as u32)
+    );
+}
+
+#[test]
+fn a_core_that_runs_one_thread_with_no_other_event_beats_every_half_stale_ns() {
+    // Node 0 of cores 0 and 1; a thread on core 1 on a context of a long
+    // budget: no timer of its own for seconds.
+    let mut sys = S::on(&machine(Arch::X86_64, 3, &[&[0, 1], &[2]]));
+    sys.ok(0, super::place_first(0, 0));
+    let other = sys.thread_on(0, 300, 1);
+    sys.ok(
+        0,
+        Syscall::SchedConfigure {
+            sched: s(301),
+            node: node_cap(0),
+            core: 1,
+            budget: 5_000_000_000,
+            period: 10_000_000_000,
+            class: 1,
+        },
+    );
+    sys.settle();
+    assert_eq!(sys.sys.node(0).cores[1].thread, Some(other));
+    let before = sys.sys.canonical().core_beacons[1].heartbeat.0;
+    sys.run_by(3 * dodos_abi::STALE_NS, MS);
+    // Its heartbeat moved at least every STALE_NS / 2: nobody accused it.
+    assert!(sys.sys.canonical().core_beacons[1].heartbeat.0 >= before + 5);
+    assert_eq!(sys.state(0), MemberState::Live);
+}
+
 // Locking: two variants with one layout.
 
 #[test]
@@ -492,6 +542,15 @@ fn the_check_refuses_a_lock_order_the_contract_forbids() {
         Step::Lock(LockId::Gate),
         Step::Pay(Cost::Lock),
         Step::Lock(LockId::Core(0)),
+    ];
+    assert!(k.m.check().is_err());
+    // Object locks out of the order of their kind, the gate lock not taken.
+    let thread = k.t;
+    k.m.locks.steps = vec![
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Core(0)),
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Thread(thread)),
     ];
     assert!(k.m.check().is_err());
     // A spin for another core or a unit inside a hold.

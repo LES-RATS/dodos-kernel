@@ -347,7 +347,7 @@ impl Model {
     /// The one check on every message received (D-124, D-129, D-131), in
     /// one function and before anything changes. `None` passes; `Some`
     /// names what it named, for the trace (code 11).
-    fn refused(&self, message: &Message) -> Option<u64> {
+    pub(crate) fn refused(&self, message: &Message) -> Option<u64> {
         let header = &message.header;
         let sender = header.sender;
         if sender >= self.table.nodes {

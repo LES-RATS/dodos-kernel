@@ -140,6 +140,41 @@ fn a_request_answered_elsewhere_is_sent_again_with_the_epoch_of_the_new_holder()
 }
 
 #[test]
+fn a_holder_answers_elsewhere_to_a_request_of_another_epoch_and_serves_one_of_its_epoch() {
+    let mut k = N::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    // Node 0 holds the IOMMU role (Model::boot); node 1 asks with an old
+    // epoch, on its request credit 0.
+    let epoch = k.m.table.roles[IOMMU_ROLE].epoch();
+    let op = crate::rings::UnitOp::Attach {
+        device: DEVICE as u16,
+    };
+    let answer = |k: &N| {
+        let ring = &k.m.table.rings[0][1].kernel;
+        (0..ring.produced).rev().find_map(|at| match ring.at(at) {
+            Some(crate::table::RingEntry::Message(m)) => match m.body {
+                crate::rings::Body::UnitAnswer { result } => Some(result),
+                _ => None,
+            },
+            _ => None,
+        })
+    };
+    k.m.unit_requested(1, Some((0, 1)), (IOMMU_ROLE as u16, epoch + 7, op));
+    assert_eq!(answer(&k), Some(dodos_abi::UnitResult::Elsewhere));
+    assert!(
+        k.m.table
+            .units
+            .get(&IOMMU_ROLE)
+            .is_none_or(|u| u.entries.is_empty())
+    );
+    k.m.unit_requested(1, Some((1, 1)), (IOMMU_ROLE as u16, epoch, op));
+    assert!(
+        k.m.table.units[&IOMMU_ROLE]
+            .entries
+            .contains_key(&(DEVICE as u16))
+    );
+}
+
+#[test]
 fn the_requester_keeps_its_request_through_the_death_of_the_holder_and_the_next_holder_serves_it() {
     let mut m = three();
     let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);

@@ -591,12 +591,13 @@ impl Model {
     /// extension's) came after the request with no start since.
     pub(crate) fn park_confirmed(&self, core: usize) -> bool {
         let request = self.table.park_requests[core];
+        // x86-64: `parked` equals the request (the handler or the stub
+        // wrote it). ARM64 and RISC-V: the firmware's answer, OFF or
+        // STOPPED after the request (`AFFINITY_INFO`, the stop extension),
+        // never the handler's own write, which comes before `CPU_OFF`.
         match self.machine.arch {
             crate::Arch::X86_64 => self.table.core_beacons[core].parked == request,
-            _ => {
-                self.table.stopped[core] == request
-                    || self.table.core_beacons[core].parked == request
-            }
+            _ => self.table.stopped[core] == request,
         }
     }
 
@@ -1535,12 +1536,6 @@ impl Model {
             )
             .with_class(member.class());
             self.table.write_member(me, me, live);
-            // Threads run again: every other core of the node chooses again
-            // (this core chooses at the end of its event).
-            let at = *self.at;
-            for core in (0..self.width()).filter(|&c| c != at) {
-                self.post(core, crate::Ipi::Reschedule);
-            }
             any = true;
         }
         any

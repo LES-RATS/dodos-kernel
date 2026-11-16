@@ -1106,6 +1106,10 @@ pub struct Model {
     /// each is also an entry of code 11 in the trace, which may be rate
     /// limited.
     refused: Ephemeral<u64>,
+    /// One more at each translation added to a space or run added to the
+    /// kernel's own space: a core caches again only what changed since its
+    /// last event (the model's bookkeeping, not the kernel's).
+    added: Ephemeral<u64>,
     /// What the current event did that the checks of crossing judge: each
     /// submission to a unit with the role word it read, and each message
     /// applied with its header.
@@ -1175,6 +1179,9 @@ impl Model {
 
     /// The threads that can run: not suspended, not waiting, and not marked
     /// *leaving its core*. A call can be applied for any of them.
+    /// CONTRACT-GAP 4: a marked thread that enters the kernel before its
+    /// core took the leave interrupt makes no call: a core takes its pending
+    /// interrupts at each entry, before the call.
     pub fn runnable(&self) -> Vec<ObjId> {
         let ready = |thread: &&Thread| Self::runnable_thread(thread);
         let ids = self.threads.iter().filter(|(_, thread)| ready(thread));

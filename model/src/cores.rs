@@ -125,6 +125,8 @@ pub(crate) struct CorePart {
     /// The heartbeat of this core as the node's other cores last saw it
     /// move, and the instant they saw it (A node of several cores).
     pub(crate) watched: Ephemeral<(u64, u64)>,
+    /// The count of additions and the root at its last caching.
+    pub(crate) cached: Ephemeral<(u64, Option<ObjId>)>,
     /// Idle, slack and kernel time, published in its core beacon.
     pub(crate) idle_ns: Ephemeral<u64>,
     pub(crate) slack_ns: Ephemeral<u64>,
@@ -345,6 +347,8 @@ impl Model {
     /// cores that loaded it.
     pub(crate) fn invalidate_on(&mut self, core: usize, flush: &Flush) {
         let part = &mut self.cores[core];
+        // What is still mapped is cached again at the core's next event.
+        part.cached.0 = (u64::MAX, None);
         match flush {
             Flush::Range { space, addresses } => {
                 if let Some(cached) = part.tlb.get_mut(space) {
@@ -497,6 +501,11 @@ impl Model {
     /// whose root it runs on, and the kernel's own space.
     pub(crate) fn cache_here(&mut self) {
         let at = *self.at;
+        let now = (self.added.0, self.cores[at].loaded);
+        if self.cores[at].cached.0 == now {
+            return;
+        }
+        self.cores[at].cached.0 = now;
         if let Some(space) = self.cores[at].loaded {
             let entries: Cached = self.aspaces[&space]
                 .translations
@@ -590,6 +599,8 @@ impl Model {
     /// `STALE_NS` and that is not idle (now − `STALE_NS` past its
     /// `idle_until`, as for stale evidence) is a failure of the node. Not
     /// before the node is ready: its cores enter one by one.
+    /// CONTRACT-GAP 16: the contract does not say which core watches, nor
+    /// when; every core does, at its due events.
     pub(crate) fn watch_own_cores(&mut self) {
         if self.width() == 1 || !self.ready {
             return;
@@ -710,6 +721,7 @@ impl Model {
         part.silent = false;
         part.tlb.clear();
         part.kernel_tlb.clear();
+        part.cached.0 = (u64::MAX, None);
         part.loaded = None;
         part.running = None;
         part.thread = None;

@@ -525,6 +525,46 @@ fn the_fence_of_each_architecture_confirms_every_core() {
 }
 
 #[test]
+fn an_arm64_fence_is_confirmed_by_off_after_the_request_never_by_the_handlers_own_write() {
+    let mut m = S::on(&machine(Arch::Aarch64, 3, &[&[0], &[1, 2]]));
+    m.ok(0, stop(1, NODE_STOP_KILL));
+    // Every event but `CPU_OFF`: the handlers write `parked`, the cores do
+    // not reach OFF, and the fence is not confirmed.
+    for _ in 0..2_000 {
+        let events: Vec<_> = m
+            .sys
+            .events()
+            .into_iter()
+            .filter(|e| !matches!(e, crate::system::Event::CpuOff { .. }))
+            .collect();
+        match events.first() {
+            Some(&event) => {
+                m.sys.fire(event);
+                assert_eq!(m.sys.check(), Ok(()));
+            }
+            None => {
+                let next = m.sys.now() + 100_000;
+                m.sys.move_clock(next);
+            }
+        }
+    }
+    for core in [1, 2] {
+        assert_eq!(m.sys.hardware(core), Hardware::Parking);
+        assert_eq!(
+            m.sys.canonical().core_beacons[core].parked,
+            m.sys.park_request(core)
+        );
+    }
+    assert!(matches!(
+        m.state(1),
+        MemberState::Fencing | MemberState::Unfenced
+    ));
+    // `CPU_OFF` completes: OFF confirms, and the node is reclaimed.
+    m.run(SWEEP_NS + 10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+}
+
+#[test]
 fn a_fence_whose_driver_dies_is_driven_again_by_another_node() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     // Core 2 cannot be stopped at once: it hangs without its handler, so
@@ -578,6 +618,11 @@ fn a_sealed_node_hands_its_unit_roles_and_resumes_with_its_generation() {
 #[test]
 fn a_seal_writes_sealed_only_after_the_last_park_request_and_resumes_on_the_same_cores() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1, 2, 3]]));
+    // A thread of node 1 runs on its core 2.
+    m.ok(1, super::place_first(1, 1));
+    let worker = m.thread_on(1, 300, 2);
+    m.settle();
+    assert_eq!(m.sys.node(1).cores[1].thread, Some(worker));
     m.ok(0, stop(1, NODE_STOP_SEAL));
     let mut sealed_with_running = false;
     for _ in 0..200 {
@@ -595,6 +640,8 @@ fn a_seal_writes_sealed_only_after_the_last_park_request_and_resumes_on_the_same
     for core in 1..4 {
         assert_eq!(m.sys.hardware(core), Hardware::Running);
     }
+    // Its threads run again where their contexts are placed.
+    assert_eq!(m.sys.node(1).cores[1].thread, Some(worker));
 }
 
 #[test]

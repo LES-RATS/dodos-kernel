@@ -444,6 +444,9 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
         let arch = [Arch::X86_64, Arch::Aarch64, Arch::Riscv64][seed as usize % 3];
         let mut m = S::on(&machine(arch, 5, &[&[0, 1], &[2, 3], &[4]]));
         let mut hung = false;
+        // A hung core that no stop of its architecture reaches: the x86-64
+        // bootstrap core, or an ARM64 core, whose handler cannot run.
+        let mut unstoppable = false;
         for _ in 0..30 {
             let actor = rng.below(3) as u16;
             let victim = (actor + 1 + rng.below(2) as u16) % 3;
@@ -482,6 +485,8 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
                         say(format_args!("{} hang core {core} nmi {nmi}", m.sys.now()));
                         m.sys.hang(core, nmi);
                         hung = true;
+                        unstoppable =
+                            !nmi && (arch == Arch::Aarch64 || (arch == Arch::X86_64 && core == 0));
                     }
                 }
                 _ => churn(&mut m, &mut rng),
@@ -509,6 +514,11 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
             assert!(
                 !matches!(state, MemberState::Fencing | MemberState::Fenced),
                 "seed {seed}: node {n} stays {state:?}"
+            );
+            // Unfenced only for a core that no stop reaches.
+            assert!(
+                state != MemberState::Unfenced || unstoppable,
+                "seed {seed}: node {n} unfenced with every core stoppable"
             );
         }
     }
