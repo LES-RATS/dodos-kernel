@@ -1,0 +1,231 @@
+# Classification of x86-64, from Intel XED's instruction data (D-125).
+# One line per encoding: KIND NAME CLASS [REASON]. `classify items x86_64`
+# lists the encodings and the domain (see src/x86_64.rs).
+#
+# Reasons: the sentence of the contract (kernel-interface.md) or of
+# kernel.md ("The write gate: mechanisms") that justifies the class.
+
+why UNUSED kernel-interface.md#architectures "Every encoding of the pinned release is classified once, as *gate* (...), *kernel* (used by the kernel, harmless to other nodes), *unreachable* (traps or is undefined at the kernel's level; refused anyway) or *unused* (refused)" -- not used by the kernel
+why UNREACHABLE kernel-interface.md#architectures "*unreachable* (traps or is undefined at the kernel's level; refused anyway)" -- invalid in 64-bit mode
+why CR kernel.md#the-write-gate-mechanisms "Instructions forbidden outside the gate and the start-up code ...: writes to CR0, CR3, CR4 and the debug registers, among them `LMSW` and `CLTS`, which write CR0 by other opcodes"
+why MSR kernel.md#the-write-gate-mechanisms "`WRMSR`, `WRMSRNS`, `WRMSRLIST` and the MSR forms with an immediate index (XED's `msr-imm`)"
+why XSTATE kernel.md#the-write-gate-mechanisms "`XSETBV` (it sets XCR0, the vector state features: the counterpart of `ZCR_EL1` under D-118) and `XRSTORS`"
+why TABLES kernel.md#the-write-gate-mechanisms "`LGDT`, `LIDT`, `LLDT`, `LTR`"
+why INVD kernel.md#the-write-gate-mechanisms "`INVD`"
+why BROADCAST kernel.md#the-write-gate-mechanisms "`INVLPGB` and `TLBSYNC` (AMD's broadcast invalidation, which reaches other cores' TLBs)"
+why VIRT kernel.md#the-write-gate-mechanisms "the VMX and SVM instructions (unless the image declares the hardening monitor)"
+why PORTS kernel.md#the-write-gate-mechanisms "`IN`, `OUT` and their string forms" and kernel-interface.md#io-ports "the gate executes one `in` or `out` of that width at that port"
+why STRING-IO kernel-interface.md#io-ports "No string I/O, no batch, no exclusive ranges (design choice). No device of version 1 needs string I/O."
+why SHADOW kernel.md#the-write-gate-mechanisms "the shadow-stack management instructions, `SETSSBSY`, `CLRSSBSY`, `WRUSSD`, `WRUSSQ` and `WRSSQ` outside the gate's mechanism"
+why FRED kernel.md#the-write-gate-mechanisms "`ERETS`, `ERETU` and `LKGS` (FRED, deferred, refused all the same)"
+why IWKEY kernel.md#the-write-gate-mechanisms "`LOADIWKEY`"
+why SEAM kernel.md#the-write-gate-mechanisms "the SEAM and TDX calls"
+why SNP kernel.md#the-write-gate-mechanisms "the SEV-SNP instructions (`PVALIDATE`, `RMPADJUST`, `RMPUPDATE`, `PSMASH`)"
+why HRESET kernel.md#the-write-gate-mechanisms "`HRESET`"
+why ENCLAVE kernel.md#the-write-gate-mechanisms "`ENCLS`, `PCONFIG`"
+why UINTR kernel-interface.md#user-interrupts-a-placed-hook "Processors that deliver an interrupt straight to a user thread (Intel's user interrupts and their equivalents) are not used in version 1"
+why FIRMWARE kernel-interface.md#the-rules "G10. ... the kernel never calls firmware runtime services (UEFI's or any other)" -- SMM, measured launch
+
+# Control and debug registers.
+iclass MOV_CR.write gate CR
+iclass MOV_DR.write gate CR
+iclass LMSW gate CR
+iclass CLTS gate CR
+iclass MOV_CR.read kernel   # CR2 in the fault entry
+iclass MOV_DR.read kernel   # DR6 in the debug entry
+iclass SMSW unused UNUSED
+
+# MSRs. kernel.md: "`WBINVD`, `INVLPG`, `INVPCID` and `RDMSR` are allowed."
+iclass WRMSR gate MSR
+iclass WRMSRNS/WRMSRNS gate MSR
+iclass WRMSRNS/WRMSRNS_IMM32_GPR64u64 gate MSR
+iclass WRMSRNS/WRMSRNS_IMM32_GPR64u64_APX gate MSR
+iclass WRMSRLIST/WRMSRLIST gate MSR
+iclass RDMSR/RDMSR_GPR64u64_IMM32 gate MSR
+iclass RDMSR/RDMSR_GPR64u64_IMM32_APX gate MSR
+iclass RDMSR kernel
+iclass RDMSRLIST/RDMSRLIST kernel   # reads only, as RDMSR
+iclass URDMSR/URDMSR_GPR64u64_IMM32 unused UNUSED
+iclass URDMSR/URDMSR_GPR64u64_GPR64u64 unused UNUSED
+iclass UWRMSR/UWRMSR_IMM32_GPR64u64 unused UNUSED
+iclass UWRMSR/UWRMSR_GPR64u64_GPR64u64 unused UNUSED
+iclass UWRMSR/UWRMSR_IMM32_GPR64u64_APX unused UNUSED
+iclass UWRMSR/UWRMSR_GPR64u64_GPR64u64_APX unused UNUSED
+
+# Extended state. XRSTORS is gate by kernel.md; the context switch of D-126
+# (XSAVES/XRSTORS in Zig) must then call the gate (listed for the owners).
+iclass XSETBV gate XSTATE
+iclass XRSTORS gate XSTATE
+iclass XRSTORS64 gate XSTATE
+iclass XSAVES kernel
+iclass XSAVES64 kernel
+iclass XGETBV kernel
+iclass XSAVE kernel
+iclass XSAVE64 kernel
+iclass XSAVEC kernel
+iclass XSAVEC64 kernel
+iclass XRSTOR kernel
+iclass XRSTOR64 kernel
+
+# Descriptor tables, written once at start-up (kernel.md).
+iclass LGDT gate TABLES
+iclass LIDT gate TABLES
+iclass LLDT gate TABLES
+iclass LTR gate TABLES
+iclass SGDT unused UNUSED
+iclass SIDT unused UNUSED
+iclass SLDT unused UNUSED
+iclass STR unused UNUSED
+iclass LAR unused UNUSED
+iclass LSL unused UNUSED
+iclass VERR unused UNUSED
+iclass VERW kernel   # clears CPU buffers on the return to user mode
+iclass ARPL unreachable UNREACHABLE
+
+# Caches and TLBs.
+iclass INVD gate INVD
+iclass WBINVD kernel
+iclass WBNOINVD kernel
+iclass INVLPG kernel
+iclass INVPCID kernel
+iclass INVPCID/INVPCID_GPR64i64_MEMi128_APX kernel
+iclass INVLPGB gate BROADCAST
+iclass TLBSYNC gate BROADCAST
+
+# Virtualisation.
+iclass VMXON gate VIRT
+iclass VMXOFF gate VIRT
+iclass VMCLEAR gate VIRT
+iclass VMPTRLD gate VIRT
+iclass VMPTRST gate VIRT
+iclass VMREAD gate VIRT
+iclass VMWRITE gate VIRT
+iclass VMLAUNCH gate VIRT
+iclass VMRESUME gate VIRT
+iclass VMCALL gate VIRT
+iclass VMFUNC gate VIRT
+iclass INVEPT gate VIRT
+iclass INVEPT/INVEPT_GPR64i64_MEMi128_APX gate VIRT
+iclass INVVPID gate VIRT
+iclass INVVPID/INVVPID_GPR64i64_MEMi128_APX gate VIRT
+iclass VMRUN gate VIRT
+iclass VMMCALL gate VIRT
+iclass VMLOAD gate VIRT
+iclass VMSAVE gate VIRT
+iclass STGI gate VIRT
+iclass CLGI gate VIRT
+iclass SKINIT gate VIRT
+iclass INVLPGA gate VIRT
+
+# Ports.
+iclass IN gate PORTS
+iclass OUT gate PORTS
+iclass INSB unused STRING-IO
+iclass INSW unused STRING-IO
+iclass INSD unused STRING-IO
+iclass OUTSB unused STRING-IO
+iclass OUTSW unused STRING-IO
+iclass OUTSD unused STRING-IO
+iclass REP_INSB unused STRING-IO
+iclass REP_INSW unused STRING-IO
+iclass REP_INSD unused STRING-IO
+iclass REP_OUTSB unused STRING-IO
+iclass REP_OUTSW unused STRING-IO
+iclass REP_OUTSD unused STRING-IO
+
+# Shadow stacks (CET). ENDBR is allowed by the instruction scan; the
+# landing-pad check of G11 is a separate check, not built yet.
+iclass SETSSBSY/SETSSBSY gate SHADOW
+iclass CLRSSBSY/CLRSSBSY_MEMu64 gate SHADOW
+iclass WRUSSD/WRUSSD_MEMu32_GPR32u32 gate SHADOW
+iclass WRUSSD/WRUSSD_MEMu32_GPR32u32_APX gate SHADOW
+iclass WRUSSQ/WRUSSQ_MEMu64_GPR64u64 gate SHADOW
+iclass WRUSSQ/WRUSSQ_MEMu64_GPR64u64_APX gate SHADOW
+iclass WRSSQ/WRSSQ_MEMu64_GPR64u64 gate SHADOW
+iclass WRSSQ/WRSSQ_MEMu64_GPR64u64_APX gate SHADOW
+iclass WRSSD/WRSSD_MEMu32_GPR32u32 gate SHADOW
+iclass WRSSD/WRSSD_MEMu32_GPR32u32_APX gate SHADOW
+iclass RSTORSSP/RSTORSSP_MEMu64 gate SHADOW
+iclass SAVEPREVSSP/SAVEPREVSSP gate SHADOW
+iclass INCSSPD/INCSSPD_GPR32u8 gate SHADOW
+iclass INCSSPQ/INCSSPQ_GPR64u8 gate SHADOW
+iclass RDSSPD/RDSSPD_GPR32u32 kernel
+iclass RDSSPQ/RDSSPQ_GPR64u64 kernel
+iclass ENDBR32/ENDBR32 kernel
+iclass ENDBR64/ENDBR64 kernel
+
+# FRED.
+iclass ERETS/ERETS unused FRED
+iclass ERETU/ERETU unused FRED
+iclass LKGS/LKGS_GPR16u16 unused FRED
+iclass LKGS/LKGS_MEMu16 unused FRED
+
+# Key Locker.
+iclass LOADIWKEY/LOADIWKEY_XMMu8_XMMu8 gate IWKEY
+iclass ENCODEKEY128/ENCODEKEY128_GPR32u8_GPR32u8 unused UNUSED
+iclass ENCODEKEY256/ENCODEKEY256_GPR32u8_GPR32u8 unused UNUSED
+iclass AESDEC128KL/AESDEC128KL_XMMu8_MEMu8 unused UNUSED
+iclass AESDEC256KL/AESDEC256KL_XMMu8_MEMu8 unused UNUSED
+iclass AESENC128KL/AESENC128KL_XMMu8_MEMu8 unused UNUSED
+iclass AESENC256KL/AESENC256KL_XMMu8_MEMu8 unused UNUSED
+iclass AESDECWIDE128KL/AESDECWIDE128KL_MEMu8 unused UNUSED
+iclass AESDECWIDE256KL/AESDECWIDE256KL_MEMu8 unused UNUSED
+iclass AESENCWIDE128KL/AESENCWIDE128KL_MEMu8 unused UNUSED
+iclass AESENCWIDE256KL/AESENCWIDE256KL_MEMu8 unused UNUSED
+
+# Confidential computing and enclaves.
+iclass SEAMCALL/SEAMCALL gate SEAM
+iclass SEAMOPS/SEAMOPS gate SEAM
+iclass SEAMRET/SEAMRET gate SEAM
+iclass TDCALL/TDCALL gate SEAM
+iclass PSMASH gate SNP
+iclass PVALIDATE gate SNP
+iclass RMPADJUST gate SNP
+iclass RMPUPDATE gate SNP
+iclass ENCLS gate ENCLAVE
+iclass PCONFIG/PCONFIG gate ENCLAVE
+iclass PCONFIG/PCONFIG64 gate ENCLAVE
+iclass ENCLU unused UNUSED
+iclass ENCLV/ENCLV unused UNUSED
+iclass PBNDKB/PBNDKB unused UNUSED
+iclass GETSEC unused FIRMWARE
+iclass RSM unused FIRMWARE
+
+iclass HRESET/HRESET_IMM8 gate HRESET
+
+# User interrupts.
+iclass CLUI/CLUI unused UINTR
+iclass STUI/STUI unused UINTR
+iclass TESTUI/TESTUI unused UINTR
+iclass UIRET/UIRET unused UINTR
+iclass SENDUIPI/SENDUIPI_GPR64u32 unused UINTR
+
+# Entry, exit and the rest. SYSRET and SYSRET64 differ only in REX.W,
+# which the byte patterns leave open, so they share a class.
+iclass SWAPGS kernel
+iclass SYSRET64 kernel
+iclass SYSRET kernel
+iclass SYSRET_AMD kernel
+iclass SYSCALL unused UNUSED
+iclass SYSCALL_AMD unused UNUSED
+iclass SYSENTER unused UNUSED
+iclass SYSEXIT unused UNUSED
+iclass CLAC kernel
+iclass STAC kernel
+iclass RDFSBASE kernel
+iclass RDGSBASE kernel
+iclass WRFSBASE kernel
+iclass WRGSBASE kernel
+iclass HLT kernel
+iclass MONITOR kernel
+iclass MWAIT kernel
+iclass RDTSC kernel
+iclass RDTSCP kernel
+iclass RDPMC unused UNUSED
+iclass INT3 kernel
+iclass INT unused UNUSED
+iclass INT1 unused UNUSED
+iclass INTO unreachable UNREACHABLE
+iclass BOUND unreachable UNREACHABLE
+iclass ENQCMDS/ENQCMDS_GPRa_MEMu32 unused UNUSED
+iclass ENQCMDS/ENQCMDS_GPRav_MEMu32_APX unused UNUSED

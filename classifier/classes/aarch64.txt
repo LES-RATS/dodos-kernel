@@ -1,0 +1,1313 @@
+# Classification of ARM64 (A64), from Arm's AARCHMRS (D-125).
+# One line per encoding: KIND NAME CLASS [REASON]. `classify items aarch64`
+# lists the encodings and the domain (see src/aarch64.rs). The class of a
+# register governs its writes; its reads are allowed wherever it is
+# `kernel` or `gate`. The kernel runs at EL2 where EL2 exists, with the EL2
+# forms of the EL1 registers (kernel.md, ARM64), else at EL1.
+
+why UNUSED kernel-interface.md#architectures "*unused* (refused)" -- not used by the kernel
+why EL3 kernel-interface.md#what-it-costs-and-what-it-does-not-cover "Not covered: ... firmware (SMM, EL3, machine mode)" and kernel-interface.md#architectures "*unreachable* (traps or is undefined at the kernel's level; refused anyway)"
+why VHE-ALIAS kernel.md#the-write-gate-mechanisms "(and their EL2 forms when the kernel runs at EL2, as it does where EL2 exists ...)" -- the _EL12 and _EL02 forms reach the EL1 and EL0 registers of a guest regime the kernel does not run: unused
+why TRANSLATION kernel.md#the-write-gate-mechanisms "Forbidden outside the gate: writes to `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1`, `TCR2_EL1`, `SCTLR_EL1`, `MAIR_EL1`, `VBAR_EL1`, `POR_EL1`, `PIR_EL1`, `PIRE0_EL1` ... (and their EL2 forms ...)" and kernel-interface.md#the-rules "G1. ... the only code that loads a translation root and that changes the state that controls translation"
+why WALKER kernel-interface.md#the-gate-over-page-tables "\"Translation\" covers the CPU page tables and TLBs under every tag, the IOMMU tables X writes, and any other walker X could configure." -- a register with a table or buffer base (field BADDR or TTBA)
+why START kernel-interface.md#the-gate-over-page-tables "(c) no other instruction can redefine translation or reach memory around it (the build-time scan and the configuration locked at start-up)" and kernel-interface.md#the-rules "G11. ... refuses any instance outside the gate and the start-up code that runs before the protection is on"
+why STAGE2 kernel.md#the-write-gate-mechanisms "the EL2 translation registers unless the image declares the hardening monitor"
+why STAGE2-USE kernel-interface.md#the-gate-over-page-tables "A faulty kernel is bounded to its own memory without two-stage translation (D-117)." -- stage-2 maintenance is not used
+why VECTOR kernel.md#the-write-gate-mechanisms "the vector-length registers `ZCR_EL1` and `SMCR_EL1` (and their EL2 forms), which keep one length per kind (D-118), and the `MSR` immediates that change the streaming vector state, `SVCRSM`, `SVCRZA` and `SVCRSMZA` (the forms `SMSTART` and `SMSTOP`), for the same reason"
+why SGI kernel.md#the-write-gate-mechanisms "the interrupt generation registers `ICC_SGI0R_EL1`, `ICC_SGI1R_EL1` and `ICC_ASGI1R_EL1` ...: a fence signal and an ordinary interrupt to another core are the same instruction with different operands, so the scan forbids every write and the gate makes them, checking G10"
+why GIC-DIST kernel.md#the-write-gate-mechanisms "An SPI is routed to a core by `GICD_IROUTER<n>` of the distributor ...; both are MMIO regions mapped only in the gate view of the holder of the unit role" -- GICv5 makes routing, enabling, priority and pending state instructions (Linux v7.3, drivers/irqchip/irq-gic-v5.c)
+why DEBUG-REGS kernel.md#the-write-gate-mechanisms "the debug registers `DBGBCR<n>_EL1`, `DBGBVR<n>_EL1`, `DBGWCR<n>_EL1`, `DBGWVR<n>_EL1` and `MDSCR_EL1`, writable at EL1 ..., which could arm a watchpoint on another node's memory"
+why DEBUG-STATE kernel-interface.md#what-it-costs-and-what-it-does-not-cover "on ARM64 ... the writes of the debug and vector-length registers" -- the other self-hosted debug registers
+why GCS kernel.md#the-write-gate-mechanisms "`GCSCR_EL1`, `GCSPR_EL1` (and their EL2 forms ...)" and "Page tables typed as Guarded Control Stack pages, written by `GCSSTR`" -- every GCS instruction moves GCSPR or stores to a GCS page
+why FIRMWARE kernel.md#the-write-gate-mechanisms "`SMC` and `HVC`" and kernel-interface.md#the-rules "Firmware calls are made only by the gate"
+why DC-ISW kernel.md#the-write-gate-mechanisms "`DC ISW`"
+why AROUND kernel-interface.md#the-gate-over-page-tables "(c) no other instruction can redefine translation or reach memory around it" -- cache maintenance by physical address
+why BROADCAST kernel.md#the-write-gate-mechanisms "`INVLPGB` and `TLBSYNC` (AMD's broadcast invalidation, which reaches other cores' TLBs)" -- the same reason applied to the shareable (IS, OS) TLBI and PLBI forms; listed for the owners
+why IMPDEF kernel.md#the-write-gate-mechanisms "implementation-defined system registers" -- and every system encoding the release does not name
+why Q-RAS question -- an error record selected by ERRSELR_EL1 may be shared by cores of several nodes (code 7 of the crash record reads them): may any kernel clear or configure it, or only the gate?
+why Q-CDDI question -- GIC CDDI deactivates an interrupt named by its ID (Linux v7.3 calls it at the end of every interrupt): kernel.md says the GICv3 CPU interface acts on the calling core only; does that hold for GICv5's CDDI, or must it be gate?
+
+insn AUTIA1716_HI_hints kernel
+insn AUTIASP_HI_hints kernel
+insn AUTIAZ_HI_hints kernel
+insn AUTIB1716_HI_hints kernel
+insn AUTIBSP_HI_hints kernel
+insn AUTIBZ_HI_hints kernel
+insn AXFLAG_M_pstate kernel
+insn BLRAAZ_64_branch_reg kernel
+insn BLRAA_64P_branch_reg kernel
+insn BLRABZ_64_branch_reg kernel
+insn BLRAB_64P_branch_reg kernel
+insn BLR_64_branch_reg kernel
+insn BRAAZ_64_branch_reg kernel
+insn BRAA_64P_branch_reg kernel
+insn BRABZ_64_branch_reg kernel
+insn BRAB_64P_branch_reg kernel
+insn BRK_EX_exception kernel
+insn BR_64_branch_reg kernel
+insn BTI_HB_hints kernel
+insn CFINV_M_pstate kernel
+insn CHKFEAT_HF_hints kernel
+insn CLRBHB_HI_hints kernel
+insn CLREX_BN_barriers kernel
+insn CSDB_HI_hints kernel
+insn DCPS1_DC_exception unused UNUSED
+insn DCPS2_DC_exception unused UNUSED
+insn DCPS3_DC_exception unused UNUSED
+insn DGH_HI_hints kernel
+insn DMB_BO_barriers kernel
+insn DRPS_64E_branch_reg unused UNUSED
+insn DSB_BO_barriers kernel
+insn DSB_BOn_barriers kernel
+insn ERETAA_64E_branch_reg kernel
+insn ERETAB_64E_branch_reg kernel
+insn ERET_64E_branch_reg kernel
+insn ESB_HI_hints kernel
+insn FLT_EX_exception unused UNUSED
+insn GCSB_HD_hints kernel
+insn HINTE_extendedhint unused UNUSED
+insn HINT_HM_hints kernel
+insn HLT_EX_exception unused UNUSED
+insn HVC_EX_exception gate FIRMWARE
+insn ISB_BI_barriers kernel
+insn MRRS_RS_systemmovepr unused IMPDEF   # an encoding no register or instruction of the release names
+insn MRS_RS_systemmove unused IMPDEF   # an encoding no register or instruction of the release names
+insn MSRR_SR_systemmovepr unused IMPDEF   # an encoding no register or instruction of the release names
+insn MSR_SI_pstate unused IMPDEF   # an encoding no register or instruction of the release names
+insn MSR_SR_systemmove unused IMPDEF   # an encoding no register or instruction of the release names
+insn NOP_HI_hints kernel
+insn PACIA1716_HI_hints kernel
+insn PACIASP_HI_hints kernel
+insn PACIAZ_HI_hints kernel
+insn PACIB1716_HI_hints kernel
+insn PACIBSP_HI_hints kernel
+insn PACIBZ_HI_hints kernel
+insn PACM_HI_hints kernel
+insn PSB_HC_hints kernel
+insn RETAASPPCR_64M_branch_reg kernel
+insn RETAA_64E_branch_reg kernel
+insn RETABSPPCR_64M_branch_reg kernel
+insn RETAB_64E_branch_reg kernel
+insn RET_64R_branch_reg kernel
+insn SB_only_barriers kernel
+insn SEVL_HI_hints kernel
+insn SEV_HI_hints kernel
+insn SHUH_HI_hints unused UNUSED
+insn SLBND_HI_hints unused UNUSED
+insn SMC_EX_exception gate FIRMWARE
+insn SRLS_HI_hints unused UNUSED
+insn STCPH_HI_hints unused UNUSED
+insn STSHH_HI_hints unused UNUSED
+insn SVC_EX_exception unused UNUSED
+insn SYSL_RC_systeminstrs unused IMPDEF   # an encoding no register or instruction of the release names
+insn SYSP_CR_syspairinstrs unused IMPDEF   # an encoding no register or instruction of the release names
+insn SYS_CR_systeminstrs unused IMPDEF   # an encoding no register or instruction of the release names
+insn TCHANGEB_tc_imm unused UNUSED
+insn TCHANGEB_tc_reg unused UNUSED
+insn TCHANGEF_tc_imm unused UNUSED
+insn TCHANGEF_tc_reg unused UNUSED
+insn TENTER_te_exception unused UNUSED
+insn TEXIT_te_branch_reg unused UNUSED
+insn TSB_HC_hints kernel
+insn WFET_only_systeminstrswithreg kernel
+insn WFE_HI_hints kernel
+insn WFIT_only_systeminstrswithreg kernel
+insn WFI_HI_hints kernel
+insn XAFLAG_M_pstate kernel
+insn XPACLRI_HI_hints kernel
+insn YIELD_HI_hints kernel
+pstate ALLINT kernel
+pstate DAIFClr kernel
+pstate DAIFSet kernel
+pstate DIT kernel
+pstate PAN kernel
+pstate PM kernel
+pstate SPSel kernel
+pstate SSBS kernel
+pstate SVCRSM gate VECTOR
+pstate SVCRSMZA gate VECTOR
+pstate SVCRZA gate VECTOR
+pstate TCO kernel
+pstate UAO kernel
+reg ACCDATA_EL1 unused UNUSED
+reg ACTLRALIAS_EL1 gate START   # writes the fields of ACTLR_EL1
+reg ACTLRMASK_EL1 gate START   # writes the fields of ACTLR_EL1
+reg ACTLRMASK_EL12 unused VHE-ALIAS
+reg ACTLRMASK_EL2 gate START   # writes the fields of ACTLR_EL2
+reg ACTLR_EL1 gate START
+reg ACTLR_EL12 unused VHE-ALIAS
+reg ACTLR_EL2 gate START
+reg ACTLR_EL3 unreachable EL3
+reg AFGDTP<p>_EL1 unused UNUSED
+reg AFGDTP<p>_EL12 unused VHE-ALIAS
+reg AFGDTP<p>_EL2 unused UNUSED
+reg AFGDTP<p>_EL3 unreachable EL3
+reg AFGDTU<p>_EL1 unused UNUSED
+reg AFGDTU<p>_EL12 unused VHE-ALIAS
+reg AFGDTU<p>_EL2 unused UNUSED
+reg AFSR0_EL1 kernel
+reg AFSR0_EL12 unused VHE-ALIAS
+reg AFSR0_EL2 kernel
+reg AFSR0_EL3 unreachable EL3
+reg AFSR1_EL1 kernel
+reg AFSR1_EL12 unused VHE-ALIAS
+reg AFSR1_EL2 kernel
+reg AFSR1_EL3 unreachable EL3
+reg AIDR_EL1 kernel   # read-only
+reg ALLINT kernel
+reg AMAIR2_EL1 gate TRANSLATION
+reg AMAIR2_EL12 unused VHE-ALIAS
+reg AMAIR2_EL2 gate TRANSLATION
+reg AMAIR2_EL3 unreachable EL3
+reg AMAIR_EL1 gate TRANSLATION
+reg AMAIR_EL12 unused VHE-ALIAS
+reg AMAIR_EL2 gate TRANSLATION
+reg AMAIR_EL3 unreachable EL3
+reg AMCFGR_EL0 kernel   # read-only
+reg AMCG1IDR_EL0 kernel   # read-only
+reg AMCGCR_EL0 kernel   # read-only
+reg AMCNTENCLR0_EL0 unused UNUSED
+reg AMCNTENCLR1_EL0 unused UNUSED
+reg AMCNTENSET0_EL0 unused UNUSED
+reg AMCNTENSET1_EL0 unused UNUSED
+reg AMCR_EL0 unused UNUSED
+reg AMEVCNTR0<n>_EL0 unused UNUSED
+reg AMEVCNTR1<n>_EL0 unused UNUSED
+reg AMEVCNTVOFF0<m>_EL2 unused UNUSED
+reg AMEVCNTVOFF1<n>_EL2 unused UNUSED
+reg AMEVTYPER0<m>_EL0 kernel   # read-only
+reg AMEVTYPER1<n>_EL0 unused UNUSED
+reg AMUSERENR_EL0 gate START
+reg APDAKeyHi_EL1 kernel   # pointer authentication keys
+reg APDAKeyLo_EL1 kernel   # pointer authentication keys
+reg APDBKeyHi_EL1 kernel   # pointer authentication keys
+reg APDBKeyLo_EL1 kernel   # pointer authentication keys
+reg APGAKeyHi_EL1 kernel   # pointer authentication keys
+reg APGAKeyLo_EL1 kernel   # pointer authentication keys
+reg APIAKeyHi_EL1 kernel   # pointer authentication keys
+reg APIAKeyLo_EL1 kernel   # pointer authentication keys
+reg APIBKeyHi_EL1 kernel   # pointer authentication keys
+reg APIBKeyLo_EL1 kernel   # pointer authentication keys
+reg BRBCR_EL1 unused UNUSED
+reg BRBCR_EL12 unused VHE-ALIAS
+reg BRBCR_EL2 unused UNUSED
+reg BRBFCR_EL1 unused UNUSED
+reg BRBIDR0_EL1 kernel   # read-only
+reg BRBINF<m>_EL1 kernel   # read-only
+reg BRBINFINJ_EL1 unused UNUSED
+reg BRBSRC<m>_EL1 kernel   # read-only
+reg BRBSRCINJ_EL1 unused UNUSED
+reg BRBTGT<m>_EL1 kernel   # read-only
+reg BRBTGTINJ_EL1 unused UNUSED
+reg BRBTS_EL1 unused UNUSED
+reg CCONTIDR_EL1 kernel   # read-only
+reg CCSIDR2_EL1 kernel   # read-only
+reg CCSIDR_EL1 kernel   # read-only
+reg CLIDR_EL1 kernel   # read-only
+reg CNTFRQ_EL0 kernel
+reg CNTHCTL_EL2 kernel
+reg CNTHPS_CTL_EL2 unused UNUSED
+reg CNTHPS_CVAL_EL2 unused UNUSED
+reg CNTHPS_TVAL_EL2 unused UNUSED
+reg CNTHP_CTL_EL2 kernel
+reg CNTHP_CVAL_EL2 kernel
+reg CNTHP_TVAL_EL2 kernel
+reg CNTHVS_CTL_EL2 unused UNUSED
+reg CNTHVS_CVAL_EL2 unused UNUSED
+reg CNTHVS_TVAL_EL2 unused UNUSED
+reg CNTHV_CTL_EL2 kernel
+reg CNTHV_CVAL_EL2 kernel
+reg CNTHV_TVAL_EL2 kernel
+reg CNTKCTL_EL1 kernel
+reg CNTKCTL_EL12 unused VHE-ALIAS
+reg CNTPCTSS_EL0 kernel   # read-only
+reg CNTPCT_EL0 kernel   # read-only
+reg CNTPOFF_EL2 gate START
+reg CNTPS_CTL_EL1 unused UNUSED
+reg CNTPS_CVAL_EL1 unused UNUSED
+reg CNTPS_TVAL_EL1 unused UNUSED
+reg CNTP_CTL_EL0 kernel
+reg CNTP_CTL_EL02 unused VHE-ALIAS
+reg CNTP_CVAL_EL0 kernel
+reg CNTP_CVAL_EL02 unused VHE-ALIAS
+reg CNTP_TVAL_EL0 kernel
+reg CNTP_TVAL_EL02 unused VHE-ALIAS
+reg CNTVCTSS_EL0 kernel   # read-only
+reg CNTVCT_EL0 kernel   # read-only
+reg CNTVOFF_EL2 gate START
+reg CNTV_CTL_EL0 kernel
+reg CNTV_CTL_EL02 unused VHE-ALIAS
+reg CNTV_CVAL_EL0 kernel
+reg CNTV_CVAL_EL02 unused VHE-ALIAS
+reg CNTV_TVAL_EL0 kernel
+reg CNTV_TVAL_EL02 unused VHE-ALIAS
+reg CONTEXTIDR_EL1 kernel
+reg CONTEXTIDR_EL12 unused VHE-ALIAS
+reg CONTEXTIDR_EL2 kernel
+reg CPACRALIAS_EL1 gate START   # writes the fields of CPACR_EL1
+reg CPACRMASK_EL1 gate START   # writes the fields of CPACR_EL1
+reg CPACRMASK_EL12 unused VHE-ALIAS
+reg CPACR_EL1 kernel
+reg CPACR_EL12 unused VHE-ALIAS
+reg CPTRMASK_EL2 gate START   # writes the fields of CPTR_EL2
+reg CPTR_EL2 kernel
+reg CPTR_EL3 unreachable EL3
+reg CSSELR_EL1 kernel
+reg CTR_EL0 kernel   # read-only
+reg CurrentEL kernel   # read-only
+reg DACR32_EL2 unused UNUSED   # AArch32 state
+reg DAIF kernel
+reg DBGAUTHSTATUS_EL1 kernel   # read-only
+reg DBGBCR<m>_EL1 gate DEBUG-REGS
+reg DBGBVR<m>_EL1 gate DEBUG-REGS
+reg DBGCLAIMCLR_EL1 gate DEBUG-STATE
+reg DBGCLAIMSET_EL1 gate DEBUG-STATE
+reg DBGDTRRX_EL0 kernel   # read-only
+reg DBGDTRTX_EL0 unused UNUSED
+reg DBGDTR_EL0 unused UNUSED
+reg DBGPRCR_EL1 gate DEBUG-STATE
+reg DBGVCR32_EL2 unused UNUSED   # AArch32 state
+reg DBGWCR<m>_EL1 gate DEBUG-REGS
+reg DBGWVR<m>_EL1 gate DEBUG-REGS
+reg DCZID_EL0 kernel   # read-only
+reg DISR_EL1 kernel
+reg DIT kernel
+reg DLR_EL0 unused UNUSED   # Debug state
+reg DPOCR_EL0 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg DPOTBR0_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg DPOTBR0_EL12 unused VHE-ALIAS
+reg DPOTBR0_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg DPOTBR0_EL3 unreachable EL3
+reg DPOTBR1_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg DPOTBR1_EL12 unused VHE-ALIAS
+reg DPOTBR1_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg DSPSR_EL0 unused UNUSED   # Debug state
+reg ELR_EL1 kernel
+reg ELR_EL12 unused VHE-ALIAS
+reg ELR_EL2 kernel
+reg ELR_EL3 unreachable EL3
+reg ERRIDR_EL1 kernel   # read-only
+reg ERRSELR_EL1 kernel
+reg ERXADDR_EL1 undecided Q-RAS
+reg ERXCTLR_EL1 undecided Q-RAS
+reg ERXFR_EL1 kernel   # read-only
+reg ERXGSR_EL1 kernel   # read-only
+reg ERXMISC0_EL1 undecided Q-RAS
+reg ERXMISC1_EL1 undecided Q-RAS
+reg ERXMISC2_EL1 undecided Q-RAS
+reg ERXMISC3_EL1 undecided Q-RAS
+reg ERXPFGCDN_EL1 unused UNUSED   # error injection
+reg ERXPFGCTL_EL1 unused UNUSED   # error injection
+reg ERXPFGF_EL1 unused UNUSED   # error injection
+reg ERXSTATUS_EL1 undecided Q-RAS
+reg ESR_EL1 kernel
+reg ESR_EL12 unused VHE-ALIAS
+reg ESR_EL2 kernel
+reg ESR_EL3 unreachable EL3
+reg FAR_EL1 kernel
+reg FAR_EL12 unused VHE-ALIAS
+reg FAR_EL2 kernel
+reg FAR_EL3 unreachable EL3
+reg FGDTP<p>_EL1 unused UNUSED
+reg FGDTP<p>_EL12 unused VHE-ALIAS
+reg FGDTP<p>_EL2 unused UNUSED
+reg FGDTP<p>_EL3 unreachable EL3
+reg FGDTU<p>_EL1 unused UNUSED
+reg FGDTU<p>_EL12 unused VHE-ALIAS
+reg FGDTU<p>_EL2 unused UNUSED
+reg FGWTE3_EL3 unreachable EL3
+reg FPCR kernel
+reg FPEXC32_EL2 unused UNUSED   # AArch32 state
+reg FPMR kernel
+reg FPSR kernel
+reg GCR_EL1 kernel
+reg GCSCRE0_EL1 kernel
+reg GCSCR_EL1 gate GCS
+reg GCSCR_EL12 unused VHE-ALIAS
+reg GCSCR_EL2 gate GCS
+reg GCSCR_EL3 unreachable EL3
+reg GCSPR_EL0 kernel
+reg GCSPR_EL1 gate GCS
+reg GCSPR_EL12 unused VHE-ALIAS
+reg GCSPR_EL2 gate GCS
+reg GCSPR_EL3 unreachable EL3
+reg GMID_EL1 kernel   # read-only
+reg GPCBW_EL3 unreachable EL3
+reg GPCCR_EL3 unreachable EL3
+reg GPTBR_EL3 unreachable EL3
+reg HACDBSBR_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg HACDBSCONS_EL2 unused UNUSED
+reg HACR_EL2 gate START
+reg HAFGRTR_EL2 gate START
+reg HCRMASK_EL2 gate START   # writes the fields of HCR_EL2
+reg HCRXMASK_EL2 gate START   # writes the fields of HCRX_EL2
+reg HCRX_EL2 gate START
+reg HCR_EL2 gate START
+reg HDBSSBR_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg HDBSSPROD_EL2 unused UNUSED
+reg HDFGRTR2_EL2 gate START
+reg HDFGRTR_EL2 gate START
+reg HDFGWTR2_EL2 gate START
+reg HDFGWTR_EL2 gate START
+reg HFGITR2_EL2 gate START
+reg HFGITR_EL2 gate START
+reg HFGRTR2_EL2 gate START
+reg HFGRTR_EL2 gate START
+reg HFGWTR2_EL2 gate START
+reg HFGWTR_EL2 gate START
+reg HPFAR_EL2 unused UNUSED
+reg HSTR_EL2 gate START
+reg ICC_AP0R<m>_EL1 unused UNUSED   # interrupt group 0
+reg ICC_AP1R<m>_EL1 kernel
+reg ICC_APR_EL1 kernel
+reg ICC_APR_EL3 unreachable EL3
+reg ICC_ASGI1R_EL1 gate SGI
+reg ICC_BPR0_EL1 unused UNUSED   # interrupt group 0
+reg ICC_BPR1_EL1 kernel
+reg ICC_CR0_EL1 kernel
+reg ICC_CR0_EL3 unreachable EL3
+reg ICC_CTLR_EL1 kernel
+reg ICC_CTLR_EL3 unreachable EL3
+reg ICC_DIR_EL1 kernel
+reg ICC_DOMHPPIR_EL3 unreachable EL3
+reg ICC_EOIR0_EL1 unused UNUSED   # interrupt group 0
+reg ICC_EOIR1_EL1 kernel
+reg ICC_HPPIR0_EL1 unused UNUSED   # interrupt group 0
+reg ICC_HPPIR1_EL1 kernel
+reg ICC_HPPIR_EL1 kernel
+reg ICC_HPPIR_EL3 unreachable EL3
+reg ICC_IAFFIDR_EL1 kernel   # read-only
+reg ICC_IAR0_EL1 unused UNUSED   # interrupt group 0
+reg ICC_IAR1_EL1 kernel
+reg ICC_ICSR_EL1 kernel
+reg ICC_IDR0_EL1 kernel   # read-only
+reg ICC_IGRPEN0_EL1 unused UNUSED   # interrupt group 0
+reg ICC_IGRPEN1_EL1 kernel
+reg ICC_IGRPEN1_EL3 unreachable EL3
+reg ICC_NMIAR1_EL1 kernel
+reg ICC_PCR_EL1 kernel
+reg ICC_PCR_EL3 unreachable EL3
+reg ICC_PMR_EL1 kernel
+reg ICC_PPI_CACTIVER<n>_EL1 kernel   # this core's private interrupts
+reg ICC_PPI_CPENDR<n>_EL1 kernel   # this core's private interrupts
+reg ICC_PPI_DOMAINR<n>_EL3 unreachable EL3
+reg ICC_PPI_ENABLER<n>_EL1 kernel   # this core's private interrupts
+reg ICC_PPI_HMR<n>_EL1 kernel   # read-only
+reg ICC_PPI_PRIORITYR<n>_EL1 kernel   # this core's private interrupts
+reg ICC_PPI_SACTIVER<n>_EL1 kernel   # this core's private interrupts
+reg ICC_PPI_SPENDR<n>_EL1 kernel   # this core's private interrupts
+reg ICC_RPR_EL1 kernel
+reg ICC_SGI0R_EL1 gate SGI
+reg ICC_SGI1R_EL1 gate SGI
+reg ICC_SRE_EL1 gate START
+reg ICC_SRE_EL2 gate START
+reg ICC_SRE_EL3 unreachable EL3
+reg ICH_AP0R<m>_EL2 unused UNUSED
+reg ICH_AP1R<m>_EL2 unused UNUSED
+reg ICH_APR_EL2 unused UNUSED
+reg ICH_CONTEXTR_EL2 unused UNUSED
+reg ICH_EISR_EL2 kernel   # read-only
+reg ICH_ELRSR_EL2 kernel   # read-only
+reg ICH_HCR_EL2 gate START
+reg ICH_HFGITR_EL2 unused UNUSED
+reg ICH_HFGRTR_EL2 unused UNUSED
+reg ICH_HFGWTR_EL2 unused UNUSED
+reg ICH_HPPIR_EL2 kernel   # read-only
+reg ICH_LR<m>_EL2 unused UNUSED
+reg ICH_MISR_EL2 kernel   # read-only
+reg ICH_PPI_ACTIVER<n>_EL2 unused UNUSED
+reg ICH_PPI_DVIR<n>_EL2 unused UNUSED
+reg ICH_PPI_ENABLER<n>_EL2 unused UNUSED
+reg ICH_PPI_HVIR<n>_EL2 unused UNUSED
+reg ICH_PPI_PENDR<n>_EL2 unused UNUSED
+reg ICH_PPI_PRIORITYR<n>_EL2 unused UNUSED
+reg ICH_VCTLR_EL2 unused UNUSED
+reg ICH_VMCR_EL2 unused UNUSED
+reg ICH_VTR_EL2 kernel   # read-only
+reg ID_AA64AFR0_EL1 kernel   # read-only
+reg ID_AA64AFR1_EL1 kernel   # read-only
+reg ID_AA64DFR0_EL1 kernel   # read-only
+reg ID_AA64DFR1_EL1 kernel   # read-only
+reg ID_AA64DFR2_EL1 kernel   # read-only
+reg ID_AA64FPFR0_EL1 kernel   # read-only
+reg ID_AA64ISAR0_EL1 kernel   # read-only
+reg ID_AA64ISAR1_EL1 kernel   # read-only
+reg ID_AA64ISAR2_EL1 kernel   # read-only
+reg ID_AA64ISAR3_EL1 kernel   # read-only
+reg ID_AA64MMFR0_EL1 kernel   # read-only
+reg ID_AA64MMFR1_EL1 kernel   # read-only
+reg ID_AA64MMFR2_EL1 kernel   # read-only
+reg ID_AA64MMFR3_EL1 kernel   # read-only
+reg ID_AA64MMFR4_EL1 kernel   # read-only
+reg ID_AA64PFR0_EL1 kernel   # read-only
+reg ID_AA64PFR1_EL1 kernel   # read-only
+reg ID_AA64PFR2_EL1 kernel   # read-only
+reg ID_AA64SMFR0_EL1 kernel   # read-only
+reg ID_AA64ZFR0_EL1 kernel   # read-only
+reg ID_AFR0_EL1 kernel   # read-only
+reg ID_DFR0_EL1 kernel   # read-only
+reg ID_DFR1_EL1 kernel   # read-only
+reg ID_ISAR0_EL1 kernel   # read-only
+reg ID_ISAR1_EL1 kernel   # read-only
+reg ID_ISAR2_EL1 kernel   # read-only
+reg ID_ISAR3_EL1 kernel   # read-only
+reg ID_ISAR4_EL1 kernel   # read-only
+reg ID_ISAR5_EL1 kernel   # read-only
+reg ID_ISAR6_EL1 kernel   # read-only
+reg ID_MMFR0_EL1 kernel   # read-only
+reg ID_MMFR1_EL1 kernel   # read-only
+reg ID_MMFR2_EL1 kernel   # read-only
+reg ID_MMFR3_EL1 kernel   # read-only
+reg ID_MMFR4_EL1 kernel   # read-only
+reg ID_MMFR5_EL1 kernel   # read-only
+reg ID_PFR0_EL1 kernel   # read-only
+reg ID_PFR1_EL1 kernel   # read-only
+reg ID_PFR2_EL1 kernel   # read-only
+reg IFSR32_EL2 unused UNUSED   # AArch32 state
+reg IRTBRP_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg IRTBRP_EL12 unused VHE-ALIAS
+reg IRTBRP_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg IRTBRP_EL3 unreachable EL3
+reg IRTBRU_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg IRTBRU_EL12 unused VHE-ALIAS
+reg IRTBRU_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg ISR_EL1 kernel   # read-only
+reg LDSTT_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg LDSTT_EL12 unused VHE-ALIAS
+reg LDSTT_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg LORC_EL1 unused UNUSED
+reg LOREA_EL1 unused UNUSED
+reg LORID_EL1 kernel   # read-only
+reg LORN_EL1 unused UNUSED
+reg LORSA_EL1 unused UNUSED
+reg MAIR2_EL1 gate TRANSLATION
+reg MAIR2_EL12 unused VHE-ALIAS
+reg MAIR2_EL2 gate TRANSLATION
+reg MAIR2_EL3 unreachable EL3
+reg MAIR_EL1 gate TRANSLATION
+reg MAIR_EL12 unused VHE-ALIAS
+reg MAIR_EL2 gate TRANSLATION
+reg MAIR_EL3 unreachable EL3
+reg MDCCINT_EL1 gate DEBUG-STATE
+reg MDCCSR_EL0 kernel   # read-only
+reg MDCR_EL2 gate DEBUG-STATE
+reg MDCR_EL3 unreachable EL3
+reg MDRAR_EL1 kernel   # read-only
+reg MDSCR_EL1 gate DEBUG-STATE
+reg MDSELR_EL1 gate DEBUG-STATE
+reg MDSTEPOP_EL1 gate DEBUG-STATE
+reg MECIDR_EL2 kernel   # read-only
+reg MECID_A0_EL2 unused UNUSED
+reg MECID_A1_EL2 unused UNUSED
+reg MECID_P0_EL2 unused UNUSED
+reg MECID_P1_EL2 unused UNUSED
+reg MECID_RL_A_EL3 unreachable EL3
+reg MFAR_EL3 unreachable EL3
+reg MIDR_EL1 kernel   # read-only
+reg MPAM0_EL1 unused UNUSED
+reg MPAM1_EL1 unused UNUSED
+reg MPAM1_EL12 unused VHE-ALIAS
+reg MPAM2_EL2 unused UNUSED
+reg MPAM3_EL3 unreachable EL3
+reg MPAMBW0_EL1 unused UNUSED
+reg MPAMBW1_EL1 unused UNUSED
+reg MPAMBW1_EL12 unused VHE-ALIAS
+reg MPAMBW2_EL2 unused UNUSED
+reg MPAMBW3_EL3 unreachable EL3
+reg MPAMBWCAP_EL2 unused UNUSED
+reg MPAMBWIDR_EL1 kernel   # read-only
+reg MPAMBWSM_EL1 unused UNUSED
+reg MPAMCTL_EL1 unused UNUSED
+reg MPAMCTL_EL12 unused VHE-ALIAS
+reg MPAMCTL_EL2 unused UNUSED
+reg MPAMCTL_EL3 unreachable EL3
+reg MPAMHCR_EL2 unused UNUSED
+reg MPAMIDR_EL1 kernel   # read-only
+reg MPAMSM_EL1 unused UNUSED
+reg MPAMVPM0_EL2 unused UNUSED
+reg MPAMVPM1_EL2 unused UNUSED
+reg MPAMVPM2_EL2 unused UNUSED
+reg MPAMVPM3_EL2 unused UNUSED
+reg MPAMVPM4_EL2 unused UNUSED
+reg MPAMVPM5_EL2 unused UNUSED
+reg MPAMVPM6_EL2 unused UNUSED
+reg MPAMVPM7_EL2 unused UNUSED
+reg MPAMVPMV_EL2 unused UNUSED
+reg MPIDR_EL1 kernel   # read-only
+reg MVFR0_EL1 kernel   # read-only
+reg MVFR1_EL1 kernel   # read-only
+reg MVFR2_EL1 kernel   # read-only
+reg NVHCRMASK_EL2 unused UNUSED   # nested virtualisation
+reg NVHCRXMASK_EL2 unused UNUSED   # nested virtualisation
+reg NVHCRX_EL2 unused UNUSED
+reg NVHCR_EL2 unused UNUSED
+reg NZCV kernel
+reg OSDLR_EL1 gate DEBUG-STATE
+reg OSDTRRX_EL1 gate DEBUG-STATE
+reg OSDTRTX_EL1 gate DEBUG-STATE
+reg OSECCR_EL1 gate DEBUG-STATE
+reg OSLAR_EL1 gate DEBUG-STATE
+reg OSLSR_EL1 kernel   # read-only
+reg PAN kernel
+reg PAR_EL1 kernel
+reg PFAR_EL1 kernel
+reg PFAR_EL12 unused VHE-ALIAS
+reg PFAR_EL2 kernel
+reg PIRE0_EL1 gate TRANSLATION
+reg PIRE0_EL12 unused VHE-ALIAS
+reg PIRE0_EL2 gate TRANSLATION
+reg PIR_EL1 gate TRANSLATION
+reg PIR_EL12 unused VHE-ALIAS
+reg PIR_EL2 gate TRANSLATION
+reg PIR_EL3 unreachable EL3
+reg PM kernel
+reg PMBIDR_EL1 kernel   # read-only
+reg PMBLIMITR_EL1 unused UNUSED
+reg PMBMAR_EL1 unused UNUSED
+reg PMBPTR_EL1 unused UNUSED
+reg PMBSR_EL1 unused UNUSED
+reg PMBSR_EL12 unused VHE-ALIAS
+reg PMBSR_EL2 unused UNUSED
+reg PMBSR_EL3 unreachable EL3
+reg PMCCFILTR_EL0 unused UNUSED
+reg PMCCNTR_EL0 unused UNUSED
+reg PMCCNTSVR_EL1 kernel   # read-only
+reg PMCEID0_EL0 kernel   # read-only
+reg PMCEID1_EL0 kernel   # read-only
+reg PMCNTENCLR_EL0 unused UNUSED
+reg PMCNTENSET_EL0 unused UNUSED
+reg PMCR_EL0 unused UNUSED
+reg PMECR_EL1 unused UNUSED
+reg PMEVCNTR<m>_EL0 unused UNUSED
+reg PMEVCNTSVR<m>_EL1 kernel   # read-only
+reg PMEVTYPER<m>_EL0 unused UNUSED
+reg PMICFILTR_EL0 unused UNUSED
+reg PMICNTR_EL0 unused UNUSED
+reg PMICNTSVR_EL1 kernel   # read-only
+reg PMINTENCLR_EL1 unused UNUSED
+reg PMINTENSET_EL1 unused UNUSED
+reg PMMIR_EL1 kernel   # read-only
+reg PMOVSCLR_EL0 unused UNUSED
+reg PMOVSSET_EL0 unused UNUSED
+reg PMSCR_EL1 unused UNUSED
+reg PMSCR_EL12 unused VHE-ALIAS
+reg PMSCR_EL2 unused UNUSED
+reg PMSDSFR_EL1 unused UNUSED
+reg PMSELR_EL0 unused UNUSED
+reg PMSEVFR_EL1 unused UNUSED
+reg PMSFCR_EL1 unused UNUSED
+reg PMSICR_EL1 unused UNUSED
+reg PMSIDR_EL1 kernel   # read-only
+reg PMSIRR_EL1 unused UNUSED
+reg PMSLATFR_EL1 unused UNUSED
+reg PMSNEVFR_EL1 unused UNUSED
+reg PMSSCR_EL1 unused UNUSED
+reg PMSWINC_EL0 unused UNUSED
+reg PMUACR_EL1 gate START
+reg PMUSERENR_EL0 gate START
+reg PMXEVCNTR_EL0 unused UNUSED
+reg PMXEVTYPER_EL0 unused UNUSED
+reg PMZR_EL0 unused UNUSED
+reg POR_EL0 kernel
+reg POR_EL1 gate TRANSLATION
+reg POR_EL12 unused VHE-ALIAS
+reg POR_EL2 gate TRANSLATION
+reg POR_EL3 unreachable EL3
+reg RCWMASK_EL1 unused UNUSED   # translation hardening (RCW instructions)
+reg RCWSMASK_EL1 unused UNUSED   # translation hardening (RCW instructions)
+reg REVIDR_EL1 kernel   # read-only
+reg RGSR_EL1 kernel
+reg RMR_EL1 unused UNUSED   # warm reset request; resets go through the firmware allow-list
+reg RMR_EL2 unused UNUSED   # warm reset request; resets go through the firmware allow-list
+reg RMR_EL3 unreachable EL3
+reg RNDR kernel   # read-only
+reg RNDRRS kernel   # read-only
+reg RVBAR_EL1 kernel   # read-only
+reg RVBAR_EL2 kernel   # read-only
+reg RVBAR_EL3 unreachable EL3
+reg S2PIR_EL2 gate STAGE2
+reg S2POR_EL1 gate STAGE2
+reg S3_<op1>_C<Cn>_C<Cm>_<op2> unused IMPDEF
+reg SCR2_EL3 unreachable EL3
+reg SCR_EL3 unreachable EL3
+reg SCTLR2ALIAS_EL1 gate START   # writes the fields of SCTLR2_EL1
+reg SCTLR2MASK_EL1 gate START   # writes the fields of SCTLR2_EL1
+reg SCTLR2MASK_EL12 unused VHE-ALIAS
+reg SCTLR2MASK_EL2 gate START   # writes the fields of SCTLR2_EL2
+reg SCTLR2_EL1 gate TRANSLATION
+reg SCTLR2_EL12 unused VHE-ALIAS
+reg SCTLR2_EL2 gate TRANSLATION
+reg SCTLR2_EL3 unreachable EL3
+reg SCTLRALIAS_EL1 gate START   # writes the fields of SCTLR_EL1
+reg SCTLRMASK_EL1 gate START   # writes the fields of SCTLR_EL1
+reg SCTLRMASK_EL12 unused VHE-ALIAS
+reg SCTLRMASK_EL2 gate START   # writes the fields of SCTLR_EL2
+reg SCTLR_EL1 gate TRANSLATION
+reg SCTLR_EL12 unused VHE-ALIAS
+reg SCTLR_EL2 gate TRANSLATION
+reg SCTLR_EL3 unreachable EL3
+reg SCXTNUM_EL0 kernel
+reg SCXTNUM_EL1 kernel
+reg SCXTNUM_EL12 unused VHE-ALIAS
+reg SCXTNUM_EL2 kernel
+reg SCXTNUM_EL3 unreachable EL3
+reg SDER32_EL2 unused UNUSED   # AArch32 state
+reg SDER32_EL3 unreachable EL3
+reg SMCR_EL1 gate VECTOR
+reg SMCR_EL12 unused VHE-ALIAS
+reg SMCR_EL2 gate VECTOR
+reg SMCR_EL3 unreachable EL3
+reg SMIDR_EL1 kernel   # read-only
+reg SMPRIMAP_EL2 unused UNUSED
+reg SMPRI_EL1 unused UNUSED
+reg SPMACCESSR_EL1 unused UNUSED
+reg SPMACCESSR_EL12 unused VHE-ALIAS
+reg SPMACCESSR_EL2 unused UNUSED
+reg SPMACCESSR_EL3 unreachable EL3
+reg SPMCFGR_EL1 kernel   # read-only
+reg SPMCGCR<m>_EL1 kernel   # read-only
+reg SPMCNTENCLR_EL0 unused UNUSED
+reg SPMCNTENSET_EL0 unused UNUSED
+reg SPMCR_EL0 unused UNUSED
+reg SPMDEVAFF_EL1 kernel   # read-only
+reg SPMDEVARCH_EL1 kernel   # read-only
+reg SPMEVCNTR<m>_EL0 unused UNUSED
+reg SPMEVFILT2R<m>_EL0 unused UNUSED
+reg SPMEVFILTR<m>_EL0 unused UNUSED
+reg SPMEVTYPER<m>_EL0 unused UNUSED
+reg SPMIIDR_EL1 kernel   # read-only
+reg SPMINTENCLR_EL1 unused UNUSED
+reg SPMINTENSET_EL1 unused UNUSED
+reg SPMOVSCLR_EL0 unused UNUSED
+reg SPMOVSSET_EL0 unused UNUSED
+reg SPMROOTCR_EL3 unreachable EL3
+reg SPMSCR_EL1 unused UNUSED
+reg SPMSELR_EL0 unused UNUSED
+reg SPMZR_EL0 unused UNUSED
+reg SPSR_EL1 kernel
+reg SPSR_EL12 unused VHE-ALIAS
+reg SPSR_EL2 kernel
+reg SPSR_EL3 unreachable EL3
+reg SPSR_abt unused UNUSED   # AArch32 state
+reg SPSR_fiq unused UNUSED   # AArch32 state
+reg SPSR_irq unused UNUSED   # AArch32 state
+reg SPSR_und unused UNUSED   # AArch32 state
+reg SPSel kernel
+reg SP_EL0 kernel
+reg SP_EL1 kernel
+reg SP_EL2 kernel
+reg SSBS kernel
+reg STINDEX_EL1 unused UNUSED
+reg STINDEX_EL12 unused VHE-ALIAS
+reg STINDEX_EL2 unused UNUSED
+reg STINDEX_EL3 unreachable EL3
+reg SVCR gate VECTOR
+reg TCO kernel
+reg TCR2ALIAS_EL1 gate START   # writes the fields of TCR2_EL1
+reg TCR2MASK_EL1 gate START   # writes the fields of TCR2_EL1
+reg TCR2MASK_EL12 unused VHE-ALIAS
+reg TCR2MASK_EL2 gate START   # writes the fields of TCR2_EL2
+reg TCR2_EL1 gate TRANSLATION
+reg TCR2_EL12 unused VHE-ALIAS
+reg TCR2_EL2 gate TRANSLATION
+reg TCRALIAS_EL1 gate START   # writes the fields of TCR_EL1
+reg TCRMASK_EL1 gate START   # writes the fields of TCR_EL1
+reg TCRMASK_EL12 unused VHE-ALIAS
+reg TCRMASK_EL2 gate START   # writes the fields of TCR_EL2
+reg TCR_EL1 gate TRANSLATION
+reg TCR_EL12 unused VHE-ALIAS
+reg TCR_EL2 gate TRANSLATION
+reg TCR_EL3 unreachable EL3
+reg TFSRE0_EL1 kernel
+reg TFSR_EL1 kernel
+reg TFSR_EL12 unused VHE-ALIAS
+reg TFSR_EL2 kernel
+reg TFSR_EL3 unreachable EL3
+reg TINDEX_EL0 unused UNUSED
+reg TINDEX_EL1 unused UNUSED
+reg TINDEX_EL12 unused VHE-ALIAS
+reg TINDEX_EL2 unused UNUSED
+reg TINDEX_EL3 unreachable EL3
+reg TLBIDIDR_EL1 kernel   # read-only
+reg TPCR0_EL0 unused UNUSED
+reg TPCR0_EL1 unused UNUSED
+reg TPCR0_EL12 unused VHE-ALIAS
+reg TPCR0_EL2 unused UNUSED
+reg TPCR1_EL0 unused UNUSED
+reg TPCR1_EL1 unused UNUSED
+reg TPCR1_EL12 unused VHE-ALIAS
+reg TPCR1_EL2 unused UNUSED
+reg TPIDR2_EL0 kernel
+reg TPIDR3_EL0 unused UNUSED
+reg TPIDR3_EL1 unused UNUSED
+reg TPIDR3_EL12 unused VHE-ALIAS
+reg TPIDR3_EL2 unused UNUSED
+reg TPIDR3_EL3 unreachable EL3
+reg TPIDRRO_EL0 kernel
+reg TPIDR_EL0 kernel
+reg TPIDR_EL1 kernel
+reg TPIDR_EL2 kernel
+reg TPIDR_EL3 unreachable EL3
+reg TRBBASER_EL1 unused UNUSED
+reg TRBIDR_EL1 kernel   # read-only
+reg TRBLIMITR_EL1 unused UNUSED
+reg TRBMAR_EL1 unused UNUSED
+reg TRBMPAM_EL1 unused UNUSED
+reg TRBPTR_EL1 unused UNUSED
+reg TRBSR_EL1 unused UNUSED
+reg TRBSR_EL12 unused VHE-ALIAS
+reg TRBSR_EL2 unused UNUSED
+reg TRBSR_EL3 unreachable EL3
+reg TRBTRG_EL1 unused UNUSED
+reg TRCACATR<m> unused UNUSED
+reg TRCACVR<m> unused UNUSED
+reg TRCAUTHSTATUS kernel   # read-only
+reg TRCAUXCTLR unused UNUSED
+reg TRCBBCTLR unused UNUSED
+reg TRCCCCTLR unused UNUSED
+reg TRCCIDCCTLR0 unused UNUSED
+reg TRCCIDCCTLR1 unused UNUSED
+reg TRCCIDCVR<m> unused UNUSED
+reg TRCCLAIMCLR unused UNUSED
+reg TRCCLAIMSET unused UNUSED
+reg TRCCNTCTLR<m> unused UNUSED
+reg TRCCNTRLDVR<m> unused UNUSED
+reg TRCCNTVR<m> unused UNUSED
+reg TRCCONFIGR unused UNUSED
+reg TRCDEVARCH kernel   # read-only
+reg TRCDEVID kernel   # read-only
+reg TRCEVENTCTL0R unused UNUSED
+reg TRCEVENTCTL1R unused UNUSED
+reg TRCEXTINSELR<m> unused UNUSED
+reg TRCIDR0 kernel   # read-only
+reg TRCIDR1 kernel   # read-only
+reg TRCIDR10 kernel   # read-only
+reg TRCIDR11 kernel   # read-only
+reg TRCIDR12 kernel   # read-only
+reg TRCIDR13 kernel   # read-only
+reg TRCIDR2 kernel   # read-only
+reg TRCIDR3 kernel   # read-only
+reg TRCIDR4 kernel   # read-only
+reg TRCIDR5 kernel   # read-only
+reg TRCIDR6 kernel   # read-only
+reg TRCIDR7 kernel   # read-only
+reg TRCIDR8 kernel   # read-only
+reg TRCIDR9 kernel   # read-only
+reg TRCIMSPEC0 unused UNUSED
+reg TRCIMSPEC<m> unused UNUSED
+reg TRCITECR_EL1 unused UNUSED
+reg TRCITECR_EL12 unused VHE-ALIAS
+reg TRCITECR_EL2 unused UNUSED
+reg TRCITEEDCR unused UNUSED
+reg TRCOSLSR kernel   # read-only
+reg TRCPRGCTLR unused UNUSED
+reg TRCQCTLR unused UNUSED
+reg TRCRSCTLR<m> unused UNUSED
+reg TRCRSR unused UNUSED
+reg TRCSEQEVR<m> unused UNUSED
+reg TRCSEQRSTEVR unused UNUSED
+reg TRCSEQSTR unused UNUSED
+reg TRCSSCCR<m> unused UNUSED
+reg TRCSSCSR<m> unused UNUSED
+reg TRCSSPCICR<m> unused UNUSED
+reg TRCSTALLCTLR unused UNUSED
+reg TRCSTATR kernel   # read-only
+reg TRCSYNCPR unused UNUSED
+reg TRCTRACEIDR unused UNUSED
+reg TRCTSCTLR unused UNUSED
+reg TRCVICTLR unused UNUSED
+reg TRCVIIECTLR unused UNUSED
+reg TRCVIPCSSCTLR unused UNUSED
+reg TRCVISSCTLR unused UNUSED
+reg TRCVMIDCCTLR0 unused UNUSED
+reg TRCVMIDCCTLR1 unused UNUSED
+reg TRCVMIDCVR<m> unused UNUSED
+reg TRFCR_EL1 gate START
+reg TRFCR_EL12 unused VHE-ALIAS
+reg TRFCR_EL2 gate START
+reg TTBR0_EL1 gate TRANSLATION
+reg TTBR0_EL12 unused VHE-ALIAS
+reg TTBR0_EL2 gate TRANSLATION
+reg TTBR0_EL3 unreachable EL3
+reg TTBR1_EL1 gate TRANSLATION
+reg TTBR1_EL12 unused VHE-ALIAS
+reg TTBR1_EL2 gate TRANSLATION
+reg TTTBRP_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg TTTBRP_EL12 unused VHE-ALIAS
+reg TTTBRP_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg TTTBRP_EL3 unreachable EL3
+reg TTTBRU_EL1 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg TTTBRU_EL12 unused VHE-ALIAS
+reg TTTBRU_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg UAO kernel
+reg VBAR_EL1 gate TRANSLATION   # exception vectors
+reg VBAR_EL12 unused VHE-ALIAS
+reg VBAR_EL2 gate TRANSLATION   # exception vectors
+reg VBAR_EL3 unreachable EL3
+reg VDISR_EL2 unused UNUSED
+reg VDISR_EL3 unreachable EL3
+reg VMECID_A_EL2 unused UNUSED
+reg VMECID_P_EL2 unused UNUSED
+reg VMPIDR_EL2 unused UNUSED
+reg VNCCR_EL2 gate WALKER   # a table or buffer base (field BADDR or TTBA)
+reg VNCR_EL2 unused UNUSED
+reg VPIDR_EL2 unused UNUSED
+reg VSESR_EL2 unused UNUSED
+reg VSESR_EL3 unreachable EL3
+reg VSTCR_EL2 gate STAGE2
+reg VSTTBR_EL2 gate STAGE2
+reg VTCR_EL2 gate STAGE2
+reg VTLBID<n>_EL2 gate STAGE2
+reg VTLBIDOS<n>_EL2 gate STAGE2
+reg VTTBR_EL2 gate STAGE2
+reg ZCR_EL1 gate VECTOR
+reg ZCR_EL12 unused VHE-ALIAS
+reg ZCR_EL2 gate VECTOR
+reg ZCR_EL3 unreachable EL3
+sys APAS unused UNUSED
+sys AT.S12E0R unused STAGE2-USE
+sys AT.S12E0W unused STAGE2-USE
+sys AT.S12E1R unused STAGE2-USE
+sys AT.S12E1W unused STAGE2-USE
+sys AT.S1E0R kernel
+sys AT.S1E0W kernel
+sys AT.S1E1A kernel
+sys AT.S1E1R kernel
+sys AT.S1E1RP kernel
+sys AT.S1E1W kernel
+sys AT.S1E1WP kernel
+sys AT.S1E2A kernel
+sys AT.S1E2R kernel
+sys AT.S1E2W kernel
+sys AT.S1E3A unused UNUSED   # EL3 regime
+sys AT.S1E3R unused UNUSED   # EL3 regime
+sys AT.S1E3W unused UNUSED   # EL3 regime
+sys BRB.IALL unused UNUSED
+sys BRB.INJ unused UNUSED
+sys CFP.RCTX kernel
+sys COSP.RCTX kernel
+sys CPP.RCTX kernel
+sys DC.CGDSW unused UNUSED   # set/way maintenance
+sys DC.CGDVAC kernel
+sys DC.CGDVADP kernel
+sys DC.CGDVAOC kernel
+sys DC.CGDVAP kernel
+sys DC.CGSW unused UNUSED   # set/way maintenance
+sys DC.CGVAC kernel
+sys DC.CGVADP kernel
+sys DC.CGVAP kernel
+sys DC.CIGDPAE unused AROUND   # by physical address
+sys DC.CIGDPAPA unused AROUND   # by physical address
+sys DC.CIGDSW unused UNUSED   # set/way maintenance
+sys DC.CIGDVAC kernel
+sys DC.CIGDVAOC kernel
+sys DC.CIGDVAPS kernel
+sys DC.CIGSW unused UNUSED   # set/way maintenance
+sys DC.CIGVAC kernel
+sys DC.CIPAE unused AROUND   # by physical address
+sys DC.CIPAPA unused AROUND   # by physical address
+sys DC.CISW unused UNUSED   # set/way maintenance
+sys DC.CIVAC kernel
+sys DC.CIVAOC kernel
+sys DC.CIVAPS kernel
+sys DC.CSW unused UNUSED   # set/way maintenance
+sys DC.CVAC kernel
+sys DC.CVADP kernel
+sys DC.CVAOC kernel
+sys DC.CVAP kernel
+sys DC.CVAU kernel
+sys DC.GBVA kernel
+sys DC.GVA kernel
+sys DC.GZVA kernel
+sys DC.IGDSW unused UNUSED   # set/way maintenance
+sys DC.IGDVAC kernel
+sys DC.IGSW unused UNUSED   # set/way maintenance
+sys DC.IGVAC kernel
+sys DC.ISW gate DC-ISW
+sys DC.IVAC kernel
+sys DC.ZGBVA kernel
+sys DC.ZVA kernel
+sys DVP.RCTX kernel
+sys GCSPOPCX gate GCS
+sys GCSPOPM gate GCS
+sys GCSPOPX gate GCS
+sys GCSPUSHM gate GCS
+sys GCSPUSHX gate GCS
+sys GCSSS1 gate GCS
+sys GCSSS2 gate GCS
+sys GIC.CDAFF gate GIC-DIST
+sys GIC.CDDI undecided Q-CDDI
+sys GIC.CDDIS gate GIC-DIST
+sys GIC.CDEN gate GIC-DIST
+sys GIC.CDEOI kernel
+sys GIC.CDHM gate GIC-DIST
+sys GIC.CDPEND gate GIC-DIST
+sys GIC.CDPRI gate GIC-DIST
+sys GIC.CDRCFG kernel
+sys GIC.LDAFF unused UNUSED   # another interrupt domain
+sys GIC.LDDI unused UNUSED   # another interrupt domain
+sys GIC.LDDIS unused UNUSED   # another interrupt domain
+sys GIC.LDEN unused UNUSED   # another interrupt domain
+sys GIC.LDHM unused UNUSED   # another interrupt domain
+sys GIC.LDPEND unused UNUSED   # another interrupt domain
+sys GIC.LDPRI unused UNUSED   # another interrupt domain
+sys GIC.LDRCFG unused UNUSED   # another interrupt domain
+sys GIC.VDAFF unused UNUSED   # virtual interrupts
+sys GIC.VDDI unused UNUSED   # virtual interrupts
+sys GIC.VDDIS unused UNUSED   # virtual interrupts
+sys GIC.VDEN unused UNUSED   # virtual interrupts
+sys GIC.VDHM unused UNUSED   # virtual interrupts
+sys GIC.VDPEND unused UNUSED   # virtual interrupts
+sys GIC.VDPRI unused UNUSED   # virtual interrupts
+sys GIC.VDRCFG unused UNUSED   # virtual interrupts
+sys GICR.CDIA kernel   # acknowledges on this core
+sys GICR.CDNMIA kernel   # acknowledges on this core
+sys GSB.ACK kernel
+sys GSB.SYS kernel
+sys IC.IALLU kernel
+sys IC.IALLUIS kernel
+sys IC.IVAU kernel
+sys PLBI.ALLE1 unused STAGE2-USE
+sys PLBI.ALLE1IS unused STAGE2-USE
+sys PLBI.ALLE1ISNXS unused STAGE2-USE
+sys PLBI.ALLE1NXS unused STAGE2-USE
+sys PLBI.ALLE1OS unused STAGE2-USE
+sys PLBI.ALLE1OSNXS unused STAGE2-USE
+sys PLBI.ALLE2 kernel
+sys PLBI.ALLE2IS gate BROADCAST
+sys PLBI.ALLE2ISNXS gate BROADCAST
+sys PLBI.ALLE2NXS kernel
+sys PLBI.ALLE2OS gate BROADCAST
+sys PLBI.ALLE2OSNXS gate BROADCAST
+sys PLBI.ALLE3 unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.ALLE3IS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.ALLE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.ALLE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.ALLE3OS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.ALLE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.ASIDE1 kernel
+sys PLBI.ASIDE1IS gate BROADCAST
+sys PLBI.ASIDE1ISNXS gate BROADCAST
+sys PLBI.ASIDE1NXS kernel
+sys PLBI.ASIDE1OS gate BROADCAST
+sys PLBI.ASIDE1OSNXS gate BROADCAST
+sys PLBI.PERMAE1 kernel
+sys PLBI.PERMAE1IS gate BROADCAST
+sys PLBI.PERMAE1ISNXS gate BROADCAST
+sys PLBI.PERMAE1NXS kernel
+sys PLBI.PERMAE1OS gate BROADCAST
+sys PLBI.PERMAE1OSNXS gate BROADCAST
+sys PLBI.PERME1 kernel
+sys PLBI.PERME1IS gate BROADCAST
+sys PLBI.PERME1ISNXS gate BROADCAST
+sys PLBI.PERME1NXS kernel
+sys PLBI.PERME1OS gate BROADCAST
+sys PLBI.PERME1OSNXS gate BROADCAST
+sys PLBI.PERME2 kernel
+sys PLBI.PERME2IS gate BROADCAST
+sys PLBI.PERME2ISNXS gate BROADCAST
+sys PLBI.PERME2NXS kernel
+sys PLBI.PERME2OS gate BROADCAST
+sys PLBI.PERME2OSNXS gate BROADCAST
+sys PLBI.PERME3 unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.PERME3IS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.PERME3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.PERME3NXS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.PERME3OS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.PERME3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys PLBI.VMALLE1 kernel
+sys PLBI.VMALLE1IS gate BROADCAST
+sys PLBI.VMALLE1ISNXS gate BROADCAST
+sys PLBI.VMALLE1NXS kernel
+sys PLBI.VMALLE1OS gate BROADCAST
+sys PLBI.VMALLE1OSNXS gate BROADCAST
+sys SYS.S1_<op1>_<Cn>_<Cm>_<op2> unused IMPDEF
+sys SYSL.S1_<op1>_<Cn>_<Cm>_<op2> unused IMPDEF
+sys SYSP.S1_<op1>_<Cn>_<Cm>_<op2> unused IMPDEF
+sys TLBI.ALLE1 unused STAGE2-USE
+sys TLBI.ALLE1IS unused STAGE2-USE
+sys TLBI.ALLE1ISNXS unused STAGE2-USE
+sys TLBI.ALLE1NXS unused STAGE2-USE
+sys TLBI.ALLE1OS unused STAGE2-USE
+sys TLBI.ALLE1OSNXS unused STAGE2-USE
+sys TLBI.ALLE2 kernel
+sys TLBI.ALLE2IS gate BROADCAST
+sys TLBI.ALLE2ISNXS gate BROADCAST
+sys TLBI.ALLE2NXS kernel
+sys TLBI.ALLE2OS gate BROADCAST
+sys TLBI.ALLE2OSNXS gate BROADCAST
+sys TLBI.ALLE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.ALLE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.ALLE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.ALLE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.ALLE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.ALLE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.ASIDE1 kernel
+sys TLBI.ASIDE1IS gate BROADCAST
+sys TLBI.ASIDE1ISNXS gate BROADCAST
+sys TLBI.ASIDE1NXS kernel
+sys TLBI.ASIDE1OS gate BROADCAST
+sys TLBI.ASIDE1OSNXS gate BROADCAST
+sys TLBI.IPAS2E1 unused STAGE2-USE
+sys TLBI.IPAS2E1IS unused STAGE2-USE
+sys TLBI.IPAS2E1ISNXS unused STAGE2-USE
+sys TLBI.IPAS2E1NXS unused STAGE2-USE
+sys TLBI.IPAS2E1OS unused STAGE2-USE
+sys TLBI.IPAS2E1OSNXS unused STAGE2-USE
+sys TLBI.IPAS2LE1 unused STAGE2-USE
+sys TLBI.IPAS2LE1IS unused STAGE2-USE
+sys TLBI.IPAS2LE1ISNXS unused STAGE2-USE
+sys TLBI.IPAS2LE1NXS unused STAGE2-USE
+sys TLBI.IPAS2LE1OS unused STAGE2-USE
+sys TLBI.IPAS2LE1OSNXS unused STAGE2-USE
+sys TLBI.PAALL unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.PAALLOS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RIPAS2E1 unused STAGE2-USE
+sys TLBI.RIPAS2E1IS unused STAGE2-USE
+sys TLBI.RIPAS2E1ISNXS unused STAGE2-USE
+sys TLBI.RIPAS2E1NXS unused STAGE2-USE
+sys TLBI.RIPAS2E1OS unused STAGE2-USE
+sys TLBI.RIPAS2E1OSNXS unused STAGE2-USE
+sys TLBI.RIPAS2LE1 unused STAGE2-USE
+sys TLBI.RIPAS2LE1IS unused STAGE2-USE
+sys TLBI.RIPAS2LE1ISNXS unused STAGE2-USE
+sys TLBI.RIPAS2LE1NXS unused STAGE2-USE
+sys TLBI.RIPAS2LE1OS unused STAGE2-USE
+sys TLBI.RIPAS2LE1OSNXS unused STAGE2-USE
+sys TLBI.RPALOS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RPAOS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVAAE1 kernel
+sys TLBI.RVAAE1IS gate BROADCAST
+sys TLBI.RVAAE1ISNXS gate BROADCAST
+sys TLBI.RVAAE1NXS kernel
+sys TLBI.RVAAE1OS gate BROADCAST
+sys TLBI.RVAAE1OSNXS gate BROADCAST
+sys TLBI.RVAALE1 kernel
+sys TLBI.RVAALE1IS gate BROADCAST
+sys TLBI.RVAALE1ISNXS gate BROADCAST
+sys TLBI.RVAALE1NXS kernel
+sys TLBI.RVAALE1OS gate BROADCAST
+sys TLBI.RVAALE1OSNXS gate BROADCAST
+sys TLBI.RVAE1 kernel
+sys TLBI.RVAE1IS gate BROADCAST
+sys TLBI.RVAE1ISNXS gate BROADCAST
+sys TLBI.RVAE1NXS kernel
+sys TLBI.RVAE1OS gate BROADCAST
+sys TLBI.RVAE1OSNXS gate BROADCAST
+sys TLBI.RVAE2 kernel
+sys TLBI.RVAE2IS gate BROADCAST
+sys TLBI.RVAE2ISNXS gate BROADCAST
+sys TLBI.RVAE2NXS kernel
+sys TLBI.RVAE2OS gate BROADCAST
+sys TLBI.RVAE2OSNXS gate BROADCAST
+sys TLBI.RVAE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVAE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVAE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVAE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVAE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVAE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVALE1 kernel
+sys TLBI.RVALE1IS gate BROADCAST
+sys TLBI.RVALE1ISNXS gate BROADCAST
+sys TLBI.RVALE1NXS kernel
+sys TLBI.RVALE1OS gate BROADCAST
+sys TLBI.RVALE1OSNXS gate BROADCAST
+sys TLBI.RVALE2 kernel
+sys TLBI.RVALE2IS gate BROADCAST
+sys TLBI.RVALE2ISNXS gate BROADCAST
+sys TLBI.RVALE2NXS kernel
+sys TLBI.RVALE2OS gate BROADCAST
+sys TLBI.RVALE2OSNXS gate BROADCAST
+sys TLBI.RVALE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVALE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVALE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVALE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVALE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.RVALE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VAAE1 kernel
+sys TLBI.VAAE1IS gate BROADCAST
+sys TLBI.VAAE1ISNXS gate BROADCAST
+sys TLBI.VAAE1NXS kernel
+sys TLBI.VAAE1OS gate BROADCAST
+sys TLBI.VAAE1OSNXS gate BROADCAST
+sys TLBI.VAALE1 kernel
+sys TLBI.VAALE1IS gate BROADCAST
+sys TLBI.VAALE1ISNXS gate BROADCAST
+sys TLBI.VAALE1NXS kernel
+sys TLBI.VAALE1OS gate BROADCAST
+sys TLBI.VAALE1OSNXS gate BROADCAST
+sys TLBI.VAE1 kernel
+sys TLBI.VAE1IS gate BROADCAST
+sys TLBI.VAE1ISNXS gate BROADCAST
+sys TLBI.VAE1NXS kernel
+sys TLBI.VAE1OS gate BROADCAST
+sys TLBI.VAE1OSNXS gate BROADCAST
+sys TLBI.VAE2 kernel
+sys TLBI.VAE2IS gate BROADCAST
+sys TLBI.VAE2ISNXS gate BROADCAST
+sys TLBI.VAE2NXS kernel
+sys TLBI.VAE2OS gate BROADCAST
+sys TLBI.VAE2OSNXS gate BROADCAST
+sys TLBI.VAE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VAE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VAE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VAE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VAE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VAE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VALE1 kernel
+sys TLBI.VALE1IS gate BROADCAST
+sys TLBI.VALE1ISNXS gate BROADCAST
+sys TLBI.VALE1NXS kernel
+sys TLBI.VALE1OS gate BROADCAST
+sys TLBI.VALE1OSNXS gate BROADCAST
+sys TLBI.VALE2 kernel
+sys TLBI.VALE2IS gate BROADCAST
+sys TLBI.VALE2ISNXS gate BROADCAST
+sys TLBI.VALE2NXS kernel
+sys TLBI.VALE2OS gate BROADCAST
+sys TLBI.VALE2OSNXS gate BROADCAST
+sys TLBI.VALE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VALE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VALE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VALE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VALE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VALE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBI.VMALLE1 kernel
+sys TLBI.VMALLE1IS gate BROADCAST
+sys TLBI.VMALLE1ISNXS gate BROADCAST
+sys TLBI.VMALLE1NXS kernel
+sys TLBI.VMALLE1OS gate BROADCAST
+sys TLBI.VMALLE1OSNXS gate BROADCAST
+sys TLBI.VMALLS12E1 unused STAGE2-USE
+sys TLBI.VMALLS12E1IS unused STAGE2-USE
+sys TLBI.VMALLS12E1ISNXS unused STAGE2-USE
+sys TLBI.VMALLS12E1NXS unused STAGE2-USE
+sys TLBI.VMALLS12E1OS unused STAGE2-USE
+sys TLBI.VMALLS12E1OSNXS unused STAGE2-USE
+sys TLBI.VMALLWS2E1 unused STAGE2-USE
+sys TLBI.VMALLWS2E1IS unused STAGE2-USE
+sys TLBI.VMALLWS2E1ISNXS unused STAGE2-USE
+sys TLBI.VMALLWS2E1NXS unused STAGE2-USE
+sys TLBI.VMALLWS2E1OS unused STAGE2-USE
+sys TLBI.VMALLWS2E1OSNXS unused STAGE2-USE
+sys TLBIP.IPAS2E1 unused STAGE2-USE
+sys TLBIP.IPAS2E1IS unused STAGE2-USE
+sys TLBIP.IPAS2E1ISNXS unused STAGE2-USE
+sys TLBIP.IPAS2E1NXS unused STAGE2-USE
+sys TLBIP.IPAS2E1OS unused STAGE2-USE
+sys TLBIP.IPAS2E1OSNXS unused STAGE2-USE
+sys TLBIP.IPAS2LE1 unused STAGE2-USE
+sys TLBIP.IPAS2LE1IS unused STAGE2-USE
+sys TLBIP.IPAS2LE1ISNXS unused STAGE2-USE
+sys TLBIP.IPAS2LE1NXS unused STAGE2-USE
+sys TLBIP.IPAS2LE1OS unused STAGE2-USE
+sys TLBIP.IPAS2LE1OSNXS unused STAGE2-USE
+sys TLBIP.RIPAS2E1 unused STAGE2-USE
+sys TLBIP.RIPAS2E1IS unused STAGE2-USE
+sys TLBIP.RIPAS2E1ISNXS unused STAGE2-USE
+sys TLBIP.RIPAS2E1NXS unused STAGE2-USE
+sys TLBIP.RIPAS2E1OS unused STAGE2-USE
+sys TLBIP.RIPAS2E1OSNXS unused STAGE2-USE
+sys TLBIP.RIPAS2LE1 unused STAGE2-USE
+sys TLBIP.RIPAS2LE1IS unused STAGE2-USE
+sys TLBIP.RIPAS2LE1ISNXS unused STAGE2-USE
+sys TLBIP.RIPAS2LE1NXS unused STAGE2-USE
+sys TLBIP.RIPAS2LE1OS unused STAGE2-USE
+sys TLBIP.RIPAS2LE1OSNXS unused STAGE2-USE
+sys TLBIP.RVAAE1 kernel
+sys TLBIP.RVAAE1IS gate BROADCAST
+sys TLBIP.RVAAE1ISNXS gate BROADCAST
+sys TLBIP.RVAAE1NXS kernel
+sys TLBIP.RVAAE1OS gate BROADCAST
+sys TLBIP.RVAAE1OSNXS gate BROADCAST
+sys TLBIP.RVAALE1 kernel
+sys TLBIP.RVAALE1IS gate BROADCAST
+sys TLBIP.RVAALE1ISNXS gate BROADCAST
+sys TLBIP.RVAALE1NXS kernel
+sys TLBIP.RVAALE1OS gate BROADCAST
+sys TLBIP.RVAALE1OSNXS gate BROADCAST
+sys TLBIP.RVAE1 kernel
+sys TLBIP.RVAE1IS gate BROADCAST
+sys TLBIP.RVAE1ISNXS gate BROADCAST
+sys TLBIP.RVAE1NXS kernel
+sys TLBIP.RVAE1OS gate BROADCAST
+sys TLBIP.RVAE1OSNXS gate BROADCAST
+sys TLBIP.RVAE2 kernel
+sys TLBIP.RVAE2IS gate BROADCAST
+sys TLBIP.RVAE2ISNXS gate BROADCAST
+sys TLBIP.RVAE2NXS kernel
+sys TLBIP.RVAE2OS gate BROADCAST
+sys TLBIP.RVAE2OSNXS gate BROADCAST
+sys TLBIP.RVAE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVAE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVAE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVAE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVAE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVAE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVALE1 kernel
+sys TLBIP.RVALE1IS gate BROADCAST
+sys TLBIP.RVALE1ISNXS gate BROADCAST
+sys TLBIP.RVALE1NXS kernel
+sys TLBIP.RVALE1OS gate BROADCAST
+sys TLBIP.RVALE1OSNXS gate BROADCAST
+sys TLBIP.RVALE2 kernel
+sys TLBIP.RVALE2IS gate BROADCAST
+sys TLBIP.RVALE2ISNXS gate BROADCAST
+sys TLBIP.RVALE2NXS kernel
+sys TLBIP.RVALE2OS gate BROADCAST
+sys TLBIP.RVALE2OSNXS gate BROADCAST
+sys TLBIP.RVALE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVALE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVALE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVALE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVALE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.RVALE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VAAE1 kernel
+sys TLBIP.VAAE1IS gate BROADCAST
+sys TLBIP.VAAE1ISNXS gate BROADCAST
+sys TLBIP.VAAE1NXS kernel
+sys TLBIP.VAAE1OS gate BROADCAST
+sys TLBIP.VAAE1OSNXS gate BROADCAST
+sys TLBIP.VAALE1 kernel
+sys TLBIP.VAALE1IS gate BROADCAST
+sys TLBIP.VAALE1ISNXS gate BROADCAST
+sys TLBIP.VAALE1NXS kernel
+sys TLBIP.VAALE1OS gate BROADCAST
+sys TLBIP.VAALE1OSNXS gate BROADCAST
+sys TLBIP.VAE1 kernel
+sys TLBIP.VAE1IS gate BROADCAST
+sys TLBIP.VAE1ISNXS gate BROADCAST
+sys TLBIP.VAE1NXS kernel
+sys TLBIP.VAE1OS gate BROADCAST
+sys TLBIP.VAE1OSNXS gate BROADCAST
+sys TLBIP.VAE2 kernel
+sys TLBIP.VAE2IS gate BROADCAST
+sys TLBIP.VAE2ISNXS gate BROADCAST
+sys TLBIP.VAE2NXS kernel
+sys TLBIP.VAE2OS gate BROADCAST
+sys TLBIP.VAE2OSNXS gate BROADCAST
+sys TLBIP.VAE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VAE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VAE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VAE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VAE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VAE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VALE1 kernel
+sys TLBIP.VALE1IS gate BROADCAST
+sys TLBIP.VALE1ISNXS gate BROADCAST
+sys TLBIP.VALE1NXS kernel
+sys TLBIP.VALE1OS gate BROADCAST
+sys TLBIP.VALE1OSNXS gate BROADCAST
+sys TLBIP.VALE2 kernel
+sys TLBIP.VALE2IS gate BROADCAST
+sys TLBIP.VALE2ISNXS gate BROADCAST
+sys TLBIP.VALE2NXS kernel
+sys TLBIP.VALE2OS gate BROADCAST
+sys TLBIP.VALE2OSNXS gate BROADCAST
+sys TLBIP.VALE3 unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VALE3IS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VALE3ISNXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VALE3NXS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VALE3OS unused UNUSED   # EL3 or the granule protection tables
+sys TLBIP.VALE3OSNXS unused UNUSED   # EL3 or the granule protection tables
+sys TRCIT unused UNUSED

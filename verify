@@ -5,6 +5,10 @@ cd "$(dirname "$0")"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# Rule G11 (D-125): every encoding of the pinned specifications classified
+# once; prints the counts per class and the undecided encodings. The tests
+# above already fail on an unclassified encoding; this is the report.
+cargo run -q -p dodos-classifier --bin classify -- check
 # The page size is a value of the machine (D-121): the tests whose rules
 # involve the page run again on two more geometries, 16 KB pages (three
 # levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). Debugging is among
