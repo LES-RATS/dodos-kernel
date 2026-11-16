@@ -969,55 +969,59 @@ fn the_rebuild_of_a_unit_keeps_only_the_entries_of_live_nodes() {
 
 #[test]
 fn a_holder_refuses_a_request_of_another_epoch_even_when_it_holds_the_role_again() {
+    // Three nodes of one fence class: the IOMMU role is node 0's. Node 2
+    // asks it; before the request arrives (its ring, 2 to 0, holds it
+    // while the rings between nodes 0 and 1 carry the hand-overs) the role
+    // goes to node 1 and back to node 0.
     let mut machine = Machine::example();
     machine.cores[1].fence = 1;
+    let mut third = machine.cores[1];
+    third.hw_id = 4;
+    machine.cores.push(third);
     let mut m = S::on(&machine);
-    // The IOMMU role is node 0's. Node 1 asks it; before the request
-    // arrives the role goes to node 1 and back to node 0.
-    m.ok(1, retype(ObjectKind::IoSpace, 0, 100));
+    let (iommu, role) = (19, 20);
+    assert_eq!(m.sys.role(0).holder(), 0);
+    m.ok(2, retype(ObjectKind::IoSpace, 0, 100));
     let attach = Syscall::IoSpaceAttach {
-        iommu: s(18),
+        iommu: s(iommu),
         iospace: s(100),
         device: 0x10,
     };
-    assert_eq!(m.on_node(1, attach), WAITS);
+    assert_eq!(m.on_node(2, attach), WAITS);
     let request = m
         .sys
         .find(|b| matches!(b, Body::UnitRequest { .. }))
         .unwrap();
     let held = m.sys.pending()[request].clone();
+    assert_eq!((held.from, held.to), (2, 0));
     let hand = |n| Syscall::RoleHand {
-        role: s(IOMMU_ROLE),
+        role: s(role),
         core: core(n),
     };
+    // Every message but node 2's request, oldest first: the hand-over.
+    let others = |m: &mut S| {
+        for _ in 0..16 {
+            let Some(i) = m.sys.pending().iter().position(|p| p.from != 2) else {
+                break;
+            };
+            m.sys.deliver(i);
+            assert_eq!(m.sys.check(), Ok(()));
+        }
+        m.sys.recover(16);
+    };
     m.on_node(0, hand(1)).unwrap();
-    // Node 1 completes the hand-over, then hands it back.
-    for _ in 0..8 {
-        let Some(i) = m.sys.find(|b| matches!(b, Body::Handed { .. })) else {
-            break;
-        };
-        m.sys.deliver(i);
-    }
-    m.sys.recover(16);
-    // Node 1, holder now, served its own request.
-    assert_eq!(m.sys.node(1).woken(m.t[1]), Some(&DONE));
+    others(&mut m);
+    assert_eq!(m.sys.role(0).holder(), 1);
     m.on_node(1, hand(0)).unwrap();
-    for _ in 0..8 {
-        let Some(i) = m.sys.find(|b| matches!(b, Body::Handed { .. })) else {
-            break;
-        };
-        m.sys.deliver(i);
-    }
-    m.sys.recover(16);
+    others(&mut m);
     assert_eq!(m.sys.role(0).holder(), 0);
     // The old request arrives: refused for its epoch.
     let index = m.sys.pending().iter().position(|p| *p == held).unwrap();
     m.sys.deliver(index);
-    assert!(
-        m.sys
-            .find(|b| matches!(b, Body::UnitAnswer { done: false, .. }))
-            .is_some()
-    );
+    assert_eq!(m.sys.check(), Ok(()));
+    let refused = |b: &Body| matches!(b, Body::UnitAnswer { done: false, .. });
+    let answer = m.sys.find(refused).expect("an answer of refusal");
+    assert_eq!(m.sys.pending()[answer].to, 2);
     m.run(MS);
 }
 

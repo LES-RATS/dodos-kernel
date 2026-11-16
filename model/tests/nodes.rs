@@ -163,6 +163,22 @@ impl S {
         self.deliver(index);
     }
 
+    /// Delivers the first message in flight that `wanted` accepts, and
+    /// before it every older message of its ring, oldest first (one ring
+    /// per ordered pair of nodes).
+    fn deliver_through(&mut self, wanted: impl Fn(&Body) -> bool) {
+        let index = self.sys.find(wanted).expect("a message in flight");
+        let (from, to) = (self.sys.pending()[index].from, self.sys.pending()[index].to);
+        let older = self.sys.pending()[..index]
+            .iter()
+            .filter(|p| p.from == from && p.to == to)
+            .count();
+        for _ in 0..=older {
+            let first = self.sys.pending().iter().position(|p| p.from == from && p.to == to);
+            self.deliver(first.expect("a message of the ring"));
+        }
+    }
+
     /// A second thread on `node`, in `slot`, in the spaces of the first,
     /// with a message page and a context of its own on the node's core.
     fn spawn(&mut self, node: u16, slot: u32) -> ObjId {
@@ -650,7 +666,8 @@ fn revoking_a_mapped_grant_waits_for_the_holder_then_returns_again() {
     m.deliver_where(|b| matches!(b, Body::Revoke { .. }));
     // The holder removed its root remote capability and its mapping.
     assert_eq!(m.sys.node(1).translated(m.t[1], AT), None);
-    m.deliver_where(|b| matches!(b, Body::RevokeStep { done: true, .. }));
+    // Its answer arrives after what it sent before on the same ring.
+    m.deliver_through(|b| matches!(b, Body::RevokeStep { done: true, .. }));
     assert_eq!(m.woken(0), Some(&Err(Error::Again)));
     m.ok(0, Syscall::CapRevoke(s(OBJ)));
     assert_eq!(m.on(1, Syscall::Signal(s(GOT))), Err(Error::Invalid));
@@ -1069,13 +1086,13 @@ fn a_stale_remote_capability_sent_home_is_dropped() {
         message: msg(9, vec![Transfer::Derive(s(OBJ), Rights::SEND.bits())]),
     };
     assert_eq!(m.by(0, b, send), WAITS);
-    for _ in 0..4 {
-        m.deliver_where(|body| !matches!(body, Body::TransferGrant { grants: Some(g), .. } if matches!(g[..], [Crossing::Home { .. }])));
-    }
-    assert_eq!(got(m.sys.node(1).woken(c)), (9, 1, 0));
-    m.settle();
-    // The crossing of serial 0 is refused.
+    // The crossing of serial 0, the oldest message of ring 1 to 0, arrives
+    // now that the entry is live with serial 1: refused.
+    m.deliver_where(|body| matches!(body, Body::TransferGrant { grants: Some(g), .. } if matches!(g[..], [Crossing::Home { .. }])));
     assert_eq!(got(m.woken(0)), (8, 0, Header::FLAG_CAPS_DROPPED));
+    // The new transfer completes, with serial 1.
+    m.settle();
+    assert_eq!(got(m.sys.node(1).woken(c)), (9, 1, 0));
 }
 
 #[test]

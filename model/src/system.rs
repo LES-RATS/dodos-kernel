@@ -161,8 +161,17 @@ impl System {
     }
 
     /// The message in flight at `index` arrives at its node, which runs.
+    /// The order of messages: one ring per ordered pair of nodes, so a
+    /// message never overtakes an older one with the same sender and
+    /// receiver; messages of different rings arrive in any order.
     pub fn deliver(&mut self, index: usize) {
-        let to = self.in_flight[index].to;
+        let (from, to) = (self.in_flight[index].from, self.in_flight[index].to);
+        assert!(
+            !self.in_flight[..index]
+                .iter()
+                .any(|p| p.from == from && p.to == to),
+            "ring order: an older message from {from} to {to} is still in flight"
+        );
         assert!(self.runs(to), "node {to} does not run");
         let packet = self.in_flight.remove(index);
         let from = packet.from as usize;
