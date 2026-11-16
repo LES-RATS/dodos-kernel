@@ -197,7 +197,10 @@ pub enum Error {
     Gone = 1,
     /// A bounded step was done; repeat the call.
     Again = 2,
-    /// A right is missing.
+    /// A right is missing; or the call asks for more than a capability
+    /// allows (rights that are not a subset, another badge); or a state
+    /// check that guards a rule of the gate refuses it (the class of a page
+    /// a mapping targets, the owner of a device identifier). Order of checks.
     Denied = 3,
     /// Bad slot, wrong object type or bad argument.
     Invalid = 4,

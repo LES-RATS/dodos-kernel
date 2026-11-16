@@ -1020,10 +1020,9 @@ impl Model {
                                 MemberState::Live | MemberState::Sealing
                             ))
                 });
-        // CONTRACT-GAP (reported): the barrier does not say that the
-        // context entries of the node must be gone; when the holder of a
-        // unit is itself fenced, nobody has blocked them (R1) until its
-        // successor rebuilds the unit. The model waits for that too.
+        // The reclaim barrier: no context entry of any IOMMU unit names the
+        // node's generation; when the holder of a unit is itself fenced,
+        // nobody blocks them (R1) until its successor takes the unit.
         let blocked = self.table.units.values().all(|unit| {
             unit.entries
                 .values()
@@ -1157,7 +1156,7 @@ impl Model {
         let page = self.table.geometry.page();
         self.aspaces
             .values()
-            .flat_map(|space| space.table_pages.iter().map(|at| at / page))
+            .flat_map(|space| space.table_pages().map(|at| at / page))
             .collect()
     }
 

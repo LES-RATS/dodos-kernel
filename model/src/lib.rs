@@ -614,10 +614,27 @@ struct ASpace {
     /// Address spaces and their tables: the lower tables taken, hooked or on
     /// the free list. The hooked ones follow from the translations.
     tables: u64,
-    /// The gate over page tables (G2): the physical pages of its root table
-    /// and of the lower tables taken from its untyped, of class *table*. The
-    /// start-up aspace, made from kept memory, has none here.
-    table_pages: Vec<u64>,
+    /// The gate over page tables (G2), for a space made from an untyped (the
+    /// start-up aspace, made from kept memory, has none here): the physical
+    /// page of its root table, of class *page table of level L* (an
+    /// iospace's, *iospace table*); each hooked lower table, by its level
+    /// and the address bits above what it covers, of the class of its level;
+    /// and the free list, most recently freed last, whose pages keep the
+    /// class they had.
+    root: Option<u64>,
+    hooked: BTreeMap<(u32, u64), u64>,
+    free: Vec<u64>,
+}
+
+impl ASpace {
+    /// The physical pages of its table pages: root, hooked and free.
+    fn table_pages(&self) -> impl Iterator<Item = u64> + '_ {
+        self.root
+            .iter()
+            .copied()
+            .chain(self.hooked.values().copied())
+            .chain(self.free.iter().copied())
+    }
 }
 
 /// IOMMU: one unit, made by the kernel at start.
@@ -1134,9 +1151,28 @@ impl Model {
         self.table.owners[chunk as usize]
     }
 
-    /// The map count of a chunk (G4).
+    /// The map count of a chunk (G4): bits 0-31 of its gate word.
     pub fn map_count(&self, chunk: u64) -> u64 {
-        self.table.maps[chunk as usize]
+        self.table.map_count(chunk)
+    }
+
+    /// The gate word of a chunk (G4), raw: the map count, and the number of
+    /// its pages not of class *data* in bits 32-44.
+    pub fn gate_word(&self, chunk: u64) -> u64 {
+        self.table.gate_word(chunk).raw()
+    }
+
+    /// The leaf count of an entry of the device table (G4).
+    pub fn device_leaves(&self, index: usize) -> u64 {
+        self.table.device_leaves[index]
+    }
+
+    /// The class of a page of ordinary memory, by its physical address, as
+    /// the page classes hold it (G2): `PageClass::DATA` if not stored.
+    pub fn page_class(&self, at: u64) -> dodos_abi::PageClass {
+        let page = at / self.page();
+        let class = self.table.classes.get(&page).copied();
+        class.unwrap_or(dodos_abi::PageClass::DATA)
     }
 
     /// Every used entry of this node's grant table, by index, as

@@ -66,6 +66,7 @@ impl Model {
         aspace.records.push(cap);
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
         self.count_leaves(cap, frame, mapping, 1);
+        self.rehook(space);
     }
 
     /// The gate over page tables, G4: the chunks that the leaves of a
@@ -82,8 +83,37 @@ impl Model {
         chunks
     }
 
-    /// G4: adds or takes the leaves of a mapping to the map counts; the
-    /// leaves of a frame under a grant count in its use entry (G6).
+    /// G2 and G4: what the leaves of a frame are counted in. A page of
+    /// device memory or of the global read-only set lies in no chunk: a
+    /// device leaf counts in the leaf count of its device entry, a leaf of
+    /// the global read-only set in no count; a leaf of ordinary memory in
+    /// the map counts of the chunks it touches.
+    pub(crate) fn leaf_target(&self, frame: crate::Frame) -> Target {
+        if frame.memory != dodos_abi::MemoryType::WriteBack {
+            let end = frame.base + frame.pages * self.bytes(frame.page);
+            let index = self.table.devices.iter().position(|entry| {
+                let base = entry.base();
+                entry.is_used() && base <= frame.base && end <= base + (1 << entry.log2())
+            });
+            // A device frame lies in an entry of the device table; one that
+            // lies in none (a state only a test builds) is counted nowhere.
+            return index.map_or(Target::Nothing, Target::Entry);
+        }
+        let end = frame.base + frame.pages * self.bytes(frame.page);
+        let kept = self
+            .table
+            .kept
+            .iter()
+            .any(|&(s, e)| s <= frame.base && end <= e);
+        match frame.kept || kept {
+            true => Target::Nothing,
+            false => Target::Chunks,
+        }
+    }
+
+    /// G4: adds or takes the leaves of a mapping to the map counts, or to
+    /// the leaf count of a device entry; the leaves of a frame under a
+    /// grant count in its use entry (G6).
     fn count_leaves(&mut self, cap: CapId, frame: crate::Frame, mapping: Mapping, sign: i64) {
         if let Some(remote) = self.remotes.get(&self.caps[&cap].object) {
             let node = self.node as usize;
@@ -95,15 +125,79 @@ impl Model {
             }
             return;
         }
-        for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
-            let Some(count) =
-                std::sync::Arc::make_mut(&mut self.table.maps).get_mut(chunk as usize)
-            else {
-                continue;
+        match self.leaf_target(frame) {
+            Target::Chunks => {
+                for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
+                    self.table.add_leaves(chunk, sign);
+                }
+            }
+            Target::Entry(index) => {
+                let leaves = &mut std::sync::Arc::make_mut(&mut self.table.device_leaves)[index];
+                *leaves = leaves
+                    .checked_add_signed(sign * mapping.count as i64)
+                    .expect("a leaf count never goes below 0");
+            }
+            Target::Nothing => {}
+        }
+    }
+
+    /// The tables of a space made from an untyped follow its translations
+    /// (G2): a table no translation needs any more goes to the free list,
+    /// keeping its class; a table needed and not hooked is taken from the
+    /// free list (most recently freed first), and the gate gives it the
+    /// class of its level (an iospace's tables are of class *iospace
+    /// table*). The start-up aspace's tables are kept memory: not followed.
+    pub(crate) fn rehook(&mut self, space: ObjId) {
+        if self.objects[&space].from.is_none() {
+            return;
+        }
+        let levels = self.levels(space);
+        let io = self.iospaces.contains_key(&space);
+        let geometry = self.machine.geometry;
+        let aspace = &self.aspaces[&space];
+        let pages = aspace.translations.iter().map(|(&at, t)| (at, t.size));
+        let needed = tables(pages, levels, geometry);
+        let gone: Vec<(u32, u64)> = aspace
+            .hooked
+            .keys()
+            .filter(|key| !needed.contains(key))
+            .copied()
+            .collect();
+        let new: Vec<(u32, u64)> = needed
+            .iter()
+            .filter(|key| !aspace.hooked.contains_key(key))
+            .copied()
+            .collect();
+        let aspace = live(&mut self.aspaces, space);
+        for key in gone.iter().rev() {
+            let page = aspace.hooked.remove(key).expect("hooked");
+            aspace.free.push(page);
+        }
+        let mut classes = Vec::new();
+        for key in new {
+            let page = aspace.free.pop().expect("a table on the free list");
+            aspace.hooked.insert(key, page);
+            classes.push((page, key.0));
+        }
+        let page = geometry.page();
+        for (at, level) in classes {
+            let class = match io {
+                true => dodos_abi::PageClass::IOSPACE_TABLE,
+                false => dodos_abi::PageClass::table(level as u8).expect("a level"),
             };
-            *count = count
-                .checked_add_signed(sign)
-                .expect("a map count never goes below 0");
+            self.table.set_class(at / page, Some(class));
+        }
+    }
+
+    /// The class of the root table of a space: a page table of level *L*,
+    /// or an iospace table.
+    pub(crate) fn root_class(&self, space: ObjId) -> dodos_abi::PageClass {
+        match self.iospaces.contains_key(&space) {
+            true => dodos_abi::PageClass::IOSPACE_TABLE,
+            false => {
+                let levels = self.machine.geometry.levels as u8;
+                dodos_abi::PageClass::table(levels).expect("a level")
+            }
         }
     }
 
@@ -119,7 +213,19 @@ impl Model {
         live(&mut self.caps, cap).record = Record::Empty;
         let frame = self.frames[&self.caps[&cap].object];
         self.count_leaves(cap, frame, mapping, -1);
+        self.rehook(mapping.space);
     }
+}
+
+/// What the leaves of a frame are counted in (G4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Target {
+    /// The map counts of the chunks they touch: ordinary memory.
+    Chunks,
+    /// The leaf count of this entry of the device table: device memory.
+    Entry(usize),
+    /// No count: the global read-only set.
+    Nothing,
 }
 
 /// IOMMU: the levels of the tables of an `iospace` of `width` address bits.
@@ -221,9 +327,10 @@ impl Model {
         // word), at least one.
         let budget = self.machine.gate_chunks;
         let device = frame.memory != dodos_abi::MemoryType::WriteBack;
-        let cost = |model: &Self, page: u64| match device {
-            true => 1,
-            false => model.leaf_chunks(frame, page, 1).len() as u64,
+        let target = self.leaf_target(frame);
+        let cost = |model: &Self, page: u64| match target {
+            Target::Chunks => model.leaf_chunks(frame, page, 1).len() as u64,
+            Target::Entry(_) | Target::Nothing => 1,
         };
         let (mut step, mut spent) = (0, 0);
         while done + step < map.count {
@@ -244,18 +351,25 @@ impl Model {
         if (first..first + step).any(|page| !self.class_of(frame, page).permits(leaf)) {
             return Err(Error::Denied);
         }
-        // The gate over page tables, G4: a map count that would pass its
-        // maximum is `busy`.
-        let mut added: std::collections::BTreeMap<u64, u64> = Default::default();
-        for chunk in self.leaf_chunks(frame, first, step) {
-            *added.entry(chunk).or_default() += 1;
-        }
+        // The gate over page tables, G4: a map count, or the leaf count of
+        // a device entry, that would pass its maximum is `busy`. A leaf of
+        // the global read-only set is counted nowhere.
         let remote = self.remotes.contains_key(&self.caps[&cap].object);
+        let max = self.machine.map_count_max;
         let overflow = !remote
-            && added.iter().any(|(&chunk, &leaves)| {
-                let count = self.table.maps.get(chunk as usize).copied().unwrap_or(0);
-                count + leaves > self.machine.map_count_max
-            });
+            && match self.leaf_target(frame) {
+                Target::Chunks => {
+                    let mut added: std::collections::BTreeMap<u64, u64> = Default::default();
+                    for chunk in self.leaf_chunks(frame, first, step) {
+                        *added.entry(chunk).or_default() += 1;
+                    }
+                    added
+                        .iter()
+                        .any(|(&chunk, &leaves)| self.table.map_count(chunk) + leaves > max)
+                }
+                Target::Entry(index) => self.table.device_leaves[index] + step > max,
+                Target::Nothing => false,
+            };
         if overflow {
             return Err(Error::Busy);
         }
@@ -295,11 +409,10 @@ impl Model {
             let taken = self
                 .take(untyped, table, table, Clearing::WithinCall)
                 .expect("checked above");
-            // G2: the gate turns a page of class data into a table page.
+            // G2: the page goes to the free list; the gate gives it the
+            // class of the level it is hooked at (`rehook`).
             let at = self.untypeds[&untyped].base + taken.at;
-            std::sync::Arc::make_mut(&mut self.table.classes)
-                .insert(at / table, crate::table::PageClass::Table);
-            live(&mut self.aspaces, space).table_pages.push(at);
+            live(&mut self.aspaces, space).free.push(at);
         }
         live(&mut self.aspaces, space).tables += missing;
         let partial = done + step < map.count;
@@ -325,10 +438,11 @@ impl Model {
 
     /// The class of a page of a frame (G2): device memory is of class
     /// device, a kept frame or range of class global read-only, a table
-    /// page of its class, every other page of ordinary memory data. For a
-    /// leaf larger than a page, the first class of a page it covers that is
-    /// not data, as the gate reads it from the count of each chunk's gate
-    /// word.
+    /// page of its class, every other page of ordinary memory data. A leaf
+    /// smaller than a chunk reads the class byte of each page it covers; a
+    /// leaf that covers whole chunks reads each chunk's count of pages not
+    /// of class *data* in its gate word, one word per chunk (G3, the
+    /// bound), and is refused if one is not 0.
     pub(crate) fn class_of(&self, frame: crate::Frame, page: u64) -> dodos_abi::PageClass {
         use dodos_abi::PageClass;
         if frame.memory != dodos_abi::MemoryType::WriteBack {
@@ -340,13 +454,19 @@ impl Model {
             return PageClass::GLOBAL_READ_ONLY;
         }
         let small = self.page();
-        match self
-            .table
-            .classes
-            .range(start / small..end.div_ceil(small))
-            .next()
-        {
-            Some(_) => PageClass::table(1).expect("level 1"),
+        let classes = &self.table.classes;
+        let shift = self.table.geometry.chunk_shift();
+        if bytes >= 1 << shift {
+            let chunks = start >> shift..end >> shift;
+            let counted = chunks
+                .into_iter()
+                .any(|c| self.table.gate_word(c).not_data() != 0);
+            if !counted {
+                return PageClass::DATA;
+            }
+        }
+        match classes.range(start / small..end.div_ceil(small)).next() {
+            Some((_, &class)) => class,
             None => PageClass::DATA,
         }
     }
@@ -379,6 +499,7 @@ impl Model {
         mapping.partial = partial;
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
         self.count_leaves(cap, frame, added, 1);
+        self.rehook(mapping.space);
     }
 
     /// `aspace_unmap` and `iospace_unmap`: no right on the capability

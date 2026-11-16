@@ -103,13 +103,26 @@ impl Model {
                     assert!(self.table.write_owner(self.node, index, before, after));
                     // The gate maps the run into the kernel's own space,
                     // with page classes data and map counts 0.
+                    // G13: its gate word and page classes are reset.
                     self.kernel_runs.insert(index);
-                    std::sync::Arc::make_mut(&mut self.table.maps)[index as usize] = 0;
+                    self.table.set_map_count(index, 0);
+                    let pages = self.table.geometry.chunk() / self.table.geometry.page();
+                    let stored: Vec<u64> = self
+                        .table
+                        .classes
+                        .range(index * pages..(index + 1) * pages)
+                        .map(|(&page, _)| page)
+                        .collect();
+                    for page in stored {
+                        self.table.set_class(page, None);
+                    }
                 }
                 _ => {
                     let mut entry = self.table.devices[index as usize];
                     entry.owner = Ownership::taken(Owner::Node(self.node), generation);
                     assert!(self.table.write_entry(self.node, index as usize, entry));
+                    // G13: its leaf count is reset.
+                    std::sync::Arc::make_mut(&mut self.table.device_leaves)[index as usize] = 0;
                 }
             }
         }
@@ -249,16 +262,18 @@ impl Model {
         Ok(Output::Index(spare as u64))
     }
 
-    /// Whether a map count of the run of a block is not 0 (G5).
+    /// Whether a map count of the run of a block, or the leaf count of its
+    /// device entry, is not 0 (G5).
     pub(crate) fn mapped_block(&self, object: ObjId) -> bool {
         let untyped = &self.untypeds[&object];
         match untyped.block {
             Some(Block::Run) => {
                 let shift = self.table.geometry.chunk_shift();
                 let chunks = untyped.base >> shift..(untyped.base + untyped.bytes) >> shift;
-                chunks.into_iter().any(|c| self.table.maps[c as usize] != 0)
+                chunks.into_iter().any(|c| self.table.map_count(c) != 0)
             }
-            _ => false,
+            Some(Block::Entry(index)) => self.table.device_leaves[index] != 0,
+            None => false,
         }
     }
 

@@ -474,17 +474,21 @@ impl System {
             }
             let model = self.nodes[node].take().expect("checked");
             let leaves = model.chunk_leaves();
+            let entry_leaves = model.entry_leaves();
             let tables = model.table_pages();
             let core = model.table.placed[node];
             self.write_beacon(|t| {
-                for (count, own) in std::sync::Arc::make_mut(&mut t.maps)
+                for (chunk, &own) in leaves.iter().enumerate() {
+                    t.add_leaves(chunk as u64, -(own as i64));
+                }
+                for (count, own) in std::sync::Arc::make_mut(&mut t.device_leaves)
                     .iter_mut()
-                    .zip(&leaves)
+                    .zip(&entry_leaves)
                 {
                     *count -= own;
                 }
-                for page in &tables {
-                    std::sync::Arc::make_mut(&mut t.classes).remove(page);
+                for &page in &tables {
+                    t.set_class(page, None);
                 }
                 t.reports[node].clear();
                 for (grant, entry) in std::mem::take(&mut t.grants[node]) {
@@ -550,13 +554,25 @@ impl System {
             false => Err(invariant.to_string()),
         };
         let table = self.table();
-        let mut leaves = vec![0u64; table.maps.len()];
+        let mut leaves = vec![0u64; table.gate_words.len()];
+        let mut entries = vec![0u64; table.device_leaves.len()];
         for node in self.nodes.iter().flatten() {
             for (sum, own) in leaves.iter_mut().zip(node.chunk_leaves()) {
                 *sum += own;
             }
+            for (sum, own) in entries.iter_mut().zip(node.entry_leaves()) {
+                *sum += own;
+            }
         }
-        ensure(leaves == *table.maps, "58: map count of the machine")?;
+        let counts = (0..leaves.len() as u64).map(|c| table.map_count(c));
+        ensure(
+            leaves.iter().copied().eq(counts),
+            "58: map count of the machine",
+        )?;
+        ensure(
+            entries == *table.device_leaves,
+            "58: leaf count of a device entry of the machine",
+        )?;
         let tables: BTreeSet<u64> = self
             .nodes
             .iter()
@@ -995,13 +1011,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .table
-            .maps
+            .gate_words
             .iter()
-            .position(|&m| m > 0)
-            .unwrap();
-        tables(&mut sys, |t| {
-            std::sync::Arc::make_mut(&mut t.maps)[chunk] += 1
-        });
+            .position(|&m| m as u32 > 0)
+            .unwrap() as u64;
+        tables(&mut sys, |t| t.add_leaves(chunk, 1));
         assert_eq!(sys.check(), Err("58: map count of the machine".into()));
     }
 
@@ -1012,13 +1026,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .table
-            .maps
+            .gate_words
             .iter()
-            .position(|&m| m > 0)
-            .unwrap();
-        tables(&mut sys, |t| {
-            std::sync::Arc::make_mut(&mut t.maps)[chunk] = 0
-        });
+            .position(|&m| m as u32 > 0)
+            .unwrap() as u64;
+        tables(&mut sys, |t| t.set_map_count(chunk, 0));
         assert_eq!(sys.check(), Err("node 0: 58: map count".into()));
     }
 

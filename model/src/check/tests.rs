@@ -2093,16 +2093,14 @@ fn translation_to_a_table_page_is_reported() {
     let broken = spoiled(|m, _| {
         let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
         let page = m.frames[&start].base / m.machine.geometry.page();
-        std::sync::Arc::make_mut(&mut m.table.classes).insert(page, crate::table::PageClass::Table);
+        m.table.set_class(page, dodos_abi::PageClass::table(1));
     });
     assert_eq!(broken, "58: translation to a table page");
 }
 
 #[test]
 fn map_count_that_is_not_the_number_of_leaves_is_reported() {
-    let broken = spoiled_with_block(|m, _, chunk| {
-        std::sync::Arc::make_mut(&mut m.table.maps)[chunk as usize] += 1
-    });
+    let broken = spoiled_with_block(|m, _, chunk| m.table.add_leaves(chunk, 1));
     assert_eq!(broken, "58: map count");
 }
 
@@ -2110,8 +2108,8 @@ fn map_count_that_is_not_the_number_of_leaves_is_reported() {
 fn page_class_of_no_table_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
         let pages = m.machine.geometry.chunk() / m.machine.geometry.page();
-        std::sync::Arc::make_mut(&mut m.table.classes)
-            .insert(chunk * pages, crate::table::PageClass::Table);
+        m.table
+            .set_class(chunk * pages, dodos_abi::PageClass::table(1));
     });
     assert_eq!(broken, "59: page classes");
 }
@@ -2428,8 +2426,20 @@ fn map_frame(rights: Rights) -> Syscall {
 fn a_leaf_whose_page_class_refuses_it_is_denied_by_the_call() {
     let (mut m, t, frame) = with_frame();
     let page = m.geometry().page();
-    std::sync::Arc::make_mut(&mut m.table.classes)
-        .insert(frame.base / page, crate::table::PageClass::Table);
+    m.table
+        .set_class(frame.base / page, dodos_abi::PageClass::table(1));
+    // DeepSeek F8 of the seventh review, for the table case: the class is
+    // judged after the two `busy`s above it and before the map count's: a
+    // map count that would pass its maximum too gives `denied`; without the
+    // class, `busy`.
+    let chunk = frame.base >> m.geometry().chunk_shift();
+    m.machine.map_count_max = m.table.map_count(chunk);
+    assert_eq!(m.apply(t, map_frame(Rights::READ)), Err(Error::Denied));
+    m.table.set_class(frame.base / page, None);
+    assert_eq!(m.apply(t, map_frame(Rights::READ)), Err(Error::Busy));
+    m.table
+        .set_class(frame.base / page, Some(dodos_abi::PageClass::IOSPACE_TABLE));
+    m.machine.map_count_max = dodos_abi::MAP_COUNT_MAX;
     assert_eq!(m.apply(t, map_frame(Rights::READ)), Err(Error::Denied));
     let (mut m, t, frame) = with_frame();
     let object = m.object_at(t, SlotAddr::own(120)).unwrap();
@@ -2487,15 +2497,55 @@ fn the_gate_refuses_to_give_a_block_whose_map_count_is_not_zero() {
         destination: SlotAddr::own(120),
     };
     assert_eq!(m.apply(t, take), Ok(Output::Done));
-    std::sync::Arc::make_mut(&mut m.table.maps)[free as usize] = 1;
+    m.table.set_map_count(free, 1);
     let give = Syscall::MemoryGive {
         control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
         untyped: SlotAddr::own(120),
         node: 1,
     };
     assert_eq!(m.apply(t, give.clone()), Err(Error::Busy));
-    std::sync::Arc::make_mut(&mut m.table.maps)[free as usize] = 0;
+    m.table.set_map_count(free, 0);
     assert_eq!(m.apply(t, give), Ok(Output::Done));
+}
+
+/// Opus S3 of the seventh review: the leaf count of a device entry is what
+/// G5 reads to refuse the give or the destruction of a device block that
+/// still has leaves.
+#[test]
+fn the_gate_refuses_to_give_a_device_block_whose_leaf_count_is_not_zero() {
+    let (mut m, t) = Model::boot(&Machine::example()).unwrap();
+    let index = (0..m.device_count())
+        .find(|&i| m.device_entry(i).base() == 2 << 20)
+        .unwrap();
+    let take = Syscall::MemoryTake {
+        control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        kind: 1,
+        place: index as u64,
+        size: 0,
+        destination: SlotAddr::own(120),
+    };
+    assert_eq!(m.apply(t, take), Ok(Output::Done));
+    std::sync::Arc::make_mut(&mut m.table.device_leaves)[index] = 1;
+    let give = Syscall::MemoryGive {
+        control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        untyped: SlotAddr::own(120),
+        node: 1,
+    };
+    assert_eq!(m.apply(t, give.clone()), Err(Error::Busy));
+    std::sync::Arc::make_mut(&mut m.table.device_leaves)[index] = 0;
+    assert_eq!(m.apply(t, give), Ok(Output::Done));
+}
+
+/// 59: a gate word whose count of pages not of class data is not the
+/// number of the chunk's pages that the page classes hold is reported.
+#[test]
+fn a_gate_word_that_miscounts_the_pages_not_of_class_data_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        let word = m.table.gate_word(chunk);
+        let wrong = dodos_abi::GateWord::new(word.map_count(), word.not_data() + 1).unwrap();
+        std::sync::Arc::make_mut(&mut m.table.gate_words)[chunk as usize] = wrong.raw();
+    });
+    assert_eq!(broken, "59: pages not of class data in a gate word");
 }
 
 /// DeepSeek F5 (M11): a use entry counts the leaves its node holds under

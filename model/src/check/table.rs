@@ -97,29 +97,60 @@ impl Model {
     /// invariant 58 counts them (memory under a grant counts in its use
     /// entry instead).
     pub(crate) fn chunk_leaves(&self) -> Vec<u64> {
+        self.leaves_by_target().0
+    }
+
+    /// The leaves of this node's translations that target each entry of
+    /// the device table (G4), as invariant 58 counts them.
+    pub(crate) fn entry_leaves(&self) -> Vec<u64> {
+        self.leaves_by_target().1
+    }
+
+    /// The leaves of ordinary memory by chunk, and of device memory by
+    /// entry of the device table; a leaf of the global read-only set counts
+    /// nowhere (G2, G4), and a leaf under a grant in its use entry (G6).
+    fn leaves_by_target(&self) -> (Vec<u64>, Vec<u64>) {
         let table = &self.table;
         let shift = table.geometry.chunk_shift();
         let mut leaves = vec![0u64; table.owners.len()];
+        let mut entries = vec![0u64; table.devices.len()];
         for space in self.aspaces.values() {
             for t in space.translations.values() {
                 let object = self.caps[&t.cap].object;
                 if self.remotes.contains_key(&object) {
                     continue;
                 }
-                let (Some(frame), Some(bytes)) =
+                let (Some(&frame), Some(bytes)) =
                     (self.frames.get(&object), table.geometry.bytes(t.size))
                 else {
                     continue;
                 };
+                // Where the page lies, read from the tables, not from the
+                // gate's helpers: device memory is a used entry of the
+                // device table, the global read-only set a kept range.
                 let start = frame.base + t.page * bytes;
-                for c in start >> shift..(start + bytes).div_ceil(1 << shift) {
+                let end = start + bytes;
+                if frame.memory != dodos_abi::MemoryType::WriteBack {
+                    let entry = table.devices.iter().position(|entry| {
+                        let base = entry.base();
+                        entry.is_used() && base <= start && end <= base + (1 << entry.log2())
+                    });
+                    if let Some(entry) = entry {
+                        entries[entry] += 1;
+                    }
+                    continue;
+                }
+                if frame.kept || table.kept.iter().any(|&(s, e)| s <= start && end <= e) {
+                    continue;
+                }
+                for c in start >> shift..end.div_ceil(1 << shift) {
                     if let Some(count) = leaves.get_mut(c as usize) {
                         *count += 1;
                     }
                 }
             }
         }
-        leaves
+        (leaves, entries)
     }
 
     pub(super) fn check_table(&self) -> Check {
@@ -288,22 +319,84 @@ impl Model {
             ensure(!table_page, "58: translation to a table page")?;
         }
         // Alone, the node's leaves are every leaf; on a machine of several
-        // models, the others' count too, and `System::check` sums them.
+        // models, the others' count too, and `System::check` sums them. A
+        // leaf of device memory counts in its entry, one of the global
+        // read-only set nowhere (G2, G4).
+        let (chunk_leaves, entry_leaves) = self.leaves_by_target();
+        let counts: Vec<u64> = (0..chunk_leaves.len() as u64)
+            .map(|c| table.map_count(c))
+            .collect();
         let counted = match self.shared {
-            false => leaves == *table.maps,
-            true => leaves.iter().zip(table.maps.iter()).all(|(l, m)| l <= m),
+            false => chunk_leaves == counts && entry_leaves == *table.device_leaves,
+            true => {
+                chunk_leaves.iter().zip(&counts).all(|(l, m)| l <= m)
+                    && entry_leaves
+                        .iter()
+                        .zip(table.device_leaves.iter())
+                        .all(|(l, m)| l <= m)
+            }
         };
         ensure(counted, "58: map count")?;
         for (&entry, used) in &table.uses[node as usize] {
             let counted = granted.get(&entry).copied().unwrap_or(0);
             ensure(used.leaves == counted, "58: leaves of a use entry")?;
         }
-        // 59: the table pages.
-        let tables: BTreeSet<u64> = self
-            .aspaces
+        // 59: the table pages, with their classes: the root of a space of
+        // the class of its top level (an iospace's, iospace table), each
+        // hooked table of the class of its level, a free one of a table
+        // class; and each gate word counts the pages of its chunk not of
+        // class data.
+        let mut tables: BTreeMap<u64, Option<dodos_abi::PageClass>> = BTreeMap::new();
+        for (&id, space) in &self.aspaces {
+            let io = self.iospaces.contains_key(&id);
+            let class = |level: u32| match io {
+                true => Some(dodos_abi::PageClass::IOSPACE_TABLE),
+                false => dodos_abi::PageClass::table(level as u8),
+            };
+            if let Some(root) = space.root {
+                let top = match io {
+                    true => 0,
+                    false => table.geometry.levels,
+                };
+                tables.insert(root / page, class(top));
+            }
+            for (&(level, _), &at) in &space.hooked {
+                tables.insert(at / page, class(level));
+            }
+            for &at in &space.free {
+                tables.insert(at / page, None);
+            }
+            let taken = space.hooked.len() + space.free.len();
+            let followed = space.root.is_none() || space.tables == taken as u64;
+            ensure(followed, "59: tables of a space")?;
+        }
+        let classes_right = tables.iter().all(|(page, class)| {
+            let stored = table.classes.get(page);
+            match class {
+                Some(class) => stored == Some(class),
+                None => stored
+                    .is_some_and(|c| *c == dodos_abi::PageClass::IOSPACE_TABLE || c.raw() > 16),
+            }
+        });
+        ensure(classes_right, "59: page classes")?;
+        let stored_only = table
+            .classes
             .values()
-            .flat_map(|space| space.table_pages.iter().map(|at| at / page))
-            .collect();
+            .all(|c| c.raw() != 0 && dodos_abi::PageClass::stored(c.raw()).is_some());
+        ensure(stored_only, "59: page classes")?;
+        let pages = table.geometry.chunk() / page;
+        for chunk in 0..table.gate_words.len() as u64 {
+            let stored = table
+                .classes
+                .range(chunk * pages..(chunk + 1) * pages)
+                .count();
+            let word = table.gate_word(chunk);
+            ensure(
+                usize::from(word.not_data()) == stored,
+                "59: pages not of class data in a gate word",
+            )?;
+        }
+        let tables: BTreeSet<u64> = tables.into_keys().collect();
         let classes: BTreeSet<u64> = table.classes.keys().copied().collect();
         // Alone, the node's tables are every table page; on a machine of
         // several models, `System::check` takes the union.

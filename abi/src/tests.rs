@@ -934,9 +934,10 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, chunks),
         offset_of!(StartMachine, device_capacity),
         offset_of!(StartMachine, layout),
-        offset_of!(StartMachine, reserved),
+        offset_of!(StartMachine, identifiers),
+        offset_of!(StartMachine, device_leaves),
     ];
-    assert_eq!(machine, [28, 32, 40, 52, 56]);
+    assert_eq!(machine, [28, 32, 40, 52, 56, 60]);
     let kind = [
         offset_of!(StartKindRecord, baseline),
         offset_of!(StartKindRecord, id),
@@ -1728,6 +1729,12 @@ fn page_classes_have_their_bytes_and_the_rules_of_g3() {
     for byte in [5, 16, 25, 255] {
         assert_eq!(PageClass::from_raw(byte), None, "{byte}");
     }
+    // DeepSeek F11 of the seventh review: the page classes hold 0, 4 and
+    // 16 + k; gate, global read-only and device pages lie in no chunk.
+    let stored: Vec<u8> = (0..=255)
+        .filter(|&b| PageClass::stored(b).is_some())
+        .collect();
+    assert_eq!(stored, [0, 4, 17, 18, 19, 20, 21, 22, 23, 24]);
     let leaf = |write, exec, device_type| Leaf {
         write,
         exec,

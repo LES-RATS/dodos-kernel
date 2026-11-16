@@ -327,11 +327,11 @@ impl Model {
         }
         // The gate over page tables, G2: the root table of a space is a
         // table page.
-        if let Some(space) = self.aspaces.get_mut(&id) {
-            space.table_pages.push(base);
+        if self.aspaces.contains_key(&id) {
+            let class = self.root_class(id);
+            live(&mut self.aspaces, id).root = Some(base);
             let page = base / self.machine.geometry.page();
-            std::sync::Arc::make_mut(&mut self.table.classes)
-                .insert(page, crate::table::PageClass::Table);
+            self.table.set_class(page, Some(class));
         }
         Ok(Output::Done)
     }
@@ -983,8 +983,8 @@ impl Model {
                 self.iospaces.remove(&id);
                 // G2: the gate turns the table pages back into data.
                 let page = self.machine.geometry.page();
-                for at in &space.table_pages {
-                    std::sync::Arc::make_mut(&mut self.table.classes).remove(&(at / page));
+                for at in space.table_pages() {
+                    self.table.set_class(at / page, None);
                 }
                 for untyped in object
                     .from

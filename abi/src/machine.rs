@@ -145,6 +145,17 @@ impl PageClass {
         }
     }
 
+    /// `None` for a byte the page classes may not hold (G2): the stored
+    /// classes are *data*, *iospace table* and *page table of level k*; a
+    /// *gate*, *global read-only* or *device* page lies in no chunk, and its
+    /// class follows from where it lies.
+    pub const fn stored(raw: u8) -> Option<Self> {
+        match raw {
+            0 | 4 | 17..=24 => Some(Self(raw)),
+            _ => None,
+        }
+    }
+
     /// `None` for a byte that names no class.
     pub const fn from_raw(raw: u8) -> Option<Self> {
         match raw {
@@ -1182,6 +1193,15 @@ mod proofs {
             Owner::Reserve(_) => holds,
         };
         assert!(accepted == expected);
+    }
+
+    #[kani::proof]
+    fn a_stored_class_is_a_class_and_never_gate_global_or_device() {
+        let raw: u8 = kani::any();
+        if let Some(class) = PageClass::stored(raw) {
+            assert!(PageClass::from_raw(raw) == Some(class));
+            assert!(raw != 1 && raw != 2 && raw != 3);
+        }
     }
 
     #[kani::proof]

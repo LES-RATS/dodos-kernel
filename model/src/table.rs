@@ -4,8 +4,8 @@
 //! machine; a node that runs alone holds it.
 
 use dodos_abi::{
-    DeviceEntry, Geometry, Governs, Member, MemberState, Owner, Ownership, RoleKind, RoleState,
-    RoleWord,
+    DeviceEntry, GateWord, Geometry, Governs, Member, MemberState, Owner, Ownership, PageClass,
+    RoleKind, RoleState, RoleWord,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -121,14 +121,6 @@ pub(crate) struct UseEntry {
     pub(crate) leaves: u64,
 }
 
-/// The class of a page (The gate over page tables, G2). A page of memory a
-/// node holds that is not listed is of class *data*.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PageClass {
-    /// A table page of an `aspace` or an `iospace`, its root included.
-    Table,
-}
-
 /// Which word of the living part a write names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Word {
@@ -186,11 +178,19 @@ pub(crate) struct Table {
     /// The ownership words, one per chunk, as raw words: a stray write is a
     /// word that fails its check.
     pub(crate) owners: Arc<Vec<u64>>,
-    /// The map count of each chunk (G4).
-    pub(crate) maps: Arc<Vec<u64>>,
-    /// The page classes, by page number, of the pages not of class *data*.
+    /// The gate word of each chunk (G4, `GateWord` of `abi/`), raw: the map
+    /// count in bits 0-31, the number of the chunk's pages not of class
+    /// *data* in bits 32-44.
+    pub(crate) gate_words: Arc<Vec<u64>>,
+    /// The page classes, by page number, of the pages of ordinary memory
+    /// not of class *data*: a page table of level k, or an iospace table.
+    /// The other classes are not stored: *device* and *global read-only*
+    /// follow from where a page lies, and the gate's own pages are kept.
     pub(crate) classes: Arc<BTreeMap<u64, PageClass>>,
     pub(crate) devices: Arc<Vec<DeviceEntry>>,
+    /// The leaf count of each entry of the device table (G4): the leaves of
+    /// its owner's tables, CPU and IOMMU, that target its pages.
+    pub(crate) device_leaves: Arc<Vec<u64>>,
     /// The identifier words of the devices, by segment << 16 | identifier,
     /// as raw ownership words; one not listed is free and unclaimed.
     pub(crate) identifiers: BTreeMap<u32, u64>,
@@ -277,6 +277,62 @@ impl Table {
         let before = self.roles[role];
         self.roles[role] = to;
         self.role_writes.push((role, writer, before, to));
+    }
+
+    /// The gate word of a chunk (G4).
+    pub(crate) fn gate_word(&self, chunk: u64) -> GateWord {
+        GateWord::from_raw(self.gate_words[chunk as usize]).expect("a gate word")
+    }
+
+    /// The map count of a chunk, 0 for a chunk beyond the table.
+    pub(crate) fn map_count(&self, chunk: u64) -> u64 {
+        match self.gate_words.get(chunk as usize) {
+            Some(&raw) => GateWord::from_raw(raw)
+                .expect("a gate word")
+                .map_count()
+                .into(),
+            None => 0,
+        }
+    }
+
+    /// The gate adds `delta` leaves to the map count of a chunk.
+    pub(crate) fn add_leaves(&mut self, chunk: u64, delta: i64) {
+        let Some(&raw) = self.gate_words.get(chunk as usize) else {
+            return;
+        };
+        let word = GateWord::from_raw(raw).expect("a gate word");
+        let count = u64::from(word.map_count())
+            .checked_add_signed(delta)
+            .expect("a map count never goes below 0");
+        let count = u32::try_from(count).expect("a map count fits 32 bits");
+        let word = GateWord::new(count, word.not_data()).expect("a gate word");
+        Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
+    }
+
+    /// The gate writes the map count of a chunk (G13: 0 at a take; R6: 0).
+    pub(crate) fn set_map_count(&mut self, chunk: u64, count: u32) {
+        let word = self.gate_word(chunk);
+        let word = GateWord::new(count, word.not_data()).expect("a gate word");
+        Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
+    }
+
+    /// The gate writes the class of a page of ordinary memory, by page
+    /// number (`None` for *data*), and the count of its chunk's pages not
+    /// of class *data* in the chunk's gate word (G2).
+    pub(crate) fn set_class(&mut self, page: u64, class: Option<PageClass>) {
+        let before = match class {
+            Some(class) => Arc::make_mut(&mut self.classes).insert(page, class),
+            None => Arc::make_mut(&mut self.classes).remove(&page),
+        };
+        let delta = i32::from(class.is_some()) - i32::from(before.is_some());
+        let chunk = (page * self.geometry.page()) >> self.geometry.chunk_shift();
+        if delta == 0 || chunk as usize >= self.gate_words.len() {
+            return;
+        }
+        let word = self.gate_word(chunk);
+        let not_data = u16::try_from(i32::from(word.not_data()) + delta).expect("pages of a chunk");
+        let word = GateWord::new(word.map_count(), not_data).expect("at most E pages");
+        Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
     }
 
     /// Whether a node's member word is dead.

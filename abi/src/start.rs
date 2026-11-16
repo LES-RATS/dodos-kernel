@@ -297,7 +297,11 @@ pub struct StartMachine {
     pub role_count: u32,
     pub grants_per_node: u32,
     pub layout: u32,
-    pub reserved: u64,
+    /// The offset of the identifier words of the devices.
+    pub identifiers: u32,
+    /// The offset of the leaf counts of the device entries (G4), one u64
+    /// per entry of the device table.
+    pub device_leaves: u32,
 }
 
 #[repr(C)]
