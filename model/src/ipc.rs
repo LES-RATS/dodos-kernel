@@ -699,9 +699,16 @@ impl Model {
                     }
                 }
                 // Grants that arrive for a destroyed receiver are refused,
-                // and a revocation step completes without its thread.
+                // and a revocation step completes without its thread; so
+                // does a request to the holder of a unit role, which holds
+                // no wait there: an attach or a detach is done on the unit
+                // whatever became of the thread (Calls on an object of
+                // another node).
                 Some(Request::Transfer { receiver, .. }) => *receiver = None,
                 Some(Request::Revoke {
+                    thread: waiting, ..
+                })
+                | Some(Request::Unit {
                     thread: waiting, ..
                 }) => *waiting = None,
                 _ => {
