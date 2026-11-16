@@ -1078,23 +1078,39 @@ impl NodeGen {
 /// Proofs checked by Kani for every input, not for chosen examples.
 #[cfg(kani)]
 mod proofs {
+    use super::*;
+
+    /// Whether `value` is one of `list`, by a loop Kani unwinds (a slice's
+    /// `contains` goes through `memchr` for bytes).
+    fn listed<const N: usize>(list: &[u64; N], value: u64) -> bool {
+        let mut i = 0;
+        while i < N {
+            if list[i] == value {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     #[kani::proof]
+    #[kani::unwind(50)]
     fn an_arm64_class_is_classified_exactly_when_the_architecture_defines_it() {
         let ec: u8 = kani::any::<u8>() & 0x3F;
         let syndrome = (ec as u64) << crate::aarch64::ESR_EC_SHIFT;
-        let defined = crate::aarch64::EXCEPTION_CLASSES.contains(&ec);
+        let classes = crate::aarch64::EXCEPTION_CLASSES.map(u64::from);
         // Status code 0 of an abort is an address size fault: classified.
+        let defined = listed(&classes, ec as u64);
         assert!(crate::aarch64::exception_use(syndrome).is_some() == defined);
     }
 
     #[kani::proof]
+    #[kani::unwind(21)]
     fn a_riscv_cause_is_classified_exactly_when_the_specification_defines_it() {
         let scause: u64 = kani::any();
-        let defined = crate::riscv64::CAUSES.contains(&scause);
+        let defined = listed(&crate::riscv64::CAUSES, scause);
         assert!(crate::riscv64::exception_use(scause).is_some() == defined);
     }
-
-    use super::*;
 
     #[kani::proof]
     fn header_new_refuses_or_reads_back() {
