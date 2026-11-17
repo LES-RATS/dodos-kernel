@@ -84,14 +84,14 @@ impl System {
             }
             let (slot, generation) = (word.slot(), word.generation());
             let named = matches!(word.state(), CoreState::Owned | CoreState::Joining);
-            // The node whose kernel runs on the core is the one its word
-            // names.
-            let runner = self
+            // Every node whose kernel runs on the core is the one its word
+            // names (the ninth model review, finding 14: the first runner
+            // found hid a second one).
+            let mut runners = self
                 .models()
-                .find(|(_, m)| m.position(core as u64).is_some_and(|p| !m.is_silent(p)))
-                .map(|(n, _)| n);
+                .filter(|(_, m)| m.position(core as u64).is_some_and(|p| !m.is_silent(p)));
             ensure(
-                named && runner.is_none_or(|n| n == slot),
+                named && runners.all(|(n, _)| n == slot),
                 "P2: a core executes a node its word does not name",
             )?;
             let member = table.member(slot);
@@ -123,8 +123,16 @@ impl System {
         for (chunk, &held) in leaves.iter().enumerate() {
             let count = table.map_count(chunk as u64);
             let owner = dodos_abi::Ownership::from_raw(table.owners[chunk]);
-            let alive = owner.is_some_and(|w| match w.owner() {
-                dodos_abi::Owner::Node(n) => {
+            // A chunk *none* of a floor is its node's (judged exactly while
+            // that node runs); a kept chunk holds no counted leaf (G4).
+            let base = chunk as u64 * table.geometry.chunk();
+            let floor = table
+                .floors
+                .iter()
+                .position(|f| f.iter().any(|&(start, end)| start <= base && base < end));
+            let alive = owner.is_some_and(|w| match (w.state(), w.owner()) {
+                (dodos_abi::OwnState::None, _) => floor.is_none_or(|n| self.running_node(n as u16)),
+                (_, dodos_abi::Owner::Node(n)) => {
                     self.has_generation(n, w.generation()) && self.running_node(n)
                 }
                 _ => true,

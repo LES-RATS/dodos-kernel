@@ -457,3 +457,125 @@ fn a_line_beyond_the_last_line_word_is_unsupported() {
     let line = dodos_abi::IrqSource::line(beyond, false, false).raw();
     assert_eq!(m.call(0, claim_on(0, line, 210)), Err(Error::Unsupported));
 }
+
+// A resume while a peer is unfenced, or died and started again (the ninth
+// model review, finding 9; `node_start` mode 1: R0, R2 and R3 for every node
+// whose generation ended while it was sealed, R4 and R5 for those still
+// fenced or unfenced).
+
+/// Node 2's next fence cannot be confirmed: its core is in VMX root
+/// operation, which blocks INIT, and its kernel cannot run the NMI handler.
+fn unfence(m: &mut S, killer: u16) {
+    m.sys.set_vmx(2, true);
+    m.sys.hang(2, false);
+    m.ok(killer, kill(2));
+    m.run(dodos_abi::FENCE_NS + 10 * MS);
+    assert_eq!(m.state(2), MemberState::Unfenced);
+}
+
+#[test]
+fn a_node_resumes_while_a_peer_is_unfenced() {
+    use super::pass17::{resume, seal};
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.ok(0, seal(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    unfence(&mut m, 0);
+    m.ok(0, resume(1));
+    m.run(50 * MS);
+    assert_eq!(m.state(1), MemberState::Live);
+}
+
+#[test]
+fn a_resume_keeps_the_reclaim_of_a_later_generation_of_a_peer_that_died_while_sealed() {
+    use super::pass17::{resume, seal};
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.ok(0, seal(1));
+    m.run(10 * MS);
+    m.ok(0, kill(2));
+    m.run(20 * MS);
+    assert_eq!(m.state(2), MemberState::Dead);
+    m.ok(0, fresh(2, 0b100));
+    m.run(20 * MS);
+    assert_eq!(m.state(2), MemberState::Live);
+    let later = m.sys.member(2).generation();
+    unfence(&mut m, 0);
+    m.ok(0, resume(1));
+    // At the step that makes node 1 live, its reclaim of node 2 is the
+    // reclaim of the later generation, not one begun again for the
+    // generation that ended while it was sealed.
+    for _ in 0..10_000 {
+        if m.state(1) == MemberState::Live {
+            break;
+        }
+        match m.sys.events().first() {
+            Some(&event) => m.sys.fire(event),
+            None => m.sys.move_clock(m.sys.now() + 100_000),
+        }
+    }
+    assert_eq!(m.state(1), MemberState::Live);
+    let reclaim = m.sys.node(1).reclaims.get(&2).map(|r| r.generation);
+    assert_eq!(reclaim, Some(later));
+}
+
+// The checker's G4 and G6 judged on their own (the ninth model review,
+// finding 11).
+
+#[test]
+fn a_map_count_above_the_leaves_of_a_floor_chunk_is_reported_by_g4() {
+    let mut m = S::two();
+    let frame = m.retype(0, ObjectKind::Frame, 1, 150);
+    m.ok(0, frame);
+    let object = m.sys.node(0).object_at(m.t[0], s(150)).unwrap();
+    let chunk = m.sys.node(0).frames[&object].base >> m.sys.node(0).geometry().chunk_shift();
+    // A count above the leaves (none) of a chunk of node 0's floor: the
+    // node's own check allows it on a machine of several nodes, G4 does not.
+    m.sys.edit_table(|t| {
+        std::sync::Arc::make_mut(&mut t.gate_words)[chunk as usize] += 1;
+    });
+    let report = m.sys.check().expect_err("spoiled");
+    assert_eq!(report, "G4: a map count is not the leaves of its chunk");
+}
+
+#[test]
+fn a_grant_freed_while_an_unfenced_holder_translates_to_it_is_reported_by_g6() {
+    let mut m = S::two();
+    super::pass17::granted_to_1(&mut m);
+    let map = Syscall::ASpaceMap(crate::Map {
+        space: s(dodos_abi::START_SLOT_ASPACE),
+        frame: s(110),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    });
+    m.ok(1, map);
+    // Node 1's fence cannot be confirmed: it is unfenced, still holds its
+    // translation, and its own check no longer runs, so G6 alone sees a
+    // grant freed under it.
+    m.sys.set_vmx(1, true);
+    m.sys.hang(1, false);
+    m.ok(0, kill(1));
+    m.run(dodos_abi::FENCE_NS + 10 * MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    m.sys.edit_table(|t| t.grants[0].clear());
+    let report = m.sys.check().expect_err("spoiled");
+    assert_eq!(
+        report,
+        "G6: a grant freed while its holder translates to it"
+    );
+}
+
+#[test]
+fn a_core_that_two_nodes_run_is_reported_by_p2_even_when_the_first_is_named() {
+    let mut m = S::on(&machine(Arch::X86_64, 2, &[&[0], &[1]]));
+    // Node 1's kernel runs on core 0 too, which names node 0: the first
+    // runner found matches the word and hid the second.
+    m.sys.node_mut(1).cores[0].number = 0;
+    let report = m.sys.check().expect_err("spoiled");
+    assert!(
+        report.ends_with("P2: a core executes a node its word does not name"),
+        "{report}"
+    );
+}

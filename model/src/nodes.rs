@@ -958,6 +958,11 @@ impl Model {
             isolated: true,
             ..Default::default()
         };
+        self.r0_effects(node, generation);
+    }
+
+    /// What R0 does, apart from this node's record of its reclaim.
+    fn r0_effects(&mut self, node: u16, generation: u32) {
         let waiting: Vec<ObjId> = self
             .threads
             .iter()
@@ -1147,6 +1152,16 @@ impl Model {
             any = true;
         }
         any
+    }
+
+    /// Whether R2 to R4 of this node's reclaim of `node` are done: no
+    /// remote capability of it left, R3 written, every block audited.
+    fn audited(&self, node: u16) -> bool {
+        let reclaim = self.reclaims.get(&node);
+        let audit = reclaim.and_then(|r| r.audit.as_ref());
+        reclaim.is_some_and(|r| r.r3)
+            && audit.is_some_and(Vec::is_empty)
+            && !self.remotes.values().any(|r| r.node == node)
     }
 
     /// R4 for one block: every ownership word it covers still reads taken
@@ -1522,9 +1537,14 @@ impl Model {
                 MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
             ) {
                 any |= self.reclaim_step(node, units);
-                if state != MemberState::Fencing
-                    && !self.reclaims.get(&node).is_some_and(|r| r.acked)
-                {
+                // R4 and R5 for a fenced node, R2 to R4 for an unfenced one,
+                // whose memory stays frozen and which gets no `acked`.
+                let done = match state {
+                    MemberState::Fenced => self.reclaims.get(&node).is_some_and(|r| r.acked),
+                    MemberState::Unfenced => self.audited(node),
+                    _ => true,
+                };
+                if !done {
                     return any;
                 }
             }
@@ -1534,8 +1554,12 @@ impl Model {
             // credits are freed; then its remote capabilities go, with no
             // release, and the grants made to it are freed at once (R2,
             // R3; Grants, "Generations").
+            // R0 once for that generation, which leaves the reclaim of a
+            // later generation of the node as it is.
             if let Some(old) = self.ended_while_sealed(node) {
-                self.r0(node, old);
+                if self.ended_done.insert((node, old)) {
+                    self.r0_effects(node, old);
+                }
                 any |= self.drop_ended(node, old, units);
             }
         }
@@ -1543,6 +1567,7 @@ impl Model {
             self.ready = true;
             self.resuming = false;
             self.sealed_view.clear();
+            self.ended_done.clear();
             let live = Member::new(
                 MemberState::Live,
                 member.evidence(),

@@ -1586,16 +1586,19 @@ mod proofs {
     }
 
     /// A core word of a node at the full widths of its fields (a slot of 16
-    /// bits, a generation of 32, the mark): one of the two constructors that
-    /// name a node, marked or not.
-    fn any_named_word() -> (CoreWord, u16, u32) {
+    /// bits, a generation of 32, the mark, the flag unusable): one of the
+    /// two constructors that name a node, marked or not, unusable or not.
+    /// Returns the word, its fields and the two flags chosen.
+    fn any_named_word() -> (CoreWord, u16, u32, bool, bool) {
         let (slot, generation): (u16, u32) = (kani::any(), kani::any());
+        let (mark, unusable): (bool, bool) = (kani::any(), kani::any());
         let word = match kani::any() {
             true => CoreWord::joining(slot, generation),
             false => CoreWord::owned(slot, generation),
         };
-        let word = if kani::any() { word.marked() } else { word };
-        (word, slot, generation)
+        let word = if mark { word.marked() } else { word };
+        let word = if unusable { word.unusable() } else { word };
+        (word, slot, generation, mark, unusable)
     }
 
     /// A core word read back, at the full widths of `CoreWord` (the eighth
@@ -1614,23 +1617,28 @@ mod proofs {
     /// with a slot and a generation of 4 bits.
     #[kani::proof]
     fn core_words_read_back() {
-        let (word, slot, generation) = any_named_word();
+        let (word, slot, generation, mark, unusable) = any_named_word();
         assert!(word.slot() == slot && word.generation() == generation);
         assert!(word.names(slot, generation));
         assert!(word.state() == CoreState::Joining || word.state() == CoreState::Owned);
-        let free = CoreWord::free(kani::any());
+        assert!(word.is_marked() == mark && word.is_unusable() == unusable);
+        let flag: bool = kani::any();
+        let free = CoreWord::free(flag);
         assert!(free.state() == CoreState::Free && free.slot() == CORE_NO_SLOT);
         assert!(free.generation() == 0 && !free.is_marked());
+        assert!(free.is_unusable() == flag);
     }
 
     /// (2): the base `from_raw` recovers from a word a constructor wrote is
     /// the base the constructor built from its fields, at the full widths.
     #[kani::proof]
     fn core_words_keep_their_base() {
-        let (word, slot, generation) = any_named_word();
-        let state = word.raw() & 0b11;
+        let (word, slot, generation, mark, unusable) = any_named_word();
+        // The base from the inputs chosen, not from the word itself.
+        let state = word.state() as u64;
         let built = state
-            | word.raw() & (CORE_MARK | CORE_UNUSABLE)
+            | if mark { CORE_MARK } else { 0 }
+            | if unusable { CORE_UNUSABLE } else { 0 }
             | (slot as u64) << 16
             | (generation as u64) << 32;
         assert!(CoreWord::base(word.raw()) == built);
@@ -1642,7 +1650,7 @@ mod proofs {
     /// longer holds: it is refused. At the full widths.
     #[kani::proof]
     fn core_words_with_a_check_bit_flipped_are_refused() {
-        let (word, _, _) = any_named_word();
+        let (word, _, _, _, _) = any_named_word();
         let bit: u32 = kani::any();
         kani::assume(bit >= 4 && bit < 16);
         let flipped = word.raw() ^ 1 << bit;

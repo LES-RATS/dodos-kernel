@@ -65,7 +65,7 @@ use dodos_abi::{
     Error, Geometry, IrqSource, MAX_CAPS, MemoryType, ObjectKind, PageSize, Received, Rights,
     SlotAddr, TaskId,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 
 /// Identity of a kernel object. It is never reused.
@@ -1105,6 +1105,9 @@ pub struct Model {
     /// The member words as this node last saw them when it wrote sealed:
     /// at its resume, a generation that ended since gets R0, R2 and R3.
     sealed_view: Vec<dodos_abi::Member>,
+    /// The generations that ended while this node was sealed whose R0 its
+    /// resume has done, once each.
+    ended_done: BTreeSet<(u16, u32)>,
     starts: BTreeMap<usize, nodes::Starting>,
     start_image: (bool, u64),
     handing: BTreeMap<usize, roles::Handover>,

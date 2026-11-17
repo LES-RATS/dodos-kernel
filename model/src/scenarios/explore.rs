@@ -618,9 +618,10 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
                         && m.state(0) == MemberState::Live
                         && m.sys.node(0).runnable().contains(&thread)
                     {
-                        // Messages of 60 words: 8 entries each, so the 64
-                        // entries of the ring fill before the 8 sends in
-                        // flight are used.
+                        // Messages of 60 words: 9 entries each (⌈(16 + 8 ×
+                        // 63) / 64⌉), so the 64 entries of the ring fill
+                        // before the 8 sends in flight are used: the
+                        // seventh leaves one entry, and the next is `busy`.
                         let send = Syscall::NodeSend {
                             node: node_cap(1),
                             message: crate::Message {
@@ -630,8 +631,12 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
                             doorbell: SlotAddr::NONE,
                         };
                         let outcome = m.call_by(0, thread, send);
-                        if m.sys.has(0)
-                            && !m.sys.node(0).ring_room(1, dodos_abi::NodeMessage::Send, 8)
+                        // A send refused by the full ring (the ninth model
+                        // review, finding 12: the room after any send was
+                        // counted, `busy` or not).
+                        if outcome == Err(Error::Busy)
+                            && m.sys.has(0)
+                            && !m.sys.node(0).ring_room(1, dodos_abi::NodeMessage::Send, 9)
                         {
                             full += 1;
                         }
