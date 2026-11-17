@@ -273,6 +273,14 @@ impl Model {
 
     /// An arrival on the core at `position` of the node.
     pub fn interrupt_on(&mut self, position: usize, vector: u8) {
+        match self.contended.is_empty() {
+            true => self.interrupt_once(position, vector),
+            false => self.interrupt_contended(position, vector),
+        }
+    }
+
+    /// An arrival, with no lock held by another core.
+    pub(crate) fn interrupt_once(&mut self, position: usize, vector: u8) {
         *self.last_event = None;
         let entry = self.begin_on(position);
         self.touch_core(position);

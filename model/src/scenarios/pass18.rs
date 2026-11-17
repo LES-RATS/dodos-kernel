@@ -688,3 +688,298 @@ fn the_core_that_completes_a_request_writes_its_state_word_done() {
     assert_eq!(k.m.cores[0].request_state, RequestState::Done);
     assert_eq!(k.m.cores[0].request, None);
 }
+
+// Tries that fail (the ninth model review, finding 10; A node of several
+// cores, the order of L2, D-134; the quiet word, D-135). Another core holds
+// a lock across the node's events (`Model::contended`): the tries the
+// contract makes can fail, the second round, a changed link and `again`
+// are reached.
+
+use crate::locks::{Holder, LockId, Step};
+
+/// A node of two cores under L2: a receiver (slot 300, core 0) waits on an
+/// endpoint (310) with wait number 7, and a third thread (320) runs on core
+/// 1; returns the node and the call of the first thread that delivers to
+/// the receiver.
+fn l2_delivery() -> (N, ObjId, ObjId, Syscall) {
+    let mut machine = one_node(Arch::X86_64, 2);
+    machine.locking = crate::Locking::L2;
+    // An MSI's claim then asks no unit, so it ends in its call.
+    machine.remapping = false;
+    let mut k = N::on(&machine);
+    k.place_first(0);
+    let receiver = k.thread_on(300, 0);
+    let third = k.thread_on(320, 1);
+    k.ok(k.retype(ObjectKind::Endpoint, 0, 310));
+    k.ok(k.retype(ObjectKind::Reply, 0, 311));
+    let recv = Syscall::Recv {
+        endpoint: s(310),
+        reply: s(311),
+        range: crate::Range::NONE,
+        wait: 7,
+    };
+    assert_eq!(k.call(receiver, recv), WAITS);
+    let call = Syscall::Call {
+        endpoint: s(310),
+        message: crate::Message::default(),
+        range: crate::Range::NONE,
+        wait: 0,
+    };
+    (k, receiver, third, call)
+}
+
+/// The first lock a call tries, as it runs with no lock held elsewhere.
+fn first_try(k: &N, thread: ObjId, call: &Syscall) -> LockId {
+    let mut dry = k.m.clone();
+    let _ = dry.apply(thread, call.clone());
+    dry.locks
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Try(l) => Some(*l),
+            _ => None,
+        })
+        .expect("the call tries a lock")
+}
+
+#[test]
+fn under_l2_a_failed_try_takes_a_second_round_in_the_order_and_the_call_goes_on() {
+    let (mut k, receiver, _, call) = l2_delivery();
+    let lock = first_try(&k, k.t, &call);
+    k.m.contended.insert(
+        lock,
+        Holder {
+            tries: 1,
+            then: None,
+        },
+    );
+    assert_eq!(k.call(k.t, call), WAITS);
+    // Delivered: the receiver has the message.
+    assert!(k.m.woken(receiver).is_some());
+    let steps = &k.m.locks.steps;
+    let failed = steps.iter().position(|s| *s == Step::TryFailed(lock));
+    let retaken = steps.iter().rposition(|s| *s == Step::Lock(lock));
+    assert!(failed.is_some() && retaken > failed, "{steps:?}");
+}
+
+#[test]
+fn under_l2_a_link_changed_by_the_holder_makes_the_call_return_again_with_nothing_changed() {
+    let (mut k, receiver, third, call) = l2_delivery();
+    let lock = first_try(&k, k.t, &call);
+    // The holder's event cancels the receiver's wait: the queue the call
+    // read no longer leads to the same thread.
+    let cancel = Syscall::ThreadCancel(s(300), 7);
+    k.m.contended.insert(
+        lock,
+        Holder {
+            tries: 1,
+            then: Some((third, cancel.clone())),
+        },
+    );
+    // What the node is once the holder's event alone has run.
+    let mut expected = k.m.clone();
+    expected.contended.clear();
+    let _ = expected.apply_once(third, cancel);
+    assert_eq!(k.call(k.t, call), Err(Error::Again));
+    assert_eq!(k.m.woken(receiver), Some(&Err(Error::Cancelled)));
+    // The call changed nothing: no caller queued, the caller runs on.
+    assert_eq!(k.m.endpoints, expected.endpoints);
+    assert_eq!(k.m.threads[&k.t].wait, expected.threads[&k.t].wait);
+    assert_eq!(k.m.threads[&k.t].again_tries, 1);
+    assert!(k.m.locks.steps.contains(&Step::TryFailed(lock)));
+}
+
+#[test]
+fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() {
+    let (mut k, _, third, call) = l2_delivery();
+    let recv = Syscall::Recv {
+        endpoint: s(310),
+        reply: s(311),
+        range: crate::Range::NONE,
+        wait: 8,
+    };
+    let receiver = k.m.object_at(k.t, s(300)).unwrap();
+    for round in 0..2 {
+        let lock = first_try(&k, k.t, &call);
+        let cancel = Syscall::ThreadCancel(s(300), 7 + round);
+        k.m.contended.insert(
+            lock,
+            Holder {
+                tries: 2,
+                then: Some((third, cancel)),
+            },
+        );
+        assert_eq!(k.call(k.t, call.clone()), Err(Error::Again));
+        // The receiver waits again, with the next wait number.
+        let mut again = recv.clone();
+        if let Syscall::Recv { wait, .. } = &mut again {
+            *wait = 8 + round;
+        }
+        assert_eq!(k.call(receiver, again), WAITS);
+    }
+    assert_eq!(k.m.threads[&k.t].again_tries, 2);
+    // A third time: the call takes the quiet word, the holder's event ends
+    // (it cancels the receiver), and the call runs alone: it queues.
+    let lock = first_try(&k, k.t, &call);
+    let cancel = Syscall::ThreadCancel(s(300), 9);
+    k.m.contended.insert(
+        lock,
+        Holder {
+            tries: 9,
+            then: Some((third, cancel)),
+        },
+    );
+    let outcome = k.call(k.t, call);
+    assert_ne!(outcome, Err(Error::Again));
+    assert!(k.m.contended.is_empty());
+    assert_eq!(k.m.threads[&k.t].again_tries, 0);
+    // Its two rounds would return `again` a third time: it escalates, and
+    // under the quiet word it only waits, in the order.
+    let steps = &k.m.locks.steps;
+    let quiet = steps.iter().position(|s| *s == Step::Quiet(true));
+    let quiet = quiet.expect("the quiet word taken");
+    assert_eq!(steps.last(), Some(&Step::Quiet(false)), "{steps:?}");
+    let alone = &steps[quiet..];
+    assert!(
+        !alone
+            .iter()
+            .any(|s| matches!(s, Step::Try(_) | Step::TryFailed(_)))
+    );
+}
+
+#[test]
+fn under_l2_a_signal_whose_try_fails_never_returns_again() {
+    let (mut k, _, third, _) = l2_delivery();
+    // A notify bound to the endpoint the receiver waits on.
+    k.ok(k.retype(ObjectKind::Notify, 0, 330));
+    k.ok(Syscall::NotifyBind {
+        notify: s(330),
+        endpoint: s(310),
+    });
+    let signal = Syscall::Signal(s(330));
+    let lock = first_try(&k, k.t, &signal);
+    // The holder cancels the receiver: the binding still holds, but no
+    // receiver waits; the signal still ends, its bits pending.
+    let cancel = Syscall::ThreadCancel(s(300), 7);
+    k.m.contended.insert(
+        lock,
+        Holder {
+            tries: 5,
+            then: Some((third, cancel)),
+        },
+    );
+    assert_eq!(k.call(k.t, signal), DONE);
+    let notify = k.m.object_at(k.t, s(330)).unwrap();
+    assert_ne!(k.m.notifies[&notify].word, 0);
+    let steps = &k.m.locks.steps;
+    assert!(steps.contains(&Step::TryFailed(lock)), "{steps:?}");
+}
+
+#[test]
+fn the_check_refuses_the_orders_that_the_rounds_of_l2_forbid() {
+    let (mut k, _, _, _) = l2_delivery();
+    let thread = k.t;
+    let pay = Step::Pay(crate::locks::Cost::Lock);
+    // A lock taken after a failed try while a lock is still held.
+    k.m.locks.steps = vec![
+        pay,
+        Step::Lock(LockId::Core(0)),
+        pay,
+        Step::TryFailed(LockId::Thread(thread)),
+        pay,
+        Step::Lock(LockId::Gate),
+    ];
+    assert_eq!(
+        k.m.check(),
+        Err("L2: a lock taken after a failed try before every lock held was released")
+    );
+    // The same, released first: a second round in the order.
+    k.m.locks.steps = vec![
+        pay,
+        Step::Lock(LockId::Core(0)),
+        pay,
+        Step::TryFailed(LockId::Thread(thread)),
+        Step::Unlock(LockId::Core(0)),
+        pay,
+        Step::Lock(LockId::Thread(thread)),
+        pay,
+        Step::Lock(LockId::Core(0)),
+    ];
+    assert_eq!(k.m.check(), Ok(()));
+    // Three rounds.
+    let mut three = Vec::new();
+    for _ in 0..3 {
+        three.extend([
+            pay,
+            Step::Lock(LockId::Core(0)),
+            pay,
+            Step::TryFailed(LockId::Thread(thread)),
+            Step::Unlock(LockId::Core(0)),
+        ]);
+    }
+    k.m.locks.steps = three;
+    assert_eq!(
+        k.m.check(),
+        Err("L2: more than two rounds of locks in one call")
+    );
+    // The quiet word taken holding a lock, and a try under it.
+    k.m.locks.steps = vec![pay, Step::Lock(LockId::Core(0)), Step::Quiet(true)];
+    assert_eq!(
+        k.m.check(),
+        Err("L2: the quiet word taken while a lock is held")
+    );
+    k.m.locks.steps = vec![
+        Step::Quiet(true),
+        pay,
+        Step::Lock(LockId::Core(0)),
+        pay,
+        Step::Try(LockId::Thread(thread)),
+        Step::Quiet(false),
+    ];
+    assert_eq!(k.m.check(), Err("L2: a try under the quiet word"));
+}
+
+#[test]
+fn under_l2_an_arrival_whose_try_fails_takes_its_locks_in_the_order_and_ends() {
+    let (mut k, _, third, _) = l2_delivery();
+    // An MSI on core 0, bound to a notify bound to the endpoint the receiver
+    // waits on.
+    k.ok(k.retype(ObjectKind::Notify, 0, 330));
+    k.ok(Syscall::NotifyBind {
+        notify: s(330),
+        endpoint: s(310),
+    });
+    let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
+    let claimed = k.call(k.t, claim_on(0, msi, 340));
+    assert!(matches!(claimed, Ok(Output::Msi { .. })), "{claimed:?}");
+    k.ok(Syscall::IrqBind {
+        irq: s(340),
+        notify: s(330),
+    });
+    let mut dry = k.m.clone();
+    dry.interrupt_on(0, 48);
+    let lock = dry
+        .locks
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Try(l) => Some(*l),
+            _ => None,
+        })
+        .expect("the arrival tries a lock");
+    let cancel = Syscall::ThreadCancel(s(300), 7);
+    k.m.contended.insert(
+        lock,
+        Holder {
+            tries: 5,
+            then: Some((third, cancel)),
+        },
+    );
+    k.m.interrupt_on(0, 48);
+    assert_eq!(k.m.check(), Ok(()));
+    let steps = &k.m.locks.steps;
+    assert!(steps.contains(&Step::TryFailed(lock)), "{steps:?}");
+    // No receiver waits any more: the bits are pending in the notify.
+    let notify = k.m.object_at(k.t, s(330)).unwrap();
+    assert_ne!(k.m.notifies[&notify].word, 0);
+}

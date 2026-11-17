@@ -683,6 +683,10 @@ struct Iommu {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Thread {
+    /// Its consecutive results `again` of the rule of tries under L2 (a
+    /// failed try of the second round, or a link that changed): at 2, its
+    /// next such call escalates to the quiet word (D-135).
+    again_tries: u8,
     /// Bindings, each a link both ways: the capability space, the address
     /// space, the fault endpoint with the badge of the capability given to
     /// `thread_configure`, and the frame capability whose record binds the
@@ -1058,6 +1062,9 @@ pub struct Model {
     /// The locks the last event took and the waits it entered, for the
     /// checks of the two variants (A node of several cores).
     locks: Ephemeral<locks::Trace>,
+    /// Locks of this node held by other cores across its events, as a test
+    /// scripts them (variant L2): what makes a try fail (D-134, D-135).
+    pub(crate) contended: BTreeMap<locks::LockId, locks::Holder>,
     /// Under variant L2: the objects as they were before the event.
     before: Ephemeral<Option<Box<locks::Snapshot>>>,
     /// The pending interrupts of the cores are delivered by the caller
@@ -1364,6 +1371,14 @@ impl Model {
     /// core that runs it, else the core of its context.
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
+        match self.contended.is_empty() {
+            true => self.apply_once(thread, call),
+            false => self.apply_contended(thread, call),
+        }
+    }
+
+    /// One call as one event, with no lock held by another core.
+    pub(crate) fn apply_once(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         let kind = match call {
             Syscall::CapDelete(_) | Syscall::CapRevoke(_) => sched::EventKind::Removal,
             Syscall::TaskRevoke(_) => sched::EventKind::TaskRevoke,

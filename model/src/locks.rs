@@ -70,6 +70,17 @@ pub enum LockId {
     Gate,
 }
 
+/// A lock of this node that another core holds across this node's events,
+/// as a test scripts it: the tries of other cores it makes fail before its
+/// event ends, and what that event does when it ends (a call of a thread
+/// of the node, on the holder's core), if anything. A wait for the lock
+/// lets the holder's event end: a lock is held for one bounded event.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Holder {
+    pub(crate) tries: u32,
+    pub(crate) then: Option<(ObjId, crate::Syscall)>,
+}
+
 /// The kinds of wait a thread enters at the end of an event, and the spin
 /// an event must never make inside a hold (a wait for a unit or for another
 /// node in the middle of an event).
@@ -109,7 +120,14 @@ pub enum Step {
     /// A lock found by reading an object the event holds, earlier in the
     /// order than a lock held: tried, never waited for (D-134).
     Try(LockId),
+    /// A try that failed: another core held the lock. The call releases
+    /// every lock it holds, having changed nothing, before it takes any
+    /// other (D-134).
+    TryFailed(LockId),
     Unlock(LockId),
+    /// The node's quiet word taken (`true`) or cleared (`false`) by a call
+    /// that escalates after two `again` of the rule of tries (D-135).
+    Quiet(bool),
     /// A thread entered a wait at the end of the event.
     Wait(WaitKind),
     /// The event waited inside its hold (never, in a correct kernel).
@@ -230,7 +248,7 @@ impl crate::Model {
 
     /// Whether the event's objects are compared with the state before it:
     /// variant L2 on a node of several cores.
-    fn locking_watched(&self) -> bool {
+    pub(crate) fn locking_watched(&self) -> bool {
         self.width() > 1 && self.machine.locking == Locking::L2
     }
 
@@ -309,6 +327,273 @@ impl crate::Model {
             .iter()
             .any(|l| matches!(l, LockId::Thread(_) | LockId::Core(_)))
     }
+}
+
+/// How a round of locks ended.
+enum Round {
+    /// Every lock taken: these, in the order taken.
+    Taken(Vec<LockId>),
+    /// A try failed: the locks held then, and the index of the failed lock
+    /// in the order of the round.
+    Failed(Vec<LockId>, usize),
+    /// A wait reached a lock another core holds, whose event changes what
+    /// the call reads: the round is begun again once it has ended.
+    Changed(Vec<LockId>),
+}
+
+/// Locking under contention (variant L2, A node of several cores, D-134,
+/// D-135). The model runs one event at a time; a lock another core holds
+/// across events (`Model::contended`) makes a try fail. A call then makes
+/// the rounds of the contract: the locks it finds, in the order it finds
+/// them, waits in the order by kind and tries for the others; at a failed
+/// try it releases everything, takes the locks it knows in the order,
+/// reads again what it follows and returns `again` with nothing changed if
+/// a link changed or a try of its second round failed. A `signal` never
+/// returns `again`: its second round waits for every lock. After two such
+/// `again` in a row, a call escalates to the quiet word: the other cores
+/// leave their events and the call runs alone.
+impl crate::Model {
+    /// The locks an event would take, in the order it finds them: the event
+    /// run on a copy of the node with no lock held elsewhere.
+    fn dry_found(&self, event: &Contended) -> Vec<LockId> {
+        let mut dry = self.clone();
+        dry.contended.clear();
+        let _ = dry.run_once(event);
+        dry.locks
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Lock(l) | Step::Try(l) => Some(*l),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The event, as it runs with no lock held elsewhere.
+    fn run_once(&mut self, event: &Contended) -> crate::Outcome {
+        match event {
+            Contended::Call(thread, call) => self.apply_once(*thread, call.clone()),
+            Contended::Arrival(position, vector) => {
+                self.interrupt_once(*position, *vector);
+                Ok(crate::Output::Done)
+            }
+        }
+    }
+
+    /// A try of a lock that another core holds fails while that holder
+    /// still makes tries fail.
+    fn try_fails(&mut self, lock: LockId) -> bool {
+        match self.contended.get_mut(&lock) {
+            Some(holder) if holder.tries > 0 => {
+                holder.tries -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The event of the core that holds `lock` ends, with its effect: a wait
+    /// for the lock is a wait for that event. Returns whether it changed
+    /// the node.
+    fn let_go(&mut self, lock: LockId) -> bool {
+        let Some(holder) = self.contended.remove(&lock) else {
+            return false;
+        };
+        let Some((thread, call)) = holder.then else {
+            return false;
+        };
+        let _ = self.apply_once(thread, call);
+        true
+    }
+
+    /// One round: the locks of `found` not yet held, in its order.
+    fn round(&mut self, found: &[LockId], mut held: Vec<LockId>, steps: &mut Vec<Step>) -> Round {
+        for (index, &lock) in found.iter().enumerate() {
+            if held.contains(&lock) {
+                continue;
+            }
+            steps.push(Step::Pay(Cost::Lock));
+            if held.iter().all(|&h| h < lock) {
+                steps.push(Step::Lock(lock));
+                held.push(lock);
+                if self.let_go(lock) {
+                    return Round::Changed(held);
+                }
+            } else if self.try_fails(lock) {
+                steps.push(Step::TryFailed(lock));
+                return Round::Failed(held, index);
+            } else {
+                steps.push(Step::Try(lock));
+                held.push(lock);
+            }
+        }
+        Round::Taken(held)
+    }
+
+    /// A call under contention.
+    pub(crate) fn apply_contended(
+        &mut self,
+        thread: ObjId,
+        call: crate::Syscall,
+    ) -> crate::Outcome {
+        self.contend(Contended::Call(thread, call))
+    }
+
+    /// An arrival under contention: an event that is not a call never
+    /// returns `again`.
+    pub(crate) fn interrupt_contended(&mut self, position: usize, vector: u8) {
+        let _ = self.contend(Contended::Arrival(position, vector));
+    }
+
+    /// An event under contention, by the rule of tries.
+    fn contend(&mut self, event: Contended) -> crate::Outcome {
+        if !self.locking_watched() {
+            self.contended.clear();
+            return self.run_once(&event);
+        }
+        let mut steps = Vec::new();
+        let first = self.dry_found(&event);
+        let (held, failed) = match self.round(&first, Vec::new(), &mut steps) {
+            Round::Taken(held) => return self.finish(&event, steps, &held),
+            // The holder's event came first: begin again, nothing changed.
+            Round::Changed(held) => {
+                release(&held, &mut steps);
+                return self.contend(event);
+            }
+            Round::Failed(held, index) => (held, index),
+        };
+        release(&held, &mut steps);
+        // The second round: the locks it now knows, in the order, waiting.
+        let mut known: Vec<LockId> = first[..=failed].to_vec();
+        for &lock in &known {
+            self.let_go(lock);
+        }
+        let second = self.dry_found(&event);
+        if event.never_again() {
+            // A `signal`, or an event that is not a call, follows the path
+            // of an arrival: it waits for every lock of its second round,
+            // in the order, and never returns `again` (D-135).
+            known.extend(second.iter().copied());
+            known.sort();
+            known.dedup();
+            for &lock in &known {
+                steps.push(Step::Pay(Cost::Lock));
+                steps.push(Step::Lock(lock));
+                self.let_go(lock);
+            }
+            return self.finish(&event, steps, &known);
+        }
+        known.sort();
+        known.dedup();
+        for &lock in &known {
+            steps.push(Step::Pay(Cost::Lock));
+            steps.push(Step::Lock(lock));
+        }
+        // It checks that what it read still leads to the same locks.
+        let changed = first[..=failed].iter().any(|l| !second.contains(l));
+        let held = match changed {
+            true => known,
+            false => match self.round(&second, known, &mut steps) {
+                Round::Taken(held) => return self.finish(&event, steps, &held),
+                Round::Failed(held, _) | Round::Changed(held) => held,
+            },
+        };
+        release(&held, &mut steps);
+        self.again_of_tries(event, steps)
+    }
+
+    /// The event runs with the locks the rounds took; the steps it records
+    /// are the rounds', then its own other steps, then the releases.
+    fn finish(
+        &mut self,
+        event: &Contended,
+        mut steps: Vec<Step>,
+        held: &[LockId],
+    ) -> crate::Outcome {
+        let outcome = self.run_once(event);
+        self.record_rounds(&mut steps, held);
+        if let Contended::Call(thread, _) = event
+            && let Some(t) = self.threads.get_mut(thread)
+        {
+            t.again_tries = 0;
+        }
+        outcome
+    }
+
+    /// Replaces the lock steps the event synthesised with the rounds it
+    /// made, keeping its other steps.
+    fn record_rounds(&mut self, steps: &mut Vec<Step>, held: &[LockId]) {
+        let others = self.locks.steps.iter().copied().filter(|s| {
+            !matches!(
+                s,
+                Step::Lock(_) | Step::Try(_) | Step::Unlock(_) | Step::Pay(Cost::Lock)
+            )
+        });
+        steps.extend(others);
+        release(held, steps);
+        self.locks.steps = std::mem::take(steps);
+    }
+
+    /// A call that the rule of tries makes return `again`, with nothing
+    /// changed; or, if its thread already got two such results in a row,
+    /// the escalation: it takes the node's quiet word, the other cores
+    /// leave their events (every lock they held is let go), and it runs
+    /// alone, waiting for its locks in the order (D-135).
+    fn again_of_tries(&mut self, event: Contended, mut steps: Vec<Step>) -> crate::Outcome {
+        let Contended::Call(thread, _) = event else {
+            unreachable!("only a call returns again");
+        };
+        let tries = self.threads.get(&thread).map_or(0, |t| t.again_tries);
+        if tries >= 2 {
+            steps.push(Step::Quiet(true));
+            let held: Vec<LockId> = self.contended.keys().copied().collect();
+            for lock in held {
+                self.let_go(lock);
+            }
+            let mut alone = self.dry_found(&event);
+            alone.sort();
+            alone.dedup();
+            for &lock in &alone {
+                steps.push(Step::Pay(Cost::Lock));
+                steps.push(Step::Lock(lock));
+            }
+            let outcome = self.run_once(&event);
+            self.record_rounds(&mut steps, &alone);
+            self.locks.steps.push(Step::Quiet(false));
+            if let Some(t) = self.threads.get_mut(&thread) {
+                t.again_tries = 0;
+            }
+            return outcome;
+        }
+        // An event that changes nothing: the call's entry and exit.
+        let core = self.core_of(thread);
+        let entry = self.begin_on(core);
+        self.end(entry);
+        self.locks.steps = steps;
+        if let Some(t) = self.threads.get_mut(&thread) {
+            t.again_tries = tries + 1;
+        }
+        Err(dodos_abi::Error::Again)
+    }
+}
+
+/// An event that may find locks held by another core.
+enum Contended {
+    Call(ObjId, crate::Syscall),
+    /// An interrupt arrival: the core's position and the vector.
+    Arrival(usize, u8),
+}
+
+impl Contended {
+    /// A `signal`, and an event that is not a call, never return `again`.
+    fn never_again(&self) -> bool {
+        !matches!(self, Self::Call(_, call) if !matches!(call, crate::Syscall::Signal(_)))
+    }
+}
+
+/// The releases of the locks held, in the reverse order.
+fn release(held: &[LockId], steps: &mut Vec<Step>) {
+    steps.extend(held.iter().rev().map(|&l| Step::Unlock(l)));
 }
 
 /// The state of the objects that have a lock under variant L2, before an

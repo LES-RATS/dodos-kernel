@@ -262,7 +262,12 @@ impl Model {
             let paid = steps.iter().any(|s| {
                 matches!(
                     s,
-                    Step::Pay(_) | Step::Lock(_) | Step::Try(_) | Step::Unlock(_)
+                    Step::Pay(_)
+                        | Step::Lock(_)
+                        | Step::Try(_)
+                        | Step::TryFailed(_)
+                        | Step::Unlock(_)
+                        | Step::Quiet(_)
                 )
             });
             ensure(
@@ -291,7 +296,7 @@ impl Model {
                         Step::Lock(LockId::Gate) => {
                             ensure(node, "L1: the gate lock taken outside the node lock")?
                         }
-                        Step::Lock(_) | Step::Try(_) => {
+                        Step::Lock(_) | Step::Try(_) | Step::TryFailed(_) | Step::Quiet(_) => {
                             return Err("L1: a lock other than the node lock and the gate lock");
                         }
                         _ => {}
@@ -303,9 +308,24 @@ impl Model {
                 // "A core waits for a lock only in the order by kind": a
                 // wait is for a lock after every lock held; a lock that
                 // comes before one held is tried (D-134). Judged in the
-                // order the event took them, never sorted.
+                // order the event took them, never sorted. A failed try
+                // releases every lock before anything else is taken; a call
+                // makes at most two rounds; the quiet word is taken with no
+                // lock held, and no try fails under it (D-135).
                 let mut held: Vec<LockId> = Vec::new();
+                let (mut failed, mut releasing, mut quiet, mut most) = (0, false, false, 0);
                 for step in steps {
+                    let takes = matches!(
+                        step,
+                        Step::Lock(_) | Step::Try(_) | Step::TryFailed(_) | Step::Quiet(true)
+                    );
+                    if takes {
+                        ensure(
+                            !releasing || held.is_empty(),
+                            "L2: a lock taken after a failed try before every lock held was released",
+                        )?;
+                        releasing = false;
+                    }
                     match *step {
                         Step::Lock(lock) => {
                             ensure(
@@ -314,17 +334,32 @@ impl Model {
                             )?;
                             held.push(lock);
                         }
-                        Step::Try(lock) => {
+                        Step::Try(lock) | Step::TryFailed(lock) => {
                             ensure(
                                 held.iter().any(|&h| lock < h) && !held.contains(&lock),
                                 "L2: a lock tried that is not before a lock held",
                             )?;
-                            held.push(lock);
+                            ensure(!quiet, "L2: a try under the quiet word")?;
+                            match *step {
+                                Step::Try(_) => held.push(lock),
+                                _ => (failed, releasing) = (failed + 1, true),
+                            }
                         }
                         Step::Unlock(lock) => held.retain(|&h| h != lock),
+                        Step::Quiet(true) => {
+                            ensure(
+                                held.is_empty(),
+                                "L2: the quiet word taken while a lock is held",
+                            )?;
+                            quiet = true;
+                        }
+                        Step::Quiet(false) => quiet = false,
                         _ => {}
                     }
+                    most = most.max(held.len());
                 }
+                ensure(failed <= 2, "L2: more than two rounds of locks in one call")?;
+                ensure(!quiet, "L2: the quiet word held past the end of an event")?;
                 if let Some(&last) = locks.last() {
                     ensure(
                         !locks.contains(&LockId::Gate) || last == LockId::Gate,
@@ -332,14 +367,18 @@ impl Model {
                     )?;
                 }
                 if let Some(bound) = self.locks.bound {
-                    ensure(locks.len() <= bound, "L2: more than k locks in one call")?;
+                    ensure(most <= bound, "L2: more than k locks in one call")?;
                 }
                 let paid = steps
                     .iter()
                     .filter(|s| matches!(s, Step::Pay(Cost::Lock)))
                     .count();
+                let tried = steps
+                    .iter()
+                    .filter(|s| matches!(s, Step::TryFailed(_)))
+                    .count();
                 ensure(
-                    paid == locks.len(),
+                    paid == locks.len() + tried,
                     "L2: a lock taken without its instruction",
                 )?;
             }
