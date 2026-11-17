@@ -796,7 +796,11 @@ fn an_attach_through_another_nodes_unit_uses_a_domain_number_of_the_requesters_r
     let requester = (0..3).find(|&n| n != holder).unwrap();
     let iospace = m.retype(requester, ObjectKind::IoSpace, 0, 150);
     m.ok(requester, iospace);
-    let iommu = s(slots_of(m.sys.node(requester), m.t[requester as usize], ObjectKind::Iommu)[0]);
+    let iommu = s(slots_of(
+        m.sys.node(requester),
+        m.t[requester as usize],
+        ObjectKind::Iommu,
+    )[0]);
     let attach = Syscall::IoSpaceAttach {
         iommu,
         iospace: s(150),
@@ -809,5 +813,10 @@ fn an_attach_through_another_nodes_unit_uses_a_domain_number_of_the_requesters_r
     let unit = &m.sys.canonical().units[&0];
     assert_eq!(unit.entries.get(&0x10).map(|e| e.0), Some(requester));
     let domain = unit.domains[&0x10];
-    assert!(m.sys.node(holder).domain_range(0, requester).contains(&domain));
+    assert!(
+        m.sys
+            .node(holder)
+            .domain_range(0, requester)
+            .contains(&domain)
+    );
 }
