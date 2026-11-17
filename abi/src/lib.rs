@@ -126,8 +126,8 @@ pub const CSPACE_MAX_SLOTS: u32 = 1 << 20;
 /// Bytes of the directory of a capability space for each segment of its
 /// maximum, before the directory is rounded up to a power of two (Slots and
 /// addresses): a segment's address and its sequence word, which serves the
-/// lock-free slot read of a node of several cores and, in variant L2, the
-/// segment's lock (D-129).
+/// lock-free slot read of a node of several cores and stays reserved as the
+/// segment's lock of a lock per object (D-129, D-138).
 pub const CSPACE_DIRECTORY_BYTES: usize = 16;
 
 /// Bytes that one call of a creation clears, at most (rules of

@@ -1,6 +1,6 @@
 //! Threads: configuration, bindings, resumption, suspension, cancellation.
 
-use crate::{CapId, Model, ObjId, Outcome, Output, Record, Wait, live, locked};
+use crate::{CapId, Model, ObjId, Outcome, Output, Record, Wait, live};
 use dodos_abi::{Error, MemoryType, ObjectKind, PageSize, Rights, SlotAddr};
 
 /// The four bindings that `thread_configure` replaces at once.
@@ -90,7 +90,7 @@ impl Model {
         self.bound_space(target).or(Err(Error::Busy))?;
         // Register calls: resuming a suspended thread clears its fault
         // record.
-        let resumed = locked(&mut self.threads, &self.locks, target);
+        let resumed = live(&mut self.threads, target);
         if resumed.suspended {
             resumed.recorded = None;
         }
@@ -107,8 +107,7 @@ impl Model {
     /// mark is set, so one that succeeds has a thread that executes nothing.
     pub(crate) fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        self.touch_own(target);
-        locked(&mut self.threads, &self.locks, target).suspended = true;
+        live(&mut self.threads, target).suspended = true;
         self.observe();
         if self.mark_leaving(target) || self.threads[&target].leaving {
             return Err(Error::Again);
@@ -136,8 +135,7 @@ impl Model {
         number: u64,
     ) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        self.touch_own(target);
-        let cancelled = locked(&mut self.threads, &self.locks, target);
+        let cancelled = live(&mut self.threads, target);
         cancelled.cancelled_up_to = cancelled.cancelled_up_to.max(number);
         let ended = match number {
             0 => true,
@@ -177,7 +175,7 @@ impl Model {
         if needed > changed.area {
             return Err(Error::NoMemory);
         }
-        locked(&mut self.threads, &self.locks, target).mask = mask;
+        live(&mut self.threads, target).mask = mask;
         Ok(Output::Done)
     }
 
@@ -186,10 +184,7 @@ impl Model {
     // end of the vector) after it leaves the list of what it was bound to.
 
     pub(crate) fn bind_space(&mut self, thread: ObjId, space: Option<ObjId>) {
-        let old = std::mem::replace(
-            &mut locked(&mut self.threads, &self.locks, thread).cspace,
-            space,
-        );
+        let old = std::mem::replace(&mut live(&mut self.threads, thread).cspace, space);
         if let Some(old) = old {
             leave(&mut live(&mut self.cspaces, old).threads, thread);
         }
@@ -199,48 +194,29 @@ impl Model {
     }
 
     pub(crate) fn bind_aspace(&mut self, thread: ObjId, aspace: Option<ObjId>) {
-        let old = std::mem::replace(
-            &mut locked(&mut self.threads, &self.locks, thread).aspace,
-            aspace,
-        );
+        let old = std::mem::replace(&mut live(&mut self.threads, thread).aspace, aspace);
         if let Some(old) = old {
-            leave(
-                &mut locked(&mut self.aspaces, &self.locks, old).threads,
-                thread,
-            );
+            leave(&mut live(&mut self.aspaces, old).threads, thread);
         }
         if let Some(aspace) = aspace {
-            locked(&mut self.aspaces, &self.locks, aspace)
-                .threads
-                .push(thread);
+            live(&mut self.aspaces, aspace).threads.push(thread);
         }
     }
 
     pub(crate) fn bind_fault(&mut self, thread: ObjId, fault: Option<(ObjId, u64)>) {
-        let old = std::mem::replace(
-            &mut locked(&mut self.threads, &self.locks, thread).fault,
-            fault,
-        );
+        let old = std::mem::replace(&mut live(&mut self.threads, thread).fault, fault);
         if let Some((old, _)) = old {
-            leave(
-                &mut locked(&mut self.endpoints, &self.locks, old).threads,
-                thread,
-            );
+            leave(&mut live(&mut self.endpoints, old).threads, thread);
         }
         if let Some((endpoint, _)) = fault {
-            locked(&mut self.endpoints, &self.locks, endpoint)
-                .threads
-                .push(thread);
+            live(&mut self.endpoints, endpoint).threads.push(thread);
         }
     }
 
     /// Bindings: the message page is bound through the record of the frame
     /// capability given; the thread names the capability.
     pub(crate) fn bind_page(&mut self, thread: ObjId, page: Option<CapId>) {
-        let old = std::mem::replace(
-            &mut locked(&mut self.threads, &self.locks, thread).page,
-            page,
-        );
+        let old = std::mem::replace(&mut live(&mut self.threads, thread).page, page);
         if let Some(old) = old {
             live(&mut self.caps, old).record = Record::Empty;
         }

@@ -6,7 +6,7 @@
 
 use crate::rings::{Body, Completes, Item, REPORT_ITEMS};
 use crate::units::Rebuild;
-use crate::{Model, ObjId, Outcome, Output, Wait, locked};
+use crate::{Model, ObjId, Outcome, Output, Wait, live};
 use dodos_abi::{
     Error, FENCE_NS, IOMMU_WAIT_NS, MemberState, OwnState, Owner, Ownership, REPORT_END, Rights,
     RoleKind, RoleState, RoleWord, SETTLE_NS, SlotAddr,
@@ -146,7 +146,7 @@ impl Model {
                         caller: Some(thread),
                     },
                 );
-                locked(&mut self.threads, &self.locks, thread).wait = Wait::Hand(role);
+                live(&mut self.threads, thread).wait = Wait::Hand(role);
                 self.wait_mark(crate::locks::WaitKind::Unit);
                 self.observe();
                 Ok(Output::Waits)

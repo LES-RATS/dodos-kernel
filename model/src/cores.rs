@@ -17,7 +17,7 @@
 //! contract does (`Model::check_cores`).
 
 use crate::locks::Cost;
-use crate::{CapId, Ephemeral, Model, ObjId, Output, Wait, locked};
+use crate::{CapId, Ephemeral, Model, ObjId, Output, Wait, live};
 use dodos_abi::{Error, Rights};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +53,8 @@ pub(crate) enum Flush {
     Tag(ObjId),
     /// The translations of these chunks in the kernel's own space.
     Kernel(Vec<u64>),
+    /// Nothing: the barrier before a watermark returns (D-138).
+    Nothing,
 }
 
 /// What the completion of a request completes.
@@ -69,6 +71,8 @@ pub(crate) enum Completes {
     /// run are written at the completion (`memory_give`, or the destruction
     /// of a block).
     Run(crate::blocks::FreedRun),
+    /// A barrier: the barrier epoch becomes at least this kernel epoch.
+    Barrier(u64),
 }
 
 /// The state word of a core's invalidation request: *in use* written by
@@ -237,7 +241,7 @@ impl Model {
             return false;
         }
         if !self.threads[&thread].leaving {
-            locked(&mut self.threads, &self.locks, thread).leaving = true;
+            live(&mut self.threads, thread).leaving = true;
             self.post(core, Ipi::Leave);
             self.observe();
         }
@@ -254,7 +258,7 @@ impl Model {
             return;
         };
         if self.threads.get(&thread).is_some_and(|t| t.leaving) {
-            locked(&mut self.threads, &self.locks, thread).leaving = false;
+            live(&mut self.threads, thread).leaving = false;
             self.cores[at].thread = None;
             self.cores[at].running = None;
             self.observe();
@@ -294,7 +298,7 @@ impl Model {
         let space = match &flush {
             Flush::Range { space, .. } => Some(*space),
             Flush::Tag(space) => Some(*space),
-            Flush::Kernel(_) => None,
+            Flush::Kernel(_) | Flush::Nothing => None,
         };
         if !self.others_hold(space) {
             match self.machine.arch {
@@ -351,7 +355,7 @@ impl Model {
             return Started::Complete;
         }
         if let Some(thread) = waiter {
-            locked(&mut self.threads, &self.locks, thread).wait = Wait::Cores(at);
+            live(&mut self.threads, thread).wait = Wait::Cores(at);
             self.wait_mark(crate::locks::WaitKind::Cores);
             self.observe();
         }
@@ -362,6 +366,9 @@ impl Model {
     /// translations go, and a whole tag clears the core's bit in the set of
     /// cores that loaded it.
     pub(crate) fn invalidate_on(&mut self, core: usize, flush: &Flush) {
+        if *flush == Flush::Nothing {
+            return;
+        }
         let part = &mut self.cores[core];
         // What is still mapped is cached again at the core's next event.
         part.cached.0 = (u64::MAX, None);
@@ -384,7 +391,37 @@ impl Model {
                     part.kernel_tlb.remove(chunk);
                 }
             }
+            Flush::Nothing => {}
         }
+    }
+
+    /// The barrier before a watermark returns (A node of several cores,
+    /// D-138): the request of the calling core with nothing to invalidate
+    /// and the kernel epoch of the moment, asking every other core of the
+    /// node, idle ones included, on every architecture (on ARM64 it is the
+    /// request's only use). Each asked core answers at the interrupt, which
+    /// it takes at the end of its current event; the completion raises the
+    /// barrier epoch. Nothing if the request of the core is in use.
+    pub(crate) fn start_barrier(&mut self) {
+        let at = *self.at;
+        if self.width() == 1 || self.cores[at].request_state == RequestState::InUse {
+            return;
+        }
+        let asked = self.all_cores() & !(1u64 << at);
+        for core in (0..self.width()).filter(|&c| asked & 1 << c != 0) {
+            self.cores[core].pending.insert(at);
+            self.post(core, Ipi::Invalidate);
+        }
+        self.pay(Cost::Request);
+        self.cores[at].request = Some(Request {
+            flush: Flush::Nothing,
+            asked,
+            acked: 0,
+            started: self.now,
+            completes: Completes::Barrier(self.kernel_epoch),
+            waiter: None,
+        });
+        self.cores[at].request_state = RequestState::InUse;
     }
 
     /// At the invalidation interrupt, a core does on itself what each
@@ -432,6 +469,7 @@ impl Model {
                 }
             }
             Completes::Run(freed) => self.write_freed(freed),
+            Completes::Barrier(epoch) => self.barrier_epoch = self.barrier_epoch.max(epoch),
         }
         if let Some(thread) = request.waiter
             && self
@@ -510,7 +548,7 @@ impl Model {
             let bit = 1u64 << at;
             if self.aspaces[&space].cores & bit == 0 && self.width() > 1 {
                 self.pay(Cost::LoadedSet);
-                locked(&mut self.aspaces, &self.locks, space).cores |= bit;
+                live(&mut self.aspaces, space).cores |= bit;
             }
         }
         self.cache_here();

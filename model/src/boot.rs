@@ -5,7 +5,7 @@
 use crate::caps::Clearing;
 use crate::memory::hooked;
 use crate::table::{RoleRecord, Table};
-use crate::{CapId, Frame, Iommu, Mapping, Model, ObjId, Place, live, locked};
+use crate::{CapId, Frame, Iommu, Mapping, Model, ObjId, Place, live};
 use dodos_abi::x86_64::{REG_RDI, REG_RIP};
 use dodos_abi::{
     BootFloors, BootMembership, CORE_ANSWER_RANGE_NS, CORES_PER_KERNEL_MAX, CSPACE_SEGMENT_SLOTS,
@@ -187,19 +187,12 @@ pub struct Machine {
     /// The cores per node the kernel image supports (entry `Node`).
     pub cores_supported: u32,
     /// The longest hold of a node's lock measured for the image, *H*, and
-    /// under L2 the longest hold of an object lock *h*, the longest kernel
-    /// event on one core *E*1, the longest one-core bound of a call
-    /// *B*1max and the delivery of one interrupt *D*: the machine start-up
-    /// refuses a `CORE_ANSWER_NS` not above the longest healthy wait, and
-    /// a `STALE_NS` or a `STUCK_NS` not above it with an event (D-131,
-    /// D-137).
+    /// the delivery of one interrupt *D*: the machine start-up refuses a
+    /// `CORE_ANSWER_NS` not above the longest healthy wait, 2 × *E* + *D*
+    /// with *E* = *N* × *H*, and a `STALE_NS` or a `STUCK_NS` not above it
+    /// with an event (D-131, D-137, D-138).
     pub hold_ns: u64,
-    pub object_hold_ns: u64,
-    pub event_ns: u64,
-    pub one_core_ns: u64,
     pub delivery_ns: u64,
-    /// The lock discipline of a node of several cores.
-    pub locking: crate::Locking,
     /// The image declares the hardening monitor: every core is of fence
     /// class 2.
     pub monitor: bool,
@@ -375,11 +368,7 @@ impl Machine {
             boot_nodes: None,
             cores_supported: CORES_PER_KERNEL_MAX as u32,
             hold_ns: 10_000,
-            object_hold_ns: 1_000,
-            event_ns: 10_000,
-            one_core_ns: 10_000,
             delivery_ns: 5_000,
-            locking: crate::Locking::L1,
             monitor: false,
             accept_unfenced: false,
             processor_entropy: true,
@@ -758,13 +747,10 @@ impl Machine {
         let measured = crate::locks::Measured {
             cores: largest,
             node_hold: self.hold_ns,
-            object_hold: self.object_hold_ns,
-            event: self.event_ns,
-            one_core: self.one_core_ns,
             delivery: self.delivery_ns,
         };
-        let held = measured.healthy_wait(self.locking);
-        let event = measured.event_with_waits(self.locking);
+        let held = measured.healthy_wait();
+        let event = measured.event_with_waits();
         let stale = u64::from(self.membership.stale_ms) * 1_000_000;
         let stuck = u64::from(self.membership.stuck_ms) * 1_000_000;
         let beats = stale > answer.saturating_add(event)
@@ -1087,8 +1073,8 @@ impl Model {
             node,
             table,
             cores: parts,
-            // The kernel epoch starts at 1, so an entry word of 0 means a
-            // core out of a kernel event (D-135).
+            // The kernel epoch starts at 1; the barrier epoch at 0 covers
+            // no watermark (D-135, D-138).
             kernel_epoch: 1,
             ..Self::default()
         };
@@ -1155,7 +1141,7 @@ impl Model {
         }
         // The start-up task: identifier 1 of this node, marks 0, mark-aware.
         let task = add(self, ObjectKind::Task, 0, START_SLOT_TASK, all);
-        let start = locked(&mut self.tasks, &self.locks, task);
+        let start = live(&mut self.tasks, task);
         (start.id, start.aware) = (TaskId::new(self.node, 1), true);
         self.task_counter = 1;
         // The memory_control has every right, `exec` included (rule 8).
@@ -1316,19 +1302,17 @@ impl Model {
         // The address space was built with the tables these mappings need
         // and the reserve of free tables the boot image states.
         let hooked = hooked(&self.aspaces[&aspace], geometry.levels, geometry);
-        locked(&mut self.aspaces, &self.locks, aspace).tables = hooked + machine.reserve_tables;
+        live(&mut self.aspaces, aspace).tables = hooked + machine.reserve_tables;
         // The first thread: bound to the space in slot 1, the address space
         // in slot 2 and the message page in slot 10; not suspended.
         self.bind_space(thread, Some(space));
         self.bind_aspace(thread, Some(aspace));
         self.bind_page(thread, Some(message_page));
-        locked(&mut self.tasks, &self.locks, task)
-            .threads
-            .push(thread);
-        locked(&mut self.threads, &self.locks, thread).task = Some(task);
+        live(&mut self.tasks, task).threads.push(thread);
+        live(&mut self.threads, thread).task = Some(task);
         // Registers: the entry point, and the address of the start-up page
         // in the first argument register; the others 0, the flags fixed.
-        let first = locked(&mut self.threads, &self.locks, thread);
+        let first = live(&mut self.threads, thread);
         first.suspended = false;
         first.regs[REG_RIP] = machine.entry;
         first.regs[REG_RDI] = 2 * page;

@@ -2,7 +2,7 @@
 
 use crate::caps::Clearing;
 use crate::{
-    ASpace, CapId, Map, Mapping, Model, ObjId, Outcome, Output, Record, Translation, live, locked,
+    ASpace, CapId, Map, Mapping, Model, ObjId, Outcome, Output, Record, Translation, live,
 };
 use dodos_abi::{
     Error, Geometry, IOSPACE_MAX_DEVICES, ObjectKind, PageSize, Rights, SlotAddr,
@@ -52,7 +52,7 @@ impl Model {
         let frame = self.frames[&self.caps[&cap].object];
         let size = frame.page;
         let bytes = self.bytes(size);
-        let aspace = locked(&mut self.aspaces, &self.locks, space);
+        let aspace = live(&mut self.aspaces, space);
         for page in mapping.first..mapping.first + mapping.count {
             let at = mapping.address + (page - mapping.first) * bytes;
             let translation = Translation {
@@ -177,7 +177,7 @@ impl Model {
             .filter(|key| !aspace.hooked.contains_key(key))
             .copied()
             .collect();
-        let aspace = locked(&mut self.aspaces, &self.locks, space);
+        let aspace = live(&mut self.aspaces, space);
         for key in gone.iter().rev() {
             let page = aspace.hooked.remove(key).expect("hooked");
             match by {
@@ -232,7 +232,7 @@ impl Model {
         let Record::Mapping(mapping) = self.caps[&cap].record else {
             return None;
         };
-        let aspace = locked(&mut self.aspaces, &self.locks, mapping.space);
+        let aspace = live(&mut self.aspaces, mapping.space);
         let addresses: Vec<u64> = aspace
             .translations
             .iter()
@@ -566,9 +566,9 @@ impl Model {
             // G2: the page goes to the free list; the gate gives it the
             // class of the level it is hooked at (`rehook`).
             let at = self.untypeds[&untyped].base + taken.at;
-            locked(&mut self.aspaces, &self.locks, space).free.push(at);
+            live(&mut self.aspaces, space).free.push(at);
         }
-        locked(&mut self.aspaces, &self.locks, space).tables += missing;
+        live(&mut self.aspaces, space).tables += missing;
         let partial = done + step < map.count;
         if done > 0 {
             self.extend_mapping(cap, step, partial);
@@ -633,7 +633,7 @@ impl Model {
         };
         let frame = self.frames[&self.caps[&cap].object];
         let bytes = self.bytes(frame.page);
-        let aspace = locked(&mut self.aspaces, &self.locks, mapping.space);
+        let aspace = live(&mut self.aspaces, mapping.space);
         for page in mapping.first + mapping.count..mapping.first + mapping.count + more {
             let at = mapping.address + (page - mapping.first) * bytes;
             let translation = Translation {
@@ -752,7 +752,7 @@ impl Model {
         }
         mapping.rights = rights;
         live(&mut self.caps, cap).record = Record::Mapping(mapping);
-        let aspace = locked(&mut self.aspaces, &self.locks, space);
+        let aspace = live(&mut self.aspaces, space);
         let mut addresses = Vec::new();
         for (&at, translation) in aspace.translations.iter_mut().filter(|(_, t)| t.cap == cap) {
             translation.rights = rights;
@@ -873,9 +873,7 @@ impl Model {
         unit.attached.insert(device, iospace);
         unit.order.push(device);
         let unit = unit.unit;
-        locked(&mut self.aspaces, &self.locks, iospace)
-            .units
-            .insert(unit);
+        live(&mut self.aspaces, iospace).units.insert(unit);
         // The context entry, written by the holder of the unit's role: a
         // unit request, which the thread waits for.
         let role = self.unit_role(unit);

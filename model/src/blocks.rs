@@ -208,6 +208,7 @@ impl Model {
             return Err(Error::Invalid);
         }
         self.idle_block(cap, object)?;
+        self.return_watermark(object)?;
         // The gate refuses a give while a map count of the run is not 0.
         if self.mapped_block(object) {
             return Err(Error::Busy);
@@ -249,6 +250,11 @@ impl Model {
     /// step must end with `again`.
     pub(crate) fn unmap_block(&mut self, object: ObjId) -> Option<bool> {
         let block = self.untypeds[&object].block?;
+        // A watermark ready to return is returned first, by the barrier
+        // (A node of several cores, D-138).
+        if self.return_watermark(object).is_err() {
+            return Some(false);
+        }
         let in_flight = self.cores.iter().filter_map(|c| c.request.as_ref()).any(
             |r| matches!(&r.completes, crate::cores::Completes::Run(f) if f.object == Some(object)),
         );
@@ -288,6 +294,7 @@ impl Model {
             return Err(Error::Invalid);
         }
         self.idle_block(cap, object)?;
+        self.return_watermark(object)?;
         let unclaimed = Ownership::free(Owner::Unclaimed);
         let spare = self
             .table
@@ -341,7 +348,6 @@ impl Model {
     /// it), and what its words become is kept for their write. A block that
     /// is destroyed by steps keeps its place until the words are written.
     fn take_block(&mut self, object: ObjId, freed: Freed, keep: bool) -> Option<FreedRun> {
-        self.touch_untyped(object);
         let untyped = self.untypeds.get_mut(&object)?;
         let block = match keep {
             true => untyped.block?,

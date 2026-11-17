@@ -5,18 +5,16 @@
 //! is caught here.
 
 use super::*;
+use crate::Wait;
 use crate::cores::{Completes, Flush, Request};
 use crate::locks::{Cost, LockId, Step};
 use crate::nodes::HwAction;
 use crate::table::{FenceStep, GrantState};
-use crate::{Locking, Wait};
 use dodos_abi::{CHECK_MUL, CoreWord, Member, RoleWord};
 
-/// A node of two cores alone, under `locking`.
-fn node2(locking: Locking) -> N {
-    let mut machine = one_node(crate::Arch::X86_64, 2);
-    machine.locking = locking;
-    N::on(&machine)
+/// A node of two cores alone.
+fn node2() -> N {
+    N::on(&one_node(crate::Arch::X86_64, 2))
 }
 
 #[track_caller]
@@ -68,7 +66,7 @@ fn request(asked: u64, acked: u64, started: u64) -> Request {
 
 #[test]
 fn a_translation_a_core_keeps_after_a_completed_change_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     let space = k.m.threads[&k.t].aspace.unwrap();
     let cap = *k.m.caps.keys().next().unwrap();
     k.m.cores[1]
@@ -84,7 +82,7 @@ fn a_translation_a_core_keeps_after_a_completed_change_is_reported() {
 
 #[test]
 fn a_run_of_the_kernels_space_a_core_still_translates_after_it_was_given_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.cores[1].kernel_tlb.insert(u64::MAX >> 30);
     reported(
         &k,
@@ -102,7 +100,7 @@ fn a_request_on_a_node_of_one_core_is_reported() {
 
 #[test]
 fn a_request_that_asks_its_own_core_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.cores[0].request = Some(request(0b11, 0, 0));
     k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     reported(&k, "TLB: a request asks its own core");
@@ -110,7 +108,7 @@ fn a_request_that_asks_its_own_core_is_reported() {
 
 #[test]
 fn a_complete_request_kept_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.cores[0].request = Some(request(0b10, 0b10, 0));
     k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     reported(&k, "TLB: a complete request kept");
@@ -118,7 +116,7 @@ fn a_complete_request_kept_is_reported() {
 
 #[test]
 fn a_request_whose_record_is_not_unmapping_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     let cap = *k.m.caps.keys().next().unwrap();
     let mut r = request(0b10, 0, 0);
     r.completes = Completes::Record(cap);
@@ -130,7 +128,7 @@ fn a_request_whose_record_is_not_unmapping_is_reported() {
 
 #[test]
 fn a_request_whose_thread_waits_for_something_else_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     let thread = idle_thread(&mut k);
     let mut r = request(0b10, 0, 0);
     r.waiter = Some(thread);
@@ -143,7 +141,7 @@ fn a_request_whose_thread_waits_for_something_else_is_reported() {
 
 #[test]
 fn a_request_older_than_core_answer_ns_on_a_node_that_did_not_accuse_itself_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.cores[0].request = Some(request(0b10, 0, 0));
     k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     k.m.cores[1].pending.insert(0);
@@ -156,7 +154,7 @@ fn a_request_older_than_core_answer_ns_on_a_node_that_did_not_accuse_itself_is_r
 
 #[test]
 fn a_pending_bit_that_names_no_request_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.cores[1].pending.insert(0);
     reported(&k, "TLB: a pending bit names no request that asks the core");
 }
@@ -173,7 +171,7 @@ fn an_idle_mark_on_a_node_of_one_core_is_reported() {
 
 #[test]
 fn a_thread_waiting_for_a_request_not_in_flight_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     let thread = idle_thread(&mut k);
     k.m.threads.get_mut(&thread).unwrap().wait = Wait::Cores(1);
     reported(
@@ -186,7 +184,7 @@ fn a_thread_waiting_for_a_request_not_in_flight_is_reported() {
 
 #[test]
 fn a_marked_thread_with_no_leave_interrupt_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     let thread = idle_thread(&mut k);
     k.m.threads.get_mut(&thread).unwrap().leaving = true;
     reported(
@@ -217,7 +215,7 @@ fn a_node_of_one_core_that_pays_for_several_is_reported() {
 
 #[test]
 fn a_spin_inside_a_hold_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.locks.steps = vec![Step::Spin(crate::locks::WaitKind::Cores)];
     reported(
         &k,
@@ -226,57 +224,17 @@ fn a_spin_inside_a_hold_is_reported() {
 }
 
 #[test]
-fn under_l1_the_gate_lock_outside_the_node_lock_is_reported() {
-    let mut k = node2(Locking::L1);
+fn the_gate_lock_outside_the_node_lock_is_reported() {
+    let mut k = node2();
     k.m.locks.steps = vec![Step::Lock(LockId::Gate), Step::Unlock(LockId::Gate)];
-    reported(&k, "L1: the gate lock taken outside the node lock");
+    reported(&k, "the gate lock taken outside the node lock");
 }
 
 #[test]
-fn under_l1_the_node_lock_held_past_the_exit_is_reported() {
-    let mut k = node2(Locking::L1);
+fn the_node_lock_held_past_the_exit_is_reported() {
+    let mut k = node2();
     k.m.locks.steps = vec![Step::Pay(Cost::Lock), Step::Lock(LockId::Node)];
-    reported(&k, "L1: the node lock held past the exit of an event");
-}
-
-#[test]
-fn under_l1_a_lock_of_an_object_is_reported() {
-    let mut k = node2(Locking::L1);
-    let thread = k.t;
-    k.m.locks.steps = vec![Step::Lock(LockId::Thread(thread))];
-    reported(&k, "L1: a lock other than the node lock and the gate lock");
-}
-
-#[test]
-fn under_l2_the_gate_lock_before_another_is_reported() {
-    let mut k = node2(Locking::L2);
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Gate),
-        Step::Pay(Cost::Lock),
-        Step::Try(LockId::Core(0)),
-    ];
-    reported(&k, "L2: the gate lock is not the last of the order");
-}
-
-#[test]
-fn under_l2_more_than_k_locks_is_reported() {
-    let mut k = node2(Locking::L2);
-    k.m.locks.bound = Some(1);
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Core(0)),
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Gate),
-    ];
-    reported(&k, "L2: more than k locks in one call");
-}
-
-#[test]
-fn under_l2_a_lock_without_its_instruction_is_reported() {
-    let mut k = node2(Locking::L2);
-    k.m.locks.steps = vec![Step::Lock(LockId::Core(0))];
-    reported(&k, "L2: a lock taken without its instruction");
+    reported(&k, "the node lock held past the exit of an event");
 }
 
 // Credits.
@@ -591,7 +549,7 @@ fn a_grant_freed_while_its_holder_translates_to_it_is_reported() {
 
 #[test]
 fn a_thread_on_two_cores_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     k.m.cores[1].thread = Some(k.t);
     k.m.cores[1].ipis.insert(crate::Ipi::Reschedule);
     reported(&k, "46: a thread on two cores");
@@ -599,7 +557,7 @@ fn a_thread_on_two_cores_is_reported() {
 
 #[test]
 fn a_running_thread_bound_to_no_address_space_is_reported() {
-    let mut k = node2(Locking::L1);
+    let mut k = node2();
     let space = k.m.threads[&k.t].aspace.unwrap();
     k.m.threads.get_mut(&k.t).unwrap().aspace = None;
     k.m.aspaces

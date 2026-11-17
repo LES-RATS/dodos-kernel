@@ -56,7 +56,7 @@ pub use boot::{
 };
 pub use check::Census;
 pub use cores::Ipi;
-pub use locks::{LockId, Locking, Step};
+pub use locks::{LockId, Step};
 pub use nodes::HwAction;
 pub use rings::Message as RingMessage;
 pub use system::{Hardware, System};
@@ -582,11 +582,10 @@ struct Untyped {
     /// Objects, segments of capability spaces and tables of address spaces
     /// taken from it and not yet destroyed.
     live: u32,
-    /// Under L2 on several cores: the kernel epoch at which its watermark
-    /// became ready to return, at the destruction of its last object; it
-    /// returns at the first `untyped_retype` that finds every other core
-    /// out of the kernel event it was in then (word 6 of its root's slot,
-    /// D-135).
+    /// On several cores: the kernel epoch at which its watermark became
+    /// ready to return, at the destruction of its last object; it returns
+    /// at the first `untyped_retype` once a complete barrier covers that
+    /// epoch (word 6 of its root's slot, D-135, D-138).
     ready: Option<u64>,
 }
 
@@ -694,10 +693,6 @@ struct Iommu {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Thread {
-    /// Its consecutive results `again` of the rule of tries under L2 (a
-    /// failed try of the second round, or a link that changed): at 2, its
-    /// next such call escalates to the quiet word (D-135).
-    again_tries: u8,
     /// Bindings, each a link both ways: the capability space, the address
     /// space, the fault endpoint with the badge of the capability given to
     /// `thread_configure`, and the frame capability whose record binds the
@@ -1074,21 +1069,15 @@ pub struct Model {
     /// What the last event did, for the invariants that judge an event.
     event: Ephemeral<EventLog>,
     /// The locks the last event took and the waits it entered, for the
-    /// checks of the two variants (A node of several cores).
+    /// checks of the node lock (A node of several cores).
     locks: Ephemeral<locks::Trace>,
-    /// Locks of this node held by other cores across its events, as a test
-    /// scripts them (variant L2): what makes a try fail (D-134, D-135).
-    pub(crate) contended: BTreeMap<usize, locks::Holder>,
     /// The kernel epoch: one word of the node block, raised at the last
-    /// destruction of an untyped's object and at an escalation (D-135).
+    /// destruction of an untyped's object (D-135, D-138).
     pub(crate) kernel_epoch: u64,
-    /// The core whose escalated call holds the quiet word, if any, and the
-    /// arrivals each other core keeps pending at its controller meanwhile,
-    /// its interrupts masked while it waits (D-137).
-    pub(crate) quiet: Option<usize>,
-    pub(crate) masked: BTreeMap<usize, Vec<u8>>,
-    /// Under variant L2: the objects as they were before the event.
-    before: Ephemeral<Option<Box<locks::Snapshot>>>,
+    /// The barrier epoch: the largest kernel epoch a complete barrier
+    /// covers; a watermark ready at an epoch it covers returns (A node of
+    /// several cores, D-138).
+    pub(crate) barrier_epoch: u64,
     /// The pending interrupts of the cores are delivered by the caller
     /// (`System`), which interleaves them, rather than at the end of each
     /// event.
@@ -1188,19 +1177,6 @@ pub struct Model {
 /// The entry `id` of one of the maps of the state, to change it. Every
 /// identity the state holds names a live entry (`Model::check`).
 fn live<K: Ord + Debug, T>(map: &mut BTreeMap<K, T>, id: K) -> &mut T {
-    map.get_mut(&id).expect("names a live entry")
-}
-
-/// The entry of an object that has a lock word under variant L2, to change
-/// it: the event records that it touched the object's lock.
-fn locked<'a, T: locks::Locked>(
-    map: &'a mut BTreeMap<ObjId, T>,
-    trace: &locks::Trace,
-    id: ObjId,
-) -> &'a mut T {
-    if let Some(lock) = T::lock(id) {
-        trace.touch(lock);
-    }
     map.get_mut(&id).expect("names a live entry")
 }
 
@@ -1397,14 +1373,6 @@ impl Model {
     /// core that runs it, else the core of its context.
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
-        match self.contended.is_empty() {
-            true => self.apply_once(thread, call),
-            false => self.apply_contended(thread, call),
-        }
-    }
-
-    /// One call as one event, with no lock held by another core.
-    pub(crate) fn apply_once(&mut self, thread: ObjId, call: Syscall) -> Outcome {
         let kind = match call {
             Syscall::CapDelete(_) | Syscall::CapRevoke(_) => sched::EventKind::Removal,
             Syscall::TaskRevoke(_) => sched::EventKind::TaskRevoke,
@@ -1414,22 +1382,15 @@ impl Model {
         let core = self.core_of(thread);
         assert!(!self.cores[core].silent, "core {core} does not answer");
         let entry = self.begin_on(core);
-        self.locks.bound = Some(locks::bound(&call));
         self.locks.lock_free = matches!(call, Syscall::Signal(_));
         let outcome = self.made(thread, call);
-        // Any result of a call other than the `again` of the rule of tries
-        // sets the thread's count of them to 0 (D-135; finding 5 of the
-        // tenth model review: only a call under contention reset it).
-        if let Some(t) = self.threads.get_mut(&thread) {
-            t.again_tries = 0;
-        }
         self.end(entry);
         self.auto_deliver();
         outcome
     }
 
     fn made(&mut self, thread: ObjId, call: Syscall) -> Outcome {
-        let made = locked(&mut self.threads, &self.locks, thread);
+        let made = live(&mut self.threads, thread);
         (made.outcome, made.answered) = (None, false);
         let number = match call {
             Syscall::Call { wait, .. }
@@ -1446,7 +1407,7 @@ impl Model {
         // object it armed is idle again. A call that ends without waiting
         // does not look at the word.
         if outcome == Output::Waits {
-            let waiting = locked(&mut self.threads, &self.locks, thread);
+            let waiting = live(&mut self.threads, thread);
             if number != 0 && number <= waiting.cancelled_up_to {
                 self.unlink(thread);
                 return Err(Error::Cancelled);
@@ -1891,7 +1852,7 @@ impl Model {
     /// Ends a bounded wait (one that holds no queue): its outcome may be
     /// any outcome of its call.
     pub(crate) fn end_bounded(&mut self, thread: ObjId) {
-        let ended = locked(&mut self.threads, &self.locks, thread);
+        let ended = live(&mut self.threads, thread);
         (ended.wait, ended.answered) = (Wait::None, true);
     }
 
@@ -1905,7 +1866,8 @@ impl Model {
     /// answer has its effect on the thread, and a wait that ends without an
     /// answer leaves it suspended with the fault dropped.
     fn wake(&mut self, thread: ObjId, outcome: Outcome) {
-        let woken = locked(&mut self.threads, &self.locks, thread);
+        self.locks.woke = true;
+        let woken = live(&mut self.threads, thread);
         woken.number = 0;
         if std::mem::take(&mut woken.faulting) {
             woken.raised = None;

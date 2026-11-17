@@ -785,47 +785,6 @@ fn one_node_on_a_machine_of_class_0_holds_the_boot_core_alone_when_the_cores_dif
     assert_eq!(machine.initial_nodes(), vec![vec![0]]);
 }
 
-// L2 (A node of several cores, "The order of L2 and its bound", D-134): a
-// lock found through an object the call holds, earlier in the order, is
-// tried; the trace keeps the order the call took its locks in.
-
-#[test]
-fn under_l2_a_call_records_its_locks_in_the_order_it_took_them_with_tries_apart() {
-    let mut machine = one_node(crate::Arch::X86_64, 2);
-    machine.locking = crate::Locking::L2;
-    let mut k = N::on(&machine);
-    k.place_first(0);
-    let receiver = k.thread_on(300, 0);
-    k.ok(k.retype(ObjectKind::Endpoint, 0, 310));
-    k.ok(k.retype(ObjectKind::Reply, 0, 311));
-    let recv = Syscall::Recv {
-        endpoint: s(310),
-        reply: s(311),
-        range: Range::NONE,
-        wait: 0,
-    };
-    assert_eq!(k.call(receiver, recv), WAITS);
-    let call = Syscall::Call {
-        endpoint: s(310),
-        message: crate::Message::default(),
-        range: Range::NONE,
-        wait: 0,
-    };
-    assert_eq!(k.call(k.t, call), WAITS);
-    // The delivery lends the caller's context: the model finds it after the
-    // lock of the core it queues on, earlier in the order, so it is a try,
-    // not a wait; the trace is the order of the call, not a sorted list.
-    let context = k.m.threads[&k.t].home.unwrap();
-    let steps = &k.m.locks.steps;
-    let core = steps
-        .iter()
-        .position(|s| matches!(s, crate::locks::Step::Lock(crate::locks::LockId::Core(_))));
-    let tried = steps
-        .iter()
-        .position(|s| *s == crate::locks::Step::Try(crate::locks::LockId::Sched(context)));
-    assert!(core.is_some() && tried > core, "{steps:?}");
-}
-
 // A requester takes the domain number of a new iospace from its own node
 // slot's range (Devices and shared hardware, domain numbers, D-134).
 

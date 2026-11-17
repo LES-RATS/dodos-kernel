@@ -6,7 +6,7 @@
 use super::*;
 use crate::cores::{Flush, Ipi};
 use crate::locks::{Cost, LockId, Step};
-use crate::{Locking, Record, Wait};
+use crate::{Record, Wait};
 use dodos_abi::{CrashReason, START_SLOT_ASPACE};
 
 pub(super) const FRAME: u32 = 200;
@@ -477,31 +477,25 @@ fn a_core_that_runs_one_thread_with_no_other_event_beats_every_half_stale_ns() {
     assert_eq!(sys.state(0), MemberState::Live);
 }
 
-// Locking: two variants with one layout.
+// Locking: one node lock (D-138).
 
 #[test]
 fn a_node_of_one_core_takes_no_lock_and_pays_no_cost_of_several_cores() {
-    for locking in [Locking::L1, Locking::L2] {
-        let mut machine = one_node(Arch::X86_64, 1);
-        machine.locking = locking;
-        let mut k = N::on(&machine);
-        k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
-        k.ok(map(FRAME, AT, rw()));
-        k.ok(Syscall::ASpaceUnmap(s(FRAME)));
-        assert!(
-            k.m.locks
-                .steps
-                .iter()
-                .all(|s| !matches!(s, Step::Lock(_) | Step::Unlock(_) | Step::Pay(_)))
-        );
-    }
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
+    k.ok(map(FRAME, AT, rw()));
+    k.ok(Syscall::ASpaceUnmap(s(FRAME)));
+    assert!(
+        k.m.locks
+            .steps
+            .iter()
+            .all(|s| !matches!(s, Step::Lock(_) | Step::Unlock(_) | Step::Pay(_)))
+    );
 }
 
 #[test]
-fn under_l1_every_event_holds_the_node_lock_from_entry_to_exit_and_the_gate_lock_inside() {
-    let mut machine = one_node(Arch::X86_64, 2);
-    machine.locking = Locking::L1;
-    let mut k = N::on(&machine);
+fn every_event_holds_the_node_lock_from_entry_to_exit_and_the_gate_lock_inside() {
+    let mut k = N::on(&one_node(Arch::X86_64, 2));
     k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
     k.ok(map(FRAME, AT, rw()));
     let steps: Vec<&Step> =
@@ -516,89 +510,28 @@ fn under_l1_every_event_holds_the_node_lock_from_entry_to_exit_and_the_gate_lock
 }
 
 #[test]
-fn under_l2_a_call_takes_its_locks_in_the_order_of_their_kind_the_gate_lock_last() {
-    let mut machine = one_node(Arch::X86_64, 2);
-    machine.locking = Locking::L2;
-    let mut k = N::on(&machine);
+fn the_check_refuses_a_lock_the_contract_forbids() {
+    let mut k = N::on(&one_node(Arch::X86_64, 2));
     k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
-    k.ok(map(FRAME, AT, rw()));
-    let locks: Vec<LockId> =
-        k.m.locks
-            .steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::Lock(l) => Some(*l),
-                _ => None,
-            })
-            .collect();
-    assert!(!locks.is_empty());
-    assert!(locks.windows(2).all(|w| w[0] < w[1]));
-    assert_eq!(locks.last(), Some(&LockId::Gate));
-    let paid =
-        k.m.locks
-            .steps
-            .iter()
-            .filter(|s| **s == Step::Pay(Cost::Lock))
-            .count();
-    assert_eq!(paid, locks.len());
-}
-
-#[test]
-fn the_check_refuses_a_lock_order_the_contract_forbids() {
-    let mut machine = one_node(Arch::X86_64, 2);
-    machine.locking = Locking::L2;
-    let mut k = N::on(&machine);
-    k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
-    // The gate lock before an object lock.
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Gate),
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Core(0)),
-    ];
-    assert!(k.m.check().is_err());
-    // Object locks out of the order of their kind, the gate lock not taken.
-    let thread = k.t;
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Core(0)),
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Thread(thread)),
-    ];
-    assert!(k.m.check().is_err());
-    // Found locks: a lock earlier than one held is tried, never waited
-    // for; a try of a lock that is not before any lock held is not one the
-    // contract's rule makes (D-134). The order is judged as the call took
-    // the locks, never sorted.
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Core(0)),
-        Step::Pay(Cost::Lock),
-        Step::Try(LockId::Thread(thread)),
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Gate),
-    ];
-    assert_eq!(k.m.check(), Ok(()));
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Core(0)),
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Thread(thread)),
-    ];
+    // The gate lock outside the node lock.
+    k.m.locks.steps = vec![Step::Pay(Cost::Lock), Step::Lock(LockId::Gate)];
     assert_eq!(
         k.m.check(),
-        Err("L2: a lock waited for out of the order fixed by kind")
+        Err("the gate lock taken outside the node lock")
     );
-    k.m.locks.steps = vec![
-        Step::Pay(Cost::Lock),
-        Step::Try(LockId::Thread(thread)),
-        Step::Pay(Cost::Lock),
-        Step::Lock(LockId::Gate),
-    ];
+    // The node lock held past the exit.
+    k.m.locks.steps = vec![Step::Pay(Cost::Lock), Step::Lock(LockId::Node)];
     assert_eq!(
         k.m.check(),
-        Err("L2: a lock tried that is not before a lock held")
+        Err("the node lock held past the exit of an event")
     );
+    // The node lock taken twice: a queue lock is not reentrant.
+    k.m.locks.steps = vec![
+        Step::Lock(LockId::Node),
+        Step::Lock(LockId::Node),
+        Step::Unlock(LockId::Node),
+    ];
+    assert_eq!(k.m.check(), Err("the node lock taken twice in one event"));
     // A spin for another core or a unit inside a hold.
     k.m.locks.steps = vec![Step::Spin(crate::locks::WaitKind::Unit)];
     assert!(k.m.check().is_err());

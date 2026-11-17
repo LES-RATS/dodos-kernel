@@ -60,9 +60,8 @@
 //! | Eighth model review, Mistral F1 to F15 | `mistral.rs` (one test per mutation), `checker.rs` and `check/tests.rs` (the checker fed a bad state) |
 
 use super::*;
-use crate::locks::{LockId, Step};
+use crate::Record;
 use crate::system::Hardware;
-use crate::{Locking, Record};
 use dodos_abi::{
     CoreState, CoreWord, CrashReason, Evidence, NODE_START_FRESH, NODE_START_RESUME,
     NODE_STOP_KILL, NODE_STOP_SEAL, RoleState, SETTLE_NS, START_SLOT_MAILBOX,
@@ -396,52 +395,6 @@ fn deepseek_3_a_record_unmapping_is_busy_for_unmap_and_protect() {
         rights: Rights::READ.bits(),
     };
     assert_eq!(k.call(other, protect), Err(Error::Busy));
-}
-
-#[test]
-fn deepseek_4_an_untyped_is_guarded_by_its_segments_lock_and_an_interrupt_entry_by_its_cores() {
-    let mut machine = one_node(Arch::X86_64, 2);
-    machine.locking = Locking::L2;
-    let mut k = N::on(&machine);
-    k.ok(k.retype(ObjectKind::Notify, 0, 200));
-    let untyped = k.m.object_at(k.t, s(k.ut)).unwrap();
-    let place = k.m.caps[&k.m.objects[&untyped].root].place;
-    let segment = LockId::Segment(place.space, place.index / dodos_abi::CSPACE_SEGMENT_SLOTS);
-    let locks = |k: &N| -> Vec<LockId> {
-        k.m.locks
-            .steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::Lock(l) | Step::Try(l) => Some(*l),
-                _ => None,
-            })
-            .collect()
-    };
-    // The untyped's watermark is guarded by the lock of the segment of its
-    // root capability's slot, not only the destination's.
-    assert_ne!(
-        place.index / dodos_abi::CSPACE_SEGMENT_SLOTS,
-        200 / dodos_abi::CSPACE_SEGMENT_SLOTS
-    );
-    assert!(locks(&k).contains(&segment));
-    // A claim of an interrupt writes the interrupt table of a core: that
-    // core's lock word.
-    let irq_control = s(dodos_abi::START_SLOT_IRQ_CONTROL);
-    let claim = Syscall::IrqClaim {
-        control: irq_control,
-        source: dodos_abi::IrqSource::msi(0, 3, 1, 0).raw(),
-        core: 1,
-        vector: 48,
-        destination: s(210),
-    };
-    let claimed = k.call(k.t, claim);
-    // The remapping entry is a unit request: the call may wait for it; its
-    // event wrote the interrupt table of core 1 all the same.
-    assert!(
-        matches!(claimed, Ok(Output::Msi { .. }) | Ok(Output::Waits)),
-        "{claimed:?}"
-    );
-    assert!(locks(&k).contains(&LockId::Core(1)));
 }
 
 #[test]

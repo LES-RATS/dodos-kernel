@@ -1,6 +1,6 @@
 //! Threads: faults, and the register calls.
 
-use crate::{Model, ObjId, Outcome, Output, Parcel, Wait, Window, locked};
+use crate::{Model, ObjId, Outcome, Output, Parcel, Wait, Window, live};
 use dodos_abi::x86_64::{
     REG_DR0, REG_DR3, REG_DR7, REG_RFLAGS, REG_RIP, REG_RSP, REG_UINTR, REGS_CANONICAL, REGS_WORDS,
     dr7_valid, rflags,
@@ -32,13 +32,6 @@ impl Model {
                 || self.threads[&thread].regs[REG_DR7] & 0xFF != 0,
             "no breakpoint is enabled"
         );
-        // Under L2, with another core in an event, the delivery of a fault
-        // follows the path of an arrival: it is an event, not a call, and
-        // never returns `again` (A node of several cores, D-137).
-        if !self.contended.is_empty() {
-            self.fault_contended(thread, kind, exception);
-            return;
-        }
         self.fault_once(thread, kind, exception);
     }
 
@@ -47,7 +40,7 @@ impl Model {
         *self.last_event = None;
         let core = self.core_of(thread);
         let entry = self.begin_on(core);
-        locked(&mut self.threads, &self.locks, thread).outcome = None;
+        live(&mut self.threads, thread).outcome = None;
         // A spurious fault (D-129): a page fault on an address the node's
         // own tables translate with the access asked is resolved on the
         // faulting core, without a message.
@@ -109,7 +102,7 @@ impl Model {
             first: 0,
             count: 0,
         };
-        let raising = locked(&mut self.threads, &self.locks, thread);
+        let raising = live(&mut self.threads, thread);
         (raising.faulting, raising.raised) = (true, Some((kind as u32, word0)));
         self.enter(thread, endpoint, parcel, window);
     }
@@ -117,7 +110,7 @@ impl Model {
     /// Faults: a fault that is not delivered is recorded in the thread,
     /// which becomes suspended; its registers are unchanged.
     pub(crate) fn record(&mut self, thread: ObjId, kind: u32, words: [u64; 5]) {
-        let recorded = locked(&mut self.threads, &self.locks, thread);
+        let recorded = live(&mut self.threads, thread);
         (recorded.suspended, recorded.recorded) = (true, Some((kind, words)));
         self.observe();
         // Debugging: code 5, the fault recorded in its thread.
@@ -133,7 +126,7 @@ impl Model {
     /// suspended while it waited gets the answer's effect and runs when it
     /// is resumed.
     pub(crate) fn answered(&mut self, thread: ObjId, outcome: Outcome) {
-        let resumed = locked(&mut self.threads, &self.locks, thread);
+        let resumed = live(&mut self.threads, thread);
         let Ok(Output::Message(answer)) = outcome else {
             resumed.suspended = true;
             self.observe();
@@ -212,7 +205,7 @@ impl Model {
                 return Err(Error::Invalid);
             }
         }
-        let written = locked(&mut self.threads, &self.locks, target);
+        let written = live(&mut self.threads, target);
         // A node of several cores: a thread marked *leaving its core* has
         // its registers still on another core.
         if !written.suspended || written.wait != Wait::None || written.leaving {

@@ -11,7 +11,7 @@
 
 use crate::table::FenceStep;
 use crate::table::{FenceRecord, Observation, Watched};
-use crate::{Model, ObjId, Outcome, Output, Wait, live, locked};
+use crate::{Model, ObjId, Outcome, Output, Wait, live};
 use dodos_abi::{
     CoreState, CoreWord, DRIVER_NONE, Error, Evidence, FENCE_NS, IDLE_ENTRY_WORDS,
     IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_HALT, IDLE_METHOD_MWAIT, IDLE_METHOD_PSCI,
@@ -406,7 +406,6 @@ impl Model {
     ) -> Outcome {
         let position = self.own_core(thread, node, core)?;
         let table = idle_table(words, self.machine.arch)?;
-        self.touch_core(position);
         self.cores[position].idle_table = table;
         Ok(Output::Done)
     }
@@ -432,7 +431,6 @@ impl Model {
         if lowest > 0xFF || highest > 0xFF || preference > 0xFF || lowest > highest {
             return Err(Error::Invalid);
         }
-        self.touch_core(position);
         self.cores[position].perf = Some(request);
         Ok(Output::Done)
     }
@@ -538,7 +536,7 @@ impl Model {
         let watchers: Vec<(ObjId, u64)> = self.watchers.iter().flatten().copied().collect();
         for (notify, bits) in watchers {
             if self.notifies.contains_key(&notify) && !self.dying(notify) {
-                locked(&mut self.notifies, &self.locks, notify).word |= bits;
+                live(&mut self.notifies, notify).word |= bits;
                 self.hand_over(notify);
             }
         }

@@ -336,7 +336,9 @@ impl Model {
                         "54: block on an entry not taken",
                     )?;
                 }
-                None if self.objects.get(&id).is_some_and(|o| o.from.is_none()) => {
+                None if self.objects.get(&id).is_some_and(|o| o.from.is_none())
+                    && !self.written_block(id) =>
+                {
                     let (start, end) = (untyped.base, untyped.base + untyped.bytes);
                     let floor = table.floors[node as usize]
                         .iter()

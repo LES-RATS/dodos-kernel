@@ -151,6 +151,25 @@ impl Model {
         }
     }
 
+    /// A block whose words a removal step has written free (on x86-64 and
+    /// RISC-V in a node of several cores, at the completion of the request
+    /// of its run, which forgets the block) and that the next step of the
+    /// removal destroys: its root, dying, is still a child of the
+    /// memory_control capability it was taken through (found by pass 20).
+    pub(crate) fn written_block(&self, id: ObjId) -> bool {
+        let Some(untyped) = self.untypeds.get(&id) else {
+            return false;
+        };
+        let Some(root) = self.objects.get(&id).and_then(|o| self.caps.get(&o.root)) else {
+            return false;
+        };
+        let parent = root.parent.and_then(|parent| self.caps.get(&parent));
+        let control = parent.and_then(|parent| self.objects.get(&parent.object));
+        untyped.block.is_none()
+            && root.dying
+            && control.is_some_and(|c| c.kind == ObjectKind::MemoryControl)
+    }
+
     /// Checks every invariant of the state and names the first that fails.
     ///
     /// The derivation tree:
@@ -590,7 +609,9 @@ impl Model {
                 let control = parent.and_then(|parent| self.objects.get(&parent.object));
                 let claimed = control.is_some_and(|c| c.kind == ObjectKind::IrqControl);
                 ensure(claimed, "11: parent of an irq")?;
-            } else if self.untypeds.get(&id).is_some_and(|u| u.block.is_some()) {
+            } else if self.untypeds.get(&id).is_some_and(|u| u.block.is_some())
+                || self.written_block(id)
+            {
                 // `memory_control`: a block is a child of the memory_control
                 // capability it was taken through.
                 let parent = root.parent.and_then(|parent| self.caps.get(&parent));

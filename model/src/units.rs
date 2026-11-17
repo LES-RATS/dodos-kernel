@@ -8,7 +8,7 @@
 //! failed (IOMMU).
 
 use crate::rings::{Body, Completes, UnitOp};
-use crate::{CapId, Model, ObjId, Output, Wait, locked};
+use crate::{CapId, Model, ObjId, Output, Wait, live};
 use dodos_abi::{
     Error, IOMMU_WAIT_NS, MemberState, RoleState, TraceCode, UNIT_REQUESTS, UnitResult,
 };
@@ -178,7 +178,7 @@ impl Model {
             then: chain.then,
         });
         if let Waiter::Thread(Some(thread)) = waiter {
-            locked(&mut self.threads, &self.locks, thread).wait = Wait::Unit(index);
+            live(&mut self.threads, thread).wait = Wait::Unit(index);
             self.wait_mark(crate::locks::WaitKind::Unit);
             self.observe();
         }

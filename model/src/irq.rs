@@ -1,10 +1,10 @@
 //! Interrupts: the entries of the interrupt table of each physical core of
 //! the node (D-129), their claim, binding and acknowledgement, and the
-//! arrival of an interrupt on its core. An entry is guarded by its core's
-//! lock word under variant L2 (D-131).
+//! arrival of an interrupt on its core, an event under the node lock
+//! (D-138).
 
 use crate::caps::Placing;
-use crate::{Irq, IrqState, Model, ObjId, Outcome, Output, live, locked};
+use crate::{Irq, IrqState, Model, ObjId, Outcome, Output, live};
 use dodos_abi::x86_64::{
     IRQ_MAX_CORES_REMAPPED, IRQ_TABLE_ENTRIES, IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST,
 };
@@ -122,7 +122,6 @@ impl Model {
         let root = self.create(ObjectKind::Irq, 0, Some(cap), Rights::ALL, place);
         let id = self.caps[&root].object;
         live(&mut self.objects, id).from = None;
-        self.touch_core(position);
         let irq = Irq {
             core: position,
             vector,
@@ -185,7 +184,7 @@ impl Model {
         self.unit_request_with(role, op, waiter, None, words, chain)?;
         // Served at once (a unit or an IOAPIC this node holds, or a failed
         // unit passed over): the call ends with its result.
-        let claimed = locked(&mut self.threads, &self.locks, thread);
+        let claimed = live(&mut self.threads, thread);
         if claimed.wait == crate::Wait::None && claimed.answered {
             claimed.answered = false;
             return claimed.outcome.take().unwrap_or(Ok(Output::Waits));
@@ -212,11 +211,8 @@ impl Model {
             return Err(Error::Invalid);
         }
         let bits = if badge == 0 { 1 } else { badge };
-        self.touch_core(self.irqs[&irq].core);
         live(&mut self.irqs, irq).notify = Some((notify, bits));
-        locked(&mut self.notifies, &self.locks, notify)
-            .irqs
-            .push(irq);
+        live(&mut self.notifies, notify).irqs.push(irq);
         let entry = live(&mut self.irqs, irq);
         if std::mem::take(&mut entry.pending) {
             entry.state = IrqState::Fired;
@@ -236,7 +232,6 @@ impl Model {
         let dying = self.irqs[&irq]
             .notify
             .is_some_and(|(notify, _)| self.dying(notify));
-        self.touch_core(self.irqs[&irq].core);
         let entry = live(&mut self.irqs, irq);
         match entry.state {
             _ if dying => return Err(Error::Busy),
@@ -282,27 +277,10 @@ impl Model {
         self.interrupt_on(0, vector);
     }
 
-    /// An arrival on the core at `position` of the node. A core that
-    /// waits for the quiet word another core holds keeps its interrupts
-    /// masked: the arrival stays pending at its controller and is taken
-    /// once the word is released, with none of its steps done meanwhile
-    /// (A node of several cores, D-137).
+    /// An arrival on the core at `position` of the node: one event.
     pub fn interrupt_on(&mut self, position: usize, vector: u8) {
-        if self.quiet.is_some_and(|holder| holder != position) {
-            self.masked.entry(position).or_default().push(vector);
-            return;
-        }
-        match self.contended.is_empty() {
-            true => self.interrupt_once(position, vector),
-            false => self.interrupt_contended(position, vector),
-        }
-    }
-
-    /// An arrival, with no lock held by another core.
-    pub(crate) fn interrupt_once(&mut self, position: usize, vector: u8) {
         *self.last_event = None;
         let entry = self.begin_on(position);
-        self.touch_core(position);
         let found = self
             .irqs
             .iter()
@@ -328,7 +306,7 @@ impl Model {
     }
 
     fn signal_bits(&mut self, notify: ObjId, bits: u64) {
-        locked(&mut self.notifies, &self.locks, notify).word |= bits;
+        live(&mut self.notifies, notify).word |= bits;
         self.hand_over(notify);
     }
 
@@ -337,7 +315,7 @@ impl Model {
         let entry = live(&mut self.irqs, irq);
         entry.state = IrqState::Idle;
         if let Some((notify, _)) = entry.notify.take() {
-            locked(&mut self.notifies, &self.locks, notify)
+            live(&mut self.notifies, notify)
                 .irqs
                 .retain(|&other| other != irq);
         }
@@ -414,7 +392,6 @@ impl Model {
     pub(crate) fn irq_destroyed(&mut self, irq: ObjId) {
         self.unbind_irq(irq);
         if let Some(entry) = self.irqs.remove(&irq) {
-            self.touch_core(entry.core);
             // A line's word is written free, unclaimed (D-135).
             if entry.source.is_line() {
                 self.table.write_line(self.node, entry.source.id(), None);

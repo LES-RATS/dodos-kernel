@@ -6,7 +6,7 @@ the contract it applies, and a whole check of the contract's invariants
 runs after every step of every test. It follows the shape of nodes decided
 on 16 November 2026 (D-128, D-129, D-131): a node covers *N* physical cores
 fixed when it starts (*N* = 1 is a particular case), the cores of a node
-share its state under locks, and nodes share only single-writer words of
+share its state under one node lock (D-138), and nodes share only single-writer words of
 the machine table and the eleven kinds of message on two rings per ordered
 pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
 
@@ -16,19 +16,10 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   per core (`cores.rs`: what the core runs, its queues, timers, interrupt
   table, idle word, invalidation request, pending set, interrupts, loaded
   root and the translations its TLB may hold), its locks (`locks.rs`: the
-  trace of each event under variant L1 or L2; under L2 the locks in the
-  order the event found them, a lock earlier than one held recorded as a
-  try, never sorted; another core in a kernel event, as a test scripts it
-  with `Model::hold`, is a second core: it holds the locks of its own trace,
-  checked by the same order, no lock is ever held by two cores, a try of
-  one of its locks fails, and a wait for one lets its event end with its
-  effect; the event then makes the contract's rounds: the second round,
-  `again` with nothing changed, the escalation to the quiet word, which
-  raises the kernel epoch and reads every other core's entry word, waiting
-  for the cores whose word is below the new epoch; a `signal`, an arrival
-  and the delivery of a fault never return `again`; a fault's and a
-  waiting thread's fields are locked by the object waited on, marks by
-  no lock), its
+  trace of each event under the node lock, the gate lock inside it, a
+  `signal` that wakes no one taking none; the barrier before a watermark
+  returns, a request of the core with nothing to invalidate, is in
+  `cores.rs` and `caps.rs`), its
   rings (`rings.rs`: the
   check of every message received, credits, the reserve of answers), its
   grants (`grants.rs`), its unit requests and unit service table
@@ -68,7 +59,12 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   the new *k*, a fault as an event, `task_revoke`'s first call, the
   removal of a line's `irq` as a request, tables freed after their
   invalidation, the stopped time of the debugger, the sweep of sealed
-  nodes, the replacement slot), `mistral.rs` (one test per mutation of the
+  nodes, the replacement slot), `pass20.rs` (what D-138 left: the
+  watermark's barrier, on ARM64 too and before a give or the destruction
+  of a block, marks written under the node lock, the lock-free signal, the
+  bound of a request and its start-up check, and a fault of the model
+  older than the pass, a block of a run destroyed on two cores),
+  `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
   and of the machine; those of one node are in `check/tests.rs`), and
@@ -107,15 +103,20 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
   firmware.
 - Nodes that take and give cores at run time: the contract only reserves
   words for it, and so does the model.
-- Real concurrency under L2: every event runs alone; another core is in a
-  kernel event only as a test scripts it (`Model::hold`), a second core
-  that holds the locks it has taken and whose event ends, with its effect,
-  when a lock of it is waited for or an escalation reads its entry word.
-  The order of the trace is the order in which the model's code touches
-  the objects, close to but not always a kernel's order of discovery. The
-  store-load order of the entry word against the quiet word is checked by
-  `locks::entry_orders`, an explorer of the four orders of two cores'
-  accesses, not by the events themselves.
+- Real concurrency: every event runs alone, as the node lock makes them;
+  the lock-free slot read, its check under the lock and the atomic OR of a
+  `signal` are not interleaved with other events (the small models of the
+  contract's list are for that).
+- The lock per object (variant L2): it left the contract of version 1 by
+  D-138, and its model left with it: the order by kind, the tries and
+  their two rounds, `Model::hold` and the scripted second core, the
+  `again` of tries and its count, the escalation to the quiet word, the
+  entry words and `locks::entry_orders`, the bound *k* (`locks::bound`),
+  their tests and the L2 values of the machine's configuration. The text
+  is in `research/drafts/locking-l2.md` of the documentation repository,
+  and this branch's history keeps the model (commit `04503d5`). `abi/` had
+  no value of L2 to keep: the words the contract reserves for it (lock
+  words, the quiet word, the entry words) are not in `abi/` yet.
 - The debugger stub of a development image: only its release word and its
   stopped time, as `System::stub_stop` (a test's input) raises and lowers
   them; the clock of membership leaves the stop out for the observations,

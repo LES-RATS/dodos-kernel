@@ -1,6 +1,6 @@
 //! Tasks and marks: the unit of provenance and of stopping.
 
-use crate::{Model, ObjId, Outcome, Output, Wait, locked};
+use crate::{Model, ObjId, Outcome, Output, Wait, live};
 use dodos_abi::{Error, Marks, ObjectKind, Rights, SlotAddr, TaskFlags, TaskId};
 
 impl Model {
@@ -12,19 +12,18 @@ impl Model {
         Marks::from_bits(task.unwrap_or(thread.marks)).ok()
     }
 
-    /// Adds marks to the effective marks of a thread, at a delivery: by
-    /// atomic ORs that take no lock, into its own word always and into its
-    /// task's word too if it is attached to one, the task read after the
-    /// own word is written (Tasks and marks, D-137: marks only gain bits,
-    /// and a delivery that races a `task_attach` loses none).
+    /// Adds marks to the effective marks of a thread, at a delivery: its
+    /// task's word if it is attached to one, otherwise its own word. Marks
+    /// are read and written under the node lock, so one plain write does it
+    /// (Tasks and marks, D-138).
     pub(crate) fn mark(&mut self, thread: ObjId, marks: u64) {
         if marks == 0 {
             return;
         }
         let own = self.threads.get_mut(&thread).expect("a live thread");
-        own.marks |= marks;
-        if let Some(task) = own.task {
-            self.tasks.get_mut(&task).expect("a live task").marks |= marks;
+        match own.task {
+            Some(task) => self.tasks.get_mut(&task).expect("a live task").marks |= marks,
+            None => own.marks |= marks,
         }
     }
 
@@ -74,33 +73,33 @@ impl Model {
             // The thread joins the new task, whose marks become marks | m,
             // even when it is mark-aware.
             Some(task) => {
-                let joined = locked(&mut self.tasks, &self.locks, task);
+                let joined = live(&mut self.tasks, task);
                 joined.marks |= marks;
                 joined.threads.push(target);
-                locked(&mut self.threads, &self.locks, target).task = Some(task);
+                live(&mut self.threads, target).task = Some(task);
             }
             // Detaching sets the thread's own word to the marks of the task
             // it leaves; it succeeds on a thread attached to nothing.
-            None => locked(&mut self.threads, &self.locks, target).marks |= marks,
+            None => live(&mut self.threads, target).marks |= marks,
         }
         Ok(Output::Done)
     }
 
     /// The thread leaves its task, keeping the task's marks in its own word.
     pub(crate) fn detach_task(&mut self, thread: ObjId) {
-        let Some(task) = locked(&mut self.threads, &self.locks, thread).task.take() else {
+        let Some(task) = live(&mut self.threads, thread).task.take() else {
             return;
         };
-        let left = locked(&mut self.tasks, &self.locks, task);
+        let left = live(&mut self.tasks, task);
         left.threads.retain(|&other| other != thread);
         let marks = left.marks;
-        locked(&mut self.threads, &self.locks, thread).marks |= marks;
+        live(&mut self.threads, thread).marks = marks;
     }
 
     pub(crate) fn task_mark(&mut self, thread: ObjId, task: SlotAddr, marks: u64) -> Outcome {
         let task = self.task(thread, task, Rights::WRITE)?;
         let marks = Marks::from_bits(marks)?;
-        locked(&mut self.tasks, &self.locks, task).marks |= marks.bits();
+        live(&mut self.tasks, task).marks |= marks.bits();
         Ok(Output::Done)
     }
 
@@ -117,7 +116,7 @@ impl Model {
         if !self.tasks[&aware].aware {
             return Err(Error::Denied);
         }
-        locked(&mut self.tasks, &self.locks, task).aware = true;
+        live(&mut self.tasks, task).aware = true;
         Ok(Output::Done)
     }
 
@@ -134,14 +133,13 @@ impl Model {
         // by the threads, and its whole step; it detaches nothing (Tasks and
         // marks, D-137).
         if !self.tasks[&task].revoked {
-            locked(&mut self.tasks, &self.locks, task).revoked = true;
+            live(&mut self.tasks, task).revoked = true;
             let at = *self.at;
             for core in (0..self.width()).filter(|&c| c != at) {
                 let Some(running) = self.cores[core].thread else {
                     continue;
                 };
                 if self.threads[&running].task == Some(task) {
-                    self.touch_own(running);
                     self.mark_leaving(running);
                 }
             }
@@ -176,13 +174,12 @@ impl Model {
     pub(crate) fn stop(&mut self, thread: ObjId) {
         // A thread that waits for another node, a unit or its node's cores
         // is stopped when its call returns: its wait is not ended.
-        self.touch_own(thread);
         let wait = &self.threads[&thread].wait;
         if *wait != Wait::None && !self.threads[&thread].bounded() {
             self.unlink(thread);
             self.wake(thread, Err(Error::Gone));
         }
-        locked(&mut self.threads, &self.locks, thread).suspended = true;
+        live(&mut self.threads, thread).suspended = true;
         self.observe();
         self.detach_task(thread);
     }

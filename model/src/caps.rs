@@ -2,7 +2,7 @@
 
 use crate::{
     ASpace, CSpace, Cap, CapId, Endpoint, Frame, Model, Notify, ObjId, Object, Outcome, Output,
-    Place, Record, ReplyState, Sched, Slot, Sweep, Task, Thread, Untyped, live, locked,
+    Place, Record, ReplyState, Sched, Slot, Sweep, Task, Thread, Untyped, live,
 };
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
@@ -328,7 +328,7 @@ impl Model {
         // table page.
         if self.aspaces.contains_key(&id) {
             let class = self.root_class(id);
-            locked(&mut self.aspaces, &self.locks, id).root = Some(base);
+            live(&mut self.aspaces, id).root = Some(base);
             let page = base / self.machine.geometry.page();
             self.table.set_class(page, Some(class));
         }
@@ -428,20 +428,8 @@ impl Model {
         align: u64,
         clearing: Clearing,
     ) -> Result<Taken, Error> {
-        // A watermark ready to return: it returns once every other core of
-        // the node has left the kernel event it was in at the destruction
-        // (its entry word 0 or at least that epoch); until then
-        // `untyped_retype` returns `again` with nothing changed (A node of
-        // several cores, D-134, D-135).
-        if clearing != Clearing::WithinCall
-            && let Some(epoch) = self.untypeds[&untyped].ready
-        {
-            if self.entered_before(epoch) {
-                return Err(Error::Again);
-            }
-            let untyped = live(&mut self.untypeds, untyped);
-            (untyped.watermark, untyped.clean, untyped.ready) = (0, 0, None);
-            untyped.zero.clear();
+        if clearing != Clearing::WithinCall {
+            self.return_watermark(untyped)?;
         }
         let untyped = live(&mut self.untypeds, untyped);
         let start = untyped.watermark.checked_next_multiple_of(align);
@@ -483,11 +471,11 @@ impl Model {
     /// is destroyed the watermark returns to the start, and so does the
     /// clean mark; this is the only moment the memory becomes usable again.
     fn release(&mut self, untyped: ObjId) {
-        // Under L2 on several cores the watermark is only ready to return:
-        // the destroying core raises the kernel epoch (D-135).
-        // The rule holds under both variants on a node of several cores:
-        // under L1 the lock-free paths reach object memory before the node
-        // lock (D-137).
+        // On a node of several cores the watermark is only ready to return:
+        // the destroying event raises the kernel epoch, and the memory is
+        // reused after a barrier, since the lock-free paths reach object
+        // memory before the node lock (A node of several cores, D-135,
+        // D-138).
         let watched = self.width() > 1;
         if watched && self.untypeds[&untyped].live == 1 {
             self.kernel_epoch += 1;
@@ -511,15 +499,32 @@ impl Model {
         }
     }
 
-    /// Whether another core of the node is in a kernel event it entered
-    /// before `epoch`: its entry word is not 0 and below it. In the model a
-    /// core is in an event across this node's events only as a test makes
-    /// it (`Model::hold`).
-    pub(crate) fn entered_before(&self, epoch: u64) -> bool {
-        let at = *self.at;
-        self.contended
-            .values()
-            .any(|h| h.core != at && h.entered != 0 && h.entered < epoch)
+    /// A watermark ready to return returns, and the clean mark with it,
+    /// once a complete barrier covers the epoch at which it became ready:
+    /// every other core of the node has then left the kernel event it was
+    /// in at the destruction. Until then the call starts the barrier, if
+    /// none in flight covers that epoch, and returns `again` with nothing
+    /// changed (A node of several cores, D-134, D-135, D-138).
+    pub(crate) fn return_watermark(&mut self, untyped: ObjId) -> Result<(), Error> {
+        let Some(epoch) = self.untypeds[&untyped].ready else {
+            return Ok(());
+        };
+        if epoch > self.barrier_epoch {
+            let covered =
+                self.cores.iter().filter_map(|c| c.request.as_ref()).any(
+                    |r| matches!(r.completes, crate::cores::Completes::Barrier(e) if e >= epoch),
+                );
+            if !covered {
+                self.start_barrier();
+            }
+            if epoch > self.barrier_epoch {
+                return Err(Error::Again);
+            }
+        }
+        let untyped = live(&mut self.untypeds, untyped);
+        (untyped.watermark, untyped.clean, untyped.ready) = (0, 0, None);
+        untyped.zero.clear();
+        Ok(())
     }
 
     /// A new object and its root capability, in an empty slot. The parent
@@ -920,7 +925,7 @@ impl Model {
                     let completes = crate::cores::Completes::Destroy(object);
                     match self.start_request(flush, completes, None) {
                         crate::cores::Started::Complete => {
-                            locked(&mut self.aspaces, &self.locks, object).flushed = true;
+                            live(&mut self.aspaces, object).flushed = true;
                         }
                         _ => return Undone::Wait,
                     }
@@ -941,7 +946,7 @@ impl Model {
             // suspended flag, so that its core does not choose it again once
             // it has left" (A node of several cores, gap 14).
             ObjectKind::Thread if self.running_core(object).is_some_and(|c| c != *self.at) => {
-                locked(&mut self.threads, &self.locks, object).suspended = true;
+                live(&mut self.threads, object).suspended = true;
                 self.mark_leaving(object);
                 return Undone::Wait;
             }
@@ -1144,7 +1149,7 @@ impl Model {
             ObjectKind::Endpoint => {
                 let endpoint = self.endpoints.remove(&id).expect("names a live entry");
                 if let Some(notify) = endpoint.notify {
-                    locked(&mut self.notifies, &self.locks, notify).endpoint = None;
+                    live(&mut self.notifies, notify).endpoint = None;
                 }
             }
             // The budget follows the call: destroying a reply object takes
@@ -1162,7 +1167,7 @@ impl Model {
             ObjectKind::Notify => {
                 let notify = self.notifies.remove(&id).expect("names a live entry");
                 if let Some(endpoint) = notify.endpoint {
-                    locked(&mut self.endpoints, &self.locks, endpoint).notify = None;
+                    live(&mut self.endpoints, endpoint).notify = None;
                 }
             }
             _ => {}

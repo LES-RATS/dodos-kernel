@@ -10,7 +10,7 @@ use crate::rings::{Body, Completes};
 use crate::table::{GrantEntry, GrantState, UseEntry};
 use crate::{
     Cap, CapId, Delivery, Frame, Message, Model, ObjId, Object, Outcome, Output, Place, Record,
-    Slot, Transfer, Wait, live, locked,
+    Slot, Transfer, Wait, live,
 };
 use dodos_abi::{
     Error, GRANTS, Header, MemberState, ObjectKind, Rights, SEND_GRANTS_MAX, SlotAddr,
@@ -279,7 +279,7 @@ impl Model {
             .ok()
             .flatten()
             .expect("the ring and the credits were judged");
-        locked(&mut self.threads, &self.locks, thread).wait = Wait::Node {
+        live(&mut self.threads, thread).wait = Wait::Node {
             peer: target,
             credit: credit.0,
         };
@@ -330,9 +330,7 @@ impl Model {
             },
         );
         if let Some((notify, _)) = doorbell {
-            locked(&mut self.notifies, &self.locks, notify)
-                .doorbells
-                .push(grant);
+            live(&mut self.notifies, notify).doorbells.push(grant);
         }
         let frame = self.frames[&self.caps[&cap].object];
         Granted {
@@ -474,7 +472,6 @@ impl Model {
                 boot: false,
             },
         );
-        self.touch_slot(place.space, place.index);
         live(&mut self.cspaces, place.space).slots[place.index as usize] = Slot::Full(cap);
         self.frames.insert(id, granted.frame);
         let remote = Remote {
@@ -591,7 +588,7 @@ impl Model {
             && self.notifies.contains_key(&notify)
             && !self.dying(notify)
         {
-            locked(&mut self.notifies, &self.locks, notify).word |= bits;
+            live(&mut self.notifies, notify).word |= bits;
             self.hand_over(notify);
         }
     }
@@ -602,9 +599,7 @@ impl Model {
         let Some(grant) = self.notifies[&notify].doorbells.last().copied() else {
             return false;
         };
-        locked(&mut self.notifies, &self.locks, notify)
-            .doorbells
-            .pop();
+        live(&mut self.notifies, notify).doorbells.pop();
         let me = self.node as usize;
         if let Some(entry) = self.table.grants[me].get_mut(&grant) {
             entry.doorbell = None;
@@ -690,7 +685,7 @@ impl Model {
         else {
             return Ok(false);
         };
-        locked(&mut self.threads, &self.locks, thread).wait = Wait::Node {
+        live(&mut self.threads, thread).wait = Wait::Node {
             peer: grantee,
             credit: index,
         };
