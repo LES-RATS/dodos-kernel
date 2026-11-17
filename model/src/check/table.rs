@@ -65,9 +65,25 @@ fn judge_write(write: &crate::table::WordWrite) -> Check {
                         dodos_abi::MemberState::Fenced | dodos_abi::MemberState::Dead
                     ) && m.generation() == g
                 });
-            // An identifier word is detached to free, unclaimed.
-            let identifier = matches!(write.word, crate::table::Word::Identifier(_));
-            ensure_write((held && (!identifier || after_owner == 0xFFFF)) || claimed || cleared)
+            // An identifier word is detached to free, unclaimed, and so is a
+            // line word, also by R6 when the generation that took it is over
+            // (Interrupts, D-135).
+            let word = write.word;
+            let identifier = matches!(
+                word,
+                crate::table::Word::Identifier(_) | crate::table::Word::Line(_)
+            );
+            let line_cleared = matches!(word, crate::table::Word::Line(_))
+                && state == 2
+                && after_owner == 0xFFFF
+                && write.owner.is_some_and(|m| {
+                    matches!(
+                        m.state(),
+                        dodos_abi::MemberState::Fenced | dodos_abi::MemberState::Dead
+                    ) && m.generation() == g
+                });
+            let freed = held && (!identifier || after_owner == 0xFFFF);
+            ensure_write(freed || claimed || cleared || line_cleared)
         }
         _ => ensure_write(false),
     }

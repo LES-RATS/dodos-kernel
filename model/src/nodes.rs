@@ -482,7 +482,6 @@ impl Model {
         )
         .with_class(member.class());
         self.table.write_member(self.node, node, fencing);
-        self.table.fences[node as usize] = FenceRecord::default();
         if node != self.node {
             self.fences.insert(
                 node,
@@ -874,7 +873,7 @@ impl Model {
                 !(self.table.core_word(c).is_some_and(|w| w.is_marked()) && self.park_confirmed(c))
             })
             .collect();
-        let started = self.table.fences[node as usize].started;
+        let started = self.table.fences[node as usize].begun(g);
         if unconfirmed.is_empty() && started.is_some() {
             for core in 0..self.table.start_requests.len() {
                 if crate::table::Table::started_node(self.table.start_requests[core])
@@ -906,8 +905,14 @@ impl Model {
             }
             return false;
         }
+        // The first fence action of a generation writes the record anew:
+        // that generation, its instant, every other word 0 (gap 6).
         if started.is_none() {
-            self.table.fences[node as usize].started = Some(now);
+            self.table.fences[node as usize] = FenceRecord {
+                generation: g,
+                started: Some(now),
+                ..FenceRecord::default()
+            };
         }
         for core in unconfirmed {
             let word = self.table.core_word(core).expect("names the node");
@@ -921,7 +926,7 @@ impl Model {
             }
             self.hw_out.push(HwAction::Stop { core });
             self.table.fence_trace.push(FenceStep::Stopped(core));
-            self.table.fences[node as usize].last_stop.insert(core, now);
+            self.table.fences[node as usize].stopped(core, now);
         }
         for core in 0..self.table.start_requests.len() {
             if crate::table::Table::started_node(self.table.start_requests[core]) == Some((node, g))
@@ -1311,14 +1316,18 @@ impl Model {
                         None => cursor = Clear { phase: 3, index: 0 },
                     }
                 }
-                // Its use entries: free.
+                // Its use entries: free; then the line words its generation
+                // took: free, unclaimed (Interrupts, D-135).
                 3 => {
                     let next = self.table.uses[node as usize].keys().next().copied();
-                    match next {
-                        Some(index) => {
+                    let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), g).raw();
+                    let line = self.table.lines.iter().find(|&(_, &raw)| raw == taken);
+                    match (next, line.map(|(&gsi, _)| gsi)) {
+                        (Some(index), _) => {
                             self.table.uses[node as usize].remove(&index);
                         }
-                        None => cursor = Clear { phase: 4, index: 0 },
+                        (None, Some(gsi)) => self.table.write_line(self.node, gsi, None),
+                        (None, None) => cursor = Clear { phase: 4, index: 0 },
                     }
                 }
                 // Every core word that names its generation: free, keeping
@@ -1330,11 +1339,11 @@ impl Model {
                         cursor = Clear { phase: 5, index: 0 };
                         continue;
                     };
-                    let last = self.table.fences[node as usize]
-                        .last_stop
-                        .get(&core)
-                        .copied()
-                        .unwrap_or(0);
+                    let record = &self.table.fences[node as usize];
+                    let last = match record.generation == g {
+                        true => record.last_stop(core),
+                        false => 0,
+                    };
                     if !self.park_confirmed(core) || self.now < last + SETTLE_NS {
                         self.reclaims.entry(node).or_default().clear = Some(cursor);
                         *units += 1;

@@ -414,14 +414,19 @@ impl System {
         }
     }
 
-    /// A start's wake reaches a core late (a test's input): x86-64 an NMI.
-    /// A core in the park stub takes it as a start; a core that runs its
-    /// node's kernel takes it as the fence's signal only if its word
-    /// carries the fence mark (D-134).
+    /// A start's wake reaches a core late (a test's input). A core in the
+    /// park stub, or off, takes it as a start. On x86-64 the wake is an NMI,
+    /// the fence's own signal, which a core that runs its node's kernel
+    /// takes as a fence only if its word carries the fence mark (D-134); on
+    /// ARM64 it is `CPU_ON` and on RISC-V `sbi_hart_start`, which a core
+    /// already on answers with `ALREADY_ON` or `SBI_ERR_ALREADY_AVAILABLE`
+    /// and which starts nothing (Node slots and core words, the start
+    /// request and the entry stub).
     pub fn late_wake(&mut self, core: usize) {
-        match self.hardware[core] {
-            Hardware::Stub { .. } | Hardware::Off => self.wake(core),
-            _ => self.stop(core),
+        match (self.machine.arch, self.hardware[core]) {
+            (_, Hardware::Stub { .. } | Hardware::Off) => self.wake(core),
+            (Arch::X86_64, _) => self.stop(core),
+            (Arch::Aarch64 | Arch::Riscv64, _) => {}
         }
     }
 
@@ -544,9 +549,14 @@ impl System {
     /// writes what it can of its core's crash record (reason 5), unless the
     /// record holds a committed record of the same generation.
     fn fence_record(&mut self, core: usize) {
+        // The node kernel's handler is armed from the entry stub on (it
+        // installs it, or registers SDEI event 0, before it reads its word).
         if !matches!(
             self.hardware[core],
-            Hardware::Running | Hardware::Hung { nmi: true }
+            Hardware::Running
+                | Hardware::Hung { nmi: true }
+                | Hardware::Entering
+                | Hardware::EntryStub { installed: true }
         ) {
             return;
         }
@@ -579,6 +589,7 @@ impl System {
                 Arch::X86_64,
                 Hardware::Running
                 | Hardware::Hung { nmi: true }
+                | Hardware::Entering
                 | Hardware::EntryStub { installed: true },
             ) if !self.marked(core) => {}
             // A kernel that can run its handler writes the park request it
@@ -589,6 +600,7 @@ impl System {
                 Hardware::Running
                 | Hardware::Hung { nmi: true }
                 | Hardware::Stub { .. }
+                | Hardware::Entering
                 | Hardware::EntryStub { installed: true },
             ) => {
                 // The handler leaves VMX root operation if it is in it.
@@ -608,7 +620,6 @@ impl System {
                 Arch::X86_64,
                 Hardware::Hung { nmi: false }
                 | Hardware::WaitSipi
-                | Hardware::Entering
                 | Hardware::EntryStub { installed: false },
             ) if !booted && !self.table().core_beacons[core].vmx => {
                 self.write_parked(core, false);
@@ -622,9 +633,16 @@ impl System {
             // to the park routine, which calls `CPU_OFF` (a later event).
             // The fence is confirmed by OFF after the request, never by the
             // handler's own write.
-            (Arch::Aarch64, Hardware::Running | Hardware::Hung { nmi: true })
-                if !self.marked(core) => {}
-            (Arch::Aarch64, Hardware::Running | Hardware::Hung { nmi: true }) => {
+            // A core that is entering its node registered the handler in the
+            // entry stub, before it read its word.
+            (
+                Arch::Aarch64,
+                Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Entering,
+            ) if !self.marked(core) => {}
+            (
+                Arch::Aarch64,
+                Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Entering,
+            ) => {
                 self.fence_record(core);
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Parking;
@@ -637,7 +655,9 @@ impl System {
                 self.share(table);
             }
             (Arch::Aarch64, _) => {}
-            // RISC-V: the stop extension stops the hart whatever it does.
+            // RISC-V: the stop extension stops the hart whatever it does; the
+            // gate sends it only to a marked word (G10).
+            (Arch::Riscv64, _) if !self.marked(core) => {}
             (Arch::Riscv64, _) => {
                 self.write_parked(core, true);
                 self.hardware[core] = Hardware::Off;
@@ -674,8 +694,15 @@ impl System {
         }
         let request = self.table().start_requests[core];
         let Some((node, generation)) = crate::table::Table::started_node(request) else {
-            // The stub writes `parked`, finds no request, and halts again.
-            self.hardware[core] = Hardware::Stub { window: true };
+            // The stub's handler interrupted its loop: it writes the park
+            // request it reads into `parked`, finds no start request, and
+            // the stub halts again.
+            // ARM64 and RISC-V: the entry stub finds no request and the
+            // core parks again, off.
+            if self.machine.arch == Arch::X86_64 {
+                self.write_parked(core, false);
+                self.hardware[core] = Hardware::Stub { window: true };
+            }
             return;
         };
         if self.machine.arch == Arch::X86_64 {

@@ -112,6 +112,10 @@ pub const MAP_COUNT_MAX: u64 = u32::MAX as u64;
 /// Identifier words of each PCI segment an IOMMU unit serves: one per bus,
 /// device and function (IOMMU).
 pub const IDENTIFIERS_PER_SEGMENT: usize = 65_536;
+/// Line words at most: one ownership word per claimable line of the machine
+/// (x86-64: per GSI an IOAPIC serves), in the living part; a line beyond the
+/// last word is `unsupported` for `irq_claim` (Interrupts, D-135).
+pub const IRQ_LINES_MAX: usize = 4_096;
 /// Bit 5 of word 2 of a frame slot: the mapping its record holds is partial,
 /// made in steps (G3).
 pub const SLOT_RECORD_PARTIAL: u64 = 1 << 5;

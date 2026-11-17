@@ -949,9 +949,11 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, park_requests),
         offset_of!(StartMachine, start_requests),
         offset_of!(StartMachine, fence_records),
+        offset_of!(StartMachine, lines),
+        offset_of!(StartMachine, line_count),
     ];
-    assert_eq!(machine, [28, 32, 40, 52, 56, 60, 64, 68, 72, 76]);
-    assert_eq!(START_MACHINE_LAYOUT, 2);
+    assert_eq!(machine, [28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84]);
+    assert_eq!(START_MACHINE_LAYOUT, 3);
     let node = [
         offset_of!(StartNode, slot),
         offset_of!(StartNode, slots),
@@ -1083,7 +1085,7 @@ fn layouts_are_fixed() {
     assert_eq!(ranges, [0, 1, 2, 3, 4]);
     assert_eq!(size_of::<StartMemory>(), 56);
     assert_eq!(size_of::<StartIommu>(), 16);
-    assert_eq!(size_of::<StartMachine>(), 80);
+    assert_eq!(size_of::<StartMachine>(), 88);
     assert_eq!(size_of::<StartRole>(), 8);
     assert_eq!(size_of::<StartImage>(), 48);
     assert_eq!(size_of::<StartKindRecord>(), 56);

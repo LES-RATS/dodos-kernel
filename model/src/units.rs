@@ -65,6 +65,14 @@ pub(crate) struct UnitEntry {
     pub(crate) then: Option<(usize, UnitOp)>,
 }
 
+/// What follows the first unit of a claim: the segment whose later units
+/// it asks, and the redirection entry of a line after the last (gap 12).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Chain {
+    pub(crate) segment: Option<u16>,
+    pub(crate) then: Option<(usize, UnitOp)>,
+}
+
 /// An entry of the unit service table: a request of another node that the
 /// holder serves, submitted to the unit (or kept while the unit is
 /// rebuilt).
@@ -134,12 +142,14 @@ impl Model {
         waiter: Waiter,
         record: Option<CapId>,
     ) -> Result<(), Error> {
-        self.unit_request_with(role, op, waiter, record, None)
+        self.unit_request_with(role, op, waiter, record, None, Chain::default())
             .map(|_| ())
     }
 
-    /// A unit request whose done gives the waiting call these result words
-    /// (`irq_claim`).
+    /// A unit request whose done gives the waiting call these result words,
+    /// and the later units and redirection entry of a claim (`irq_claim`),
+    /// all written in the entry before it is first sent: a unit this node
+    /// holds is served at once, and a failed one is passed over at once.
     pub(crate) fn unit_request_with(
         &mut self,
         role: usize,
@@ -147,6 +157,7 @@ impl Model {
         waiter: Waiter,
         record: Option<CapId>,
         words: Option<(u64, u64)>,
+        chain: Chain,
     ) -> Result<usize, Error> {
         let free = self.unit_requests.iter().position(Option::is_none);
         let Some(index) = free else {
@@ -162,9 +173,9 @@ impl Model {
             record,
             order: self.unit_order,
             words,
-            segment: None,
+            segment: chain.segment,
             failed: false,
-            then: None,
+            then: chain.then,
         });
         if let Waiter::Thread(Some(thread)) = waiter {
             locked(&mut self.threads, &self.locks, thread).wait = Wait::Unit(index);
@@ -266,18 +277,43 @@ impl Model {
                 device,
                 domain,
                 root,
-            } => held(device) && in_range(domain) && root != 0,
+            } => {
+                // G9: the root names an iospace table held by the node that
+                // holds the device.
+                let page = root / self.table.geometry.page();
+                let class = self.table.classes.get(&page).copied();
+                held(device)
+                    && in_range(domain)
+                    && class == Some(dodos_abi::PageClass::IOSPACE_TABLE)
+                    && self.table.holds_page(root, node, generation)
+            }
             UnitOp::Detach { device, domain } => state.is_none_or(|u| {
                 u.entries.get(&device).is_none_or(|&owner| owner == from)
                     && u.domains.get(&device).is_none_or(|&d| d == domain)
             }),
             UnitOp::Invalidate { domain } => domain.is_some_and(in_range),
             UnitOp::InterruptCache { handle } => names(handle_core(handle)),
+            // Masked: operand 2 is 0, and the line's word is free or names
+            // the requester (D-135).
             UnitOp::Redirection {
                 claimed: false,
                 gsi,
+                target,
                 ..
-            } => state.is_none_or(|u| u.lines.get(&gsi).is_none_or(|&owner| owner == from)),
+            } => {
+                let word = self.table.line_word(gsi);
+                let free = word.state() == dodos_abi::OwnState::Free;
+                let names = word.owner() == dodos_abi::Owner::Node(node);
+                target == crate::rings::Target::Masked && (free || names)
+            }
+            // Claimed: the line's word names the requester with its
+            // generation (D-135), and the target a core whose word names it.
+            UnitOp::Redirection { gsi, .. }
+                if self.table.line_word(gsi)
+                    != dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation) =>
+            {
+                false
+            }
             UnitOp::Redirection { target, .. } => match target {
                 crate::rings::Target::Remapped { handle, .. } => names(handle_core(handle)),
                 crate::rings::Target::Direct { apic, .. } => self

@@ -149,10 +149,15 @@ fn a_holder_answers_elsewhere_to_a_request_of_another_epoch_and_serves_one_of_it
     // number of its own range (the holder's gate checks both, D-134).
     let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(1), k.m.table.generation(1));
     k.m.table.identifiers.insert(DEVICE as u32, taken.raw());
+    // The root names an iospace table in node 1's floor (G9).
+    let root = k.m.table.floors[1][0].0;
+    let page = root / k.m.table.geometry.page();
+    std::sync::Arc::make_mut(&mut k.m.table.classes)
+        .insert(page, dodos_abi::PageClass::IOSPACE_TABLE);
     let op = crate::rings::UnitOp::Attach {
         device: DEVICE as u16,
         domain: *k.m.domain_range(0, 1).start(),
-        root: 1 << 30,
+        root,
     };
     let answer = |k: &N| {
         let ring = &k.m.table.rings[0][1].kernel;

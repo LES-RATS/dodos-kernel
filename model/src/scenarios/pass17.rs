@@ -388,7 +388,7 @@ fn reserve_keeps_room_for_a_report_of_28_items_and_fails_beyond_it() {
 
 /// Four nodes of one core each on a machine with three IOMMU units on PCI
 /// segment 0: the unit roles go to nodes 1, 2 and 3.
-fn three_units() -> S {
+pub(super) fn three_units() -> S {
     let mut machine = machine(crate::Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]);
     let first = machine.iommus[0];
     machine.iommus.push(first);
@@ -406,7 +406,7 @@ fn claim(source: u64, vector: u64, destination: u32) -> Syscall {
     }
 }
 
-fn submissions(m: &S, role: usize) -> u64 {
+pub(super) fn submissions(m: &S, role: usize) -> u64 {
     m.sys.node(0).table.units.get(&role).map_or(0, |u| u.next)
 }
 
@@ -518,7 +518,7 @@ fn a_claim_of_a_remapped_line_invalidates_the_interrupt_entry_cache_before_the_r
 
 /// Three nodes; the holder of the IOMMU role, a requester, and a third
 /// node whose numbers and cores the requester names.
-fn holder_requester_third() -> (S, u16, u16, u16) {
+pub(super) fn holder_requester_third() -> (S, u16, u16, u16) {
     let m = S::on(&machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     let holder = m.sys.role(0).holder();
     let requester = (0..3).find(|&n| n != holder).unwrap();
@@ -528,7 +528,13 @@ fn holder_requester_third() -> (S, u16, u16, u16) {
 
 /// The holder judges `op` from `requester`; returns whether its gate
 /// refused it, and checks that a refusal changed nothing on the unit.
-fn judged(m: &mut S, holder: u16, requester: u16, role: usize, op: crate::rings::UnitOp) -> bool {
+pub(super) fn judged(
+    m: &mut S,
+    holder: u16,
+    requester: u16,
+    role: usize,
+    op: crate::rings::UnitOp,
+) -> bool {
     let epoch = m.sys.role(role).epoch();
     let before = m.sys.node(holder).refused.0;
     let unit = m.sys.node(holder).table.units.get(&role).cloned();
@@ -545,7 +551,27 @@ fn judged(m: &mut S, holder: u16, requester: u16, role: usize, op: crate::rings:
     refused
 }
 
-fn hold_identifier(m: &mut S, node: u16, device: u16) {
+/// A page of a node's floor made an iospace table, as an iospace's root
+/// (G9): what a correct requester names in an attach.
+pub(super) fn iospace_root(m: &mut S, node: u16) -> u64 {
+    let at = m.sys.canonical().floors[node as usize][0].0;
+    m.sys.edit_table(|t| {
+        let page = at / t.geometry.page();
+        std::sync::Arc::make_mut(&mut t.classes).insert(page, dodos_abi::PageClass::IOSPACE_TABLE);
+    });
+    at
+}
+
+/// The line word of a GSI taken by a node, as its claim writes it.
+pub(super) fn hold_line(m: &mut S, node: u16, gsi: u32) {
+    let generation = m.sys.member(node).generation();
+    m.sys.edit_table(|t| {
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation);
+        t.lines.insert(gsi, taken.raw());
+    });
+}
+
+pub(super) fn hold_identifier(m: &mut S, node: u16, device: u16) {
     let generation = m.sys.member(node).generation();
     m.sys.edit_table(|t| {
         let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation);
@@ -559,10 +585,11 @@ fn the_holder_refuses_an_attach_under_a_domain_number_of_another_node() {
     hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let other = *m.sys.node(holder).domain_range(0, third).start();
+    let root = iospace_root(&mut m, requester);
     let attach = |domain| crate::rings::UnitOp::Attach {
         device: 0x10,
         domain,
-        root: 1 << 30,
+        root,
     };
     assert!(judged(&mut m, holder, requester, 0, attach(other)));
     assert!(judged(&mut m, holder, requester, 0, attach(0)));
@@ -588,10 +615,11 @@ fn the_holder_refuses_a_detach_of_a_context_entry_of_another_node() {
     let (mut m, holder, requester, third) = holder_requester_third();
     hold_identifier(&mut m, third, 0x10);
     let domain = *m.sys.node(holder).domain_range(0, third).start();
+    let root = iospace_root(&mut m, third);
     let attach = crate::rings::UnitOp::Attach {
         device: 0x10,
         domain,
-        root: 1 << 30,
+        root,
     };
     assert!(!judged(&mut m, holder, third, 0, attach));
     let detach = crate::rings::UnitOp::Detach {
@@ -642,6 +670,8 @@ fn the_holder_of_an_ioapic_refuses_a_redirection_entry_aimed_at_another_nodes_co
         true => (third, (0..3).find(|&n| n != holder && n != third).unwrap()),
         false => (requester, third),
     };
+    // The requester's claim of the line took its word (D-135).
+    hold_line(&mut m, requester, 5);
     let redirection = |target| crate::rings::UnitOp::Redirection {
         gsi: 5,
         claimed: true,

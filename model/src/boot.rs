@@ -624,7 +624,14 @@ impl Machine {
     pub(crate) fn layout(&self) -> Result<Layout, Refusal> {
         let geometry = self.geometry;
         let n = self.nodes() as u64;
-        if !geometry.valid() || self.cores.is_empty() || self.cores.len() > NODES_MAX {
+        // Firmware boots one core (the bootstrap processor on x86-64).
+        let list = self.core_list();
+        let booted: Vec<usize> = (0..list.len()).filter(|&c| list[c].booted).collect();
+        if !geometry.valid()
+            || self.cores.is_empty()
+            || self.cores.len() > NODES_MAX
+            || booted.len() != 1
+        {
             return Err(Refusal::MachineValues);
         }
         // BootNodes: at most NODES_MAX slots and one per usable core; each
@@ -648,7 +655,11 @@ impl Machine {
             .iommus
             .iter()
             .all(|u| u64::from(u.domains.saturating_sub(2)) / n.max(1) >= 1);
-        if !slots_ok || !domains_ok || nodes.len() > n as usize || !fits {
+        // The layout leaves no core firmware booted in no node (Start-up
+        // state: the kernel refuses to start if `BootNodes` "leaves the core
+        // firmware booted in no node").
+        let boot_core_placed = named.contains(&booted[0]);
+        if !slots_ok || !domains_ok || nodes.len() > n as usize || !fits || !boot_core_placed {
             return Err(Refusal::Nodes);
         }
         if self.boot_seed == 0 && !self.processor_entropy {
@@ -966,6 +977,7 @@ impl Machine {
             devices: std::sync::Arc::new(layout.devices.clone()),
             device_leaves: std::sync::Arc::new(vec![0; layout.devices.len()]),
             identifiers: Default::default(),
+            lines: Default::default(),
             members,
             roles: roles.clone(),
             grants: vec![Default::default(); n],

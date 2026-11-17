@@ -37,7 +37,8 @@ fn f2_the_first_round_of_a_fence_cancels_the_start_requests_aimed_at_the_node() 
     assert_ne!(m.sys.canonical().start_requests[2], 0);
     m.ok(0, kill(1));
     for _ in 0..1000 {
-        if m.sys.canonical().fences[1].started.is_some() {
+        let generation = m.sys.member(1).generation();
+        if m.sys.canonical().fences[1].begun(generation).is_some() {
             break;
         }
         match m.sys.events().first() {
@@ -86,7 +87,7 @@ fn f3_r6_keeps_a_core_word_until_settle_ns_after_the_last_stop_even_when_confirm
     assert!(!free(&m.sys));
     let now = m.sys.now();
     m.sys.edit_table(|t| {
-        t.fences[1].last_stop.insert(1, now);
+        t.fences[1].stopped(1, now);
     });
     tick(&mut m.sys);
     m.sys.settle(100_000);

@@ -1,0 +1,459 @@
+//! The scenarios of pass 18 (D-135): the corrections of the tenth review of
+//! the contract (`Docs/reviews/2026-11-17-contract-review-10-*.md`) and of
+//! the ninth review of the model (`2026-11-17-model-review-9-*.md`), each a
+//! test named after the sentence it guards.
+
+use super::pass17::{fresh, kill};
+use super::*;
+use crate::nodes::HwAction;
+use crate::system::{Event, Hardware};
+
+/// Fires the first action in flight that `pick` chooses, moving the clock
+/// until one is there.
+fn fire_action(m: &mut S, pick: impl Fn(&(u16, HwAction)) -> bool) {
+    for _ in 0..1000 {
+        if let Some(index) = m.sys.actions().iter().position(&pick) {
+            m.sys.fire(Event::Action(index));
+            return;
+        }
+        match m
+            .sys
+            .events()
+            .into_iter()
+            .find(|e| !matches!(e, Event::Action(_)))
+        {
+            Some(event) => m.sys.fire(event),
+            None => m.sys.move_clock(m.sys.now() + 100_000),
+        }
+    }
+    panic!("no such action");
+}
+
+/// Node 1 of cores 1 and 2 killed and dead, then started fresh again: its
+/// start actions are in flight, none carried out.
+fn restarting(arch: Arch) -> S {
+    let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
+    m.ok(0, kill(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    m.ok(0, fresh(1, 0b110));
+    m
+}
+
+// The stop of a core, by architecture (the ninth model review, findings 1
+// to 4; Node slots and core words, the start request and the entry stub).
+
+#[test]
+fn a_late_start_wake_of_a_running_core_changes_nothing_on_arm64_and_risc_v() {
+    for arch in [Arch::Aarch64, Arch::Riscv64] {
+        let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
+        let parked = m.sys.canonical().core_beacons[1].parked;
+        // `CPU_ON` or `sbi_hart_start` to a core already on starts nothing.
+        m.sys.late_wake(1);
+        m.settle();
+        assert_eq!(m.sys.hardware(1), Hardware::Running, "{arch:?}");
+        assert_eq!(m.sys.canonical().core_beacons[1].parked, parked);
+        assert_eq!(m.state(1), MemberState::Live);
+    }
+}
+
+#[test]
+fn a_stop_that_reaches_an_unmarked_core_changes_nothing_on_every_architecture() {
+    for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64] {
+        let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
+        // A fence signal on a word without the fence mark: the gate sends
+        // none (G10), and the handler parks only on a marked word.
+        m.sys.push_action(0, HwAction::Stop { core: 1 });
+        m.settle();
+        assert_eq!(m.sys.hardware(1), Hardware::Running, "{arch:?}");
+        assert_eq!(m.state(1), MemberState::Live, "{arch:?}");
+    }
+}
+
+#[test]
+fn an_arm64_core_that_waits_in_its_node_for_the_first_core_is_stopped_by_the_fence() {
+    let mut m = restarting(Arch::Aarch64);
+    // Core 2 enters first: it registered SDEI event 0 in the entry stub and
+    // waits for core 1, which builds the node.
+    fire_action(&mut m, |a| matches!(a, (_, HwAction::Start { core: 2 })));
+    assert_eq!(m.sys.hardware(2), Hardware::Entering);
+    m.ok(0, kill(1));
+    fire_action(&mut m, |a| matches!(a, (_, HwAction::Stop { core: 2 })));
+    assert_eq!(m.sys.hardware(2), Hardware::Parking);
+    assert_eq!(
+        m.sys.canonical().core_beacons[2].parked,
+        m.sys.park_request(2)
+    );
+}
+
+#[test]
+fn an_x86_64_core_in_vmx_root_that_waits_in_its_node_is_stopped_by_its_nmi() {
+    let mut m = restarting(Arch::X86_64);
+    fire_action(&mut m, |a| matches!(a, (_, HwAction::Start { core: 2 })));
+    for _ in 0..4 {
+        if m.sys.hardware(2) == Hardware::Entering {
+            break;
+        }
+        m.sys.fire(Event::EntryStep { core: 2 });
+    }
+    assert_eq!(m.sys.hardware(2), Hardware::Entering);
+    // INIT is blocked in VMX root operation; the node kernel's NMI handler,
+    // installed by the entry stub, parks the core.
+    m.sys.set_vmx(2, true);
+    m.ok(0, kill(1));
+    fire_action(&mut m, |a| matches!(a, (_, HwAction::Stop { core: 2 })));
+    assert_eq!(m.sys.hardware(2), Hardware::Stub { window: false });
+    let beacon = m.sys.canonical().core_beacons[2];
+    assert_eq!(beacon.parked, m.sys.park_request(2));
+    // The handler wrote the crash record of this generation (the first
+    // kill wrote one of the generation before).
+    let record = m.sys.canonical().crash.areas[2].record;
+    assert_eq!(
+        record.map(|r| (r.reason, r.generation)),
+        Some((
+            dodos_abi::CrashReason::Fenced as u32,
+            m.sys.member(1).generation()
+        ))
+    );
+}
+
+#[test]
+fn a_stale_wake_of_a_halted_park_stub_writes_the_current_park_request() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    m.ok(0, kill(1));
+    m.run(10 * MS);
+    assert_eq!(m.sys.hardware(1), Hardware::Stub { window: false });
+    // A park request is raised while the stub is halted, then a stale wake
+    // reaches it: the stub's handler writes the request it reads.
+    m.sys.edit_table(|t| t.park_requests[1] += 1);
+    m.sys.late_wake(1);
+    assert_eq!(
+        m.sys.canonical().core_beacons[1].parked,
+        m.sys.park_request(1)
+    );
+}
+
+// The start-up layout (the ninth model review, finding 8, and its mutation
+// M3; Start-up state).
+
+#[test]
+fn the_start_up_refuses_a_layout_that_leaves_the_core_firmware_booted_in_no_node() {
+    let machine = machine(Arch::X86_64, 2, &[&[1]]);
+    assert_eq!(machine.layout().err(), Some(crate::boot::Refusal::Nodes));
+}
+
+#[test]
+fn one_node_of_class_0_on_more_cores_than_one_window_runs_on_the_booted_core() {
+    let mut machine = machine(Arch::X86_64, 65, &[&[0]]);
+    machine.cores[0].fence = 0;
+    machine.cores_supported = 128;
+    assert_eq!(machine.initial_nodes(), vec![vec![0]]);
+    machine.cores.truncate(64);
+    assert_eq!(machine.initial_nodes(), vec![(0..64).collect::<Vec<_>>()]);
+}
+
+// The fence record (the ninth model review, finding 5; The fence, the fence
+// record, gap 6, D-134).
+
+#[test]
+fn the_fence_record_is_written_anew_by_the_first_fence_action_not_by_the_accusation() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    m.ok(0, kill(1));
+    m.run(10 * MS);
+    let old = m.sys.member(1).generation();
+    let confirmed = m.sys.canonical().fences[1].confirmed;
+    assert!(confirmed.is_some());
+    m.ok(0, fresh(1, 0b110));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Live);
+    let new = m.sys.member(1).generation();
+    // The accusation: the record still concerns the generation before.
+    m.ok(0, kill(1));
+    let record = m.sys.canonical().fences[1].clone();
+    assert_eq!((record.generation, record.confirmed), (old, confirmed));
+    assert_eq!(record.begun(new), None);
+    // The first fence action writes it anew.
+    m.run(MS);
+    let record = m.sys.canonical().fences[1].clone();
+    assert_eq!(record.generation, new);
+    assert!(record.begun(new).is_some());
+}
+
+#[test]
+fn the_fence_record_keeps_the_last_stop_of_a_core_at_its_number_mod_64() {
+    let mut m = S::on(&machine(Arch::X86_64, 66, &[&[0], &[65]]));
+    m.ok(0, kill(1));
+    m.run(MS);
+    let record = m.sys.canonical().fences[1].clone();
+    assert_eq!(
+        record.last_stop.keys().copied().collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(Some(record.last_stop(65)), record.started);
+}
+
+// The claim of an irq over several units (the ninth model review, finding 7
+// and its mutation M23; Devices and shared hardware, several remapping
+// units, gap 12).
+
+fn claim_on(core: u64, source: u64, destination: u32) -> Syscall {
+    Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source,
+        core,
+        vector: 48,
+        destination: s(destination),
+    }
+}
+
+#[test]
+fn a_claim_whose_first_unit_is_held_by_the_claimer_and_failed_still_asks_the_later_units() {
+    let mut m = super::pass17::three_units();
+    let roles = m.sys.node(1).segment_roles(0);
+    assert_eq!(m.sys.role(roles[0]).holder(), 1);
+    // A first claim finds the unit broken: it is failed from then on.
+    m.sys.break_unit(roles[0]);
+    let first = dodos_abi::IrqSource::msi(0, 3, 2, 0).raw();
+    let mut call = claim_on(1, first, 211);
+    if let Syscall::IrqClaim { vector, .. } = &mut call {
+        *vector = 49;
+    }
+    assert_eq!(m.call(1, call), WAITS);
+    m.run(2 * dodos_abi::IOMMU_WAIT_NS + 60 * MS);
+    assert!(m.sys.role(roles[0]).failed());
+    let later: Vec<u64> = roles[1..]
+        .iter()
+        .map(|&r| super::pass17::submissions(&m, r))
+        .collect();
+    // The first unit is this node's and failed: it is passed over at once,
+    // and the call waits for the later ones.
+    let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
+    assert_eq!(m.call(1, claim_on(1, msi, 210)), WAITS);
+    m.run(dodos_abi::IOMMU_WAIT_NS + 60 * MS);
+    assert_eq!(m.woken(1), Some(&Err(Error::Busy)));
+    for (i, &role) in roles[1..].iter().enumerate() {
+        let asked = m
+            .sys
+            .node(role_holder(&m, role))
+            .table
+            .units
+            .get(&role)
+            .map_or(0, |u| u.next);
+        assert_eq!(asked, later[i] + 1, "unit of role {role}");
+    }
+}
+
+fn role_holder(m: &S, role: usize) -> u16 {
+    m.sys.role(role).holder()
+}
+
+#[test]
+fn a_claim_that_finds_its_first_unit_failed_before_a_working_one_ends_busy() {
+    let mut m = super::pass17::three_units();
+    let roles = m.sys.node(0).segment_roles(0);
+    m.sys.break_unit(roles[0]);
+    let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
+    assert_eq!(m.call(0, claim_on(0, msi, 210)), WAITS);
+    m.run(dodos_abi::IOMMU_WAIT_NS + 60 * MS);
+    assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
+}
+
+#[test]
+fn a_line_claim_served_at_once_by_the_claimers_own_ioapic_returns_its_result() {
+    let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    machine.remapping = false;
+    let mut m = S::on(&machine);
+    let role = m
+        .sys
+        .node(0)
+        .ioapic_role(5)
+        .expect("an IOAPIC serves GSI 5");
+    let holder = m.sys.role(role).holder();
+    let line = dodos_abi::IrqSource::line(5, false, false).raw();
+    let outcome = m.call(holder, claim_on(u64::from(holder), line, 210));
+    assert_eq!(
+        outcome,
+        Ok(Output::Msi {
+            address: 0,
+            data: 0
+        })
+    );
+    assert!(m.sys.node(holder).unit_requests.iter().all(Option::is_none));
+}
+
+// What the holder's gate checks of a unit request's operands (the ninth
+// model review, finding 6 and its mutations M26 and M31; Devices and shared
+// hardware, the operands of each operation, G9).
+
+use super::pass17::{hold_identifier, holder_requester_third, iospace_root, judged};
+use crate::rings::{Target, UnitOp};
+
+#[test]
+fn the_holder_refuses_an_attach_whose_root_is_not_an_iospace_table_of_the_requester() {
+    let (mut m, holder, requester, third) = holder_requester_third();
+    hold_identifier(&mut m, requester, 0x10);
+    let own = *m.sys.node(holder).domain_range(0, requester).start();
+    let attach = |root| UnitOp::Attach {
+        device: 0x10,
+        domain: own,
+        root,
+    };
+    // No root; a page of the requester's floor that is not an iospace
+    // table; an iospace table of another node.
+    let data = m.sys.canonical().floors[requester as usize][0].0 + 4 * 4096;
+    let foreign = iospace_root(&mut m, third);
+    assert!(judged(&mut m, holder, requester, 0, attach(0)));
+    assert!(judged(&mut m, holder, requester, 0, attach(data)));
+    assert!(judged(&mut m, holder, requester, 0, attach(foreign)));
+    let root = iospace_root(&mut m, requester);
+    assert!(!judged(&mut m, holder, requester, 0, attach(root)));
+}
+
+#[test]
+fn the_holder_refuses_a_detach_of_the_requesters_device_under_another_domain_number() {
+    let (mut m, holder, requester, _) = holder_requester_third();
+    hold_identifier(&mut m, requester, 0x10);
+    let own = *m.sys.node(holder).domain_range(0, requester).start();
+    let root = iospace_root(&mut m, requester);
+    let attach = UnitOp::Attach {
+        device: 0x10,
+        domain: own,
+        root,
+    };
+    assert!(!judged(&mut m, holder, requester, 0, attach));
+    let detach = |domain| UnitOp::Detach {
+        device: 0x10,
+        domain,
+    };
+    assert!(judged(&mut m, holder, requester, 0, detach(own + 1)));
+    let unit = &m.sys.node(holder).table.units[&0];
+    assert!(unit.entries.contains_key(&0x10));
+    assert!(!judged(&mut m, holder, requester, 0, detach(own)));
+}
+
+#[test]
+fn the_holder_refuses_a_masked_redirection_entry_whose_second_operand_is_not_0() {
+    let (mut m, _, requester, third) = holder_requester_third();
+    let role = m.sys.node(0).ioapic_role(5).unwrap();
+    let holder = m.sys.role(role).holder();
+    let requester = if holder == requester {
+        third
+    } else {
+        requester
+    };
+    let masked = |target| UnitOp::Redirection {
+        gsi: 5,
+        claimed: false,
+        level: true,
+        low: false,
+        target,
+    };
+    let remapped = Target::Remapped {
+        handle: requester * 192,
+        vector: 50,
+    };
+    assert!(judged(&mut m, holder, requester, role, masked(remapped)));
+    assert!(!judged(
+        &mut m,
+        holder,
+        requester,
+        role,
+        masked(Target::Masked)
+    ));
+}
+
+#[test]
+fn the_holder_refuses_an_interrupt_entry_cache_invalidation_of_a_handle_of_no_core() {
+    let (mut m, holder, requester, _) = holder_requester_third();
+    // Handle 65,000 names core 338, which this machine of 3 cores lacks: a
+    // faulty requester's operand is refused, never a panic.
+    let op = UnitOp::InterruptCache { handle: 65_000 };
+    assert!(judged(&mut m, holder, requester, 0, op));
+}
+
+// The owner word of a line (Interrupts, D-135).
+
+/// Node `node` claims line `gsi` on its own core (node n runs on core n)
+/// into slot `slot`, and its claim completes.
+fn claim_line(m: &mut S, node: u16, gsi: u32, slot: u32) -> crate::Outcome {
+    let line = dodos_abi::IrqSource::line(gsi, false, false).raw();
+    let outcome = m.call(node, claim_on(u64::from(node), line, slot));
+    match outcome {
+        WAITS => {
+            m.run(2 * MS);
+            m.woken(node).cloned().expect("the claim ended")
+        }
+        other => other,
+    }
+}
+
+#[test]
+fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
+    let (mut m, _, _, _) = holder_requester_third();
+    let role = m.sys.node(0).ioapic_role(5).unwrap();
+    let holder = m.sys.role(role).holder();
+    let others: Vec<u16> = (0..3).filter(|&n| n != holder).collect();
+    let (a, b) = (others[0], others[1]);
+    assert!(matches!(
+        claim_line(&mut m, a, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+    // A second claim of the same line by the same node is refused too.
+    assert_eq!(claim_line(&mut m, a, 5, 211), Err(Error::Busy));
+    let taken =
+        dodos_abi::Ownership::taken(dodos_abi::Owner::Node(a), m.sys.member(a).generation());
+    assert_eq!(m.sys.canonical().line_word(5), taken);
+    // Node b's own irq_control and core: refused by the line's word.
+    assert_eq!(claim_line(&mut m, b, 5, 210), Err(Error::Busy));
+    // A forged redirection entry from b, aimed at b's core, is refused by
+    // the IOAPIC's holder.
+    {
+        let forged = UnitOp::Redirection {
+            gsi: 5,
+            claimed: true,
+            level: false,
+            low: false,
+            target: Target::Remapped {
+                handle: b * 192,
+                vector: 48,
+            },
+        };
+        assert!(judged(&mut m, holder, b, role, forged));
+    }
+    // The irq removed, its word is free and b may claim the line.
+    m.ok(a, Syscall::CapDelete(s(210)));
+    let free = dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed);
+    assert_eq!(m.sys.canonical().line_word(5), free);
+    assert!(matches!(
+        claim_line(&mut m, b, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+}
+
+#[test]
+fn r6_frees_the_line_words_of_a_generation_that_is_over() {
+    let (mut m, holder, a, b) = holder_requester_third();
+    assert!(matches!(
+        claim_line(&mut m, a, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+    let killer = if holder != a { holder } else { b };
+    m.ok(killer, kill(a));
+    m.run(20 * MS);
+    assert_eq!(m.state(a), MemberState::Dead);
+    assert!(!m.sys.canonical().lines.contains_key(&5));
+    assert!(matches!(
+        claim_line(&mut m, b, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+}
+
+#[test]
+fn a_line_beyond_the_last_line_word_is_unsupported() {
+    let mut machine = machine(Arch::X86_64, 2, &[&[0], &[1]]);
+    machine.ioapics[0].first_gsi = dodos_abi::IRQ_LINES_MAX as u32 - 4;
+    let mut m = S::on(&machine);
+    let beyond = dodos_abi::IRQ_LINES_MAX as u32 + 2;
+    let line = dodos_abi::IrqSource::line(beyond, false, false).raw();
+    assert_eq!(m.call(0, claim_on(0, line, 210)), Err(Error::Unsupported));
+}

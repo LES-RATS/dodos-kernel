@@ -161,13 +161,36 @@ pub(crate) struct UnitState {
 /// action, of the confirmed stop, and of the last stop sent to each of its
 /// cores: the fence record of the node slot in the living part, written by
 /// the driver's gate (The fence, the fence record, gap 6; its layout is
-/// `dodos_abi::FenceRecord`, whose last stops are by the core's position,
-/// kept here by core number).
+/// `dodos_abi::FenceRecord`): the generation it concerns, written anew by
+/// the first fence action of a generation, and the last stops indexed by
+/// core number mod 64 (D-134).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct FenceRecord {
+    pub(crate) generation: u32,
     pub(crate) started: Option<u64>,
     pub(crate) confirmed: Option<u64>,
+    /// By `dodos_abi::FenceRecord::stop_index`.
     pub(crate) last_stop: BTreeMap<usize, u64>,
+}
+
+impl FenceRecord {
+    /// The instant of the first fence action of `generation`, if the record
+    /// concerns it.
+    pub(crate) fn begun(&self, generation: u32) -> Option<u64> {
+        self.started.filter(|_| self.generation == generation)
+    }
+
+    /// The instant of the last stop sent to a core, 0 for none.
+    pub(crate) fn last_stop(&self, core: usize) -> u64 {
+        let index = dodos_abi::FenceRecord::stop_index(core);
+        self.last_stop.get(&index).copied().unwrap_or(0)
+    }
+
+    /// A stop sent to a core now.
+    pub(crate) fn stopped(&mut self, core: usize, now: u64) {
+        self.last_stop
+            .insert(dodos_abi::FenceRecord::stop_index(core), now);
+    }
 }
 
 /// A grant entry of the granting node: the grantee and its generation,
@@ -210,6 +233,8 @@ pub(crate) enum Word {
     Entry(usize),
     /// The identifier word of a device, by segment << 16 | identifier.
     Identifier(u32),
+    /// The line word of a claimable line, by GSI (Interrupts, D-135).
+    Line(u32),
 }
 
 /// One write of the living part, kept until the next check of the
@@ -278,6 +303,9 @@ pub(crate) struct Table {
     /// The identifier words of the devices, by segment << 16 | identifier,
     /// as raw ownership words; one not listed is free and unclaimed.
     pub(crate) identifiers: BTreeMap<u32, u64>,
+    /// The line words, by GSI, as raw ownership words; one not listed is
+    /// free and unclaimed (Interrupts, D-135).
+    pub(crate) lines: BTreeMap<u32, u64>,
     pub(crate) members: Vec<Member>,
     pub(crate) roles: Vec<RoleWord>,
     /// The grant table and the use table of each node, by index, and the
@@ -356,7 +384,22 @@ impl Table {
 
     /// The core word of a physical core, `None` if it fails its check.
     pub(crate) fn core_word(&self, core: usize) -> Option<CoreWord> {
-        CoreWord::from_raw(self.core_words[core])
+        CoreWord::from_raw(*self.core_words.get(core)?)
+    }
+
+    /// Whether a page of ordinary memory is held by a node with a
+    /// generation: its chunk taken by it, or in its floor (G3 (2)).
+    pub(crate) fn holds_page(&self, at: u64, node: u16, generation: u32) -> bool {
+        let chunk = at / self.geometry.chunk();
+        let taken = self.owners.get(chunk as usize).is_some_and(|&raw| {
+            dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
+                w.state() == dodos_abi::OwnState::Taken
+                    && w.owner() == dodos_abi::Owner::Node(node)
+                    && w.generation() == generation
+            })
+        });
+        let floors = self.floors.get(node as usize).into_iter().flatten();
+        taken || floors.clone().any(|&(start, end)| start <= at && at < end)
     }
 
     /// The physical cores whose words name a node with a generation (owned
@@ -603,6 +646,28 @@ impl Table {
         match after {
             Some(word) => self.identifiers.insert(key, word.raw()),
             None => self.identifiers.remove(&key),
+        };
+        self.writes.push(write);
+    }
+
+    /// The line word of a GSI, free and unclaimed if it is not listed.
+    pub(crate) fn line_word(&self, gsi: u32) -> Ownership {
+        let raw = self.lines.get(&gsi).copied();
+        let raw = raw.unwrap_or(Ownership::free(Owner::Unclaimed).raw());
+        Ownership::from_raw(raw).unwrap_or(Ownership::taken(Owner::Unclaimed, u32::MAX))
+    }
+
+    /// The write gate on a line word: *taken* by the writer's generation,
+    /// or `None` for *free*, unclaimed; also R6's clearing of a word that a
+    /// generation that is over took, to its cleared value.
+    pub(crate) fn write_line(&mut self, writer: u16, gsi: u32, after: Option<Ownership>) {
+        let unclaimed = Ownership::free(Owner::Unclaimed).raw();
+        let before = self.lines.get(&gsi).copied().unwrap_or(unclaimed);
+        let after_raw = after.map_or(unclaimed, Ownership::raw);
+        let write = self.journal(writer, Word::Line(gsi), before, after_raw);
+        match after {
+            Some(word) => self.lines.insert(gsi, word.raw()),
+            None => self.lines.remove(&gsi),
         };
         self.writes.push(write);
     }

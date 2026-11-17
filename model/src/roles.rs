@@ -336,10 +336,15 @@ impl Model {
             return None;
         }
         let member = self.table.member(judged);
+        // The instants of the fence record of the generation judged.
         let record = &self.table.fences[judged as usize];
+        let same = record.generation == member.generation();
         let at = match member.state() {
-            MemberState::Fenced | MemberState::Dead => record.confirmed.unwrap_or(0) + SETTLE_NS,
-            MemberState::Unfenced => record.started? + FENCE_NS + SETTLE_NS,
+            MemberState::Fenced | MemberState::Dead if same => {
+                record.confirmed.unwrap_or(0) + SETTLE_NS
+            }
+            MemberState::Fenced | MemberState::Dead => SETTLE_NS,
+            MemberState::Unfenced => record.begun(member.generation())? + FENCE_NS + SETTLE_NS,
             _ => return None,
         };
         let successor = dodos_abi::successor(&self.table.members, judged as usize)?;

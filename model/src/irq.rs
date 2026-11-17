@@ -54,6 +54,10 @@ impl Model {
         if !self.machine.remapping && apic > 255 || self.machine.remapping && remapped_core {
             return Err(Error::Unsupported);
         }
+        // A line beyond the last line word (Interrupts, D-135).
+        if source.is_line() && source.id() as usize >= dodos_abi::IRQ_LINES_MAX {
+            return Err(Error::Unsupported);
+        }
         // Unlike cores: without such an event, kind 3 is `unsupported`.
         if source.is_core_event() && !self.machine.core_events {
             return Err(Error::Unsupported);
@@ -67,9 +71,17 @@ impl Model {
         if claimed(&|irq| irq.core == position && irq.vector == vector) {
             return Err(Error::Busy);
         }
-        if source.is_line()
-            && claimed(&|irq| irq.source.is_line() && irq.source.id() == source.id())
-        {
+        // A line whose word the rules of taking refuse to this node, or that
+        // this node's current generation already holds: claimed on any core
+        // and any vector of the machine (Interrupts, the owner word of a
+        // line, D-135).
+        // (The rules of taking refuse a word this node's generation holds.)
+        let generation = self.table.generation(self.node);
+        let line_taken = source.is_line()
+            && !self
+                .table
+                .may_take(self.table.line_word(source.id()), self.node);
+        if line_taken {
             return Err(Error::Busy);
         }
         self.vacant(place)?;
@@ -120,6 +132,10 @@ impl Model {
             notify: None,
         };
         self.irqs.insert(id, irq);
+        if source.is_line() {
+            let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation);
+            self.table.write_line(self.node, source.id(), Some(taken));
+        }
         // The fixed remapping entry of the vector on that core: handle
         // core number × 192 + (vector − 48), written by this node's gate.
         let entry = u64::from(vector - IRQ_VECTOR_FIRST);
@@ -135,7 +151,6 @@ impl Model {
         let Some(role) = role else {
             return Ok(Output::Msi { address, data });
         };
-        let generation = self.table.generation(self.node);
         for &unit in &units {
             let remap = &mut self.table.units.entry(unit).or_default().remap;
             remap.insert(handle as u32, (self.node, generation));
@@ -167,12 +182,21 @@ impl Model {
             true => redirection.expect("a line without remapping").1,
         };
         let waiter = crate::units::Waiter::Thread(Some(thread));
-        let entry = self.unit_request_with(role, op, waiter, None, Some((address, data)))?;
-        if !units.is_empty()
-            && let Some(e) = self.unit_requests[entry].as_mut()
-        {
-            e.segment = Some(segment);
-            e.then = redirection;
+        let chain = match units.is_empty() {
+            false => crate::units::Chain {
+                segment: Some(segment),
+                then: redirection,
+            },
+            true => crate::units::Chain::default(),
+        };
+        let words = Some((address, data));
+        self.unit_request_with(role, op, waiter, None, words, chain)?;
+        // Served at once (a unit or an IOAPIC this node holds, or a failed
+        // unit passed over): the call ends with its result.
+        let claimed = locked(&mut self.threads, &self.locks, thread);
+        if claimed.wait == crate::Wait::None && claimed.answered {
+            claimed.answered = false;
+            return claimed.outcome.take().unwrap_or(Ok(Output::Waits));
         }
         Ok(Output::Waits)
     }
@@ -308,6 +332,10 @@ impl Model {
         self.unbind_irq(irq);
         if let Some(entry) = self.irqs.remove(&irq) {
             self.touch_core(entry.core);
+            // A line's word is written free, unclaimed (D-135).
+            if entry.source.is_line() {
+                self.table.write_line(self.node, entry.source.id(), None);
+            }
         }
     }
 }

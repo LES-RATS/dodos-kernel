@@ -336,8 +336,8 @@ pub struct StartIommu {
     pub role: u32,
 }
 
-/// Where the living part lies in the frame of slot 13, and its sizes (80
-/// bytes since D-129).
+/// Where the living part lies in the frame of slot 13, and its sizes (88
+/// bytes since D-135, 80 since D-129).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartMachine {
@@ -367,11 +367,16 @@ pub struct StartMachine {
     /// The offset of the fence records, one `FenceRecord` per node slot
     /// (The fence: the fence record; layout 2).
     pub fence_records: u32,
+    /// The offset of the line words, one `Ownership` per claimable line,
+    /// and their number (Interrupts, D-135; layout 3).
+    pub lines: u32,
+    pub line_count: u32,
 }
 
 /// The layout version of the living part that `StartMachine` describes.
-/// 2 since the fence records (pass 16), 1 since D-129.
-pub const START_MACHINE_LAYOUT: u32 = 2;
+/// 3 since the line words (D-135), 2 since the fence records (pass 16), 1
+/// since D-129.
+pub const START_MACHINE_LAYOUT: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

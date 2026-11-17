@@ -276,6 +276,7 @@ impl Model {
         self.check_irqs()?;
         self.check_table()?;
         self.check_identifiers()?;
+        self.check_lines()?;
         self.check_cores()?;
         self.check_node()?;
         self.check_debug()?;
@@ -306,6 +307,32 @@ impl Model {
         match held == attached {
             true => Ok(()),
             false => Err("88: identifier words and attached devices"),
+        }
+    }
+
+    /// 96. a line is claimed by an irq of this node exactly while its line
+    ///     word reads taken by this node's generation (Interrupts, the
+    ///     owner word of a line, D-135).
+    fn check_lines(&self) -> Check {
+        let generation = self.table.generation(self.node);
+        let taken =
+            dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation).raw();
+        let claimed: std::collections::BTreeSet<u32> = self
+            .irqs
+            .values()
+            .filter(|irq| irq.source.is_line())
+            .map(|irq| irq.source.id())
+            .collect();
+        let held: std::collections::BTreeSet<u32> = self
+            .table
+            .lines
+            .iter()
+            .filter(|&(_, &raw)| raw == taken)
+            .map(|(&gsi, _)| gsi)
+            .collect();
+        match held == claimed {
+            true => Ok(()),
+            false => Err("96: line words and claimed lines"),
         }
     }
 
