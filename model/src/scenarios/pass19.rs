@@ -1096,3 +1096,26 @@ fn a_start_on_a_core_that_never_beats_is_accused_after_start_ns_and_not_before()
     assert_ne!(m.state(1), MemberState::Starting);
     assert_eq!(m.sys.member(1).evidence(), dodos_abi::Evidence::Stale);
 }
+
+// The kernel epoch rises only at an escalation or at the last destruction
+// of an untyped's object (finding 3 of the tenth model review).
+
+#[test]
+fn a_raise_of_the_kernel_epoch_by_no_escalation_and_no_last_destruction_is_reported() {
+    let (mut k, _, _, _) = super::pass18::l2_delivery();
+    k.m.kernel_epoch += 1;
+    let epoch = k.m.kernel_epoch;
+    k.m.locks.steps = vec![Step::Epoch(epoch)];
+    assert_eq!(
+        k.m.check(),
+        Err("epoch: raised neither by an escalation nor at the last destruction of an untyped")
+    );
+    let untyped = *k.m.untypeds.keys().next().unwrap();
+    k.m.locks.steps = vec![Step::Epoch(epoch), Step::Ready(untyped)];
+    assert_eq!(k.m.check(), Ok(()));
+    k.m.locks.steps = vec![Step::Epoch(epoch + 1), Step::Ready(untyped)];
+    assert_eq!(
+        k.m.check(),
+        Err("epoch: the node's epoch is not its last raise")
+    );
+}

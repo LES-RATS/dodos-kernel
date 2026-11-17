@@ -2467,14 +2467,16 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 27, cspace 9,438, aspace 39, frame
-    // 9,509, thread 141, sched 13, endpoint 13, reply 920, notify 472. Pass
-    // 15 changed the generator (the calls of nodes); the larger counts of
-    // untyped and endpoint before it came each from one seed in which one
-    // object stayed dying for hundreds of steps. A copy under `cap_delete`
-    // 32.
+    // Measured, in steps: untyped 28, cspace 9,475, aspace 39, frame
+    // 10,994, thread 141, sched 13, endpoint 13, reply 921, notify 221.
+    // Pass 15 changed the generator (the calls of nodes); the larger counts
+    // of untyped and endpoint before it came each from one seed in which one
+    // object stayed dying for hundreds of steps. Pass 19 measured them again
+    // (D-137: the destruction of an iospace waits for the answers of its
+    // detaches, which reshaped the walk of 32 KB pages, every count higher
+    // there but the notifies', 474 to 221). A copy under `cap_delete` 32.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [21, 7079, 30, 7132, 106, 10, 10, 690, 354]);
+    at_least(dying, [21, 7107, 30, 8246, 106, 10, 10, 691, 166]);
     at_least([reached.dying_copies], [24]);
 }
 
