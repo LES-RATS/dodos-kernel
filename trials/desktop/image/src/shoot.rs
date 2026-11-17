@@ -15,6 +15,12 @@
 //! the other kind, and mixed. With 13 others the bootstrap core is one of
 //! the targets (it takes the vector through its IDT; the firmware's own
 //! interrupts keep running there).
+//!
+//! A shootdown not acknowledged within `ACK_LIMIT_NS` ends its line: the
+//! initiator releases every target and the line is reported as `F shoot`
+//! with its keys, the other lines still run. A target never waits for an
+//! initiator that stopped (the bootstrap core as a target would otherwise
+//! spin until the step's watchdog resets the machine, losing the cause).
 
 use crate::idt::{DODOS_SHOOT_ACKS, DODOS_SHOOT_VA, V_SHOOT};
 use crate::ipi::{self, Target};
@@ -29,13 +35,20 @@ use dodos_trial_multicore::rt::Mutex;
 
 static DONE: AtomicU64 = AtomicU64::new(0);
 
+/// Longest wait for every acknowledgement of one shootdown: far above any
+/// real one (microseconds), so only a lost interrupt or acknowledgement
+/// reaches it. Not 100 ms: under QEMU on a loaded host a virtual core's
+/// thread can stay off its host core for longer (lines that failed at
+/// 100 ms on a loaded host passed on an idle one).
+const ACK_LIMIT_NS: u64 = 1_000_000_000;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Send {
     Unicast,
     Logical,
 }
 
-fn shoot(targets: &[u32], send: Send, frames: (u64, u64), k: u64) -> u64 {
+fn shoot(targets: &[u32], send: Send, frames: (u64, u64), k: u64) -> Result<u64, String> {
     let n = targets.len() as u64;
     let va = paging::window_va(30);
     paging::map(
@@ -70,15 +83,20 @@ fn shoot(targets: &[u32], send: Send, frames: (u64, u64), k: u64) -> u64 {
             }
         }
     }
-    let end = t0 + tsc::ns_to_ticks(100_000_000);
-    while DODOS_SHOOT_ACKS.load(Ordering::Acquire) < n {
-        assert!(
-            x86::rdtsc() < end,
-            "shootdown not acknowledged within 100 ms"
-        );
+    let end = t0 + tsc::ns_to_ticks(ACK_LIMIT_NS);
+    loop {
+        let acks = DODOS_SHOOT_ACKS.load(Ordering::Acquire);
+        if acks >= n {
+            return Ok(x86::tsc_end() - t0);
+        }
+        if x86::rdtsc() >= end {
+            return Err(alloc::format!(
+                "shootdown {k} acknowledged by {acks} of {n} within {} ms",
+                ACK_LIMIT_NS / 1_000_000
+            ));
+        }
         x86::pause();
     }
-    x86::tsc_end() - t0
 }
 
 fn measure(
@@ -89,7 +107,7 @@ fn measure(
     n: usize,
 ) -> Result<Vec<u64>, String> {
     DONE.store(0, Ordering::Release);
-    let out: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let out: Mutex<Result<Vec<u64>, String>> = Mutex::new(Ok(Vec::new()));
     let apics: Vec<u32> = targets.iter().map(|&t| smp::cores()[t].apic).collect();
     let frames = (paging::frame(), paging::frame());
     let ready = AtomicU64::new(0);
@@ -107,14 +125,19 @@ fn measure(
             }
             let gap = if idle { 50_000 } else { 2_000 };
             let mut v = Vec::with_capacity(n);
+            let mut r = Ok(());
             for k in 0..=n as u64 {
                 tsc::spin_ns(gap);
-                let t = shoot(&apics, send, frames, k);
-                if k > 0 {
-                    v.push(t);
+                match shoot(&apics, send, frames, k) {
+                    Ok(t) if k > 0 => v.push(t),
+                    Ok(_) => {}
+                    Err(e) => {
+                        r = Err(e);
+                        break;
+                    }
                 }
             }
-            *out.lock().expect("out") = v;
+            *out.lock().expect("out") = r.map(|()| v);
             DONE.store(1, Ordering::Release);
             for &t in &apics {
                 apic::send(t, apic::FIXED, crate::idt::V_FLAG);
@@ -146,7 +169,7 @@ fn measure(
         }
     })?;
     let _ = bsp_in;
-    Ok(core::mem::take(&mut *out.lock().expect("out")))
+    core::mem::replace(&mut *out.lock().expect("out"), Ok(Vec::new()))
 }
 
 pub fn run(cx: &mut Ctx) -> Result<(), String> {
@@ -205,7 +228,7 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
     for (set, targets) in cases {
         for &send in sends {
             for idle in [false, true] {
-                let mut v = measure(init, &targets, idle, send, n)?;
+                let r = measure(init, &targets, idle, send, n);
                 let kinds: String = targets.iter().map(|&t| smp::kind(t).name()).collect();
                 let k = alloc::format!(
                     "initiator={init} initiator_kind={} others={} set={set} kinds={kinds} targets={} send={} bsp_target={}",
@@ -219,7 +242,10 @@ pub fn run(cx: &mut Ctx) -> Result<(), String> {
                     },
                     u8::from(targets.contains(&0))
                 );
-                stats::report_ticks("shoot", &k, &mut v);
+                match r {
+                    Ok(mut v) => stats::report_ticks("shoot", &k, &mut v),
+                    Err(e) => crate::out!("F shoot {k} error=\"{e}\""),
+                }
             }
         }
         crate::con::flush();

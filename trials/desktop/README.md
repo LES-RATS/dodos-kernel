@@ -201,7 +201,12 @@ BSP flag test, the
 rehearsal of the bootstrap core's restart on a worker; three warm-reset
 methods across four boots; resuming after a step that reset the machine;
 the image's watchdog resetting the machine when a step hung (seen during
-development, the spin fallback path).
+development, the spin fallback path, and again on 17 November: on a loaded
+host `shoot` missed its acknowledgement guard, then 100 ms, which panicked
+the initiator while the bootstrap core waited for it as a target, until
+the step's watchdog reset the machine). A late acknowledgement now ends
+only its line, reported as `F shoot` with its keys, and the guard is 1 s;
+under load that path ran and reported each line.
 
 Only the real machine will run: everything in `cet` (QEMU has no CET; the
 instruction encodings were checked by disassembly against the SDM's

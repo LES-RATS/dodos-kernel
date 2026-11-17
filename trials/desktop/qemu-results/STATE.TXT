@@ -24,17 +24,17 @@ done trial-alternate 1
 start ept 1
 done ept 1
 start warm-reset 1
-wr method=uefi-warm rep=0 nonce=0x10029ce75a2b8 regions=0x1800000,0x40000000,0x7be00000 boot=1
+wr method=uefi-warm rep=0 nonce=0x10057ae420120 regions=0x1800000,0x40000000,0x7be00000 boot=1
 resume warm-reset 1
 boot 2
 start warm-reset 2
 wr-done method=uefi-warm rep=0
-wr method=acpi rep=0 nonce=0x2002dd08fdf10 regions=0x1800000,0x40000000,0x7be00000 boot=2
+wr method=acpi rep=0 nonce=0x20061783ccbf0 regions=0x1800000,0x40000000,0x7be00000 boot=2
 resume warm-reset 2
 boot 3
 start warm-reset 3
 wr-done method=acpi rep=0
-wr method=uefi-cold rep=0 nonce=0x30031af79d250 regions=0x1800000,0x40000000,0x7be00000 boot=3
+wr method=uefi-cold rep=0 nonce=0x30068452abab8 regions=0x1800000,0x40000000,0x7be00000 boot=3
 resume warm-reset 3
 boot 4
 start warm-reset 4
