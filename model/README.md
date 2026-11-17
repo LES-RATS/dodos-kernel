@@ -69,7 +69,16 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   mark, the bound of the tables a change unhooks, a line's mask in its
   `Report`, an MSI's removal as a request and the handle a failed unit
   did not confirm retired, `idle_until`, the fence record and the waits on
-  the clock less the stopped time),
+  the clock less the stopped time), `pass21.rs` (D-140, the thirteenth
+  contract review: a detach tied to its requester and refused on the
+  wrong unit unless the word reads *detached* with its root, the retired
+  word of each core in the machine table through R6 and the next start,
+  R1 on a failed unit holding only the nodes whose devices sat behind it
+  (and a unit that does not confirm R1 judged failed), the bind's full
+  barrier, the start instant of a request read under the lock, the route
+  of a line on ARM64 and RISC-V, a refused detach at a destruction step,
+  the invalidation of a line's remapping entry at its removal; then the
+  twelfth model review judged finding by finding),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -85,6 +94,23 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   the counts measured on 17 November 2026, rounded up).
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
+
+## Mutations shown equivalent
+
+- The clause of `reclaim_step` that drops, in state dead, a reclaim
+  record of an older generation (`r.generation != g`; the tenth model
+  review's m25, the twelfth's m33) is equivalent: every reader of a
+  `Reclaim` reaches it after `r0` (which replaces a record of another
+  generation before R1 to R6 read it) or after the generation check of a
+  unit role's take-over (`roles.rs`), so a record of an older generation
+  left while the node is dead is replaced before any of its fields is
+  read; only the map's contents while the node is dead differ, and
+  nothing reads them then (R6's cursor is read only while the node is
+  fenced and its barrier holds, after `reclaim_step` ran `r0`). The test
+  `deepseek12_m33_the_reclaim_of_a_second_death_of_one_slot_starts_afresh`
+  holds the reset of `r0` that makes it so. The tenth review's m18 (a
+  start never over) is killed by pass 19's
+  `a_start_whose_core_never_takes_its_wake_ends_at_start_ns`.
 
 ## Where the contract is silent
 
@@ -112,7 +138,14 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
 - Real concurrency: every event runs alone, as the node lock makes them;
   the lock-free slot read, its check under the lock and the atomic OR of a
   `signal` are not interleaved with other events (the small models of the
-  contract's list are for that).
+  contract's list are for that). So the check of the sequence words under
+  the lock (D-138) has no code here: no event can change a segment
+  between a lookup and its lock, and a step that recorded it would be a
+  check no state can fail (the twelfth model review, finding 2, judged
+  so). What the model holds of the orders is their cost: the bind's full
+  barrier on a node of several cores (`Cost::Fence`), and the wait for
+  the lock as a time (`Model::lock_wait`, a test's input), so that what is
+  read under the lock, a request's start instant, is read after it.
 - The lock per object (variant L2): it left the contract of version 1 by
   D-138, and its model left with it: the order by kind, the tries and
   their two rounds, `Model::hold` and the scripted second core, the
@@ -128,7 +161,8 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
   them; the clock of membership leaves the stop out for the observations,
   the seal, the evidence, the fence record, the waits (a request's start,
   a unit's submission, a start, a hand-over) and `idle_until`.
-- The invalidation of the interrupt entry cache after the masking of a
-  line with interrupt remapping, at the removal of its `irq`: the model
-  masks the line; the requests for its remapping entry are modelled for
-  an MSI only.
+- The line controllers of ARM64 and RISC-V (the GIC distributor, an
+  APLIC domain) and the ITS: a line is an IOAPIC's input on every
+  architecture, its route a redirection entry whose target names a core
+  by its hardware identifier, which is how G9's check of the target core
+  is tested on ARM64 and RISC-V.

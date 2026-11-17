@@ -58,6 +58,10 @@ pub enum Cost {
     LoadedSet,
     /// A lock instruction.
     Lock,
+    /// A full barrier between a store and a load of another address: the
+    /// bind's write of the binding before its read of the word (A node of
+    /// several cores, the third order, D-140).
+    Fence,
 }
 
 /// One step of an event, in order.

@@ -12,7 +12,7 @@ use crate::locks::{Cost, LockId, Measured, Step};
 /// A node of `cores` cores on `arch`; an untyped of 64 KB at slot 350, a
 /// context made from it at 351 and destroyed: its watermark is ready to
 /// return. Returns the node and the untyped.
-fn ready_untyped(arch: Arch, cores: usize) -> (N, ObjId) {
+pub(super) fn ready_untyped(arch: Arch, cores: usize) -> (N, ObjId) {
     let mut k = N::on(&one_node(arch, cores));
     k.ok(k.retype(ObjectKind::Untyped, 1 << 16, 350));
     k.ok(retype_from(350, ObjectKind::Sched, 0, 351));
@@ -294,6 +294,9 @@ fn the_destruction_of_a_block_whose_watermark_is_ready_to_return_waits_for_the_b
     ));
     assert!(k.m.kernel_runs.contains(&free));
     assert!(k.m.untypeds.contains_key(&block));
+    // The step went no further than the barrier: the block is not taken
+    // yet (the twelfth model review, finding 11).
+    assert!(k.m.untypeds[&block].block.is_some());
     k.interrupts();
     // Then the destruction goes on: its own request for the run, then the
     // words written at its completion.
@@ -373,7 +376,7 @@ fn a_thread_detached_by_the_destruction_of_its_task_keeps_its_marks() {
 
 /// Node 0 of three makes an iospace and asks the attach of the device of
 /// node 1's unit, not yet consumed; returns the machine and the root.
-fn attach_in_flight() -> (S, u64) {
+pub(super) fn attach_in_flight() -> (S, u64) {
     use super::units::{DEVICE, IOSPACE, attach, three};
     let mut m = three();
     let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
@@ -574,7 +577,7 @@ fn a_vector_whose_invalidation_a_failed_unit_did_not_confirm_is_not_claimed_agai
         m.run(10 * MS);
     }
     assert_eq!(outcome, DONE);
-    assert!(!m.sys.node(0).retired.is_empty());
+    assert!(!m.sys.canonical().retired.is_empty());
     let again = Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
         source: dodos_abi::IrqSource::msi(0, 3, 1, 0).raw(),
@@ -605,7 +608,7 @@ fn the_removal_of_an_msi_with_remapping_is_a_request_that_clears_its_entry() {
     assert!(!remapped(&m));
     m.run(30 * MS);
     assert_eq!(m.call(0, Syscall::CapDelete(s(210))), DONE);
-    assert!(m.sys.node(0).retired.is_empty());
+    assert!(m.sys.canonical().retired.is_empty());
     let again = Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
         source: dodos_abi::IrqSource::msi(0, 3, 1, 0).raw(),
@@ -742,6 +745,7 @@ fn the_holders_gate_writes_detached_only_from_attached() {
     let op = crate::rings::UnitOp::Detach {
         device: DEVICE as u16,
         domain: 0,
+        root: before.root(),
     };
     m.sys.node_mut(holder).detach_confirmed(IOMMU_ROLE, op);
     assert_eq!(m.sys.node(holder).table.attach_word(DEVICE as u32), before);

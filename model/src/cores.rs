@@ -342,7 +342,7 @@ impl Model {
             flush,
             asked,
             acked: 0,
-            started: self.membership_now(),
+            started: self.locked_now(),
             completes,
             waiter,
         };
@@ -417,7 +417,7 @@ impl Model {
             flush: Flush::Nothing,
             asked,
             acked: 0,
-            started: self.membership_now(),
+            started: self.locked_now(),
             completes: Completes::Barrier(self.kernel_epoch),
             waiter: None,
         });

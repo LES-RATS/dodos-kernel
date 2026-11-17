@@ -574,8 +574,12 @@ fn kernel_refuses_times_of_membership_out_of_their_ranges() {
         );
     }
     // At the low end STALE_NS must still exceed CORE_ANSWER_NS and an
-    // event (D-137), so CORE_ANSWER_NS is at its own low end.
+    // event (D-137), so CORE_ANSWER_NS is at its own low end, for an image
+    // of 4 cores: one of 64 with H = 10 µs needs CORE_ANSWER_NS above
+    // 2 × 640 µs + D, judged for the largest N the image supports (the
+    // twelfth model review, finding 9).
     let edges = with(|m| {
+        m.cores_supported = 4;
         m.membership.stale_ms = 10;
         m.membership.stuck_ms = 1000;
         m.membership.sweep_ms = 60_000;

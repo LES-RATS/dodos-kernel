@@ -160,6 +160,15 @@ pub(crate) struct UnitState {
     pub(crate) next: u64,
 }
 
+/// A claimed entry of a core's interrupt table, as the kept memory holds
+/// it: who claimed it, and the unit roles that hold its remapping entry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct IrqTableEntry {
+    pub(crate) node: u16,
+    pub(crate) generation: u32,
+    pub(crate) units: Vec<usize>,
+}
+
 /// The fence of a node, as every node reads it: the instant of its first
 /// action, of the confirmed stop, and of the last stop sent to each of its
 /// cores: the fence record of the node slot in the living part, written by
@@ -357,6 +366,15 @@ pub(crate) struct Table {
     pub(crate) resume_replacement: Vec<bool>,
     /// The units of the unit roles, as their hardware holds them, by role.
     pub(crate) units: BTreeMap<usize, UnitState>,
+    /// The interrupt tables of the physical cores, kept memory (rule 3):
+    /// each claimed entry by its handle (the core's number × 192 + the
+    /// vector's index), with the node and generation that claimed it and
+    /// the unit roles that hold its remapping entry (Interrupts).
+    pub(crate) irq_tables: BTreeMap<u16, IrqTableEntry>,
+    /// The retired word of each physical core, a bit per vector of its
+    /// table, as handles: set at a removal's answer *failed* and by R6,
+    /// cleared only when the machine restarts (Interrupts, the irq, D-140).
+    pub(crate) retired: BTreeSet<u16>,
     /// The writes of ownership and identifier words since the last check of
     /// the invariants, and whether that check has run since (the next event
     /// then starts a new journal).

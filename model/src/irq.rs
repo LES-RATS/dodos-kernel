@@ -71,12 +71,12 @@ impl Model {
         if claimed(&|irq| irq.core == position && irq.vector == vector) {
             return Err(Error::Busy);
         }
-        // A vector whose remapping entry's invalidation a unit answered
-        // *failed* stays claimed, with no irq, while the unit is failed
-        // (Interrupts, the irq, D-139).
+        // A vector whose bit is set in the core's retired word, in the
+        // living part: a failed unit may still hold its remapping entry
+        // (Interrupts, the irq, D-139, D-140).
         let handle = u64::from(self.cores[position].number) * IRQ_TABLE_ENTRIES as u64
             + u64::from(vector.saturating_sub(IRQ_VECTOR_FIRST));
-        if self.retired.contains(&(handle as u16)) {
+        if self.table.retired.contains(&(handle as u16)) {
             return Err(Error::Busy);
         }
         // A line whose word the rules of taking refuse to this node, or that
@@ -140,6 +140,12 @@ impl Model {
             removing: false,
         };
         self.irqs.insert(id, irq);
+        let kept = crate::table::IrqTableEntry {
+            node: self.node,
+            generation,
+            units: units.clone(),
+        };
+        self.table.irq_tables.insert(handle as u16, kept);
         if source.is_line() {
             let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation);
             self.table.write_line(self.node, source.id(), Some(taken));
@@ -227,8 +233,24 @@ impl Model {
             self.signal_bits(notify, bits);
         } else {
             entry.state = IrqState::Armed;
+            self.unmask_line(irq);
         }
         Ok(Output::Done)
+    }
+
+    /// An irq armed: a level line is unmasked at its controller, which
+    /// takes back the mask a rebuild wrote from its `Report` (Interrupts,
+    /// the states of an irq; D-139).
+    fn unmask_line(&mut self, irq: ObjId) {
+        let source = self.irqs[&irq].source;
+        if let Some(role) = source
+            .is_line()
+            .then(|| self.ioapic_role(source.id()))
+            .flatten()
+            && let Some(unit) = self.table.units.get_mut(&role)
+        {
+            unit.masked.remove(&source.id());
+        }
     }
 
     /// `irq_ack`: `busy` on an idle irq; nothing on an armed one; on a fired
@@ -250,7 +272,10 @@ impl Model {
                 let (notify, bits) = entry.notify.expect("a fired irq is bound");
                 self.signal_bits(notify, bits);
             }
-            IrqState::Fired => entry.state = IrqState::Armed,
+            IrqState::Fired => {
+                entry.state = IrqState::Armed;
+                self.unmask_line(irq);
+            }
         }
         Ok(Output::Done)
     }
@@ -292,7 +317,8 @@ impl Model {
         let found = self
             .irqs
             .iter()
-            .find(|(_, irq)| irq.core == position && irq.vector == vector);
+            .find(|(_, irq)| irq.core == position && irq.vector == vector)
+            .filter(|(_, irq)| !self.line_masked(irq.source));
         if let Some((&id, _)) = found {
             let dying = self.irqs[&id]
                 .notify
@@ -311,6 +337,19 @@ impl Model {
         }
         self.end(entry);
         self.auto_deliver();
+    }
+
+    /// Whether a line's redirection entry is masked at its IOAPIC as a
+    /// rebuild wrote it from the line's `Report` (D-139): a masked entry
+    /// raises nothing, so no arrival reaches the core.
+    fn line_masked(&self, source: dodos_abi::IrqSource) -> bool {
+        source.is_line()
+            && self.ioapic_role(source.id()).is_some_and(|role| {
+                self.table
+                    .units
+                    .get(&role)
+                    .is_some_and(|u| u.masked.contains(&source.id()))
+            })
     }
 
     fn signal_bits(&mut self, notify: ObjId, bits: u64) {
@@ -354,8 +393,12 @@ impl Model {
         if self.line_asking(gsi) {
             return Undone::Wait;
         }
+        // The redirection entry masked and answered: then, where a remapping
+        // entry is cleared, the invalidation of the interrupt entry cache
+        // of each unit that serves the IOAPIC's segment (Interrupts, the
+        // irq, D-137; pass 20 had left it out of the model).
         if entry.removing {
-            return Undone::Nothing;
+            return self.line_remap_removal(irq);
         }
         let Some(role) = self.ioapic_role(gsi) else {
             return Undone::Nothing;
@@ -469,6 +512,75 @@ impl Model {
         }
     }
 
+    /// The second half of the removal of a line's irq, once its redirection
+    /// entry is masked: its gate clears the remapping entry of its handle in
+    /// each unit of the IOAPIC's segment, and the invalidation of the
+    /// interrupt entry cache is asked of each, one after another as for a
+    /// claim; a unit held by this node is served at once. Nothing when no
+    /// unit holds the entry any more and no invalidation is in flight. A
+    /// handle whose invalidation a unit answered *failed* is retired.
+    fn line_remap_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
+        use crate::caps::Undone;
+        let entry = self.irqs[&irq];
+        let segment = self
+            .machine
+            .ioapics
+            .iter()
+            .find(|io| (io.first_gsi..io.first_gsi + io.inputs).contains(&entry.source.id()))
+            .map_or(0, |io| io.segment);
+        let units = match self.machine.remapping {
+            true => self.segment_roles(segment),
+            false => Vec::new(),
+        };
+        let handle = self.handle_of(&entry);
+        if self.handle_asking(handle) {
+            return Undone::Wait;
+        }
+        let remapped = |m: &Self, role: usize| {
+            m.table
+                .units
+                .get(&role)
+                .is_some_and(|u| u.remap.contains_key(&u32::from(handle)))
+        };
+        let Some(&first) = units.iter().find(|&&role| remapped(self, role)) else {
+            return Undone::Nothing;
+        };
+        let held = |role: usize| {
+            let word = self.table.roles[role];
+            word.state() == dodos_abi::RoleState::Held && word.holder() == self.node
+        };
+        let local = units
+            .iter()
+            .all(|&role| held(role) && !self.unit_failed(role));
+        if !local && self.unit_requests.iter().all(Option::is_some) {
+            return Undone::Wait;
+        }
+        for &unit in &units {
+            if let Some(state) = self.table.units.get_mut(&unit) {
+                state.remap.remove(&u32::from(handle));
+            }
+        }
+        if local {
+            return Undone::Nothing;
+        }
+        let op = crate::rings::UnitOp::InterruptCache { handle };
+        let chain = crate::units::Chain {
+            segment: Some(segment),
+            then: None,
+        };
+        let waiter = crate::units::Waiter::Thread(None);
+        if self
+            .unit_request_with(first, op, waiter, None, None, chain)
+            .is_err()
+        {
+            return Undone::Wait;
+        }
+        match self.handle_asking(handle) {
+            true => Undone::Wait,
+            false => Undone::Unit,
+        }
+    }
+
     /// Whether an entry of the unit request table still asks the
     /// invalidation of the interrupt entry cache for a handle.
     fn handle_asking(&self, handle: u16) -> bool {
@@ -492,6 +604,8 @@ impl Model {
     pub(crate) fn irq_destroyed(&mut self, irq: ObjId) {
         self.unbind_irq(irq);
         if let Some(entry) = self.irqs.remove(&irq) {
+            let handle = self.handle_of(&entry);
+            self.table.irq_tables.remove(&handle);
             // A line's word is written free, unclaimed (D-135).
             if entry.source.is_line() {
                 self.table.write_line(self.node, entry.source.id(), None);

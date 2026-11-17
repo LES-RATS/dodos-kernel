@@ -743,7 +743,10 @@ impl Machine {
         // with an event (and the reserve's period for STUCK_NS): a core
         // that waits does not beat (D-131, D-137).
         let answer = u64::from(self.membership.core_answer_ms) * 1_000_000;
-        let largest = u64::from(self.cores_supported.min(self.cores.len() as u32));
+        // The largest N the image supports (entry `Node`), whatever cores
+        // this machine has: the image's values are judged for that N (A
+        // node of several cores; the twelfth model review, finding 9).
+        let largest = u64::from(self.cores_supported);
         let measured = crate::locks::Measured {
             cores: largest,
             node_hold: self.hold_ns,
@@ -923,6 +926,8 @@ impl Machine {
             }
         }
         Table {
+            irq_tables: Default::default(),
+            retired: Default::default(),
             geometry: self.geometry,
             nodes: n as u16,
             floors: layout.floors.clone(),

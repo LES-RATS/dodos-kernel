@@ -557,7 +557,7 @@ impl Model {
     /// *attached* with the root (D-137). A device whose attach is in flight
     /// is in no header and no report; its kept attach is served once the
     /// rebuild ends (the attach word against every event, D-139).
-    fn rebuilt_attach(&mut self, role: usize, device: u16, root: u64) -> bool {
+    pub(crate) fn rebuilt_attach(&mut self, role: usize, device: u16, root: u64) -> bool {
         let Some(key) = self.attach_key(role, device) else {
             return false;
         };
@@ -587,7 +587,7 @@ impl Model {
     /// This node's items on a unit, in the fixed order of a report: its
     /// devices attached through the unit, from its own list, by identifier;
     /// then the lines it claimed, by global system interrupt.
-    fn items(&self, role: usize) -> Vec<Item> {
+    pub(crate) fn items(&self, role: usize) -> Vec<Item> {
         let record = self.table.role_records[role];
         let mut items: Vec<Item> = match record.governs {
             dodos_abi::Governs::IommuUnit => self

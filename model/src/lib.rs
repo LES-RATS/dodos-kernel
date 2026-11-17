@@ -1078,10 +1078,11 @@ pub struct Model {
     /// The kernel epoch: one word of the node block, raised at the last
     /// destruction of an untyped's object (D-135, D-138).
     pub(crate) kernel_epoch: u64,
-    /// The remapping handles retired by the removal of an irq whose
-    /// invalidation a failed unit did not confirm: their vectors stay
-    /// claimed, with no irq (Interrupts, the irq, D-139).
-    pub(crate) retired: BTreeSet<u16>,
+    /// A test's input: how long an event of this node waits for the node
+    /// lock before it holds it. The model runs every event alone, so the
+    /// wait is a time and not an interleaving; what reads the clock under
+    /// the lock reads it this much later than the event's entry.
+    pub(crate) lock_wait: u64,
     /// The barrier epoch: the largest kernel epoch a complete barrier
     /// covers; a watermark ready at an epoch it covers returns (A node of
     /// several cores, D-138).

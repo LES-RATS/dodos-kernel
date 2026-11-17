@@ -799,7 +799,9 @@ impl Model {
             }
             let pinned =
                 self.table.attach_word(key).state() == Some(dodos_abi::AttachState::Pinned);
-            if pinned && self.holds_identifier(key) {
+            // *Pinned* is `busy` for every caller, before the owner's
+            // `denied` (the order of iospace 0, D-139).
+            if pinned {
                 return Err(Error::Busy);
             }
             let Some(from) = attached else {
@@ -815,8 +817,13 @@ impl Model {
                 return Err(Error::Again);
             }
             let domain = self.domains.get(&from).copied().unwrap_or(0);
+            let root = self.aspaces[&from].root.unwrap_or(0);
             live(&mut self.iommus, iommu).detaching.insert(device);
-            let op = crate::rings::UnitOp::Detach { device, domain };
+            let op = crate::rings::UnitOp::Detach {
+                device,
+                domain,
+                root,
+            };
             let waiter = crate::units::Waiter::Thread(Some(thread));
             self.unit_request(role, op, waiter, None)?;
             return Ok(Output::Waits);
@@ -919,9 +926,14 @@ impl Model {
         }
         let iospace = self.iommus[&iommu].attached[&device];
         let domain = self.domains.get(&iospace).copied().unwrap_or(0);
+        let root = self.aspaces[&iospace].root.unwrap_or(0);
         live(&mut self.iommus, iommu).detaching.insert(device);
-        let op = crate::rings::UnitOp::Detach { device, domain };
-        self.unit_request(role, op, crate::units::Waiter::Thread(None), None)?;
+        let op = crate::rings::UnitOp::Detach {
+            device,
+            domain,
+            root,
+        };
+        self.unit_request(role, op, crate::units::Waiter::Step, None)?;
         Ok(())
     }
 
@@ -1023,6 +1035,7 @@ impl Model {
         role: usize,
         device: u16,
         result: dodos_abi::UnitResult,
+        waiter: crate::units::Waiter,
     ) -> bool {
         let (Some(key), Some(iommu)) = (self.attach_key(role, device), self.iommu_of(role)) else {
             return false;
@@ -1043,8 +1056,13 @@ impl Model {
             self.table.write_identifier(self.node, key, None);
             self.set_root_class(root);
         }
+        // A detach the holder refused (done on a word still *attached*):
+        // at a call the device stays in the header; at a step of a
+        // destruction it leaves it as at *failed*, so no step asks again
+        // for ever (the attach word against every event, D-140).
         let refused = result == dodos_abi::UnitResult::Done
-            && word.state() == Some(dodos_abi::AttachState::Attached);
+            && word.state() == Some(dodos_abi::AttachState::Attached)
+            && waiter != crate::units::Waiter::Step;
         if !refused {
             self.detach_local(iommu, device);
         }

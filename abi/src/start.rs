@@ -374,13 +374,21 @@ pub struct StartMachine {
     /// The offset of the attach words, one `AttachWord` per device
     /// identifier, beside the identifier words (IOMMU, D-137; layout 4).
     pub attach_words: u32,
-    pub reserved: u32,
+    /// The offset of the retired words, `RETIRED_WORD_BYTES` per physical
+    /// core: a bit per vector of its interrupt table, set when a failed
+    /// unit may still hold the vector's remapping entry, cleared only at
+    /// machine start-up (Interrupts, the irq, D-140; layout 5).
+    pub retired_words: u32,
 }
 
 /// The layout version of the living part that `StartMachine` describes.
-/// 4 since the attach words (D-137), 3 since the line words (D-135), 2
+/// 5 since the retired words (D-140), 4 since the attach words (D-137), 3 since the line words (D-135), 2
 /// since the fence records (pass 16), 1 since D-129.
-pub const START_MACHINE_LAYOUT: u32 = 4;
+pub const START_MACHINE_LAYOUT: u32 = 5;
+
+/// The retired word of a physical core: one bit per entry of its interrupt
+/// table (Interrupts, the irq, D-140).
+pub const RETIRED_WORD_BYTES: usize = crate::x86_64::IRQ_TABLE_ENTRIES / 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

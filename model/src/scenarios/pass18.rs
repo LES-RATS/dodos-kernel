@@ -324,6 +324,7 @@ fn the_holder_refuses_a_detach_of_the_requesters_device_under_another_domain_num
     let detach = |domain| UnitOp::Detach {
         device: 0x10,
         domain,
+        root,
     };
     assert!(judged(&mut m, holder, requester, 0, detach(own + 1)));
     let unit = &m.sys.node(holder).table.units[&0];
@@ -426,8 +427,18 @@ fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
     assert_eq!(m.call(a, Syscall::CapDelete(s(210))), Err(Error::Again));
     assert_eq!(m.sys.canonical().line_word(5), taken);
     assert_eq!(claim_line(&mut m, b, 5, 212), Err(Error::Busy));
-    m.settle();
-    m.ok(a, Syscall::CapDelete(s(210)));
+    // Then the invalidation of the line's remapping entry in the units of
+    // the IOAPIC's segment (pass 21): the word stays a's until its answer.
+    let mut outcome = Err(Error::Again);
+    for _ in 0..8 {
+        m.settle();
+        outcome = m.call(a, Syscall::CapDelete(s(210)));
+        if outcome != Err(Error::Again) {
+            break;
+        }
+        assert_eq!(m.sys.canonical().line_word(5), taken);
+    }
+    assert_eq!(outcome, DONE);
     let free = dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed);
     assert_eq!(m.sys.canonical().line_word(5), free);
     assert!(matches!(

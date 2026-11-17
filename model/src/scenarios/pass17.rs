@@ -635,6 +635,7 @@ fn the_holder_refuses_a_detach_of_a_context_entry_of_another_node() {
     let detach = crate::rings::UnitOp::Detach {
         device: 0x10,
         domain,
+        root,
     };
     assert!(judged(&mut m, holder, requester, 0, detach));
     assert!(

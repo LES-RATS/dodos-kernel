@@ -66,6 +66,10 @@ pub(crate) struct Reclaim {
     pub(crate) isolated: bool,
     /// R1 submitted to each unit this node holds, by role, and done.
     pub(crate) r1: std::collections::BTreeMap<usize, Option<u64>>,
+    /// The unit roles behind which the node had a device when R1 ran: a
+    /// context entry R1 cleared, or an attach word left *attached*. On a
+    /// failed unit R1 stays undone for these alone (Reclaim, R1, D-140).
+    pub(crate) devices: std::collections::BTreeSet<usize>,
     pub(crate) r3: bool,
     /// R4: the blocks still to audit, once begun.
     pub(crate) audit: Option<Vec<ObjId>>,
@@ -605,6 +609,13 @@ impl Model {
         self.now.saturating_sub(self.table.stopped_time)
     }
 
+    /// The clock of membership read under the node lock, once the event
+    /// holds it: the start instant of a request is read so, when the
+    /// request is written, not at the call's entry (TLB, D-140).
+    pub(crate) fn locked_now(&self) -> u64 {
+        self.membership_now() + self.lock_wait
+    }
+
     /// The evidence that holds against a node now, as the gate checks it.
     pub(crate) fn evidence(&self, node: u16) -> Option<Evidence> {
         let member = self.table.member(node);
@@ -1040,6 +1051,7 @@ impl Model {
             {
                 continue;
             }
+            let device = self.had_device(role, node, generation);
             let unit = self.table.units.entry(role).or_default();
             unit.entries
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
@@ -1050,6 +1062,9 @@ impl Model {
             let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
             if let Some(reclaim) = self.reclaims.get_mut(&node) {
                 reclaim.r1.insert(role, Some(serial));
+                if device {
+                    reclaim.devices.insert(role);
+                }
             }
         }
     }
@@ -1069,9 +1084,33 @@ impl Model {
             if word.state() != RoleState::Held || word.holder() != self.node {
                 continue;
             }
+            // A unit that has not confirmed R1's invalidation within
+            // `IOMMU_WAIT_NS` of its submission has failed (IOMMU), as for
+            // any other submission (pass 21: the model never judged R1's).
+            if let Some(serial) = serial
+                && !self.unit_failed(role)
+                && !self.confirmed(role, serial)
+                && self.table.units[&role]
+                    .queue
+                    .iter()
+                    .any(|&(s, at)| s == serial && at + dodos_abi::IOMMU_WAIT_NS <= self.now)
+            {
+                self.fail_unit(role);
+            }
             match serial {
                 None => {}
                 Some(serial) if !self.unit_failed(role) && self.confirmed(role, serial) => {
+                    self.reclaims
+                        .get_mut(&node)
+                        .expect("a reclaim")
+                        .r1
+                        .insert(role, None);
+                }
+                // On a failed unit, R1 is done at once for a node that had
+                // no device behind it (Reclaim, R1, D-140).
+                Some(_)
+                    if self.unit_failed(role) && !self.reclaims[&node].devices.contains(&role) =>
+                {
                     self.reclaims
                         .get_mut(&node)
                         .expect("a reclaim")
@@ -1082,6 +1121,31 @@ impl Model {
             }
         }
         done
+    }
+
+    /// Whether `node`'s generation had a device behind the unit of `role`:
+    /// a context entry names it, or an attach word beside an identifier
+    /// word it took, in the unit's segment, reads *attached* (Reclaim, R1,
+    /// D-140).
+    fn had_device(&self, role: usize, node: u16, generation: u32) -> bool {
+        let entry = self.table.units.get(&role).is_some_and(|u| {
+            u.entries
+                .values()
+                .any(|&(n, g)| n == node && g == generation)
+        });
+        let record = self.table.role_records[role];
+        if record.governs != dodos_abi::Governs::IommuUnit {
+            return entry;
+        }
+        let segment = u32::from(self.machine.iommus[usize::from(record.object)].segment);
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation).raw();
+        let attached = self.table.attach.iter().any(|(&key, &raw)| {
+            key >> 16 == segment
+                && self.table.identifiers.get(&key) == Some(&taken)
+                && dodos_abi::AttachWord::from_raw(raw).and_then(dodos_abi::AttachWord::state)
+                    == Some(dodos_abi::AttachState::Attached)
+        });
+        entry || attached
     }
 
     /// R2 to R5 for one node, in steps of the reserve: at most `units`
@@ -1394,11 +1458,28 @@ impl Model {
                                 .keys()
                                 .copied()
                                 .find(|key| self.table.identifiers.get(key) == Some(&taken));
-                            match attached {
-                                Some(key) => {
+                            // Then the entries of its cores' interrupt
+                            // tables: free, each vector retired first in
+                            // its core's retired word if a unit whose role
+                            // word reads *failed* held its remapping entry
+                            // (Reclaim, R6; Interrupts, D-140).
+                            let entry = self
+                                .table
+                                .irq_tables
+                                .iter()
+                                .find(|(_, e)| e.node == node && e.generation == g)
+                                .map(|(&h, e)| (h, e.units.clone()));
+                            match (attached, entry) {
+                                (Some(key), _) => {
                                     self.table.attach.remove(&key);
                                 }
-                                None => cursor = Clear { phase: 4, index: 0 },
+                                (None, Some((handle, units))) => {
+                                    if units.iter().any(|&role| self.unit_failed(role)) {
+                                        self.table.retired.insert(handle);
+                                    }
+                                    self.table.irq_tables.remove(&handle);
+                                }
+                                (None, None) => cursor = Clear { phase: 4, index: 0 },
                             }
                         }
                     }

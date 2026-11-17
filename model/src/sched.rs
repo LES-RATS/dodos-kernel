@@ -599,6 +599,17 @@ impl Model {
     /// request (`CORE_ANSWER_NS` after its start), and, while the core runs
     /// a thread, its previous event + `STALE_NS` / 2, an event that only
     /// beats (D-131). An idle core with nothing armed sets no timer.
+    /// The due event of the core's invalidation request, on the hardware
+    /// clock: `CORE_ANSWER_NS` after its start, which is read on the clock
+    /// less the stopped time, so the stops already counted are added back
+    /// (The stopped time, D-137).
+    pub(crate) fn request_due(&self, core: usize) -> Option<u64> {
+        self.cores[core]
+            .request
+            .as_ref()
+            .map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time)
+    }
+
     pub(crate) fn hardware(&self, core: usize) -> Option<u64> {
         let part = &self.cores[core];
         let budget = part.running.and_then(|(context, ready)| {
@@ -616,10 +627,7 @@ impl Model {
             .flatten()
             .filter(|armed| armed.core == core)
             .map(|armed| armed.instant);
-        let answer = part
-            .request
-            .as_ref()
-            .map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time);
+        let answer = self.request_due(core);
         let beat = part
             .thread
             .map(|_| part.previous + self.table.stale_ns / 2)

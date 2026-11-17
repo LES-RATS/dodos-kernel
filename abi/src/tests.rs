@@ -952,12 +952,14 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, lines),
         offset_of!(StartMachine, line_count),
         offset_of!(StartMachine, attach_words),
+        offset_of!(StartMachine, retired_words),
     ];
     assert_eq!(
         machine,
-        [28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88]
+        [28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92]
     );
-    assert_eq!(START_MACHINE_LAYOUT, 4);
+    assert_eq!(START_MACHINE_LAYOUT, 5);
+    assert_eq!(RETIRED_WORD_BYTES, 24);
     let node = [
         offset_of!(StartNode, slot),
         offset_of!(StartNode, slots),

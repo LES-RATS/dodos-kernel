@@ -121,9 +121,12 @@ fn an_attach_pins_its_root_and_a_detach_unpins_it_only_at_its_answer() {
     );
     // The owner's gate never writes 0 from attached.
     let role = IOMMU_ROLE;
-    m.sys
-        .node_mut(0)
-        .detach_answered(role, DEVICE as u16, dodos_abi::UnitResult::Done);
+    m.sys.node_mut(0).detach_answered(
+        role,
+        DEVICE as u16,
+        dodos_abi::UnitResult::Done,
+        crate::units::Waiter::Thread(None),
+    );
     assert_eq!(m.sys.canonical().attach_word(key), word);
     // A detach: answered done once the holder has written detached; the
     // owner then writes 0, the identifier word free and the count 0.

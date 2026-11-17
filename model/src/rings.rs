@@ -26,8 +26,10 @@ pub enum UnitOp {
     /// the requesting node's generation, whose root table is at `root`,
     /// under the domain number of that iospace on the unit.
     Attach { device: u16, domain: u16, root: u64 },
-    /// The context entry of a device, under that domain number, is cleared.
-    Detach { device: u16, domain: u16 },
+    /// The context entry of a device, under that domain number, is cleared;
+    /// `root` is the root table the requester's header entry names (operand
+    /// 2 since D-140).
+    Detach { device: u16, domain: u16, root: u64 },
     /// The unit's translation cache is invalidated (after an unmap or the
     /// unhooking of a table in an iospace that serves devices): for one
     /// domain number, or the whole unit (`None`, the holder's own: R1, a

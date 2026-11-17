@@ -33,6 +33,9 @@ pub(crate) enum Waiter {
     /// The record left *unmapping* by a removal step, a step of a `Revoke`
     /// or a step of R2, for which no thread waits.
     Record(CapId),
+    /// A step for which no thread waits and no record is left: a device
+    /// detached by the destruction of its iospace.
+    Step,
 }
 
 /// An entry of the unit request table: the role, the operation, the epoch
@@ -302,10 +305,30 @@ impl Model {
                         .is_some_and(|n| n >= 1)
                     && self.table.holds_page(root, node, generation)
             }
-            UnitOp::Detach { device, domain } => state.is_none_or(|u| {
-                u.entries.get(&device).is_none_or(|&owner| owner == from)
-                    && u.domains.get(&device).is_none_or(|&d| d == domain)
-            }),
+            // The identifier word names the requester with its generation,
+            // as for an attach; the context entry names that domain number,
+            // or none is left and the attach word already reads *detached*
+            // with that root: a detach served again (D-140).
+            UnitOp::Detach {
+                device,
+                domain,
+                root,
+            } => {
+                let entry = state.and_then(|u| u.entries.get(&device).map(|&o| (o, u)));
+                held(device)
+                    && match entry {
+                        Some((owner, u)) => {
+                            owner == from && u.domains.get(&device).is_none_or(|&d| d == domain)
+                        }
+                        None => self.attach_key(role, device).is_some_and(|k| {
+                            Some(self.table.attach_word(k))
+                                == dodos_abi::AttachWord::new(
+                                    dodos_abi::AttachState::Detached,
+                                    root,
+                                )
+                        }),
+                    }
+            }
             UnitOp::Invalidate { domain } => domain.is_some_and(in_range),
             UnitOp::InterruptCache { handle } => names(handle_core(handle)),
             // Masked: operand 2 is 0, and the line's word is free or names
@@ -588,7 +611,7 @@ impl Model {
                 .values()
                 .any(|irq| irq.removing && self.handle_of(irq) == handle)
         {
-            self.retired.insert(handle);
+            self.table.retired.insert(handle);
         }
         // The attach word against every event (D-139): an attach or a
         // detach is judged by the word at its answer; one that did not
@@ -599,14 +622,16 @@ impl Model {
             {
                 UnitResult::Failed
             }
-            UnitOp::Detach { device, .. } if !self.detach_answered(entry.role, device, result) => {
+            UnitOp::Detach { device, .. }
+                if !self.detach_answered(entry.role, device, result, entry.waiter) =>
+            {
                 UnitResult::Failed
             }
             _ => result,
         };
         let record = match entry.waiter {
             Waiter::Record(cap) => Some(cap),
-            Waiter::Thread(_) => entry.record,
+            Waiter::Thread(_) | Waiter::Step => entry.record,
         };
         if let Some(cap) = record {
             match result {

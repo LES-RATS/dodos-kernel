@@ -340,6 +340,13 @@ impl Model {
             }
         }
         live(&mut self.notifies, notify).endpoint = endpoint;
+        // The third order (A node of several cores, D-140): on a node of
+        // several cores the write of the binding is ordered before the read
+        // of the word by a full barrier, so a lock-free `signal` that ORs
+        // meanwhile is seen here or sees the binding.
+        if endpoint.is_some() && self.width() > 1 {
+            self.pay(crate::locks::Cost::Fence);
+        }
         // Notifications: a pending word is delivered at once to a thread
         // that already waits to receive.
         self.hand_over(notify);
