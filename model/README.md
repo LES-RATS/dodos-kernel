@@ -7,8 +7,8 @@ runs after every step of every test. It follows the shape of nodes decided
 on 16 November 2026 (D-128, D-129, D-131): a node covers *N* physical cores
 fixed when it starts (*N* = 1 is a particular case), the cores of a node
 share its state under locks, and nodes share only single-writer words of
-the machine table and the twelve kinds of message on two rings per ordered
-pair.
+the machine table and the eleven kinds of message on two rings per ordered
+pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
 
 ## What it holds
 
@@ -18,7 +18,11 @@ pair.
   root and the translations its TLB may hold), its locks (`locks.rs`: the
   trace of each event under variant L1 or L2; under L2 the locks in the
   order the event found them, a lock earlier than one held recorded as a
-  try, never sorted), its rings (`rings.rs`: the
+  try, never sorted; a lock a test scripts as held by another core across
+  events makes a try fail, and the event then makes the contract's rounds:
+  the second round, `again` with nothing changed, the escalation to the
+  quiet word, a `signal` and an arrival that never return `again`), its
+  rings (`rings.rs`: the
   check of every message received, credits, the reserve of answers), its
   grants (`grants.rs`), its unit requests and unit service table
   (`units.rs`), its roles (`roles.rs`), and the membership, fence, reclaim,
@@ -45,7 +49,10 @@ pair.
   starts), `crossing.rs` (what crosses between nodes), `units.rs` (unit
   requests and roles), `reviews.rs` (one test per scenario the reviews
   broke the text with, and a table of where the others are), `pass17.rs`
-  (the corrections of D-134), `mistral.rs` (one test per mutation of the
+  (the corrections of D-134), `pass18.rs` (the ninth model review judged,
+  and what D-135 changed: line words, failed tries and the quiet word,
+  the watermark ready to return, the state word of a request, the retry
+  of a start, the removal of the `Ping`), `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
   and of the machine; those of one node are in `check/tests.rs`), and
@@ -84,12 +91,16 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
   firmware.
 - Nodes that take and give cores at run time: the contract only reserves
   words for it, and so does the model.
-- A try that fails under L2: every event runs alone, so a try always
-  succeeds and the second round of the contract's rule (D-134) is never
-  taken; the order of the trace is the order in which the model's code
-  touches the objects, close to but not always a kernel's order of
-  discovery.
-- The sweep's `Ping`: the first core of a live node always has a timer
-  armed (the recovery reserve's period, the sweep), so no successor is ever
-  idle with nothing armed, and the ping is never sent (an open point of the
-  contract since pass 17).
+- Real concurrency under L2: every event runs alone; a failed try comes
+  only from a lock a test scripts as held by another core (`Holder`), whose
+  event ends, with its effect, when the lock is waited for. The order of
+  the trace is the order in which the model's code touches the objects,
+  close to but not always a kernel's order of discovery; in particular the
+  model locks a woken thread and its reply object by their own words,
+  where the contract guards them by the lock of the object waited on.
+- The waits for the quiet word and for the entry words of other cores:
+  another core is in a kernel event only while a test makes it hold a
+  lock, and an escalation lets every such holder end its event.
+- The debugger stub and its release word (development images only): the
+  suspension of the clocks of membership while it is raised (D-135) has
+  no executable check.
