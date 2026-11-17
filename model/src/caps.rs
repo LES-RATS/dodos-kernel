@@ -64,7 +64,7 @@ enum Swept {
 }
 
 /// What `Model::undo` did with one unit of a removal step.
-enum Undone {
+pub(crate) enum Undone {
     /// It undid one link to the object.
     Unit,
     /// Nothing is left to undo.
@@ -983,6 +983,7 @@ impl Model {
             // Once its devices are detached, it serves none, and its records
             // are emptied with their counts lowered once the detaches are
             // confirmed; a unit that failed keeps the counts.
+            ObjectKind::Irq => return self.irq_removal(object),
             ObjectKind::IoSpace => {
                 let device = self.iospaces[&object].last().copied();
                 match (device, self.aspaces[&object].records.last().copied()) {

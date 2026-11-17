@@ -501,6 +501,10 @@ impl crate::Model {
                 self.interrupt_once(*position, *vector);
                 Ok(crate::Output::Done)
             }
+            Contended::Fault(thread, kind, exception) => {
+                self.fault_once(*thread, *kind, *exception);
+                Ok(crate::Output::Done)
+            }
         }
     }
 
@@ -630,6 +634,29 @@ impl crate::Model {
         let _ = self.contend(Contended::Arrival(position, vector));
     }
 
+    /// The delivery of a fault under contention: an event, which follows
+    /// the path of an arrival and never returns `again` (D-137).
+    pub(crate) fn fault_contended(
+        &mut self,
+        thread: ObjId,
+        kind: dodos_abi::FaultKind,
+        exception: [u64; 3],
+    ) {
+        let _ = self.contend(Contended::Fault(thread, kind, exception));
+    }
+
+    /// The quiet word is released: each core that kept arrivals pending at
+    /// its controller takes them now, in their order (D-137).
+    pub(crate) fn release_quiet(&mut self) {
+        self.quiet = None;
+        let masked = std::mem::take(&mut self.masked);
+        for (position, vectors) in masked {
+            for vector in vectors {
+                self.interrupt_on(position, vector);
+            }
+        }
+    }
+
     /// An event under contention, by the rule of tries.
     fn contend(&mut self, event: Contended) -> crate::Outcome {
         if !self.locking_watched() {
@@ -754,9 +781,15 @@ impl crate::Model {
                 steps.push(Step::Pay(Cost::Lock));
                 steps.push(Step::Lock(lock));
             }
+            // The call runs alone, holding the quiet word: the cores that
+            // enter meanwhile keep their interrupts masked (D-137).
+            self.quiet = Some(at);
             let outcome = self.run_once(&event);
             self.record_rounds(&mut steps, &alone);
             self.locks.steps.push(Step::Quiet(false));
+            let trace = std::mem::take(&mut self.locks.steps);
+            self.release_quiet();
+            self.locks.steps = trace;
             if let Some(t) = self.threads.get_mut(&thread) {
                 t.again_tries = 0;
             }
@@ -779,6 +812,9 @@ enum Contended {
     Call(ObjId, crate::Syscall),
     /// An interrupt arrival: the core's position and the vector.
     Arrival(usize, u8),
+    /// The delivery of a fault: the faulting thread, its kind and its
+    /// exception words.
+    Fault(ObjId, dodos_abi::FaultKind, [u64; 3]),
 }
 
 impl Contended {
@@ -887,6 +923,127 @@ pub(crate) fn order(
     Ok(())
 }
 
+/// The ordering of a core's entry against an escalation (A node of several
+/// cores, the four orders, D-137): core *a* writes its entry word, then
+/// reads the quiet word; core *b* takes the quiet word by a read-modify-
+/// write, visible at once, then reads *a*'s entry word. With the ordering
+/// operation, *a*'s store is visible before its read; without it, the store
+/// may stay in *a*'s store buffer past its read (each of the three
+/// architectures allows it). Returns, for every interleaving, whether *a*
+/// enters (it read the word free) and whether *b* runs alone (it read *a*'s
+/// entry word 0).
+#[cfg(test)]
+pub(crate) fn entry_orders(ordered: bool) -> Vec<(bool, bool)> {
+    // a's steps: 0 write (to its buffer), 1 store visible, 2 read; b's: 0
+    // take, 1 read. With the ordering operation, a's store is visible as
+    // part of its write; without it, the store may become visible before
+    // or after a's read.
+    let sequences: &[&[u8]] = match ordered {
+        true => &[&[0, 2]],
+        false => &[&[0, 1, 2], &[0, 2, 1]],
+    };
+    let mut outcomes = Vec::new();
+    for a_steps in sequences {
+        outcomes.extend(interleave(a_steps, ordered));
+    }
+    outcomes
+}
+
+/// Every interleaving of core a's steps with core b's two.
+#[cfg(test)]
+fn interleave(a_steps: &[u8], ordered: bool) -> Vec<(bool, bool)> {
+    let mut outcomes = Vec::new();
+    let total = a_steps.len() + 2;
+    for mask in 0u32..1 << total {
+        if mask.count_ones() as usize != a_steps.len() {
+            continue;
+        }
+        let (mut ai, mut bi) = (0, 0);
+        let (mut visible, mut taken) = (false, false);
+        let (mut a_enters, mut b_alone) = (false, false);
+        for slot in 0..total {
+            if mask >> slot & 1 == 1 {
+                match a_steps[ai] {
+                    0 => visible |= ordered,
+                    1 => visible = true,
+                    _ => a_enters = !taken,
+                }
+                ai += 1;
+            } else {
+                match bi {
+                    0 => taken = true,
+                    _ => b_alone = !visible,
+                }
+                bi += 1;
+            }
+        }
+        outcomes.push((a_enters, b_alone));
+    }
+    outcomes
+}
+
+/// The bounds of D-137 (A node of several cores, the bound of an escalated
+/// call and the start-up checks): the longest event of a core, its waits
+/// for locks included, under each variant; the bound of an escalated call;
+/// the longest healthy wait that `CORE_ANSWER_NS` judges.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Measured {
+    /// *N*, the cores of the largest node the image supports.
+    pub(crate) cores: u64,
+    /// *H*, the longest hold of the node lock (L1); *h*, of an object
+    /// lock (L2).
+    pub(crate) node_hold: u64,
+    pub(crate) object_hold: u64,
+    /// *E*1, the longest kernel event on one core; *B*1max, the longest
+    /// one-core bound of a call; *D*, the delivery of one interrupt.
+    pub(crate) event: u64,
+    pub(crate) one_core: u64,
+    pub(crate) delivery: u64,
+}
+
+impl Measured {
+    /// *k*max, the largest bound of the image's calls.
+    pub(crate) const K_MAX: u64 = 32 * 8 + 64 * 2 + 2 + 1;
+
+    /// *E*: the longest event of another core, its waits for locks included.
+    pub(crate) fn event_with_waits(&self, locking: Locking) -> u64 {
+        let others = self.cores.saturating_sub(1);
+        let waits = match locking {
+            Locking::L1 => others.saturating_mul(self.node_hold),
+            Locking::L2 => (2 * Self::K_MAX)
+                .saturating_mul(others)
+                .saturating_mul(self.object_hold),
+        };
+        self.event.saturating_add(waits)
+    }
+
+    /// The bound of an escalated call whose own one-core bound is `own`:
+    /// own + E + (N − 1) × B1max, a closed form (D-137).
+    pub(crate) fn escalated(&self, own: u64) -> u64 {
+        let ahead = self.cores.saturating_sub(1).saturating_mul(self.one_core);
+        own.saturating_add(self.event_with_waits(Locking::L2))
+            .saturating_add(ahead)
+    }
+
+    /// The longest healthy wait `CORE_ANSWER_NS` judges: N × H + D under
+    /// L1 (a request); 2 × E + (N − 1) × B1max + D under L2 (a request
+    /// whose asked core ends its event, then waits for the quiet word).
+    pub(crate) fn healthy_wait(&self, locking: Locking) -> u64 {
+        match locking {
+            Locking::L1 => self
+                .cores
+                .saturating_mul(self.node_hold)
+                .saturating_add(self.delivery),
+            // The asked core's event, then a wait for the quiet word (an
+            // escalated call's bound less its own), then the delivery.
+            Locking::L2 => self
+                .event_with_waits(Locking::L2)
+                .saturating_add(self.escalated(0))
+                .saturating_add(self.delivery),
+        }
+    }
+}
+
 /// The releases of the locks held, in the reverse order.
 fn release(held: &[LockId], steps: &mut Vec<Step>) {
     steps.extend(held.iter().rev().map(|&l| Step::Unlock(l)));
@@ -955,9 +1112,25 @@ impl Snapshot {
             ids.dedup();
             ids
         }
+        // The marks words take no lock: every write of them is an atomic OR
+        // (Tasks and marks, D-137).
+        fn unmarked<T: Clone>(
+            map: &std::collections::BTreeMap<ObjId, T>,
+            clear: fn(&mut T),
+        ) -> std::collections::BTreeMap<ObjId, T> {
+            map.iter()
+                .map(|(&id, value)| {
+                    let mut value = value.clone();
+                    clear(&mut value);
+                    (id, value)
+                })
+                .collect()
+        }
+        let threads = |m| unmarked(m, |t: &mut crate::Thread| t.marks = 0);
+        let tasks = |m| unmarked(m, |t: &mut crate::Task| t.marks = 0);
         let mut locks = Vec::new();
         locks.extend(
-            diff(&self.threads, &model.threads)
+            diff(&threads(&self.threads), &threads(&model.threads))
                 .into_iter()
                 .map(LockId::Thread),
         );
@@ -982,7 +1155,7 @@ impl Snapshot {
                 .map(LockId::Timer),
         );
         locks.extend(
-            diff(&self.tasks, &model.tasks)
+            diff(&tasks(&self.tasks), &tasks(&model.tasks))
                 .into_iter()
                 .map(LockId::Task),
         );

@@ -420,7 +420,13 @@ fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
         };
         assert!(judged(&mut m, holder, b, role, forged));
     }
-    // The irq removed, its word is free and b may claim the line.
+    // The irq removed, its word is free and b may claim the line. The
+    // removal asks the IOAPIC's holder to mask the line first: a request,
+    // the line word still a's until it is answered (D-137).
+    assert_eq!(m.call(a, Syscall::CapDelete(s(210))), Err(Error::Again));
+    assert_eq!(m.sys.canonical().line_word(5), taken);
+    assert_eq!(claim_line(&mut m, b, 5, 212), Err(Error::Busy));
+    m.settle();
     m.ok(a, Syscall::CapDelete(s(210)));
     let free = dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed);
     assert_eq!(m.sys.canonical().line_word(5), free);

@@ -150,6 +150,13 @@ impl Model {
     /// class of its level (an iospace's tables are of class *iospace
     /// table*). The start-up aspace's tables are kept memory: not followed.
     pub(crate) fn rehook(&mut self, space: ObjId) {
+        self.rehook_by(space, None);
+    }
+
+    /// `rehook`, for the clearing of the record of `by`: the tables it
+    /// unhooks wait for the invalidation of that record before they join
+    /// the free list (D-137).
+    fn rehook_by(&mut self, space: ObjId, by: Option<CapId>) {
         if self.objects[&space].from.is_none() {
             return;
         }
@@ -173,7 +180,10 @@ impl Model {
         let aspace = locked(&mut self.aspaces, &self.locks, space);
         for key in gone.iter().rev() {
             let page = aspace.hooked.remove(key).expect("hooked");
-            aspace.free.push(page);
+            match by {
+                Some(cap) => aspace.unhooked.push((cap, page)),
+                None => aspace.free.push(page),
+            }
         }
         let mut classes = Vec::new();
         for key in new {
@@ -232,7 +242,7 @@ impl Model {
         aspace.translations.retain(|_, t| t.cap != cap);
         self.table.gated.0 = true;
         live(&mut self.caps, cap).record = Record::Unmapping(mapping);
-        self.rehook(mapping.space);
+        self.rehook_by(mapping.space, Some(cap));
         Some(addresses)
     }
 
@@ -250,6 +260,11 @@ impl Model {
         };
         if let Some(aspace) = self.aspaces.get_mut(&mapping.space) {
             aspace.records.retain(|&other| other != cap);
+            // Its unhooked tables join the free list now (D-137).
+            let (done, kept): (Vec<_>, Vec<_>) =
+                aspace.unhooked.iter().partition(|&&(by, _)| by == cap);
+            aspace.unhooked = kept;
+            aspace.free.extend(done.into_iter().map(|(_, page)| page));
         }
         live(&mut self.caps, cap).record = Record::Empty;
         let frame = self.frames[&self.caps[&cap].object];

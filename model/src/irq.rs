@@ -130,6 +130,7 @@ impl Model {
             state: IrqState::Idle,
             pending: false,
             notify: None,
+            removing: false,
         };
         self.irqs.insert(id, irq);
         if source.is_line() {
@@ -281,8 +282,16 @@ impl Model {
         self.interrupt_on(0, vector);
     }
 
-    /// An arrival on the core at `position` of the node.
+    /// An arrival on the core at `position` of the node. A core that
+    /// waits for the quiet word another core holds keeps its interrupts
+    /// masked: the arrival stays pending at its controller and is taken
+    /// once the word is released, with none of its steps done meanwhile
+    /// (A node of several cores, D-137).
     pub fn interrupt_on(&mut self, position: usize, vector: u8) {
+        if self.quiet.is_some_and(|holder| holder != position) {
+            self.masked.entry(position).or_default().push(vector);
+            return;
+        }
         match self.contended.is_empty() {
             true => self.interrupt_once(position, vector),
             false => self.interrupt_contended(position, vector),
@@ -342,6 +351,62 @@ impl Model {
         };
         self.unbind_irq(irq);
         true
+    }
+
+    /// The removal of an irq on a line whose controller another node drives
+    /// is a request, as an unmapping is (Interrupts, the irq, D-137): the
+    /// step unbinds it, asks the holder to mask the line and returns
+    /// `again`; a claim still asking on that line ends first; the line word
+    /// is freed only once the request is answered. Says what the step does.
+    pub(crate) fn irq_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
+        use crate::caps::Undone;
+        let entry = self.irqs[&irq].clone();
+        if !entry.source.is_line() {
+            return Undone::Nothing;
+        }
+        let gsi = entry.source.id();
+        if self.line_asking(gsi) {
+            return Undone::Wait;
+        }
+        if entry.removing {
+            return Undone::Nothing;
+        }
+        let Some(role) = self.ioapic_role(gsi) else {
+            return Undone::Nothing;
+        };
+        if self.unit_requests.iter().all(Option::is_some) {
+            return Undone::Wait;
+        }
+        self.unbind_irq(irq);
+        live(&mut self.irqs, irq).removing = true;
+        let op = crate::rings::UnitOp::Redirection {
+            gsi,
+            claimed: false,
+            level: entry.source.level(),
+            low: entry.source.active_low(),
+            target: crate::rings::Target::Masked,
+        };
+        if self
+            .unit_request(role, op, crate::units::Waiter::Thread(None), None)
+            .is_err()
+        {
+            return Undone::Wait;
+        }
+        // Served at once when this node holds the role itself.
+        match self.line_asking(gsi) {
+            true => Undone::Wait,
+            false => Undone::Unit,
+        }
+    }
+
+    /// Whether an entry of the unit request table still asks something of
+    /// a line: its redirection entry, or a claim's units before it.
+    fn line_asking(&self, gsi: u32) -> bool {
+        let names = |op: &crate::rings::UnitOp| matches!(*op, crate::rings::UnitOp::Redirection { gsi: g, .. } if g == gsi);
+        self.unit_requests
+            .iter()
+            .flatten()
+            .any(|e| names(&e.op) || e.then.is_some_and(|(_, op)| names(&op)))
     }
 
     /// Destroying an irq: it is unbound, its source masked, its pending bit

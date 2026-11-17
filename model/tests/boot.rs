@@ -573,12 +573,33 @@ fn kernel_refuses_times_of_membership_out_of_their_ranges() {
             "{stale} {stuck} {sweep}"
         );
     }
+    // At the low end STALE_NS must still exceed CORE_ANSWER_NS and an
+    // event (D-137), so CORE_ANSWER_NS is at its own low end.
     let edges = with(|m| {
         m.membership.stale_ms = 10;
         m.membership.stuck_ms = 1000;
         m.membership.sweep_ms = 60_000;
+        m.membership.core_answer_ms = 1;
     });
     assert!(Model::boot(&edges).is_ok());
+    // D-137: a core that waits for a lock or the quiet word does not beat:
+    // STALE_NS not above CORE_ANSWER_NS and an event is refused, and so is
+    // STUCK_NS not above the reserve's period, CORE_ANSWER_NS and an event.
+    let stale = with(|m| {
+        m.membership.stale_ms = 10;
+        m.membership.core_answer_ms = 10;
+    });
+    assert_eq!(Model::boot(&stale), Err(Refusal::Floors));
+    let stuck = with(|m| {
+        m.membership.stuck_ms = 20;
+        m.membership.core_answer_ms = 10;
+    });
+    assert_eq!(Model::boot(&stuck), Err(Refusal::Floors));
+    let stuck = with(|m| {
+        m.membership.stuck_ms = 21;
+        m.membership.core_answer_ms = 10;
+    });
+    assert!(Model::boot(&stuck).is_ok());
 }
 
 #[test]

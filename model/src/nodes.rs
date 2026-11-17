@@ -598,6 +598,15 @@ impl Model {
         }
     }
 
+    /// The clock of membership: in a development image, the monotonic
+    /// clock less the time spent stopped in the debugger stub, which the
+    /// instants that membership compares are read from (the observations,
+    /// the seal, the evidence); a production image reads the monotonic
+    /// clock (Two builds, and the debugger stub, D-137).
+    pub(crate) fn membership_now(&self) -> u64 {
+        self.now.saturating_sub(self.table.stopped_time)
+    }
+
     /// The evidence that holds against a node now, as the gate checks it.
     pub(crate) fn evidence(&self, node: u16) -> Option<Evidence> {
         let member = self.table.member(node);
@@ -610,10 +619,11 @@ impl Model {
             return Some(Evidence::SelfReported);
         }
         if member.state() == MemberState::Sealed {
-            let sealed = beacon.sealed_at.unwrap_or(self.now);
-            return (self.now >= sealed + self.table.seal_ns).then_some(Evidence::Seal);
+            let now = self.membership_now();
+            let sealed = beacon.sealed_at.unwrap_or(now);
+            return (now >= sealed + self.table.seal_ns).then_some(Evidence::Seal);
         }
-        let now = self.now;
+        let now = self.membership_now();
         let me = self.node as usize;
         for observation in self.table.beacons[me]
             .observations
@@ -701,7 +711,13 @@ impl Model {
     /// ring that holds a message, at most 8, each expiring after 4 ×
     /// `STALE_NS`. A sealed node does not beat: it is never observed.
     fn observe_needed(&mut self) -> bool {
-        let now = self.now;
+        // In a development image no gate records an observation while the
+        // release word of the stub is raised, and every instant is read
+        // from the clock of membership (D-137).
+        if self.table.release {
+            return false;
+        }
+        let now = self.membership_now();
         let me = self.node as usize;
         let life = OBSERVATION_LIFE * self.table.stale_ns;
         let before = self.table.beacons[me].observations.len();
@@ -709,7 +725,7 @@ impl Model {
             .observations
             .retain(|o| now < o.at + life);
         let mut changed = before != self.table.beacons[me].observations.len();
-        let swept = now >= self.next_sweep;
+        let swept = self.now >= self.next_sweep;
         for node in self.needed() {
             if !self.table.writes(node) || !self.real(node) {
                 continue;
@@ -762,7 +778,7 @@ impl Model {
             // (`reserve_due`): a live or sealing node is never idle with
             // nothing armed, so the sweep sends no message (D-135: the
             // ping is removed).
-            self.next_sweep = now + self.table.sweep_ns;
+            self.next_sweep = self.now + self.table.sweep_ns;
             changed = true;
         }
         changed
@@ -771,6 +787,10 @@ impl Model {
     /// Accusations, with evidence the gate checks: at least one other node
     /// live or sealing, except for evidence self.
     fn accuse_with_evidence(&mut self) -> bool {
+        // No accusation while the release word of the stub is raised.
+        if self.table.release {
+            return false;
+        }
         for node in (0..self.table.nodes).filter(|&z| z != self.node) {
             let state = self.table.member(node).state();
             let accusable = matches!(
@@ -1474,7 +1494,7 @@ impl Model {
                     && !(0..self.table.nodes).any(|z| z != me && self.has_kernel_message(z));
                 *units = units.saturating_sub(1);
                 if handed && quiet {
-                    self.table.beacons[me as usize].sealed_at = Some(self.now);
+                    self.table.beacons[me as usize].sealed_at = Some(self.membership_now());
                     for position in 1..self.width() {
                         let core = self.cores[position].number as usize;
                         self.table.park_requests[core] += 1;

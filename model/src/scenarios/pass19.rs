@@ -549,3 +549,329 @@ fn a_resume_beside_an_unfenced_peer_waits_until_r2_removed_every_remote_capabili
     assert!(live);
     assert_eq!(held(&m), 0);
 }
+
+// The store-load order of the entry word and the quiet word (D-137): the
+// four orders of two cores' accesses.
+
+#[test]
+fn with_the_ordering_operations_no_interleaving_lets_a_core_enter_while_an_escalation_runs_alone() {
+    let ordered = crate::locks::entry_orders(true);
+    // Six interleavings of a's two accesses with b's two.
+    assert_eq!(ordered.len(), 6);
+    assert!(!ordered.contains(&(true, true)), "{ordered:?}");
+    // Without them, the store-buffer outcome is reachable: a reads the word
+    // free while b reads a's entry word 0.
+    let unordered = crate::locks::entry_orders(false);
+    assert!(unordered.contains(&(true, true)), "{unordered:?}");
+}
+
+// A core that waits for the quiet word keeps its interrupts masked (D-137).
+
+#[test]
+fn an_arrival_on_a_core_that_waits_for_the_quiet_word_stays_pending_until_the_word_is_released() {
+    let (mut k, _, _, _) = super::pass18::l2_delivery();
+    k.ok(k.retype(ObjectKind::Notify, 0, 330));
+    let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
+    let claim = Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: msi,
+        core: 0,
+        vector: 48,
+        destination: s(340),
+    };
+    assert!(k.call(k.t, claim).is_ok());
+    k.ok(Syscall::IrqBind {
+        irq: s(340),
+        notify: s(330),
+    });
+    let notify = k.m.object_at(k.t, s(330)).unwrap();
+    // Core 1's escalated call holds the word: core 0's arrival is kept at
+    // its controller, none of its steps done.
+    k.m.quiet = Some(1);
+    k.m.interrupt_on(0, 48);
+    assert_eq!(k.m.notifies[&notify].word, 0);
+    assert_eq!(k.m.masked.get(&0), Some(&vec![48]));
+    assert_eq!(k.m.check(), Ok(()));
+    // Released: core 0 takes it, and the notify is signalled.
+    k.m.release_quiet();
+    assert!(k.m.masked.is_empty());
+    assert_ne!(k.m.notifies[&notify].word, 0);
+    // An arrival kept with the word released is reported.
+    k.m.masked.insert(2, vec![48]);
+    assert_eq!(
+        k.m.check(),
+        Err("quiet word: an arrival kept pending with the word released")
+    );
+}
+
+// The closed bound of an escalated call and the healthy wait that
+// CORE_ANSWER_NS judges (D-137).
+
+#[test]
+fn the_bound_of_an_escalated_call_is_closed_and_core_answer_ns_covers_a_request_under_each_variant()
+{
+    use crate::locks::{Locking, Measured};
+    let m = Measured {
+        cores: 4,
+        node_hold: 100,
+        object_hold: 10,
+        event: 1_000,
+        one_core: 500,
+        delivery: 50,
+    };
+    let e2 = 1_000 + 2 * Measured::K_MAX * 3 * 10;
+    assert_eq!(m.event_with_waits(Locking::L2), e2);
+    assert_eq!(m.event_with_waits(Locking::L1), 1_000 + 3 * 100);
+    // own + E + (N − 1) × B1max.
+    assert_eq!(m.escalated(700), 700 + e2 + 3 * 500);
+    // L1: N × H + D; L2: 2 × E + (N − 1) × B1max + D.
+    assert_eq!(m.healthy_wait(Locking::L1), 4 * 100 + 50);
+    assert_eq!(m.healthy_wait(Locking::L2), 2 * e2 + 3 * 500 + 50);
+    assert_eq!(Measured::K_MAX, 387);
+}
+
+#[test]
+fn the_start_up_refuses_a_core_answer_ns_below_the_healthy_wait_of_l2_that_n_minus_1_times_h_passes()
+ {
+    let mut machine = one_node(Arch::X86_64, 4);
+    machine.locking = crate::Locking::L2;
+    machine.cores_supported = 4;
+    assert!(Model::boot(&machine).is_ok());
+    // h = 10 µs: E = E1 + 2 × 387 × 3 × 10 µs, about 23 ms, so a request's
+    // wait passes 10 ms, though (N − 1) × H is 30 µs.
+    machine.object_hold_ns = 10_000;
+    assert_eq!(
+        Model::boot(&machine).err(),
+        Some(crate::boot::Refusal::Floors)
+    );
+}
+
+// Marks only gain bits: ORed into the own word always, and into the task
+// (D-137).
+
+#[test]
+fn a_delivery_ors_its_marks_into_the_receivers_own_word_and_its_task_and_takes_no_task_lock() {
+    let (mut k, receiver, _, call) = super::pass18::l2_delivery();
+    k.ok(k.retype(ObjectKind::Task, 0, 390));
+    k.ok(Syscall::TaskAttach {
+        thread: s(300),
+        task: s(390),
+    });
+    let task = k.m.object_at(k.t, s(390)).unwrap();
+    let untrusted = dodos_abi::Marks::UNTRUSTED.bits();
+    // The caller's task is marked.
+    k.ok(Syscall::TaskMark {
+        task: s(dodos_abi::START_SLOT_TASK),
+        marks: untrusted,
+    });
+    assert_eq!(k.call(k.t, call), WAITS);
+    assert_eq!(k.m.tasks[&task].marks & untrusted, untrusted);
+    assert_eq!(k.m.threads[&receiver].marks & untrusted, untrusted);
+    let steps = &k.m.locks.steps;
+    assert!(
+        !steps
+            .iter()
+            .any(|s| matches!(s, Step::Lock(LockId::Task(_)) | Step::Try(LockId::Task(_)))),
+        "{steps:?}"
+    );
+}
+
+// The bound k counted again (D-137).
+
+#[test]
+fn the_bound_k_of_each_call_is_the_contracts() {
+    use crate::locks::bound;
+    let range = crate::Range::NONE;
+    let call = Syscall::Call {
+        endpoint: s(1),
+        message: crate::Message::default(),
+        range,
+        wait: 0,
+    };
+    let send = Syscall::Send {
+        target: s(1),
+        message: crate::Message::default(),
+    };
+    let recv = Syscall::Recv {
+        endpoint: s(1),
+        reply: s(2),
+        range,
+        wait: 0,
+    };
+    let reply_recv = Syscall::ReplyRecv {
+        reply: s(2),
+        message: crate::Message::default(),
+        endpoint: s(1),
+        range,
+        wait: 0,
+    };
+    let configure = Syscall::ThreadConfigure {
+        thread: s(1),
+        cspace: s(2),
+        aspace: s(3),
+        fault: s(4),
+        page: s(5),
+    };
+    assert_eq!(
+        [call, send, recv, reply_recv, configure].map(|c| bound(&c)),
+        [33, 29, 40, 67, 21]
+    );
+    assert_eq!(bound(&Syscall::CapDelete(s(1))), 387);
+    assert_eq!(bound(&Syscall::TaskRevoke(s(1))), 194);
+    assert_eq!(bound(&Syscall::Yield), 12);
+}
+
+// The debugger's stopped time (D-137).
+
+#[test]
+fn a_node_sealed_before_a_long_stop_in_the_stub_is_not_accused_with_seal_at_the_release() {
+    use super::pass17::seal;
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.ok(0, seal(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    // A stop of 30 SEAL_NS: no node accuses another while it lasts, and at
+    // the release the seal is only as old as the time that was not stopped.
+    m.sys.stub_stop(30 * m.sys.canonical().seal_ns);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    // The clock of membership goes on: SEAL_NS later, it is accused.
+    m.run(m.sys.canonical().seal_ns + m.sys.canonical().sweep_ns);
+    assert_ne!(m.state(1), MemberState::Sealed);
+    assert_eq!(m.sys.member(1).evidence(), dodos_abi::Evidence::Seal);
+}
+
+// The sweep reads the seal of its sealed successors (D-137).
+
+#[test]
+fn a_sealed_node_that_nobody_needs_is_accused_with_seal_within_sweep_ns_and_seal_ns() {
+    use super::pass17::seal;
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.ok(0, seal(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    let sealed = m.sys.now();
+    let bound = sealed + m.sys.canonical().seal_ns + m.sys.canonical().sweep_ns;
+    m.sys.advance(bound);
+    assert_ne!(m.state(1), MemberState::Sealed);
+    assert_eq!(m.sys.member(1).evidence(), dodos_abi::Evidence::Seal);
+}
+
+// An unhooked table joins its free list only at the completion of the
+// invalidation that covers its unhooking (Address spaces and their tables,
+// D-137).
+
+#[test]
+fn a_table_unhooked_by_an_unmap_joins_the_free_list_only_at_the_completion_of_its_request() {
+    let mut m = three();
+    attached(&mut m, 0);
+    let frame = m.retype(0, ObjectKind::Frame, 1, 160);
+    m.ok(0, frame);
+    let untyped = super::untyped_slot(m.sys.node(0), m.t[0]);
+    m.ok(
+        0,
+        Syscall::IoSpaceMap(crate::Map {
+            space: s(IOSPACE),
+            frame: s(160),
+            untyped: s(untyped),
+            address: 1 << 20,
+            first: 0,
+            count: 1,
+            rights: dodos_abi::Rights::READ.bits(),
+        }),
+    );
+    let space = m.sys.node(0).object_at(m.t[0], s(IOSPACE)).unwrap();
+    let free = m.sys.node(0).aspaces[&space].free.len();
+    // The unmap waits for the unit: the device may still hold a cached
+    // entry of the old parent, so the tables it unhooked wait too.
+    assert_eq!(m.call(0, Syscall::IoSpaceUnmap(s(160))), WAITS);
+    let waiting: Vec<u64> = m.sys.node(0).aspaces[&space]
+        .unhooked
+        .iter()
+        .map(|&(_, at)| at)
+        .collect();
+    assert!(!waiting.is_empty());
+    assert_eq!(m.sys.node(0).aspaces[&space].free.len(), free);
+    m.run(30 * MS);
+    assert_eq!(m.woken(0), Some(&DONE));
+    let aspace = &m.sys.node(0).aspaces[&space];
+    assert!(aspace.unhooked.is_empty());
+    assert!(waiting.iter().all(|at| aspace.free.contains(at)));
+}
+
+// The removal of a line's irq waits for a claim still asking on that line
+// (Interrupts, the irq, D-137).
+
+#[test]
+fn the_removal_of_a_lines_irq_waits_while_an_entry_still_asks_for_that_line() {
+    let (mut m, holder, a, _) = holder_requester_third();
+    let claim = Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::line(5, false, false).raw(),
+        core: u64::from(a),
+        vector: 48,
+        destination: s(210),
+    };
+    let claimed = m.call(a, claim);
+    if claimed == WAITS {
+        m.settle();
+    }
+    let _ = holder;
+    let thread = m.t[a as usize];
+    let node = m.sys.node_mut(a);
+    let irq = node.object_at(thread, s(210)).expect("the irq");
+    // An entry still asks the line's redirection entry.
+    let index = node.unit_requests.iter().position(Option::is_none).unwrap();
+    node.unit_requests[index] = Some(crate::units::UnitEntry {
+        role: node.ioapic_role(5).unwrap(),
+        op: UnitOp::Redirection {
+            gsi: 5,
+            claimed: true,
+            level: false,
+            low: false,
+            target: crate::rings::Target::Masked,
+        },
+        epoch: 0,
+        stage: crate::units::Stage::Queued,
+        waiter: crate::units::Waiter::Thread(None),
+        record: None,
+        order: 0,
+        words: None,
+        segment: None,
+        failed: false,
+        then: None,
+    });
+    assert!(matches!(node.irq_removal(irq), crate::caps::Undone::Wait));
+    assert!(!node.irqs[&irq].removing);
+}
+
+// The delivery of a fault is an event, not a call: under contention it
+// follows the path of an arrival and never returns `again` (D-137).
+
+#[test]
+fn under_l2_a_fault_waits_for_the_core_that_holds_its_endpoint_and_is_delivered() {
+    let (mut k, receiver, _, _) = super::pass18::l2_delivery();
+    // A thread on core 1 whose fault endpoint is the endpoint the receiver
+    // waits on.
+    let mut calls = super::thread_calls(k.ut, k.m.node, 500, 1);
+    if let Syscall::ThreadConfigure { fault, .. } = &mut calls[3] {
+        *fault = s(310);
+    }
+    for call in calls {
+        k.ok(call);
+    }
+    let faulter = k.m.object_at(k.t, s(500)).unwrap();
+    k.interrupts();
+    // Core 2 is in an event that holds the endpoint's lock.
+    let endpoint = k.m.object_at(k.t, s(310)).unwrap();
+    k.m.hold(2, &[LockId::Endpoint(endpoint)], None)
+        .expect("a third core");
+    k.m.fault(faulter, dodos_abi::FaultKind::Undefined, [6, 0, 0]);
+    assert_eq!(k.m.check(), Ok(()));
+    // It waited for core 2's event, then delivered the fault as a call; no
+    // `again`, no escalation.
+    assert!(k.m.contended.is_empty());
+    assert!(matches!(k.m.woken(receiver), Some(Ok(Output::Message(_)))));
+    assert!(!k.m.locks.steps.contains(&Step::Quiet(true)));
+}

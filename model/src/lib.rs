@@ -654,6 +654,10 @@ struct ASpace {
     root: Option<u64>,
     hooked: BTreeMap<(u32, u64), u64>,
     free: Vec<u64>,
+    /// The tables unhooked by the clearing of a record, by its capability,
+    /// which join the free list only at the completion of the invalidation
+    /// that covers their unhooking (Address spaces and their tables, D-137).
+    unhooked: Vec<(CapId, u64)>,
     /// A node of several cores: the set of the node's cores that loaded its
     /// tag since it was last invalidated on them, by position (TLB).
     cores: u64,
@@ -672,6 +676,7 @@ impl ASpace {
             .copied()
             .chain(self.hooked.values().copied())
             .chain(self.free.iter().copied())
+            .chain(self.unhooked.iter().map(|&(_, page)| page))
     }
 }
 
@@ -859,6 +864,9 @@ struct Irq {
     pending: bool,
     /// The notify it is bound to, and the bits it sets.
     notify: Option<(ObjId, u64)>,
+    /// Its removal asked the holder of its line's controller to mask the
+    /// line (Interrupts, the irq, D-137).
+    removing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1074,6 +1082,11 @@ pub struct Model {
     /// The kernel epoch: one word of the node block, raised at the last
     /// destruction of an untyped's object and at an escalation (D-135).
     pub(crate) kernel_epoch: u64,
+    /// The core whose escalated call holds the quiet word, if any, and the
+    /// arrivals each other core keeps pending at its controller meanwhile,
+    /// its interrupts masked while it waits (D-137).
+    pub(crate) quiet: Option<usize>,
+    pub(crate) masked: BTreeMap<usize, Vec<u8>>,
     /// Under variant L2: the objects as they were before the event.
     before: Ephemeral<Option<Box<locks::Snapshot>>>,
     /// The pending interrupts of the cores are delivered by the caller

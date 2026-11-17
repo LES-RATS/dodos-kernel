@@ -32,6 +32,18 @@ impl Model {
                 || self.threads[&thread].regs[REG_DR7] & 0xFF != 0,
             "no breakpoint is enabled"
         );
+        // Under L2, with another core in an event, the delivery of a fault
+        // follows the path of an arrival: it is an event, not a call, and
+        // never returns `again` (A node of several cores, D-137).
+        if !self.contended.is_empty() {
+            self.fault_contended(thread, kind, exception);
+            return;
+        }
+        self.fault_once(thread, kind, exception);
+    }
+
+    /// A fault, with no lock held by another core.
+    pub(crate) fn fault_once(&mut self, thread: ObjId, kind: FaultKind, exception: [u64; 3]) {
         *self.last_event = None;
         let core = self.core_of(thread);
         let entry = self.begin_on(core);

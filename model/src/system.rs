@@ -430,6 +430,22 @@ impl System {
         }
     }
 
+    /// The debugger stub of a development image stops the machine for `ns`
+    /// nanoseconds: it raises the release word, time passes (no node
+    /// records an observation or accuses another meanwhile), it adds the
+    /// stop to the stopped time, then lowers the release word (Two builds,
+    /// and the debugger stub, D-137).
+    #[cfg(test)]
+    pub fn stub_stop(&mut self, ns: u64) {
+        self.edit_table(|t| t.release = true);
+        let to = self.now + ns;
+        self.advance(to);
+        self.edit_table(|t| {
+            t.stopped_time += ns;
+            t.release = false;
+        });
+    }
+
     /// A parked core is in the park stub between its read of the start
     /// request and its halt (a test's input): a wake that reaches it now
     /// is lost.

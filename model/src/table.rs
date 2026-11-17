@@ -303,6 +303,11 @@ pub(crate) struct Table {
     /// The identifier words of the devices, by segment << 16 | identifier,
     /// as raw ownership words; one not listed is free and unclaimed.
     pub(crate) identifiers: BTreeMap<u32, u64>,
+    /// In a development image, the release word of the debugger stub and
+    /// the stopped time, the total of the times spent stopped in the stub
+    /// (Two builds, and the debugger stub, D-137).
+    pub(crate) release: bool,
+    pub(crate) stopped_time: u64,
     /// The attach words, by segment << 16 | identifier, as raw words; one
     /// not listed is 0 (IOMMU, D-137).
     pub(crate) attach: BTreeMap<u32, u64>,

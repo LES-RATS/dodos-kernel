@@ -186,10 +186,18 @@ pub struct Machine {
     pub boot_nodes: Option<(u16, Vec<(u64, u64)>)>,
     /// The cores per node the kernel image supports (entry `Node`).
     pub cores_supported: u32,
-    /// The longest hold of a node's lock measured for the image, *H*: the
-    /// machine start-up refuses a `CORE_ANSWER_NS` not above (N − 1) × H
-    /// for the largest N the image supports (D-131).
+    /// The longest hold of a node's lock measured for the image, *H*, and
+    /// under L2 the longest hold of an object lock *h*, the longest kernel
+    /// event on one core *E*1, the longest one-core bound of a call
+    /// *B*1max and the delivery of one interrupt *D*: the machine start-up
+    /// refuses a `CORE_ANSWER_NS` not above the longest healthy wait, and
+    /// a `STALE_NS` or a `STUCK_NS` not above it with an event (D-131,
+    /// D-137).
     pub hold_ns: u64,
+    pub object_hold_ns: u64,
+    pub event_ns: u64,
+    pub one_core_ns: u64,
+    pub delivery_ns: u64,
     /// The lock discipline of a node of several cores.
     pub locking: crate::Locking,
     /// The image declares the hardening monitor: every core is of fence
@@ -367,6 +375,10 @@ impl Machine {
             boot_nodes: None,
             cores_supported: CORES_PER_KERNEL_MAX as u32,
             hold_ns: 10_000,
+            object_hold_ns: 1_000,
+            event_ns: 10_000,
+            one_core_ns: 10_000,
+            delivery_ns: 5_000,
             locking: crate::Locking::L1,
             monitor: false,
             accept_unfenced: false,
@@ -737,17 +749,33 @@ impl Machine {
         };
         let in_range =
             |ms: u32, (low, high): (u64, u64)| (low..=high).contains(&(u64::from(ms) * 1_000_000));
-        // CORE_ANSWER_NS must stay above (N − 1) × H for the largest N the
-        // image supports (D-131).
+        // CORE_ANSWER_NS must stay above the longest healthy wait for the
+        // largest N the image supports, and STALE_NS and STUCK_NS above it
+        // with an event (and the reserve's period for STUCK_NS): a core
+        // that waits does not beat (D-131, D-137).
         let answer = u64::from(self.membership.core_answer_ms) * 1_000_000;
         let largest = u64::from(self.cores_supported.min(self.cores.len() as u32));
-        let held = largest.saturating_sub(1).saturating_mul(self.hold_ns);
+        let measured = crate::locks::Measured {
+            cores: largest,
+            node_hold: self.hold_ns,
+            object_hold: self.object_hold_ns,
+            event: self.event_ns,
+            one_core: self.one_core_ns,
+            delivery: self.delivery_ns,
+        };
+        let held = measured.healthy_wait(self.locking);
+        let event = measured.event_with_waits(self.locking);
+        let stale = u64::from(self.membership.stale_ms) * 1_000_000;
+        let stuck = u64::from(self.membership.stuck_ms) * 1_000_000;
+        let beats = stale > answer.saturating_add(event)
+            && stuck > (dodos_abi::RECOVERY_PERIOD_NS + answer).saturating_add(event);
         let timed = in_range(self.membership.stale_ms, STALE_RANGE_NS)
             && in_range(self.membership.stuck_ms, STALE_RANGE_NS)
             && in_range(self.membership.sweep_ms, SWEEP_RANGE_NS)
             && in_range(self.membership.seal_ms, SEAL_RANGE_NS)
             && in_range(self.membership.core_answer_ms, CORE_ANSWER_RANGE_NS)
-            && answer > held;
+            && answer > held
+            && beats;
         let ordinary_bytes: u64 = ordinary.iter().map(|(s, e)| e - s).sum();
         let sizes = floors(ordinary_bytes, n, self.floors, chunk)
             .filter(|sizes| sizes.total <= chunks.len() as u64 * chunk);
@@ -978,6 +1006,8 @@ impl Machine {
             device_leaves: std::sync::Arc::new(vec![0; layout.devices.len()]),
             identifiers: Default::default(),
             attach: Default::default(),
+            release: false,
+            stopped_time: 0,
             lines: Default::default(),
             members,
             roles: roles.clone(),

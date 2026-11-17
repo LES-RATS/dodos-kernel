@@ -389,6 +389,14 @@ impl Model {
     /// the core of the last event, with a trace that keeps the order; no
     /// lock held by two cores.
     fn check_holders(&self) -> Check {
+        // Arrivals kept pending at a controller only while another core
+        // holds the quiet word (D-137).
+        for &position in self.masked.keys() {
+            ensure(
+                self.quiet.is_some_and(|holder| holder != position),
+                "quiet word: an arrival kept pending with the word released",
+            )?;
+        }
         let mut all: Vec<LockId> = Vec::new();
         for (&core, holder) in &self.contended {
             ensure(

@@ -454,10 +454,14 @@ impl Model {
             for (&(level, _), &at) in &space.hooked {
                 tables.insert(at / page, class(level));
             }
-            for &at in &space.free {
+            for &at in space
+                .free
+                .iter()
+                .chain(space.unhooked.iter().map(|(_, at)| at))
+            {
                 tables.insert(at / page, None);
             }
-            let taken = space.hooked.len() + space.free.len();
+            let taken = space.hooked.len() + space.free.len() + space.unhooked.len();
             let followed = space.root.is_none() || space.tables == taken as u64;
             ensure(followed, "59: tables of a space")?;
         }

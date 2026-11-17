@@ -12,11 +12,19 @@ impl Model {
         Marks::from_bits(task.unwrap_or(thread.marks)).ok()
     }
 
-    /// Adds marks to the effective marks of a thread.
+    /// Adds marks to the effective marks of a thread, at a delivery: by
+    /// atomic ORs that take no lock, into its own word always and into its
+    /// task's word too if it is attached to one, the task read after the
+    /// own word is written (Tasks and marks, D-137: marks only gain bits,
+    /// and a delivery that races a `task_attach` loses none).
     pub(crate) fn mark(&mut self, thread: ObjId, marks: u64) {
-        match self.threads[&thread].task {
-            Some(task) => locked(&mut self.tasks, &self.locks, task).marks |= marks,
-            None => locked(&mut self.threads, &self.locks, thread).marks |= marks,
+        if marks == 0 {
+            return;
+        }
+        let own = self.threads.get_mut(&thread).expect("a live thread");
+        own.marks |= marks;
+        if let Some(task) = own.task {
+            self.tasks.get_mut(&task).expect("a live task").marks |= marks;
         }
     }
 
