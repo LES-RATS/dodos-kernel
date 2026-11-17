@@ -42,7 +42,7 @@ measurement unless it is about interrupts.
 | `platform` | ACPI tables present (SPCR, DBG2); a 16550 at COM1 (scratch register); every PCI serial controller (class 0700h); every xHCI controller and whether it lists the USB Debug Capability (extended capability 10); every EHCI and its debug port capability (0Ah); each I/O APIC's version (EOI register from version 20h); the local APIC's EOI-broadcast suppression bit (SDM vol. 3A 13.4.8). Reads only | bootstrap core | once | P-007 (D-058); open point "end of interrupt of a level line from any node" (presence only) | A serial port (COM1 or PCI): option A of P-007 needs no purchase. DbC listed: option B is possible, on the controller named. Neither: a PCIe serial card is to buy |
 | `stall` | Each worker reads the TSC in a tight loop with interrupts masked for 30 s and keeps the longest gap and the gaps over 10 µs, 100 µs, 1 ms; SMI count before and after | all workers at once | 30 s | `STALE_NS`, `STUCK_NS`, `CORE_ANSWER_NS` ("above the longest firmware stall of the reference machines") | The longest gap seen sets the floor; the documents' values (100 ms, 100 ms, 10 ms) stand if they are well above it (suggested: ten times) |
 | `gate` | Per sample of 64 operations: an 8-byte store (baseline); MOV CR3 to a second root and back, without PCID and with PCID and bit 63 (no flush); clear CR0.WP, store to a read-only page, set WP; open PKS key 1 in IA32_PKRS, store to a page of key 1, close it (WRMSR, and WRMSRNS when present), after checking a store with the key closed faults with the PK bit; INVLPG and INVPCID type 0 then the store that reloads the entry | one P and one E worker | 2,000 samples | P-003 (kernel.md table rows 2 to 4) | The cost per operation of each window mechanism against a store. Fallback B (gate root with PCID) is judged by `gate.cr3 pcid=1`; C (PKS) only if `identity` and the fault check say it works |
-| `cet` | Map a page as a supervisor shadow-stack page (R/W 0, dirty 1) and check an ordinary store faults; WRSSQ to it; then the window's own page table mapped only as a shadow-stack page: a new entry written by WRSSQ serves the walk, gets its accessed and dirty bits, is replaced by another WRSSQ and the walk follows; an ordinary store to the table faults. Costs: 64 and 512 WRSSQ per sample (512 = one gate call's batch of *E* entries); 64 CALL/RET pairs with supervisor shadow stacks off and on; 64 indirect CALLs to an ENDBR64 target with IBT off and on | one P and one E worker | 2,000 samples | P-003 first mechanism (D-120); kernel.md "CET's cost" (proxies only, see below) | `cet.walk` all 1 and the stores faulting: mechanism A works on this processor and is chosen (no window); any 0: fallback B. `cet.wrssq ops=512` against `gate.cr3`: the price of A per batch. The CALL/RET and indirect deltas bound CET's overhead per call and per indirect branch |
+| `cet` | Map a page as a supervisor shadow-stack page (R/W 0, dirty 1) and check an ordinary store faults; WRSSQ to it; then the window's own page table mapped only as a shadow-stack page: a new entry written by WRSSQ serves the walk, gets its accessed and dirty bits, is replaced by another WRSSQ and the walk follows; an ordinary store to the table faults. Costs: 64 and 512 WRSSQ per sample (512 = one gate call's batch of *E* entries); 64 CALL/RET pairs with supervisor shadow stacks off and on; 64 indirect CALLs to an ENDBR64 target with IBT off and on. Everything with supervisor shadow stacks on (both `SH_STK_EN` and `WR_SHSTK_EN`) only on a core whose CPUID.07H.01H:EDX.CET_SSS[18] is 1 | one P and one E worker | 2,000 samples | P-003 first mechanism (D-120); kernel.md "CET's cost" (proxies only, see below) | `cet.walk` all 1 and the stores faulting: mechanism A works on this processor and is chosen (no window); any 0, or `cet.sss cet_sss=0` (the kernel does not enable supervisor shadow stacks there, kernel.md row 1): fallback B. `cet.wrssq ops=512` against `gate.cr3`: the price of A per batch. The CALL/RET and indirect deltas bound CET's overhead per call and per indirect branch |
 | `ipi` | Self-IPI taken and ended; round trip A→B→A by fixed IPIs (B's handler answers); one-way (B stamps the TSC); the same round trip by two cache-line writes; B spinning, halted, or in MWAIT with each hint CPUID 05H enumerates (core C6 and C7 residency read around); the round trip between every ordered pair of workers | pairs P→P, E→E, P→E, E→P; then all pairs | 20,000 spinning, 2,000 per idle state, 500 per pair of the matrix | the real interrupt cost the trial modelled (`ipi`); kernel.md line 71; the overhead gate "IPC round trip between two cores" (gates.md, "To set") | The real `ipi` value of the trial; the cross-kind penalty for placement; the exit time of each sleep state (derived table: round trip minus spinning) for the idle policy |
 | `shoot` | Change a page-table entry, INVLPG locally, send the shootdown vector to each target (unicast) or once per x2APIC cluster (logical), wait for every acknowledgement | initiator and 1, 2, 5, 13 others: same kind, other kind, mixed; targets busy or halted; the bootstrap core joins at 13 | 5,000 | kernel-interface.md "TLB, one core and several" (the bound of `aspace_unmap`); open point "a shootdown inside a node of 2 to 14 cores"; kernel-shape-opus.md 8.2, second criterion | The cost of an unmap's wait per node size. 8.2: if a shootdown inside a node of 6 cores (`others=5`) is not faster than the same unmap done by messages between one-core nodes (5 × `ipi.rtt`, as a lower bound), case 3.1's main argument fails |
 | `trial` | The multicore trial's suites `locks, a1t, a2t, a3t, ct, a3n, br` unchanged (lookups with changes, IPC between cores, signals from many threads, a process beside others, the atomic notify, unmaps by every thread), worker *i* on the *i*-th core (P cores first), nodes of 2 to 6 cores against the same number of one-core nodes, interrupt cost 0, 1000 ns and **real** (a real interrupt taken where the model charges `ipi_ns`) | 14 workers | 3 × 150 ms per cell | open point "Locking inside a node of several cores" (L1, L2); D-129 | L1 is the default; L2 where L1's IPC (`a2t`) or unmap (`br`) cost is too high (the open point's rule). kernel-shape-opus.md 8.2: C* is wrong for this machine if the weighted cost of the lock exceeds the weighted gain (the weights need traces, below) |
@@ -216,39 +216,34 @@ none, so only the walk of the list ran); SPCR and DBG2 (QEMU has neither).
 
 ## Changes for the documents
 
-Not made here (the Docs repository is not touched); listed for the owners:
+Four changes this trial found while it was written are in the contract
+since (Docs at 74011e1, D-134 and D-135), and the image follows them:
 
-1. **The park stub's lost wake-up** (kernel-interface.md, "The fence", step
-   4). "An NMI wakes it: it reads its start request and, if one names a
-   node, goes to the entry stub; otherwise it halts again": an NMI that
-   arrives after the stub has read its start request and before HLT is
-   taken and returns into the HLT, which then waits for the next event. The
-   bootstrap-core test hit it under QEMU (`resends=1` in 5). The starter must
-   repeat the NMI every millisecond until the start is confirmed (as the
-   fence's driver repeats its steps), or the stub must wait with MONITOR on
-   its start request and MWAIT, which a store wakes. To add to step 4.
-2. **SDM numbering.** The contract cites order 325384-086 (December 2024):
-   §10.4.2, §10.4.4 table 10-1, §25.8, §33.5.1, §33.14.2. In 325462-093
-   (September 2026) the same texts are vol. 3A §11.4.2 and §11.4.4.1 table
-   11-1, vol. 3C §26.8, §34.5.1 and §34.14.2.
-3. **WRSSQ at ring 0 needs supervisor shadow stacks on.** Its operation
-   requires CR4.CET, IA32_S_CET.SH_STK_EN and IA32_S_CET.WR_SHSTK_EN at
-   CPL < 3 (vol. 2D WRSSD/WRSSQ). Mechanism A of kernel.md therefore means
-   supervisor shadow stacks on in the gate at least, with a valid SSP
-   (SETSSBSY with a token, or loaded at a privilege change); and
-   CPUID.07H.01H:EDX.CET_SSS[18] says when an operating system can enable
-   them "as long as it ensures that a supervisor shadow stack cannot become
-   prematurely busy due to page faults" (vol. 1 table 21-25). To add to
-   P-002's list and to kernel.md's row 1.
-4. **IA32_PKRS on 12th and 13th generation hybrid parts.** SDM vol. 4 table
-   2-46 lists MSR 6E1H IA32_PKRS among the MSRs of these processors: one
-   more source against Intel support's 2023 answer quoted in kernel.md
-   (row 3). The run decides.
-5. **After the run**: P-002, P-003 (with P-004), P-007, P-016 and the open
+1. **The park stub's lost wake-up** (kernel-interface.md, "The fence"): an
+   NMI that arrives after the stub has read its start request and before
+   HLT is lost (the bootstrap-core test hit it under QEMU, `resends=1` in
+   5). The contract now has the starter send the wake again every
+   `START_RETRY_NS` (1 ms) until `started` equals its request; `bsp.park`
+   resends every millisecond and reports the count.
+2. **SDM edition.** The contract cites one edition, 325462-093 (September
+   2026), as the image's comments do.
+3. **WRSSQ at ring 0 needs supervisor shadow stacks on**: CR4.CET,
+   `IA32_S_CET.SH_STK_EN` and `IA32_S_CET.WR_SHSTK_EN` (vol. 2D
+   WRSSD/WRSSQ), and the kernel checks `CPUID.07H.01H:EDX.CET_SSS[18]`
+   before it enables them (kernel.md, write gate row 1; P-002). `cet` sets
+   both bits for its shadow-stack windows and runs them only on a core
+   whose CET_SSS is 1; otherwise it reports `cet.sss cet_sss=0` and
+   measures only CALL/RET without shadow stacks and IBT.
+4. **IA32_PKRS on 12th and 13th generation hybrid parts** (SDM vol. 4
+   table 2-46) is cited in kernel.md row 3. The run decides.
+
+Still for the owners (the Docs repository is not touched here):
+
+1. **After the run**: P-002, P-003 (with P-004), P-007, P-016 and the open
    points named in the plan above change status with the numbers; the
    inventory's group D loses the items this run covers; `plan/progress.md`
    (AGENTS.md: "Update plan/progress.md ... in the same change as the work")
    should record that the image exists and is waiting for the machine.
-6. **What the run cannot give** (the section above) stays open in the
+2. **What the run cannot give** (the section above) stays open in the
    documents, notably the trial's weights and the kernel-dependent numbers
    of P-015 and P-017.

@@ -1,7 +1,10 @@
 //! P-003, first mechanism (D-120): page tables typed as supervisor
 //! shadow-stack pages, written only by WRSSQ. Runs on one core of each
-//! kind when CPUID.07H.0:ECX.CET_SS[7] is set. QEMU has no CET: this step
-//! runs only on the real machine (README, "What QEMU ran").
+//! kind when CPUID.07H.0:ECX.CET_SS[7] is set; everything with supervisor
+//! shadow stacks on only where CPUID.07H.01H:EDX.CET_SSS[18] is set too,
+//! as the kernel checks it before enabling them (kernel.md, write gate row
+//! 1; P-002). QEMU has no CET: this step runs only on the real machine
+//! (README, "What QEMU ran").
 //!
 //! Facts used, SDM 325462-093:
 //! - a linear address is a shadow-stack address when the R/W flag is 0 and
@@ -278,27 +281,6 @@ fn measure(core: usize, samples: usize, out: &Mutex<Vec<Sample>>) {
         info(alloc::format!("F cet core={core} cr4.cet=fault"));
         return;
     }
-    // SAFETY: the SSP that SETSSBSY will load; used only inside windows.
-    unsafe { x86::wrmsr(x86::IA32_PL0_SSP, s.token) };
-    smp::mark("cet ordinary store");
-    let ordinary = plain_store(paging::window_va(11));
-    smp::mark("cet one wrssq");
-    let (_, f1) = s.window(1, paging::window_va(11), 0x5A5A, 0, false, SS, true);
-    // SAFETY: reads the target frame through its identity mapping.
-    let landed = unsafe { (target as *const u64).read_volatile() } == 0x5A5A;
-    info(alloc::format!(
-        "I cet.basic core={core} ordinary_store={} wrssq_fault={} wrssq_landed={}",
-        fault_text(ordinary),
-        fault_text(f1),
-        u8::from(landed)
-    ));
-    if f1.is_some() {
-        // SAFETY: CR4 as found.
-        unsafe { x86::set_cr4(cr4) };
-        return;
-    }
-    smp::mark("cet walk");
-    walk(core, &s, out);
     let push = |name: &'static str, extra: String, t: Vec<u64>, c: Vec<u64>| {
         out.lock().expect("out").push(Sample {
             name,
@@ -325,12 +307,27 @@ fn measure(core: usize, samples: usize, out: &Mutex<Vec<Sample>>) {
         c.remove(0);
         push(name, extra, t, if pmu { c } else { Vec::new() });
     };
-    smp::mark("cet wrssq");
-    run("cet.wrssq", " ops=64".into(), 0, 64, SS, true);
-    run("cet.wrssq", " ops=512".into(), 0, 512, SS, true);
     smp::mark("cet callret");
     run("cet.callret", " ops=64 shstk=0".into(), 2, 64, 0, false);
-    run("cet.callret", " ops=64 shstk=1".into(), 2, 64, SS, true);
+    // Supervisor shadow stacks only where CPUID.07H.01H:EDX.CET_SSS[18]
+    // allows an operating system to enable them (vol. 1 table 21-25), as
+    // the kernel does (kernel.md, write gate row 1; P-002).
+    if bit(cpuid(7, 1).edx, 18) {
+        if !shadow_stacks(core, &s, target, out) {
+            // SAFETY: CR4 as found.
+            unsafe { x86::set_cr4(cr4) };
+            return;
+        }
+        smp::mark("cet wrssq");
+        run("cet.wrssq", " ops=64".into(), 0, 64, SS, true);
+        run("cet.wrssq", " ops=512".into(), 0, 512, SS, true);
+        smp::mark("cet callret");
+        run("cet.callret", " ops=64 shstk=1".into(), 2, 64, SS, true);
+    } else {
+        info(alloc::format!(
+            "I cet.sss core={core} cet_sss=0 supervisor_shadow_stacks=off"
+        ));
+    }
     if bit(cpuid(7, 0).edx, 20) {
         smp::mark("cet indirect");
         run("cet.indirect", " ops=64 ibt=0".into(), 3, 64, 0, false);
@@ -345,6 +342,35 @@ fn measure(core: usize, samples: usize, out: &Mutex<Vec<Sample>>) {
     }
     // SAFETY: CR4 as found; IA32_S_CET is 0 after every window.
     unsafe { x86::set_cr4(cr4) };
+}
+
+/// The checks with supervisor shadow stacks on: an ordinary store to a
+/// shadow-stack page faults, one WRSSQ lands, then `walk`. False when that
+/// WRSSQ faulted, so nothing more with shadow stacks on is measured.
+fn shadow_stacks(core: usize, s: &Setup, target: u64, out: &Mutex<Vec<Sample>>) -> bool {
+    // SAFETY: the SSP that SETSSBSY will load; used only inside windows.
+    unsafe { x86::wrmsr(x86::IA32_PL0_SSP, s.token) };
+    smp::mark("cet ordinary store");
+    let ordinary = plain_store(paging::window_va(11));
+    smp::mark("cet one wrssq");
+    let (_, f1) = s.window(1, paging::window_va(11), 0x5A5A, 0, false, SS, true);
+    // SAFETY: reads the target frame through its identity mapping.
+    let landed = unsafe { (target as *const u64).read_volatile() } == 0x5A5A;
+    gate::info(
+        out,
+        alloc::format!(
+            "I cet.basic core={core} ordinary_store={} wrssq_fault={} wrssq_landed={}",
+            fault_text(ordinary),
+            fault_text(f1),
+            u8::from(landed)
+        ),
+    );
+    if f1.is_some() {
+        return false;
+    }
+    smp::mark("cet walk");
+    walk(core, s, out);
+    true
 }
 
 /// The page-walk check: the window's own page table, mapped only as a
