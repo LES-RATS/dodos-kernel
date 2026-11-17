@@ -1124,6 +1124,10 @@ pub struct Model {
     /// The generations that ended while this node was sealed whose R0 its
     /// resume has done, once each.
     ended_done: BTreeSet<(u16, u32)>,
+    /// The runs of R0 for each generation of each node, which the check
+    /// holds to at most one (`node_start` mode resume: "R0 once for that
+    /// generation"; finding 8 of the tenth model review).
+    r0_runs: BTreeMap<(u16, u32), u32>,
     starts: BTreeMap<usize, nodes::Starting>,
     start_image: (bool, u64),
     handing: BTreeMap<usize, roles::Handover>,

@@ -252,9 +252,9 @@ impl Model {
     }
 
     /// Where a line claimed on the core at `position` with `vector` points
-    /// its redirection entry: its fixed remapping handle (core number × 192
-    /// + vector − 48) and the vector with interrupt remapping, the vector
-    /// and the core's APIC ID without (Interrupts, x86-64).
+    /// its redirection entry: its fixed remapping handle (core number times
+    /// 192, plus vector less 48) and the vector with interrupt remapping,
+    /// the vector and the core's APIC ID without (Interrupts, x86-64).
     pub(crate) fn line_target(&self, position: usize, vector: u8) -> crate::rings::Target {
         let core = u64::from(self.cores[position].number);
         let handle = core * IRQ_TABLE_ENTRIES as u64 + u64::from(vector - IRQ_VECTOR_FIRST);

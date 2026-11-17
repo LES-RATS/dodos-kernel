@@ -335,6 +335,21 @@ impl Model {
     ///     word reads taken by this node's generation (Interrupts, the
     ///     owner word of a line, D-135).
     fn check_lines(&self) -> Check {
+        // The table of line words has at most `IRQ_LINES_MAX` words, kept
+        // for the life of the machine (Interrupts, D-135; finding 9 of the
+        // tenth model review).
+        if self
+            .table
+            .lines
+            .keys()
+            .any(|&gsi| gsi as usize >= dodos_abi::IRQ_LINES_MAX)
+        {
+            return Err("96: a line word beyond the last");
+        }
+        // R0 once for each generation of each node (finding 8).
+        if self.r0_runs.values().any(|&runs| runs > 1) {
+            return Err("R0: run twice for one generation");
+        }
         let generation = self.table.generation(self.node);
         let taken =
             dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation).raw();

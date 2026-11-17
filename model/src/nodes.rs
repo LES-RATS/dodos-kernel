@@ -952,6 +952,7 @@ impl Model {
 
     /// What R0 does, apart from this node's record of its reclaim.
     fn r0_effects(&mut self, node: u16, generation: u32) {
+        *self.r0_runs.entry((node, generation)).or_default() += 1;
         let waiting: Vec<ObjId> = self
             .threads
             .iter()
@@ -1561,8 +1562,13 @@ impl Model {
             // R3; Grants, "Generations").
             // R0 once for that generation, which leaves the reclaim of a
             // later generation of the node as it is.
+            // R0 once for that generation: not again if this node ran it
+            // before it sealed (the node was accused while this node
+            // sealed), which the explorations reached (pass 19, the count of
+            // finding 8 of the tenth model review).
             if let Some(old) = self.ended_while_sealed(node) {
-                if self.ended_done.insert((node, old)) {
+                let ran = self.r0_runs.contains_key(&(node, old));
+                if self.ended_done.insert((node, old)) && !ran {
                     self.r0_effects(node, old);
                 }
                 any |= self.drop_ended(node, old, units);

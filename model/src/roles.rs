@@ -612,7 +612,12 @@ impl Model {
                 })
                 .map(|irq| {
                     let target = self.line_target(irq.core, irq.vector);
-                    Item::Line(irq.source.id(), irq.source.level(), irq.source.active_low(), target)
+                    Item::Line(
+                        irq.source.id(),
+                        irq.source.level(),
+                        irq.source.active_low(),
+                        target,
+                    )
                 })
                 .collect(),
             _ => Vec::new(),

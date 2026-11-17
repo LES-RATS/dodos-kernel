@@ -87,7 +87,7 @@ pub struct System {
     nodes: Vec<Option<Model>>,
     hardware: Vec<Hardware>,
     actions: Vec<(u16, HwAction)>,
-    machine: Machine,
+    pub(crate) machine: Machine,
     layout: Layout,
     /// The machine stopped with a stop record (containment violated).
     pub stopped: bool,

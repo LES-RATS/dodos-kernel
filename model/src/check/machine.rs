@@ -33,6 +33,12 @@ impl System {
         if self.models().next().is_none() {
             return Ok(());
         }
+        // Only the machine start-up fills the slot of the replacement
+        // kernel image; no call writes it (D-136).
+        ensure(
+            self.canonical().replacement == self.machine.replacement,
+            "D-136: the replacement slot written after the machine start-up",
+        )?;
         self.check_cores()?;
         self.check_fence_order()?;
         self.check_counts()?;
