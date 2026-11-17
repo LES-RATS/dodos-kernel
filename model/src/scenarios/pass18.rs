@@ -579,3 +579,112 @@ fn a_core_that_two_nodes_run_is_reported_by_p2_even_when_the_first_is_named() {
         "{report}"
     );
 }
+
+// The mutation M5 of the ninth model review: an IOAPIC on another PCI
+// segment (Devices and shared hardware, several remapping units: "the
+// IOAPIC of a line, whose segment the DMAR gives").
+
+#[test]
+fn the_claim_of_a_remapped_line_asks_the_units_of_its_ioapics_segment_only() {
+    let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    let mut other = machine.iommus[0];
+    other.segment = 1;
+    machine.iommus.push(other);
+    machine.ioapics[0].segment = 1;
+    let mut m = S::on(&machine);
+    let asked = |m: &S, unit: usize| {
+        let role = m.sys.node(0).segment_roles(machine.iommus[unit].segment)[0];
+        super::pass17::submissions(m, role)
+    };
+    let before = (asked(&m, 0), asked(&m, 1));
+    let claimer = (0..3)
+        .find(|&n| n != m.sys.role(m.sys.node(0).ioapic_role(5).unwrap()).holder())
+        .unwrap();
+    assert!(matches!(
+        claim_line(&mut m, claimer, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+    assert_eq!((asked(&m, 0), asked(&m, 1)), (before.0, before.1 + 1));
+}
+
+// The retry of a start and the sweep at due events of the first core
+// (D-135: Node slots and core words, the start request; Detection, the
+// sweep), and the `Ping` removed.
+
+#[test]
+fn a_start_wake_is_sent_again_every_start_retry_ns_until_the_core_takes_it() {
+    let mut m = S::two();
+    m.ok(0, kill(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    // The core never takes its wake.
+    m.sys.hang(1, true);
+    m.ok(0, fresh(1, 0b10));
+    let from = m.sys.now();
+    // Time passes from one armed instant to the next, not in steps.
+    m.sys.advance(from + 10 * MS);
+    assert_eq!(m.sys.check(), Ok(()));
+    let wakes: Vec<u64> = m
+        .sys
+        .sent
+        .iter()
+        .filter(|(at, node, a)| *at >= from && *node == 0 && *a == HwAction::Start { core: 1 })
+        .map(|(at, _, _)| *at)
+        .collect();
+    assert!(wakes.len() >= 9, "{wakes:?}");
+    assert!(
+        wakes
+            .windows(2)
+            .all(|w| w[1] - w[0] == dodos_abi::START_RETRY_NS),
+        "{wakes:?}"
+    );
+}
+
+#[test]
+fn the_first_core_of_an_idle_live_node_keeps_its_sweep_armed() {
+    let mut m = S::two();
+    // Past the instants of the first sweep's observations.
+    m.run(600 * MS);
+    // Neither node has work: each first core is idle with its sweep armed,
+    // never with nothing armed.
+    for core in 0..2 {
+        let idle_until = m.sys.canonical().core_beacons[core].idle_until.0;
+        assert_ne!(idle_until, u64::MAX, "core {core}");
+        assert!(idle_until <= m.sys.now() + m.sys.canonical().sweep_ns);
+    }
+}
+
+#[test]
+fn a_kind_9_message_is_one_the_receiver_does_not_know() {
+    assert_eq!(dodos_abi::NodeMessage::from_raw(9), None);
+    let mut m = S::two();
+    let header = dodos_abi::RingHeader {
+        kind: 9,
+        length: 1,
+        sender: 0,
+        sender_generation: m.sys.member(0).generation(),
+        receiver_generation: m.sys.member(1).generation(),
+        credit: u32::from(dodos_abi::CREDIT_NONE),
+    };
+    let before = m.sys.node(1).refused.0;
+    m.sys.inject_raw(0, 1, false, header, 1);
+    m.run(20 * MS);
+    assert_eq!(m.sys.node(1).refused.0, before + 1);
+}
+
+// The state word of an invalidation request (A node of several cores,
+// D-135: the completing core writes *done*, its own core starts the next).
+
+#[test]
+fn the_core_that_completes_a_request_writes_its_state_word_done() {
+    use super::cores::{FRAME, two_threads};
+    use crate::cores::RequestState;
+    let (mut k, _) = two_threads(Arch::X86_64, 2);
+    assert_eq!(k.call(k.t, Syscall::ASpaceUnmap(s(FRAME))), WAITS);
+    assert_eq!(k.m.cores[0].request_state, RequestState::InUse);
+    // Core 1's acknowledgement completes core 0's request.
+    k.m.take_interrupts(1);
+    assert_eq!(k.m.check(), Ok(()));
+    assert_eq!(k.m.cores[0].request_state, RequestState::Done);
+    assert_eq!(k.m.cores[0].request, None);
+}

@@ -120,7 +120,6 @@ pub enum Body {
         next: u64,
         items: Vec<Item>,
     },
-    Ping,
     SendAnswer {
         delivered: bool,
         dropped: bool,
@@ -149,7 +148,6 @@ impl Body {
             Body::Handed { .. } => NodeMessage::Handed,
             Body::ReportAsk { .. } => NodeMessage::ReportAsk,
             Body::Report { .. } => NodeMessage::Report,
-            Body::Ping => NodeMessage::Ping,
             Body::SendAnswer { .. } => NodeMessage::SendAnswer,
             Body::Send { .. } => NodeMessage::Send,
             Body::Signal { .. } => NodeMessage::Signal,
@@ -164,7 +162,6 @@ impl Body {
             Body::UnitRequest { .. } => 3,
             Body::UnitAnswer { .. } | Body::ReportAsk { .. } => 2,
             Body::Report { items, .. } => 1 + 3 * items.len(),
-            Body::Ping => 0,
             Body::SendAnswer { uses, .. } => 1 + uses.len(),
             Body::Send { grants, words, .. } => 3 + grants.len() + words.len(),
         }
@@ -447,7 +444,7 @@ impl Model {
                 (!matches).then_some(u64::from(*role))
             }
             // A `UnitRequest` passes whatever its epoch.
-            Body::UnitRequest { .. } | Body::Ping => None,
+            Body::UnitRequest { .. } => None,
             // A `Send`'s stamp carries 0 (a sender attached to no task) or
             // a task identifier of the sender's node with a counter that is
             // not 0 (D-134).
@@ -627,7 +624,6 @@ impl Model {
                 self.report_asked(from, credit, role, epoch, key)
             }
             Body::Report { next, items } => self.report_received(from, credit, next, items),
-            Body::Ping => {}
             Body::SendAnswer {
                 delivered,
                 dropped,

@@ -758,22 +758,11 @@ impl Model {
             }
         }
         if swept {
+            // The next sweep, at a due event of the first core's timer queue
+            // (`reserve_due`): a live or sealing node is never idle with
+            // nothing armed, so the sweep sends no message (D-135: the
+            // ping is removed).
             self.next_sweep = now + self.table.sweep_ns;
-            // A successor that is idle with no armed timer is sent an
-            // interrupt and a ping, which becomes stuck evidence if it is
-            // not consumed.
-            for z in self.successors() {
-                let g = self.table.generation(z);
-                let idle = self
-                    .table
-                    .cores_of(z, g)
-                    .iter()
-                    .all(|&c| self.table.core_beacons[c].idle_until.0 == u64::MAX);
-                if idle {
-                    let _ = self.write_message(z, crate::rings::Body::Ping, None, None);
-                    self.hw_out.push(HwAction::Interrupt { node: z });
-                }
-            }
             changed = true;
         }
         changed
@@ -1634,11 +1623,7 @@ impl Model {
         let cores: Vec<usize> = self.starts.keys().copied().collect();
         for core in cores {
             let start = self.starts[&core];
-            let member = self.table.member(start.node);
-            let current =
-                member.state() == MemberState::Starting && member.generation() == start.generation;
-            let confirmed = self.table.core_beacons[core].started == start.request;
-            if !current || confirmed || now >= start.since + START_NS {
+            if self.start_over(core, &start) {
                 self.starts.remove(&core);
                 any = true;
                 continue;
@@ -1652,6 +1637,24 @@ impl Model {
             any = true;
         }
         any
+    }
+
+    /// Whether a start this node drives is over: the core took its
+    /// request, the node no longer reads starting with the request's
+    /// generation, or `START_NS` has passed.
+    fn start_over(&self, core: usize, start: &crate::nodes::Starting) -> bool {
+        let member = self.table.member(start.node);
+        let current =
+            member.state() == MemberState::Starting && member.generation() == start.generation;
+        let confirmed = self.table.core_beacons[core].started == start.request;
+        !current || confirmed || self.now >= start.since + START_NS
+    }
+
+    /// Whether a start has work now: its end, its first wake, or the due
+    /// event of its first core every `START_RETRY_NS` (D-135).
+    fn start_due(&self, core: usize, start: &crate::nodes::Starting) -> bool {
+        let retry = start.last == 0 || self.now >= start.last + START_RETRY_NS;
+        retry || self.start_over(core, start)
     }
 
     // The recovery reserve.
@@ -1682,6 +1685,7 @@ impl Model {
         }
         for start in self.starts.values() {
             instants.push(start.last + START_RETRY_NS);
+            instants.push(start.since + START_NS);
         }
         instants.extend(self.unit_deadline());
         let me = self.node as usize;
@@ -1754,7 +1758,7 @@ impl Model {
             || self.seal.is_some()
             || self.table.member(self.node).state() == MemberState::Sealing
             || !self.ready
-            || !self.starts.is_empty()
+            || self.starts.iter().any(|(&core, s)| self.start_due(core, s))
     }
 
     /// One step of the recovery reserve, on the node's first core: at most

@@ -71,6 +71,19 @@ pub(crate) enum Completes {
     Run(crate::blocks::FreedRun),
 }
 
+/// The state word of a core's invalidation request: *in use* written by
+/// its starting core, *done* written by the core whose acknowledgement
+/// completes it, by compare-and-swap; a core starts a new request only
+/// once its previous one reads *done* (A node of several cores, D-135).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RequestState {
+    /// Never used since the node started.
+    #[default]
+    None,
+    InUse,
+    Done,
+}
+
 /// The invalidation request of a core (TLB, x86-64 and RISC-V): only that
 /// core starts it, for one change at a time.
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +124,8 @@ pub(crate) struct CorePart {
     /// Its invalidation request, and the positions whose request is pending
     /// on it.
     pub(crate) request: Option<Request>,
+    /// The state word of its request.
+    pub(crate) request_state: RequestState,
     pub(crate) pending: BTreeSet<usize>,
     /// The interrupts sent to it and not yet taken.
     pub(crate) ipis: BTreeSet<Ipi>,
@@ -293,7 +308,7 @@ impl Model {
             }
             return Started::Complete;
         }
-        if self.cores[at].request.is_some() {
+        if self.cores[at].request_state == RequestState::InUse {
             return Started::InUse;
         }
         self.invalidate_on(at, &flush);
@@ -328,6 +343,7 @@ impl Model {
             waiter,
         };
         self.cores[at].request = Some(request);
+        self.cores[at].request_state = RequestState::InUse;
         if asked == 0 {
             // A request that asks no core completes in the call that starts
             // it (every other core of the set is idle and owes it).
@@ -403,7 +419,10 @@ impl Model {
     /// is emptied, the destruction step or the give may go on, the waiting
     /// thread becomes runnable with its result, and the request is freed.
     fn complete(&mut self, requester: usize) {
+        // The completing core writes the state word *done*; the rest of the
+        // request is written by its own core only (D-135).
         let request = self.cores[requester].request.take().expect("a request");
+        self.cores[requester].request_state = RequestState::Done;
         match request.completes {
             Completes::Record(cap) => self.finish_unmapping(cap),
             Completes::Protect => {}
@@ -566,7 +585,7 @@ impl Model {
     /// use returns `again` with nothing changed.
     pub(crate) fn request_free(&self) -> Result<(), Error> {
         let needs = self.width() > 1 && self.machine.arch != crate::Arch::Aarch64;
-        match needs && self.here().request.is_some() {
+        match needs && self.here().request_state == RequestState::InUse {
             true => Err(Error::Again),
             false => Ok(()),
         }

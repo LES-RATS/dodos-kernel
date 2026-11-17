@@ -335,10 +335,15 @@ fn full_credits() -> Vec<Option<crate::rings::Credit>> {
     peer
 }
 
+/// A message of one entry that is not an answer (a `Release` of a grant
+/// that the receiver refuses, consumed as one entry).
 fn ping() -> crate::rings::Message {
     crate::rings::Message {
-        header: RingHeader::new(dodos_abi::NodeMessage::Ping, 1, (1, 1), 1, None),
-        body: Body::Ping,
+        header: RingHeader::new(dodos_abi::NodeMessage::Release, 1, (1, 1), 1, None),
+        body: Body::Release {
+            grant: 4095,
+            serial: 0,
+        },
     }
 }
 

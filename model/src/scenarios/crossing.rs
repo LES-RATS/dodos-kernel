@@ -435,12 +435,28 @@ fn message(
 fn a_message_whose_sender_generation_is_not_current_is_refused() {
     let mut m = two();
     let before = refused_count(&m, 1);
-    let ping = message(dodos_abi::NodeMessage::Ping, (0, 9), 1, None, Body::Ping);
+    // A unit request passes whatever its epoch: only the generations are
+    // judged here.
+    let request = |sender| {
+        let body = Body::UnitRequest {
+            role: 0,
+            epoch: u32::MAX,
+            op: crate::rings::UnitOp::Invalidate { domain: None },
+        };
+        message(
+            dodos_abi::NodeMessage::UnitRequest,
+            sender,
+            1,
+            Some((0, 1)),
+            body,
+        )
+    };
+    let ping = request((0, 9));
     m.sys.inject(0, 1, ping);
     m.run(20 * MS);
     assert_eq!(refused_count(&m, 1), before + 1);
     // The same message with the sender's generation passes.
-    let ping = message(dodos_abi::NodeMessage::Ping, (0, 1), 1, None, Body::Ping);
+    let ping = request((0, 1));
     m.sys.inject(0, 1, ping);
     m.run(20 * MS);
     assert_eq!(refused_count(&m, 1), before + 1);
@@ -450,7 +466,18 @@ fn a_message_whose_sender_generation_is_not_current_is_refused() {
 fn a_message_to_an_earlier_generation_of_the_receiver_is_refused() {
     let mut m = two();
     let before = refused_count(&m, 1);
-    let ping = message(dodos_abi::NodeMessage::Ping, (0, 1), 0, None, Body::Ping);
+    let body = Body::UnitRequest {
+        role: 0,
+        epoch: u32::MAX,
+        op: crate::rings::UnitOp::Invalidate { domain: None },
+    };
+    let ping = message(
+        dodos_abi::NodeMessage::UnitRequest,
+        (0, 1),
+        0,
+        Some((0, 1)),
+        body,
+    );
     m.sys.inject(0, 1, ping);
     m.run(20 * MS);
     assert_eq!(refused_count(&m, 1), before + 1);
@@ -460,7 +487,18 @@ fn a_message_to_an_earlier_generation_of_the_receiver_is_refused() {
 fn a_message_whose_kind_is_not_that_of_its_body_is_refused() {
     let mut m = two();
     let before = refused_count(&m, 1);
-    let mut ping = message(dodos_abi::NodeMessage::Ping, (0, 1), 1, None, Body::Ping);
+    let body = Body::UnitRequest {
+        role: 0,
+        epoch: u32::MAX,
+        op: crate::rings::UnitOp::Invalidate { domain: None },
+    };
+    let mut ping = message(
+        dodos_abi::NodeMessage::UnitRequest,
+        (0, 1),
+        1,
+        Some((0, 1)),
+        body,
+    );
     ping.header.kind = dodos_abi::NodeMessage::Handed as u8;
     m.sys.inject(0, 1, ping);
     m.run(20 * MS);
@@ -596,7 +634,7 @@ fn an_unreadable_header_is_consumed_as_one_entry() {
 fn a_producer_index_too_far_ahead_is_read_as_a_failure_of_the_sender_and_resynchronised() {
     let mut m = two();
     let header = RingHeader {
-        kind: dodos_abi::NodeMessage::Ping as u8,
+        kind: dodos_abi::NodeMessage::Release as u8,
         length: 0,
         sender: 0,
         sender_generation: 1,
@@ -653,7 +691,7 @@ fn a_fresh_start_consumes_nothing_sent_to_its_earlier_generation() {
     m.run(10 * MS);
     // A raw entry left in the ring before the start.
     let header = RingHeader {
-        kind: dodos_abi::NodeMessage::Ping as u8,
+        kind: dodos_abi::NodeMessage::Release as u8,
         length: 0,
         sender: 0,
         sender_generation: 1,

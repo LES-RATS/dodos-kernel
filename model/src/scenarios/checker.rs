@@ -96,6 +96,7 @@ fn a_run_of_the_kernels_space_a_core_still_translates_after_it_was_given_is_repo
 fn a_request_on_a_node_of_one_core_is_reported() {
     let mut k = N::on(&one_node(crate::Arch::X86_64, 1));
     k.m.cores[0].request = Some(request(0, 0, 0));
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     reported(&k, "TLB: a request on a node of one core or on ARM64");
 }
 
@@ -103,6 +104,7 @@ fn a_request_on_a_node_of_one_core_is_reported() {
 fn a_request_that_asks_its_own_core_is_reported() {
     let mut k = node2(Locking::L1);
     k.m.cores[0].request = Some(request(0b11, 0, 0));
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     reported(&k, "TLB: a request asks its own core");
 }
 
@@ -110,6 +112,7 @@ fn a_request_that_asks_its_own_core_is_reported() {
 fn a_complete_request_kept_is_reported() {
     let mut k = node2(Locking::L1);
     k.m.cores[0].request = Some(request(0b10, 0b10, 0));
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     reported(&k, "TLB: a complete request kept");
 }
 
@@ -120,6 +123,7 @@ fn a_request_whose_record_is_not_unmapping_is_reported() {
     let mut r = request(0b10, 0, 0);
     r.completes = Completes::Record(cap);
     k.m.cores[0].request = Some(r);
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     k.m.cores[1].pending.insert(0);
     reported(&k, "TLB: the record of a request is not unmapping");
 }
@@ -131,6 +135,7 @@ fn a_request_whose_thread_waits_for_something_else_is_reported() {
     let mut r = request(0b10, 0, 0);
     r.waiter = Some(thread);
     k.m.cores[0].request = Some(r);
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     k.m.cores[1].pending.insert(0);
     k.m.threads.get_mut(&thread).unwrap().wait = Wait::Cores(1);
     reported(&k, "TLB: the thread of a request waits for another");
@@ -140,6 +145,7 @@ fn a_request_whose_thread_waits_for_something_else_is_reported() {
 fn a_request_older_than_core_answer_ns_on_a_node_that_did_not_accuse_itself_is_reported() {
     let mut k = node2(Locking::L1);
     k.m.cores[0].request = Some(request(0b10, 0, 0));
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
     k.m.cores[1].pending.insert(0);
     k.m.set_now(dodos_abi::CORE_ANSWER_NS);
     reported(
@@ -338,7 +344,7 @@ fn a_unit_operation_submitted_after_step_1_of_a_hand_over_is_reported() {
 fn a_message_applied_to_another_generation_of_its_receiver_is_reported() {
     let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
     let sender = k.m.table.member(1);
-    let header = dodos_abi::RingHeader::new(dodos_abi::NodeMessage::Ping, 1, (1, 1), 99, None);
+    let header = dodos_abi::RingHeader::new(dodos_abi::NodeMessage::Release, 1, (1, 1), 99, None);
     k.m.applied.push((header, sender));
     reported(
         &k,
@@ -352,7 +358,7 @@ fn a_message_of_a_generation_that_is_over_applied_is_reported() {
     let sender = k.m.table.member(1);
     let me = k.m.table.generation(0);
     let header = dodos_abi::RingHeader::new(
-        dodos_abi::NodeMessage::Ping,
+        dodos_abi::NodeMessage::Release,
         1,
         (1, sender.generation() + 2),
         me,

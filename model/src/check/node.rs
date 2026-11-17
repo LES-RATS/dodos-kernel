@@ -156,6 +156,12 @@ impl Model {
     /// accused itself.
     fn check_requests(&self) -> Check {
         for (requester, core) in self.cores.iter().enumerate() {
+            // The state word reads *in use* exactly while the request is.
+            let in_use = core.request_state == crate::cores::RequestState::InUse;
+            ensure(
+                in_use == core.request.is_some(),
+                "TLB: the state word of a request",
+            )?;
             let Some(request) = &core.request else {
                 continue;
             };

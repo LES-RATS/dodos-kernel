@@ -64,7 +64,6 @@ pub enum Ring {
 ///   `ReportAsk` adds the key it asks from.
 /// - `Report`: the key of the next item, or `REPORT_END`; then three words
 ///   per item.
-/// - `Ping`: nothing.
 /// - `SendAnswer`: 1 if delivered, with `caps_dropped` in bit 1; then one
 ///   word per frame, the use index or `u64::MAX` if not delivered.
 /// - `Send`: the message header, the task identifier and the marks of the
@@ -81,14 +80,16 @@ pub enum NodeMessage {
     Handed = 6,
     ReportAsk = 7,
     Report = 8,
-    Ping = 9,
+    // 9 is reserved: it was the sweep's `Ping`, removed by D-135, and is
+    // never used again.
     SendAnswer = 10,
     Send = 11,
     Signal = 12,
 }
 
 impl NodeMessage {
-    pub const ALL: [Self; 12] = [
+    /// The eleven kinds, in the order of their numbers (9 reserved).
+    pub const ALL: [Self; 11] = [
         Self::Revoke,
         Self::RevokeStep,
         Self::Release,
@@ -97,19 +98,19 @@ impl NodeMessage {
         Self::Handed,
         Self::ReportAsk,
         Self::Report,
-        Self::Ping,
         Self::SendAnswer,
         Self::Send,
         Self::Signal,
     ];
 
     /// The kind of number `raw`, `None` for a kind the receiver does not
-    /// know.
+    /// know (0, the reserved 9, and every number above 12).
     pub const fn from_raw(raw: u8) -> Option<Self> {
-        if raw == 0 || raw as usize > Self::ALL.len() {
-            return None;
+        match raw {
+            1..=8 => Some(Self::ALL[raw as usize - 1]),
+            10..=12 => Some(Self::ALL[raw as usize - 2]),
+            _ => None,
         }
-        Some(Self::ALL[raw as usize - 1])
     }
 
     pub const fn ring(self) -> Ring {

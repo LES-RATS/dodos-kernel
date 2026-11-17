@@ -2308,14 +2308,17 @@ fn core_words_have_their_bits_and_refuse_a_bad_check() {
 }
 
 #[test]
-fn the_twelve_kinds_of_message_have_their_numbers_and_rings() {
-    for (number, kind) in NodeMessage::ALL.into_iter().enumerate() {
-        assert_eq!(kind as u8, number as u8 + 1);
+fn the_eleven_kinds_of_message_have_their_numbers_and_rings() {
+    for (index, kind) in NodeMessage::ALL.into_iter().enumerate() {
+        // 9 is reserved (the `Ping` removed by D-135).
+        let number = index as u8 + if index < 8 { 1 } else { 2 };
+        assert_eq!(kind as u8, number);
         assert_eq!(NodeMessage::from_raw(kind as u8), Some(kind));
         let user = matches!(kind, NodeMessage::Send | NodeMessage::Signal);
         assert_eq!(kind.ring() == Ring::User, user, "{kind:?}");
     }
     assert_eq!(NodeMessage::from_raw(0), None);
+    assert_eq!(NodeMessage::from_raw(9), None);
     assert_eq!(NodeMessage::from_raw(13), None);
     use NodeMessage::*;
     let requests: [_; 3] = [Revoke, UnitRequest, ReportAsk];
@@ -2374,7 +2377,7 @@ fn a_ring_header_holds_its_credit_and_judges_its_length() {
         (2, 17 | 99 << 5)
     );
     assert_eq!(header.credit(), Some((17, 99)));
-    let ping = RingHeader::new(NodeMessage::Ping, 1, (3, 7), 2, None);
+    let ping = RingHeader::new(NodeMessage::Release, 1, (3, 7), 2, None);
     assert_eq!((ping.credit, ping.credit()), (31, None));
     assert!(header.readable(10) && !header.readable(9));
     let zero = RingHeader {

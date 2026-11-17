@@ -583,11 +583,6 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
             );
         }
     }
-    // The sweep's `Ping` is never sent: the first core of every live node
-    // keeps a timer armed (the recovery reserve's period, and the sweep
-    // itself every `SWEEP_NS`), so no successor is ever idle with nothing
-    // armed (reported with pass 17: the rule of the ping is dead as the
-    // contract writes it).
 }
 
 // The kernel-shape explorer: `credits`.

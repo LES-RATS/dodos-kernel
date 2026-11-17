@@ -9,7 +9,7 @@ use crate::locks::{Cost, LockId, Step};
 use crate::{Locking, Record, Wait};
 use dodos_abi::{CrashReason, START_SLOT_ASPACE};
 
-const FRAME: u32 = 200;
+pub(super) const FRAME: u32 = 200;
 const AT: u64 = 1 << 30;
 
 fn map(frame: u32, address: u64, rights: Rights) -> Syscall {
@@ -31,7 +31,7 @@ fn rw() -> Rights {
 /// A node of `n` cores with a second thread placed on core number 1,
 /// running there, and a frame mapped in the start-up space that both
 /// threads share, which core 1 has used (its translation is cached).
-fn two_threads(arch: Arch, n: usize) -> (N, ObjId) {
+pub(super) fn two_threads(arch: Arch, n: usize) -> (N, ObjId) {
     let mut k = N::on(&one_node(arch, n));
     // The first context leaves room on core 0 for another.
     k.place_first(0);
