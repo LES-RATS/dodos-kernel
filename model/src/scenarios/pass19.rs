@@ -1008,18 +1008,48 @@ fn a_second_core_never_takes_a_lock_another_core_holds() {
 // The verification of the tenth model review, missed fault 2: R5 is not
 // written while R2 still has remote capabilities to remove.
 
-#[test]
-fn r5_is_written_only_once_r2_removed_every_remote_capability_of_the_fenced_node() {
+/// Node 2 grants node 0 `4 × rounds` frames, then is killed; node 0's
+/// recovery runs until it acknowledges node 2. Node 0 holds no unit role
+/// then (node 1 holds the IOMMU's, node 2 the IOAPIC's), so its R1 is done
+/// at once and only R2 and R4 can hold its R5 back. Returns node 0's run
+/// blocks, the remote capabilities of node 2 it still held at the step
+/// that acknowledged, and whether its audit was done then.
+fn acknowledged_after_grants(rounds: u32, blocks: u32) -> (usize, usize, bool) {
     use crate::{Message, Range, Transfer};
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
-    let reply = m.retype(1, ObjectKind::Reply, 0, 100);
-    m.ok(1, reply);
+    let reply = m.retype(0, ObjectKind::Reply, 0, 100);
+    m.ok(0, reply);
+    // Node 0 takes `blocks` runs of one chunk of unclaimed memory: R4
+    // audits each.
+    let shift = m.sys.canonical().geometry.chunk_shift();
+    let free: Vec<u64> = m
+        .sys
+        .canonical()
+        .owners
+        .iter()
+        .enumerate()
+        .filter(|&(_, &raw)| {
+            dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
+                w.state() == dodos_abi::OwnState::Free && w.owner() == dodos_abi::Owner::Unclaimed
+            })
+        })
+        .map(|(chunk, _)| (chunk as u64) << shift)
+        .take(blocks as usize)
+        .collect();
+    for (n, place) in free.into_iter().enumerate() {
+        let take = Syscall::MemoryTake {
+            control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),
+            kind: 0,
+            place,
+            size: u64::from(shift),
+            destination: s(700 + n as u32),
+        };
+        m.ok(0, take);
+    }
     let rights = dodos_abi::Rights::READ
         .union(dodos_abi::Rights::DERIVE)
         .bits();
-    // Nine sends of four frames from node 2 to node 1: 36 grants, more
-    // remote capabilities than the 32 units of one step.
-    for round in 0..9u32 {
+    for round in 0..rounds {
         let first = 200 + 4 * round;
         for n in 0..4 {
             let frame = m.retype(2, ObjectKind::Frame, 1, first + n);
@@ -1034,9 +1064,9 @@ fn r5_is_written_only_once_r2_removed_every_remote_capability_of_the_fenced_node
             },
             wait: 0,
         };
-        assert_eq!(m.call(1, recv), WAITS);
+        assert_eq!(m.call(0, recv), WAITS);
         let send = Syscall::NodeSend {
-            node: node_cap(1),
+            node: node_cap(0),
             message: Message {
                 label: 7,
                 words: vec![7],
@@ -1052,26 +1082,61 @@ fn r5_is_written_only_once_r2_removed_every_remote_capability_of_the_fenced_node
     }
     let held = |m: &S| {
         m.sys
-            .node(1)
+            .node(0)
             .remotes
             .values()
             .filter(|r| r.node == 2)
             .count()
     };
-    assert_eq!(held(&m), 36);
-    m.ok(0, kill(2));
+    assert_eq!(held(&m), 4 * rounds as usize);
+    let blocks = m
+        .sys
+        .node(0)
+        .untypeds
+        .values()
+        .filter(|u| u.block == Some(crate::Block::Run))
+        .count();
+    m.ok(1, kill(2));
     let generation = m.sys.member(2).generation();
+    // Event by event until node 2 is fenced, then node 0's reserve step by
+    // step, as its own reserve would take them (the model otherwise runs
+    // every step a node can make at one instant in one event).
     for _ in 0..200_000 {
+        if m.state(2) == MemberState::Fenced {
+            break;
+        }
         if m.sys.settle(1) == 0 {
             let now = m.sys.now();
             m.sys.advance(now + 50_000);
         }
-        if m.sys.canonical().beacons[1].acked[2] == generation {
+    }
+    assert_eq!(m.state(2), MemberState::Fenced);
+    for _ in 0..64 {
+        if m.sys.node(0).table.beacons[0].acked[2] == generation {
             break;
         }
+        m.sys.node_mut(0).reserve_step();
     }
-    assert_eq!(m.sys.canonical().beacons[1].acked[2], generation);
-    assert_eq!(held(&m), 0);
+    assert_eq!(m.sys.node(0).table.beacons[0].acked[2], generation);
+    let reclaim = m.sys.node(0).reclaims.get(&2).cloned();
+    let audited = reclaim.is_some_and(|r| r.audit.is_some_and(|a| a.is_empty()));
+    (blocks, held(&m), audited)
+}
+
+#[test]
+fn r5_is_written_only_once_r2_removed_every_remote_capability_of_the_fenced_node() {
+    // 72 grants and no block: R2 takes three steps of 32 units, which
+    // outlast R1, and nothing is left for R4 to stop R5.
+    let (blocks, held, audited) = acknowledged_after_grants(18, 0);
+    assert_eq!((blocks, held, audited), (0, 0, true));
+}
+
+#[test]
+fn r5_is_written_only_once_r4_audited_every_block() {
+    // 64 grants take R2 two whole steps, and the second leaves no unit for
+    // R4's three blocks: R5 waits for the next step.
+    let (blocks, held, audited) = acknowledged_after_grants(16, 3);
+    assert_eq!((blocks, held, audited), (3, 0, true));
 }
 
 // The verification of the tenth model review, missed fault 3: a starting
@@ -1118,4 +1183,23 @@ fn a_raise_of_the_kernel_epoch_by_no_escalation_and_no_last_destruction_is_repor
         k.m.check(),
         Err("epoch: the node's epoch is not its last raise")
     );
+}
+
+#[test]
+fn a_start_on_a_reused_core_with_an_old_idle_until_is_not_accused_before_start_ns() {
+    use super::pass17::fresh;
+    // A sweep every 100 ms observes the starting node early.
+    let mut two = machine(Arch::X86_64, 2, &[&[0], &[1]]);
+    two.membership.sweep_ms = 100;
+    let mut m = S::on(&two);
+    m.ok(0, kill(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    // Core 1 ran node 1 before: its `idle_until` is an old instant, so the
+    // test of STALE_NS would hold at once.
+    m.sys.hang(1, true);
+    m.ok(0, fresh(1, 0b10));
+    let since = m.sys.now();
+    m.sys.advance(since + dodos_abi::START_NS - MS);
+    assert_eq!(m.state(1), MemberState::Starting);
 }
