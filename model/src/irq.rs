@@ -360,7 +360,7 @@ impl Model {
     /// is freed only once the request is answered. Says what the step does.
     pub(crate) fn irq_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
         use crate::caps::Undone;
-        let entry = self.irqs[&irq].clone();
+        let entry = self.irqs[&irq];
         if !entry.source.is_line() {
             return Undone::Nothing;
         }
