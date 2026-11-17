@@ -144,6 +144,42 @@ fn refresh(m: &mut S) {
     }
 }
 
+/// A `Release` crossing a `Revoke` of one grant: the grant entry of node 0
+/// is revoking while node 1's `Release` of it is in the ring to node 0, or
+/// pending in its use entry (Grants, "A `Release` crossing a `Revoke`").
+fn crossed(m: &S) -> bool {
+    let table = m.sys.canonical();
+    let revoking = table.grants[0]
+        .values()
+        .any(|e| e.state == crate::table::GrantState::Revoking);
+    let ring = &table.rings[1][0].kernel;
+    let start = table.beacons[0].consumed[1].0;
+    let release = (start..ring.produced).any(|at| {
+        matches!(
+            ring.at(at),
+            Some(crate::table::RingEntry::Message(crate::rings::Message {
+                body: crate::rings::Body::Release { .. },
+                ..
+            }))
+        )
+    });
+    let pending = table.uses[1].values().any(|u| u.release_pending);
+    revoking && (release || pending)
+}
+
+/// What the explorations reached, summed over their seeds: each must be
+/// reached at least once (the eighth model review found the seeds never
+/// reached a full ring, a core stopping in a request or an applied
+/// `Handed`, and a crossing once in 132 runs).
+fn reached(what: &str, count: usize) {
+    if std::env::var("DODOS_COUNTS").is_ok() {
+        eprintln!("reached {what}: {count}");
+    }
+    if std::env::var("DODOS_SEED").is_err() {
+        assert!(count >= 1, "the seeds never reach {what}");
+    }
+}
+
 // The node-protocol explorer: `crossing`.
 
 #[test]
@@ -151,6 +187,7 @@ fn crossing_a_release_and_a_revoke_of_one_grant_in_every_order() {
     if !once() {
         return;
     }
+    let mut crossings = 0;
     for seed in seeds(SEEDS) {
         say(format_args!("seed {seed}"));
         let mut rng = Rng(seed + 1);
@@ -203,7 +240,17 @@ fn crossing_a_release_and_a_revoke_of_one_grant_in_every_order() {
                 2 => {
                     let _ = try_call(&mut m, 1, Syscall::ASpaceUnmap(s(110)));
                 }
+                // Steered: the revocation and the release at once, neither
+                // node having read the other's message.
+                3 => {
+                    let _ = try_call(&mut m, 0, Syscall::CapRevoke(s(101)));
+                    let _ = try_call(&mut m, 1, Syscall::CapDelete(s(110)));
+                }
                 _ => churn(&mut m, &mut rng),
+            }
+            if crossed(&m) {
+                crossings += 1;
+                break;
             }
         }
         // Liveness: every revocation ends; the machine is quiet.
@@ -220,6 +267,7 @@ fn crossing_a_release_and_a_revoke_of_one_grant_in_every_order() {
             "seed {seed}: the grant outlived its revocation"
         );
     }
+    reached("a Release crossing a Revoke", crossings);
 }
 
 // The node-protocol explorer: `unit`.
@@ -229,8 +277,10 @@ fn unit_a_request_across_a_hand_over_and_the_deaths_of_its_parties() {
     if !once() {
         return;
     }
+    let mut handed = 0;
     for seed in seeds(SEEDS) {
         let mut rng = Rng(seed + 101);
+        let mut handed_here = 0;
         // Node 0 (class 1) requests; nodes 1, 2 and 3 (class 2) may hold
         // the IOMMU role.
         let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]));
@@ -279,9 +329,11 @@ fn unit_a_request_across_a_hand_over_and_the_deaths_of_its_parties() {
                 }
                 _ => churn(&mut m, &mut rng),
             }
+            handed_here = handed_here.max(applied_handed(&m));
         }
         quiet(&mut m);
         quiet(&mut m);
+        handed += handed_here.max(applied_handed(&m));
         // Liveness: the request ended done, and the unit's context entry
         // names node 0's iospace.
         assert_eq!(m.sys.node(0).woken(requester), Some(&DONE), "seed {seed}");
@@ -292,6 +344,15 @@ fn unit_a_request_across_a_hand_over_and_the_deaths_of_its_parties() {
         let unit = &m.sys.canonical().units[&0];
         assert!(unit.entries.contains_key(&0x10), "seed {seed}");
     }
+    reached("a Handed applied", handed);
+}
+
+/// The `Handed`s applied by the nodes that run.
+fn applied_handed(m: &S) -> usize {
+    (0..m.t.len() as u16)
+        .filter(|&n| m.sys.has(n))
+        .map(|n| *m.sys.node(n).handed_applied as usize)
+        .sum()
 }
 
 // The node-protocol explorer: `rings`.
@@ -522,6 +583,11 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
             );
         }
     }
+    // The sweep's `Ping` is never sent: the first core of every live node
+    // keeps a timer armed (the recovery reserve's period, and the sweep
+    // itself every `SWEEP_NS`), so no successor is ever idle with nothing
+    // armed (reported with pass 17: the rule of the ping is dead as the
+    // contract writes it).
 }
 
 // The kernel-shape explorer: `credits`.
@@ -531,9 +597,15 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
     if !once() {
         return;
     }
+    let mut full = 0;
     for seed in seeds(SEEDS / 2) {
         let mut rng = Rng(seed + 501);
         let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+        // Steered: in half of the seeds node 1's core stops answering, so
+        // that its user ring fills until a send no longer fits.
+        if seed % 2 == 0 {
+            m.sys.hang(1, true);
+        }
         m.ok(0, super::place_first(0, 0));
         let senders: Vec<ObjId> = (0..10).map(|i| m.thread_on(0, 300 + 4 * i, 0)).collect();
         let frame = m.retype(0, ObjectKind::Frame, 1, 200);
@@ -546,12 +618,23 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
                         && m.state(0) == MemberState::Live
                         && m.sys.node(0).runnable().contains(&thread)
                     {
+                        // Messages of 60 words: 8 entries each, so the 64
+                        // entries of the ring fill before the 8 sends in
+                        // flight are used.
                         let send = Syscall::NodeSend {
                             node: node_cap(1),
-                            message: crate::Message::default(),
+                            message: crate::Message {
+                                words: vec![7; 60],
+                                ..crate::Message::default()
+                            },
                             doorbell: SlotAddr::NONE,
                         };
                         let outcome = m.call_by(0, thread, send);
+                        if m.sys.has(0)
+                            && !m.sys.node(0).ring_room(1, dodos_abi::NodeMessage::Send, 8)
+                        {
+                            full += 1;
+                        }
                         assert!(
                             matches!(
                                 outcome,
@@ -576,4 +659,94 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
         quiet(&mut m);
         assert!(!waits_bounded(&m, 0), "seed {seed}");
     }
+    reached("a full ring", full);
+}
+
+// A core of a node stops in the middle of a request of another core: the
+// request waits for it, and the node accuses itself after
+// `CORE_ANSWER_NS` (TLB, a core that does not acknowledge; A node of
+// several cores).
+
+#[test]
+fn a_core_stops_in_the_middle_of_a_request_of_another_core() {
+    if !once() {
+        return;
+    }
+    let mut stopped_in_request = 0;
+    for seed in seeds(SEEDS / 2) {
+        let mut rng = Rng(seed + 601);
+        // Node 1 of cores 1 and 2: a thread on core 2 has its space loaded;
+        // node 0 supervises.
+        let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+        m.ok(1, super::place_first(1, 1));
+        let other = m.thread_on(1, 300, 2);
+        m.settle();
+        let frame = m.retype(1, ObjectKind::Frame, 1, 150);
+        m.ok(1, frame);
+        let map = Syscall::ASpaceMap(crate::Map {
+            space: s(dodos_abi::START_SLOT_ASPACE),
+            frame: s(150),
+            untyped: SlotAddr::NONE,
+            address: 1 << 30,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.union(Rights::WRITE).bits(),
+        });
+        let _ = try_call(&mut m, 1, map);
+        let mut hung = false;
+        for _ in 0..30 {
+            match rng.below(6) {
+                0 => {
+                    let _ = try_call(&mut m, 1, Syscall::ASpaceUnmap(s(150)));
+                }
+                // Steered: core 2 stops while a request of core 1 asks it.
+                1 | 2 if !hung => {
+                    let asks = m.sys.has(1)
+                        && m.sys.node(1).cores.iter().any(|c| {
+                            c.request
+                                .as_ref()
+                                .is_some_and(|r| r.asked & 0b10 != 0 && r.acked & 0b10 == 0)
+                        });
+                    if asks {
+                        m.sys.hang(2, rng.below(2) == 0);
+                        hung = true;
+                        stopped_in_request += 1;
+                    }
+                }
+                3 => {
+                    let _ = try_call(&mut m, 1, map_again());
+                }
+                _ => churn(&mut m, &mut rng),
+            }
+        }
+        let _ = other;
+        m.run_by(dodos_abi::CORE_ANSWER_NS + 100 * MS, MS);
+        // Liveness: a node whose core stopped in a request accused itself
+        // and was reclaimed, or the request completed.
+        if hung {
+            assert_ne!(m.state(1), MemberState::Live, "seed {seed}");
+        }
+        assert!(
+            !m.sys.has(1)
+                || m.sys.node(1).cores.iter().all(|c| c.request.is_none())
+                || m.state(1) != MemberState::Live,
+            "seed {seed}"
+        );
+    }
+    reached(
+        "a core stopping in the middle of a request",
+        stopped_in_request,
+    );
+}
+
+fn map_again() -> Syscall {
+    Syscall::ASpaceMap(crate::Map {
+        space: s(dodos_abi::START_SLOT_ASPACE),
+        frame: s(150),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.union(Rights::WRITE).bits(),
+    })
 }

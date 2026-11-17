@@ -518,7 +518,7 @@ impl Model {
                     .insert(device, (z, g));
             }
         }
-        let serial = self.submit(role, crate::rings::UnitOp::Invalidate);
+        let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
         rebuild.closing = Some((serial, self.now));
         self.rebuilds.insert(role, rebuild);
         true

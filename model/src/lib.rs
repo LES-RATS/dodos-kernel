@@ -1025,6 +1025,10 @@ pub struct Model {
     /// last, each by its `iommu` and its identifier: the node's own list of
     /// its devices on each unit (D-131).
     iospaces: BTreeMap<ObjId, Vec<(ObjId, u16)>>,
+    /// The domain number of each iospace that serves devices, on its unit,
+    /// taken from this node slot's range at its first device and freed with
+    /// its last (Devices and shared hardware, D-134).
+    domains: BTreeMap<ObjId, u16>,
     iommus: BTreeMap<ObjId, Iommu>,
     scheds: BTreeMap<ObjId, Sched>,
     /// Timers: `None` while idle.
@@ -1098,6 +1102,9 @@ pub struct Model {
     seal: Option<nodes::SealStep>,
     ready: bool,
     resuming: bool,
+    /// The member words as this node last saw them when it wrote sealed:
+    /// at its resume, a generation that ended since gets R0, R2 and R3.
+    sealed_view: Vec<dodos_abi::Member>,
     starts: BTreeMap<usize, nodes::Starting>,
     start_image: (bool, u64),
     handing: BTreeMap<usize, roles::Handover>,
@@ -1108,6 +1115,8 @@ pub struct Model {
     /// each is also an entry of code 11 in the trace, which may be rate
     /// limited.
     refused: Ephemeral<u64>,
+    /// What the explorations count: the `Handed`s this node applied.
+    handed_applied: Ephemeral<u64>,
     /// One more at each translation added to a space or run added to the
     /// kernel's own space: a core caches again only what changed since its
     /// last event (the model's bookkeeping, not the kernel's).

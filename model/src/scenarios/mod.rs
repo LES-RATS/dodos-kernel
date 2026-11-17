@@ -4,10 +4,13 @@
 //! is about. The harness drives a whole machine (`System`) or one node
 //! alone (`Model`), and every step is followed by the whole check.
 
+mod checker;
 mod cores;
 mod crossing;
 mod explore;
 mod membership;
+mod mistral;
+mod pass17;
 mod reviews;
 mod units;
 

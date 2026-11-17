@@ -49,6 +49,15 @@
 //! | Round 2, Hydrogen 5: the rebuild forgets the floors | `units::the_rebuild_keeps_without_a_report_the_entries_of_a_sealed_node` |
 //! | Round 2, Hydrogen 6: write skew of role words | the role words change only by compare-and-swap through the gate (`table::write_role`), checked by ONE-HOLDER |
 //! | First round, `fence_owned`: the fence covers joining cores | `kernel_shape_the_fence_stops_the_joining_cores_*` here |
+//! | Ninth review 1: a late start wake, the start request's layout, a fence NMI in the entry stub | `pass17::a_start_wake_that_reaches_a_core_already_running_changes_nothing`, `pass17::a_fence_nmi_that_lands_in_the_entry_stub_gives_no_false_confirmation` |
+//! | Ninth review 2: the fence record by core number | `abi` `a_fence_record_indexes_its_last_stops_by_core_number_modulo_64`, `mistral::f3_*` (R6 by the core's own last stop) |
+//! | Ninth review 3: `cap_delete` of an invalid remote capability with a mapping | `crossing::cap_delete_of_an_invalid_remote_capability_with_a_mapping_undoes_the_mapping` |
+//! | Ninth review 4: the unit sequence of a claim | `pass17::a_claim_passes_a_failed_unit_*`, `pass17::a_claim_whose_waiting_thread_is_destroyed_*`, `pass17::a_claim_of_a_remapped_line_*` |
+//! | Ninth review 5: domain numbers and the operands of a unit request | `pass17::the_holder_refuses_*`, `pass17::each_node_slot_takes_its_domain_numbers_*`, `pass17::the_start_up_refuses_a_unit_*` |
+//! | Ninth review 6: the order of L2 | `pass17::under_l2_a_call_records_its_locks_*`, `cores::the_check_refuses_a_lock_order_the_contract_forbids` |
+//! | Ninth review 7: one node on a machine of class 0 | `pass17::one_node_on_a_machine_of_class_0_*` |
+//! | Eighth model review, DeepSeek 1 to 3 and Hydrogen's table row 17 | `pass17::a_thread_attached_to_no_task_*`, `pass17::a_send_whose_stamp_*`, `pass17::reserve_keeps_room_*`, invariant "fence: a stop sent before its word was marked", `pass17::a_resume_after_a_peer_died_*` |
+//! | Eighth model review, Mistral F1 to F15 | `mistral.rs` (one test per mutation), `checker.rs` and `check/tests.rs` (the checker fed a bad state) |
 
 use super::*;
 use crate::locks::{LockId, Step};
@@ -403,7 +412,7 @@ fn deepseek_4_an_untyped_is_guarded_by_its_segments_lock_and_an_interrupt_entry_
             .steps
             .iter()
             .filter_map(|s| match s {
-                Step::Lock(l) => Some(*l),
+                Step::Lock(l) | Step::Try(l) => Some(*l),
                 _ => None,
             })
             .collect()

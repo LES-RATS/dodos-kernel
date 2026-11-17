@@ -315,7 +315,9 @@ impl Model {
                 Some(thread) => crate::units::Waiter::Thread(Some(thread)),
                 None => crate::units::Waiter::Record(cap),
             };
-            self.unit_request(role, crate::rings::UnitOp::Invalidate, who, Some(cap))?;
+            let domain = self.domains.get(&space).copied();
+            let op = crate::rings::UnitOp::Invalidate { domain };
+            self.unit_request(role, op, who, Some(cap))?;
             return Ok(Unmapped::Waits);
         }
         self.request_free()?;
@@ -781,8 +783,8 @@ impl Model {
                 if self.unit_requests.iter().all(Option::is_some) {
                     return Err(Error::Again);
                 }
-                self.detach_local(iommu, device, true);
-                let op = crate::rings::UnitOp::Detach { device };
+                let domain = self.detach_local(iommu, device, true);
+                let op = crate::rings::UnitOp::Detach { device, domain };
                 let waiter = crate::units::Waiter::Thread(Some(thread));
                 self.unit_request(role, op, waiter, None)?;
                 return Ok(Output::Waits);
@@ -816,13 +818,13 @@ impl Model {
         if served.len() >= IOSPACE_MAX_DEVICES {
             return Err(Error::Busy);
         }
-        // A domain number for the iospace on that unit, given at its first
-        // device and freed with its last.
-        let domains = unit.attached.values().collect::<BTreeSet<_>>().len() as u32;
-        let limit = self.machine.iommus[unit.unit].domains;
-        if served.is_empty() && domains >= limit {
-            return Err(Error::Busy);
-        }
+        // A domain number for the iospace on that unit, taken from this
+        // node slot's range at its first device and freed with its last
+        // (Devices and shared hardware, domain numbers, D-134).
+        let domain = match self.domains.get(&iospace) {
+            Some(&domain) => domain,
+            None => self.free_domain(unit.unit).ok_or(Error::Busy)?,
+        };
         // A call that finds no free entry of the unit request table returns
         // `again` with nothing changed.
         if self.unit_requests.iter().all(Option::is_some) {
@@ -833,6 +835,7 @@ impl Model {
             self.table.generation(self.node),
         );
         self.table.write_identifier(self.node, key, Some(taken));
+        self.domains.insert(iospace, domain);
         live(&mut self.iospaces, iospace).push((iommu, device));
         let unit = live(&mut self.iommus, iommu);
         unit.attached.insert(device, iospace);
@@ -844,7 +847,12 @@ impl Model {
         // The context entry, written by the holder of the unit's role: a
         // unit request, which the thread waits for.
         let role = self.unit_role(unit);
-        let op = crate::rings::UnitOp::Attach { device };
+        let root = self.aspaces[&iospace].root.unwrap_or(0);
+        let op = crate::rings::UnitOp::Attach {
+            device,
+            domain,
+            root,
+        };
         self.unit_request(role, op, crate::units::Waiter::Thread(Some(thread)), None)?;
         Ok(Output::Waits)
     }
@@ -860,9 +868,9 @@ impl Model {
         }
         // On a failed unit the identifier word stays taken by this node.
         let failed = self.unit_failed(role);
-        self.detach_local(iommu, device, !failed);
+        let domain = self.detach_local(iommu, device, !failed);
         if !failed {
-            let op = crate::rings::UnitOp::Detach { device };
+            let op = crate::rings::UnitOp::Detach { device, domain };
             self.unit_request(role, op, crate::units::Waiter::Thread(None), None)?;
         }
         Ok(())
@@ -889,9 +897,23 @@ impl Model {
         mine || self.table.may_take(word, self.node)
     }
 
+    /// The lowest domain number of this node slot's range on a unit that
+    /// none of its iospaces holds, if any is left.
+    fn free_domain(&self, unit: usize) -> Option<u16> {
+        let used: BTreeSet<u16> = self
+            .domains
+            .iter()
+            .filter(|(space, _)| self.aspaces[space].units.contains(&unit))
+            .map(|(_, &domain)| domain)
+            .collect();
+        self.domain_range(unit, self.node)
+            .find(|domain| !used.contains(domain))
+    }
+
     /// The node's own record of a detach, and its report; the identifier
-    /// word becomes free and unclaimed.
-    fn detach_local(&mut self, iommu: ObjId, device: u16, free: bool) {
+    /// word becomes free and unclaimed. Returns the iospace's domain
+    /// number, freed with its last device.
+    fn detach_local(&mut self, iommu: ObjId, device: u16, free: bool) -> u16 {
         let index = self.iommus[&iommu].unit;
         let key = self.identifier_key(index, device);
         if free {
@@ -902,5 +924,10 @@ impl Model {
         let iospace = unit.attached.remove(&device);
         let iospace = iospace.expect("the device is attached");
         live(&mut self.iospaces, iospace).retain(|&found| found != (iommu, device));
+        let domain = self.domains.get(&iospace).copied().unwrap_or(0);
+        if self.iospaces[&iospace].is_empty() {
+            self.domains.remove(&iospace);
+        }
+        domain
     }
 }

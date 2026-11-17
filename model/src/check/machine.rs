@@ -6,7 +6,7 @@ use crate::rings::Completes;
 use crate::system::Hardware;
 use crate::table::{GrantState, RingEntry};
 use crate::{Model, System};
-use dodos_abi::{CoreState, CoreWord, MemberState, RING_ANSWER_RESERVE, RING_KERNEL_ENTRIES};
+use dodos_abi::{CoreState, CoreWord, MemberState, RING_KERNEL_ENTRIES};
 
 type Check = Result<(), String>;
 
@@ -34,6 +34,7 @@ impl System {
             return Ok(());
         }
         self.check_cores()?;
+        self.check_fence_order()?;
         self.check_counts()?;
         self.check_grants()?;
         self.check_rings()?;
@@ -83,7 +84,16 @@ impl System {
             }
             let (slot, generation) = (word.slot(), word.generation());
             let named = matches!(word.state(), CoreState::Owned | CoreState::Joining);
-            ensure(named, "P2: a core executes a node its word does not name")?;
+            // The node whose kernel runs on the core is the one its word
+            // names.
+            let runner = self
+                .models()
+                .find(|(_, m)| m.position(core as u64).is_some_and(|p| !m.is_silent(p)))
+                .map(|(n, _)| n);
+            ensure(
+                named && runner.is_none_or(|n| n == slot),
+                "P2: a core executes a node its word does not name",
+            )?;
             let member = table.member(slot);
             ensure(
                 member.generation() == generation && member.state() != MemberState::Dead,
@@ -142,7 +152,10 @@ impl System {
             for used in table.uses[slot as usize].values() {
                 let over = table.member(used.granter).generation() != used.generation
                     || matches!(table.member(used.granter).state(), MemberState::Dead);
-                if used.leaves == 0 || over || model.leaves_frozen(used) {
+                // A unit that failed keeps the leaves counted for ever, and
+                // the grant stays: G6 holds then too (IOMMU: "a frame
+                // another node granted stays pinned").
+                if used.leaves == 0 || over {
                     continue;
                 }
                 let entry = table.grants[used.granter as usize].get(&used.grant);
@@ -195,17 +208,19 @@ impl System {
         for (x, model) in self.models() {
             for y in (0..n).filter(|&y| y != x) {
                 let peer = &model.peers_of(y);
-                let owed = peer.iter().flatten().count() as u64;
-                ensure(
-                    owed <= RING_ANSWER_RESERVE,
-                    "RESERVE: answers owed exceed the reserve",
-                )?;
+                self.check_reserve(x, y, peer)?;
                 let member = table.member(y);
                 let answering = matches!(
                     member.state(),
                     MemberState::Starting | MemberState::Live | MemberState::Sealing
                 );
-                if !answering || !self.has_generation(y, member.generation()) {
+                // A sealed or resuming node keeps its credits toward a peer
+                // whose generation ended while it was sealed until its
+                // resume runs R0 for it (Grants, "Generations").
+                if !answering
+                    || !self.has_generation(y, member.generation())
+                    || model.ended_while_sealed(y).is_some()
+                {
                     continue;
                 }
                 for (index, credit) in peer.iter().enumerate() {
@@ -255,6 +270,76 @@ impl System {
                     _ => false,
                 })
             })
+    }
+
+    /// The fence, inside the event that makes it: "the driver raises p's
+    /// park request, then marks p's word, then stops p". In the trace of
+    /// the event, a core marked was raised before, and a core both marked
+    /// and stopped was marked before it was stopped. The state after the
+    /// event cannot tell the orders apart (the eighth model review).
+    pub(crate) fn check_fence_order(&self) -> Check {
+        use crate::table::FenceStep;
+        let trace = &self.canonical().fence_trace;
+        for (at, step) in trace.iter().enumerate() {
+            let before = &trace[..at];
+            match *step {
+                FenceStep::Marked(core) => ensure(
+                    before.contains(&FenceStep::Raised(core)),
+                    "fence: a word marked before its park request was raised",
+                )?,
+                FenceStep::Stopped(core) => ensure(
+                    !trace[at..].contains(&FenceStep::Marked(core)),
+                    "fence: a stop sent before its word was marked",
+                )?,
+                FenceStep::Raised(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// RESERVE: "the kernel ring Y → X keeps `REQUESTS_PER_PEER` +
+    /// `SENDS_PER_PEER` + 10 entries (34) for the answers to X: one entry
+    /// for each credit X can have in use toward Y, and 10 more because a
+    /// `Report` takes up to 11 entries; a new holder has at most one
+    /// `ReportAsk` in flight to each node". The premise (one `ReportAsk`),
+    /// and the conclusion: the entries of the answers still owed to X (11
+    /// for a `ReportAsk`, 1 for any other credit whose answer is not yet in
+    /// the ring Y → X) fit in what the ring has free.
+    pub(crate) fn check_reserve(
+        &self,
+        x: u16,
+        y: u16,
+        peer: &[Option<crate::rings::Credit>],
+    ) -> Check {
+        let asks = peer
+            .iter()
+            .flatten()
+            .filter(|c| c.kind == dodos_abi::NodeMessage::ReportAsk)
+            .count();
+        ensure(
+            asks <= 1,
+            "RESERVE: more than one ReportAsk in flight to a peer",
+        )?;
+        let still_owed: u64 = peer
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| Some((i as u8, c.as_ref()?)))
+            .filter(|&(i, c)| !self.in_ring(y, x, i, c.serial))
+            .map(|(_, c)| match c.kind {
+                dodos_abi::NodeMessage::ReportAsk => dodos_abi::RING_MESSAGE_ENTRIES_MAX as u64,
+                _ => 1,
+            })
+            .sum();
+        let table = self.canonical();
+        let used = table.rings[y as usize][x as usize]
+            .kernel
+            .produced
+            .wrapping_sub(table.beacons[x as usize].consumed[y as usize].0);
+        let free = RING_KERNEL_ENTRIES.saturating_sub(used);
+        ensure(
+            still_owed <= free,
+            "RESERVE: answers still owed exceed the free entries of the ring",
+        )
     }
 
     /// Whether the holder `from` has a `Release` of grant `grant` of `to`
@@ -316,11 +401,5 @@ impl Model {
     /// Whether this node serves the unit request of `from` with a credit.
     pub(crate) fn serves(&self, from: u16, credit: u8) -> bool {
         self.unit_service.contains_key(&(from, credit))
-    }
-
-    /// Whether a use entry's leaves are kept by a failed unit (never
-    /// lowered, IOMMU).
-    pub(crate) fn leaves_frozen(&self, _used: &crate::table::UseEntry) -> bool {
-        false
     }
 }

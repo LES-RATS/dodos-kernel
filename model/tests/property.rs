@@ -2436,9 +2436,12 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     assert!(reached.several_threads as usize > STEPS);
 }
 
-// The coverage of the 24 seeds. The floors are about half of what was
-// measured (in the comments), so that a change of the generator that loses a
-// kind of state fails here.
+// The coverage of the 24 seeds. Each floor is three quarters of the count
+// measured on 17 November 2026 (pass 17), rounded up: the smallest of the
+// three runs of `verify` (pages of 4, 16 and 32 KB), over the 24 seeds, in
+// the comments. A change of the generator that loses a quarter of a kind of
+// state fails here, not only one that loses all of it (the eighth model
+// review found floors halved and floors of 1 that guarded only against 0).
 
 /// Asserts that each count is at least its floor.
 #[track_caller]
@@ -2453,9 +2456,9 @@ fn at_least<const N: usize>(counts: [u32; N], floors: [u32; N]) {
 #[test]
 fn deepest_capability_and_longest_walk_are_reached() {
     let reached = all_seeds();
-    // Measured: depth 64, a walk of 124 capabilities.
+    // Measured: depth 64, a walk of 126 capabilities.
     assert_eq!(reached.deepest, TREE_DEPTH);
-    assert!(reached.longest_walk >= 100, "{}", reached.longest_walk);
+    assert!(reached.longest_walk >= 95, "{}", reached.longest_walk);
     assert!(reached.longest_walk <= LONGEST_WALK);
     // A removal walks the tree in every seed.
     assert_eq!(reached.seeds_walked as u64, SEEDS);
@@ -2464,23 +2467,22 @@ fn deepest_capability_and_longest_walk_are_reached() {
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps, the smaller of the two geometries: untyped 27,
-    // cspace 9,438, aspace 39, frame 9,509, thread 141, sched 13, endpoint
-    // 13, reply 920, notify 472. Pass 15 changed the generator (the calls
-    // of nodes); the larger counts of untyped and endpoint before it came
-    // each from one seed in which one object stayed dying for hundreds of
-    // steps. A copy under `cap_delete` 32 (325 before, 954 of them from
-    // three seeds).
+    // Measured, in steps: untyped 27, cspace 9,438, aspace 39, frame
+    // 9,509, thread 141, sched 13, endpoint 13, reply 920, notify 472. Pass
+    // 15 changed the generator (the calls of nodes); the larger counts of
+    // untyped and endpoint before it came each from one seed in which one
+    // object stayed dying for hundreds of steps. A copy under `cap_delete`
+    // 32.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [13, 4700, 19, 4700, 70, 6, 6, 460, 236]);
-    at_least([reached.dying_copies], [16]);
+    at_least(dying, [21, 7079, 30, 7132, 106, 10, 10, 690, 354]);
+    at_least([reached.dying_copies], [24]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 39,300 of 58,659 calls.
-    at_least([reached.outside], [29_000]);
+    // Measured: 47,633 calls, 30,820 of them successful.
+    at_least([reached.outside], [35725]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -2491,9 +2493,9 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps, the smaller of the two geometries: callers queued
-    // 38,742, reply objects armed 13,686, receivers 39,375, waiters on a
-    // notify 14,847, a notify bound 28,800.
+    // Measured, in steps: callers queued 39,286, reply objects armed
+    // 17,243, receivers 35,958, waiters on a notify 20,739, a notify bound
+    // 22,621.
     let waits = [
         reached.callers,
         reached.served,
@@ -2501,22 +2503,20 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [19_000, 6800, 19_000, 7400, 14_000]);
-    // Measured, each once, on both geometries: 29 messages with
-    // capabilities, 4 with the capabilities dropped, 2 notifications, 15
-    // threads woken with `gone`.
+    at_least(waits, [29465, 12933, 26969, 15555, 16966]);
+    // Measured: 23 messages with capabilities, 9 with the capabilities
+    // dropped, 4 notifications, 9 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [15, 2, 1, 7]);
-    // Measured: 9 messages received with four capabilities (the smaller
-    // geometry), and 24 calls by a thread whose capability space is
-    // destroyed, the directed case of each seed (the random calls reached
-    // none once the calls of the cores and debugging were added).
-    at_least([reached.with_four, reached.destroyed], [4, 24]);
+    at_least(ends, [18, 7, 3, 7]);
+    // Measured: 9 messages received with four capabilities, and 36 calls by
+    // a thread whose capability space is destroyed (the directed case of
+    // each seed, and more).
+    at_least([reached.with_four, reached.destroyed], [7, 27]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -2525,61 +2525,59 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 3,445 accepted and 40 refused, cspace 94 and 16;
-    // by `send` 8 delivered and none refused (one in pass 10).
-    at_least(reached.moved, [1700, 47]);
-    at_least(reached.refused, [20, 8]);
-    at_least([reached.sent, reached.sent_refused], [4, 1]);
-    // The same moves listed by `call` and by `reply_recv`: 22 and 13.
-    at_least([reached.called, reached.answered], [11, 6]);
+    // Measured: untyped 3,466 accepted and 75 refused, cspace 76 and 13;
+    // by `send` 28 delivered and 24 refused.
+    at_least(reached.moved, [2600, 57]);
+    at_least(reached.refused, [57, 10]);
+    at_least([reached.sent, reached.sent_refused], [21, 18]);
+    // The same moves listed by `call` and by `reply_recv`: 13 and 15.
+    at_least([reached.called, reached.answered], [10, 12]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 31 queued callers, 3 callers that wait for the reply (10
-    // before the generator of pass 15), 25 receivers, 13 waiters on a
-    // notify; the ends by a wait number below.
-    at_least(reached.cancelled, [15, 1, 12, 6]);
+    // Measured: 31 queued callers, 3 callers that wait for the reply, 25
+    // receivers, 13 waiters on a notify; 9 ends by a wait number.
+    at_least(reached.cancelled, [24, 3, 19, 10]);
     at_least([reached.cancelled_by_number], [7]);
-    // Measured, the smaller geometry: `call` 11, `recv` 7, `reply_recv` 1
-    // and `wait` 3 returned `cancelled` at once.
-    at_least(reached.cancelled_at_once, [3, 3, 1, 1]);
+    // Measured: `call` 7, `recv` 3, `reply_recv` 1 and `wait` 3 returned
+    // `cancelled` at once (`reply_recv` once: its floor is that once).
+    at_least(reached.cancelled_at_once, [6, 3, 1, 3]);
 }
 
 #[test]
 fn removal_steps_that_only_move_the_sweep_are_reached() {
     let reached = all_seeds();
-    // Measured: 49 `again` of a removal removed nothing.
-    at_least([reached.swept_only], [24]);
+    // Measured: 220 `again` of a removal removed nothing.
+    at_least([reached.swept_only], [165]);
 }
 
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 9 calls returned `unsupported` for the one kind this
+    // Measured: 10 calls returned `unsupported` for the one kind this
     // version does not make, the reserved `vcpu` (the other kinds never
     // made from an untyped are `invalid` since 16 November 2026).
-    at_least([reached.retype_unsupported], [4]);
+    at_least([reached.retype_unsupported], [8]);
 }
 
 #[test]
 fn faults_are_raised_delivered_and_waited_on() {
     let reached = all_seeds();
-    // Measured: 151 faults found no handler and 65 were delivered; a thread
-    // waited on a fault after 14,596 steps (the smaller geometry).
-    at_least(reached.faults, [75, 32]);
-    at_least([reached.faulting], [7300]);
+    // Measured: 131 faults found no handler and 39 were delivered; a thread
+    // waited on a fault after 18,581 steps.
+    at_least(reached.faults, [99, 30]);
+    at_least([reached.faulting], [13936]);
 }
 
 #[test]
 fn scheduling_states_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps, the smaller of the two geometries: a context
-    // throttled 80,877, lent 4,650, a timer armed 529, a thread marked as
-    // having lost its context 2,257, the core idle 7,656, running on slack
-    // 69,285, a fault no address space queued 7,194, a fault no context
-    // queued 386.
+    // Measured, in steps: a context throttled 80,347, lent 5,518, a timer
+    // armed 270, a thread marked as having lost its context 3,277, the
+    // core idle 12,964, running on slack 67,910, a fault no address space
+    // queued 5,887, a fault no context queued 448.
     let states = [
         reached.throttled,
         reached.lent,
@@ -2590,18 +2588,17 @@ fn scheduling_states_are_reached() {
         reached.no_aspace,
         reached.no_context,
     ];
-    at_least(states, [40_000, 2300, 260, 1100, 3800, 34_000, 3500, 190]);
-    // Measured: the clock moved 4,730 times, and a timer fired in 13.
-    at_least([reached.advanced, reached.fired], [2300, 6]);
+    at_least(states, [60261, 4139, 203, 2458, 9723, 50933, 4416, 336]);
+    // Measured: the clock moved 4,771 times, and a timer fired in 9.
+    at_least([reached.advanced, reached.fired], [3579, 7]);
 }
 
 #[test]
 fn interrupts_and_marks_are_reached() {
     let reached = all_seeds();
-    // Measured, the smaller of the two geometries: 1,140 interrupts
-    // arrived, the marks of a thread grew 4 times; after 67,260 steps an
-    // irq was claimed, after 1,709 one was fired, after 1,059 a task was
-    // revoked.
+    // Measured: 1,234 interrupts arrived, the marks of a thread grew 3
+    // times; after 81,208 steps an irq was claimed, after 2,425 one was
+    // fired, after 3,851 a task was revoked.
     let counts = [
         reached.interrupts,
         reached.marked,
@@ -2609,21 +2606,21 @@ fn interrupts_and_marks_are_reached() {
         reached.irq_fired,
         reached.revoked,
     ];
-    at_least(counts, [570, 2, 33_000, 850, 520]);
+    at_least(counts, [926, 3, 60906, 1819, 2889]);
 }
 
 #[test]
 fn mappings_and_devices_are_reached_and_undone_by_removals() {
     let reached = all_seeds();
-    // Measured: a mapping held after 119,818 steps, a device attached after
-    // 32,845; 521 removals undid a mapping and 52 detached a device.
+    // Measured: a mapping held after 121,858 steps, a device attached after
+    // 32,317; 463 removals undid a mapping and 70 detached a device.
     let counts = [
         reached.mapped,
         reached.attached,
         reached.unmapped_by_removal,
         reached.detached_by_removal,
     ];
-    at_least(counts, [59_000, 16_000, 260, 26]);
+    at_least(counts, [91394, 24238, 348, 53]);
 }
 
 #[test]

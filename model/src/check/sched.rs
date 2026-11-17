@@ -71,7 +71,11 @@ impl Model {
             };
             let state = match sched.configured {
                 true => {
-                    let throttled = sched.throttled.is_some_and(|(at, _)| at > self.now);
+                    // A context placed on a core that stopped answering
+                    // keeps its state: that core takes no timer interrupt
+                    // (until its node accuses itself).
+                    let silent = self.cores.get(sched.core).is_some_and(|c| c.silent);
+                    let throttled = silent || sched.throttled.is_some_and(|(at, _)| at > self.now);
                     valid((sched.budget, sched.period))
                         && sched.pending.is_none_or(valid)
                         && sched.class <= 2

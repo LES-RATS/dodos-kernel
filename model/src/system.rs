@@ -36,6 +36,11 @@ pub enum Hardware {
     Parking,
     /// Started for a node whose first core has not built its state yet.
     Entering,
+    /// x86-64: in the kept image's entry stub, left by the park stub with a
+    /// start request; `installed` once it has installed the node kernel's
+    /// NMI handler, after which it reads its core word (Node slots and core
+    /// words, the start request and the entry stub, D-134).
+    EntryStub { installed: bool },
 }
 
 /// One event that can happen now.
@@ -52,6 +57,9 @@ pub enum Event {
     /// ARM64: `CPU_OFF` of a core whose handler completed the fence's
     /// event; from then `AFFINITY_INFO` answers OFF.
     CpuOff { core: usize },
+    /// x86-64: the entry stub's next step: it installs the node kernel's
+    /// NMI handler, then reads its core word and enters or parks again.
+    EntryStep { core: usize },
 }
 
 /// A deterministic generator (xorshift64*), seeded by the tests.
@@ -281,6 +289,9 @@ impl System {
             if hw == Hardware::Parking {
                 events.push(Event::CpuOff { core });
             }
+            if matches!(hw, Hardware::EntryStub { .. }) {
+                events.push(Event::EntryStep { core });
+            }
         }
         events
     }
@@ -310,6 +321,7 @@ impl System {
                 self.share(table);
                 self.hardware[core] = Hardware::Off;
             }
+            Event::EntryStep { core } => self.entry_step(core),
         }
     }
 
@@ -399,6 +411,17 @@ impl System {
             && let Some(position) = model.position(core as u64)
         {
             model.silence(position);
+        }
+    }
+
+    /// A start's wake reaches a core late (a test's input): x86-64 an NMI.
+    /// A core in the park stub takes it as a start; a core that runs its
+    /// node's kernel takes it as the fence's signal only if its word
+    /// carries the fence mark (D-134).
+    pub fn late_wake(&mut self, core: usize) {
+        match self.hardware[core] {
+            Hardware::Stub { .. } | Hardware::Off => self.wake(core),
+            _ => self.stop(core),
         }
     }
 
@@ -547,12 +570,26 @@ impl System {
     fn stop(&mut self, core: usize) {
         let booted = self.table().booted[core];
         match (self.machine.arch, self.hardware[core]) {
-            // x86-64: the NMI. A kernel that can run its handler writes the
-            // park request it reads into `parked` and returns by IRET into
-            // the park stub; the stub's own NMI handler does the same.
+            // x86-64: the NMI. The node kernel's handler parks its core only
+            // if the core's word carries the fence mark, and otherwise
+            // returns and changes nothing (D-134: a late start wake is not
+            // a fence signal); the stop is sent only under a marked word,
+            // so this guards a future path that would reuse it.
             (
                 Arch::X86_64,
-                Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Stub { .. },
+                Hardware::Running
+                | Hardware::Hung { nmi: true }
+                | Hardware::EntryStub { installed: true },
+            ) if !self.marked(core) => {}
+            // A kernel that can run its handler writes the park request it
+            // reads into `parked` and returns by IRET into the park stub;
+            // the stub's own NMI handler does the same from its loop.
+            (
+                Arch::X86_64,
+                Hardware::Running
+                | Hardware::Hung { nmi: true }
+                | Hardware::Stub { .. }
+                | Hardware::EntryStub { installed: true },
             ) => {
                 // The handler leaves VMX root operation if it is in it.
                 self.fence_record(core);
@@ -563,9 +600,16 @@ impl System {
             // INIT (not to the bootstrap core, and blocked in VMX root
             // operation), then the SIPIs to the park stub, which writes
             // `parked`.
+            // The entry stub before it installed the kernel's handler: the
+            // stub's handler only returns (it writes `parked` only from its
+            // own loop, D-134), so only INIT stops it; the entry stub then
+            // reads its word, which the fence marked before its NMI.
             (
                 Arch::X86_64,
-                Hardware::Hung { nmi: false } | Hardware::WaitSipi | Hardware::Entering,
+                Hardware::Hung { nmi: false }
+                | Hardware::WaitSipi
+                | Hardware::Entering
+                | Hardware::EntryStub { installed: false },
             ) if !booted && !self.table().core_beacons[core].vmx => {
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Stub { window: false };
@@ -578,6 +622,8 @@ impl System {
             // to the park routine, which calls `CPU_OFF` (a later event).
             // The fence is confirmed by OFF after the request, never by the
             // handler's own write.
+            (Arch::Aarch64, Hardware::Running | Hardware::Hung { nmi: true })
+                if !self.marked(core) => {}
             (Arch::Aarch64, Hardware::Running | Hardware::Hung { nmi: true }) => {
                 self.fence_record(core);
                 self.write_parked(core, false);
@@ -632,23 +678,69 @@ impl System {
             self.hardware[core] = Hardware::Stub { window: true };
             return;
         };
+        if self.machine.arch == Arch::X86_64 {
+            // The park stub writes the request it takes into `started` and
+            // leaves for the entry stub, which installs the kernel's NMI
+            // handler before it reads its core word (D-134).
+            let mut table = self.table().clone();
+            table.core_beacons[core].started = request;
+            self.share(table);
+            self.hardware[core] = Hardware::EntryStub { installed: false };
+            return;
+        }
+        self.enter_if_named(core, node, generation, request);
+    }
+
+    /// The x86-64 entry stub's next step: it installs the node kernel's NMI
+    /// handler, then reads its core word and enters or parks again.
+    fn entry_step(&mut self, core: usize) {
+        match self.hardware[core] {
+            Hardware::EntryStub { installed: false } => {
+                self.hardware[core] = Hardware::EntryStub { installed: true };
+            }
+            Hardware::EntryStub { installed: true } => {
+                let request = self.table().core_beacons[core].started;
+                match crate::table::Table::started_node(request) {
+                    Some((node, generation)) => {
+                        self.enter_if_named(core, node, generation, request);
+                    }
+                    None => self.park(core),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a core's word carries the fence mark.
+    fn marked(&self, core: usize) -> bool {
+        CoreWord::from_raw(self.table().core_words[core]).is_some_and(|w| w.is_marked())
+    }
+
+    /// The entry stub reads the core word and parks again unless the word
+    /// is not marked and names a node that is starting or live with the
+    /// word's generation; otherwise the core enters its node.
+    fn enter_if_named(&mut self, core: usize, node: u16, generation: u32, request: u64) {
         let word = CoreWord::from_raw(self.table().core_words[core]);
         let member = self.table().member(node);
         let enters = word.is_some_and(|w| !w.is_marked() && w.names(node, generation))
             && member.generation() == generation
             && matches!(member.state(), MemberState::Starting | MemberState::Live);
         if !enters {
-            self.hardware[core] = match self.machine.arch {
-                Arch::X86_64 => Hardware::Stub { window: true },
-                _ => Hardware::Off,
-            };
+            match self.machine.arch {
+                // The entry stub parks again: the park stub writes `parked`.
+                Arch::X86_64 => self.park(core),
+                _ => self.hardware[core] = Hardware::Off,
+            }
             return;
         }
-        // The stub writes the start request it takes into `started` of its
-        // core beacon (Node slots and core words, the start request, gap 8).
-        let mut table = self.table().clone();
-        table.core_beacons[core].started = request;
-        self.share(table);
+        // ARM64 and RISC-V: the entry stub writes the start request it
+        // takes into `started`, as its first write (gap 8, D-134); on
+        // x86-64 the park stub wrote it already.
+        if self.table().core_beacons[core].started != request {
+            let mut table = self.table().clone();
+            table.core_beacons[core].started = request;
+            self.share(table);
+        }
         self.hardware[core] = Hardware::Entering;
         self.enter(core, node, generation);
     }
@@ -691,5 +783,28 @@ impl System {
             model.core_entered(c);
         }
         self.after(node);
+    }
+}
+
+/// Test inputs that write a state no event makes: what a faulty kernel, a
+/// corrupted word or a state the explorations do not reach would leave, so
+/// that a test can judge a rule or an invariant on it.
+#[cfg(test)]
+impl System {
+    /// The kernel of a node, to change what it keeps.
+    pub(crate) fn node_mut(&mut self, node: u16) -> &mut Model {
+        self.model(node)
+    }
+
+    /// An action in flight, as if a node had asked for it.
+    pub(crate) fn push_action(&mut self, node: u16, action: HwAction) {
+        self.actions.push((node, action));
+    }
+
+    /// The machine table, changed as every kernel then reads it.
+    pub(crate) fn edit_table(&mut self, edit: impl FnOnce(&mut crate::table::Table)) {
+        let mut table = self.table().clone();
+        edit(&mut table);
+        self.share(table);
     }
 }

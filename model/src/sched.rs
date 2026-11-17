@@ -152,6 +152,7 @@ impl Model {
     pub(crate) fn begin(&mut self) -> Option<(ObjId, bool)> {
         self.table.begin_journal();
         self.table.member_writes.clear();
+        self.table.fence_trace.clear();
         self.table.role_writes.clear();
         self.table.gated.0 = false;
         self.submitted.0.clear();

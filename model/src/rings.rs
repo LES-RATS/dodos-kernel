@@ -23,18 +23,39 @@ use dodos_abi::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitOp {
     /// The context entry of a device points at the tables of an iospace of
-    /// the requesting node's generation.
-    Attach { device: u16 },
-    /// The context entry of a device is cleared.
-    Detach { device: u16 },
+    /// the requesting node's generation, whose root table is at `root`,
+    /// under the domain number of that iospace on the unit.
+    Attach { device: u16, domain: u16, root: u64 },
+    /// The context entry of a device, under that domain number, is cleared.
+    Detach { device: u16, domain: u16 },
     /// The unit's translation cache is invalidated (after an unmap or the
-    /// unhooking of a table in an iospace that serves devices).
-    Invalidate,
-    /// The interrupt entry cache is invalidated after a remapping entry.
-    InterruptCache,
-    /// A line's redirection entry in an IOAPIC: claimed by the requester,
-    /// or masked.
-    Redirection { gsi: u32, claimed: bool },
+    /// unhooking of a table in an iospace that serves devices): for one
+    /// domain number, or the whole unit (`None`, the holder's own: R1, a
+    /// rebuild).
+    Invalidate { domain: Option<u16> },
+    /// The interrupt entry cache is invalidated for one remapping handle,
+    /// after its entry is written (index-selective, mask 0).
+    InterruptCache { handle: u16 },
+    /// A line's redirection entry in an IOAPIC: claimed by the requester
+    /// (with its trigger, its polarity and its target), or masked.
+    Redirection {
+        gsi: u32,
+        claimed: bool,
+        level: bool,
+        low: bool,
+        target: Target,
+    },
+}
+
+/// Where a line's redirection entry points: a remapping handle and the
+/// vector of its remapping entry; without remapping a vector and an APIC
+/// ID; nothing for a masked entry (Devices and shared hardware, the
+/// operands of each operation, D-134).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Remapped { handle: u16, vector: u8 },
+    Direct { vector: u8, apic: u32 },
+    Masked,
 }
 
 /// One item of a `Report`: a device the asked node attached through the
@@ -208,7 +229,7 @@ impl Peer {
     }
 
     /// A free credit of the kind: a request credit, or a send credit.
-    fn free(&self, send: bool) -> Option<u8> {
+    pub(crate) fn free(&self, send: bool) -> Option<u8> {
         let range = match send {
             false => 0..REQUESTS_PER_PEER,
             true => REQUESTS_PER_PEER..REQUESTS_PER_PEER + SENDS_PER_PEER,
@@ -427,11 +448,12 @@ impl Model {
             }
             // A `UnitRequest` passes whatever its epoch.
             Body::UnitRequest { .. } | Body::Ping => None,
-            // A `Send`'s stamp carries a task identifier of the sender's
-            // node.
+            // A `Send`'s stamp carries 0 (a sender attached to no task) or
+            // a task identifier of the sender's node with a counter that is
+            // not 0 (D-134).
             Body::Send { stamp, .. } => {
                 let task = dodos_abi::TaskId::from_raw(stamp.0);
-                (task.node() != sender).then_some(stamp.0)
+                (stamp.0 != 0 && (task.counter() == 0 || task.node() != sender)).then_some(stamp.0)
             }
             // An answer names a credit of this node toward the sender that
             // is in use, with that serial and the kind of request it
@@ -597,7 +619,10 @@ impl Model {
                 self.unit_requested(from, credit, (role, epoch, op))
             }
             Body::UnitAnswer { result } => self.unit_answered(from, credit, result),
-            Body::Handed { role, .. } => self.handed(role as usize),
+            Body::Handed { role, .. } => {
+                self.handed_applied.0 += 1;
+                self.handed(role as usize);
+            }
             Body::ReportAsk { role, epoch, key } => {
                 self.report_asked(from, credit, role, epoch, key)
             }

@@ -694,8 +694,10 @@ fn iospace_attach_needs_manage_on_the_iommu_and_on_the_iospace() {
 
 #[test]
 fn unit_without_a_free_domain_number_is_busy() {
+    // One domain number for each node slot: number 0 is never used and the
+    // last is the kernel's own (Devices and shared hardware, D-134).
     let mut machine = Machine::example();
-    machine.iommus[0].domains = 1;
+    machine.iommus[0].domains = 2 + machine.nodes() as u32;
     let mut k = K::on(&machine);
     k.retype(UT, IoSpace, 0, 30);
     k.retype(UT, IoSpace, 0, 31);

@@ -262,16 +262,25 @@ pub enum UnitResult {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitOperation {
-    /// Attach a device to an iospace (its context entry, its domain).
+    /// Attach a device to an iospace: operand 1 the device identifier
+    /// (bits 0-15) and the domain number (16-31), from the requester's
+    /// node slot's range; operand 2 the physical address of the iospace's
+    /// root table (D-134).
     Attach = 1,
-    /// Detach a device.
+    /// Detach a device: operand 1 the device identifier (0-15) and the
+    /// domain number (16-31); operand 2 0.
     Detach = 2,
     /// Invalidate the IOMMU translations of a domain, after an unmap or the
-    /// unhooking of a table.
+    /// unhooking of a table: operand 1 the domain number (0-15).
     Invalidate = 3,
-    /// Invalidate the interrupt entry cache after a remapping entry.
+    /// Invalidate the interrupt entry cache after a remapping entry:
+    /// operand 1 the handle (bits 0-15), index-selective (D-134).
     InterruptCache = 4,
-    /// Program a line's redirection entry in an IOAPIC.
+    /// Program a line's redirection entry in an IOAPIC: operand 1 the GSI
+    /// (0-31), 1 claimed or 0 masked (32), the trigger (33) and the
+    /// polarity (34); operand 2 remapped the handle (0-15) and the vector
+    /// (16-23), not remapped the vector (16-23) and the APIC ID (32-63),
+    /// masked 0 (D-134).
     Redirection = 5,
 }
 
@@ -283,6 +292,20 @@ mod proofs {
     /// the ring's entries ahead of the consumer, and its reserve free; a
     /// resynchronised consumer is never more than the ring's entries behind
     /// the producer and never moves back while the ring is sane.
+    ///
+    /// What the assumption `sane` leaves unproven: the consequences of
+    /// `ring_fits` (the producer stays within the ring's entries of the
+    /// consumer, the reserve stays free) for a ring whose producer index is
+    /// already more than its entries ahead of its consumer. There they are
+    /// false (a message of no entry fits a ring already beyond its
+    /// entries), and they need not hold: `ring_fits` is called only by the
+    /// sender on its own ring, whose producer only it writes and which it
+    /// keeps sane. A ring written by a faulty node is the receiver's
+    /// concern, and the receiver never calls `ring_fits` on it: it calls
+    /// `ring_resync`, whose two assertions below hold for every pair of
+    /// indices, sane or not (the producer is never more than the ring's
+    /// entries ahead of the resynchronised consumer), and reads each header
+    /// by the rule `a_readable_header_fits_in_what_was_produced` proves.
     #[kani::proof]
     fn ring_indices_never_overflow_the_ring() {
         let (produced, consumed, length, reserve): (u64, u64, u64, u64) =

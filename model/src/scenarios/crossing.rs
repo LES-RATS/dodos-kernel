@@ -705,7 +705,9 @@ fn a_resume_keeps_its_consumer_indices_and_consumes_the_answers_that_waited() {
                 node == 0
             }
             crate::system::Event::Action(i) => m.sys.actions()[i].0 == 0,
-            crate::system::Event::StubHalt { .. } | crate::system::Event::CpuOff { .. } => true,
+            crate::system::Event::StubHalt { .. }
+            | crate::system::Event::CpuOff { .. }
+            | crate::system::Event::EntryStep { .. } => true,
         });
         match mine {
             Some(event) => {
@@ -766,4 +768,32 @@ fn the_kernel_ring_keeps_its_reserve_of_answers_free_of_requests() {
     assert!(model.ring_room(1, dodos_abi::NodeMessage::Revoke, entries - reserve));
     assert!(!model.ring_room(1, dodos_abi::NodeMessage::Revoke, entries - reserve + 1));
     assert!(model.ring_room(1, dodos_abi::NodeMessage::RevokeStep, entries));
+}
+
+#[test]
+fn cap_delete_of_an_invalid_remote_capability_with_a_mapping_undoes_the_mapping() {
+    // A use of an invalid remote capability "other than `cap_delete`" is
+    // `gone`; `cap_delete` by its holder is a removal that reaches the
+    // slot and undoes the mapping with its invalidations (Grants, D-134).
+    let mut m = two();
+    granted(&mut m, SlotAddr::NONE);
+    map_got(&mut m);
+    assert!(m.sys.node(1).translated(m.t[1], AT).is_some());
+    // The granter's generation ends: every remote capability of it is
+    // invalid, and the holder has not yet run R2.
+    m.sys.hang(0, true);
+    m.sys.edit_table(|t| {
+        let member = t.member(0);
+        t.members[0] = dodos_abi::Member::new(
+            MemberState::Fencing,
+            dodos_abi::Evidence::Kill,
+            1,
+            member.generation(),
+        )
+        .with_class(member.class());
+    });
+    assert_eq!(m.call(1, Syscall::ASpaceUnmap(s(GOT))), Err(Error::Gone));
+    assert_eq!(m.call(1, Syscall::CapDelete(s(GOT))), DONE);
+    assert_eq!(m.sys.node(1).translated(m.t[1], AT), None);
+    assert!(m.sys.node(1).remotes.is_empty());
 }

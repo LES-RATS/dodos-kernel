@@ -51,11 +51,18 @@ pub(crate) struct UnitEntry {
     /// The result a done gives the waiting call, if not none: the message
     /// words of `irq_claim`.
     pub(crate) words: Option<(u64, u64)>,
-    /// For the claim of an MSI, the PCI segment whose units are asked one
-    /// after another: at a done, the entry is used again for the next unit
-    /// of that segment (Devices and shared hardware, several remapping
-    /// units, gap 12).
+    /// For a claim that writes a remapping entry, the PCI segment whose
+    /// units are asked one after another: at a done or a *failed*, the
+    /// entry is used again for the next unit of that segment (Devices and
+    /// shared hardware, several remapping units, gap 12, D-134). The cursor
+    /// is the entry's role and this segment.
     pub(crate) segment: Option<u16>,
+    /// Whether a unit of the sequence was found failed: the call then ends
+    /// `busy` after the last one.
+    pub(crate) failed: bool,
+    /// For the claim of a remapped line, its redirection entry, asked of
+    /// the holder of the IOAPIC's role after the last unit (D-134).
+    pub(crate) then: Option<(usize, UnitOp)>,
 }
 
 /// An entry of the unit service table: a request of another node that the
@@ -156,6 +163,8 @@ impl Model {
             order: self.unit_order,
             words,
             segment: None,
+            failed: false,
+            then: None,
         });
         if let Waiter::Thread(Some(thread)) = waiter {
             locked(&mut self.threads, &self.locks, thread).wait = Wait::Unit(index);
@@ -179,25 +188,107 @@ impl Model {
     /// holds one wait and one entry of the unit request table at a time"
     /// (Devices and shared hardware, gap 12). Returns whether the entry was
     /// used again.
-    fn next_unit(&mut self, index: usize, entry: UnitEntry) -> bool {
-        let Some(segment) = entry.segment else {
-            return false;
-        };
-        let roles = self.segment_roles(segment);
-        let after = roles.iter().position(|&r| r == entry.role).map(|i| i + 1);
-        let Some(&role) = after.and_then(|i| roles.get(i)) else {
-            return false;
+    fn next_unit(&mut self, index: usize, entry: UnitEntry, failed: bool) -> bool {
+        let failed = entry.failed || failed;
+        let next = entry.segment.and_then(|segment| {
+            let roles = self.segment_roles(segment);
+            let after = roles.iter().position(|&r| r == entry.role).map(|i| i + 1);
+            after.and_then(|i| roles.get(i)).copied()
+        });
+        // After the last unit, the redirection entry of a remapped line.
+        let (role, op, segment, then) = match (next, entry.then) {
+            (Some(role), then) => (role, entry.op, entry.segment, then),
+            (None, Some((role, op))) => (role, op, None, None),
+            (None, None) => return false,
         };
         self.unit_order += 1;
         self.unit_requests[index] = Some(UnitEntry {
             role,
+            op,
             epoch: self.table.roles[role].epoch(),
             stage: Stage::Queued,
             order: self.unit_order,
+            segment,
+            failed,
+            then,
             ..entry
         });
         self.unit_send_queued();
         true
+    }
+
+    /// The domain numbers of node slot `slot` on IOMMU unit `unit`: 0 is
+    /// never used and the last is the kernel's own, and slot *s* owns 1 +
+    /// *s* × *d* to (*s* + 1) × *d*, with *d* = ⌊(*D* − 2) / *n*⌋ (Devices
+    /// and shared hardware, domain numbers, D-134).
+    pub(crate) fn domain_range(&self, unit: usize, slot: u16) -> std::ops::RangeInclusive<u16> {
+        let total = self.machine.iommus[unit].domains;
+        let per = total.saturating_sub(2) / u32::from(self.table.nodes.max(1));
+        let first = 1 + u32::from(slot) * per;
+        // Empty when the unit has no number for each slot (the start-up
+        // refuses such a layout).
+        (first as u16)..=((first + per - 1) as u16)
+    }
+
+    /// What the holder's gate checks of a request's operands before it
+    /// writes the unit (the table of operands, D-134): a device whose
+    /// identifier word the requester holds and a domain number of its
+    /// range; a context entry of its own; a handle, or an APIC ID, of a
+    /// core whose word names it; the masking of a line it claimed.
+    pub(crate) fn operands_allowed(&self, role: usize, op: UnitOp, from: (u16, u32)) -> bool {
+        let (node, generation) = from;
+        let names = |core: usize| {
+            self.table
+                .core_word(core)
+                .is_some_and(|w| w.names(node, generation))
+        };
+        let handle_core = |handle: u16| usize::from(handle) / dodos_abi::x86_64::IRQ_TABLE_ENTRIES;
+        let record = self.table.role_records[role];
+        let unit =
+            (record.governs == dodos_abi::Governs::IommuUnit).then_some(usize::from(record.object));
+        let in_range =
+            |domain: u16| unit.is_some_and(|u| self.domain_range(u, node).contains(&domain));
+        let held = |device: u16| {
+            unit.is_some_and(|u| {
+                let key = u32::from(self.machine.iommus[u].segment) << 16 | u32::from(device);
+                let raw = self.table.identifiers.get(&key).copied();
+                raw.and_then(dodos_abi::Ownership::from_raw)
+                    .is_some_and(|w| {
+                        w.state() == dodos_abi::OwnState::Taken
+                            && w.owner() == dodos_abi::Owner::Node(node)
+                            && w.generation() == generation
+                    })
+            })
+        };
+        let state = self.table.units.get(&role);
+        match op {
+            UnitOp::Attach {
+                device,
+                domain,
+                root,
+            } => held(device) && in_range(domain) && root != 0,
+            UnitOp::Detach { device, domain } => state.is_none_or(|u| {
+                u.entries.get(&device).is_none_or(|&owner| owner == from)
+                    && u.domains.get(&device).is_none_or(|&d| d == domain)
+            }),
+            UnitOp::Invalidate { domain } => domain.is_some_and(in_range),
+            UnitOp::InterruptCache { handle } => names(handle_core(handle)),
+            UnitOp::Redirection {
+                claimed: false,
+                gsi,
+                ..
+            } => state.is_none_or(|u| u.lines.get(&gsi).is_none_or(|&owner| owner == from)),
+            UnitOp::Redirection { target, .. } => match target {
+                crate::rings::Target::Remapped { handle, .. } => names(handle_core(handle)),
+                crate::rings::Target::Direct { apic, .. } => self
+                    .machine
+                    .core_list()
+                    .iter()
+                    .position(|c| c.hw_id == u64::from(apic))
+                    .is_some_and(names),
+                crate::rings::Target::Masked => false,
+            },
+        }
     }
 
     /// The entries of the unit request table, served oldest first: an entry
@@ -283,19 +374,21 @@ impl Model {
         unit.next += 1;
         let serial = unit.next;
         match op {
-            UnitOp::Attach { device } => {
+            UnitOp::Attach { device, domain, .. } => {
                 unit.entries.insert(device, requester);
+                unit.domains.insert(device, domain);
             }
-            UnitOp::Detach { device } => {
+            UnitOp::Detach { device, .. } => {
                 unit.entries.remove(&device);
+                unit.domains.remove(&device);
             }
-            UnitOp::Redirection { gsi, claimed } => {
+            UnitOp::Redirection { gsi, claimed, .. } => {
                 match claimed {
                     true => unit.lines.insert(gsi, requester),
                     false => unit.lines.remove(&gsi),
                 };
             }
-            UnitOp::Invalidate | UnitOp::InterruptCache => {}
+            UnitOp::Invalidate { .. } | UnitOp::InterruptCache { .. } => {}
         }
         // A redirection entry, written through an index and a data
         // register, is not confirmed by the unit: answered at once.
@@ -343,6 +436,15 @@ impl Model {
         }
         if self.unit_failed(role) {
             return answer(self, UnitResult::Failed);
+        }
+        // The holder's gate refuses operands that name what the requester
+        // does not hold: nothing is written, the refusal is traced (code
+        // 11), and the request is answered done (D-134).
+        let requester = (from, self.table.generation(from));
+        if !self.operands_allowed(role, op, requester) {
+            self.refused.0 += 1;
+            self.trace(TraceCode::Refused, None, [u64::from(from), 4, role as u64]);
+            return answer(self, UnitResult::Done);
         }
         let submitted = match self.rebuilds.contains_key(&role) {
             true => None,
@@ -403,9 +505,16 @@ impl Model {
         let Some(entry) = self.unit_requests[index].take() else {
             return;
         };
-        if result == UnitResult::Done && self.next_unit(index, entry) {
+        // A claim goes on to its next unit, or to its line's redirection
+        // entry, at a done or a *failed* alike (gap 12, D-134).
+        let failed = result == UnitResult::Failed;
+        if result != UnitResult::Elsewhere && self.next_unit(index, entry, failed) {
             return;
         }
+        let result = match entry.failed {
+            true => UnitResult::Failed,
+            false => result,
+        };
         let record = match entry.waiter {
             Waiter::Record(cap) => Some(cap),
             Waiter::Thread(_) => entry.record,

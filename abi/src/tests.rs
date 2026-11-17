@@ -2407,3 +2407,13 @@ fn ring_indices_count_free_entries_and_resynchronise() {
     assert_eq!(ring_resync(100, 10, n), 36);
     assert_eq!(ring_resync(74, 10, n), 10);
 }
+
+/// The fence record holds a core's last stop at its core number modulo 64,
+/// which never moves while R6 frees the other words of the node (D-134).
+#[test]
+fn a_fence_record_indexes_its_last_stops_by_core_number_modulo_64() {
+    assert_eq!(FenceRecord::stop_index(5), 5);
+    assert_eq!(FenceRecord::stop_index(64 + 5), 5);
+    let window: Vec<usize> = (128..192).map(FenceRecord::stop_index).collect();
+    assert_eq!(window, (0..64).collect::<Vec<_>>());
+}

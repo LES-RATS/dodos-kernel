@@ -1056,6 +1056,7 @@ impl Model {
             ObjectKind::ASpace | ObjectKind::IoSpace => {
                 let space = self.aspaces.remove(&id).expect("names a live entry");
                 self.iospaces.remove(&id);
+                self.domains.remove(&id);
                 // G2: the gate turns the table pages back into data.
                 let page = self.machine.geometry.page();
                 for at in space.table_pages() {

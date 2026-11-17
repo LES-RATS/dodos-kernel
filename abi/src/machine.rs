@@ -262,7 +262,8 @@ pub const START_NS: u64 = 1_000_000_000;
 /// core words, the start request).
 pub const START_RETRY_NS: u64 = 1_000_000;
 
-/// The cores of a node a fence record holds the last stop of, by position.
+/// The cores of a node a fence record holds the last stop of: a node's
+/// cores lie in one window of 64 core numbers.
 pub const FENCE_RECORD_CORES: usize = 64;
 /// Bytes of one fence record.
 pub const FENCE_RECORD_BYTES: usize = 544;
@@ -270,9 +271,12 @@ pub const FENCE_RECORD_BYTES: usize = 544;
 /// The fence record of a node slot, in the living part, written by the gate
 /// of the node's fence driver (The fence: the fence record): the generation
 /// it concerns, the instant of the first fence action, the instant the fence
-/// was confirmed, and for each position of the node's cores the instant of
-/// the last stop sent to that core. An instant of 0 means none. The delays
-/// of a take-over (Roles) and of R6 are measured from these instants.
+/// was confirmed, and for each core of the node, at the index of its core
+/// number modulo 64 (`stop_index`), the instant of the last stop sent to
+/// that core: a node's cores lie in one window of 64 core numbers, so the
+/// index never changes while R6 frees other words, as a position would
+/// (D-134). An instant of 0 means none; the instants are the gate's clock.
+/// The delays of a take-over (Roles) and of R6 are measured from them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FenceRecord {
@@ -282,6 +286,14 @@ pub struct FenceRecord {
     pub confirmed: u64,
     pub reserved2: u64,
     pub last_stop: [u64; FENCE_RECORD_CORES],
+}
+
+impl FenceRecord {
+    /// The index in `last_stop` of the last stop sent to a core: its core
+    /// number modulo 64 (The fence, the fence record, D-134).
+    pub const fn stop_index(core: usize) -> usize {
+        core % FENCE_RECORD_CORES
+    }
 }
 /// The time a node may stay sealed before evidence seal accuses it.
 pub const SEAL_NS: u64 = 1_000_000_000;
@@ -830,8 +842,13 @@ pub struct CoreWord(u64);
 impl CoreWord {
     const CHECK: u64 = 0xfff << 4;
 
+    /// The word without its check bits: what the check is computed from.
+    const fn base(raw: u64) -> u64 {
+        raw & !Self::CHECK
+    }
+
     const fn checked(v: u64) -> Self {
-        let v = v & !Self::CHECK;
+        let v = Self::base(v);
         Self(v | (v.wrapping_mul(CHECK_MUL) >> 52) << 4)
     }
 
@@ -1564,13 +1581,75 @@ mod proofs {
         }
     }
 
-    /// A core word read back: the constructors write a word that `from_raw`
-    /// accepts and whose fields are those given; a word with a check bit
-    /// flipped is refused. The check is a product of 64 bits, as for the
-    /// ownership words, so the proof takes a slot and a generation of 4 bits
-    /// each (the solver's time grows with the bits of the product).
+    /// A core word of a node at the full widths of its fields (a slot of 16
+    /// bits, a generation of 32, the mark): one of the two constructors that
+    /// name a node, marked or not.
+    fn any_named_word() -> (CoreWord, u16, u32) {
+        let (slot, generation): (u16, u32) = (kani::any(), kani::any());
+        let word = match kani::any() {
+            true => CoreWord::joining(slot, generation),
+            false => CoreWord::owned(slot, generation),
+        };
+        let word = if kani::any() { word.marked() } else { word };
+        (word, slot, generation)
+    }
+
+    /// A core word read back, at the full widths of `CoreWord` (the eighth
+    /// model review found the proof narrowed to 4 bits of slot and of
+    /// generation). `from_raw` accepts a word when the check it recomputes
+    /// from the word's base (the word without its check bits) equals the
+    /// check stored; the constructors store the check of the base they
+    /// build. So a word reads back if (1) its fields are those given and
+    /// (2) the base `from_raw` recovers is the base the constructor hashed:
+    /// the check, a pure function, then gives the same value on both sides.
+    /// Proved at the full widths, without the product of 64 bits in the
+    /// cone of either property, which is what kept the end-to-end proof
+    /// from ending: (1) here, (2) in `core_words_keep_their_base`, and the
+    /// refusal of a flipped check bit in `core_words_with_a_check_bit_flipped_are_refused`.
+    /// `core_words_read_back_end_to_end` runs the real product, end to end,
+    /// with a slot and a generation of 4 bits.
     #[kani::proof]
     fn core_words_read_back() {
+        let (word, slot, generation) = any_named_word();
+        assert!(word.slot() == slot && word.generation() == generation);
+        assert!(word.names(slot, generation));
+        assert!(word.state() == CoreState::Joining || word.state() == CoreState::Owned);
+        let free = CoreWord::free(kani::any());
+        assert!(free.state() == CoreState::Free && free.slot() == CORE_NO_SLOT);
+        assert!(free.generation() == 0 && !free.is_marked());
+    }
+
+    /// (2): the base `from_raw` recovers from a word a constructor wrote is
+    /// the base the constructor built from its fields, at the full widths.
+    #[kani::proof]
+    fn core_words_keep_their_base() {
+        let (word, slot, generation) = any_named_word();
+        let state = word.raw() & 0b11;
+        let built = state
+            | word.raw() & (CORE_MARK | CORE_UNUSABLE)
+            | (slot as u64) << 16
+            | (generation as u64) << 32;
+        assert!(CoreWord::base(word.raw()) == built);
+        assert!(CoreWord::base(word.raw()) & CoreWord::CHECK == 0);
+    }
+
+    /// A word with one check bit flipped has the same base, so the check
+    /// `from_raw` recomputes is the stored one, which the flipped word no
+    /// longer holds: it is refused. At the full widths.
+    #[kani::proof]
+    fn core_words_with_a_check_bit_flipped_are_refused() {
+        let (word, _, _) = any_named_word();
+        let bit: u32 = kani::any();
+        kani::assume(bit >= 4 && bit < 16);
+        let flipped = word.raw() ^ 1 << bit;
+        assert!(CoreWord::base(flipped) == CoreWord::base(word.raw()));
+        assert!(flipped & CoreWord::CHECK != word.raw() & CoreWord::CHECK);
+    }
+
+    /// The real check end to end, with a slot and a generation of 4 bits
+    /// each (the solver's time grows with the bits of the product).
+    #[kani::proof]
+    fn core_words_read_back_end_to_end() {
         let (slot, generation): (u8, u8) = (kani::any(), kani::any());
         let (slot, generation) = (u16::from(slot & 0xF), u32::from(generation & 0xF));
         let word = match kani::any::<u8>() % 3 {
@@ -1580,13 +1659,21 @@ mod proofs {
         };
         let word = if kani::any() { word.marked() } else { word };
         assert!(CoreWord::from_raw(word.raw()) == Some(word));
-        if word.state() != CoreState::Free {
-            assert!(word.slot() == slot && word.generation() == generation);
-            assert!(word.names(slot, generation));
-        }
         let bit: u32 = kani::any();
         kani::assume(bit >= 4 && bit < 16);
         assert!(CoreWord::from_raw(word.raw() ^ 1 << bit).is_none());
+    }
+
+    /// The word of a fence record that holds the last stop sent to a core:
+    /// by its core number modulo 64, always inside the record, and two
+    /// cores of one window of 64 core numbers never share one (D-134).
+    #[kani::proof]
+    fn fence_record_stop_index_is_inside_and_one_per_core_of_a_window() {
+        let (a, b): (usize, usize) = (kani::any(), kani::any());
+        assert!(FenceRecord::stop_index(a) < FENCE_RECORD_CORES);
+        if a / FENCE_RECORD_CORES == b / FENCE_RECORD_CORES && a != b {
+            assert!(FenceRecord::stop_index(a) != FenceRecord::stop_index(b));
+        }
     }
 
     #[kani::proof]

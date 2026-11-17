@@ -13,22 +13,25 @@
 //!   iospace), the sequence word of a `cspace` segment for a slot written
 //!   (and for the state of an `untyped`, in its root's slot), the lock word
 //!   of a core for its queues and its interrupt table, and the gate lock
-//!   last. The event's locks are collected where it touches objects
-//!   (`live`), taken in the order of `LockId` before the event changes
-//!   anything, and released at its exit.
+//!   last. The event's locks are recorded in the order it finds them,
+//!   where it touches objects (`live`), not sorted: a lock that comes after
+//!   every lock the event holds is waited for; a lock that comes before one
+//!   it holds is one it found by reading an object it holds, which the
+//!   contract has it *try* ("The order of L2 and its bound", D-134). In
+//!   the model every event runs alone, so a try never fails and the
+//!   second round of the contract's rule is never needed.
 //!
-//! The order by kind is the contract's ("The order of L2 and its bound",
-//! A node of several cores, gap 5): that of `LockId`'s variants, objects of
-//! one kind by identity as by address. The bound *k* of a call is `bound`,
-//! an upper bound of the objects and slots its rules name, the cores whose
-//! queues it may change and the gate lock.
+//! The order by kind is the contract's: that of `LockId`'s variants,
+//! objects of one kind by identity as by address. The bound *k* of a call
+//! is `bound`, the most locks it holds at once.
 //!
 //! The checks (`Model::check_locks`): a node of one core takes no lock and
 //! pays no cost of several cores; under L1 every lock is the node lock or
-//! the gate lock inside it; under L2 the locks are taken in order, the gate
-//! lock last, at most *k*, and every object the event changed was locked
-//! (compared with the state before the event); under both, no event spins
-//! for a unit or another node.
+//! the gate lock inside it; under L2 a wait is only for a lock that comes
+//! after every lock held, a try only for one that comes before a lock
+//! held, the gate lock last, at most *k*, and every object the event
+//! changed was locked (compared with the state before the event); under
+//! both, no event spins for a unit or another node.
 
 use crate::ObjId;
 use std::cell::RefCell;
@@ -101,7 +104,11 @@ pub enum Cost {
 /// One step of an event, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// A lock waited for: in the order by kind, after every lock held.
     Lock(LockId),
+    /// A lock found by reading an object the event holds, earlier in the
+    /// order than a lock held: tried, never waited for (D-134).
+    Try(LockId),
     Unlock(LockId),
     /// A thread entered a wait at the end of the event.
     Wait(WaitKind),
@@ -257,21 +264,34 @@ impl crate::Model {
                 }
             }
             Locking::L2 => {
-                let mut touched: Vec<LockId> = self.locks.touched.borrow().clone();
+                // In the order the event found them: those it touched, then
+                // the objects it changed without touching them, then the
+                // gate lock.
+                let mut found: Vec<LockId> = self.locks.touched.borrow().clone();
                 if let Some(before) = self.before.take() {
-                    touched.extend(before.changed(self));
+                    for lock in before.changed(self) {
+                        if !found.contains(&lock) {
+                            found.push(lock);
+                        }
+                    }
                 }
+                found.retain(|&l| l != LockId::Gate);
                 if gate {
-                    touched.push(LockId::Gate);
+                    found.push(LockId::Gate);
                 }
-                touched.sort();
-                touched.dedup();
-                for &lock in &touched {
+                let mut held: Option<LockId> = None;
+                for &lock in &found {
                     steps.push(Step::Pay(Cost::Lock));
-                    steps.push(Step::Lock(lock));
+                    match held {
+                        Some(top) if lock < top => steps.push(Step::Try(lock)),
+                        _ => {
+                            steps.push(Step::Lock(lock));
+                            held = Some(lock);
+                        }
+                    }
                 }
                 steps.append(&mut self.locks.steps);
-                for &lock in touched.iter().rev() {
+                for &lock in found.iter().rev() {
                     steps.push(Step::Unlock(lock));
                 }
             }

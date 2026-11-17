@@ -566,6 +566,39 @@ fn the_check_refuses_a_lock_order_the_contract_forbids() {
         Step::Lock(LockId::Thread(thread)),
     ];
     assert!(k.m.check().is_err());
+    // Found locks: a lock earlier than one held is tried, never waited
+    // for; a try of a lock that is not before any lock held is not one the
+    // contract's rule makes (D-134). The order is judged as the call took
+    // the locks, never sorted.
+    k.m.locks.steps = vec![
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Core(0)),
+        Step::Pay(Cost::Lock),
+        Step::Try(LockId::Thread(thread)),
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Gate),
+    ];
+    assert_eq!(k.m.check(), Ok(()));
+    k.m.locks.steps = vec![
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Core(0)),
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Thread(thread)),
+    ];
+    assert_eq!(
+        k.m.check(),
+        Err("L2: a lock waited for out of the order fixed by kind")
+    );
+    k.m.locks.steps = vec![
+        Step::Pay(Cost::Lock),
+        Step::Try(LockId::Thread(thread)),
+        Step::Pay(Cost::Lock),
+        Step::Lock(LockId::Gate),
+    ];
+    assert_eq!(
+        k.m.check(),
+        Err("L2: a lock tried that is not before a lock held")
+    );
     // A spin for another core or a unit inside a hold.
     k.m.locks.steps = vec![Step::Spin(crate::locks::WaitKind::Unit)];
     assert!(k.m.check().is_err());

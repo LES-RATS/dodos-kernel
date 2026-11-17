@@ -80,12 +80,27 @@ impl Model {
         // segment, one after another (Devices and shared hardware, several
         // remapping units, gap 12): the first unit is asked here, the next
         // ones at the done of the one before.
-        let units = self.segment_roles(source.segment());
-        let role = match (source.is_line(), self.machine.remapping) {
-            (true, _) => self.ioapic_role(source.id()),
-            (false, true) => units.first().copied(),
-            (false, false) => None,
+        // A line's remapping entry is invalidated in the units of its
+        // IOAPIC's segment before the IOAPIC's redirection entry is asked
+        // (Interrupts, the interrupt remapping cache, D-134).
+        let segment = match source.is_line() {
+            true => self
+                .machine
+                .ioapics
+                .iter()
+                .find(|io| (io.first_gsi..io.first_gsi + io.inputs).contains(&source.id()))
+                .map_or(0, |io| io.segment),
+            false => source.segment(),
         };
+        let units = match self.machine.remapping {
+            true => self.segment_roles(segment),
+            false => Vec::new(),
+        };
+        let ioapic = source
+            .is_line()
+            .then(|| self.ioapic_role(source.id()))
+            .flatten();
+        let role = units.first().copied().or(ioapic);
         if role.is_some() && self.unit_requests.iter().all(Option::is_some) {
             return Err(Error::Again);
         }
@@ -121,25 +136,43 @@ impl Model {
             return Ok(Output::Msi { address, data });
         };
         let generation = self.table.generation(self.node);
-        let op = match source.is_line() {
-            true => crate::rings::UnitOp::Redirection {
+        for &unit in &units {
+            let remap = &mut self.table.units.entry(unit).or_default().remap;
+            remap.insert(handle as u32, (self.node, generation));
+        }
+        let target = match self.machine.remapping {
+            true => crate::rings::Target::Remapped {
+                handle: handle as u16,
+                vector,
+            },
+            false => crate::rings::Target::Direct {
+                vector,
+                apic: apic as u32,
+            },
+        };
+        let redirection = ioapic.map(|io| {
+            let op = crate::rings::UnitOp::Redirection {
                 gsi: source.id(),
                 claimed: true,
+                level: source.level(),
+                low: source.active_low(),
+                target,
+            };
+            (io, op)
+        });
+        let op = match units.is_empty() {
+            false => crate::rings::UnitOp::InterruptCache {
+                handle: handle as u16,
             },
-            false => {
-                for &unit in &units {
-                    let remap = &mut self.table.units.entry(unit).or_default().remap;
-                    remap.insert(handle as u32, (self.node, generation));
-                }
-                crate::rings::UnitOp::InterruptCache
-            }
+            true => redirection.expect("a line without remapping").1,
         };
         let waiter = crate::units::Waiter::Thread(Some(thread));
         let entry = self.unit_request_with(role, op, waiter, None, Some((address, data)))?;
-        if !source.is_line()
+        if !units.is_empty()
             && let Some(e) = self.unit_requests[entry].as_mut()
         {
-            e.segment = Some(source.segment());
+            e.segment = Some(segment);
+            e.then = redirection;
         }
         Ok(Output::Waits)
     }

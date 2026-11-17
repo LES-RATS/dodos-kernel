@@ -144,6 +144,8 @@ pub(crate) struct RingPair {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct UnitState {
     pub(crate) entries: BTreeMap<u16, (u16, u32)>,
+    /// The domain number of each context entry, by device.
+    pub(crate) domains: BTreeMap<u16, u16>,
     pub(crate) remap: BTreeMap<u32, (u16, u32)>,
     pub(crate) queue: Vec<(u64, u64)>,
     pub(crate) mapped: BTreeSet<u16>,
@@ -329,6 +331,18 @@ pub(crate) struct Table {
     /// the machine table: an entry of a translation table, or a gate word
     /// (Gate over page tables).
     pub(crate) gated: crate::Ephemeral<bool>,
+    /// The steps of the fence in the current event, in the order they were
+    /// made (The fence: "the driver raises p's park request, then marks p's
+    /// word, then stops p").
+    pub(crate) fence_trace: crate::Ephemeral<Vec<FenceStep>>,
+}
+
+/// One step of the fence on a physical core, as the trace records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FenceStep {
+    Raised(usize),
+    Marked(usize),
+    Stopped(usize),
 }
 
 impl Table {

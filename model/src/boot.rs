@@ -68,6 +68,9 @@ pub struct IommuUnit {
 pub struct IoApic {
     pub first_gsi: u32,
     pub inputs: u32,
+    /// The PCI segment of the IOAPIC's source ID, as the DMAR gives it:
+    /// the remapping units of that segment serve its lines.
+    pub segment: u16,
 }
 
 /// A segment of the first service: mapped at `vaddr` with `rights`, read
@@ -300,6 +303,7 @@ impl Machine {
             ioapics: vec![IoApic {
                 first_gsi: 0,
                 inputs: 24,
+                segment: 0,
             }],
             remapping: true,
             x2apic: false,
@@ -398,7 +402,13 @@ impl Machine {
     pub fn initial_nodes(&self) -> Vec<Vec<usize>> {
         let count = self.cores.len();
         if self.single() {
-            if count <= self.cores_supported as usize {
+            // Every usable core if they lie in one window of 64 core
+            // numbers, have the same state features and vector lengths, and
+            // are no more than the image supports; the core firmware booted
+            // otherwise (Start-up state, D-134).
+            let one_window = count <= dodos_abi::CORE_WINDOW_BITS as usize;
+            let alike = (0..count).all(|c| self.state_kind(c) == self.state_kind(0));
+            if count <= self.cores_supported as usize && one_window && alike {
                 return vec![(0..count).collect()];
             }
             let booted = self.core_list().iter().position(|c| c.booted).unwrap_or(0);
@@ -632,7 +642,13 @@ impl Machine {
                 && cores.iter().all(|&c| named.insert(c))
         });
         let slots_ok = n >= 1 && n as usize <= NODES_MAX && n as usize <= self.cores.len();
-        if !slots_ok || nodes.len() > n as usize || !fits {
+        // Each IOMMU unit leaves every node slot at least one domain number
+        // (Devices and shared hardware, domain numbers, D-134).
+        let domains_ok = self
+            .iommus
+            .iter()
+            .all(|u| u64::from(u.domains.saturating_sub(2)) / n.max(1) >= 1);
+        if !slots_ok || !domains_ok || nodes.len() > n as usize || !fits {
             return Err(Refusal::Nodes);
         }
         if self.boot_seed == 0 && !self.processor_entropy {
@@ -941,6 +957,7 @@ impl Machine {
                 })
                 .collect(),
             member_writes: Default::default(),
+            fence_trace: Default::default(),
             gated: Default::default(),
             role_writes: Default::default(),
             owners: std::sync::Arc::new(layout.owners.clone()),

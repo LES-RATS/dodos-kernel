@@ -253,9 +253,12 @@ impl Model {
     fn check_locks(&self) -> Check {
         let steps = &self.locks.steps;
         if self.width() == 1 {
-            let paid = steps
-                .iter()
-                .any(|s| matches!(s, Step::Pay(_) | Step::Lock(_) | Step::Unlock(_)));
+            let paid = steps.iter().any(|s| {
+                matches!(
+                    s,
+                    Step::Pay(_) | Step::Lock(_) | Step::Try(_) | Step::Unlock(_)
+                )
+            });
             ensure(
                 !paid,
                 "N = 1: a node of one core paid for a rule of several cores",
@@ -268,7 +271,7 @@ impl Model {
         let locks: Vec<LockId> = steps
             .iter()
             .filter_map(|s| match s {
-                Step::Lock(l) => Some(*l),
+                Step::Lock(l) | Step::Try(l) => Some(*l),
                 _ => None,
             })
             .collect();
@@ -282,7 +285,7 @@ impl Model {
                         Step::Lock(LockId::Gate) => {
                             ensure(node, "L1: the gate lock taken outside the node lock")?
                         }
-                        Step::Lock(_) => {
+                        Step::Lock(_) | Step::Try(_) => {
                             return Err("L1: a lock other than the node lock and the gate lock");
                         }
                         _ => {}
@@ -291,10 +294,31 @@ impl Model {
                 ensure(!node, "L1: the node lock held past the exit of an event")?;
             }
             Locking::L2 => {
-                ensure(
-                    locks.windows(2).all(|w| w[0] < w[1]),
-                    "L2: the locks of a call taken out of the order fixed by kind",
-                )?;
+                // "A core waits for a lock only in the order by kind": a
+                // wait is for a lock after every lock held; a lock that
+                // comes before one held is tried (D-134). Judged in the
+                // order the event took them, never sorted.
+                let mut held: Vec<LockId> = Vec::new();
+                for step in steps {
+                    match *step {
+                        Step::Lock(lock) => {
+                            ensure(
+                                held.iter().all(|&h| h < lock),
+                                "L2: a lock waited for out of the order fixed by kind",
+                            )?;
+                            held.push(lock);
+                        }
+                        Step::Try(lock) => {
+                            ensure(
+                                held.iter().any(|&h| lock < h) && !held.contains(&lock),
+                                "L2: a lock tried that is not before a lock held",
+                            )?;
+                            held.push(lock);
+                        }
+                        Step::Unlock(lock) => held.retain(|&h| h != lock),
+                        _ => {}
+                    }
+                }
                 if let Some(&last) = locks.last() {
                     ensure(
                         !locks.contains(&LockId::Gate) || last == LockId::Gate,

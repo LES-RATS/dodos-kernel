@@ -9,6 +9,7 @@
 //! What a node asks of the machine (stops, starts, parks, interrupts to
 //! other nodes) is a `HwAction`, which `System` carries out.
 
+use crate::table::FenceStep;
 use crate::table::{FenceRecord, Observation, Watched};
 use crate::{Model, ObjId, Outcome, Output, Wait, live, locked};
 use dodos_abi::{
@@ -913,10 +914,13 @@ impl Model {
             if !word.is_marked() {
                 // The park request first, then the mark.
                 self.table.park_requests[core] += 1;
+                self.table.fence_trace.push(FenceStep::Raised(core));
                 let before = self.table.core_words[core];
                 self.table.write_core(core, before, word.marked());
+                self.table.fence_trace.push(FenceStep::Marked(core));
             }
             self.hw_out.push(HwAction::Stop { core });
+            self.table.fence_trace.push(FenceStep::Stopped(core));
             self.table.fences[node as usize].last_stop.insert(core, now);
         }
         for core in 0..self.table.start_requests.len() {
@@ -1006,7 +1010,7 @@ impl Model {
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
             unit.lines
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
-            let serial = self.submit(role, crate::rings::UnitOp::Invalidate);
+            let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
             if let Some(reclaim) = self.reclaims.get_mut(&node) {
                 reclaim.r1.insert(role, Some(serial));
             }
@@ -1479,6 +1483,7 @@ impl Model {
                 )
                 .with_class(member.class());
                 self.table.write_member(me, me, sealed);
+                self.sealed_view = self.table.members.clone();
                 self.hw_out.push(HwAction::Park { core });
                 self.cores[0].silent = true;
                 self.seal = None;
@@ -1514,17 +1519,21 @@ impl Model {
                     return any;
                 }
             }
-            if state == MemberState::Dead
-                || self.table.generation(node) != self.seen_generation(node)
-            {
-                // A generation over while sealed: its remote capabilities go,
-                // with no release, and the grants made to it are freed.
-                any |= self.drop_ended(node, units);
+            // A generation that was not over when this node sealed and is
+            // over now (dead, or started again: the member word names
+            // another generation) gets R0: its waits end with `gone`, its
+            // credits are freed; then its remote capabilities go, with no
+            // release, and the grants made to it are freed at once (R2,
+            // R3; Grants, "Generations").
+            if let Some(old) = self.ended_while_sealed(node) {
+                self.r0(node, old);
+                any |= self.drop_ended(node, old, units);
             }
         }
         if self.cores.iter().all(|c| !c.silent) {
             self.ready = true;
             self.resuming = false;
+            self.sealed_view.clear();
             let live = Member::new(
                 MemberState::Live,
                 member.evidence(),
@@ -1538,14 +1547,26 @@ impl Model {
         any
     }
 
-    /// The generation of a node as this node last processed it.
-    fn seen_generation(&self, node: u16) -> u32 {
-        self.seen.0.get(node as usize).map_or(0, |m| m.generation())
+    /// The generation of `node` that this node saw when it sealed, if it
+    /// was not over then and is over now.
+    pub(crate) fn ended_while_sealed(&self, node: u16) -> Option<u32> {
+        let old = *self.sealed_view.get(node as usize)?;
+        let now = self.table.member(node);
+        let was = old.state() != MemberState::Dead && old.generation() != 0;
+        let over = now.state() == MemberState::Dead || now.generation() != old.generation();
+        (was && over).then_some(old.generation())
     }
 
     /// The remote capabilities of a generation of `node` that is over are
-    /// removed, with no release; the grants made to it freed (R2, R3).
-    fn drop_ended(&mut self, node: u16, units: &mut usize) -> bool {
+    /// removed, with no release; the grants made to that generation, live,
+    /// revoking or pinned, are freed (R2, R3).
+    fn drop_ended(&mut self, node: u16, generation: u32, units: &mut usize) -> bool {
+        let me = self.node as usize;
+        for entry in self.table.grants[me].values_mut() {
+            if entry.grantee == node && entry.generation == generation {
+                entry.state = crate::table::GrantState::Pinned;
+            }
+        }
         let mut any = false;
         while *units > 0 {
             let me = self.node as usize;
@@ -1729,9 +1750,12 @@ impl Model {
                 progressed |= self.clear_step(node, &mut units);
             }
             progressed |= self.unpin(&mut units);
-            progressed |= self.roles_step(&mut units);
+            // The kernel rings before the roles: a `Handed` that came is
+            // applied before the target reads the handing word (both take
+            // step 5, Roles).
             progressed |= self.unit_step();
             progressed |= self.serve_kernel_rings(&mut units);
+            progressed |= self.roles_step(&mut units);
             self.send_pending();
             progressed |= self.observe_needed();
             progressed |= self.accuse_with_evidence();

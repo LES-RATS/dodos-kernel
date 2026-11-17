@@ -2582,3 +2582,250 @@ fn an_attached_device_whose_identifier_word_is_not_its_nodes_is_reported() {
     });
     assert_eq!(broken, "88: identifier words and attached devices");
 }
+
+// Pass 17 (the eighth model review, F15): each invariant that no test had
+// fed a bad state is fed one here, so that a check that cannot fail would
+// be caught.
+
+/// The start-up thread's own context.
+fn own_context(m: &Model) -> ObjId {
+    let ready = object(m, START_SLOT_THREAD);
+    m.threads[&ready]
+        .home
+        .expect("the first thread has its context")
+}
+
+#[test]
+fn block_whose_parent_is_not_a_memory_control_is_reported() {
+    // An untyped of the floor, a start-up root with no parent, said to be
+    // a block: a block is a child of the memory_control it was taken
+    // through.
+    let broken = spoiled(|m, at| live(&mut m.untypeds, at.untyped).block = Some(crate::Block::Run));
+    assert_eq!(broken, "11: parent of a block");
+}
+
+#[test]
+fn thread_whose_fault_endpoint_does_not_list_it_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.waiter).fault = Some((at.endpoint, 0)));
+    assert_eq!(broken, "32: fault endpoint of a thread");
+}
+
+#[test]
+fn address_space_that_lists_a_thread_not_bound_to_it_is_reported() {
+    let broken = spoiled(|m, at| {
+        let aspace = *m.aspaces.keys().next().unwrap();
+        live(&mut m.aspaces, aspace).threads.push(at.waiter);
+    });
+    assert_eq!(broken, "32: thread listed by an address space");
+}
+
+#[test]
+fn context_entered_twice_in_the_order_of_its_queues_is_reported() {
+    let broken = spoiled(|m, _| {
+        let context = own_context(m);
+        let entered = m.entered;
+        let queued = live(&mut m.scheds, context).queue.as_mut().unwrap();
+        queued.entered = entered + 1;
+    });
+    assert_eq!(broken, "41: order of entry");
+}
+
+#[test]
+fn context_placed_on_a_core_the_node_does_not_have_is_reported() {
+    let broken = spoiled(|m, _| {
+        let context = own_context(m);
+        live(&mut m.scheds, context).core = 7;
+    });
+    assert_eq!(broken, "42: core of a context");
+}
+
+#[test]
+fn context_whose_chain_names_a_lend_of_another_context_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = own_context(m);
+        live(&mut m.scheds, context).chain.push(at.reply);
+    });
+    assert_eq!(broken, "44: chain of a context");
+}
+
+#[test]
+fn thread_whose_home_does_not_name_it_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = own_context(m);
+        live(&mut m.threads, at.waiter).home = Some(context);
+    });
+    assert_eq!(broken, "44: home of a thread");
+}
+
+#[test]
+fn notify_that_lists_a_timer_not_armed_on_it_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.notifies, at.notify).timers.push(at.endpoint));
+    assert_eq!(broken, "47: timers of a notify");
+}
+
+#[test]
+fn notify_that_lists_an_irq_not_bound_to_it_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.notifies, at.notify).irqs.push(at.endpoint));
+    assert_eq!(broken, "51: irqs of a notify");
+}
+
+#[test]
+fn two_blocks_on_one_entry_of_the_device_table_are_reported() {
+    let broken = spoiled_with_block(|m, block, _| {
+        let device = object(m, DEVICE);
+        let (base, bytes, entry) = {
+            let d = &m.untypeds[&device];
+            (d.base, d.bytes, d.block)
+        };
+        let run = live(&mut m.untypeds, block);
+        (run.base, run.bytes, run.block) = (base, bytes, entry);
+    });
+    assert_eq!(broken, "53: two blocks on an entry");
+}
+
+#[test]
+fn block_on_an_entry_whose_range_it_does_not_have_is_reported() {
+    let broken = spoiled(|m, _| {
+        let device = object(m, DEVICE);
+        live(&mut m.untypeds, device).bytes /= 2;
+    });
+    assert_eq!(broken, "54: block on an entry not taken");
+}
+
+#[test]
+fn address_space_whose_count_of_tables_is_not_its_tables_is_reported() {
+    let broken = spoiled(|m, at| {
+        let retype = Syscall::UntypedRetype {
+            untyped: SlotAddr::own(UNTYPED),
+            kind: ObjectKind::ASpace,
+            size: 0,
+            page: 0,
+            memory: 0,
+            destination: SlotAddr::own(310),
+        };
+        let mut outcome = m.apply(at.ready, retype.clone());
+        while outcome == Err(Error::Again) {
+            outcome = m.apply(at.ready, retype.clone());
+        }
+        assert_eq!(outcome, Ok(Output::Done));
+        // A page on the free list that the count of tables does not count.
+        let aspace = object(m, 310);
+        let root = m.aspaces[&aspace].root.unwrap();
+        live(&mut m.aspaces, aspace).free.push(root + 0x1000);
+    });
+    assert_eq!(broken, "59: tables of a space");
+}
+
+#[test]
+fn record_that_names_a_space_that_does_not_exist_is_reported() {
+    let broken = spoiled(|m, _| {
+        let copy = cap(m, dodos_abi::START_SLOT_MESSAGE_PAGE_MAP);
+        let Record::Mapping(mut mapping) = m.caps[&copy].record else {
+            panic!("slot 11 holds the mapping of the message page");
+        };
+        let space = live(&mut m.aspaces, mapping.space);
+        space.records.retain(|&c| c != copy);
+        space.translations.retain(|_, t| t.cap != copy);
+        mapping.space = ObjId(u32::MAX);
+        live(&mut m.caps, copy).record = Record::Mapping(mapping);
+    });
+    assert!(
+        broken == "36: record of a space that does not exist",
+        "{broken}"
+    );
+}
+
+/// A node without interrupt remapping (so that no claim waits for a unit)
+/// with a line claimed on vector 48 of its core and an MSI on vector 49.
+fn with_irqs() -> (Model, ObjId, ObjId) {
+    let mut machine = Machine::example();
+    machine.remapping = false;
+    let (mut m, thread) = Model::boot(&machine).unwrap();
+    let claim = |source: u64, vector: u64, slot: u32| Syscall::IrqClaim {
+        control: SlotAddr::own(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source,
+        core: 0,
+        vector,
+        destination: SlotAddr::own(slot),
+    };
+    let line = IrqSource::line(5, true, false).raw();
+    let msi = IrqSource::msi(0, 3, 1, 0).raw();
+    let first = m.apply(thread, claim(line, 48, 320));
+    let second = m.apply(thread, claim(msi, 49, 321));
+    assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+    let irq = |m: &Model, slot| m.object_at(thread, SlotAddr::own(slot)).unwrap();
+    let (line, msi) = (irq(&m, 320), irq(&m, 321));
+    (m, line, msi)
+}
+
+#[test]
+fn a_line_claimed_twice_is_reported() {
+    let (mut model, line, msi) = with_irqs();
+    assert_eq!(model.check(), Ok(()));
+    let source = model.irqs[&line].source;
+    live(&mut model.irqs, msi).source = source;
+    assert_eq!(model.check(), Err("51: line of an irq"));
+}
+
+#[test]
+fn a_level_source_with_an_arrival_pending_is_reported() {
+    let (mut model, line, _) = with_irqs();
+    assert_eq!(model.check(), Ok(()));
+    live(&mut model.irqs, line).pending = true;
+    assert_eq!(model.check(), Err("51: pending level source"));
+}
+
+#[test]
+fn a_port_access_off_x86_64_is_reported() {
+    let mut machine = Machine::example();
+    machine.arch = crate::boot::Arch::Aarch64;
+    let (mut model, _) = Model::boot(&machine).unwrap();
+    assert_eq!(model.check(), Ok(()));
+    model.event.ports = Some((0x60, 0x60));
+    assert_eq!(model.check(), Err("93: a port access off x86-64"));
+}
+
+#[test]
+fn translations_that_overlap_are_reported() {
+    let mut model = state();
+    let (block, _) = with_block(&mut model);
+    let thread = object(&model, START_SLOT_THREAD);
+    let block_slot = model.caps[&model.objects[&block].root].place.index;
+    let retype = Syscall::UntypedRetype {
+        untyped: SlotAddr::own(block_slot),
+        kind: ObjectKind::Frame,
+        size: 1,
+        page: 1,
+        memory: 0,
+        destination: SlotAddr::own(330),
+    };
+    let mut outcome = model.apply(thread, retype.clone());
+    while outcome == Err(Error::Again) {
+        outcome = model.apply(thread, retype.clone());
+    }
+    assert_eq!(outcome, Ok(Output::Done));
+    let large = model.machine.geometry.chunk();
+    let map = Syscall::ASpaceMap(Map {
+        space: SlotAddr::own(dodos_abi::START_SLOT_ASPACE),
+        frame: SlotAddr::own(330),
+        untyped: SlotAddr::NONE,
+        address: 4 * large,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    });
+    assert_eq!(model.apply(thread, map), Ok(Output::Done));
+    assert_eq!(model.check(), Ok(()));
+    // The large page's record and translation moved to address 0, over the
+    // message page at P: both records still name their translations.
+    let frame_cap = cap(&model, 330);
+    let Record::Mapping(mut mapping) = model.caps[&frame_cap].record else {
+        panic!("a mapping");
+    };
+    let space = live(&mut model.aspaces, mapping.space);
+    let t = space.translations.remove(&(4 * large)).unwrap();
+    space.translations.insert(0, t);
+    mapping.address = 0;
+    live(&mut model.caps, frame_cap).record = Record::Mapping(mapping);
+    assert_eq!(model.check(), Err("35: translations that overlap"));
+}

@@ -16,7 +16,9 @@ pair.
   per core (`cores.rs`: what the core runs, its queues, timers, interrupt
   table, idle word, invalidation request, pending set, interrupts, loaded
   root and the translations its TLB may hold), its locks (`locks.rs`: the
-  trace of each event under variant L1 or L2), its rings (`rings.rs`: the
+  trace of each event under variant L1 or L2; under L2 the locks in the
+  order the event found them, a lock earlier than one held recorded as a
+  try, never sorted), its rings (`rings.rs`: the
   check of every message received, credits, the reserve of answers), its
   grants (`grants.rs`), its unit requests and unit service table
   (`units.rs`), its roles (`roles.rs`), and the membership, fence, reclaim,
@@ -32,7 +34,8 @@ pair.
   of the contract it checks: those of one node (`Model::check`, with
   `check/node.rs` for the rules of several cores) and those of the whole
   machine (`System::check` in `check/machine.rs`: P2, P3, G4, G6, LEAK,
-  CREDIT, RESERVE, ONE-HOLDER, the order of the fence).
+  CREDIT, RESERVE, ONE-HOLDER, the order of the fence, judged on the trace
+  of the event as well as on the state after it).
 
 ## Tests
 
@@ -41,12 +44,20 @@ pair.
   `membership.rs` (the node calls, detection, fence, seal and resume,
   starts), `crossing.rs` (what crosses between nodes), `units.rs` (unit
   requests and roles), `reviews.rs` (one test per scenario the reviews
-  broke the text with, and a table of where the others are), and
+  broke the text with, and a table of where the others are), `pass17.rs`
+  (the corrections of D-134), `mistral.rs` (one test per mutation of the
+  eighth model review that left every test green), `checker.rs` (the
+  checker fed a bad state, one per invariant of a node of several cores
+  and of the machine; those of one node are in `check/tests.rs`), and
   `explore.rs` (seeded explorations that port the two explorers of the
-  research drafts). `DODOS_SEED=<n>` replays one seed of an exploration
-  with its actions printed.
+  research drafts, steered so that each reaches a full ring, a release
+  crossing a revoke, a core stopping in a request and an applied
+  `Handed`, asserted over the seeds). `DODOS_SEED=<n>` replays one seed
+  of an exploration with its actions printed; `DODOS_COUNTS` prints what
+  the explorations reached.
 - `tests/`: the calls on one node, judged argument by argument, and the
-  random walk of `property.rs` with its coverage floors.
+  random walk of `property.rs` with its coverage floors (three quarters of
+  the counts measured on 17 November 2026, rounded up).
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
 
@@ -73,3 +84,12 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
   firmware.
 - Nodes that take and give cores at run time: the contract only reserves
   words for it, and so does the model.
+- A try that fails under L2: every event runs alone, so a try always
+  succeeds and the second round of the contract's rule (D-134) is never
+  taken; the order of the trace is the order in which the model's code
+  touches the objects, close to but not always a kernel's order of
+  discovery.
+- The sweep's `Ping`: the first core of a live node always has a timer
+  armed (the recovery reserve's period, the sweep), so no successor is ever
+  idle with nothing armed, and the ping is never sent (an open point of the
+  contract since pass 17).
