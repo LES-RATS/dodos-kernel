@@ -792,8 +792,9 @@ fn under_l2_a_call_records_its_locks_in_the_order_it_took_them_with_tries_apart(
 #[test]
 fn an_attach_through_another_nodes_unit_uses_a_domain_number_of_the_requesters_range() {
     let mut m = S::on(&machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    // A requester other than node 0, whose range starts at 1.
     let holder = m.sys.role(0).holder();
-    let requester = (0..3).find(|&n| n != holder).unwrap();
+    let requester = (1..3).find(|&n| n != holder).unwrap();
     let iospace = m.retype(requester, ObjectKind::IoSpace, 0, 150);
     m.ok(requester, iospace);
     let iommu = s(slots_of(
