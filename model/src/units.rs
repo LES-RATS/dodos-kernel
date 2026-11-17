@@ -278,13 +278,28 @@ impl Model {
                 domain,
                 root,
             } => {
-                // G9: the root names an iospace table held by the node that
-                // holds the device.
+                // G9: the attach word moves from *pinned* to *attached* with
+                // that root, or reads *attached* with it; the root is an
+                // iospace root with a device pinned, held by the node that
+                // holds the device (D-137).
                 let page = root / self.table.geometry.page();
                 let class = self.table.classes.get(&page).copied();
+                let word = self
+                    .attach_key(role, device)
+                    .map(|k| self.table.attach_word(k));
+                let pinned = word.is_some_and(|w| {
+                    w.root() == root
+                        && matches!(
+                            w.state(),
+                            Some(dodos_abi::AttachState::Pinned | dodos_abi::AttachState::Attached)
+                        )
+                });
                 held(device)
                     && in_range(domain)
-                    && class == Some(dodos_abi::PageClass::IOSPACE_TABLE)
+                    && pinned
+                    && class
+                        .and_then(dodos_abi::PageClass::root_devices)
+                        .is_some_and(|n| n >= 1)
                     && self.table.holds_page(root, node, generation)
             }
             UnitOp::Detach { device, domain } => state.is_none_or(|u| {
@@ -406,6 +421,17 @@ impl Model {
         let now = self.now;
         let word = self.table.roles[role];
         self.submitted.0.push((role, word));
+        // The holder's gate writes the attach word *attached* before the
+        // context entry (D-137).
+        if let UnitOp::Attach { device, root, .. } = op
+            && let Some(key) = self.attach_key(role, device)
+        {
+            let attached = dodos_abi::AttachWord::new(dodos_abi::AttachState::Attached, root);
+            let pinned = dodos_abi::AttachWord::new(dodos_abi::AttachState::Pinned, root);
+            if let (Some(pinned), Some(attached)) = (pinned, attached) {
+                self.table.swap_attach(key, pinned, attached);
+            }
+        }
         let unit = self.table.units.entry(role).or_default();
         unit.next += 1;
         let serial = unit.next;
@@ -551,6 +577,9 @@ impl Model {
             true => UnitResult::Failed,
             false => result,
         };
+        if let (UnitOp::Detach { device, .. }, UnitResult::Done) = (entry.op, result) {
+            self.detach_done(entry.role, device);
+        }
         let record = match entry.waiter {
             Waiter::Record(cap) => Some(cap),
             Waiter::Thread(_) => entry.record,
@@ -603,6 +632,7 @@ impl Model {
                 continue;
             };
             if self.confirmed(entry.role, submitted) {
+                self.detach_confirmed(entry.role, entry.op);
                 self.unit_complete(index, UnitResult::Done);
                 any = true;
             } else if at + IOMMU_WAIT_NS <= self.now {
@@ -618,6 +648,7 @@ impl Model {
                 continue;
             };
             let result = if self.confirmed(entry.role, serial) {
+                self.detach_confirmed(entry.role, entry.op);
                 UnitResult::Done
             } else if at + IOMMU_WAIT_NS <= self.now {
                 self.fail_unit(entry.role);
@@ -633,6 +664,24 @@ impl Model {
         let before: Vec<Option<UnitEntry>> = self.unit_requests.clone();
         self.unit_send_queued();
         any || before != self.unit_requests
+    }
+
+    /// The holder's gate, once the invalidation that follows the clearing of
+    /// a detached device's context entry is confirmed: the attach word
+    /// *attached* becomes *detached* (D-137).
+    fn detach_confirmed(&mut self, role: usize, op: UnitOp) {
+        let UnitOp::Detach { device, .. } = op else {
+            return;
+        };
+        let Some(key) = self.attach_key(role, device) else {
+            return;
+        };
+        let word = self.table.attach_word(key);
+        if word.state() == Some(dodos_abi::AttachState::Attached) {
+            let detached =
+                dodos_abi::AttachWord::new(dodos_abi::AttachState::Detached, word.root());
+            self.table.swap_attach(key, word, detached.expect("a root"));
+        }
     }
 
     /// The earliest instant a unit wait ends by time: `IOMMU_WAIT_NS` after

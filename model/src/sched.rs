@@ -549,7 +549,7 @@ impl Model {
     ///
     /// If r is still not positive, the context is exhausted again at once,
     /// in the same event; its next instant is after now, so this ends.
-    fn replenish(&mut self, context: ObjId, n: u64) {
+    pub(crate) fn replenish(&mut self, context: ObjId, n: u64) {
         let now = self.now;
         self.event.resets.push(context);
         let sched = locked(&mut self.scheds, &self.locks, context);

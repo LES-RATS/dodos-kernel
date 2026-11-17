@@ -299,13 +299,13 @@ fn the_holder_refuses_an_attach_whose_root_is_not_an_iospace_table_of_the_reques
         root,
     };
     // No root; a page of the requester's floor that is not an iospace
-    // table; an iospace table of another node.
+    // root; the root of another node, pinned for another device.
     let data = m.sys.canonical().floors[requester as usize][0].0 + 4 * 4096;
-    let foreign = iospace_root(&mut m, third);
+    let foreign = iospace_root(&mut m, third, 0x11);
     assert!(judged(&mut m, holder, requester, 0, attach(0)));
     assert!(judged(&mut m, holder, requester, 0, attach(data)));
     assert!(judged(&mut m, holder, requester, 0, attach(foreign)));
-    let root = iospace_root(&mut m, requester);
+    let root = iospace_root(&mut m, requester, 0x10);
     assert!(!judged(&mut m, holder, requester, 0, attach(root)));
 }
 
@@ -314,7 +314,7 @@ fn the_holder_refuses_a_detach_of_the_requesters_device_under_another_domain_num
     let (mut m, holder, requester, _) = holder_requester_third();
     hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
-    let root = iospace_root(&mut m, requester);
+    let root = iospace_root(&mut m, requester, 0x10);
     let attach = UnitOp::Attach {
         device: 0x10,
         domain: own,
@@ -704,7 +704,7 @@ use crate::locks::{LockId, Step};
 /// moving it a notify (360), so that the delivery tries the segment of the
 /// receiver's range (D-137: the receiver's own fields are guarded by the
 /// endpoint's lock, so a delivery with no capability tries nothing).
-fn l2_delivery() -> (N, ObjId, ObjId, Syscall) {
+pub(super) fn l2_delivery() -> (N, ObjId, ObjId, Syscall) {
     let mut machine = one_node(Arch::X86_64, 3);
     machine.locking = crate::Locking::L2;
     // An MSI's claim then asks no unit, so it ends in its call.
@@ -739,7 +739,7 @@ fn l2_delivery() -> (N, ObjId, ObjId, Syscall) {
 }
 
 /// The first lock a call tries, as it runs with no lock held elsewhere.
-fn first_try(k: &N, thread: ObjId, call: &Syscall) -> LockId {
+pub(super) fn first_try(k: &N, thread: ObjId, call: &Syscall) -> LockId {
     let mut dry = k.m.clone();
     let _ = dry.apply(thread, call.clone());
     dry.locks

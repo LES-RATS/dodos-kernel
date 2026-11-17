@@ -439,15 +439,17 @@ impl Model {
         for (&id, space) in &self.aspaces {
             let io = self.iospaces.contains_key(&id);
             let class = |level: u32| match io {
-                true => Some(dodos_abi::PageClass::IOSPACE_TABLE),
+                true => dodos_abi::PageClass::iospace_table(level as u8),
                 false => dodos_abi::PageClass::table(level as u8),
             };
             if let Some(root) = space.root {
-                let top = match io {
-                    true => 0,
-                    false => table.geometry.levels,
+                // An iospace's root counts the devices whose attach word
+                // names it (D-137).
+                let class = match io {
+                    true => dodos_abi::PageClass::iospace_root(table.attached_to(root)),
+                    false => class(table.geometry.levels),
                 };
-                tables.insert(root / page, class(top));
+                tables.insert(root / page, class);
             }
             for (&(level, _), &at) in &space.hooked {
                 tables.insert(at / page, class(level));
@@ -463,8 +465,7 @@ impl Model {
             let stored = table.classes.get(page);
             match class {
                 Some(class) => stored == Some(class),
-                None => stored
-                    .is_some_and(|c| *c == dodos_abi::PageClass::IOSPACE_TABLE || c.raw() > 16),
+                None => stored.is_some_and(|c| c.raw() > 16 && c.root_devices().is_none()),
             }
         });
         ensure(classes_right, "59: page classes")?;

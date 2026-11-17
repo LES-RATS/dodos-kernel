@@ -556,13 +556,18 @@ pub(super) fn judged(
     refused
 }
 
-/// A page of a node's floor made an iospace table, as an iospace's root
-/// (G9): what a correct requester names in an attach.
-pub(super) fn iospace_root(m: &mut S, node: u16) -> u64 {
+/// A page of a node's floor made an iospace's root, with `device` pinned to
+/// it by the node's gate (G9, the attach word, D-137): what a correct
+/// requester names in an attach.
+pub(super) fn iospace_root(m: &mut S, node: u16, device: u16) -> u64 {
     let at = m.sys.canonical().floors[node as usize][0].0;
     m.sys.edit_table(|t| {
+        let pinned = dodos_abi::AttachWord::new(dodos_abi::AttachState::Pinned, at);
+        t.attach
+            .insert(u32::from(device), pinned.expect("a root").raw());
         let page = at / t.geometry.page();
-        std::sync::Arc::make_mut(&mut t.classes).insert(page, dodos_abi::PageClass::IOSPACE_TABLE);
+        let class = dodos_abi::PageClass::iospace_root(t.attached_to(at));
+        std::sync::Arc::make_mut(&mut t.classes).insert(page, class.expect("a count"));
     });
     at
 }
@@ -590,7 +595,7 @@ fn the_holder_refuses_an_attach_under_a_domain_number_of_another_node() {
     hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let other = *m.sys.node(holder).domain_range(0, third).start();
-    let root = iospace_root(&mut m, requester);
+    let root = iospace_root(&mut m, requester, 0x10);
     let attach = |domain| crate::rings::UnitOp::Attach {
         device: 0x10,
         domain,
@@ -620,7 +625,7 @@ fn the_holder_refuses_a_detach_of_a_context_entry_of_another_node() {
     let (mut m, holder, requester, third) = holder_requester_third();
     hold_identifier(&mut m, third, 0x10);
     let domain = *m.sys.node(holder).domain_range(0, third).start();
-    let root = iospace_root(&mut m, third);
+    let root = iospace_root(&mut m, third, 0x10);
     let attach = crate::rings::UnitOp::Attach {
         device: 0x10,
         domain,

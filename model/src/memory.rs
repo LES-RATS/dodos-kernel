@@ -183,19 +183,21 @@ impl Model {
         }
         let page = geometry.page();
         for (at, level) in classes {
+            // G2: a table of the class of the level it is hooked at, an
+            // iospace's as *iospace table of level k* (D-137).
             let class = match io {
-                true => dodos_abi::PageClass::IOSPACE_TABLE,
+                true => dodos_abi::PageClass::iospace_table(level as u8).expect("a level"),
                 false => dodos_abi::PageClass::table(level as u8).expect("a level"),
             };
             self.table.set_class(at / page, Some(class));
         }
     }
 
-    /// The class of the root table of a space: a page table of level *L*,
-    /// or an iospace table.
+    /// The class of the root table of a new space: a page table of level
+    /// *L*, or an iospace root with no device attached (D-137).
     pub(crate) fn root_class(&self, space: ObjId) -> dodos_abi::PageClass {
         match self.iospaces.contains_key(&space) {
-            true => dodos_abi::PageClass::IOSPACE_TABLE,
+            true => dodos_abi::PageClass::iospace_root(0).expect("0 devices"),
             false => {
                 let levels = self.machine.geometry.levels as u8;
                 dodos_abi::PageClass::table(levels).expect("a level")
@@ -783,7 +785,7 @@ impl Model {
                 if self.unit_requests.iter().all(Option::is_some) {
                     return Err(Error::Again);
                 }
-                let domain = self.detach_local(iommu, device, true);
+                let domain = self.detach_local(iommu, device);
                 let op = crate::rings::UnitOp::Detach { device, domain };
                 let waiter = crate::units::Waiter::Thread(Some(thread));
                 self.unit_request(role, op, waiter, None)?;
@@ -825,6 +827,12 @@ impl Model {
             Some(&domain) => domain,
             None => self.free_domain(unit.unit).ok_or(Error::Busy)?,
         };
+        // A device whose attach word is not 0 is still being detached: its
+        // owner's gate pins a root only from 0 (IOMMU, the attach word,
+        // D-137).
+        if self.table.attach_word(key) != dodos_abi::AttachWord::NONE {
+            return Err(Error::Busy);
+        }
         // A call that finds no free entry of the unit request table returns
         // `again` with nothing changed.
         if self.unit_requests.iter().all(Option::is_some) {
@@ -834,7 +842,16 @@ impl Model {
             dodos_abi::Owner::Node(self.node),
             self.table.generation(self.node),
         );
+        // In one gate call: the identifier word taken, the attach word
+        // pinned with the iospace's root, the root's count of devices
+        // raised (D-137).
         self.table.write_identifier(self.node, key, Some(taken));
+        let root = self.aspaces[&iospace].root.unwrap_or(0);
+        let pinned = dodos_abi::AttachWord::new(dodos_abi::AttachState::Pinned, root);
+        let pinned = pinned.expect("a root aligned on a page");
+        self.table
+            .swap_attach(key, dodos_abi::AttachWord::NONE, pinned);
+        self.set_root_class(root);
         self.domains.insert(iospace, domain);
         live(&mut self.iospaces, iospace).push((iommu, device));
         let unit = live(&mut self.iommus, iommu);
@@ -847,7 +864,6 @@ impl Model {
         // The context entry, written by the holder of the unit's role: a
         // unit request, which the thread waits for.
         let role = self.unit_role(unit);
-        let root = self.aspaces[&iospace].root.unwrap_or(0);
         let op = crate::rings::UnitOp::Attach {
             device,
             domain,
@@ -866,14 +882,54 @@ impl Model {
         if !self.unit_failed(role) && self.unit_requests.iter().all(Option::is_some) {
             return Err(Error::Again);
         }
-        // On a failed unit the identifier word stays taken by this node.
+        // The identifier word and the attach word change only at the answer
+        // (D-137); on a failed unit they stay as they are.
         let failed = self.unit_failed(role);
-        let domain = self.detach_local(iommu, device, !failed);
+        let domain = self.detach_local(iommu, device);
         if !failed {
             let op = crate::rings::UnitOp::Detach { device, domain };
             self.unit_request(role, op, crate::units::Waiter::Thread(None), None)?;
         }
         Ok(())
+    }
+
+    /// The class of an iospace's root: 48 + the devices whose attach word
+    /// names it (G2, D-137), written by the owner's gate.
+    pub(crate) fn set_root_class(&mut self, root: u64) {
+        let devices = self.table.attached_to(root);
+        let class = dodos_abi::PageClass::iospace_root(devices).expect("at most 16 devices");
+        self.table
+            .set_class(root / self.machine.geometry.page(), Some(class));
+    }
+
+    /// At the answer done of a detach: the owner's gate writes the attach
+    /// word 0 from *pinned* or *detached*, never from *attached*, lowers the
+    /// root's count and writes the identifier word *free*, unclaimed
+    /// (D-137).
+    pub(crate) fn detach_done(&mut self, role: usize, device: u16) {
+        let Some(key) = self.attach_key(role, device) else {
+            return;
+        };
+        let word = self.table.attach_word(key);
+        let ended = matches!(
+            word.state(),
+            Some(dodos_abi::AttachState::Pinned | dodos_abi::AttachState::Detached)
+        );
+        if ended
+            && self
+                .table
+                .swap_attach(key, word, dodos_abi::AttachWord::NONE)
+        {
+            self.table.write_identifier(self.node, key, None);
+            self.set_root_class(word.root());
+        }
+    }
+
+    /// The identifier word of the device of the unit that a role governs.
+    pub(crate) fn attach_key(&self, role: usize, device: u16) -> Option<u32> {
+        let record = self.table.role_records[role];
+        (record.governs == dodos_abi::Governs::IommuUnit)
+            .then(|| self.identifier_key(usize::from(record.object), device))
     }
 
     /// The identifier word of a device of an IOMMU unit: its segment and its
@@ -913,12 +969,7 @@ impl Model {
     /// The node's own record of a detach, and its report; the identifier
     /// word becomes free and unclaimed. Returns the iospace's domain
     /// number, freed with its last device.
-    fn detach_local(&mut self, iommu: ObjId, device: u16, free: bool) -> u16 {
-        let index = self.iommus[&iommu].unit;
-        let key = self.identifier_key(index, device);
-        if free {
-            self.table.write_identifier(self.node, key, None);
-        }
+    fn detach_local(&mut self, iommu: ObjId, device: u16) -> u16 {
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);
         let iospace = unit.attached.remove(&device);

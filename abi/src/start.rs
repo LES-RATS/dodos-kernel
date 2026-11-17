@@ -336,8 +336,8 @@ pub struct StartIommu {
     pub role: u32,
 }
 
-/// Where the living part lies in the frame of slot 13, and its sizes (88
-/// bytes since D-135, 80 since D-129).
+/// Where the living part lies in the frame of slot 13, and its sizes (96
+/// bytes since D-137, 88 since D-135, 80 since D-129).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartMachine {
@@ -371,12 +371,16 @@ pub struct StartMachine {
     /// and their number (Interrupts, D-135; layout 3).
     pub lines: u32,
     pub line_count: u32,
+    /// The offset of the attach words, one `AttachWord` per device
+    /// identifier, beside the identifier words (IOMMU, D-137; layout 4).
+    pub attach_words: u32,
+    pub reserved: u32,
 }
 
 /// The layout version of the living part that `StartMachine` describes.
-/// 3 since the line words (D-135), 2 since the fence records (pass 16), 1
-/// since D-129.
-pub const START_MACHINE_LAYOUT: u32 = 3;
+/// 4 since the attach words (D-137), 3 since the line words (D-135), 2
+/// since the fence records (pass 16), 1 since D-129.
+pub const START_MACHINE_LAYOUT: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

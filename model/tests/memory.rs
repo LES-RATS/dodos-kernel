@@ -753,6 +753,10 @@ fn destroying_an_iospace_detaches_its_devices_then_empties_its_records() {
     // 16 devices and 16 records in the first call; the device of slot 0x10
     // was attached first and is detached in it.
     k.no(Syscall::CapDelete(s(30)), Error::Again);
+    // The device is being detached: its attach word is not 0 until the
+    // detach's answer (D-137).
+    k.no(attach(31, 0x10), Error::Busy);
+    k.m.settle();
     k.ok(attach(31, 0x10));
     // The first record is still full.
     k.no(iomap(31, 40, 0, 1, R), Error::Busy);
@@ -789,9 +793,12 @@ fn removing_the_iommu_root_destroys_nothing_and_keeps_the_devices() {
     }
     k.ok(Syscall::CapDelete(s(IOMMU)));
     assert_eq!(k.m.census().devices, 40);
-    // Destroying an iospace still detaches its devices.
-    k.ok(Syscall::CapDelete(s(32)));
+    // Destroying an iospace still detaches its devices: its root goes once
+    // their detaches are answered (D-137).
+    k.no(Syscall::CapDelete(s(32)), Error::Again);
     assert_eq!(k.m.census().devices, 32);
+    k.m.settle();
+    k.ok(Syscall::CapDelete(s(32)));
 }
 
 #[test]

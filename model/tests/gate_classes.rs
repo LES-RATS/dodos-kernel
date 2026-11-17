@@ -174,17 +174,20 @@ fn a_table_taken_again_from_the_free_list_takes_the_class_of_its_new_level() {
 }
 
 #[test]
-fn iospace_tables_are_of_class_iospace_table() {
+fn an_iospace_root_is_of_class_root_with_0_devices_and_its_tables_of_their_level() {
     let (mut m, t, base) = with_space(IoSpace);
     let page = m.geometry().page();
-    assert_eq!(m.page_class(base), PageClass::IOSPACE_TABLE);
+    // D-137: the root counts its devices; each lower table has the class
+    // of its level.
+    assert_eq!(Some(m.page_class(base)), PageClass::iospace_root(0));
     ok(
         &mut m,
         t,
         retype(common::UNTYPED, Frame, PageSize::Page, 1, 160),
     );
     ok(&mut m, t, map(IoSpace, s(160), BLOCK, AT, 1));
-    assert_eq!(m.page_class(base + 2 * page), PageClass::IOSPACE_TABLE);
+    let level = m.page_class(base + 2 * page).iospace_level();
+    assert!(level.is_some_and(|l| l >= 1), "{level:?}");
     let chunk = base >> m.geometry().chunk_shift();
     assert!(GateWord::from_raw(m.gate_word(chunk)).unwrap().not_data() >= 2);
 }

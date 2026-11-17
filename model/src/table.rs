@@ -303,6 +303,9 @@ pub(crate) struct Table {
     /// The identifier words of the devices, by segment << 16 | identifier,
     /// as raw ownership words; one not listed is free and unclaimed.
     pub(crate) identifiers: BTreeMap<u32, u64>,
+    /// The attach words, by segment << 16 | identifier, as raw words; one
+    /// not listed is 0 (IOMMU, D-137).
+    pub(crate) attach: BTreeMap<u32, u64>,
     /// The line words, by GSI, as raw ownership words; one not listed is
     /// free and unclaimed (Interrupts, D-135).
     pub(crate) lines: BTreeMap<u32, u64>,
@@ -648,6 +651,42 @@ impl Table {
             None => self.identifiers.remove(&key),
         };
         self.writes.push(write);
+    }
+
+    /// The attach word of a device identifier, 0 if it is not listed.
+    pub(crate) fn attach_word(&self, key: u32) -> dodos_abi::AttachWord {
+        let raw = self.attach.get(&key).copied().unwrap_or(0);
+        dodos_abi::AttachWord::from_raw(raw).unwrap_or(dodos_abi::AttachWord::NONE)
+    }
+
+    /// A compare-and-swap of an attach word through a gate: written only if
+    /// it reads `before` (IOMMU, D-137). Returns whether it was written.
+    pub(crate) fn swap_attach(
+        &mut self,
+        key: u32,
+        before: dodos_abi::AttachWord,
+        after: dodos_abi::AttachWord,
+    ) -> bool {
+        if self.attach_word(key) != before {
+            return false;
+        }
+        match after == dodos_abi::AttachWord::NONE {
+            true => self.attach.remove(&key),
+            false => self.attach.insert(key, after.raw()),
+        };
+        true
+    }
+
+    /// The devices whose attach word names `root`: the *n* of the root's
+    /// class (G2, D-137).
+    pub(crate) fn attached_to(&self, root: u64) -> u8 {
+        let words = self
+            .attach
+            .values()
+            .filter_map(|&raw| dodos_abi::AttachWord::from_raw(raw));
+        words
+            .filter(|w| w.state().is_some() && w.root() == root)
+            .count() as u8
     }
 
     /// The line word of a GSI, free and unclaimed if it is not listed.

@@ -283,9 +283,13 @@ impl Model {
         self.check_events()
     }
 
-    /// 88. a device is attached to an iospace of this node exactly while
-    ///     its identifier word reads taken by this node's generation
-    ///     (IOMMU: a device identifier has an owner).
+    /// 88. a device is attached to an iospace of this node, or is being
+    ///     detached (its attach word not 0, D-137), exactly while its
+    ///     identifier word reads taken by this node's generation (IOMMU: a
+    ///     device identifier has an owner); an attach word that is not 0
+    ///     sits beside an identifier word taken by some generation, and
+    ///     names a root of class 48 + n with n at least the words that name
+    ///     it (D-137).
     fn check_identifiers(&self) -> Check {
         let generation = self.table.generation(self.node);
         let taken =
@@ -304,6 +308,23 @@ impl Model {
             .filter(|&(_, &raw)| raw == taken)
             .map(|(&key, _)| key)
             .collect();
+        for (&key, &raw) in &self.table.attach {
+            let word = dodos_abi::AttachWord::from_raw(raw);
+            let named = self.table.identifiers.get(&key).copied();
+            let owned = named
+                .and_then(dodos_abi::Ownership::from_raw)
+                .is_some_and(|w| w.state() == dodos_abi::OwnState::Taken);
+            let root = word.map_or(0, |w| w.root()) / self.table.geometry.page();
+            let class = self.table.classes.get(&root).copied();
+            let counted = class.and_then(dodos_abi::PageClass::root_devices);
+            if word.is_none_or(|w| w.state().is_none()) || !owned || counted.is_none_or(|n| n == 0)
+            {
+                return Err("88: an attach word with no identifier word or root beside it");
+            }
+            if raw != 0 && named == Some(taken) {
+                attached.insert(key);
+            }
+        }
         match held == attached {
             true => Ok(()),
             false => Err("88: identifier words and attached devices"),

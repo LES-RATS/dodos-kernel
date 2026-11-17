@@ -951,9 +951,13 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, fence_records),
         offset_of!(StartMachine, lines),
         offset_of!(StartMachine, line_count),
+        offset_of!(StartMachine, attach_words),
     ];
-    assert_eq!(machine, [28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84]);
-    assert_eq!(START_MACHINE_LAYOUT, 3);
+    assert_eq!(
+        machine,
+        [28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88]
+    );
+    assert_eq!(START_MACHINE_LAYOUT, 4);
     let node = [
         offset_of!(StartNode, slot),
         offset_of!(StartNode, slots),
@@ -1085,7 +1089,7 @@ fn layouts_are_fixed() {
     assert_eq!(ranges, [0, 1, 2, 3, 4]);
     assert_eq!(size_of::<StartMemory>(), 56);
     assert_eq!(size_of::<StartIommu>(), 16);
-    assert_eq!(size_of::<StartMachine>(), 88);
+    assert_eq!(size_of::<StartMachine>(), 96);
     assert_eq!(size_of::<StartRole>(), 8);
     assert_eq!(size_of::<StartImage>(), 48);
     assert_eq!(size_of::<StartKindRecord>(), 56);
@@ -1848,22 +1852,42 @@ fn page_classes_have_their_bytes_and_the_rules_of_g3() {
         PageClass::GATE,
         PageClass::GLOBAL_READ_ONLY,
         PageClass::DEVICE,
-        PageClass::IOSPACE_TABLE,
     ]
     .map(PageClass::raw);
-    assert_eq!(raw, [0, 1, 2, 3, 4]);
+    assert_eq!(raw, [0, 1, 2, 3]);
+    // D-137: an iospace table of level k is 32 + k, an iospace root with n
+    // devices attached 48 + n, n up to 16; the former 4 names no class.
+    assert_eq!(PageClass::iospace_table(1).map(PageClass::raw), Some(33));
+    assert_eq!(PageClass::iospace_table(0), None);
+    assert_eq!(PageClass::iospace_table(9), None);
+    assert_eq!(PageClass::iospace_root(0).map(PageClass::raw), Some(48));
+    assert_eq!(PageClass::iospace_root(16).map(PageClass::raw), Some(64));
+    assert_eq!(PageClass::iospace_root(17), None);
+    assert_eq!(PageClass::from_raw(4), None);
+    let root = PageClass::iospace_root(3).unwrap();
+    assert_eq!((root.root_devices(), root.iospace_level()), (Some(3), None));
+    let lower = PageClass::iospace_table(2).unwrap();
+    assert_eq!(
+        (lower.root_devices(), lower.iospace_level()),
+        (None, Some(2))
+    );
     assert_eq!(PageClass::table(1).map(PageClass::raw), Some(17));
     assert_eq!(PageClass::table(0), None);
     assert_eq!(PageClass::table(9), None);
     for byte in [5, 16, 25, 255] {
         assert_eq!(PageClass::from_raw(byte), None, "{byte}");
     }
-    // DeepSeek F11 of the seventh review: the page classes hold 0, 4 and
-    // 16 + k; gate, global read-only and device pages lie in no chunk.
+    // DeepSeek F11 of the seventh review: the page classes hold 0, 16 + k,
+    // and since D-137 32 + k and 48 + n; gate, global read-only and device
+    // pages lie in no chunk.
     let stored: Vec<u8> = (0..=255)
         .filter(|&b| PageClass::stored(b).is_some())
         .collect();
-    assert_eq!(stored, [0, 4, 17, 18, 19, 20, 21, 22, 23, 24]);
+    let mut expected: Vec<u8> = Vec::from([0]);
+    expected.extend(17..=24);
+    expected.extend(33..=40);
+    expected.extend(48..=64);
+    assert_eq!(stored, expected);
     let leaf = |write, exec, device_type| Leaf {
         write,
         exec,
@@ -1883,12 +1907,41 @@ fn page_classes_have_their_bytes_and_the_rules_of_g3() {
     assert!(!device.permits(leaf(false, false, false)));
     for class in [
         PageClass::GATE,
-        PageClass::IOSPACE_TABLE,
+        PageClass::iospace_table(1).unwrap(),
+        PageClass::iospace_root(1).unwrap(),
         PageClass::table(1).unwrap(),
         PageClass::table(4).unwrap(),
     ] {
         assert!(!class.permits(leaf(false, false, false)), "{class:?}");
     }
+}
+
+/// D-137: the attach word of a device identifier, 0 or a state and the
+/// root's page-aligned address; a state 0 with an address, or an address
+/// not aligned on a page, fails its check.
+#[test]
+fn an_attach_word_holds_a_state_and_a_page_aligned_root() {
+    use crate::{AttachState, AttachWord};
+    assert_eq!(AttachWord::from_raw(0), Some(AttachWord::NONE));
+    assert_eq!(AttachWord::NONE.state(), None);
+    for state in [
+        AttachState::Pinned,
+        AttachState::Attached,
+        AttachState::Detached,
+    ] {
+        let word = AttachWord::new(state, 0x1234_5000).unwrap();
+        assert_eq!((word.state(), word.root()), (Some(state), 0x1234_5000));
+        assert_eq!(AttachWord::from_raw(word.raw()), Some(word));
+    }
+    assert_eq!(
+        AttachWord::new(AttachState::Pinned, 0x1000).map(AttachWord::raw),
+        Some(0x1001)
+    );
+    assert_eq!(AttachWord::new(AttachState::Pinned, 0), None);
+    assert_eq!(AttachWord::new(AttachState::Pinned, 0x1800), None);
+    assert_eq!(AttachWord::from_raw(0x1000), None);
+    assert_eq!(AttachWord::from_raw(0x1006), None);
+    assert_eq!(AttachWord::from_raw(2), None);
 }
 
 /// DeepSeek F4: the map count is the low 32 bits of the gate word.

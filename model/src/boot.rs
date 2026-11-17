@@ -977,6 +977,7 @@ impl Machine {
             devices: std::sync::Arc::new(layout.devices.clone()),
             device_leaves: std::sync::Arc::new(vec![0; layout.devices.len()]),
             identifiers: Default::default(),
+            attach: Default::default(),
             lines: Default::default(),
             members,
             roles: roles.clone(),

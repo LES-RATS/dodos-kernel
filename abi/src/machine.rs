@@ -130,8 +130,10 @@ pub const SLOT_RECORD_PARTIAL: u64 = 1 << 5;
 pub const SLOT_FRAME_ASKED_MASK: u64 = 0xfff;
 
 /// The class of a page (The gate over page tables, G2), one byte per page
-/// of ordinary memory: 0 data, 1 gate, 2 global read-only, 3 device, 4
-/// iospace table, 16 + k a page table of level k.
+/// of ordinary memory: 0 data, 1 gate, 2 global read-only, 3 device, 16 + k
+/// a page table of level k, 32 + k an iospace table of level k, 48 + n an
+/// iospace root with n devices attached (D-137; 4, *iospace table*, is no
+/// longer a class).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageClass(u8);
@@ -150,7 +152,6 @@ impl PageClass {
     pub const GATE: Self = Self(1);
     pub const GLOBAL_READ_ONLY: Self = Self(2);
     pub const DEVICE: Self = Self(3);
-    pub const IOSPACE_TABLE: Self = Self(4);
 
     /// A page table of level `level`, 1 (its entries are pages) to 8.
     pub const fn table(level: u8) -> Option<Self> {
@@ -160,13 +161,49 @@ impl PageClass {
         }
     }
 
+    /// An iospace table of level `level`, 1 (its entries are pages) to 8,
+    /// below its root (D-137).
+    pub const fn iospace_table(level: u8) -> Option<Self> {
+        match level {
+            1..=8 => Some(Self(32 + level)),
+            _ => None,
+        }
+    }
+
+    /// The root of an iospace with `devices` devices pinned or attached to
+    /// it, 0 to 16 (D-137).
+    pub const fn iospace_root(devices: u8) -> Option<Self> {
+        match devices {
+            0..=16 => Some(Self(48 + devices)),
+            _ => None,
+        }
+    }
+
+    /// The level of an iospace table, `None` for any other class.
+    pub const fn iospace_level(self) -> Option<u8> {
+        match self.0 {
+            33..=40 => Some(self.0 - 32),
+            _ => None,
+        }
+    }
+
+    /// The devices pinned or attached to an iospace root, `None` for any
+    /// other class.
+    pub const fn root_devices(self) -> Option<u8> {
+        match self.0 {
+            48..=64 => Some(self.0 - 48),
+            _ => None,
+        }
+    }
+
     /// `None` for a byte the page classes may not hold (G2): the stored
-    /// classes are *data*, *iospace table* and *page table of level k*; a
-    /// *gate*, *global read-only* or *device* page lies in no chunk, and its
-    /// class follows from where it lies.
+    /// classes are *data*, *page table of level k*, *iospace table of level
+    /// k* and *iospace root with n devices attached*; a *gate*, *global
+    /// read-only* or *device* page lies in no chunk, and its class follows
+    /// from where it lies.
     pub const fn stored(raw: u8) -> Option<Self> {
         match raw {
-            0 | 4 | 17..=24 => Some(Self(raw)),
+            0 | 17..=24 | 33..=40 | 48..=64 => Some(Self(raw)),
             _ => None,
         }
     }
@@ -174,7 +211,7 @@ impl PageClass {
     /// `None` for a byte that names no class.
     pub const fn from_raw(raw: u8) -> Option<Self> {
         match raw {
-            0..=4 | 17..=24 => Some(Self(raw)),
+            0..=3 | 17..=24 | 33..=40 | 48..=64 => Some(Self(raw)),
             _ => None,
         }
     }
@@ -196,6 +233,68 @@ impl PageClass {
             3 => !leaf.exec && leaf.device_type,
             _ => false,
         }
+    }
+}
+
+/// The state of an attach word (IOMMU, D-137).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachState {
+    /// The owner's gate pinned the root: an attach may be served.
+    Pinned = 1,
+    /// The holder's gate wrote a context entry that names the root.
+    Attached = 2,
+    /// The holder's gate cleared the entry and its invalidation is done.
+    Detached = 3,
+}
+
+/// The attach word of a device identifier, beside its identifier word in
+/// the living part (IOMMU, D-137): 0, or the state in bits 0-1 and the
+/// physical address of the iospace's root, aligned on a page, in the other
+/// bits. Changed only by compare-and-swap through a gate.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachWord(u64);
+
+impl AttachWord {
+    pub const NONE: Self = Self(0);
+    /// The address bits that a page of the smallest size leaves 0.
+    const LOW: u64 = 0xfff;
+
+    /// `None` for a root of 0 or not aligned on the smallest page.
+    pub const fn new(state: AttachState, root: u64) -> Option<Self> {
+        if root == 0 || root & Self::LOW != 0 {
+            return None;
+        }
+        Some(Self(root | state as u64))
+    }
+
+    /// `None` for a word that fails its check: a state 0 with an address,
+    /// a state with no address, or a bit set between the state and the
+    /// address.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        let root = raw & !Self::LOW;
+        match (raw & 0b11, root, raw & Self::LOW & !0b11) {
+            (0, 0, 0) => Some(Self::NONE),
+            (1..=3, 1.., 0) => Some(Self(raw)),
+            _ => None,
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn state(self) -> Option<AttachState> {
+        match self.0 & 0b11 {
+            1 => Some(AttachState::Pinned),
+            2 => Some(AttachState::Attached),
+            3 => Some(AttachState::Detached),
+            _ => None,
+        }
+    }
+
+    pub const fn root(self) -> u64 {
+        self.0 & !Self::LOW
     }
 }
 
@@ -1353,6 +1452,28 @@ pub const fn ioport_check(
 /// Whether two ranges of ports, inclusive, meet.
 pub const fn ports_meet(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
+}
+
+#[cfg(kani)]
+mod attach_word_proofs {
+    use super::{AttachState, AttachWord};
+
+    /// An attach word reads back what its constructor writes, for every
+    /// state and every root it accepts (D-137).
+    #[kani::proof]
+    fn an_attach_word_reads_back_what_new_writes() {
+        let state = match kani::any::<u8>() % 3 {
+            0 => AttachState::Pinned,
+            1 => AttachState::Attached,
+            _ => AttachState::Detached,
+        };
+        let root: u64 = kani::any();
+        if let Some(word) = AttachWord::new(state, root) {
+            assert_eq!(AttachWord::from_raw(word.raw()), Some(word));
+            assert_eq!(word.state(), Some(state));
+            assert_eq!(word.root(), root);
+        }
+    }
 }
 
 #[cfg(kani)]

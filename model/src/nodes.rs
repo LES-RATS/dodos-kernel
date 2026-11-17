@@ -1331,7 +1331,23 @@ impl Model {
                             self.table.uses[node as usize].remove(&index);
                         }
                         (None, Some(gsi)) => self.table.write_line(self.node, gsi, None),
-                        (None, None) => cursor = Clear { phase: 4, index: 0 },
+                        (None, None) => {
+                            // Then the attach words beside the identifier
+                            // words its generation took: 0, the barrier
+                            // holding, so after every holder's R1 (D-137).
+                            let attached = self
+                                .table
+                                .attach
+                                .keys()
+                                .copied()
+                                .find(|key| self.table.identifiers.get(key) == Some(&taken));
+                            match attached {
+                                Some(key) => {
+                                    self.table.attach.remove(&key);
+                                }
+                                None => cursor = Clear { phase: 4, index: 0 },
+                            }
+                        }
                     }
                 }
                 // Every core word that names its generation: free, keeping

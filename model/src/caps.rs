@@ -1010,7 +1010,22 @@ impl Model {
                             _ => self.empty_mapping(cap),
                         }
                     }
-                    (None, None) => return Undone::Nothing,
+                    // A detach is a unit request: the root is not removed
+                    // while one is in flight, so the attach words of its
+                    // devices read 0 (or the unit failed) before the root
+                    // can turn back into data (D-137).
+                    (None, None) => {
+                        let units = self.aspaces[&object].units.clone();
+                        let roles: Vec<usize> = units.iter().map(|&u| self.unit_role(u)).collect();
+                        let pending = self.unit_requests.iter().flatten().any(|e| {
+                            roles.contains(&e.role)
+                                && matches!(e.op, crate::rings::UnitOp::Detach { .. })
+                        });
+                        if pending {
+                            return Undone::Wait;
+                        }
+                        return Undone::Nothing;
+                    }
                 }
             }
             _ => return Undone::Nothing,
@@ -1104,9 +1119,13 @@ impl Model {
                 let space = self.aspaces.remove(&id).expect("names a live entry");
                 self.iospaces.remove(&id);
                 self.domains.remove(&id);
-                // G2: the gate turns the table pages back into data.
+                // G2: the gate turns the table pages back into data, only
+                // once the root's count of devices is 0; a detach answered
+                // *failed* leaves the attach word *attached*, and the pages
+                // keep their class until the machine restarts (D-137).
                 let page = self.machine.geometry.page();
-                for at in space.table_pages() {
+                let pinned = space.root.is_some_and(|r| self.table.attached_to(r) > 0);
+                for at in space.table_pages().filter(|_| !pinned) {
                     self.table.set_class(at / page, None);
                 }
                 for untyped in object

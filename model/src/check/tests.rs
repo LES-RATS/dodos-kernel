@@ -2437,7 +2437,7 @@ fn a_leaf_whose_page_class_refuses_it_is_denied_by_the_call() {
     m.table.set_class(frame.base / page, None);
     assert_eq!(m.apply(t, map_frame(Rights::READ)), Err(Error::Busy));
     m.table
-        .set_class(frame.base / page, Some(dodos_abi::PageClass::IOSPACE_TABLE));
+        .set_class(frame.base / page, dodos_abi::PageClass::iospace_table(1));
     m.machine.map_count_max = dodos_abi::MAP_COUNT_MAX;
     assert_eq!(m.apply(t, map_frame(Rights::READ)), Err(Error::Denied));
     let (mut m, t, frame) = with_frame();

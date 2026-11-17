@@ -739,6 +739,7 @@ impl Model {
         };
         let part = &mut self.cores[position];
         part.silent = false;
+        let part = &mut self.cores[position];
         part.tlb.clear();
         part.kernel_tlb.clear();
         part.cached.0 = (u64::MAX, None);
@@ -755,6 +756,28 @@ impl Model {
                 .write_core(number, before, CoreWordOf::owned(self.node, generation));
         }
         self.enter_idle(position);
+        // The core answers again: a context of it throttled while it was
+        // silent, whose replenishment instant has passed, is replenished at
+        // once ("If that instant is not after now, it is replenished at
+        // once"; finding 4 of the tenth model review, finding 15 of the
+        // ninth: invariant 43 failed at a resume).
+        let now = self.now;
+        let late: Vec<(ObjId, u64)> = self
+            .scheds
+            .iter()
+            .filter(|(_, sched)| sched.core == position)
+            .filter_map(|(&id, sched)| {
+                let (instant, n) = sched.throttled?;
+                (instant <= now).then_some((id, n))
+            })
+            .collect();
+        if !late.is_empty() {
+            let entry = self.begin_on(position);
+            for (context, n) in late {
+                self.replenish(context, n);
+            }
+            self.end(entry);
+        }
         if self.ready {
             return;
         }
