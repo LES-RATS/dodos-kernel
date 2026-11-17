@@ -1321,6 +1321,14 @@ impl Model {
         self.table.gate_word(chunk).raw()
     }
 
+    /// Whether a thread's breakpoint control word enables a breakpoint, so
+    /// that a hit, a fault of kind 9, can be given to `Model::fault`.
+    pub fn breakpoint_enabled(&self, thread: ObjId) -> bool {
+        self.threads
+            .get(&thread)
+            .is_some_and(|t| t.regs[dodos_abi::x86_64::REG_DR7] & 0xFF != 0)
+    }
+
     /// The leaf count of an entry of the device table (G4).
     pub fn device_leaves(&self, index: usize) -> u64 {
         self.table.device_leaves[index]

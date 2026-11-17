@@ -131,14 +131,7 @@ fn an_attach_pins_its_root_and_a_detach_unpins_it_only_at_its_answer() {
     // A detach: answered done once the holder has written detached; the
     // owner then writes 0, the identifier word free and the count 0.
     let detach = super::units::attach(&m, 0, 0, DEVICE);
-    let detach = match detach {
-        Syscall::IoSpaceAttach { iommu, device, .. } => Syscall::IoSpaceAttach {
-            iommu,
-            iospace: SlotAddr::NONE,
-            device,
-        },
-        other => other,
-    };
+    let detach = super::pass17::detach_of(detach);
     assert_eq!(m.call(0, detach), WAITS);
     assert_ne!(m.sys.canonical().attach_word(key), AttachWord::NONE);
     m.run(30 * MS);
@@ -562,7 +555,7 @@ fn a_table_unhooked_by_an_unmap_joins_the_free_list_only_at_the_completion_of_it
 
 #[test]
 fn the_removal_of_a_lines_irq_waits_while_an_entry_still_asks_for_that_line() {
-    let (mut m, holder, a, _) = holder_requester_third();
+    let (mut m, _, a, _) = holder_requester_third();
     let claim = Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
         source: dodos_abi::IrqSource::line(5, false, false).raw(),
@@ -570,15 +563,13 @@ fn the_removal_of_a_lines_irq_waits_while_an_entry_still_asks_for_that_line() {
         vector: 48,
         destination: s(210),
     };
-    let claimed = m.call(a, claim);
-    if claimed == WAITS {
-        m.settle();
-    }
-    let _ = holder;
+    super::pass17::succeeds(&mut m, a, claim, 30 * MS);
     let thread = m.t[a as usize];
+    assert_eq!(m.sys.check(), Ok(()));
     let node = m.sys.node_mut(a);
     let irq = node.object_at(thread, s(210)).expect("the irq");
-    // An entry still asks the line's redirection entry.
+    // An entry still asks the line's redirection entry: the claim of a
+    // remapped line queues it after its last unit (its `then`, gap 12).
     let index = node.unit_requests.iter().position(Option::is_none).unwrap();
     node.unit_requests[index] = Some(crate::units::UnitEntry {
         role: node.ioapic_role(5).unwrap(),
@@ -599,8 +590,10 @@ fn the_removal_of_a_lines_irq_waits_while_an_entry_still_asks_for_that_line() {
         failed: false,
         then: None,
     });
+    assert_eq!(node.check(), Ok(()), "the entry is one the check accepts");
     assert!(matches!(node.irq_removal(irq), crate::caps::Undone::Wait));
     assert!(!node.irqs[&irq].removing);
+    assert_eq!(m.sys.check(), Ok(()));
 }
 
 // The `Report` of a line carries the operands of its operation 5 claimed;
@@ -633,8 +626,8 @@ fn a_new_holder_of_an_ioapic_rewrites_a_reported_lines_entry_from_its_operands()
 /// Node 2 grants node 0 `4 × rounds` frames, then is killed; node 0's
 /// recovery runs until it acknowledges node 2. Node 0 holds no unit role
 /// then (node 1 holds the IOMMU's, node 2 the IOAPIC's), so its R1 is done
-/// at once and only R2 and R4 can hold its R5 back. Returns node 0's run
-/// blocks, the remote capabilities of node 2 it still held at the step
+/// at once and only R2 and R4 can hold its R5 back. Returns the number of
+/// node 0's run blocks taken, the remote capabilities of node 2 it still held at the step
 /// that acknowledged, and whether its audit was done then.
 fn acknowledged_after_grants(rounds: u32, blocks: u32) -> (usize, usize, bool) {
     use crate::{Message, Range, Transfer};
@@ -711,7 +704,7 @@ fn acknowledged_after_grants(rounds: u32, blocks: u32) -> (usize, usize, bool) {
             .count()
     };
     assert_eq!(held(&m), 4 * rounds as usize);
-    let blocks = m
+    let runs = m
         .sys
         .node(0)
         .untypeds
@@ -742,7 +735,7 @@ fn acknowledged_after_grants(rounds: u32, blocks: u32) -> (usize, usize, bool) {
     assert_eq!(m.sys.node(0).table.beacons[0].acked[2], generation);
     let reclaim = m.sys.node(0).reclaims.get(&2).cloned();
     let audited = reclaim.is_some_and(|r| r.audit.is_some_and(|a| a.is_empty()));
-    (blocks, held(&m), audited)
+    (runs, held(&m), audited)
 }
 
 #[test]

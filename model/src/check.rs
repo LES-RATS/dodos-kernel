@@ -44,9 +44,10 @@ pub struct Census {
     /// Devices whose detach is in flight (D-139).
     pub detaching: usize,
     /// Threads that wait on a fault, and of these, by the kind of their
-    /// fault while it is queued.
+    /// fault while it is queued, indexed by the kind's label (1 to 9;
+    /// invariant 40 bounds it, entry 0 stays 0).
     pub faulting: usize,
-    pub fault_kinds: [usize; 9],
+    pub fault_kinds: [usize; 10],
     /// Contexts throttled, lends, armed timers, threads marked as having
     /// lost their context.
     pub throttled: usize,
@@ -126,10 +127,12 @@ impl Model {
             detaching: self.iommus.values().map(|u| u.detaching.len()).sum(),
             faulting: self.threads.values().filter(|t| t.faulting).count(),
             fault_kinds: {
-                let mut kinds = [0; 9];
+                let mut kinds = [0; 10];
                 for thread in self.threads.values().filter(|t| t.faulting) {
-                    if let Wait::Call { parcel, .. } = &thread.wait {
-                        kinds[(parcel.label as usize).min(8)] += 1;
+                    if let Wait::Call { parcel, .. } = &thread.wait
+                        && let Some(kind) = kinds.get_mut(parcel.label as usize)
+                    {
+                        *kind += 1;
                     }
                 }
                 kinds
@@ -300,6 +303,7 @@ impl Model {
         self.check_table()?;
         self.check_identifiers()?;
         self.check_lines()?;
+        self.check_reclaim()?;
         self.check_cores()?;
         self.check_node()?;
         self.check_debug()?;
@@ -369,10 +373,6 @@ impl Model {
         {
             return Err("96: a line word beyond the last");
         }
-        // R0 once for each generation of each node (finding 8).
-        if self.r0_runs.values().any(|&runs| runs > 1) {
-            return Err("R0: run twice for one generation");
-        }
         let generation = self.table.generation(self.node);
         let taken =
             dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation).raw();
@@ -393,6 +393,16 @@ impl Model {
             true => Ok(()),
             false => Err("96: line words and claimed lines"),
         }
+    }
+
+    /// R0. Reclaim runs once for each generation of each node (What a
+    /// death does: R0 to R6; finding 8 of the tenth model review). Its own
+    /// check, not a part of the interrupts' (ver-D D9).
+    fn check_reclaim(&self) -> Check {
+        ensure(
+            self.r0_runs.values().all(|&runs| runs <= 1),
+            "R0: run twice for one generation",
+        )
     }
 
     fn check_tree(&self) -> Check {
@@ -714,6 +724,29 @@ impl Model {
         };
         let waiting = self.threads.values().filter(in_queue).count();
         ensure(waiting == entries, "14: a waiting thread not queued")?;
+        // A thread waiting for a unit is the waiter of its entry of the
+        // unit request table, and an entry names as waiter only a thread
+        // that waits for it: a wait that ended otherwise, or a thread
+        // destroyed, leaves no name (ver2-AD D8).
+        for (&id, thread) in &self.threads {
+            if let Wait::Unit(index) = thread.wait {
+                let entry = self.unit_requests.get(index).and_then(Option::as_ref);
+                let named =
+                    entry.is_some_and(|e| e.waiter == crate::units::Waiter::Thread(Some(id)));
+                ensure(named, "14: a wait on no unit request")?;
+            }
+        }
+        for (index, entry) in self.unit_requests.iter().enumerate() {
+            if let Some(crate::units::Waiter::Thread(Some(thread))) =
+                entry.as_ref().map(|e| &e.waiter)
+            {
+                let waits = wait(thread) == Some(&Wait::Unit(index));
+                ensure(
+                    waits,
+                    "14: a unit request names a thread that does not wait for it",
+                )?;
+            }
+        }
 
         // A range in a destroyed space is no longer within any table.
         let within = |window: &Window| {
@@ -795,7 +828,9 @@ impl Model {
             ensure(limits, "29: message or range of a waiting thread")?;
             let fault = match &thread.wait {
                 Wait::Call { parcel, .. } => {
-                    let kind = (1..=8).contains(&parcel.label);
+                    // Every kind of the table, the hardware breakpoint (9)
+                    // included (ver-D M1).
+                    let kind = FaultKind::from_raw(parcel.label).is_some();
                     kind && parcel.words.len() == FAULT_WORDS && parcel.caps.is_empty()
                 }
                 Wait::Reply(_) => true,
@@ -843,9 +878,9 @@ impl Model {
             // From the watermark to the clean mark, padding included, every
             // byte was cleared and taken by no object since.
             let mut at = untyped.watermark;
-            let mut zero = untyped.zero.clone();
-            zero.sort();
-            for (start, end) in zero {
+            let mut cleared = untyped.zero.clone();
+            cleared.sort();
+            for (start, end) in cleared {
                 if start <= at && end > at {
                     at = end;
                 }

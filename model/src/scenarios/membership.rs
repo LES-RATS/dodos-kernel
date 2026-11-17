@@ -692,6 +692,8 @@ fn a_sealing_node_returns_to_live_if_no_other_node_is_live() {
     // Node 0 asks node 1 to seal, then node 2 kills node 0 and node 2
     // fails: node 1 is left alone and does not seal.
     m.ok(0, stop(1, NODE_STOP_SEAL));
+    // The seal began (the final review's E10: only the end was asserted).
+    assert_eq!(m.state(1), MemberState::Sealing);
     m.ok(2, stop(0, NODE_STOP_KILL));
     m.sys.fail(2, 0);
     m.run(20 * MS);

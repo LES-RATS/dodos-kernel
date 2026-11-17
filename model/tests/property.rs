@@ -22,7 +22,12 @@ const STEPS: usize = 5000;
 /// The steps of a run: more where a page is larger than 16 KB, since each
 /// creation then clears its memory in more calls and a run of `STEPS` makes
 /// fewer objects (the coverage below is measured on the smaller pages).
+/// `DODOS_PROPERTY_STEPS` sets another number (0 runs the directed cases
+/// alone, which is how the floors below are shown above them).
 fn steps() -> usize {
+    if let Ok(steps) = std::env::var("DODOS_PROPERTY_STEPS") {
+        return steps.parse().expect("DODOS_PROPERTY_STEPS is a number");
+    }
     match page() > 16 << 10 {
         true => 2 * STEPS,
         false => STEPS,
@@ -57,7 +62,7 @@ impl Rng {
 // in its own class of slots, in every capability space. Slot `34 + 9 * n + c`
 // is of class `c`; class 7 is left for moves and receive ranges. Every space
 // that a script makes is laid out as the start-up space: a capability for the
-// space itself in slot 1, an untyped in slot 20.
+// space itself in slot 1, an untyped in slot 107 (`MEMORY_SLOT`).
 const UNTYPED: u32 = 0;
 const CSPACE: u32 = 1;
 const THREAD: u32 = 2;
@@ -167,8 +172,13 @@ const PAGES: [PageSize; 5] = [
     PageSize::Large2,
 ];
 
-/// The kinds that the model makes, as `Census::dying` names them.
-const MADE: [ObjectKind; 9] = [
+/// The kinds whose dying the seeds measure, as `Census::dying` names them:
+/// every kind made from an untyped, the irq, the role and the
+/// memory_control (the final review's H8 left out timer, irq, iospace and
+/// task; the role and the memory_control were never measured). A `node`,
+/// an `iommu`, `irq_control`, `ioports` and the debug capability are of the
+/// start-up and never die in a run of one node.
+const MADE: [ObjectKind; 15] = [
     ObjectKind::Untyped,
     ObjectKind::CSpace,
     ObjectKind::ASpace,
@@ -178,6 +188,12 @@ const MADE: [ObjectKind; 9] = [
     ObjectKind::Endpoint,
     ObjectKind::Reply,
     ObjectKind::Notify,
+    ObjectKind::Timer,
+    ObjectKind::Irq,
+    ObjectKind::IoSpace,
+    ObjectKind::Task,
+    ObjectKind::MemoryControl,
+    ObjectKind::Role,
 ];
 
 /// The calls, numbered as `name_of` numbers them.
@@ -249,7 +265,7 @@ const NAMES: [&str; 64] = [
 ];
 /// The calls that never succeed on one node beside phantom nodes:
 /// `grant_signal` needs a remote frame, which only another node that runs
-/// grants, and `node_start` a dead node (both in `tests/machine.rs`).
+/// grants, and `node_start` a dead node (both in `model/src/scenarios/`).
 const NEVER_ON_ONE_NODE: [&str; 2] = ["grant_signal", "node_start"];
 /// `call`, `recv`, `reply_recv` and `wait`.
 const BLOCKING: [usize; 4] = [10, 11, 12, 15];
@@ -488,7 +504,7 @@ impl Generator<'_> {
         }
     }
 
-    /// The untyped to take memory from: mostly the one in slot 16, so that a
+    /// The untyped to take memory from: mostly the one in slot 107, so that a
     /// capability space is often grown from the untyped it was created from.
     fn memory(&mut self) -> SlotAddr {
         if self.rng.chance(60) {
@@ -774,7 +790,7 @@ impl Generator<'_> {
     }
 
     /// The arguments of a mapping: a space and a frame of their classes,
-    /// mostly the untyped in slot 20, and a range near the bottom of the
+    /// mostly the untyped in slot 107, and a range near the bottom of the
     /// user range, so that mappings meet.
     fn map(&mut self) -> Map {
         let size = if self.rng.chance(90) { page() } else { large() };
@@ -800,10 +816,12 @@ impl Generator<'_> {
         let answered = if self.rng.chance(50) { ENDPOINT } else { REPLY };
         let none = |rng: &mut Rng| rng.chance(60);
         // One call in seven is among those that the depths rule on.
+        // Values 74 to 79 and 37 are the notify binds and the debug calls
+        // (the final review's H11: they had roll 37 alone).
         let roll = if self.rng.chance(14) {
             29 + self.rng.below(8)
         } else {
-            self.rng.below(74)
+            self.rng.below(80)
         };
         match roll {
             0..3 => Syscall::CapDerive {
@@ -985,7 +1003,11 @@ impl Generator<'_> {
                         2 => block[x86_64::REG_DR7] = 1 << 13,
                         3 => block[x86_64::REG_DR0] = 1 << 63,
                         4 => block[x86_64::REG_UINTR] = 1,
-                        5 => block[x86_64::REG_DR7] = 0x1 | 0b01 << 16,
+                        // A breakpoint enabled: an execution breakpoint
+                        // or a write watchpoint of one byte, which a
+                        // fault of kind 9 can then hit (ver-D M1).
+                        5..7 => block[x86_64::REG_DR7] = 0x1 | 0b01 << 16,
+                        7..10 => block[x86_64::REG_DR7] = 0x1,
                         _ => {}
                     }
                     block
@@ -1167,7 +1189,7 @@ impl Generator<'_> {
                     _ => self.rng.below(1 << 17),
                 },
             },
-            _ if self.rng.chance(80) => Syscall::NotifyBind {
+            37 | 74..80 if self.rng.chance(80) => Syscall::NotifyBind {
                 notify: self.held(NOTIFY),
                 endpoint: if self.rng.chance(20) {
                     SlotAddr::NONE
@@ -1271,10 +1293,10 @@ impl Generator<'_> {
         copies.chain(vec![removal; 3]).chain(emptied).collect()
     }
 
-    /// A process: a capability space made from the untyped in slot 16, laid
+    /// A process: a capability space made from the untyped in slot 107, laid
     /// out as this one, with endpoints, reply objects and notifies of its
     /// own and copies of some of this space's, and a thread that runs in it.
-    fn spawn(&mut self, plan: &mut Plan) -> Vec<Syscall> {
+    fn spawn(&mut self) -> Vec<Syscall> {
         let untyped = self
             .inspect(MEMORY)
             .is_some_and(|(kind, _)| kind == ObjectKind::Untyped);
@@ -1288,7 +1310,6 @@ impl Generator<'_> {
         if !untyped || !self.whole(MEMORY) || self.model.runnable().len() > 14 {
             return Vec::new();
         }
-        let _ = plan;
         let inside = |index: u32| SlotAddr::through(space, index);
         let grown = Syscall::CSpaceGrow {
             cspace: own(space),
@@ -1325,7 +1346,10 @@ impl Generator<'_> {
         // the first thread does; the second one's is in the new space, and
         // dies with it. Now and then a thread has no address space, and
         // faults when it would run.
-        let kept = self.find_own(OTHER, Wanted::Free).map_or(inside(107), own);
+        // Without a free slot here, the first one's context goes in slot
+        // 105 of the new space, which nothing else fills (the final
+        // review's H10: slot 107 holds the untyped, and the retype failed).
+        let kept = self.find_own(OTHER, Wanted::Free).map_or(inside(105), own);
         let threads = [
             (own(thread), 34, kept),
             (inside(34 + THREAD), 43, inside(106)),
@@ -1446,10 +1470,21 @@ impl Generator<'_> {
             return Vec::new();
         };
         plan.listening.insert(space, endpoint);
+        // Now and then the range is in a space this one holds, as deep as a
+        // space whose root capability `speak` may move there: the depths
+        // refuse that move (8.6; the final review's H6: only the directed
+        // case reached a refused send).
+        let range = match self.rng.chance(40) {
+            true => Range {
+                first: self.inside(SPARE),
+                count: 1,
+            },
+            false => Range { first, count: 4 },
+        };
         vec![Syscall::Recv {
             endpoint: own(endpoint),
             reply: own(reply),
-            range: Range { first, count: 4 },
+            range,
             wait: 0,
         }]
     }
@@ -1458,8 +1493,12 @@ impl Generator<'_> {
     /// wait in this capability space, if there is one.
     fn speak(&mut self, plan: &mut Plan) -> Option<Syscall> {
         let endpoint = plan.listening.remove(&self.space?)?;
+        let caps = match self.rng.chance(40) {
+            true => vec![Transfer::Move(self.bound())],
+            false => self.four(),
+        };
         let message = Message {
-            caps: self.four(),
+            caps,
             ..Message::default()
         };
         let range = self.range();
@@ -1485,7 +1524,7 @@ impl Generator<'_> {
         space.map_or(Vec::new(), |space| vec![Syscall::CapDelete(own(space)); 10])
     }
 
-    /// An address space and an iospace from the untyped in slot 20, frames
+    /// An address space and an iospace from the untyped in slot 107, frames
     /// mapped into both, devices attached, rights changed; then the frames,
     /// the spaces or the mappings removed, in a random order.
     fn spaces(&mut self, plan: &mut Plan) -> Vec<Syscall> {
@@ -1585,15 +1624,83 @@ impl Generator<'_> {
         calls
     }
 
+    /// An object of a kind that the other scripts seldom leave dying, with
+    /// 33 copies of its capability, then the removal of its root, which
+    /// takes several calls, then the copies emptied: a timer, a task, an
+    /// iospace from the untyped in slot 107; in the start-up space a role
+    /// (the final review's H8; the memory_control is removed late in the
+    /// run, in `run`).
+    fn crowd(&mut self, plan: &mut Plan) -> Vec<Syscall> {
+        let home = self.space == Some(self.home);
+        let choice = self.rng.below(10);
+        let slots = self.spare(plan, REMOVAL_STEP + 2);
+        let [first, copies @ ..] = slots.as_slice() else {
+            return Vec::new();
+        };
+        if copies.len() <= REMOVAL_STEP {
+            return Vec::new();
+        }
+        let mut calls = Vec::new();
+        let original = match choice {
+            1..3 if home => own(common::ROLES + self.rng.below(5) as u32),
+            _ => {
+                if !self.whole(MEMORY) {
+                    return Vec::new();
+                }
+                let kinds = [ObjectKind::Timer, ObjectKind::Task, ObjectKind::IoSpace];
+                calls.push(retype(self.rng.pick(&kinds), 0, own(*first)));
+                own(*first)
+            }
+        };
+        // Copies without `exec`, which a role capability does not have.
+        let copy = |to: &u32| Syscall::CapDerive {
+            source: original,
+            destination: own(*to),
+            rights: Rights::ALL.without(Rights::EXEC).bits(),
+            badge: 0,
+        };
+        calls.extend(copies.iter().map(copy));
+        calls.extend(vec![Syscall::CapDelete(original); 3]);
+        calls.extend(copies.iter().map(|&slot| Syscall::CapDelete(own(slot))));
+        calls
+    }
+
+    /// A thread of this space that runs, suspended, given a breakpoint, and
+    /// resumed: a thread that a fault of kind 9 can then hit (ver-D M1).
+    fn watch(&mut self) -> Vec<Syscall> {
+        // A thread that runs: one with no context never faults.
+        let runs = self.model.runnable();
+        let tries: Vec<u32> = (0..8).map(|_| self.class_slot(THREAD)).collect();
+        let found = tries.into_iter().find(|&slot| {
+            let object = self.model.object_at(self.thread, own(slot));
+            object.is_some_and(|t| t != self.thread && runs.contains(&t))
+        });
+        let Some(slot) = found else {
+            return Vec::new();
+        };
+        let mut block = vec![0; x86_64::REGS_WORDS];
+        block[x86_64::REG_RFLAGS] = 0x202;
+        block[x86_64::REG_DR0] = 0x1000;
+        block[x86_64::REG_DR7] = 0x1;
+        let thread = own(slot);
+        vec![
+            Syscall::ThreadSuspend(thread),
+            Syscall::ThreadWriteRegs { thread, block },
+            Syscall::ThreadResume(thread),
+        ]
+    }
+
     fn script(&mut self, plan: &mut Plan) -> Vec<Syscall> {
         match self.rng.below(100) {
-            0..18 => self.spawn(plan),
+            0..18 => self.spawn(),
             18..44 => self.chain(plan),
             44..66 => self.fan(plan),
             66..74 => self.nest(plan),
             74..78 => self.kill(),
             78..86 => self.listen(plan),
             86..94 => self.spaces(plan),
+            94..97 => self.crowd(plan),
+            97..99 => self.watch(),
             _ => self.tidy(plan),
         }
     }
@@ -1673,7 +1780,8 @@ struct Reached {
     /// alone.
     again: u32,
     swept_only: u32,
-    /// Seeds in which a removal walked.
+    /// Seeds in which a random removal took more than one call (the
+    /// directed case's removal does not count).
     seeds_walked: u32,
     /// Steps after which a frame capability held a mapping, and a device
     /// was attached; removals that undid a mapping, and that detached a
@@ -1684,6 +1792,10 @@ struct Reached {
     /// which a thread waited on a fault.
     faults: [u32; 2],
     faulting: u32,
+    /// Breakpoint hits given (faults of kind 9), and steps after which a
+    /// thread waited on one.
+    breakpoints: u32,
+    breakpoint_waits: u32,
     /// Steps after which: a context was throttled, a context was lent, a
     /// timer was armed, a thread was marked as having lost its context,
     /// the core was idle, the running context ran on slack, a thread waited
@@ -1726,7 +1838,11 @@ impl Reached {
         let census = model.census();
         self.deepest = self.deepest.max(census.deepest);
         self.longest_walk = self.longest_walk.max(model.longest_walk());
+        // One step counts once per kind: `Census::dying` is in the order of
+        // the objects, so equal kinds are made neighbours first (the final
+        // review's D2 = H7).
         let mut kinds = census.dying;
+        kinds.sort_by_key(|kind| *kind as u8);
         kinds.dedup();
         kinds
             .iter()
@@ -1745,8 +1861,10 @@ impl Reached {
         self.lost += (census.lost > 0) as u32;
         self.idle += census.idle as u32;
         self.on_slack += census.on_slack as u32;
-        self.no_aspace += (census.fault_kinds[7] > 0) as u32;
-        self.no_context += (census.fault_kinds[8] > 0) as u32;
+        self.no_aspace += (census.fault_kinds[FaultKind::NoAddressSpace as usize] > 0) as u32;
+        self.no_context += (census.fault_kinds[FaultKind::NoContext as usize] > 0) as u32;
+        self.breakpoint_waits +=
+            (census.fault_kinds[FaultKind::HardwareBreakpoint as usize] > 0) as u32;
         self.claimed += (census.irqs > 0) as u32;
         self.irq_fired += (census.fired > 0) as u32;
         self.revoked += (census.revoked > 0) as u32;
@@ -1854,9 +1972,10 @@ fn start() -> (Model, ObjId) {
 
 /// Before the random calls: a child untyped of the memory with 40
 /// endpoints in it, then its removal, which takes two calls, so that an
-/// untyped is seen dying; then the slots are emptied. It uses slots that
-/// the scripts never use.
-fn crowd(model: &mut Model, first: ObjId, reached: &mut Reached) {
+/// untyped is dying across a call; then the slots are emptied. It uses
+/// slots that the scripts never use. It is asserted here and counts in no
+/// floor: the floors measure the random calls (the final review's H6).
+fn crowd(model: &mut Model, first: ObjId) {
     let slots: Vec<u32> = (4000..4041).collect();
     let mut calls = vec![retype(ObjectKind::Untyped, 1 << 16, own(slots[0]))];
     calls.extend(slots[1..].iter().map(|&slot| Syscall::UntypedRetype {
@@ -1867,13 +1986,17 @@ fn crowd(model: &mut Model, first: ObjId, reached: &mut Reached) {
         memory: 0,
         destination: own(slot),
     }));
+    let removal = calls.len();
     calls.extend(vec![Syscall::CapDelete(own(slots[0])); 2]);
     calls.extend(slots[1..].iter().map(|&slot| Syscall::CapDelete(own(slot))));
-    for call in calls {
+    for (index, call) in calls.into_iter().enumerate() {
         let outcome = model.apply(first, call);
         assert!(matches!(outcome, Ok(_) | Err(Error::Again)), "{outcome:?}");
         assert_eq!(model.check(), Ok(()));
-        reached.count(model);
+        if index == removal {
+            assert_eq!(outcome, Err(Error::Again));
+            assert!(model.census().dying.contains(&ObjectKind::Untyped));
+        }
     }
 }
 
@@ -1883,8 +2006,8 @@ fn crowd(model: &mut Model, first: ObjId, reached: &mut Reached) {
 /// the capability is dropped and `send` returns the flag `caps_dropped`;
 /// then the same move into the start-up space, whose root is less deep,
 /// is accepted. Then every object of the case is removed. It uses slots
-/// that the scripts never use.
-fn refused_send(model: &mut Model, first: ObjId, reached: &mut Reached) {
+/// that the scripts never use, and counts in no floor.
+fn refused_send(model: &mut Model, first: ObjId) {
     let s = |index: u32| own(4100 + index);
     let make = |kind: ObjectKind, size: u64, slot: SlotAddr| Syscall::UntypedRetype {
         untyped: MEMORY,
@@ -1962,9 +2085,6 @@ fn refused_send(model: &mut Model, first: ObjId, reached: &mut Reached) {
             Ok(Output::Sent { flags })
         );
     }
-    reached.sent += 1;
-    reached.sent_refused += 1;
-    reached.count(model);
     for index in (0..8).rev() {
         for _ in 0..16 {
             if apply(model, first, Syscall::CapDelete(s(index))) != Err(Error::Again) {
@@ -1976,8 +2096,9 @@ fn refused_send(model: &mut Model, first: ObjId, reached: &mut Reached) {
 
 /// The directed case of a thread whose capability space is destroyed while
 /// it can run: it gets `gone` from `cap_delete` as from every call. Then
-/// the thread is removed. It uses slots that the scripts never use.
-fn destroyed_space(model: &mut Model, first: ObjId, reached: &mut Reached) {
+/// the thread is removed. It uses slots that the scripts never use, and
+/// counts in no floor.
+fn destroyed_space(model: &mut Model, first: ObjId) {
     let s = |index: u32| own(4120 + index);
     let make = |kind: ObjectKind, size: u64, slot: SlotAddr| Syscall::UntypedRetype {
         untyped: MEMORY,
@@ -2028,8 +2149,6 @@ fn destroyed_space(model: &mut Model, first: ObjId, reached: &mut Reached) {
         Err(Error::Gone)
     );
     assert_eq!(model.check(), Ok(()));
-    reached.destroyed += 1;
-    reached.count(model);
     for index in [1, 2] {
         for _ in 0..16 {
             if model.apply(first, Syscall::CapDelete(s(index))) != Err(Error::Again) {
@@ -2048,10 +2167,19 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     // Every thread that could run at some step: those that can be woken.
     let mut known: BTreeSet<ObjId> = BTreeSet::new();
     let mut walked = false;
-    crowd(&mut model, first, reached);
-    refused_send(&mut model, first, reached);
-    destroyed_space(&mut model, first, reached);
+    crowd(&mut model, first);
+    refused_send(&mut model, first);
+    destroyed_space(&mut model, first);
+    // The directed cases alone: what they leave in the counters that take a
+    // maximum (the deepest capability, the longest walk).
+    if steps() == 0 {
+        reached.count(&model);
+    }
+    let mut control_due = false;
     for step in 0..steps() {
+        if step == steps() - steps() / 10 {
+            control_due = rng.chance(50);
+        }
         let threads = model.runnable();
         known.extend(&threads);
         // A thread is of use if its capability space holds a capability for
@@ -2107,6 +2235,25 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             reached.count(&model);
             continue;
         }
+        // Now and then a thread that runs with a breakpoint enabled hits
+        // it: a fault of kind 9 (ver-D M1).
+        let watched = threads
+            .iter()
+            .copied()
+            .filter(|t| model.breakpoint_enabled(*t))
+            .find(|t| plan.scripts.get(t).is_none_or(VecDeque::is_empty));
+        if let Some(watched) = watched.filter(|_| rng.chance(2)) {
+            let before = model.census().faulting;
+            let hit = [1 << rng.below(4), 0xFFFF_0FF0 | 1, 0];
+            model.fault(watched, FaultKind::HardwareBreakpoint, hit);
+            if let Err(broken) = model.check() {
+                panic!("seed {seed}, step {step}, {watched:?} hits a breakpoint: {broken}");
+            }
+            reached.breakpoints += 1;
+            reached.faults[(model.census().faulting > before) as usize] += 1;
+            reached.count(&model);
+            continue;
+        }
         // Now and then the thread faults instead of making a call.
         if rng.below(200) == 0 && !plan.scripts.contains_key(&thread) {
             let kinds = [
@@ -2152,6 +2299,17 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         }
         if plan.scripts.get(&thread).is_some_and(VecDeque::is_empty) {
             plan.scripts.remove(&thread);
+        }
+        // From the last tenth of the run, in half of the seeds, the next
+        // thread of the start-up space with no script removes the
+        // memory_control, under which every block is: it dies over several
+        // calls (H8), and little is left to do after.
+        if control_due && space == Some(home) && next.is_none() {
+            control_due = false;
+            let control = own(START_SLOT_MEMORY_CONTROL);
+            let mut script: VecDeque<Syscall> = vec![Syscall::CapDelete(control); 3].into();
+            next = script.pop_front();
+            plan.scripts.insert(thread, script);
         }
         let from_script = next.is_some();
         let call = next.unwrap_or_else(|| {
@@ -2235,6 +2393,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             reached.detached_by_removal += detached as u32;
         }
         if (name == 2 || name == 3) && outcome == Err(Error::Again) {
+            walked = true;
             reached.again += 1;
             reached.swept_only += (model.census().capabilities == capabilities) as u32;
         }
@@ -2254,7 +2413,6 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             _ => {}
         }
         reached.destroyed += destroyed as u32;
-        walked |= model.longest_walk() > 0;
         match &outcome {
             Ok(_) => {
                 reached.ok.resize(NAMES.len(), 0);
@@ -2346,6 +2504,8 @@ impl Reached {
         self.mapped += other.mapped;
         self.attached += other.attached;
         self.faulting += other.faulting;
+        self.breakpoints += other.breakpoints;
+        self.breakpoint_waits += other.breakpoint_waits;
         self.throttled += other.throttled;
         self.lent += other.lent;
         self.armed += other.armed;
@@ -2441,11 +2601,16 @@ fn invariants_hold_after_every_call_of_random_sequences() {
 }
 
 // The coverage of the 24 seeds. Each floor is three quarters of the count
-// measured on 17 November 2026 (pass 17), rounded up: the smallest of the
+// measured on 17 November 2026 (pass 23), rounded up: the smallest of the
 // three runs of `verify` (pages of 4, 16 and 32 KB), over the 24 seeds, in
 // the comments. A change of the generator that loses a quarter of a kind of
 // state fails here, not only one that loses all of it (the eighth model
 // review found floors halved and floors of 1 that guarded only against 0).
+// The directed cases count in no floor (the final review's H6: three floors
+// were below what the directed cases gave alone): with
+// `DODOS_PROPERTY_STEPS=0` the counters hold 0 but the deepest capability
+// (3), the longest walk (2) and the steps with a mapping (24), each far
+// under its floor.
 
 /// Asserts that each count is at least its floor.
 #[track_caller]
@@ -2464,31 +2629,35 @@ fn deepest_capability_and_longest_walk_are_reached() {
     assert_eq!(reached.deepest, TREE_DEPTH);
     assert!(reached.longest_walk >= 95, "{}", reached.longest_walk);
     assert!(reached.longest_walk <= LONGEST_WALK);
-    // A removal walks the tree in every seed.
+    // A random removal takes more than one call in every seed.
     assert_eq!(reached.seeds_walked as u64, SEEDS);
 }
 
 #[test]
 fn objects_of_every_kind_are_seen_dying() {
     let reached = all_seeds();
-    // Measured, in steps: untyped 28, cspace 9,475, aspace 39, frame
-    // 10,994, thread 141, sched 13, endpoint 13, reply 921, notify 221.
-    // Pass 15 changed the generator (the calls of nodes); the larger counts
-    // of untyped and endpoint before it came each from one seed in which one
-    // object stayed dying for hundreds of steps. Pass 19 measured them again
-    // (D-137: the destruction of an iospace waits for the answers of its
-    // detaches, which reshaped the walk of 32 KB pages, every count higher
-    // there but the notifies', 474 to 221). A copy under `cap_delete` 32.
+    // Measured, in steps (the smallest of the three runs): untyped 2,862,
+    // cspace 10,715, aspace 23, frame 8,548, thread 19, sched 19, endpoint
+    // 16, reply 19, notify 41, timer 20, irq 4, iospace 10,982, task 20,
+    // memory_control 976 (32 KB; 2,383 on the others), role 5. Pass 23 made
+    // the walk leave a timer, a task, an iospace and a role dying (`crowd`)
+    // and remove the memory_control late in half of the seeds (H8); a copy
+    // under `cap_delete` 359.
     let dying = MADE.map(|kind| reached.dying[kind as usize]);
-    at_least(dying, [21, 7107, 30, 8246, 106, 10, 10, 691, 166]);
-    at_least([reached.dying_copies], [24]);
+    at_least(
+        dying,
+        [
+            2147, 8037, 18, 6411, 15, 15, 12, 15, 31, 15, 3, 8237, 15, 732, 4,
+        ],
+    );
+    at_least([reached.dying_copies], [270]);
 }
 
 #[test]
 fn threads_outside_the_start_up_space_mostly_succeed() {
     let reached = all_seeds();
-    // Measured: 47,633 calls, 30,820 of them successful.
-    at_least([reached.outside], [35725]);
+    // Measured: 57,952 calls, 38,842 of them successful.
+    at_least([reached.outside], [43464]);
     assert!(
         2 * reached.outside_ok > reached.outside,
         "{}",
@@ -2499,9 +2668,9 @@ fn threads_outside_the_start_up_space_mostly_succeed() {
 #[test]
 fn waits_of_every_sort_and_their_ends_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: callers queued 39,286, reply objects armed
-    // 17,243, receivers 35,958, waiters on a notify 20,739, a notify bound
-    // 22,621.
+    // Measured, in steps: callers queued 48,534, reply objects armed
+    // 13,666, receivers 41,641, waiters on a notify 16,807, a notify bound
+    // 64,527.
     let waits = [
         reached.callers,
         reached.served,
@@ -2509,20 +2678,20 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
         reached.waiters,
         reached.bound,
     ];
-    at_least(waits, [29465, 12933, 26969, 15555, 16966]);
-    // Measured: 23 messages with capabilities, 9 with the capabilities
-    // dropped, 4 notifications, 9 threads woken with `gone`.
+    at_least(waits, [36401, 10250, 31231, 12606, 48396]);
+    // Measured: 17 messages with capabilities, 5 with the capabilities
+    // dropped, 21 notifications, 8 threads woken with `gone`.
     let ends = [
         reached.with_caps,
         reached.dropped,
         reached.notifications,
         reached.woken_gone,
     ];
-    at_least(ends, [18, 7, 3, 7]);
-    // Measured: 9 messages received with four capabilities, and 36 calls by
-    // a thread whose capability space is destroyed (the directed case of
-    // each seed, and more).
-    at_least([reached.with_four, reached.destroyed], [7, 27]);
+    at_least(ends, [13, 4, 16, 6]);
+    // Measured: 5 messages received with four capabilities, and 10 calls by
+    // a thread whose capability space is destroyed (the directed case
+    // apart).
+    at_least([reached.with_four, reached.destroyed], [4, 8]);
 }
 
 /// The invariant "removal ends" is checked after every call above. It says
@@ -2531,59 +2700,63 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 3,466 accepted and 75 refused, cspace 76 and 13;
-    // by `send` 28 delivered and 24 refused.
-    at_least(reached.moved, [2600, 57]);
-    at_least(reached.refused, [57, 10]);
-    at_least([reached.sent, reached.sent_refused], [21, 18]);
-    // The same moves listed by `call` and by `reply_recv`: 13 and 15.
-    at_least([reached.called, reached.answered], [10, 12]);
+    // Measured: untyped 3,857 accepted and 68 refused, cspace 84 and 13;
+    // by `send` 4 delivered and 1 refused at random (the directed case
+    // apart: the final review's H6 found the 24 refused all directed).
+    at_least(reached.moved, [2893, 63]);
+    at_least(reached.refused, [51, 10]);
+    at_least([reached.sent, reached.sent_refused], [3, 1]);
+    // The same moves listed by `call` and by `reply_recv`: 23 and 8.
+    at_least([reached.called, reached.answered], [18, 6]);
 }
 
 #[test]
 fn waits_of_every_sort_are_cancelled() {
     let reached = all_seeds();
-    // Measured: 31 queued callers, 3 callers that wait for the reply, 25
-    // receivers, 13 waiters on a notify; 9 ends by a wait number.
-    at_least(reached.cancelled, [24, 3, 19, 10]);
-    at_least([reached.cancelled_by_number], [7]);
-    // Measured: `call` 7, `recv` 3, `reply_recv` 1 and `wait` 3 returned
-    // `cancelled` at once (`reply_recv` once: its floor is that once).
-    at_least(reached.cancelled_at_once, [6, 3, 1, 3]);
+    // Measured: 39 queued callers, 4 callers that wait for the reply, 24
+    // receivers, 11 waiters on a notify; 15 ends by a wait number.
+    at_least(reached.cancelled, [30, 3, 18, 9]);
+    at_least([reached.cancelled_by_number], [12]);
+    // Measured: `call` 11, `recv` 10, `reply_recv` 4 and `wait` 5 returned
+    // `cancelled` at once.
+    at_least(reached.cancelled_at_once, [9, 8, 3, 4]);
 }
 
 #[test]
 fn removal_steps_that_only_move_the_sweep_are_reached() {
     let reached = all_seeds();
-    // Measured: 220 `again` of a removal removed nothing.
-    at_least([reached.swept_only], [165]);
+    // Measured: 210 `again` of a removal removed nothing.
+    at_least([reached.swept_only], [158]);
 }
 
 #[test]
 fn untyped_retype_of_a_kind_not_made_is_reached() {
     let reached = all_seeds();
-    // Measured: 10 calls returned `unsupported` for the one kind this
+    // Measured: 9 calls returned `unsupported` for the one kind this
     // version does not make, the reserved `vcpu` (the other kinds never
     // made from an untyped are `invalid` since 16 November 2026).
-    at_least([reached.retype_unsupported], [8]);
+    at_least([reached.retype_unsupported], [7]);
 }
 
 #[test]
 fn faults_are_raised_delivered_and_waited_on() {
     let reached = all_seeds();
-    // Measured: 131 faults found no handler and 39 were delivered; a thread
-    // waited on a fault after 18,581 steps.
-    at_least(reached.faults, [99, 30]);
-    at_least([reached.faulting], [13936]);
+    // Measured: 139 faults found no handler and 58 were delivered; a thread
+    // waited on a fault after 24,561 steps.
+    at_least(reached.faults, [105, 44]);
+    at_least([reached.faulting], [18421]);
+    // A breakpoint hit, a fault of kind 9, given 2 times and waited on
+    // after 924 steps (ver-D M1: the walk gave kinds 1 to 6 only).
+    at_least([reached.breakpoints, reached.breakpoint_waits], [2, 693]);
 }
 
 #[test]
 fn scheduling_states_are_reached() {
     let reached = all_seeds();
-    // Measured, in steps: a context throttled 80,347, lent 5,518, a timer
-    // armed 270, a thread marked as having lost its context 3,277, the
-    // core idle 12,964, running on slack 67,910, a fault no address space
-    // queued 5,887, a fault no context queued 448.
+    // Measured, in steps: a context throttled 86,597, lent 1,955, a timer
+    // armed 275, a thread marked as having lost its context 9,051, the
+    // core idle 13,001, running on slack 70,147, a fault no address space
+    // queued 7,665, a fault no context queued 143.
     let states = [
         reached.throttled,
         reached.lent,
@@ -2594,17 +2767,17 @@ fn scheduling_states_are_reached() {
         reached.no_aspace,
         reached.no_context,
     ];
-    at_least(states, [60261, 4139, 203, 2458, 9723, 50933, 4416, 336]);
-    // Measured: the clock moved 4,771 times, and a timer fired in 9.
-    at_least([reached.advanced, reached.fired], [3579, 7]);
+    at_least(states, [64948, 1467, 207, 6789, 9751, 52611, 5749, 108]);
+    // Measured: the clock moved 4,730 times, and a timer fired in 11.
+    at_least([reached.advanced, reached.fired], [3548, 9]);
 }
 
 #[test]
 fn interrupts_and_marks_are_reached() {
     let reached = all_seeds();
-    // Measured: 1,234 interrupts arrived, the marks of a thread grew 3
-    // times; after 81,208 steps an irq was claimed, after 2,425 one was
-    // fired, after 3,851 a task was revoked.
+    // Measured: 1,165 interrupts arrived, the marks of a thread grew 4
+    // times; after 76,208 steps an irq was claimed, after 1,348 one was
+    // fired, after 3,990 a task was revoked.
     let counts = [
         reached.interrupts,
         reached.marked,
@@ -2612,25 +2785,22 @@ fn interrupts_and_marks_are_reached() {
         reached.irq_fired,
         reached.revoked,
     ];
-    at_least(counts, [926, 3, 60906, 1819, 2889]);
+    at_least(counts, [874, 3, 57156, 1011, 2993]);
 }
 
 #[test]
 fn mappings_and_devices_are_reached_and_undone_by_removals() {
     let reached = all_seeds();
-    // Measured: a mapping held after 121,858 steps, a device attached after
-    // 32,317; 463 removals undid a mapping and 70 detached a device. Pass 20
-    // (D-139): a device leaves the header at its detach's answer, so the
-    // last count is of removals that start a detach or consume its answer,
-    // measured again at 68 (4 and 16 KB) and 103 (32 KB); three quarters of
-    // 68 is 51, and the floor stays 53, which holds.
+    // Measured: a mapping held after 119,814 steps, a device attached
+    // after 26,616; 360 removals undid a mapping and 43 started or ended a
+    // detach (D-139: a device leaves the header at its detach's answer).
     let counts = [
         reached.mapped,
         reached.attached,
         reached.unmapped_by_removal,
         reached.detached_by_removal,
     ];
-    at_least(counts, [91394, 24238, 348, 53]);
+    at_least(counts, [89861, 19962, 270, 33]);
 }
 
 #[test]
@@ -2677,8 +2847,10 @@ fn a_dying_memory_control_is_counted() {
 }
 
 /// The long run, outside `verify`: `DODOS_PROPERTY_SEEDS` seeds (2,000 if
-/// unset), as many at once as the machine has cores, every invariant
-/// checked after every call; the seeds that fail are named. Run with
+/// unset) from `DODOS_PROPERTY_FIRST` (the first seed after the 24 of
+/// `verify` if unset), as many at once as the machine has cores, every
+/// invariant checked after every call; the seeds that fail are named. Run
+/// with
 /// `cargo test --release -p dodos-model --test property many_seeds --
 /// --ignored`.
 #[test]
@@ -2687,15 +2859,18 @@ fn many_seeds() {
     let count: u64 = std::env::var("DODOS_PROPERTY_SEEDS")
         .map(|s| s.parse().expect("DODOS_PROPERTY_SEEDS is a number"))
         .unwrap_or(2000);
+    let first: u64 = std::env::var("DODOS_PROPERTY_FIRST")
+        .map(|s| s.parse().expect("DODOS_PROPERTY_FIRST is a number"))
+        .unwrap_or(SEEDS);
     let width = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
-    let next = std::sync::atomic::AtomicU64::new(SEEDS);
+    let next = std::sync::atomic::AtomicU64::new(first);
     let failed = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..width {
             scope.spawn(|| {
                 loop {
                     let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if seed >= SEEDS + count {
+                    if seed >= first + count {
                         break;
                     }
                     let one = std::panic::catch_unwind(|| {
@@ -2712,4 +2887,43 @@ fn many_seeds() {
     let mut failed = failed.into_inner().unwrap();
     failed.sort();
     assert!(failed.is_empty(), "failing seeds: {failed:?}");
+}
+
+/// One step counts each kind dying once, whatever the order of the objects
+/// (`Vec::dedup` alone removes neighbours only: the final review's D2 =
+/// H7). Two untypeds dying, an endpoint between them in the order of the
+/// objects.
+#[test]
+fn a_kind_dying_twice_in_one_step_is_counted_once() {
+    let (mut model, first) = start();
+    let mut ok = |call: Syscall| assert!(model.apply(first, call).is_ok());
+    let child = |untyped: u32, kind: ObjectKind, slot: u32| Syscall::UntypedRetype {
+        untyped: own(untyped),
+        kind,
+        size: 0,
+        page: 0,
+        memory: 0,
+        destination: own(slot),
+    };
+    ok(retype(ObjectKind::Untyped, 1 << 16, own(4000)));
+    ok(child(4000, ObjectKind::Endpoint, 4001));
+    for slot in 4002..4036 {
+        ok(derive(own(4001), own(slot)));
+    }
+    ok(retype(ObjectKind::Untyped, 1 << 16, own(4100)));
+    for slot in 4101..4135 {
+        ok(child(4100, ObjectKind::Endpoint, slot));
+    }
+    for untyped in [4000, 4100] {
+        let delete = model.apply(first, Syscall::CapDelete(own(untyped)));
+        assert_eq!(delete, Err(Error::Again));
+    }
+    let dying = model.census().dying;
+    assert_eq!(
+        dying.iter().filter(|&&k| k == ObjectKind::Untyped).count(),
+        2
+    );
+    let mut reached = Reached::default();
+    reached.count(&model);
+    assert_eq!(reached.dying[ObjectKind::Untyped as usize], 1);
 }

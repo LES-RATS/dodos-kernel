@@ -1,6 +1,6 @@
 //! Unlike cores: feature masks and the size of a thread,
-//! `thread_set_features`, what a core enables, instructions retired on
-//! demand, and `thread_move` between the two nodes of `Machine::example`.
+//! `thread_set_features`, what a core enables, and instructions retired on
+//! demand. (`thread_move` was withdrawn by D-128.)
 
 use dodos_abi::ObjectKind::{Frame, Notify, Sched, Thread};
 use dodos_abi::x86_64::{AMX, AVX, AVX512};
@@ -169,14 +169,19 @@ fn thread_size_is_the_power_of_two_above_its_area() {
     );
     let amx = FeatureMask::from_raw(1 << AMX);
     assert_eq!(thread_bytes(amx, list, &kind), Some(16384));
-    // The untyped gives a thread of mask AMX 16 KB: two of them and one of
-    // mask 0 leave the next 2 KB object at 32 KB + 2 KB.
+    // The untyped gives a thread of mask AMX 16 KB, one of mask 0 2 KB, each
+    // aligned on its size or on a page if larger (`untyped_retype`): AMX at
+    // 0, mask 0 at 16 KB, AMX at 20 KB, ending at 36 KB (the final review's
+    // F2 Opus 8: the identities compared always rose, and the comment
+    // placed the third at 32 KB).
     let mut k = K::new();
+    let watermark = |k: &K| k.m.untyped_marks(k.t, UT).unwrap().0;
     k.ok(retype(Thread, 1 << AMX, 100));
+    let first = watermark(&k) - (16 << 10);
     k.ok(retype(Thread, 0, 101));
+    assert_eq!(watermark(&k), first + (16 << 10) + 2048);
     k.ok(retype(Thread, 1 << AMX, 102));
-    let at = |k: &K, slot: u32| k.m.object_at(k.t, s(slot)).unwrap();
-    assert!(at(&k, 100) < at(&k, 101) && at(&k, 101) < at(&k, 102));
+    assert_eq!(watermark(&k), first + (36 << 10));
 }
 
 #[test]
@@ -336,6 +341,35 @@ fn the_class_is_read_when_a_counted_context_stops_running() {
     assert_eq!(read(&mut k.m, k.t, s(102)).1 & SCHED_STATE_HW_CLASS_MASK, 0);
 }
 
+/// `sched_count` turning counting on for a context already counted keeps
+/// the class its stop recorded, and its count (the final review's F2 Opus
+/// 9: on a machine with no classifier the class was 0 either way).
+#[test]
+fn counting_turned_on_again_keeps_the_class_and_the_count() {
+    let mut machine = Machine::example();
+    machine.classifier = Some(3);
+    let mut k = K::on(&machine);
+    let a = k.spawn(100, 0);
+    k.ok(count(s(102), 1));
+    k.ok(Syscall::ThreadSuspend(s(START_SLOT_THREAD)));
+    assert_eq!(k.m.running(), Some(a));
+    assert_eq!(
+        k.m.apply(a, Syscall::ThreadResume(s(START_SLOT_THREAD))),
+        DONE
+    );
+    assert_eq!(k.m.apply(a, Syscall::ThreadSuspend(s(100))), DONE);
+    assert_eq!(k.m.check(), Ok(()));
+    let (_, state, count_before) = read(&mut k.m, k.t, s(102));
+    assert_ne!(state & SCHED_STATE_HW_CLASS_MASK, 0);
+    k.ok(count(s(102), SCHED_COUNT_ON));
+    let (_, again, count_after) = read(&mut k.m, k.t, s(102));
+    assert_eq!(
+        again & SCHED_STATE_HW_CLASS_MASK,
+        state & SCHED_STATE_HW_CLASS_MASK
+    );
+    assert_eq!(count_after, count_before);
+}
+
 /// Argon F1: on a machine where the other places are phantom nodes, the
 /// only node that runs cannot stop itself (a phantom node could neither
 /// drive its fence nor take a role), so the node keeps writing and a take
@@ -376,13 +410,15 @@ fn the_only_running_node_cannot_stop_itself_beside_phantom_nodes() {
 }
 
 /// Argon F3: the order of the checks of thread_set_features and sched_count,
-/// sched_count on a counted context, and thread_move with a context still
-/// lent (mutants 20, 21, 24, 26, 31).
+/// and sched_count on a counted context (mutants 20, 21, 24, 26; mutant 31,
+/// `thread_move`, went with the call, D-128).
 #[test]
 fn unlike_cores_rules_that_no_test_pinned() {
-    // #20: thread_set_features checks target capability before mask
+    // #20: thread_set_features checks target capability before mask: a
+    // capability without `write` is `denied` though the mask is invalid
+    // too (an empty slot and a bad mask are both `invalid`, which shows no
+    // order: the final review's F2 Opus 10).
     let mut k = K::new();
-    k.no(features(999, 1u64 << 63), Error::Invalid);
     k.ok(Syscall::CapDerive {
         source: s(START_SLOT_THREAD),
         destination: s(200),
@@ -410,7 +446,8 @@ fn unlike_cores_rules_that_no_test_pinned() {
         Error::Denied,
     );
 
-    // #26: sched_count(SCHED_COUNT_ON) on an already counted context preserves count and hw_class
+    // #26: sched_count(SCHED_COUNT_ON) on an already counted context keeps
+    // its count (its class: the test below)
     k.ok(count(SCHED, SCHED_COUNT_ON));
     k.m.advance(k.m.now() + 100);
     assert_eq!(k.m.check(), Ok(()));

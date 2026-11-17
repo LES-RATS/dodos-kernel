@@ -11,12 +11,14 @@ impl Model {
     ///     made, and every translation belongs to exactly one record: the
     ///     translations of a space are those of the records of its list,
     ///     each page at its address, with the record's rights and the page
-    ///     size of the frame; a record maps 1 to 512 pages that are in its
+    ///     size of the frame; a record maps 1 to *E* pages that are in its
     ///     frame, inside the user range, and no two translations overlap;
     /// 36. a space lists, once each, exactly the capabilities whose records
     ///     name it;
     /// 37. the tables a space holds are at least those its translations
-    ///     hook: with four levels one per 512 GB that holds a page, one per
+    ///     hook: one table of level *k* per span of *P* × *E*^*k* bytes that
+    ///     holds a page smaller than the span; on the reference machine
+    ///     (four levels, *E* = 512) one per 512 GB that holds a page, one per
     ///     1 GB that holds a page smaller than 1 GB, one per 2 MB that holds
     ///     a 4 KB page; an iospace of 39 bits has three levels;
     /// 38. the rights of a mapping in an aspace include `read` and not both
@@ -56,6 +58,9 @@ impl Model {
                 else {
                     continue;
                 };
+                // Shadowed by 34 (only a frame capability has a record),
+                // which runs first; kept so that the check names a fault
+                // instead of panicking on an index.
                 let frame = self
                     .frames
                     .get(&held.object)
@@ -162,6 +167,29 @@ impl Model {
                 domains.len() as u32 <= limit,
                 "39: domain numbers of a unit",
             )?;
+        }
+        // A domain number is taken from this node slot's range on each unit
+        // of its iospace, and no two iospaces of one unit share one, nor
+        // with a number lost to a destroyed iospace (Devices and shared
+        // hardware, D-134; ver2-AD D3). It is kept from the attach, before
+        // the device enters the header, so it is not tied to a device.
+        let mut taken = BTreeSet::new();
+        for (space, &domain) in &self.domains {
+            let units = self.aspaces.get(space).map(|a| &a.units);
+            ensure(
+                units.is_some_and(|units| !units.is_empty()),
+                "39: domain number of an iospace on no unit",
+            )?;
+            for &unit in units.into_iter().flatten() {
+                ensure(
+                    self.domain_range(unit, self.node).contains(&domain),
+                    "39: domain number outside the node's range",
+                )?;
+                ensure(
+                    taken.insert((unit, domain)) && !self.lost_domains.contains(&(unit, domain)),
+                    "39: domain number shared",
+                )?;
+            }
         }
         Ok(())
     }

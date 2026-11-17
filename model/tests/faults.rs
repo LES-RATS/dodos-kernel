@@ -189,7 +189,6 @@ fn fault_on_a_dying_fault_endpoint_suspends_the_thread() {
             badge: 0,
         });
     }
-    k.make(Endpoint, 49);
     assert_eq!(k.go(Syscall::CapDelete(s(EP))), Err(Error::Again));
     k.fault(thread, FaultKind::Undefined);
     assert!(!k.can_run(thread));
@@ -501,8 +500,12 @@ fn register_calls_from_a_thread_without_a_message_page_are_invalid_after_the_thr
     assert_eq!(k.on(caller, read(42)), Err(Error::Gone));
 }
 
+/// The size, then the canonical words (both `invalid`, which shows no
+/// order between them), then the state: the size and a non-canonical word
+/// are each judged before the `busy` of a running thread (the final
+/// review's F2 Opus 17).
 #[test]
-fn thread_write_regs_checks_the_size_then_the_canonical_words_then_the_state() {
+fn thread_write_regs_judges_the_size_and_the_canonical_words_before_the_state() {
     let mut k = K::new();
     k.thread(40, 0, false);
     let write = |block: Vec<u64>| Syscall::ThreadWriteRegs {
@@ -523,9 +526,12 @@ fn thread_write_regs_checks_the_size_then_the_canonical_words_then_the_state() {
     let mut free = good.clone();
     free[REG_RAX] = u64::MAX;
     k.ok(write(free.clone()));
-    // The size before the state.
+    // The size and the canonical words before the state.
     k.ok(Syscall::ThreadResume(s(40)));
     assert_eq!(k.go(write(good[..3].to_vec())), Err(Error::Invalid));
+    let mut wrong = good.clone();
+    wrong[REG_RIP] = 1 << (Machine::example().geometry.address_bits() - 1);
+    assert_eq!(k.go(write(wrong)), Err(Error::Invalid));
     assert_eq!(k.go(write(free)), Err(Error::Busy));
 }
 
@@ -608,15 +614,45 @@ fn delivered_fault_is_not_recorded() {
     assert_eq!(k.record(40), vec![0; 6]);
 }
 
+/// The resume of a thread suspended by a fault with no handler clears its
+/// record; it runs again (the final review's F2 Opus 18: a second resume,
+/// on a running thread, could change nothing the test read).
 #[test]
-fn resuming_a_thread_that_runs_keeps_nothing_to_clear() {
+fn resuming_a_suspended_thread_clears_its_record() {
     let mut k = K::new();
     let thread = k.running(40, 0);
     k.fault(thread, FaultKind::Debug);
-    // Resumed, the thread runs; suspended again, its record is gone.
+    assert_ne!(k.record(40)[0], 0);
     k.ok(Syscall::ThreadResume(s(40)));
     assert!(k.can_run(thread));
-    k.ok(Syscall::ThreadResume(s(40)));
     k.ok(Syscall::ThreadSuspend(s(40)));
     assert_eq!(k.record(40)[0], 0);
+}
+
+/// A breakpoint hit is a fault of kind 9 "delivered like every fault"
+/// (Debugging a component): with a fault endpoint and no receiver, the
+/// thread waits as a caller with a label of 9, which invariant 40 accepts,
+/// and the census counts it as a breakpoint, not as a fault of no context
+/// (ver-D M1, DeepSeek 8).
+#[test]
+fn fault_of_kind_9_waits_on_its_endpoint() {
+    let mut k = K::new();
+    let thread = k.running(40, EP);
+    k.ok(Syscall::ThreadSuspend(s(40)));
+    let mut block = k.regs(40);
+    block[x86_64::REG_DR0] = 0x1000;
+    block[x86_64::REG_DR7] = 1;
+    k.ok(Syscall::ThreadWriteRegs {
+        thread: s(40),
+        block,
+    });
+    k.ok(Syscall::ThreadResume(s(40)));
+    k.fault(thread, FaultKind::HardwareBreakpoint);
+    let census = k.m.census();
+    assert_eq!(census.faulting, 1);
+    assert_eq!(
+        census.fault_kinds[FaultKind::HardwareBreakpoint as usize],
+        1
+    );
+    assert_eq!(census.fault_kinds[FaultKind::NoContext as usize], 0);
 }

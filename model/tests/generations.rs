@@ -220,6 +220,9 @@ fn a_run_given_to_a_live_node_stays_busy_to_every_other_node() {
         node: 0,
     };
     m.ok(1, give);
+    // Before the giver's fresh start (the final review's F2 Opus 26: only
+    // after was tried), and after.
+    assert_eq!(m.call(1, take(0, place, size, 102)), Err(Error::Busy));
     m.kill_1();
     m.restart_1();
     assert_eq!(m.call(1, take(0, place, size, 101)), Err(Error::Busy));

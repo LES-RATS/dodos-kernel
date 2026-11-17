@@ -606,12 +606,14 @@ impl Model {
     /// The due event of the core's invalidation request, on the hardware
     /// clock: `CORE_ANSWER_NS` after its start, which is read on the clock
     /// less the stopped time, so the stops already counted are added back
-    /// (The stopped time, D-137).
+    /// (The stopped time, D-137). While the release word of the stub is
+    /// raised the due event suspends: none is armed, and the first event
+    /// after the release arms it again on the new stopped time (The
+    /// debugger stub, D-135).
     pub(crate) fn request_due(&self, core: usize) -> Option<u64> {
-        self.cores[core]
-            .request
-            .as_ref()
-            .map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time)
+        let request = self.cores[core].request.as_ref();
+        let request = request.filter(|_| !self.table.release);
+        request.map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time)
     }
 
     /// Due events and the hardware timer of a core: after the choice, the
@@ -665,11 +667,15 @@ impl Model {
         let at = *self.at;
         // The due event of the core's invalidation request: a request not
         // complete `CORE_ANSWER_NS` after its start is a failure of the
-        // node, which accuses itself (A node of several cores).
-        let late = self.cores[at]
-            .request
-            .as_ref()
-            .is_some_and(|r| r.started + self.table.core_answer_ns <= self.membership_now());
+        // node, which accuses itself (A node of several cores). While the
+        // release word of the stub is raised, no node accuses itself: the
+        // due event suspends until it is lowered (The debugger stub, D-135,
+        // D-137; found by pass 23's scenario of E23).
+        let late = !self.table.release
+            && self.cores[at]
+                .request
+                .as_ref()
+                .is_some_and(|r| r.started + self.table.core_answer_ns <= self.membership_now());
         if late {
             self.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
         }

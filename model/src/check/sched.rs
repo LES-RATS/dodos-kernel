@@ -137,6 +137,9 @@ impl Model {
         self.check_timers()
     }
 
+    /// 46 (continued). The thread a core runs is the holder of its running
+    /// context, and the root it loaded is that thread's address space
+    /// unless it is dying (G7), each unless a reschedule is pending.
     fn check_choice(&self) -> Check {
         let mut running = BTreeSet::new();
         for (position, core) in self.cores.iter().enumerate() {
@@ -162,6 +165,28 @@ impl Model {
             };
             let pending = core.ipis.contains(&crate::Ipi::Reschedule);
             ensure(core.running == chosen || pending, "46: running context")?;
+            // The thread a core runs holds the context it charges: its home
+            // if the home can run, else the receiver of the top lend
+            // ("What runs next"; ver2-AD D1). Read here, not through
+            // `Model::holder`.
+            let holder = core.running.and_then(|(context, _)| {
+                let sched = self.scheds.get(&context)?;
+                let home = sched
+                    .home
+                    .filter(|home| self.threads.get(home).is_some_and(Self::runnable_thread));
+                home.or_else(|| Some(self.lends.get(sched.chain.last()?)?.1))
+            });
+            ensure(
+                pending || core.thread == holder,
+                "46: thread of the running context",
+            )?;
+            // The root a core loaded is that of the thread it runs, not
+            // dying (G7, `load_root`; ver2-AD D2).
+            let space = core
+                .thread
+                .and_then(|t| self.threads.get(&t)?.aspace)
+                .filter(|&a| !self.marked(a));
+            ensure(pending || core.loaded == space, "G7: root a core loaded")?;
             if let Some(thread) = core.thread {
                 ensure(running.insert(thread), "46: a thread on two cores")?;
                 let marked = self.threads.get(&thread).is_none_or(|t| t.leaving);

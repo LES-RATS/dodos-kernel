@@ -5,12 +5,11 @@
 //! with its rebuild by pulled reports, R1 at every change of holder, and
 //! the plain and reserve roles.
 
+use super::pass17::{kill, submissions};
 use super::*;
 use crate::Wait;
 use crate::units::Stage;
-use dodos_abi::{
-    Evidence, FENCE_NS, IOMMU_WAIT_NS, NODE_STOP_KILL, NODE_STOP_SEAL, RoleState, SETTLE_NS,
-};
+use dodos_abi::{Evidence, FENCE_NS, IOMMU_WAIT_NS, NODE_STOP_SEAL, RoleState, SETTLE_NS};
 
 /// The roles of the reference machine, by index: the IOMMU unit, the
 /// IOAPIC, two reserves, the plain role `platform`.
@@ -41,14 +40,6 @@ pub(super) fn attach(m: &S, node: u16, iospace: u32, device: u64) -> Syscall {
             s(iospace)
         },
         device,
-    }
-}
-
-fn kill(n: u16) -> Syscall {
-    Syscall::NodeStop {
-        node: node_cap(n),
-        mode: NODE_STOP_KILL,
-        core: 0,
     }
 }
 
@@ -183,6 +174,11 @@ fn a_holder_answers_elsewhere_to_a_request_of_another_epoch_and_serves_one_of_it
             .is_none_or(|u| u.entries.is_empty())
     );
     k.m.unit_requested(1, Some((1, 1)), (IOMMU_ROLE as u16, epoch, op));
+    // Served: submitted to the unit, answered done at its confirmation (the
+    // final review's E35).
+    assert!(k.m.unit_service.contains_key(&(1, 1)));
+    k.m.unit_step();
+    assert_eq!(answer(&k), Some(dodos_abi::UnitResult::Done));
     assert!(
         k.m.table.units[&IOMMU_ROLE]
             .entries
@@ -230,15 +226,11 @@ fn a_unit_that_does_not_confirm_within_iommu_wait_ns_has_failed() {
     assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
     assert!(m.sys.role(IOMMU_ROLE).failed());
     assert_eq!(m.state(1), MemberState::Live);
-    // A later request is answered failed at once.
+    // A later request is answered failed at once: the role word's failed
+    // bit ends the call before anything is sent (the final review's E35: a
+    // wait of 30 ms was allowed).
     let again = attach(&m, 0, IOSPACE, DEVICE + 1);
-    let outcome = m.call(0, again);
-    if outcome == WAITS {
-        m.run(30 * MS);
-        assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
-    } else {
-        assert_eq!(outcome, Err(Error::Busy));
-    }
+    assert_eq!(m.call(0, again), Err(Error::Busy));
 }
 
 /// Three nodes of one core each on a machine with two IOMMU units on PCI
@@ -263,10 +255,6 @@ fn claim_msi() -> Syscall {
 }
 
 /// The operations submitted to the unit of a role so far.
-fn submissions(m: &S, role: usize) -> u64 {
-    m.sys.node(0).table.units.get(&role).map_or(0, |u| u.next)
-}
-
 #[test]
 fn the_claim_of_an_msi_asks_each_remapping_unit_of_its_segment_one_after_another() {
     let mut m = two_units();
@@ -363,8 +351,9 @@ fn a_plain_role_of_a_fenced_holder_can_be_claimed_a_reserve_role_only_once_it_is
     let reserve = role_slot(&m, 1, RESERVE);
     assert!(m.call(1, Syscall::RoleClaim(platform)).is_ok());
     assert!(m.call(1, Syscall::RoleClaim(reserve)).is_ok());
-    // Node 1 hangs without its handler on a class-2 core: it is fenced by
-    // INIT, and dead once the barrier holds.
+    // Node 1 hangs with its handler on a class-2 core: the fence's NMI parks
+    // it, and it is dead once the barrier holds (the final review's M2: the
+    // comment described a hang without the handler).
     m.sys.hang(1, true);
     m.ok(0, kill(1));
     m.settle();
@@ -457,19 +446,16 @@ fn a_unit_role_is_handed_in_steps_handing_then_held_by_the_target_two_epochs_lat
         },
     );
     // The caller waits while the queue drains; the call returns once the
-    // word is handing.
-    if outcome == WAITS {
-        let mut handing = false;
-        for _ in 0..100 {
-            m.run(100_000);
-            let word = m.sys.role(IOMMU_ROLE);
-            handing |= word.state() == RoleState::Handing;
-            if word.state() == RoleState::Held && word.holder() == 2 {
-                break;
-            }
-        }
-        assert!(handing || m.sys.role(IOMMU_ROLE).holder() == 2);
-    }
+    // word is handing (step 4), which the target turns into held (step 5).
+    // Seen event by event: sampled every 100 µs, handing was never seen
+    // (the final review's E33).
+    assert!(outcome == WAITS || outcome == DONE, "{outcome:?}");
+    assert!(m.step_until(|m| m.sys.role(IOMMU_ROLE).state() == RoleState::Handing));
+    let word = m.sys.role(IOMMU_ROLE);
+    assert_eq!(
+        (word.holder(), word.target(), word.epoch()),
+        (1, 2, epoch + 1)
+    );
     m.run(30 * MS);
     let word = m.sys.role(IOMMU_ROLE);
     assert_eq!((word.state(), word.holder()), (RoleState::Held, 2));
@@ -510,16 +496,14 @@ fn a_handing_word_whose_target_dies_is_taken_over_by_the_targets_successor() {
 fn a_unit_role_is_taken_over_settle_ns_after_the_stop_is_confirmed() {
     let mut m = three();
     m.ok(0, kill(1));
-    let mut first = None;
-    for _ in 0..100 {
-        m.run(100_000);
-        let word = m.sys.role(IOMMU_ROLE);
-        if word.holder() != 1 {
-            first = Some(m.sys.now());
-            break;
-        }
-    }
-    assert!(first.is_some());
+    // Event by event, so that the instant the holder changes is exact: the
+    // stop confirmed, then `SETTLE_NS` (the final review's E32: only
+    // `is_some` was asserted, and the delay was held by no test).
+    assert!(m.step_until(|m| m.sys.role(IOMMU_ROLE).holder() != 1));
+    let confirmed = m.sys.canonical().fences[1]
+        .confirmed
+        .expect("the stop confirmed");
+    assert_eq!(m.sys.now(), confirmed + SETTLE_NS);
     // The successor is the next live node of the best class: node 2.
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
     assert_eq!(m.sys.role(IOAPIC_ROLE).holder(), 2);

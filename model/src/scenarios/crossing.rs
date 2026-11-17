@@ -240,11 +240,12 @@ fn a_send_answer_is_applied_whether_or_not_the_sending_thread_still_waits() {
     );
     assert_eq!(m.call_by(0, sender, call), WAITS);
     // The sending thread is destroyed before the answer comes.
-    let mut outcome = m.call(0, Syscall::CapDelete(s(300)));
-    while outcome == Err(Error::Again) {
-        outcome = m.call(0, Syscall::CapDelete(s(300)));
-    }
-    assert_eq!(outcome, DONE);
+    // At most 8 calls: a removal that answered `again` for ever fails here
+    // instead of hanging the run (the final review's E36).
+    let outcome = (0..8)
+        .map(|_| m.call(0, Syscall::CapDelete(s(300))))
+        .find(|outcome| *outcome != Err(Error::Again));
+    assert_eq!(outcome, Some(DONE));
     m.settle();
     // The answer still recorded the use index and freed the credit.
     let entries = m.sys.canonical().grants[0].clone();
@@ -350,11 +351,11 @@ fn removing_the_anchor_revokes_the_grant_and_the_holder_removes_its_remote_frame
     // answered: the grant is freed.
     assert_eq!(m.sys.node(1).translated(m.t[1], AT), None);
     assert!(m.sys.node(0).grant_entries().is_empty());
-    let woken = m.woken(0).cloned();
-    assert!(
-        matches!(woken, Some(Ok(Output::Done)) | Some(Err(Error::Again))),
-        "{woken:?}"
-    );
+    // The revocation's step ends `again` once the `RevokeStep` is in; the
+    // next call finds nothing left (the final review's E6: either outcome
+    // was accepted).
+    assert_eq!(m.woken(0), Some(&Err(Error::Again)));
+    assert_eq!(m.call(0, Syscall::CapRevoke(s(OBJ))), DONE);
 }
 
 #[test]
@@ -379,7 +380,11 @@ fn a_release_that_crosses_a_revoke_ends_the_revocation() {
     m.run(20 * MS);
     assert!(!m.sys.canonical().grants[0].contains_key(&grant));
     assert!(m.sys.canonical().uses[1].is_empty());
-    assert!(m.woken(0).is_some());
+    // The revoker is woken as by a `RevokeStep`: its step ends `again`, and
+    // the next call finds nothing left (E6: any wake, an error included,
+    // was accepted).
+    assert_eq!(m.woken(0), Some(&Err(Error::Again)));
+    assert_eq!(m.call(0, Syscall::CapRevoke(s(OBJ))), DONE);
 }
 
 #[test]
@@ -404,12 +409,21 @@ fn a_mapped_remote_frame_whose_grant_is_revoking_keeps_its_slot_until_a_removal_
     map_got(&mut m);
     assert_eq!(m.call(0, Syscall::CapRevoke(s(OBJ))), WAITS);
     // Before the `Revoke` is consumed, the holder uses its capability: the
-    // call is `gone`, and the slot keeps the mapping (checked by the TLB
-    // invariant: a slot made dead at once would drop the mapping without
-    // the other core's invalidation).
+    // call is `gone`, and the slot keeps the mapping, so the invalidation
+    // of every core that may hold it waits for a removal (the TLB
+    // invariant, after every step). The final review's E7: the comment
+    // spoke of core 2 alone, which had taken no event since the map.
     assert_eq!(m.call(1, Syscall::ASpaceUnmap(s(GOT))), Err(Error::Gone));
     m.run(30 * MS);
-    assert!(m.sys.node(0).grant_entries().is_empty() || m.woken(0).is_some());
+    // The grant stays while the slot does, and the revoker's step ended
+    // `again` (E6: the two halves were joined by "or").
+    assert_eq!(m.woken(0), Some(&Err(Error::Again)));
+    assert_eq!(m.sys.node(0).grant_entries().len(), 1);
+    // A removal reaches the slot: the holder answers, and the grant is
+    // freed.
+    m.ok(1, Syscall::CapDelete(s(GOT)));
+    m.run(30 * MS);
+    assert!(m.sys.node(0).grant_entries().is_empty());
 }
 
 // The one check on every message received.
@@ -509,6 +523,8 @@ fn a_message_whose_kind_is_not_that_of_its_body_is_refused() {
 fn an_answer_that_names_no_credit_in_use_is_refused_and_changes_nothing() {
     let mut m = two();
     let before = refused_count(&m, 0);
+    let credits = m.sys.node(0).peers.clone();
+    let grants = m.sys.node(0).grant_entries();
     let answer = message(
         dodos_abi::NodeMessage::SendAnswer,
         (1, 1),
@@ -523,10 +539,17 @@ fn an_answer_that_names_no_credit_in_use_is_refused_and_changes_nothing() {
     m.sys.inject(1, 0, answer);
     m.run(20 * MS);
     assert_eq!(refused_count(&m, 0), before + 1);
+    // Nothing changed: node 0's credits and grant entries (the final
+    // review's E9).
+    assert_eq!(m.sys.node(0).peers, credits);
+    assert_eq!(m.sys.node(0).grant_entries(), grants);
 }
 
+/// A grant entry of another serial (the grantee half of the name needs a
+/// third node writing in the grantee's name, which the ring's writer rule
+/// of D-141 refuses first: the final review's E8 narrowed the name).
 #[test]
-fn a_release_or_a_signal_that_names_a_grant_entry_of_another_grantee_or_serial_is_refused() {
+fn a_release_or_a_signal_that_names_a_grant_entry_of_another_serial_is_refused() {
     let mut m = two();
     let notify = m.retype(0, ObjectKind::Notify, 0, BELL);
     m.ok(0, notify);
@@ -651,7 +674,10 @@ fn a_producer_index_too_far_ahead_is_read_as_a_failure_of_the_sender_and_resynch
     // The consumer index moved to the producer minus the ring's entries in
     // one step, traced once; the entries left were read one by one.
     let refused = refused_count(&m, 1) - before;
-    assert!(refused <= 1 + dodos_abi::RING_KERNEL_ENTRIES, "{refused}");
+    // Exactly: the resynchronisation is traced once as the sender's
+    // failure, and each entry left is refused (the final review's E5: an
+    // upper bound let the trace of the resynchronisation go).
+    assert_eq!(refused, 1 + dodos_abi::RING_KERNEL_ENTRIES, "{refused}");
 }
 
 // What ends with a generation, a fresh start and a resume.

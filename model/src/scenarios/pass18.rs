@@ -126,7 +126,9 @@ fn a_stale_wake_of_a_halted_park_stub_writes_the_current_park_request() {
     // A park request is raised while the stub is halted, then a stale wake
     // reaches it: the stub's handler writes the request it reads.
     m.sys.edit_table(|t| t.park_requests[1] += 1);
+    assert_eq!(m.sys.check(), Ok(()));
     m.sys.late_wake(1);
+    assert_eq!(m.sys.check(), Ok(()));
     assert_eq!(
         m.sys.canonical().core_beacons[1].parked,
         m.sys.park_request(1)
@@ -196,12 +198,12 @@ fn the_fence_record_keeps_the_last_stop_of_a_core_at_its_number_mod_64() {
 // and its mutation M23; Devices and shared hardware, several remapping
 // units, gap 12).
 
-fn claim_on(core: u64, source: u64, destination: u32) -> Syscall {
+fn claim_on(core: u64, source: u64, vector: u64, destination: u32) -> Syscall {
     Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
         source,
         core,
-        vector: 48,
+        vector,
         destination: s(destination),
     }
 }
@@ -214,11 +216,7 @@ fn a_claim_whose_first_unit_is_held_by_the_claimer_and_failed_still_asks_the_lat
     // A first claim finds the unit broken: it is failed from then on.
     m.sys.break_unit(roles[0]);
     let first = dodos_abi::IrqSource::msi(0, 3, 2, 0).raw();
-    let mut call = claim_on(1, first, 211);
-    if let Syscall::IrqClaim { vector, .. } = &mut call {
-        *vector = 49;
-    }
-    assert_eq!(m.call(1, call), WAITS);
+    assert_eq!(m.call(1, claim_on(1, first, 49, 211)), WAITS);
     m.run(2 * dodos_abi::IOMMU_WAIT_NS + 60 * MS);
     assert!(m.sys.role(roles[0]).failed());
     let later: Vec<u64> = roles[1..]
@@ -228,13 +226,13 @@ fn a_claim_whose_first_unit_is_held_by_the_claimer_and_failed_still_asks_the_lat
     // The first unit is this node's and failed: it is passed over at once,
     // and the call waits for the later ones.
     let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
-    assert_eq!(m.call(1, claim_on(1, msi, 210)), WAITS);
+    assert_eq!(m.call(1, claim_on(1, msi, 48, 210)), WAITS);
     m.run(dodos_abi::IOMMU_WAIT_NS + 60 * MS);
     assert_eq!(m.woken(1), Some(&Err(Error::Busy)));
     for (i, &role) in roles[1..].iter().enumerate() {
         let asked = m
             .sys
-            .node(role_holder(&m, role))
+            .node(m.sys.role(role).holder())
             .table
             .units
             .get(&role)
@@ -243,17 +241,13 @@ fn a_claim_whose_first_unit_is_held_by_the_claimer_and_failed_still_asks_the_lat
     }
 }
 
-fn role_holder(m: &S, role: usize) -> u16 {
-    m.sys.role(role).holder()
-}
-
 #[test]
 fn a_claim_that_finds_its_first_unit_failed_before_a_working_one_ends_busy() {
     let mut m = super::pass17::three_units();
     let roles = m.sys.node(0).segment_roles(0);
     m.sys.break_unit(roles[0]);
     let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
-    assert_eq!(m.call(0, claim_on(0, msi, 210)), WAITS);
+    assert_eq!(m.call(0, claim_on(0, msi, 48, 210)), WAITS);
     m.run(dodos_abi::IOMMU_WAIT_NS + 60 * MS);
     assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
 }
@@ -270,7 +264,7 @@ fn a_line_claim_served_at_once_by_the_claimers_own_ioapic_returns_its_result() {
         .expect("an IOAPIC serves GSI 5");
     let holder = m.sys.role(role).holder();
     let line = dodos_abi::IrqSource::line(5, false, false).raw();
-    let outcome = m.call(holder, claim_on(u64::from(holder), line, 210));
+    let outcome = m.call(holder, claim_on(u64::from(holder), line, 48, 210));
     assert_eq!(
         outcome,
         Ok(Output::Msi {
@@ -350,7 +344,7 @@ fn the_holder_refuses_a_masked_redirection_entry_whose_second_operand_is_not_0()
         target,
     };
     let remapped = Target::Remapped {
-        handle: requester * 192,
+        handle: super::pass17::handle(requester, 48),
         vector: 50,
     };
     assert!(judged(&mut m, holder, requester, role, masked(remapped)));
@@ -378,7 +372,7 @@ fn the_holder_refuses_an_interrupt_entry_cache_invalidation_of_a_handle_of_no_co
 /// into slot `slot`, and its claim completes.
 pub(super) fn claim_line(m: &mut S, node: u16, gsi: u32, slot: u32) -> crate::Outcome {
     let line = dodos_abi::IrqSource::line(gsi, false, false).raw();
-    let outcome = m.call(node, claim_on(u64::from(node), line, slot));
+    let outcome = m.call(node, claim_on(u64::from(node), line, 48, slot));
     match outcome {
         WAITS => {
             m.run(2 * MS);
@@ -415,7 +409,7 @@ fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
             level: false,
             low: false,
             target: Target::Remapped {
-                handle: b * 192,
+                handle: super::pass17::handle(b, 48),
                 vector: 48,
             },
         };
@@ -472,7 +466,10 @@ fn a_line_beyond_the_last_line_word_is_unsupported() {
     let mut m = S::on(&machine);
     let beyond = dodos_abi::IRQ_LINES_MAX as u32 + 2;
     let line = dodos_abi::IrqSource::line(beyond, false, false).raw();
-    assert_eq!(m.call(0, claim_on(0, line, 210)), Err(Error::Unsupported));
+    assert_eq!(
+        m.call(0, claim_on(0, line, 48, 210)),
+        Err(Error::Unsupported)
+    );
 }
 
 // A resume while a peer is unfenced, or died and started again (the ninth

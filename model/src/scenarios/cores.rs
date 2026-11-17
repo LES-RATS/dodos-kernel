@@ -1,7 +1,7 @@
 //! A node of several cores (D-128, D-129, D-131): placement, wake-ups
 //! across cores, the mark *leaving its core*, the waits for a node's cores
-//! (TLB, one core and several), the idle word, `CORE_ANSWER_NS`, and the
-//! two locking variants over one layout.
+//! (TLB, one core and several), the idle word, `CORE_ANSWER_NS`, and one
+//! node lock over one layout (D-138).
 
 use super::*;
 use crate::cores::{Flush, Ipi};
@@ -470,17 +470,28 @@ fn a_core_that_runs_one_thread_with_no_other_event_beats_every_half_stale_ns() {
     );
     sys.settle();
     assert_eq!(sys.sys.node(0).cores[1].thread, Some(other));
-    let before = sys.sys.canonical().core_beacons[1].heartbeat.0;
-    sys.run_by(3 * dodos_abi::STALE_NS, MS);
-    // Its heartbeat moved at least every STALE_NS / 2: nobody accused it.
-    assert!(sys.sys.canonical().core_beacons[1].heartbeat.0 >= before + 5);
+    // Its heartbeat moves at least every STALE_NS / 2, measured gap by gap
+    // to the millisecond (the final review's E4: a count of beats in three
+    // STALE_NS let a beat every 0.6 STALE_NS pass): nobody accuses it.
+    let beat = |sys: &S| sys.sys.canonical().core_beacons[1].heartbeat.0;
+    let (mut last, mut since) = (beat(&sys), sys.sys.now());
+    for _ in 0..3 * dodos_abi::STALE_NS / MS {
+        sys.run_by(MS, MS);
+        if beat(&sys) != last {
+            (last, since) = (beat(&sys), sys.sys.now());
+        }
+        assert!(sys.sys.now() - since <= dodos_abi::STALE_NS / 2);
+    }
     assert_eq!(sys.state(0), MemberState::Live);
 }
 
 // Locking: one node lock (D-138).
 
+/// No cost of several cores on a node of one core. (It records no lock
+/// either, but by construction: `end_locks` writes none when the width is
+/// 1; the final review's E2.)
 #[test]
-fn a_node_of_one_core_takes_no_lock_and_pays_no_cost_of_several_cores() {
+fn a_node_of_one_core_pays_no_cost_of_several_cores() {
     let mut k = N::on(&one_node(Arch::X86_64, 1));
     k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
     k.ok(map(FRAME, AT, rw()));
@@ -493,20 +504,29 @@ fn a_node_of_one_core_takes_no_lock_and_pays_no_cost_of_several_cores() {
     );
 }
 
+/// Each event's own trace, read at its end: the node lock from entry to
+/// exit, and the gate lock inside it for a call that writes page tables
+/// (the final review's E2: the trace read was the last event's only).
 #[test]
 fn every_event_holds_the_node_lock_from_entry_to_exit_and_the_gate_lock_inside() {
     let mut k = N::on(&one_node(Arch::X86_64, 2));
-    k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
-    k.ok(map(FRAME, AT, rw()));
-    let steps: Vec<&Step> =
-        k.m.locks
-            .steps
-            .iter()
-            .filter(|s| matches!(s, Step::Lock(_) | Step::Unlock(_)))
-            .collect();
-    assert_eq!(steps.first(), Some(&&Step::Lock(LockId::Node)));
-    assert_eq!(steps.last(), Some(&&Step::Unlock(LockId::Node)));
-    assert!(steps.contains(&&Step::Lock(LockId::Gate)));
+    let calls = [
+        (k.retype(ObjectKind::Frame, 1, FRAME), false),
+        (map(FRAME, AT, rw()), true),
+        (Syscall::ASpaceUnmap(s(FRAME)), true),
+    ];
+    for (call, gate) in calls {
+        k.ok(call);
+        let steps: Vec<&Step> =
+            k.m.locks
+                .steps
+                .iter()
+                .filter(|s| matches!(s, Step::Lock(_) | Step::Unlock(_)))
+                .collect();
+        assert_eq!(steps.first(), Some(&&Step::Lock(LockId::Node)));
+        assert_eq!(steps.last(), Some(&&Step::Unlock(LockId::Node)));
+        assert_eq!(steps.contains(&&Step::Lock(LockId::Gate)), gate);
+    }
 }
 
 #[test]
@@ -534,9 +554,36 @@ fn the_check_refuses_a_lock_the_contract_forbids() {
     assert_eq!(k.m.check(), Err("the node lock taken twice in one event"));
     // A spin for another core or a unit inside a hold.
     k.m.locks.steps = vec![Step::Spin(crate::locks::WaitKind::Unit)];
-    assert!(k.m.check().is_err());
+    assert_eq!(
+        k.m.check(),
+        Err("no lock is held across a wait for another core or for a unit")
+    );
+    // A lock released while not held, and the gate lock never released
+    // (the final review's E3).
+    let node = |lock| vec![Step::Lock(LockId::Node), lock, Step::Unlock(LockId::Node)];
+    k.m.locks.steps = node(Step::Unlock(LockId::Gate));
+    assert_eq!(k.m.check(), Err("the gate lock released while not held"));
+    k.m.locks.steps = node(Step::Lock(LockId::Gate));
+    assert_eq!(
+        k.m.check(),
+        Err("the node lock released while not held or under the gate lock")
+    );
+    k.m.locks.steps = vec![Step::Unlock(LockId::Node)];
+    assert_eq!(
+        k.m.check(),
+        Err("the node lock released while not held or under the gate lock")
+    );
+    k.m.locks.steps = vec![
+        Step::Lock(LockId::Node),
+        Step::Lock(LockId::Gate),
+        Step::Lock(LockId::Gate),
+    ];
+    assert_eq!(k.m.check(), Err("the gate lock taken twice"));
     // A node of one core that pays for a rule of several cores.
     let mut one = N::on(&one_node(Arch::X86_64, 1));
     one.m.locks.steps = vec![Step::Pay(Cost::Interrupt)];
-    assert!(one.m.check().is_err());
+    assert_eq!(
+        one.m.check(),
+        Err("N = 1: a node of one core paid for a rule of several cores")
+    );
 }

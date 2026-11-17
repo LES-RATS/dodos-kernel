@@ -535,6 +535,7 @@ fn a_running_thread_bound_to_no_address_space_is_reported() {
     let mut k = node2();
     let space = k.m.threads[&k.t].aspace.unwrap();
     k.m.threads.get_mut(&k.t).unwrap().aspace = None;
+    k.m.cores[0].loaded = None;
     k.m.aspaces
         .get_mut(&space)
         .unwrap()
@@ -561,4 +562,285 @@ fn a_translation_under_no_grant_is_reported() {
     m.sys.edit_table(|t| t.grants[0].clear());
     let report = m.sys.check().expect_err("spoiled");
     assert_eq!(report, "node 1: 58: translation under no grant");
+}
+
+// The checks of a node that no test made fail (the final review's
+// verifications of lot D, D4 and D10, and of lot AD, D1, D2 and D8): one
+// spoiled state each, each red when its check is removed.
+
+/// A request of core 0 asking core 1, in use.
+fn in_use(k: &mut N, r: Request) {
+    k.m.cores[0].request = Some(r);
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
+    k.m.cores[1].pending.insert(0);
+}
+
+#[test]
+fn a_state_word_in_use_with_no_request_is_reported() {
+    let mut k = node2();
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
+    reported(&k, "TLB: the state word of a request");
+}
+
+#[test]
+fn a_barrier_that_invalidates_is_reported() {
+    let mut k = node2();
+    let mut r = request(0b10, 0, 0);
+    r.completes = Completes::Barrier(k.m.kernel_epoch);
+    in_use(&mut k, r);
+    reported(
+        &k,
+        "TLB: a barrier that invalidates, or an invalidation that is a barrier",
+    );
+}
+
+#[test]
+fn a_barrier_beyond_the_kernel_epoch_is_reported() {
+    let mut k = node2();
+    let mut r = request(0b10, 0, 0);
+    r.flush = Flush::Nothing;
+    r.completes = Completes::Barrier(k.m.kernel_epoch + 1);
+    in_use(&mut k, r);
+    reported(&k, "epoch: a barrier beyond the kernel epoch");
+}
+
+#[test]
+fn a_request_whose_thread_waits_for_nothing_is_reported() {
+    let mut k = node2();
+    let thread = idle_thread(&mut k);
+    let mut r = request(0b10, 0, 0);
+    r.waiter = Some(thread);
+    in_use(&mut k, r);
+    reported(&k, "TLB: the thread of a request waits for another");
+}
+
+#[test]
+fn a_request_whose_thread_is_gone_is_reported() {
+    let mut k = node2();
+    let mut r = request(0b10, 0, 0);
+    r.waiter = Some(crate::ObjId(u32::MAX - 7));
+    in_use(&mut k, r);
+    reported(&k, "TLB: the thread of a request waits for another");
+}
+
+#[test]
+fn an_epoch_raised_by_two_is_reported() {
+    let (mut k, untyped) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
+    let e = k.m.kernel_epoch;
+    k.m.kernel_epoch = e + 3;
+    k.m.locks.steps = vec![
+        Step::Epoch(e + 1),
+        Step::Ready(untyped),
+        Step::Epoch(e + 3),
+        Step::Ready(untyped),
+    ];
+    k.m.untypeds.get_mut(&untyped).unwrap().ready = Some(e + 3);
+    reported(&k, "epoch: raised by more than one at a time");
+}
+
+#[test]
+fn an_epoch_that_is_not_the_last_raise_is_reported() {
+    let (mut k, untyped) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
+    let e = k.m.kernel_epoch;
+    k.m.kernel_epoch = e + 2;
+    k.m.locks.steps = vec![Step::Epoch(e + 1), Step::Ready(untyped)];
+    k.m.untypeds.get_mut(&untyped).unwrap().ready = Some(e + 1);
+    reported(&k, "epoch: the node's epoch is not its last raise");
+}
+
+#[test]
+fn a_word_6_beyond_the_kernel_epoch_is_reported() {
+    let (mut k, untyped) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
+    let e = k.m.kernel_epoch;
+    k.m.untypeds.get_mut(&untyped).unwrap().ready = Some(e + 1);
+    reported(
+        &k,
+        "epoch: word 6 of an untyped's root slot is not the epoch its watermark became ready at",
+    );
+}
+
+#[test]
+fn a_ready_watermark_under_a_live_object_is_reported() {
+    let mut k = node2();
+    let e = k.m.kernel_epoch.max(1);
+    k.m.kernel_epoch = e;
+    let untyped =
+        k.m.untypeds
+            .iter()
+            .find(|(_, u)| u.live > 0)
+            .map(|(&id, _)| id)
+            .unwrap();
+    k.m.untypeds.get_mut(&untyped).unwrap().ready = Some(e);
+    reported(&k, "18: a watermark ready to return under a live object");
+}
+
+#[test]
+fn a_send_in_a_request_credit_is_reported() {
+    let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
+    k.m.peers[1].credits[0] = Some(crate::rings::Credit {
+        kind: dodos_abi::NodeMessage::Send,
+        serial: 1,
+        completes: crate::rings::Completes::Send {
+            grants: vec![],
+            thread: None,
+            manage: true,
+        },
+    });
+    reported(&k, "credits: a send outside the send credits");
+}
+
+#[test]
+fn a_request_in_a_send_credit_is_reported() {
+    let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
+    k.m.peers[1].credits[dodos_abi::REQUESTS_PER_PEER] = Some(crate::rings::Credit {
+        kind: dodos_abi::NodeMessage::Revoke,
+        serial: 1,
+        completes: crate::rings::Completes::Revoke { grant: 0 },
+    });
+    reported(&k, "credits: a send outside the send credits");
+}
+
+#[test]
+fn a_core_running_a_thread_that_does_not_hold_its_context_is_reported() {
+    let mut k = node2();
+    let other = idle_thread(&mut k);
+    k.m.cores[0].thread = Some(other);
+    reported(&k, "46: thread of the running context");
+}
+
+#[test]
+fn a_core_that_loaded_another_space_is_reported() {
+    let mut k = node2();
+    k.ok(k.retype(ObjectKind::ASpace, 0, 301));
+    let other = k.m.object_at(k.t, s(301)).unwrap();
+    k.m.cores[0].loaded = Some(other);
+    reported(&k, "G7: root a core loaded");
+}
+
+/// G6 by the holder's state the contract allows: a record left
+/// *unmapping*, its leaf still counted in the use entry, under a grant the
+/// granting node freed. The holder's own check accepts it (lot AD, D7);
+/// G6 alone names it.
+#[test]
+fn a_grant_freed_while_its_holder_still_counts_an_unmapping_leaf_is_reported_by_g6() {
+    let mut m = S::two();
+    super::pass17::granted_to_1(&mut m);
+    let map = Syscall::ASpaceMap(crate::Map {
+        space: s(dodos_abi::START_SLOT_ASPACE),
+        frame: s(110),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    });
+    m.ok(1, map);
+    let holder = m.t[1];
+    let node = m.sys.node_mut(1);
+    let frame = node.object_at(holder, s(110)).unwrap();
+    let cap = *node
+        .caps
+        .iter()
+        .find(|(_, c)| c.object == frame && matches!(c.record, crate::Record::Mapping(_)))
+        .unwrap()
+        .0;
+    let crate::Record::Mapping(mapping) = node.caps[&cap].record else {
+        unreachable!()
+    };
+    crate::live(&mut node.caps, cap).record = crate::Record::Unmapping(mapping);
+    for space in node.aspaces.values_mut() {
+        space.translations.retain(|_, t| t.cap != cap);
+    }
+    for core in &mut node.cores {
+        for cached in core.tlb.values_mut() {
+            cached.retain(|_, held| held.0 != cap);
+        }
+    }
+    assert_eq!(m.sys.node(1).check(), Ok(()), "the holder accepts it");
+    m.sys.edit_table(|t| t.grants[0].clear());
+    let report = m.sys.check().expect_err("spoiled");
+    assert_eq!(
+        report,
+        "G6: a grant freed while its holder translates to it"
+    );
+}
+
+// A value of the state used as an index is judged before it is used: the
+// checker names the invariant, it never panics (ver-D, Mistral's note on
+// `check_cores`; the sweep of pass 23).
+
+#[test]
+fn a_core_word_that_names_a_slot_past_the_table_is_reported() {
+    let mut m = S::two();
+    m.sys
+        .edit_table(|t| t.core_words[1] = CoreWord::owned(40, 1).raw());
+    machine_reported(&m, "core word: names a slot past the table");
+}
+
+#[test]
+fn a_use_entry_that_names_a_granter_past_the_table_is_reported() {
+    let mut m = S::two();
+    m.sys.edit_table(|t| {
+        t.uses[1].insert(
+            5,
+            crate::table::UseEntry {
+                granter: 40,
+                grant: 3,
+                serial: 1,
+                generation: 1,
+                root: crate::ObjId(0),
+                leaves: 0,
+                release_pending: false,
+                signal_pending: false,
+            },
+        );
+    });
+    let report = m.sys.check().expect_err("spoiled");
+    assert!(report.ends_with("past the table"), "{report}");
+}
+
+#[test]
+fn a_pending_bit_that_names_a_core_past_the_node_is_reported() {
+    let mut k = node2();
+    k.m.cores[1].pending.insert(7);
+    reported(&k, "TLB: a pending bit names no request that asks the core");
+}
+
+#[test]
+fn a_thread_waiting_for_a_peer_past_the_table_is_reported() {
+    let mut k = node2();
+    let thread = idle_thread(&mut k);
+    k.m.threads.get_mut(&thread).unwrap().wait = Wait::Node {
+        peer: 40,
+        credit: 3,
+    };
+    reported(
+        &k,
+        "credits: a thread waits for an answer no credit expects",
+    );
+}
+
+// Two rules of the machine that the sweep of pass 23 found held by no
+// test: each switched off, the whole suite stayed green.
+
+#[test]
+fn a_core_word_that_reads_leaving_is_reported() {
+    let mut m = S::two();
+    let g = m.sys.member(1).generation();
+    // State 2, *leaving*, which no rule writes (reserved for nodes that
+    // give cores at run time).
+    m.sys.edit_table(|t| {
+        t.core_words[1] = word_with_check(2 | 1 << 16 | u64::from(g) << 32);
+    });
+    machine_reported(&m, "core word: leaving is written");
+}
+
+#[test]
+fn a_park_request_that_goes_back_is_reported() {
+    let mut m = S::two();
+    m.ok(0, super::pass17::kill(1));
+    m.run(10 * MS);
+    assert_ne!(m.sys.park_request(1), 0, "the fence raised it");
+    m.sys.edit_table(|t| t.park_requests[1] = 0);
+    machine_reported(&m, "fence: a park request went back");
 }

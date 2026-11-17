@@ -330,11 +330,12 @@ fn thread_of_a_revoked_task_gets_gone_from_every_call_and_never_runs() {
     k.make(Task, 40);
     let threads: Vec<ObjId> = (0..33).map(|n| k.thread(200 + 2 * n, 40)).collect();
     k.no(Syscall::TaskRevoke(s(40)), Error::Again);
-    // The first one attached is still attached and runnable.
-    let last = threads[0];
-    assert_eq!(k.on(last, Syscall::CapDelete(s(EP))), Err(Error::Gone));
-    assert_eq!(k.on(last, Syscall::Yield), Err(Error::Gone));
-    assert_ne!(k.m.running(), Some(last));
+    // The first call detaches nothing (D-137); the first thread attached
+    // is still attached, and gets `gone` (the final review's F2 Opus 37).
+    let early = threads[0];
+    assert_eq!(k.on(early, Syscall::CapDelete(s(EP))), Err(Error::Gone));
+    assert_eq!(k.on(early, Syscall::Yield), Err(Error::Gone));
+    assert_ne!(k.m.running(), Some(early));
     // A thread attached to a revoked task cannot be moved to another.
     k.make(Task, 41);
     k.no(attach(200, 41), Error::Busy);
@@ -526,8 +527,9 @@ fn revoked_thread_that_the_choice_would_take_is_suspended() {
         thread: s(300),
     });
     assert_eq!(k.m.running(), Some(early));
-    // The first call detaches the 32 others; the early one stays attached
-    // to the revoked task, and is suspended when the choice takes it.
+    // The first call detaches nothing (D-137); the early one stays attached
+    // to the revoked task, and is suspended when the choice takes it (the
+    // final review's F2 Opus 37).
     k.no(Syscall::TaskRevoke(s(40)), Error::Again);
     assert!(!k.m.runnable().contains(&early));
     assert_ne!(k.m.running(), Some(early));

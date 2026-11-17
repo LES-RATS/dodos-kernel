@@ -197,12 +197,15 @@ impl Model {
                     .is_some_and(|c| matches!(c.record, Record::Unmapping(_)));
                 ensure(unmapping, "TLB: the record of a request is not unmapping")?;
             }
-            if let Some(thread) = request.waiter
-                && let Some(t) = self.threads.get(&thread)
-            {
-                let waits = t.wait == Wait::Cores(requester) || t.wait == Wait::None;
-                ensure(waits, "TLB: the thread of a request waits for another")?;
-            }
+            // A cancelled wait forgets its waiter in the same step
+            // (`forget_waiter`), so a waiter named is a live thread that
+            // waits for this request (ver-D D10).
+            let waits = request.waiter.is_none_or(|thread| {
+                self.threads
+                    .get(&thread)
+                    .is_some_and(|t| t.wait == Wait::Cores(requester))
+            });
+            ensure(waits, "TLB: the thread of a request waits for another")?;
             let panicked = self.table.beacons[self.node as usize].panic.is_some();
             ensure(
                 panicked
@@ -213,9 +216,10 @@ impl Model {
         }
         for (position, core) in self.cores.iter().enumerate() {
             for &requester in &core.pending {
-                let asks = self.cores[requester]
-                    .request
-                    .as_ref()
+                let asks = self
+                    .cores
+                    .get(requester)
+                    .and_then(|r| r.request.as_ref())
                     .is_some_and(|r| r.asked & 1 << position != 0 && r.acked & 1 << position == 0);
                 ensure(
                     asks,
@@ -285,16 +289,31 @@ impl Model {
             "no lock is held across a wait for another core or for a unit",
         )?;
         self.check_epoch()?;
-        let mut node = false;
+        // Each lock is released only while held, and the gate lock before
+        // the node lock (the final review's E3: an unmatched unlock and a
+        // gate lock never released passed).
+        let (mut node, mut gate) = (false, false);
         for step in steps {
             match step {
                 Step::Lock(LockId::Node) => {
                     ensure(!node, "the node lock taken twice in one event")?;
                     node = true;
                 }
-                Step::Unlock(LockId::Node) => node = false,
+                Step::Unlock(LockId::Node) => {
+                    ensure(
+                        node && !gate,
+                        "the node lock released while not held or under the gate lock",
+                    )?;
+                    node = false;
+                }
                 Step::Lock(LockId::Gate) => {
-                    ensure(node, "the gate lock taken outside the node lock")?
+                    ensure(node, "the gate lock taken outside the node lock")?;
+                    ensure(!gate, "the gate lock taken twice")?;
+                    gate = true;
+                }
+                Step::Unlock(LockId::Gate) => {
+                    ensure(gate, "the gate lock released while not held")?;
+                    gate = false;
                 }
                 _ => {}
             }
@@ -346,7 +365,8 @@ impl Model {
     /// What crosses between nodes, credits: "a credit is in use from the
     /// moment its message is written into the ring until the sender has
     /// consumed its answer, or until the peer's generation ends"; a node
-    /// has at most `SENDS_PER_PEER` sends in flight to a peer; a thread
+    /// has at most `SENDS_PER_PEER` sends in flight to a peer, each in a
+    /// send credit and no request in one; a thread
     /// waiting for another node names a credit in use toward it.
     fn check_credits(&self) -> Check {
         for (peer, credits) in self.peers.iter().enumerate() {
@@ -354,11 +374,17 @@ impl Model {
                 credits.credits.len() == dodos_abi::REQUESTS_PER_PEER + dodos_abi::SENDS_PER_PEER,
                 "credits: the credits of a peer",
             )?;
-            let (sends, _) = credits.sends();
-            ensure(
-                sends <= dodos_abi::SENDS_PER_PEER,
-                "credits: more sends than SENDS_PER_PEER",
-            )?;
+            // At most `SENDS_PER_PEER` sends in flight follows from the
+            // length above once a send sits only in a send credit (16 to
+            // 23) and a request never does: the count itself could not fail
+            // (ver-D D4), the place can.
+            let placed = credits.credits.iter().enumerate().all(|(index, credit)| {
+                credit.as_ref().is_none_or(|c| {
+                    matches!(c.completes, crate::rings::Completes::Send { .. })
+                        == (index >= dodos_abi::REQUESTS_PER_PEER)
+                })
+            });
+            ensure(placed, "credits: a send outside the send credits")?;
             if peer == self.node as usize {
                 ensure(
                     credits.credits.iter().all(Option::is_none),
@@ -368,9 +394,10 @@ impl Model {
         }
         for thread in self.threads.values() {
             if let Wait::Node { peer, credit } = thread.wait {
-                let in_use = self.peers[peer as usize]
-                    .credits
-                    .get(credit as usize)
+                let in_use = self
+                    .peers
+                    .get(peer as usize)
+                    .and_then(|p| p.credits.get(credit as usize))
                     .is_some_and(Option::is_some);
                 ensure(
                     in_use,

@@ -14,7 +14,7 @@
 //! | Hydrogen 2: a resume drops the answers that waited | `crossing::a_resume_keeps_its_consumer_indices_and_consumes_the_answers_that_waited`, `hydrogen_2_*` here |
 //! | Hydrogen 3: a `Release` crossing a `Revoke` | `crossing::a_release_that_crosses_a_revoke_ends_the_revocation`, `explore::crossing_*` |
 //! | Hydrogen 4: a thread destroyed while it waits for a `SendAnswer` | `crossing::a_send_answer_is_applied_whether_or_not_the_sending_thread_still_waits`, `explore::waiter_*` |
-//! | Hydrogen 5: the reports of a rebuild (cursor per unit, sealed and starting nodes, the end) | `units::the_rebuild_of_a_unit_keeps_the_entries_of_live_nodes_and_clears_those_of_no_report`, `units::the_rebuild_keeps_without_a_report_the_entries_of_a_sealed_node` |
+//! | Hydrogen 5: the reports of a rebuild (cursor per unit, sealed and starting nodes, the end) | `units::the_rebuild_of_a_unit_keeps_the_entries_of_live_nodes_and_clears_those_of_no_report`, `pass23::the_rebuild_clears_an_entry_of_a_live_node_that_its_report_does_not_claim`, `units::the_rebuild_keeps_without_a_report_the_entries_of_a_sealed_node` |
 //! | Hydrogen 6: a faulty peer's ring (unreadable header, producer too far ahead) | `crossing::an_unreadable_header_is_consumed_as_one_entry`, `crossing::a_producer_index_too_far_ahead_*` |
 //! | Hydrogen 7, Opus N3: the take-over of a handing word judged on its target | `units::a_handing_word_whose_target_dies_is_taken_over_by_the_targets_successor`, `hydrogen_n3_*` here |
 //! | Hydrogen 8: sealed before the last park request; `panic`; the two-node seal | `membership::a_seal_writes_sealed_only_after_the_last_park_request_*`, `membership::a_sealing_node_returns_to_live_*`, `hydrogen_8_*` here |
@@ -28,19 +28,19 @@
 //! | DeepSeek 1: an idle core and the invalidation | `cores::an_idle_core_is_not_asked_and_owes_the_invalidation_at_its_wake` |
 //! | DeepSeek 2: a marked thread is not runnable | `cores::sched_configure_that_moves_a_running_context_marks_*` |
 //! | DeepSeek 3: the record *unmapping* is busy | `deepseek_3_*` here |
-//! | DeepSeek 4: an interrupt entry and an untyped under L2 | `deepseek_4_*` here |
+//! | DeepSeek 4: an interrupt entry and an untyped under L2 | left with L2 (D-138) |
 //! | DeepSeek 5: ARM64 `CnP` | wording of the architecture: not modelled |
 //! | DeepSeek 6: no unit wait inside a hold; a unit's failure is not the node's | invariant "no lock is held across a wait", `units::a_unit_that_does_not_confirm_within_iommu_wait_ns_has_failed` |
 //! | DeepSeek 8: a second suspend | `cores::thread_suspend_of_a_thread_on_another_core_returns_again_while_it_is_marked` |
 //! | DeepSeek 9: the audit of the ownership words (R4) | `tests/blocks.rs` (the stray write that stops the machine) |
-//! | DeepSeek 10: the gate lock last and counted in *k* | `cores::under_l2_a_call_takes_its_locks_in_the_order_of_their_kind_the_gate_lock_last` |
+//! | DeepSeek 10: the gate lock last and counted in *k* | left with L2 (D-138); the gate lock inside the node lock: `cores::every_event_holds_the_node_lock_from_entry_to_exit_and_the_gate_lock_inside` |
 //! | DeepSeek 11: `send` for `grant_signal` | `crossing::grant_signal_is_invalid_on_a_frame_that_is_not_remote_and_needs_send` |
 //! | DeepSeek 12 to 14 | wording |
 //! | DeepSeek 15: `busy` for a full grant table | `deepseek_15_*` here |
 //! | Round 2, DeepSeek 4, first round's Test 4: the park request before the mark, the mark before the stop | invariants "fence: ..." of `System::check`, `kernel_shape_*_request_before_mark` here |
 //! | Round 2, DeepSeek 5: a take writes the taker's current generation | `membership::a_fresh_start_on_several_cores_writes_joining_then_owned_then_live` |
 //! | Round 2, DeepSeek 6 (`r6_inflight`): R6 waits `SETTLE_NS` after the last stop | `kernel_shape_r6_*` here |
-//! | Round 2, DeepSeek 7, first round's Test 2: the class rule on the taker's cores | `kernel_shape_*_class_*` here |
+//! | Round 2, DeepSeek 7, first round's Test 2: the class rule on the taker's cores | `kernel_shape_*_class` here |
 //! | Round 2, DeepSeek 8: the bootstrap core is lost when its kernel dies | `hydrogen_9_*` here (started again by its NMI) |
 //! | Round 2, Hydrogen 1: `CoreWord` ABA on *leaving* | invariant "core word: leaving is written" |
 //! | Round 2, Hydrogen 2: a park request that wraps | invariant "fence: a park request went back" |
@@ -54,45 +54,18 @@
 //! | Ninth review 3: `cap_delete` of an invalid remote capability with a mapping | `crossing::cap_delete_of_an_invalid_remote_capability_with_a_mapping_undoes_the_mapping` |
 //! | Ninth review 4: the unit sequence of a claim | `pass17::a_claim_passes_a_failed_unit_*`, `pass17::a_claim_whose_waiting_thread_is_destroyed_*`, `pass17::a_claim_of_a_remapped_line_*` |
 //! | Ninth review 5: domain numbers and the operands of a unit request | `pass17::the_holder_refuses_*`, `pass17::each_node_slot_takes_its_domain_numbers_*`, `pass17::the_start_up_refuses_a_unit_*` |
-//! | Ninth review 6: the order of L2 | `pass17::under_l2_a_call_records_its_locks_*`, `cores::the_check_refuses_a_lock_order_the_contract_forbids` |
+//! | Ninth review 6: the order of L2 | left with L2 (D-138); the one node lock: `cores::the_check_refuses_a_lock_the_contract_forbids` |
 //! | Ninth review 7: one node on a machine of class 0 | `pass17::one_node_on_a_machine_of_class_0_*` |
 //! | Eighth model review, DeepSeek 1 to 3 and Hydrogen's table row 17 | `pass17::a_thread_attached_to_no_task_*`, `pass17::a_send_whose_stamp_*`, `pass17::reserve_keeps_room_*`, invariant "fence: a stop sent before its word was marked", `pass17::a_resume_after_a_peer_died_*` |
 //! | Eighth model review, Mistral F1 to F15 | `mistral.rs` (one test per mutation), `checker.rs` and `check/tests.rs` (the checker fed a bad state) |
 
+use super::pass17::{kill, resume, seal};
 use super::*;
 use crate::Record;
 use crate::system::Hardware;
 use dodos_abi::{
-    CoreState, CoreWord, CrashReason, Evidence, NODE_START_FRESH, NODE_START_RESUME,
-    NODE_STOP_KILL, NODE_STOP_SEAL, RoleState, SETTLE_NS, START_SLOT_MAILBOX,
+    CoreState, CoreWord, Evidence, NODE_START_FRESH, RoleState, SETTLE_NS, START_SLOT_MAILBOX,
 };
-
-fn kill(n: u16) -> Syscall {
-    Syscall::NodeStop {
-        node: node_cap(n),
-        mode: NODE_STOP_KILL,
-        core: 0,
-    }
-}
-
-fn seal(n: u16) -> Syscall {
-    Syscall::NodeStop {
-        node: node_cap(n),
-        mode: NODE_STOP_SEAL,
-        core: 0,
-    }
-}
-
-fn resume(n: u16) -> Syscall {
-    Syscall::NodeStart {
-        node: node_cap(n),
-        mode: NODE_START_RESUME,
-        image: 0,
-        module: 0,
-        window: 0,
-        mask: 0,
-    }
-}
 
 fn fresh(n: u16, mask: u64) -> Syscall {
     Syscall::NodeStart {
@@ -146,6 +119,9 @@ fn granted(m: &mut S) {
 
 // The eighth review, Hydrogen and its verifications.
 
+/// Node 1 is sealed before the answer is consumed (measured by the final
+/// review's E31); `crossing::a_resume_keeps_its_consumer_indices_and_
+/// consumes_the_answers_that_waited` holds the same case without timing.
 #[test]
 fn hydrogen_2_a_thread_that_waits_for_an_answer_while_its_node_seals_gets_it_at_the_resume() {
     let mut m = S::two();
@@ -262,30 +238,40 @@ fn hydrogen_n2_a_removal_done_for_a_revoke_sends_no_release() {
     assert!(m.sys.canonical().uses[1].is_empty());
 }
 
+/// The row "4. handing (X → Y) written; `Handed` in flight | Y completes
+/// step 5 from the word, even if the `Handed` is refused" of "What a death
+/// does at each step of a planned hand-over", X the node that dies. The
+/// events run one at a time, so that the hander is killed while the word
+/// reads handing (the final review's E29: sampled every 100 µs, the word was
+/// never seen handing and node 1 was never killed).
 #[test]
 fn hydrogen_n3_the_node_that_hands_dies_after_step_4_and_the_target_completes_step_5_alone() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     let role = s(slots_of(m.sys.node(1), m.t[1], ObjectKind::Role)[0]);
-    let _ = m.call(
+    let epoch = m.sys.role(0).epoch();
+    let outcome = m.call(
         1,
         Syscall::RoleHand {
             role,
             node: node_cap(2),
         },
     );
-    for _ in 0..200 {
-        if m.sys.role(0).state() == RoleState::Handing {
-            break;
-        }
-        m.run(100_000);
-    }
-    if m.sys.role(0).state() == RoleState::Handing {
-        m.ok(0, kill(1));
-    }
+    assert!(outcome == WAITS || outcome == DONE, "{outcome:?}");
+    m.step_until(|m| m.sys.role(0).state() == RoleState::Handing);
+    let word = m.sys.role(0);
+    assert_eq!(
+        (word.state(), word.holder(), word.target()),
+        (RoleState::Handing, 1, 2),
+        "step 4 written"
+    );
+    m.ok(0, kill(1));
     m.run(30 * MS);
-    // Only the target took the role; ONE-HOLDER held at every step.
+    assert_eq!(m.state(1), MemberState::Dead);
+    // Only the target took the role, from the word; ONE-HOLDER held at
+    // every step.
     let word = m.sys.role(0);
     assert_eq!((word.state(), word.holder()), (RoleState::Held, 2));
+    assert!(word.epoch() > epoch);
 }
 
 #[test]
@@ -303,10 +289,7 @@ fn hydrogen_n5_a_revoke_step_that_needs_a_units_invalidation_completes_its_recor
         iospace: s(150),
         device: 0x10,
     };
-    let outcome = m.call(1, attach);
-    if outcome == WAITS {
-        m.run(20 * MS);
-    }
+    super::pass17::succeeds(&mut m, 1, attach, 20 * MS);
     let untyped = untyped_slot(m.sys.node(1), m.t[1]);
     m.ok(
         1,
@@ -539,5 +522,4 @@ fn kernel_shape_a_resume_runs_r0_for_a_generation_that_ended_while_the_node_was_
     assert!(m.sys.node(1).remotes.is_empty());
     assert!(m.sys.canonical().uses[1].is_empty());
     assert_eq!(m.sys.member(0).state(), MemberState::Dead);
-    let _ = CrashReason::Fenced;
 }

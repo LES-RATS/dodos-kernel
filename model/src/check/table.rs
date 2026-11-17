@@ -260,6 +260,10 @@ impl Model {
         for space in self.aspaces.values() {
             for t in space.translations.values() {
                 let object = self.caps[&t.cap].object;
+                // These two are shadowed by 35 (the translations of a space
+                // are those of its records, of the frame's page size),
+                // which runs first; kept so that the check names a fault
+                // instead of panicking.
                 let frame = self.frames.get(&object).ok_or("58: frame")?;
                 let bytes = table.geometry.bytes(t.size).ok_or("58: page size")?;
                 let start = frame.base + t.page * bytes;

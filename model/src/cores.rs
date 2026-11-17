@@ -154,11 +154,13 @@ pub(crate) struct CorePart {
     /// What a core enables for a thread, as the last switch wrote it.
     pub(crate) enabled: u32,
     /// Debugging: the rate limit of each code of its kernel ring, the
-    /// entries it suppressed and reported, and its random generator (its
-    /// state is not compared).
+    /// entries it suppressed and reported, and its random generator, whose
+    /// state decides every later read and is compared like the rest (the
+    /// final review's F2 M8: as bookkeeping, a boot that seeded it
+    /// otherwise compared equal).
     pub(crate) limits: [crate::debug::Limit; 18],
     pub(crate) reported: u64,
-    pub(crate) entropy: Ephemeral<u64>,
+    pub(crate) entropy: u64,
 }
 
 /// What `start_request` did.
@@ -678,7 +680,9 @@ impl Model {
     /// heartbeats of the node's other cores with what it last saw" (A node
     /// of several cores, gap 16).
     pub(crate) fn watch_own_cores(&mut self) {
-        if self.width() == 1 || !self.ready {
+        // No accusation, of itself either, while the release word of the
+        // stub is raised (The debugger stub, D-135, D-137).
+        if self.width() == 1 || !self.ready || self.table.release {
             return;
         }
         // Both sides of each comparison on the clock of membership (D-139).

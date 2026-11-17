@@ -367,7 +367,10 @@ fn a_thread_detached_by_the_destruction_of_its_task_keeps_its_marks() {
         marks: untrusted,
     });
     assert_eq!(k.m.threads[&thread].marks, 0);
-    while k.call(k.t, Syscall::CapDelete(s(390))) == Err(Error::Again) {}
+    let deleted = (0..8)
+        .map(|_| k.call(k.t, Syscall::CapDelete(s(390))))
+        .find(|outcome| *outcome != Err(Error::Again));
+    assert_eq!(deleted, Some(DONE));
     assert_eq!(k.m.threads[&thread].task, None);
     assert_eq!(k.m.threads[&thread].marks & untrusted, untrusted);
 }
@@ -456,14 +459,7 @@ fn one_request_at_a_time_per_device_and_an_attached_device_attached_again_succee
     let again = attach(&m, 0, IOSPACE, DEVICE);
     assert_eq!(m.call(0, again.clone()), DONE);
     // A detach in flight: a second detach and an attach are `busy`.
-    let detach = match again.clone() {
-        Syscall::IoSpaceAttach { iommu, device, .. } => Syscall::IoSpaceAttach {
-            iommu,
-            iospace: SlotAddr::NONE,
-            device,
-        },
-        other => other,
-    };
+    let detach = super::pass17::detach_of(again.clone());
     assert_eq!(m.call(0, detach.clone()), WAITS);
     assert_eq!(m.sys.node(0).census().detaching, 1);
     assert_eq!(m.sys.node(0).census().devices, 1);
@@ -486,14 +482,7 @@ fn a_detach_while_an_attach_is_in_flight_is_busy_and_the_destruction_waits_for_i
     m.ok(0, iospace);
     let call = attach(&m, 0, IOSPACE, DEVICE);
     assert_eq!(m.call(0, call.clone()), WAITS);
-    let detach = match call {
-        Syscall::IoSpaceAttach { iommu, device, .. } => Syscall::IoSpaceAttach {
-            iommu,
-            iospace: SlotAddr::NONE,
-            device,
-        },
-        other => other,
-    };
+    let detach = super::pass17::detach_of(call);
     // The attach word is pinned: a detach is `busy`, and the destruction
     // of the iospace waits for the attach's answer.
     assert_eq!(m.call_by(0, other, detach), Err(Error::Busy));
@@ -535,9 +524,10 @@ fn a_report_carries_a_lines_mask_and_the_new_holder_writes_an_idle_line_masked()
         vector: 48,
         destination: s(210),
     };
-    if m.call(a, claim) == WAITS {
-        m.run(2 * MS);
-    }
+    // The claim is left in flight on purpose: the holder dies under it.
+    let outcome = m.call(a, claim);
+    assert!(outcome == WAITS || outcome == DONE, "{outcome:?}");
+    m.run(2 * MS);
     m.ok(killer, super::pass17::kill(holder));
     m.run(30 * MS);
     assert_ne!(m.sys.role(role).holder(), holder);
@@ -560,9 +550,7 @@ fn a_vector_whose_invalidation_a_failed_unit_did_not_confirm_is_not_claimed_agai
         vector: 48,
         destination: s(210),
     };
-    if m.call(0, claim) == WAITS {
-        m.run(30 * MS);
-    }
+    super::pass17::succeeds(&mut m, 0, claim, 30 * MS);
     assert!(m.sys.node(0).object_at(m.t[0], s(210)).is_some());
     // The holder of the unit is another node: the removal is a request.
     assert_ne!(m.sys.role(IOMMU_ROLE).holder(), 0);
@@ -599,9 +587,7 @@ fn the_removal_of_an_msi_with_remapping_is_a_request_that_clears_its_entry() {
         vector: 48,
         destination: s(210),
     };
-    if m.call(0, claim) == WAITS {
-        m.run(30 * MS);
-    }
+    super::pass17::succeeds(&mut m, 0, claim, 30 * MS);
     let remapped = |m: &S| !m.sys.canonical().units[&IOMMU_ROLE].remap.is_empty();
     assert!(remapped(&m));
     assert_eq!(m.call(0, Syscall::CapDelete(s(210))), Err(Error::Again));
@@ -643,13 +629,17 @@ fn idle_until_is_written_on_the_clock_less_the_stopped_time() {
     assert_eq!(idle_until, k.m.hardware(1).unwrap() - 7 * MS);
 }
 
+/// The start of a request is read on the clock less the stopped time
+/// (D-139). How a request is judged across a stop is pass 23's
+/// `a_request_across_a_long_stop_is_late_only_on_the_clock_less_the_stopped_time`
+/// (the final review's E23: this test, named after the judgement, never ran
+/// it).
 #[test]
-fn a_request_across_a_stop_is_judged_on_the_clock_less_the_stopped_time() {
+fn a_request_reads_its_start_on_the_clock_less_the_stopped_time() {
     let mut k = N::on(&one_node(Arch::X86_64, 2));
     k.place_first(1);
     let _ = k.thread_on(300, 1);
-    // A stop already behind the node: the request's start is read on the
-    // clock less the stopped time.
+    // A stop already behind the node.
     k.m.table.stopped_time = 50 * MS;
     let later = k.m.now + 100 * MS;
     k.m.set_now(later);
@@ -659,15 +649,7 @@ fn a_request_across_a_stop_is_judged_on_the_clock_less_the_stopped_time() {
     let at = *k.m.at;
     let request = k.m.cores[at].request.clone().expect("a request");
     assert_eq!(request.started, k.m.membership_now());
-    let answer = k.m.table.core_answer_ns;
-    // A stop of twice CORE_ANSWER_NS: the clock of membership leaves it
-    // out, so the request is not late at the release.
-    let stop = 2 * answer;
-    let now = k.m.now + stop;
-    k.m.table.stopped_time += stop;
-    k.m.set_now(now);
-    assert_eq!(k.m.check(), Ok(()));
-    assert!(k.m.membership_now() < request.started + answer);
+    assert_eq!(request.started, later - 50 * MS);
 }
 
 #[test]
@@ -677,14 +659,7 @@ fn a_second_detach_while_one_is_in_flight_is_busy() {
     m.ok(0, super::place_first(0, 0));
     let other = m.thread_on(0, 300, 0);
     attached(&mut m, 0);
-    let detach = match attach(&m, 0, IOSPACE, DEVICE) {
-        Syscall::IoSpaceAttach { iommu, device, .. } => Syscall::IoSpaceAttach {
-            iommu,
-            iospace: SlotAddr::NONE,
-            device,
-        },
-        other => other,
-    };
+    let detach = super::pass17::detach_of(attach(&m, 0, IOSPACE, DEVICE));
     assert_eq!(m.call(0, detach.clone()), WAITS);
     assert_eq!(m.call_by(0, other, detach), Err(Error::Busy));
     let again = attach(&m, 0, IOSPACE, DEVICE);
@@ -715,14 +690,7 @@ fn a_detach_answered_failed_takes_the_device_out_of_the_header_and_leaves_the_wo
     attached(&mut m, 0);
     m.sys
         .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
-    let detach = match attach(&m, 0, IOSPACE, DEVICE) {
-        Syscall::IoSpaceAttach { iommu, device, .. } => Syscall::IoSpaceAttach {
-            iommu,
-            iospace: SlotAddr::NONE,
-            device,
-        },
-        other => other,
-    };
+    let detach = super::pass17::detach_of(attach(&m, 0, IOSPACE, DEVICE));
     assert_eq!(m.call(0, detach), WAITS);
     m.run(30 * MS);
     assert_eq!(m.woken(0), Some(&Err(Error::Busy)));

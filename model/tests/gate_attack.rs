@@ -227,6 +227,12 @@ fn all() -> u32 {
 fn the_holder_of_a_grant_loses_its_mapping_when_the_granter_is_accused() {
     let mut m = S::new();
     m.ok(0, retype(Frame, 1, OBJ));
+    // Node 0 maps its frame too: the granted frame's own chunk counts a
+    // leaf of node 0 (the final review's F2 Opus 19: the test read a chunk
+    // nothing ever mapped).
+    m.ok(0, map(OBJ, 1, Rights::READ));
+    let granted = m.frame(0, OBJ).2 / m.geometry(0).chunk();
+    assert_eq!(m.sys.node(0).map_count(granted), 1);
     m.transfer(vec![Transfer::Derive(s(OBJ), all())]);
     m.ok(1, map(GOT, 1, Rights::READ.union(Rights::WRITE)));
     assert_eq!(
@@ -240,8 +246,9 @@ fn the_holder_of_a_grant_loses_its_mapping_when_the_granter_is_accused() {
     // R2 removed the holder's root remote capability and its mapping.
     assert_eq!(m.sys.node(1).translated(m.t[1], AT), None);
     m.no(1, Syscall::CapInspect(s(GOT)), Error::Invalid);
-    // And the next generation of node 0 takes the chunk without a trace of
-    // the holder's leaf: the map count is 0 after R6.
+    // And the next generation of node 0 finds the chunk of the granted
+    // frame without a trace of the leaves of the dead generation: R6
+    // cleared its map count.
     m.ok(1, start(0, NODE_START_FRESH));
     // Node 1 starts core 0 in its recovery reserve; the core passes the
     // entry stub and the node becomes live.
@@ -263,6 +270,7 @@ fn the_holder_of_a_grant_loses_its_mapping_when_the_granter_is_accused() {
         },
     );
     assert_eq!(m.sys.node(0).map_count(place / geometry.chunk()), 0);
+    assert_eq!(m.sys.node(0).map_count(granted), 0);
 }
 
 // 2. A block is not given while a piece of it lives, so the gate's own
@@ -300,8 +308,9 @@ fn a_block_whose_grantee_maps_it_is_not_given() {
     // The granter's map count of the chunk is 0: the holder's leaf counts in
     // its use entry (G4, G6).
     assert_eq!(m.sys.node(0).map_count(place / geometry.chunk()), 0);
-    // The give is refused, and by the rule of the pieces, not by the gate's
-    // check of the map count: a piece of the block lives.
+    // The give is `busy`; the map count read above is 0, so the gate's
+    // check of it cannot be the one refusing (which rule of the pieces does
+    // the return value does not say: the final review's F2 Opus 22).
     m.no(
         0,
         Syscall::MemoryGive {
@@ -365,29 +374,11 @@ fn a_node_cannot_attach_or_detach_a_device_whose_identifier_another_node_holds()
     assert_eq!(m.sys.check(), Ok(()));
 }
 
-#[test]
-fn a_node_that_dies_with_an_attached_device_leaves_no_context_entry() {
-    let mut m = S::new();
-    m.ok(0, retype(IoSpace, 0, 221));
-    // Node 1 holds the unit role: the attach is a request it answers.
-    assert_eq!(
-        m.on_node(
-            0,
-            Syscall::IoSpaceAttach {
-                iommu: IOMMU,
-                iospace: s(221),
-                device: 4,
-            },
-        ),
-        WAITS
-    );
-    m.settle();
-    // Node 1 kills node 0, whose iospace serves a device: the unit's context
-    // entry names node 0's generation, which R1 must clear.
-    m.ok(1, stop(0, NODE_STOP_KILL));
-    m.run(5 * MS);
-    assert_eq!(m.state(0), MemberState::Dead);
-}
+// The death of a node with an attached device, its context entry cleared by
+// R1: `scenarios::units::a_node_that_dies_with_an_attached_device_leaves_no_
+// context_entry_once_dead`, which reads the unit's entries (this file's
+// weaker twin, which asserted only the death, was deleted: the final
+// review's F2 Opus 21).
 
 // 5. A page of the machine table is read only, and a kept frame is never
 //    writable.
@@ -445,9 +436,18 @@ fn a_frame_of_one_gigabyte_counts_in_every_chunk_it_covers() {
     let chunks = bytes / chunk;
     let size = bytes.trailing_zeros();
     let place = free_run(geometry, size);
-    if place / chunk + chunks > 4000 {
+    // The largest page of 16 and 32 KB pages is 64 GB and 512 GB: its
+    // creation clears it in 2^20 calls and more, so the case runs on 4 KB
+    // pages, and the other geometries say so (the final review's F2 Opus
+    // 20: they returned in silence).
+    if bytes > 1 << 30 {
+        assert!(geometry.page() > 4096, "skipped only on larger pages");
         return;
     }
+    assert!(
+        place / chunk + chunks <= 4098 + 8,
+        "the run lies in the memory"
+    );
     m.ok(
         0,
         Syscall::MemoryTake {

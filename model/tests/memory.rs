@@ -245,8 +245,9 @@ fn aspace_map_checks_the_frame_slot_and_kind_without_its_rights() {
     k.small(1, 40);
     k.derive(40, 41, Rights::NONE);
     k.retype(UT, Endpoint, 0, 42);
-    // The frame before the untyped: a wrong kind is `invalid` even with an
-    // untyped that is not the aspace's.
+    // A frame of the wrong kind is `invalid`, with an untyped that is not
+    // the aspace's as well (both `invalid`: no order shows; the final
+    // review's F2 Opus 32).
     k.no(map(30, 42, IMAGE, AT, 0, 1, R), Error::Invalid);
     // A frame without rights passes its slot check; the rights asked for
     // are judged with the plain arguments, after the untyped.
@@ -266,7 +267,8 @@ fn untyped_of_aspace_map_is_its_own_or_0() {
     let page = k.page();
     k.no(map(30, 41, 33, AT + page, 0, 1, R), Error::Denied);
     k.no(map(30, 41, IMAGE, AT + page, 0, 1, R), Error::Invalid);
-    // Judged right after its three checks, before the plain arguments.
+    // Refused with bad plain arguments as well (all `invalid`: no order
+    // shows).
     k.no(map(30, 41, IMAGE, AT + 1, 0, 9, X), Error::Invalid);
 }
 
@@ -287,8 +289,11 @@ fn start_up_aspace_takes_no_untyped_and_uses_its_reserve() {
     assert!(levels >= 3);
 }
 
+/// Each plain argument of `aspace_map` is refused (all `invalid`, so no
+/// order among them shows); the range before the rights does show (the
+/// final review's F2 Opus 32).
 #[test]
-fn plain_arguments_of_aspace_map_are_judged_in_order() {
+fn each_plain_argument_of_aspace_map_is_refused_and_the_range_before_the_rights() {
     let (mut k, _) = with_aspace();
     k.run(2, 35);
     k.frame(35, PageSize::Large1, 2, MemoryType::WriteBack, 40);
@@ -371,11 +376,13 @@ fn translated_address_of_any_page_size_is_busy() {
     k.no(map(30, 43, UT, AT + large, 0, 1, R), Error::Busy);
 }
 
+/// Tables come from the aspace's untyped, then, unmapped, from its free
+/// list; once the list is empty they come from the untyped again (the
+/// final review's F2 Opus 28: the name had the order reversed and the
+/// third map was missing).
 #[test]
-fn tables_come_from_the_free_list_then_from_the_untyped() {
+fn tables_come_from_the_untyped_then_from_the_free_list_then_from_the_untyped() {
     let (mut k, _) = with_aspace();
-    // An untyped of 16 KB that the aspace is not made from cannot help;
-    // with its own untyped exhausted, mapping needs the free list.
     k.small(1, 40);
     k.small(1, 41);
     k.ok(map(30, 40, UT, AT, 0, 1, R));
@@ -385,6 +392,8 @@ fn tables_come_from_the_free_list_then_from_the_untyped() {
     let root = k.span(k.levels() - 1);
     k.ok(map(30, 41, 0, 3 * root, 0, 1, R));
     k.no(map(30, 40, 0, AT, 0, 1, R), Error::NoMemory);
+    // The list is empty: the untyped supplies them again.
+    k.ok(map(30, 40, UT, AT, 0, 1, R));
 }
 
 #[test]
@@ -725,7 +734,9 @@ fn iospace_serves_devices_of_one_unit() {
     });
     let mut k = K::on(&machine);
     // The second unit's capability is in slot 19, then the roles (one more
-    // unit role), then the untypeds: the second one in slot 26.
+    // unit role), then the untypeds: the start-up one in slot 26 and the
+    // one of a chunk in 27; this test takes the first (the final review's
+    // F2 Opus 29).
     k.ok(Syscall::UntypedRetype {
         untyped: SlotAddr::own(26),
         kind: IoSpace,
@@ -823,7 +834,13 @@ fn iommu_with_no_device_attached_is_destroyed_in_one_step() {
 /// levels of 2,048 entries.
 #[test]
 fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
-    use dodos_model::{Map, SIXTEEN_KB};
+    // Every call followed by the whole check, as through `K::go` (the
+    // final review's F2 Opus 31).
+    fn checked(m: &mut Model, t: ObjId, call: Syscall) -> Outcome {
+        let outcome = m.apply(t, call);
+        assert_eq!(m.check(), Ok(()));
+        outcome
+    }
     // #129, #130, #131: tables() and io_levels() use geometry.page_shift[0] and geometry.entries on 16 KB geometry
     let mut mach = Machine::example_on(SIXTEEN_KB);
     mach.io_width = 47;
@@ -832,7 +849,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
     let chunk = m.geometry().chunk();
     let ut = SlotAddr::own(25);
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::UntypedRetype {
                 untyped: ut,
@@ -846,7 +864,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::UntypedRetype {
                 untyped: ut,
@@ -860,7 +879,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::CapDerive {
                 source: SlotAddr::own(101),
@@ -872,7 +892,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::ASpaceMap(Map {
                 space: SlotAddr::own(100),
@@ -887,7 +908,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::ASpaceMap(Map {
                 space: SlotAddr::own(100),
@@ -902,7 +924,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::CapDerive {
                 source: SlotAddr::own(101),
@@ -914,7 +937,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::UntypedRetype {
                 untyped: ut,
@@ -928,7 +952,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::UntypedRetype {
                 untyped: SlotAddr::own(105),
@@ -942,7 +967,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
         Ok(Output::Done)
     );
     assert_eq!(
-        m.apply(
+        checked(
+            &mut m,
             t,
             Syscall::IoSpaceMap(Map {
                 space: SlotAddr::own(106),
@@ -977,7 +1003,8 @@ fn r7_aspace_map_partial_and_gate_chunks_boundaries() {
     k.ok(protect(30, 40, rw()));
     k.ok(Syscall::ASpaceUnmap(s(40)));
 
-    // 2-page device frame (cost = 1 per page, so count: 2 takes 2 steps with gate_chunks = 1)
+    // A device frame of 3 pages, 2 of them mapped (cost = 1 per page, so
+    // count: 2 takes 2 steps with gate_chunks = 1)
     k.frame(DEV, PageSize::Page, 3, MemoryType::Uncached, 41);
     assert_eq!(k.go(map(30, 41, UT, AT, 0, 2, R)), Err(Error::Again));
     // #067: continuing on another aspace (31) returns Busy

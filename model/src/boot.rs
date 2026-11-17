@@ -1174,10 +1174,19 @@ impl Model {
         if start_pages > START_PAGE_MAX_PAGES {
             return Err(Refusal::StartPage);
         }
+        // Entropy: the generator of each core is seeded from the node's seed
+        // (entry `EntropySeed`, its own for each node and each fresh start)
+        // and the core number, always (Entropy). The model draws the node's
+        // seed from the machine's seed, the slot and its generation (the
+        // final review's verification of lot F2, M8: every generator
+        // started at 0).
+        let node_seed =
+            mix(machine.boot_seed ^ u64::from(node) << 48 ^ u64::from(table.generation(node)));
         let parts = cores
             .iter()
             .map(|&number| crate::cores::CorePart {
                 number: number as u32,
+                entropy: mix(node_seed ^ number as u64),
                 ..Default::default()
             })
             .collect();
@@ -1498,4 +1507,13 @@ impl Model {
         self.frames.insert(self.caps[&cap].object, frame);
         cap
     }
+}
+
+/// A mixer of 64 bits (the finaliser of SplitMix64, Steele, Lea and Flood,
+/// "Fast splittable pseudorandom number generators", 2014): distinct inputs
+/// give unrelated seeds.
+fn mix(mut x: u64) -> u64 {
+    x = (x ^ x >> 30).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ x >> 27).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ x >> 31
 }

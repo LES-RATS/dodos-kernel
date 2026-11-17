@@ -61,6 +61,13 @@ impl System {
                 word.state() != CoreState::Leaving,
                 "core word: leaving is written",
             )?;
+            // A word that names a node names a slot of the table, so that
+            // P3 can read its member word (the checker names, it never
+            // panics; ver-D, Mistral's note on `check_cores`).
+            ensure(
+                word.state() == CoreState::Free || (word.slot() as usize) < table.members.len(),
+                "core word: names a slot past the table",
+            )?;
             if word.state() == CoreState::Free {
                 ensure(
                     word.slot() == dodos_abi::CORE_NO_SLOT && word.generation() == 0,
@@ -173,8 +180,11 @@ impl System {
         let table = self.canonical();
         for (slot, model) in self.models() {
             for used in table.uses[slot as usize].values() {
-                let over = table.member(used.granter).generation() != used.generation
-                    || matches!(table.member(used.granter).state(), MemberState::Dead);
+                // A use entry names a granting slot of the table.
+                let granter = table.members.get(used.granter as usize);
+                let granter = granter.ok_or("G6: a use entry names a node past the table")?;
+                let over = granter.generation() != used.generation
+                    || matches!(granter.state(), MemberState::Dead);
                 // A unit that failed keeps the leaves counted for ever, and
                 // the grant stays: G6 holds then too (IOMMU: "a frame
                 // another node granted stays pinned").
@@ -189,7 +199,8 @@ impl System {
                 if entry.answered || entry.state == GrantState::Pinned {
                     continue;
                 }
-                let grantee = table.member(entry.grantee);
+                let grantee = table.members.get(entry.grantee as usize);
+                let grantee = *grantee.ok_or("G6: a grant entry names a grantee past the table")?;
                 let over = grantee.generation() != entry.generation
                     || !matches!(
                         grantee.state(),

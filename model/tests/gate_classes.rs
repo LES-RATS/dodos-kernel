@@ -149,6 +149,12 @@ fn a_table_taken_again_from_the_free_list_takes_the_class_of_its_new_level() {
     );
     ok(&mut m, t, map(ASpace, s(160), BLOCK, AT, 1));
     ok(&mut m, t, Syscall::ASpaceUnmap(s(160)));
+    let class_of = |m: &Model| -> Vec<u8> {
+        (0..levels as u64 - 1)
+            .map(|n| m.page_class(base + (2 + n) * page).raw())
+            .collect()
+    };
+    let before = class_of(&m);
     let log2 = geometry.chunk_shift();
     let take = Syscall::MemoryTake {
         control: s(START_SLOT_MEMORY_CONTROL),
@@ -161,15 +167,19 @@ fn a_table_taken_again_from_the_free_list_takes_the_class_of_its_new_level() {
     ok(&mut m, t, retype(142, Frame, PageSize::Large1, 1, 161));
     let far = AT + (1 << (log2 + geometry.entries.trailing_zeros()));
     ok(&mut m, t, map(ASpace, s(161), BLOCK, far, 1));
-    let classes: Vec<u8> = (0..levels as u64 - 1)
-        .map(|n| m.page_class(base + (2 + n) * page).raw())
-        .collect();
-    // Levels 2 to L − 1 are hooked once each; the table left on the free
-    // list keeps its class (here level 1 or the level it was hooked at).
-    for level in 2..levels as u8 {
-        let class = PageClass::table(level).unwrap().raw();
-        assert!(classes.contains(&class), "{classes:?}");
-    }
+    let classes = class_of(&m);
+    // What only the second map shows: a page of the free list that held a
+    // table of level 1 holds one of level 2 now (the final review's F2
+    // Opus 23: the classes of levels 2 to L − 1 were there before it).
+    let (one, two) = (
+        PageClass::table(1).unwrap().raw(),
+        PageClass::table(2).unwrap().raw(),
+    );
+    let moved = before
+        .iter()
+        .zip(&classes)
+        .any(|(&b, &a)| b == one && a == two);
+    assert!(moved, "{before:?} then {classes:?}");
     assert_eq!(m.check(), Ok(()));
 }
 
@@ -210,7 +220,11 @@ fn a_device_leaf_counts_in_its_device_entry_and_in_no_chunk() {
         ok(&mut m, t, map(kind, s(160), BLOCK, AT, 1));
         assert_eq!(counts(&m), before, "{kind:?}");
         assert_eq!(m.device_leaves(index), 1);
-        ok(&mut m, t, Syscall::ASpaceUnmap(s(160)).clone_for(kind));
+        let unmap = match kind {
+            IoSpace => Syscall::IoSpaceUnmap(s(160)),
+            _ => Syscall::ASpaceUnmap(s(160)),
+        };
+        ok(&mut m, t, unmap);
         assert_eq!(m.device_leaves(index), 0);
     }
 }
@@ -263,19 +277,5 @@ fn one_nodes_kept_leaves_never_make_another_nodes_mapping_busy() {
         let call = map(ASpace, s(at), 25, AT + n * page, 1);
         assert_eq!(sys.apply(node, t[node as usize], call), DONE);
         assert_eq!(sys.check(), Ok(()));
-    }
-}
-
-trait ForKind {
-    fn clone_for(self, kind: ObjectKind) -> Syscall;
-}
-
-impl ForKind for Syscall {
-    /// `aspace_unmap` of a frame, or `iospace_unmap` for an iospace.
-    fn clone_for(self, kind: ObjectKind) -> Syscall {
-        match (self, kind) {
-            (Syscall::ASpaceUnmap(frame), IoSpace) => Syscall::IoSpaceUnmap(frame),
-            (call, _) => call,
-        }
     }
 }

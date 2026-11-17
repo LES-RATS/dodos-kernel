@@ -536,7 +536,7 @@ impl Model {
         if words > REG_WORDS && self.threads[&thread].page.is_none() {
             return Err(Error::Invalid);
         }
-        let generator = &mut self.here_mut().entropy.0;
+        let generator = &mut self.here_mut().entropy;
         for word in mix {
             *generator ^= word;
             *generator = generator
@@ -609,6 +609,23 @@ mod tests {
         assert_eq!(area.accepted(0).map(|r| r.reason), Some(2));
         area.write_record(0, record(5));
         assert_eq!(area.accepted(0).map(|r| r.reason), Some(2));
+    }
+
+    /// `entropy_read` changes no state but the generator's (the final
+    /// review's F2 Opus 13, M8: the generator was not compared, so the test
+    /// held by an equality that held of anything).
+    #[test]
+    fn entropy_read_changes_no_state_but_the_generators() {
+        let (mut m, boot) = Model::boot(&Machine::example()).unwrap();
+        let before = m.clone();
+        let read = crate::Syscall::EntropyRead {
+            length: 13,
+            mix: [1, 2, 3, 4],
+        };
+        assert!(m.apply(boot, read).is_ok());
+        assert_ne!(m.cores[0].entropy, before.cores[0].entropy);
+        m.cores[0].entropy = before.cores[0].entropy;
+        assert_eq!(m, before);
     }
 
     /// Argon F3 (mutants 79, 92): a thread whose capability space is dying

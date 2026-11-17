@@ -2,8 +2,6 @@
 //! and the device table, given, split and destroyed (Memory and devices
 //! between nodes), on the geometry of the run.
 
-mod common;
-
 use dodos_abi::ObjectKind::{Endpoint, Frame, Untyped};
 use dodos_abi::*;
 use dodos_model::*;
@@ -165,8 +163,11 @@ fn memory_take_needs_manage_on_a_memory_control() {
     k.no(take(0, free, shift, 0), Error::Invalid);
 }
 
+/// Each plain argument of `memory_take` is refused, all with `invalid`, so
+/// no order among them shows; the plain arguments before the state, which
+/// does show, is the last pair (the final review's F2 Opus 1).
 #[test]
-fn plain_arguments_of_memory_take_are_judged_in_order() {
+fn each_plain_argument_of_memory_take_is_refused_and_before_the_state() {
     let mut k = K::new();
     let (free, shift) = (k.free(), k.shift());
     let entries = u64::from(k.m.geometry().entries.trailing_zeros());
@@ -192,8 +193,12 @@ fn plain_arguments_of_memory_take_are_judged_in_order() {
     k.no(take(1, capacity - 1, 0, 40), Error::Busy);
 }
 
+/// The depth rule refuses a take through a memory_control at depth 64 and
+/// accepts one at 63. Both the kind and the depth give `invalid`, so the
+/// order the contract states between them cannot be seen from the result
+/// (the final review's F2 Opus 1: the test was named after that order).
 #[test]
-fn depth_checks_of_memory_take_come_after_the_plain_arguments() {
+fn a_take_through_a_memory_control_at_depth_64_is_refused_and_at_63_accepted() {
     let mut k = K::new();
     let (free, shift) = (k.free(), k.shift());
     // A copy of the memory_control at depth 64.

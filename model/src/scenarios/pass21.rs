@@ -2,6 +2,7 @@
 //! contract review, and the twelfth model review judged. Each test is named
 //! after the sentence it guards.
 
+use super::pass17::detach_of;
 use super::*;
 use crate::cores::Completes;
 use crate::locks::{Cost, Step};
@@ -9,17 +10,6 @@ use crate::rings::{Target, UnitOp};
 use dodos_abi::{AttachState, AttachWord, UnitResult};
 
 /// The detach operation of a device as an `iospace_attach` with iospace 0.
-fn detach_of(call: Syscall) -> Syscall {
-    match call {
-        Syscall::IoSpaceAttach { iommu, device, .. } => Syscall::IoSpaceAttach {
-            iommu,
-            iospace: SlotAddr::NONE,
-            device,
-        },
-        other => other,
-    }
-}
-
 /// Node 0 of four, with three IOMMU units, attaches the device through the
 /// first; returns the machine and the root its attach word names.
 fn attached_on_the_first_of_three_units() -> (S, u64) {
@@ -107,10 +97,8 @@ fn a_retired_vector_stays_retired_after_r6_and_the_next_start_of_its_core() {
         vector: 48,
         destination: s(slot),
     };
-    if m.call(n, claim(210)) == WAITS {
-        m.run(30 * MS);
-    }
-    let handle = (u64::from(n) * 192) as u16;
+    super::pass17::succeeds(&mut m, n, claim(210), 30 * MS);
+    let handle = super::pass17::handle(n, 48);
     assert!(m.sys.canonical().irq_tables.contains_key(&handle));
     // The unit never confirms again: R1 for n fails it. n had no device
     // behind it, so its barrier holds all the same and R6 runs.
@@ -188,9 +176,7 @@ fn the_route_of_a_line_on_arm64_and_risc_v_names_only_a_core_of_the_requester() 
             vector: 48,
             destination: s(210),
         };
-        if m.call(a, claim) == WAITS {
-            m.run(30 * MS);
-        }
+        super::pass17::succeeds(&mut m, a, claim, 30 * MS);
         let route = |core: u16| UnitOp::Redirection {
             gsi: 5,
             claimed: true,
@@ -251,10 +237,8 @@ fn line_claimed() -> (S, u16, u16) {
         vector: 48,
         destination: s(210),
     };
-    if m.call(a, claim) == WAITS {
-        m.run(30 * MS);
-    }
-    let handle = (u64::from(a) * 192) as u16;
+    super::pass17::succeeds(&mut m, a, claim, 30 * MS);
+    let handle = super::pass17::handle(a, 48);
     (m, a, handle)
 }
 
@@ -510,9 +494,7 @@ fn deepseek12_m29_the_removal_of_an_msi_waits_for_the_answer_of_its_invalidation
         vector: 48,
         destination: s(210),
     };
-    if m.call(0, claim) == WAITS {
-        m.run(30 * MS);
-    }
+    super::pass17::succeeds(&mut m, 0, claim, 30 * MS);
     assert_ne!(m.sys.role(IOMMU_ROLE).holder(), 0);
     assert_eq!(m.call(0, Syscall::CapDelete(s(210))), Err(Error::Again));
     assert_eq!(m.call(0, Syscall::CapDelete(s(210))), Err(Error::Again));
@@ -531,10 +513,12 @@ fn deepseek12_m33_the_reclaim_of_a_second_death_of_one_slot_starts_afresh() {
     let generation = m.sys.member(2).generation();
     m.ok(0, super::pass17::kill(2));
     m.run(MS);
-    for observer in [0u16, 1] {
-        if let Some(reclaim) = m.sys.node(observer).reclaims.get(&2) {
-            assert_eq!(reclaim.generation, generation, "node {observer}");
-        }
+    // Node 1 holds a record of the second death's generation; node 0 may
+    // have none yet (the final review's E26: both were conditional).
+    let reclaim = m.sys.node(1).reclaims.get(&2).expect("node 1's record");
+    assert_eq!(reclaim.generation, generation);
+    if let Some(reclaim) = m.sys.node(0).reclaims.get(&2) {
+        assert_eq!(reclaim.generation, generation);
     }
     m.run(30 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
@@ -553,9 +537,7 @@ fn deepseek12_m16_the_report_of_an_edge_line_whose_irq_is_dying_says_masked() {
         vector: 48,
         destination: s(210),
     };
-    if m.call(a, claim) == WAITS {
-        m.run(30 * MS);
-    }
+    super::pass17::succeeds(&mut m, a, claim, 30 * MS);
     let role = m.sys.node(a).ioapic_role(5).unwrap();
     let unmasked = |m: &S| {
         m.sys

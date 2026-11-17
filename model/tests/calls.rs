@@ -681,14 +681,10 @@ fn segments_go_back_to_the_untyped_when_the_cspace_is_destroyed() {
     k.ok(retype(s(31), Untyped, bytes, s(40)));
 }
 
-/// Every right but one.
-/// Every right but `right`, and without `exec` but for an `exec` asked
-/// for: the start-up capabilities of the tests have no `exec`.
+/// Every right but `right` and `exec`: the start-up capabilities of the
+/// tests have no `exec` (the final review's D3 and H3).
 fn caps_without(right: Rights) -> Rights {
-    match right == Rights::EXEC {
-        true => Rights::ALL.without(right),
-        false => NOT_EXEC.without(right),
-    }
+    NOT_EXEC.without(right)
 }
 
 // Order of checks.
@@ -1597,9 +1593,20 @@ fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_20() {
 
 #[test]
 fn size_argument_is_zero_for_the_other_kinds() {
-    // A thread's size argument is its feature mask (tests/cores.rs).
+    // A thread's size argument is its feature mask (tests/cores.rs); a
+    // timer, a task and an iospace take 0 too (the final review's H2).
     let mut k = K::new();
-    for kind in [ASpace, ObjectKind::Sched, Endpoint, Reply, Notify] {
+    use ObjectKind::{IoSpace, Task, Timer};
+    for kind in [
+        ASpace,
+        ObjectKind::Sched,
+        Endpoint,
+        Reply,
+        Notify,
+        Timer,
+        Task,
+        IoSpace,
+    ] {
         for size in [1, 7, 4096, u64::MAX] {
             k.no(retype(UT, kind, size, s(30)), Error::Invalid);
         }
@@ -3466,7 +3473,10 @@ fn slot_of_the_root_capability_of_a_dying_space_counts_as_examined() {
     k.ok(retype(UT, CSpace, 256, s(30)));
     k.go(grow(30)).unwrap();
     k.go(grow(30)).unwrap();
-    // Slot 130 is the 129th that the sweep reaches.
+    // Slots 1 to 128, the root's slot 5 among them, are the 128 the first
+    // call examines; a capability in slot 129 would still be found and
+    // removed without examining a slot, so the notify is in slot 130 (the
+    // final review's D5).
     k.ok(retype(UT, Notify, 0, via(30, 130)));
     k.ok(derive(via(30, 130), s(40), Rights::ALL, 0));
     k.weak(30, 31, Rights::ALL);
@@ -4074,15 +4084,19 @@ fn cap_delete_on_an_empty_slot_of_an_own_dying_space_is_invalid() {
     let mut k = K::new();
     let inside = space_with_a_thread(&mut k);
     k.no(Syscall::CapDelete(s(30)), Error::Again);
+    // Slots of the dying space itself (`o`): 100 is an ordinary empty
+    // slot, 128 the first past its table, 0 the slot never used (the final
+    // review's H1: `s` named slots past the table, and only slot 0 inside
+    // it).
     assert_eq!(
-        k.on(inside, Syscall::CapDelete(s(100))),
+        k.on(inside, Syscall::CapDelete(o(100))),
         Err(Error::Invalid)
     );
     assert_eq!(
-        k.on(inside, Syscall::CapDelete(s(128))),
+        k.on(inside, Syscall::CapDelete(o(128))),
         Err(Error::Invalid)
     );
-    assert_eq!(k.on(inside, Syscall::CapDelete(s(0))), Err(Error::Invalid));
+    assert_eq!(k.on(inside, Syscall::CapDelete(o(0))), Err(Error::Invalid));
 }
 
 #[test]

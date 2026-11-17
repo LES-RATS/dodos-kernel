@@ -16,6 +16,7 @@ mod pass19;
 mod pass20;
 mod pass21;
 mod pass22;
+mod pass23;
 mod reviews;
 mod units;
 
@@ -308,6 +309,27 @@ impl S {
             self.sys.advance(at);
             assert_eq!(self.sys.check(), Ok(()));
         }
+    }
+
+    /// Events one at a time, the earliest first, each followed by the check,
+    /// until `until` holds (at most 10,000 events or steps of 10 µs): for a
+    /// state that lasts less than one step of `run`.
+    #[track_caller]
+    pub(crate) fn step_until(&mut self, until: impl Fn(&Self) -> bool) -> bool {
+        for _ in 0..10_000 {
+            if until(self) {
+                return true;
+            }
+            match self.sys.events().first() {
+                Some(&event) => self.sys.fire(event),
+                None => {
+                    let at = self.sys.now() + 10_000;
+                    self.sys.advance(at);
+                }
+            }
+            assert_eq!(self.sys.check(), Ok(()));
+        }
+        until(self)
     }
 
     /// Events chosen by the seeded generator, `count` of them at most,

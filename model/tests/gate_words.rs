@@ -79,7 +79,6 @@ fn a_destroyed_block_of_a_reserve_chunk_keeps_the_reserves_code() {
     // (the reserve's code for a reserve chunk)."
     let (mut m, t) = Model::boot(&Machine::example()).unwrap();
     let shift = m.geometry().chunk_shift();
-    let chunk = 1u64 << shift;
     let reserve = Ownership::free(Owner::Reserve(0)).raw();
     let bits = Machine::example().phys_bits;
     let at = (0..(1u64 << (bits - shift)))
@@ -87,11 +86,10 @@ fn a_destroyed_block_of_a_reserve_chunk_keeps_the_reserves_code() {
         .find(|&base| m.ownership(base >> shift) == reserve)
         .expect("a reserve chunk");
     // The role of the reserve is vacant at start-up: claim it first.
-    let role = (21..=22)
+    let claimed = (21..=22)
         .map(SlotAddr::own)
-        .find(|&role| matches!(m.apply(t, Syscall::RoleClaim(role)), Ok(Output::Epoch(_))))
-        .expect("a reserve role");
-    let _ = role;
+        .any(|role| matches!(m.apply(t, Syscall::RoleClaim(role)), Ok(Output::Epoch(_))));
+    assert!(claimed, "a reserve role");
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(START_SLOT_MEMORY_CONTROL),
         kind: 0,
@@ -116,5 +114,4 @@ fn a_destroyed_block_of_a_reserve_chunk_keeps_the_reserves_code() {
         reserve,
         "free with the reserve's code"
     );
-    assert_eq!(chunk, 1 << shift);
 }

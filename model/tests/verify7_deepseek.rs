@@ -8,6 +8,17 @@
 //! corrections: F1 wrote back the 32 words that `thread_read_regs` returns
 //! (the block and the fault record), `invalid` whatever the rule; F5 reads
 //! the whole gate word through `gate_word`.
+//!
+//! The file is the record of that review: each comment below states the
+//! finding as it was, against the model and the contract of 16 November
+//! 2026, and the line numbers it cites are those of that contract (they
+//! have moved since). The reference test of each rule, which later passes
+//! keep (the final review's F2 Opus 39 and 40): F1, `faults.rs`'s
+//! redirect below the half of the address bits; F2 and N2,
+//! `gate_attack.rs`'s `a_partial_mapping_goes_on_only_with_the_page_count_
+//! it_started_with`; F5, `gate_classes.rs` (the class of a page); F6 and
+//! N4, `gate_classes.rs` (device leaves and the global read-only set);
+//! N5, the `abi` Kani proof of `Geometry::valid`.
 
 mod common;
 
@@ -234,8 +245,7 @@ fn f1_canonical_follows_address_bits_in_abi_and_thread_write_regs() {
     );
 
     // Same failure observed through a kernel syscall (`thread_write_regs`):
-    let mut machine = Machine::example_on(low_geom);
-    machine.geometry = low_geom;
+    let machine = Machine::example_on(low_geom);
     let mut k = NodeHarness::on(&machine);
     k.ok(retype_small(Thread, 0, 30));
     let Ok(Output::Regs(mut regs)) = k.call(Syscall::ThreadReadRegs(slot(30))) else {
@@ -246,7 +256,7 @@ fn f1_canonical_follows_address_bits_in_abi_and_thread_write_regs() {
     // test wrote the 32 words back, which is `invalid` whatever the rule of
     // canonical addresses.)
     regs.truncate(dodos_abi::x86_64::REGS_WORDS);
-    regs[0] = high_lower; // REG_RIP = 0
+    regs[x86_64::REG_RIP] = high_lower;
     k.ok(Syscall::ThreadWriteRegs {
         thread: slot(30),
         block: regs,
@@ -275,9 +285,9 @@ fn f2_partial_aspace_map_rejects_different_page_count() {
     assert!(k.m.translated(viewer, VADDR).is_some());
     assert!(k.m.translated(viewer, VADDR + page).is_none());
 
-    // Resuming with a smaller count equal to the done count (1) returns Busy,
-    // but resuming with count = 3 (smaller than original 4, larger than done 1)
-    // wrongly succeeds with Ok(Done) and produces a 3-page mapping.
+    // Resuming with a smaller count equal to the done count (1) returns Busy;
+    // the finding was that count = 3 (smaller than the original 4, larger
+    // than the done 1) succeeded with Ok(Done): it is `busy` too.
     let mut retry_short = Err(Error::Again);
     for _ in 0..3 {
         retry_short = k.call(aspace_map(
@@ -292,10 +302,10 @@ fn f2_partial_aspace_map_rejects_different_page_count() {
             break;
         }
     }
-    assert_ne!(
+    assert_eq!(
         retry_short,
-        Ok(Output::Done),
-        "F2: resuming a 4-page partial aspace_map with count=3 wrongly succeeded and finalized a 3-page mapping"
+        Err(Error::Busy),
+        "F2: a 4-page partial aspace_map resumed with count = 3"
     );
 }
 
@@ -389,8 +399,9 @@ fn f5_gate_word_bits_32_to_44_count_non_data_pages() {
 }
 
 // ---------------------------------------------------------------------------
-// F6: Device leaves and global read-only (kept) leaves are counted in
-// `table.maps[chunk]`, though G2 (line 886) says both lie in no chunk.
+// F6: the finding was that device leaves and global read-only (kept)
+// leaves were counted in `table.maps[chunk]`, though G2 (line 886) says
+// both lie in no chunk.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -482,9 +493,20 @@ fn f9_completed_stepped_mapping_is_not_partial_and_hits_protect_fifth_clause() {
     // Part B (unmodified `gate_chunks == E`): `memory_take` forbids runs > E * chunk,
     // so a 2 * E-chunk run cannot be taken when largest_page <= E * chunk.
     let default_m = Machine::example();
-    if let Some(large2) = default_m.geometry.bytes(PageSize::Large2)
-        && large2 <= (1 << 30)
-    {
+    let large2 = default_m
+        .geometry
+        .bytes(PageSize::Large2)
+        .expect("three sizes");
+    // On 16 and 32 KB pages the run of 2 × E chunks lies beyond the memory
+    // of `Machine::example`, so its place would be refused too: the case
+    // runs on 4 KB pages, and the others say so (the final review's F2 Opus
+    // 20).
+    if large2 > 1 << 30 {
+        assert!(
+            default_m.geometry.page() > 4096,
+            "skipped only on larger pages"
+        );
+    } else {
         let mut k = NodeHarness::on(&default_m);
         let chunk = k.m.geometry().chunk();
         let ram = default_m.memory[4].base;
@@ -571,10 +593,10 @@ fn n2_partial_iospace_map_rejects_different_page_count() {
             break;
         }
     }
-    assert_ne!(
+    assert_eq!(
         retry_short,
-        Ok(Output::Done),
-        "N2: resuming a 4-page partial iospace_map with count=3 wrongly succeeded and finalized a 3-page mapping"
+        Err(Error::Busy),
+        "N2: a 4-page partial iospace_map resumed with count = 3"
     );
 }
 
@@ -661,8 +683,8 @@ fn n3_other_state_denied_calls_and_iospace_attach_busy_before_denied() {
 
 // ---------------------------------------------------------------------------
 // New sibling finding N4: `iospace_map` of a device leaf and multi-node boot
-// kept-frame mappings write the gate word of `*none*` chunk 0 from BOTH nodes,
-// breaking G4's single-writer rule ("so each count has one writer").
+// kept-frame mappings wrote the gate word of `*none*` chunk 0 from both
+// nodes, breaking G4's single-writer rule ("so each count has one writer").
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -751,39 +773,9 @@ fn n5_geometry_valid_forbids_unaligned_page_shifts_and_oversized_leaf() {
         levels: 3,
         user_end: 1 << 38,
     };
-    if weird.valid() {
-        let machine = Machine::example_on(weird);
-        // `Model::boot` accepts this geometry and allows `aspace_map` of a
-        // 256 KiB `Large1` page that is not a level-2 table entry size.
-        let mut k = NodeHarness::on(&machine);
-        let chunk = weird.chunk();
-        let ram = machine.memory[4].base;
-        let place = (ram + 8 * chunk).next_multiple_of(chunk);
-        k.ok(Syscall::MemoryTake {
-            control: CONTROL,
-            kind: 0,
-            place,
-            size: u64::from(chunk.trailing_zeros()),
-            destination: slot(40),
-        });
-        k.ok(retype_with(
-            slot(40),
-            Frame,
-            1,
-            PageSize::Large1,
-            MemoryType::WriteBack,
-            41,
-        ));
-        k.make_aspace(30, 31, UNTYPED);
-        k.ok(aspace_map(
-            slot(30),
-            slot(41),
-            UNTYPED,
-            VADDR,
-            1,
-            Rights::READ,
-        ));
-    }
+    // (A block that booted the model on this geometry ran only when the
+    // assertion below was about to fail: deleted, the final review's F2
+    // Opus 38.)
     assert!(
         !weird.valid(),
         "N5: unaligned page_shift [12, 18, 28, 0] with E=512 boots Model, breaks table-level math for Large1, and has Large2 = 1024 > E chunks"

@@ -2575,3 +2575,174 @@ fn module_frames_of_a_length_beyond_the_addresses_does_not_overflow() {
 fn the_crash_area_magic_is_fixed() {
     assert_eq!(CRASH_AREA_MAGIC.to_le_bytes(), *b"DodOScr\0");
 }
+
+/// The offset of every field of the `repr(C)` records that had only a size
+/// check (the final review's verification of lot A, H6: two fields of
+/// `DeviceEntry` swapped kept every test green), as the contract lays them
+/// out: the table of Start-up state, the device table, the fence record,
+/// `BootNodes`, a ring entry of a debug area and the stop record.
+#[test]
+fn fields_of_every_record_lie_where_the_contract_puts_them() {
+    use core::mem::offset_of;
+    // The device table: a word with the base, then an ownership word.
+    assert_eq!(
+        [
+            offset_of!(DeviceEntry, range),
+            offset_of!(DeviceEntry, owner)
+        ],
+        [0, 8]
+    );
+    // The fence record: the generation (bits 0-31 of word 0), word 1 the
+    // first action, word 2 the confirmation, word 3 reserved, words 4 to 67
+    // the last stops.
+    let fence = [
+        offset_of!(FenceRecord, generation),
+        offset_of!(FenceRecord, reserved),
+        offset_of!(FenceRecord, first_action),
+        offset_of!(FenceRecord, confirmed),
+        offset_of!(FenceRecord, reserved2),
+        offset_of!(FenceRecord, last_stop),
+    ];
+    assert_eq!(fence, [0, 4, 8, 16, 24, 32]);
+    // `BootNodes`: the node slots, then each node as a window and a mask.
+    assert_eq!(
+        [offset_of!(BootNodes, slots), offset_of!(BootNodes, nodes)],
+        [0, 4]
+    );
+    assert_eq!(
+        [offset_of!(BootNode, window), offset_of!(BootNode, mask)],
+        [0, 8]
+    );
+    // A ring entry: sequence, instant, word 2, task, marks, payload.
+    let entry = [
+        offset_of!(TraceEntry, seq),
+        offset_of!(TraceEntry, instant),
+        offset_of!(TraceEntry, word2),
+        offset_of!(TraceEntry, task),
+        offset_of!(TraceEntry, marks),
+        offset_of!(TraceEntry, payload),
+    ];
+    assert_eq!(entry, [0, 8, 16, 24, 32, 40]);
+    // The stop record: commit, core, reason, instant, 128 bytes of text.
+    let stop = [
+        offset_of!(StopRecord, commit),
+        offset_of!(StopRecord, core),
+        offset_of!(StopRecord, reason),
+        offset_of!(StopRecord, instant),
+        offset_of!(StopRecord, text),
+    ];
+    assert_eq!(stop, [0, 8, 12, 16, 24]);
+    // The records of Start-up state, row by row.
+    let firmware = [
+        offset_of!(StartFirmwareTable, kind),
+        offset_of!(StartFirmwareTable, reserved),
+        offset_of!(StartFirmwareTable, address),
+        offset_of!(StartFirmwareTable, len),
+    ];
+    assert_eq!(firmware, [0, 4, 8, 16]);
+    let range = [
+        offset_of!(StartMemoryRange, base),
+        offset_of!(StartMemoryRange, len),
+        offset_of!(StartMemoryRange, kind),
+        offset_of!(StartMemoryRange, reserved),
+    ];
+    assert_eq!(range, [0, 8, 16, 20]);
+    let framebuffer = [
+        offset_of!(StartFramebuffer, base),
+        offset_of!(StartFramebuffer, size),
+        offset_of!(StartFramebuffer, width),
+        offset_of!(StartFramebuffer, height),
+        offset_of!(StartFramebuffer, pitch),
+        offset_of!(StartFramebuffer, format),
+    ];
+    assert_eq!(framebuffer, [0, 8, 16, 20, 24, 28]);
+    let times = [
+        offset_of!(StartBootTimes, frequency),
+        offset_of!(StartBootTimes, stage_entry),
+        offset_of!(StartBootTimes, firmware_end),
+        offset_of!(StartBootTimes, kernel),
+        offset_of!(StartBootTimes, first_thread),
+        offset_of!(StartBootTimes, stage),
+        offset_of!(StartBootTimes, stage_version),
+    ];
+    assert_eq!(times, [0, 8, 16, 24, 32, 40, 44]);
+    let crash = [
+        offset_of!(StartCrash, base),
+        offset_of!(StartCrash, len),
+        offset_of!(StartCrash, sequence),
+        offset_of!(StartCrash, slot),
+        offset_of!(StartCrash, flags),
+    ];
+    assert_eq!(crash, [0, 8, 16, 24, 28]);
+    let interrupts = [
+        offset_of!(StartInterrupts, first_vector),
+        offset_of!(StartInterrupts, last_vector),
+        offset_of!(StartInterrupts, flags),
+        offset_of!(StartInterrupts, ioapics),
+    ];
+    assert_eq!(interrupts, [0, 4, 8, 12]);
+    assert_eq!(
+        [
+            offset_of!(StartIoApic, first_gsi),
+            offset_of!(StartIoApic, inputs)
+        ],
+        [0, 4]
+    );
+    assert_eq!(
+        [offset_of!(StartKept, base), offset_of!(StartKept, len)],
+        [0, 8]
+    );
+    let iommu = [
+        offset_of!(StartIommu, slot),
+        offset_of!(StartIommu, segment),
+        offset_of!(StartIommu, domains),
+        offset_of!(StartIommu, role),
+    ];
+    assert_eq!(iommu, [0, 4, 8, 12]);
+    let role = [
+        offset_of!(StartRole, kind),
+        offset_of!(StartRole, governs),
+        offset_of!(StartRole, object),
+        offset_of!(StartRole, slot),
+    ];
+    assert_eq!(role, [0, 1, 2, 4]);
+    let image = [
+        offset_of!(StartImage, base),
+        offset_of!(StartImage, len),
+        offset_of!(StartImage, sha256),
+    ];
+    assert_eq!(image, [0, 8, 16]);
+    let feedback = [
+        offset_of!(StartFeedback, package),
+        offset_of!(StartFeedback, slot),
+        offset_of!(StartFeedback, bytes),
+        offset_of!(StartFeedback, reserved),
+    ];
+    assert_eq!(feedback, [0, 4, 8, 12]);
+}
+
+/// Every fault status code of an ARM64 abort, 0x00 to 0x3F, as the table
+/// of kinds of Faults reads it (Arm DDI 0487 M.d, D24.2): a translation or
+/// permission fault is a page fault; alignment, an external abort not on a
+/// walk, a tag check and an unsupported exclusive or atomic access are
+/// protection; an address size or access flag fault, an abort on a walk,
+/// a parity or ECC error, a granule protection fault, a TLB conflict and an
+/// unsupported atomic update are not the thread's; the rest is reserved
+/// (the final review's verification of lot A, H6: 8 of the 64 codes were
+/// pinned, and 0x35 moved to "not the thread's" left every test green).
+#[test]
+fn every_abort_status_code_of_arm64_has_its_kind() {
+    use crate::ExceptionUse::{Fault, NotThread};
+    use crate::FaultKind::{Page, Protection};
+    let wanted = |fsc: u8| match fsc {
+        0x04..=0x07 | 0x2A | 0x2B | 0x0C..=0x0F => Some(Fault(Page)),
+        0x10 | 0x11 | 0x21 | 0x35 => Some(Fault(Protection)),
+        0x00..=0x03 | 0x29 | 0x2C | 0x08..=0x0B => Some(NotThread),
+        0x12..=0x18 | 0x1B..=0x1F | 0x22..=0x28 | 0x30 | 0x31 | 0x34 => Some(NotThread),
+        0x19 | 0x1A | 0x20 | 0x2D..=0x2F | 0x32 | 0x33 | 0x36..=0x3F => None,
+        _ => unreachable!(),
+    };
+    for fsc in 0..=0x3F {
+        assert_eq!(crate::aarch64::abort_use(fsc), wanted(fsc), "{fsc:#x}");
+    }
+}

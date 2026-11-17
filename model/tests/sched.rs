@@ -1,6 +1,7 @@
 //! Scheduling and time: one test per rule, on the start-up state of
 //! `Machine::example`. Its first thread runs on the context in slot 4
-//! (10 ms every 10 ms, class 1); the boot core's capability is in slot 16,
+//! (63/64 of the core every 10 ms, class 1, the recovery reserve holding
+//! the other 1/64); the boot core's capability is in slot 16,
 //! the other core's in slot 17.
 
 mod common;
@@ -194,7 +195,7 @@ fn timer_set(timer: u32, notify: u32, deadline: u64, tolerance: u64) -> Syscall 
 // Clock, and the start-up context.
 
 #[test]
-fn first_thread_runs_on_a_context_of_10_ms_every_10_ms() {
+fn first_thread_runs_on_a_context_of_63_64_of_the_core() {
     let mut k = K::new();
     assert_eq!(k.m.running(), Some(k.t));
     let budget = START_SCHED_BUDGET_NS;
@@ -286,13 +287,17 @@ fn admission_refuses_more_than_one_whole_core_and_changes_nothing() {
     // Removing a configuration never fails, and frees its share at once.
     k.ok(configure(40, 0, 0, 1));
     k.ok(configure(41, 10 * US, 10 * MS, 1));
-    // The bandwidth is rounded up: three thirds of a core do not fit.
+    // The bandwidth is rounded up: 31/64 of the core, 10,000 ns every
+    // 20,001 ns and 858,950 ns every 2^35 ns sum to 0.064 of a unit (2^-32
+    // of a core) below 63/64, so they fit exactly beside the reserve, and
+    // not once each is rounded up (the final review's F2 Opus 33: three
+    // thirds and the reserve did not fit whichever way it rounded).
     k.ok(configure(FIRST, 0, 0, 1));
     k.ok(configure(41, 0, 0, 1));
-    k.ok(configure(40, 10 * US, 30 * US, 1));
-    k.ok(configure(41, 10 * US, 30 * US, 1));
+    k.ok(configure(40, 4_843_750, 10 * MS, 1));
+    k.ok(configure(41, 10 * US, 20_001, 1));
     k.make(Sched, 42);
-    k.no(configure(42, 10 * US, 30 * US, 1), Error::Budget);
+    k.no(configure(42, 858_950, 1 << 35, 1), Error::Budget);
 }
 
 #[test]
@@ -310,11 +315,8 @@ fn new_configuration_sets_r_to_b_and_d_to_now_plus_t() {
 fn reconfiguration_lowers_r_keeps_d_and_uses_b_and_t_from_the_next_replenishment() {
     let mut k = K::new();
     k.ok(configure(FIRST, 4 * MS, 10 * MS, 1));
-    // r became min(10 ms, 4 ms); d stays 10 ms.
-    assert_eq!(
-        k.read(FIRST).1..=k.read(FIRST).1,
-        4 * MS as i64..=4 * MS as i64
-    );
+    // r became min(63/64 of 10 ms, 4 ms); d stays 10 ms.
+    assert_eq!(k.read(FIRST).1, 4 * MS as i64);
     assert_eq!(k.read(FIRST).2, 10 * MS);
     // Exhausted at 4 ms, replenished at 10 ms with the new budget.
     k.advance(4 * MS);
@@ -644,7 +646,7 @@ fn destroying_the_reply_object_of_a_lend_marks_its_receiver() {
     k.ok(Syscall::CapDelete(s(RP)));
     // The server, runnable and without a context, raised the fault.
     assert!(!k.can_run(server));
-    assert_eq!(k.m.census().fault_kinds[8], 1);
+    assert_eq!(k.m.census().fault_kinds[FaultKind::NoContext as usize], 1);
 }
 
 #[test]
@@ -656,7 +658,7 @@ fn destroying_a_context_marks_its_home_and_frees_its_share() {
     let thread = k.thread(50, 40);
     k.ok(Syscall::CapDelete(s(40)));
     assert!(!k.can_run(thread));
-    assert_eq!(k.m.census().fault_kinds[8], 1);
+    assert_eq!(k.m.census().fault_kinds[FaultKind::NoContext as usize], 1);
     k.context(41, half, 10 * MS, 1);
 }
 
@@ -689,7 +691,10 @@ fn thread_without_an_address_space_faults_when_it_would_run() {
     let thread = k.m.object_at(k.t, s(50)).unwrap();
     k.ok(Syscall::ThreadResume(s(50)));
     assert!(!k.can_run(thread));
-    assert_eq!(k.m.census().fault_kinds[7], 1);
+    assert_eq!(
+        k.m.census().fault_kinds[FaultKind::NoAddressSpace as usize],
+        1
+    );
     assert_eq!(k.m.running(), Some(k.t));
 }
 
@@ -915,12 +920,12 @@ fn passive_receiver_that_finds_a_fault_no_context_gets_again() {
     let victim = k.thread(60, 40);
     k.ok(Syscall::CapDelete(s(40)));
     // Nobody waited: the fault is queued, as any call.
-    assert_eq!(k.m.census().fault_kinds[8], 1);
+    assert_eq!(k.m.census().fault_kinds[FaultKind::NoContext as usize], 1);
     let handler = passive(&mut k, 50, EP);
     assert_eq!(k.on(handler, recv(EP, RP)), Err(Error::Again));
     // The faulting thread left the queue, suspended with its fault
     // recorded; the reply object stayed idle.
-    assert_eq!(k.m.census().fault_kinds[8], 0);
+    assert_eq!(k.m.census().fault_kinds[FaultKind::NoContext as usize], 0);
     assert!(!k.can_run(victim));
     assert_eq!(recorded(&mut k, 60)[0], FaultKind::NoContext as u64);
     assert_eq!(k.on(handler, recv(EP, RP)), Ok(Output::Waits));

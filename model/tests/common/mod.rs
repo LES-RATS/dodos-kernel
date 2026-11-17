@@ -1,5 +1,5 @@
 //! What the test files share: the slots of the start-up space of
-//! `Machine::example`, the same on both geometries of the tests.
+//! `Machine::example`, the same on the three geometries of the tests.
 //!
 //! The start-up space holds the fixed slots 1 to 15, then from slot 16 the
 //! two `core` roots (16, 17), the `iommu` root (18), the five `role` roots

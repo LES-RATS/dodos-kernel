@@ -231,9 +231,14 @@ fn start_up_untyped_is_taken_after_the_message_page() {
     assert_eq!(start, copied + copied_pages * page);
     assert_eq!(message, start + start_pages * page);
     assert_eq!(copied, Machine::example().memory[4].base);
-    // An endpoint goes right after the message page.
+    // An endpoint goes right after the message page: a frame retyped after
+    // it lies one page later (the final review's F2 Opus 4: where it went
+    // was not read).
     let endpoint = retype(24, Endpoint, 0, 40);
     assert_eq!(m.apply(t, endpoint), Ok(Output::Done));
+    let frame = retype(24, ObjectKind::Frame, 1, 41);
+    assert_eq!(m.apply(t, frame), Ok(Output::Done));
+    assert_eq!(base(&m, 41), message + page + page);
 }
 
 #[test]
@@ -298,9 +303,6 @@ fn kept_frames_cover_each_module_in_consecutive_slots_by_the_largest_sizes() {
     let machine = with(|m| {
         let (chunk, page) = (m.geometry.chunk(), m.geometry.page());
         m.files[0].len = chunk + 3 * page - 5;
-        m.image_base = 8 << 20;
-        m.kept.push((8 << 20, 0));
-        m.kept.pop();
     });
     let chunk = machine.geometry.chunk();
     let image = (8u64 << 20).max(chunk).next_multiple_of(chunk);
@@ -324,7 +326,6 @@ fn no_module_is_refused_for_its_size() {
     let machine = with(|m| {
         let entries = u64::from(m.geometry.entries);
         m.files[0].len = (entries + 1) * m.geometry.page();
-        m.image_base = 64 << 20;
     });
     let chunk = machine.geometry.chunk();
     let machine = Machine {
@@ -687,7 +688,16 @@ fn a_machine_with_a_core_of_fence_class_0_runs_one_node_unless_declared() {
     machine.cores[1].fence = 0;
     assert_eq!(machine.nodes(), 1);
     let (sys, _) = System::boot(&machine).unwrap();
+    // One node runs: every core word is free or names slot 0 (the final
+    // review's F2 Opus 5: `has(0)` is true of a machine of two nodes too).
     assert!(sys.has(0));
+    for core in 0..machine.cores.len() {
+        let word = CoreWord::from_raw(sys.core_word(core)).expect("a word");
+        assert!(
+            word.state() == CoreState::Free || word.slot() == 0,
+            "{core}"
+        );
+    }
     let mut monitored = machine.clone();
     monitored.monitor = true;
     assert_eq!(monitored.nodes(), 2);
@@ -714,10 +724,6 @@ fn the_geometry_of_the_tests_is_the_one_dodos_page_names() {
 /// Argon F3: the boot test of a start-up page of exactly 63 pages (mutant 122).
 #[test]
 fn a_start_up_page_of_exactly_63_pages_is_accepted() {
-    // #119: when DODOS_PAGE=16k, Machine::example() uses 16 KB pages
-    if std::env::var("DODOS_PAGE").as_deref() == Ok("16k") {
-        assert_eq!(Machine::example().geometry.page(), 16_384);
-    }
     // #122: start-up page of exactly 63 pages (START_PAGE_MAX_PAGES) is accepted
     let page = Machine::example().geometry.page() as u32;
     let fits63 = with(|m| m.files[0].name = 62 * page);
@@ -734,9 +740,16 @@ fn kernel_refuses_a_sixty_four_kb_granule() {
     let mut machine = Machine::example();
     machine.geometry = Geometry {
         page_shift: [16, 29, 0, 0],
-        entries: 4096,
+        // 8,192 entries, consistent with the page: *E* at most 4,096 is the
+        // only rule left that refuses it (the final review's F2 Opus 2: with
+        // 4,096 the geometry was refused for two other reasons first).
+        entries: 8192,
         levels: 3,
         user_end: 63 << 42,
     };
+    // The crash areas on the chunk of 512 MB, so that nothing else of the
+    // machine's values refuses it.
+    let chunk = machine.geometry.chunk();
+    machine.crash = (machine.crash.0.next_multiple_of(chunk), None);
     assert_eq!(Model::boot(&machine).err(), Some(Refusal::MachineValues));
 }

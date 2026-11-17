@@ -15,10 +15,11 @@
 //! These scenarios do not depend on the page: they run once, in the run of
 //! `verify` without `DODOS_PAGE`.
 
+use super::pass17::{fresh, kill, seal};
 use super::*;
 use crate::Wait;
 use crate::system::Rng;
-use dodos_abi::{NODE_START_FRESH, NODE_START_RESUME, NODE_STOP_KILL, NODE_STOP_SEAL};
+use dodos_abi::NODE_START_RESUME;
 
 const SEEDS: u64 = 24;
 
@@ -45,33 +46,6 @@ fn seeds(count: u64) -> Vec<u64> {
 fn say(what: std::fmt::Arguments) {
     if replayed().is_some() {
         eprintln!("{what}");
-    }
-}
-
-fn kill(n: u16) -> Syscall {
-    Syscall::NodeStop {
-        node: node_cap(n),
-        mode: NODE_STOP_KILL,
-        core: 0,
-    }
-}
-
-fn seal(n: u16) -> Syscall {
-    Syscall::NodeStop {
-        node: node_cap(n),
-        mode: NODE_STOP_SEAL,
-        core: 0,
-    }
-}
-
-fn fresh(n: u16, mask: u64) -> Syscall {
-    Syscall::NodeStart {
-        node: node_cap(n),
-        mode: NODE_START_FRESH,
-        image: 0,
-        module: 0,
-        window: 0,
-        mask,
     }
 }
 
@@ -683,7 +657,7 @@ fn a_core_stops_in_the_middle_of_a_request_of_another_core() {
         // node 0 supervises.
         let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
         m.ok(1, super::place_first(1, 1));
-        let other = m.thread_on(1, 300, 2);
+        let _ = m.thread_on(1, 300, 2);
         m.settle();
         let frame = m.retype(1, ObjectKind::Frame, 1, 150);
         m.ok(1, frame);
@@ -723,7 +697,6 @@ fn a_core_stops_in_the_middle_of_a_request_of_another_core() {
                 _ => churn(&mut m, &mut rng),
             }
         }
-        let _ = other;
         m.run_by(dodos_abi::CORE_ANSWER_NS + 100 * MS, MS);
         // Liveness: a node whose core stopped in a request accused itself
         // and was reclaimed, or the request completed.

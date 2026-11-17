@@ -429,16 +429,22 @@ impl Geometry {
         }
     }
 
-    /// *P*, the bytes of a page.
+    /// *P*, the bytes of a page. Only on a geometry [`Geometry::valid`]
+    /// accepts, as the accessors below (a page shift of 64 or more
+    /// overflows; the final review's verification of lot A, M3); the
+    /// start-up refuses every other geometry before any use.
     pub const fn page(&self) -> u64 {
         1 << self.page_shift[0]
     }
 
-    /// The log2 of the chunk: the first large page (Chunks).
+    /// The log2 of the chunk: the first large page (Chunks). Only on a
+    /// valid geometry (0 on the default one).
     pub const fn chunk_shift(&self) -> u32 {
         self.page_shift[1] as u32
     }
 
+    /// The bytes of the chunk. Only on a valid geometry (a shift of 64 or
+    /// more overflows).
     pub const fn chunk(&self) -> u64 {
         1 << self.chunk_shift()
     }
@@ -457,13 +463,14 @@ impl Geometry {
     }
 
     /// The bits of a virtual address the tables translate: the page and
-    /// log2 *E* per level.
+    /// log2 *E* per level. Only on a valid geometry (at most 64 there).
     pub const fn address_bits(&self) -> u32 {
         self.page_shift[0] as u32 + self.levels * self.entries.trailing_zeros()
     }
 
     /// The bytes one entry of the root table maps: the reserved slot is the
-    /// range of one such entry (Address spaces and their tables).
+    /// range of one such entry (Address spaces and their tables). Only on a
+    /// valid geometry (no level on the default one).
     pub const fn root_entry(&self) -> u64 {
         1 << (self.page_shift[0] as u32 + (self.levels - 1) * self.entries.trailing_zeros())
     }
@@ -472,7 +479,8 @@ impl Geometry {
     /// tables translate (`address_bits` − 1) to bit 63 are all equal
     /// (x86-64: bits 47-63 on four levels). It depends on the address bits
     /// of the geometry, never on the user range end (DeepSeek F1 of the
-    /// seventh review).
+    /// seventh review). Only on a valid geometry (no address bit on the
+    /// default one).
     pub const fn canonical(&self, address: u64) -> bool {
         let top = address >> (self.address_bits() - 1);
         top == 0 || top == u64::MAX >> (self.address_bits() - 1)
@@ -1178,7 +1186,176 @@ mod proofs {
         if g.valid() {
             assert!(g.page() >= 4096 && g.chunk() > g.page());
             assert!(g.root_entry() <= 1 << (g.address_bits() - 1));
+            // The accessors M3 names, on what `valid` accepts: the address
+            // bits within 64, the user range canonical, the reserved slot
+            // below the half the tables translate (the final review's
+            // verification of lot A, M3).
+            let bits = g.address_bits();
+            assert!(bits > g.chunk_shift() && bits <= 64);
+            assert!(g.canonical(0) && g.canonical(g.user_end - 1));
+            assert!(g.user_end + g.root_entry() <= 1 << (bits - 1));
+            assert!(bits == 64 || !g.canonical(1 << (bits - 1)));
         }
+    }
+
+    /// A task identifier reads back its node and its counter (H6 of the
+    /// final review's verification of lot A).
+    #[kani::proof]
+    fn task_id_reads_back() {
+        let (node, counter): (u16, u64) = (kani::any(), kani::any());
+        kani::assume(counter < 1 << 48);
+        let id = TaskId::new(node, counter);
+        assert!(id.node() == node && id.counter() == counter);
+        assert!(TaskId::from_raw(id.raw()) == id);
+        assert!((id == TaskId::NONE) == (node == 0 && counter == 0));
+    }
+
+    /// A node and its generation read back, bits 48-63 zero (H6).
+    #[kani::proof]
+    fn node_gen_reads_back() {
+        let (node, generation): (u16, u32) = (kani::any(), kani::any());
+        let ng = NodeGen::new(node, generation);
+        assert!(ng.node() == node && ng.generation() == generation);
+        assert!(ng.raw() >> 48 == 0);
+    }
+
+    /// Rights: only the eight rights exist, and the set operations are the
+    /// set operations (H6).
+    #[kani::proof]
+    fn rights_are_a_set_of_eight() {
+        let (a, b): (u32, u32) = (kani::any(), kani::any());
+        match Rights::from_bits(a) {
+            Some(r) => assert!(a >> 8 == 0 && r.bits() == a),
+            None => assert!(a >> 8 != 0),
+        }
+        let (x, y) = (Rights(a & 0xff), Rights(b & 0xff));
+        assert!(x.union(y).contains(x) && x.union(y).contains(y));
+        assert!(!x.without(y).contains(y) || y.bits() == 0);
+        assert!(x.contains(x.without(y)));
+        assert!(Rights::ALL.contains(x));
+    }
+
+    /// x86-64: canonical with four levels is bits 47 to 63 all equal; the
+    /// flags a write gives keep IF and the reserved bit 1 and no bit user
+    /// code cannot change; a remappable MSI's address carries its handle
+    /// (H6).
+    #[kani::proof]
+    fn x86_64_words_are_what_the_architecture_reads() {
+        let (address, flags, handle): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let canonical = address < 1 << 47 || address >= !0u64 << 47;
+        assert!(x86_64::canonical(address) == canonical);
+        let written = x86_64::rflags(flags);
+        assert!(written & x86_64::RFLAGS_FIXED == x86_64::RFLAGS_FIXED);
+        assert!(written & !(x86_64::RFLAGS_USER_MASK | x86_64::RFLAGS_FIXED) == 0);
+        assert!(x86_64::rflags(written) == written);
+        kani::assume(handle < 1 << 16);
+        let msi = x86_64::msi_remapped(handle);
+        assert!(msi >> 20 == 0xFEE && msi & 1 << 4 != 0);
+        assert!((msi >> 5 & 0x7FFF) | (msi >> 2 & 1) << 15 == handle);
+    }
+
+    /// The small decoders of `abi/` (H6 of the final review's verification
+    /// of lot A, against the rule "a pure function of abi/ has a Kani
+    /// proof"): each accepts exactly its values and reads them back.
+    #[kani::proof]
+    fn the_decoders_accept_exactly_their_values() {
+        let raw: u64 = kani::any();
+        match PageSize::from_raw(raw) {
+            Some(size) => assert!(raw < 4 && size as u64 == raw),
+            None => assert!(raw >= 4),
+        }
+        let label: u32 = kani::any();
+        match FaultKind::from_raw(label) {
+            Some(kind) => assert!((1..=9).contains(&label) && kind as u32 == label),
+            None => assert!(label == 0 || label > 9),
+        }
+        let device: bool = kani::any();
+        match MemoryType::for_memory(raw, device) {
+            Ok(MemoryType::WriteBack) => assert!(raw == 0 && !device),
+            Ok(_) => assert!(device && (raw == 1 || raw == 2)),
+            Err(e) => assert!(e as u8 == Error::Invalid as u8 && !(raw == 0 && !device)),
+        }
+        match Marks::from_bits(raw) {
+            Ok(marks) => assert!(raw >> 2 == 0 && marks.bits() == raw),
+            Err(_) => assert!(raw >> 2 != 0),
+        }
+        assert!(SlotAddr::from_raw(raw).raw() == raw);
+    }
+
+    /// The rights of a mapping: an aspace's include `read` and not both
+    /// `write` and `exec`; an iospace's are a non-empty subset of `read` and
+    /// `write` (H6).
+    #[kani::proof]
+    fn mapping_rights_are_what_a_space_allows() {
+        let word: u32 = kani::any();
+        let (r, w, x) = (Rights::READ.0, Rights::WRITE.0, Rights::EXEC.0);
+        match mapping_rights(word) {
+            Ok(rights) => {
+                assert!(rights.0 == word && word & !(r | w | x) == 0);
+                assert!(word & r != 0 && word & (w | x) != (w | x));
+            }
+            Err(_) => {
+                assert!(word & !(r | w | x) != 0 || word & r == 0 || word & (w | x) == (w | x))
+            }
+        }
+        match io_mapping_rights(word) {
+            Ok(rights) => assert!(rights.0 == word && word != 0 && word & !(r | w) == 0),
+            Err(_) => assert!(word == 0 || word & !(r | w) != 0),
+        }
+    }
+
+    /// The clock page's reading never traps, whatever a faulty kernel wrote
+    /// in it, and is `ns_base` at `counter_base` (H6).
+    #[kani::proof]
+    fn the_clock_reads_without_a_trap() {
+        let page = ClockPage {
+            version: kani::any(),
+            seq: kani::any(),
+            shift: kani::any(),
+            flags: kani::any(),
+            mult: kani::any(),
+            counter_base: kani::any(),
+            ns_base: kani::any(),
+        };
+        let counter: u64 = kani::any();
+        let _ = page.nanoseconds(counter);
+        if page.shift < 128 {
+            assert!(page.nanoseconds(page.counter_base) == page.ns_base);
+        }
+    }
+
+    /// A geometry's page sizes: `bytes` of each present size and `sizes`
+    /// agree (H6).
+    #[kani::proof]
+    fn page_sizes_agree_with_their_bit_set() {
+        let g = Geometry {
+            page_shift: kani::any(),
+            entries: kani::any(),
+            levels: kani::any(),
+            user_end: kani::any(),
+        };
+        kani::assume(g.valid());
+        let i: usize = kani::any::<usize>() % 4;
+        let size = PageSize::ALL[i];
+        assert!(g.bytes(size).is_some() == (g.sizes() >> i & 1 == 1));
+        if let Some(bytes) = g.bytes(size) {
+            assert!(bytes >= g.page() && bytes.is_power_of_two());
+        }
+    }
+
+    /// ARM64: an abort from a lower level is classified by its fault status
+    /// code, ISS bits 5-0, over the 64 codes, whatever the other bits of
+    /// the syndrome (H6: the proof above reads code 0 only).
+    #[kani::proof]
+    fn an_arm64_abort_is_classified_by_its_status_code() {
+        let iss: u64 = kani::any::<u64>() & 0x1FF_FFFF;
+        let ec = match kani::any::<bool>() {
+            true => crate::aarch64::EC_DABT_LOWER,
+            false => crate::aarch64::EC_IABT_LOWER,
+        };
+        let syndrome = (ec as u64) << crate::aarch64::ESR_EC_SHIFT | iss;
+        let fsc = (iss & 0x3F) as u8;
+        assert!(crate::aarch64::exception_use(syndrome) == crate::aarch64::abort_use(fsc));
     }
 
     /// `dr7_valid` accepts a control word only within the user mask, with

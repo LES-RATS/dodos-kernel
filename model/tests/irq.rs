@@ -164,8 +164,11 @@ fn irq_claim_needs_manage_on_an_irq_control() {
     k.no(weak(NT), Error::Invalid);
 }
 
+/// Each bad destination, source and vector is refused; all are `invalid`,
+/// so the order the contract states among them does not show here (the
+/// final review's F2 Opus 27).
 #[test]
-fn source_then_vector_are_judged_after_the_destination() {
+fn each_bad_destination_source_and_vector_of_irq_claim_is_refused() {
     let mut k = K::new();
     let raw = |source: u64, vector, slot| Syscall::IrqClaim {
         control: s(CONTROL),
@@ -201,8 +204,12 @@ fn claimed_vector_or_line_is_busy_before_a_full_destination() {
     k.no(claim(msi(), 49, NT), Error::NoSlot);
 }
 
+/// The depth checks come last among the plain arguments (Order of checks,
+/// item 3), so before the state: a claimed vector through a control at
+/// depth 64 is `invalid`, not `busy`. That they follow the other plain
+/// arguments does not show (all `invalid`; the final review's F2 Opus 27).
 #[test]
-fn irq_claim_checks_the_depth_last() {
+fn irq_claim_judges_the_depth_before_the_state() {
     let mut k = K::new();
     let mut from = CONTROL;
     for slot in 100..163 {
@@ -224,6 +231,16 @@ fn irq_claim_checks_the_depth_last() {
     k.no(deep(300), Error::Invalid);
     k.no(deep(48), Error::Invalid);
     k.go(claim(msi(), 48, 40)).unwrap();
+    // A claimed vector through the control at depth 64: the depth's
+    // `invalid` before the state's `busy`.
+    let deep_into = |slot| Syscall::IrqClaim {
+        control: s(162),
+        source: msi().raw(),
+        core: 0,
+        vector: 48,
+        destination: s(slot),
+    };
+    k.no(deep_into(41), Error::Invalid);
 }
 
 #[test]

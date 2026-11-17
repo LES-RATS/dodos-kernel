@@ -9,7 +9,6 @@
 use super::pass17::{fresh, kill};
 use super::*;
 use crate::cores::Flush;
-use crate::system::Hardware;
 use crate::table::{GrantState, Observation, UseEntry, Watched};
 use dodos_abi::{CoreState, CoreWord, SETTLE_NS};
 
@@ -21,8 +20,9 @@ fn f2_the_first_round_of_a_fence_cancels_the_start_requests_aimed_at_the_node() 
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
-    // Node 1 starts again on cores 1 and 2, and is accused before either
-    // core took its request: the fence's first round cancels both.
+    // Node 1 starts again on cores 1 and 2, and is accused before core 2,
+    // hung, took its request: the fence's first round cancels it (core 1
+    // may have taken its own; the final review's E13).
     m.sys.hang(2, false);
     m.ok(0, fresh(1, 0b110));
     for _ in 0..1000 {
@@ -205,7 +205,8 @@ fn f6_a_remote_capability_whose_use_entry_names_another_generation_is_invalid() 
 fn f7_an_unmap_whose_unit_failed_empties_the_record_and_keeps_the_map_count() {
     let mut m = S::two();
     // Node 0 maps a frame of its own in an iospace that serves a device
-    // behind the unit node 0 holds.
+    // behind the unit node 1 holds (the IOMMU role is node 1's; the final
+    // review's E12): the attach and the unmap cross as unit requests.
     let iospace = m.retype(0, ObjectKind::IoSpace, 0, 150);
     m.ok(0, iospace);
     let frame = m.retype(0, ObjectKind::Frame, 1, 151);
@@ -216,9 +217,10 @@ fn f7_an_unmap_whose_unit_failed_empties_the_record_and_keeps_the_map_count() {
         iospace: s(150),
         device: 0x10,
     };
-    if m.call(0, attach) == WAITS {
-        m.run(20 * MS);
-    }
+    assert_eq!(m.sys.role(0).holder(), 1);
+    assert_eq!(m.call(0, attach), WAITS);
+    m.run(20 * MS);
+    assert_eq!(m.woken(0), Some(&DONE));
     let untyped = untyped_slot(m.sys.node(0), m.t[0]);
     m.ok(
         0,
@@ -243,6 +245,11 @@ fn f7_an_unmap_whose_unit_failed_empties_the_record_and_keeps_the_map_count() {
     m.run(dodos_abi::IOMMU_WAIT_NS + 30 * MS);
     assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
     assert_eq!(m.sys.node(0).map_count(chunk), count);
+    // The record is emptied, as the name says (held by the test, not only
+    // by invariant 36).
+    let node = m.sys.node(0);
+    let held = node.caps.values().find(|c| c.object == object);
+    assert_eq!(held.map(|c| c.record), Some(crate::Record::Empty));
 }
 
 // F8: at step 4 "the gate refuses if Y is no longer live; X then maps the
@@ -387,6 +394,7 @@ fn f12_at_most_32_pending_signals_are_sent_in_one_event() {
     });
     let before = m.sys.canonical().rings[1][0].user.produced;
     m.sys.node_mut(1).send_pending();
+    assert_eq!(m.sys.check(), Ok(()));
     let written = m.sys.node(1).table.rings[1][0].user.produced - before;
     assert_eq!(written, dodos_abi::PENDING_STEP as u64);
 }
@@ -432,5 +440,4 @@ fn f14_one_interrupt_serves_at_most_sixteen_entries_of_a_user_ring() {
     m.sys.fire(crate::system::Event::Ipi { node: 0, core: 0 });
     let after = m.sys.canonical().beacons[0].consumed[1].1;
     assert_eq!(after - before, dodos_abi::RING_USER_STEP);
-    let _ = Hardware::Running;
 }

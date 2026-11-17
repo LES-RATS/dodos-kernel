@@ -2,8 +2,8 @@
 
 use super::{Check, ensure};
 use crate::{IrqState, Model};
+use dodos_abi::Marks;
 use dodos_abi::x86_64::{IRQ_VECTOR_FIRST, IRQ_VECTOR_LAST};
-use dodos_abi::{Marks, TaskId};
 use std::collections::BTreeSet;
 
 impl Model {
@@ -29,7 +29,8 @@ impl Model {
             let once = task.threads.iter().collect::<BTreeSet<_>>().len() == task.threads.len();
             ensure(attached && once, "48: threads of a task")?;
         }
-        ensure(!ids.contains(&TaskId::NONE.raw()), "49: task identifier")?;
+        // A counter of at least 1 makes a raw identifier that is never
+        // `TaskId::NONE` (0), so no line asks it (ver-D D3).
         for (&id, thread) in &self.threads {
             let listed = thread.task.is_none_or(|task| {
                 self.tasks
@@ -52,7 +53,7 @@ impl Model {
                 "50: running thread of a revoked task",
             )?;
         }
-        ensure(true, "50: running thread of a revoked task")
+        Ok(())
     }
 
     /// Interrupts:

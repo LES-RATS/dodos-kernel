@@ -46,6 +46,20 @@ pub(super) fn kill(n: u16) -> Syscall {
     }
 }
 
+/// The detach of the device an attach names: the same call with no
+/// iospace (shared; the final review's E24: five inlined copies, each with
+/// an arm that turned any other call into itself).
+pub(super) fn detach_of(call: Syscall) -> Syscall {
+    let Syscall::IoSpaceAttach { iommu, device, .. } = call else {
+        panic!("an attach: {call:?}");
+    };
+    Syscall::IoSpaceAttach {
+        iommu,
+        iospace: SlotAddr::NONE,
+        device,
+    }
+}
+
 pub(super) fn seal(n: u16) -> Syscall {
     Syscall::NodeStop {
         node: node_cap(n),
@@ -244,11 +258,35 @@ fn a_fence_nmi_that_lands_in_the_entry_stub_gives_no_false_confirmation() {
 // generation already over)").
 
 /// Node 0 grants node 1 its frame at slot 101; node 1 holds it at `GOT`.
-pub(super) fn granted_to_1(m: &mut S) {
-    granted(m);
+/// The remapping handle of `vector` on core `core`: the core's interrupt
+/// table of `IRQ_TABLE_ENTRIES` handles, from vector `IRQ_VECTOR_FIRST`
+/// (one layout, written once: the final review's E17 and E27).
+pub(super) fn handle(core: u16, vector: u16) -> u16 {
+    use dodos_abi::x86_64::{IRQ_TABLE_ENTRIES, IRQ_VECTOR_FIRST};
+    core * IRQ_TABLE_ENTRIES as u16 + vector - u16::from(IRQ_VECTOR_FIRST)
 }
 
-fn granted(m: &mut S) {
+/// A call that may wait for a unit (a claim, an attach): its result, at
+/// once or `ns` later, is a success, never an error (the final review's
+/// E25: eleven sites dropped it).
+pub(super) fn succeeds(m: &mut S, node: u16, call: Syscall, ns: u64) {
+    let outcome = m.call(node, call);
+    let end = match outcome == WAITS {
+        true => {
+            m.run(ns);
+            m.woken(node).cloned()
+        }
+        false => Some(outcome),
+    };
+    assert!(
+        matches!(end, Some(Ok(Output::Done | Output::Msi { .. }))),
+        "{end:?}"
+    );
+}
+
+/// Node 0 grants a frame to node 1 by a `node_send`, which node 1
+/// receives in slot `GOT`.
+pub(super) fn granted_to_1(m: &mut S) {
     let reply = m.retype(1, ObjectKind::Reply, 0, REPLY);
     m.ok(1, reply);
     let frame = m.retype(0, ObjectKind::Frame, 1, 101);
@@ -271,7 +309,7 @@ fn granted(m: &mut S) {
 #[test]
 fn a_resume_after_a_peer_died_and_started_fresh_runs_r0_and_frees_the_grants_to_it() {
     let mut m = S::on(&machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]));
-    granted(&mut m);
+    granted_to_1(&mut m);
     assert_eq!(m.sys.canonical().grants[0].len(), 1);
     // Node 1 stops answering; node 0 sends to it and waits for the answer.
     m.sys.hang(1, true);
@@ -446,11 +484,12 @@ fn a_claim_whose_waiting_thread_is_destroyed_still_asks_every_unit() {
     let thread = m.thread_on(0, 300, 0);
     let msi = dodos_abi::IrqSource::msi(0, 3, 1, 0).raw();
     assert_eq!(m.call_by(0, thread, claim(msi, 49, 211)), WAITS);
-    let mut outcome = m.call(0, Syscall::CapDelete(s(300)));
-    while outcome == Err(Error::Again) {
-        outcome = m.call(0, Syscall::CapDelete(s(300)));
-    }
-    assert_eq!(outcome, DONE);
+    // At most 8 calls: a removal that answered `again` for ever fails here
+    // instead of hanging the run (the final review's E36).
+    let outcome = (0..8)
+        .map(|_| m.call(0, Syscall::CapDelete(s(300))))
+        .find(|outcome| *outcome != Err(Error::Again));
+    assert_eq!(outcome, Some(DONE));
     m.run(60 * MS);
     for (i, &role) in roles.iter().enumerate() {
         assert_eq!(submissions(&m, role), before[i] + 1, "unit {i}");
@@ -510,7 +549,7 @@ fn a_claim_of_a_remapped_line_invalidates_the_interrupt_entry_cache_before_the_r
     let unit = &m.sys.node(0).table.units[&ioapic];
     assert!(unit.lines.contains_key(&5));
     // The remapping entry of the handle is in each unit of the segment.
-    let handle = 50 - 48;
+    let handle = u32::from(handle(0, 50));
     for &role in &roles {
         assert!(m.sys.node(0).table.units[&role].remap.contains_key(&handle));
     }
@@ -543,15 +582,20 @@ pub(super) fn judged(
     let epoch = m.sys.role(role).epoch();
     let before = m.sys.node(holder).refused.0;
     let unit = m.sys.node(holder).table.units.get(&role).cloned();
+    // Some callers write a state by hand that the check refuses before the
+    // call (a word of another node, a line of no claim): the call adds no
+    // fault of its own.
+    let checked = m.sys.check();
     let model = m.sys.node_mut(holder);
     model.unit_requested(requester, Some((0, 1)), (role as u16, epoch, op));
+    assert_eq!(m.sys.check(), checked);
     let refused = m.sys.node(holder).refused.0 == before + 1;
     if refused {
+        // A refused request "is not written to the unit": none of its
+        // state, its domains, remapping, queue, masks included (the final
+        // review's E15 compared only the entries and the lines).
         let after = m.sys.node(holder).table.units.get(&role).cloned();
-        assert_eq!(
-            after.map(|u| (u.entries, u.lines)),
-            unit.map(|u| (u.entries, u.lines))
-        );
+        assert_eq!(after, unit);
     }
     refused
 }
@@ -666,7 +710,7 @@ fn the_holder_refuses_an_invalidation_of_a_domain_number_of_another_node() {
 fn the_holder_refuses_an_interrupt_entry_cache_invalidation_of_a_handle_of_another_nodes_core() {
     let (mut m, holder, requester, third) = holder_requester_third();
     // Node n runs on core n: its handles are n × 192 to n × 192 + 191.
-    let handle = |core: u16| core * dodos_abi::x86_64::IRQ_TABLE_ENTRIES as u16 + 3;
+    let handle = |core: u16| handle(core, 51);
     let op = |h| crate::rings::UnitOp::InterruptCache { handle: h };
     assert!(judged(&mut m, holder, requester, 0, op(handle(third))));
     assert!(!judged(&mut m, holder, requester, 0, op(handle(requester))));
@@ -690,7 +734,7 @@ fn the_holder_of_an_ioapic_refuses_a_redirection_entry_aimed_at_another_nodes_co
         low: false,
         target,
     };
-    let handle = |core: u16| core * dodos_abi::x86_64::IRQ_TABLE_ENTRIES as u16 + 2;
+    let handle = |core: u16| handle(core, 50);
     let remapped = |core| crate::rings::Target::Remapped {
         handle: handle(core),
         vector: 50,

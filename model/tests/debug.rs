@@ -113,8 +113,12 @@ fn debug_write_writes_one_entry_per_24_bytes_all_but_the_last_continued() {
     assert_eq!(k.user().len(), 2 + 22);
 }
 
+/// Rights before the length: a weak capability with a length too long is
+/// `denied`; a length beyond the registers is refused without a message
+/// page. (Length before the message page is not visible: both refusals are
+/// `invalid`; the final review's F2 Opus 14.)
 #[test]
-fn debug_write_is_judged_rights_then_length_then_the_message_page() {
+fn debug_write_judges_rights_before_length_and_the_registers_without_a_page() {
     let mut k = K::new();
     k.ok(Syscall::CapDerive {
         source: DEBUG,
@@ -124,7 +128,7 @@ fn debug_write_is_judged_rights_then_length_then_the_message_page() {
     });
     let weak = Syscall::DebugWrite {
         debug: s(100),
-        length: 8,
+        length: 513,
         words: vec![1],
     };
     k.no(weak, Error::Denied);
@@ -292,8 +296,7 @@ fn block() -> Vec<u64> {
 #[test]
 fn breakpoint_words_are_judged_word_by_word_and_the_user_interrupt_word_is_unsupported() {
     let mut k = K::new();
-    let b = k.spawn();
-    let _ = b;
+    k.spawn();
     k.ok(Syscall::ThreadSuspend(s(101)));
     let regs = |block: Vec<u64>| Syscall::ThreadWriteRegs {
         thread: s(101),
@@ -464,10 +467,12 @@ fn port_calls_are_unsupported_off_x86_64() {
 
 // Entropy.
 
+/// The words it returns: ⌈length / 8⌉, the last one padded with zeros. (It
+/// changes no state but the generator's: `debug.rs`'s unit test, which can
+/// read the generator.)
 #[test]
-fn entropy_read_changes_no_state_but_the_generators_and_pads_the_last_word() {
+fn entropy_read_fills_its_words_and_pads_the_last_one() {
     let mut k = K::new();
-    let before = k.m.clone();
     let Ok(Output::Bytes(words)) = k.go(Syscall::EntropyRead {
         length: 13,
         mix: [1, 2, 3, 4],
@@ -476,7 +481,6 @@ fn entropy_read_changes_no_state_but_the_generators_and_pads_the_last_word() {
     };
     assert_eq!(words.len(), 2);
     assert_eq!(words[1] >> 40, 0);
-    assert_eq!(k.m, before);
     k.no(
         Syscall::EntropyRead {
             length: 65,
@@ -561,7 +565,6 @@ fn a_node_started_fresh_keeps_its_rings_and_goes_on_from_their_sequences() {
     assert_eq!(starts, vec![1, 2]);
     assert_eq!(sys.node(1).area_generation(1), (2, 1));
     assert_eq!(sys.node(0).crash_record(1), Some((1, 5)));
-    let _ = (Endpoint, Task);
 }
 
 // Destroying what is linked (8.5, invariant 7).
@@ -615,8 +618,11 @@ fn a_destroyed_notify_leaves_its_endpoint_unbound_with_its_receivers() {
     k.ok(bind(111, s(110)));
 }
 
+/// A thread with every link is destroyed in one call (`done`), each link
+/// undone; one step holds up to `REMOVAL_STEP` units, which the test does
+/// not count (the final review's F2 Opus 11: the name said 8).
 #[test]
-fn destroying_a_thread_with_every_link_takes_one_step_of_at_most_8_units() {
+fn destroying_a_thread_with_every_link_finishes_in_one_step() {
     let mut k = K::new();
     let b = k.spawn();
     // Its links: its wait on an endpoint, its page, its fault endpoint,
@@ -655,6 +661,15 @@ fn destroying_a_thread_with_every_link_takes_one_step_of_at_most_8_units() {
         panic!("sched");
     };
     assert_eq!(state & SCHED_STATE_HOME, 0);
+    // The page binds another thread.
+    k.ok(retype(Thread, 0, 112));
+    k.ok(Syscall::ThreadConfigure {
+        thread: s(112),
+        cspace: s(START_SLOT_CSPACE),
+        aspace: s(START_SLOT_ASPACE),
+        fault: SlotAddr::NONE,
+        page: s(103),
+    });
 }
 
 #[test]
@@ -806,21 +821,22 @@ fn debug_port_and_entropy_rules_that_no_test_pinned() {
         Error::Invalid,
     );
 
-    // #96, #97, #99: entropy_read mixes all 4 words and keeps all 8 * left bits in the last word
-    let mut k1 = K::new();
-    let mut k2 = K::new();
-    let Ok(Output::Bytes(w1)) = k1.go(Syscall::EntropyRead {
-        length: 13,
-        mix: [0, 0, 0, 1],
-    }) else {
-        panic!();
+    // #96, #97, #99: entropy_read mixes all 4 words (one word set in each
+    // of four fresh nodes gives four different results: the final review's
+    // F2 Opus 12 found only the fourth varied) and keeps all 8 * left bits
+    // in the last word.
+    let read = |mix: [u64; 4]| {
+        let mut k = K::new();
+        let Ok(Output::Bytes(words)) = k.go(Syscall::EntropyRead { length: 13, mix }) else {
+            panic!("bytes");
+        };
+        words
     };
-    let Ok(Output::Bytes(w2)) = k2.go(Syscall::EntropyRead {
-        length: 13,
-        mix: [0, 0, 0, 2],
-    }) else {
-        panic!();
-    };
-    assert_ne!(w1, w2);
-    assert!(w1[1] >> 32 != 0 || w2[1] >> 32 != 0);
+    let results = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]].map(read);
+    for i in 0..4 {
+        for j in i + 1..4 {
+            assert_ne!(results[i], results[j], "words {i} and {j}");
+        }
+    }
+    assert!(results.iter().any(|w| w[1] >> 32 != 0));
 }

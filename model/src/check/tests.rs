@@ -488,9 +488,9 @@ fn outcome_while_waiting_on_a_fault_is_reported_unless_of_kind_7_or_8_at_the_add
         "16: outcome while waiting"
     );
     // Kinds 7 and 8 at the address after the call are allowed by 16; the
-    // state then fails later invariants of the faulting wait, not 16.
+    // state then fails 30, the outcome itself (ver-D D-c).
     for kind in [FaultKind::NoAddressSpace, FaultKind::NoContext] {
-        assert_ne!(outcome_on_a_fault(kind, 0), "16: outcome while waiting");
+        assert_eq!(outcome_on_a_fault(kind, 0), "30: outcome of a wait");
     }
 }
 
@@ -1637,17 +1637,15 @@ fn with_device(m: &mut Model) -> (ObjId, ObjId) {
         iospace: own(60),
         device: 0x10,
     };
-    m.apply(boot, attach).unwrap();
     // The device enters the header at the answer done of its attach, which
-    // the node, the holder of the unit's role, serves at a step (D-139).
+    // the node, the holder of the unit's role, serves at a step (D-139);
+    // the step runs as an event, which requeues the woken thread, so the
+    // state is valid before any spoil (ver-D: the unit step called alone
+    // left "41: queue of a context", hidden by the order of the rules).
+    m.apply_settled(boot, attach).unwrap();
     let iospace = object(m, 60);
-    for _ in 0..4 {
-        if !m.iospaces[&iospace].is_empty() {
-            break;
-        }
-        m.unit_step();
-    }
     assert!(!m.iospaces[&iospace].is_empty(), "the attach is answered");
+    assert_eq!(m.check(), Ok(()), "the device attached");
     (iospace, object(m, 18))
 }
 
@@ -1773,17 +1771,17 @@ fn throttled_context_with_budget_left_is_reported() {
 }
 
 #[test]
-fn home_that_its_context_does_not_name_is_reported() {
+fn context_that_names_no_home_while_queued_is_reported() {
     let broken = spoiled(|m, at| {
         let context = first_context(m, at);
         live(&mut m.scheds, context).home = None;
     });
     assert_eq!(broken, "41: queue of a context");
-    let broken = spoiled(|m, at| {
-        let context = first_context(m, at);
-        live(&mut m.threads, at.ready).home = None;
-        let _ = context;
-    });
+}
+
+#[test]
+fn home_that_its_context_does_not_name_is_reported() {
+    let broken = spoiled(|m, at| live(&mut m.threads, at.ready).home = None);
     assert_eq!(broken, "44: home of a context");
 }
 
@@ -2580,17 +2578,169 @@ fn a_use_entry_that_counts_leaves_its_node_does_not_hold_is_reported() {
     assert_eq!(broken, "58: leaves of a use entry");
 }
 
-/// 88: the identifier word of an attached device names its node.
+/// 88: an identifier word taken by the node names a device attached (the
+/// direction "held, not attached").
 #[test]
-fn an_attached_device_whose_identifier_word_is_not_its_nodes_is_reported() {
+fn an_identifier_word_taken_with_no_device_attached_is_reported() {
     let broken = spoiled(|m, _| {
-        m.table
-            .identifiers
-            .insert(4, Ownership::free(Owner::Unclaimed).raw());
         let taken = Ownership::taken(Owner::Node(0), m.table.generation(0)).raw();
         m.table.identifiers.insert(7, taken);
     });
     assert_eq!(broken, "88: identifier words and attached devices");
+}
+
+/// 88: the identifier word of an attached device names its node (the
+/// direction "attached, not held"; ver-D D7: the test above was named
+/// after this one and built the other).
+#[test]
+fn an_attached_device_whose_identifier_word_is_not_its_nodes_is_reported() {
+    let broken = spoiled(|m, _| {
+        let (_, iommu) = with_device(m);
+        let segment = u32::from(m.machine.iommus[m.iommus[&iommu].unit].segment);
+        let other = Ownership::taken(Owner::Node(1), 1).raw();
+        m.table.identifiers.insert(segment << 16 | 0x10, other);
+    });
+    assert_eq!(broken, "88: identifier words and attached devices");
+}
+
+/// 88: an attach word sits beside an identifier word taken by some
+/// generation (ver-D D4).
+#[test]
+fn an_attach_word_with_no_identifier_word_is_reported() {
+    let broken = spoiled(|m, _| {
+        let (_, iommu) = with_device(m);
+        let segment = u32::from(m.machine.iommus[m.iommus[&iommu].unit].segment);
+        let key = segment << 16 | 0x10;
+        assert!(m.table.attach.contains_key(&key), "the attach word");
+        m.table.identifiers.remove(&key);
+    });
+    assert_eq!(
+        broken,
+        "88: an attach word with no identifier word or root beside it"
+    );
+}
+
+/// 54: a block names an entry of the device table (ver-D D4).
+#[test]
+fn a_block_of_no_entry_is_reported() {
+    let broken = spoiled(|m, _| {
+        let block = m
+            .untypeds
+            .values_mut()
+            .find(|u| matches!(u.block, Some(Block::Entry(_))))
+            .expect("the device block");
+        block.block = Some(Block::Entry(usize::MAX));
+    });
+    assert_eq!(broken, "54: block of no entry");
+}
+
+/// 35: a mapped frame's page size is one of the machine's (ver2-D 7).
+#[test]
+fn a_mapped_frame_of_a_page_size_the_machine_lacks_is_reported() {
+    let (mut m, t, _) = with_frame();
+    assert_eq!(m.apply(t, map_frame(Rights::READ)), Ok(Output::Done));
+    assert_eq!(m.check(), Ok(()));
+    let object = m.object_at(t, SlotAddr::own(120)).unwrap();
+    live(&mut m.frames, object).page = dodos_abi::PageSize::Large3;
+    assert_eq!(m.check(), Err("35: page size"));
+}
+
+/// 39: the domain number of an iospace lies in this node's range on its
+/// unit, is shared with no other iospace of the unit nor with a number
+/// lost to a destroyed iospace, and the iospace is on a unit (ver2-AD D3).
+fn spoiled_domain(spoil: impl FnOnce(&mut Model, ObjId, usize, u16)) -> &'static str {
+    spoiled(|m, _| {
+        let (iospace, iommu) = with_device(m);
+        let unit = m.iommus[&iommu].unit;
+        let domain = m.domains[&iospace];
+        assert!(m.domain_range(unit, m.node).contains(&domain));
+        spoil(m, iospace, unit, domain);
+    })
+}
+
+#[test]
+fn a_domain_number_outside_the_nodes_range_is_reported() {
+    let broken = spoiled_domain(|m, iospace, unit, _| {
+        let beyond = *m.domain_range(unit, m.node).end() + 1;
+        m.domains.insert(iospace, beyond);
+    });
+    assert_eq!(broken, "39: domain number outside the node's range");
+}
+
+#[test]
+fn a_domain_number_shared_by_two_iospaces_of_a_unit_is_reported() {
+    let broken = spoiled_domain(|m, _, unit, domain| {
+        let other = *m
+            .aspaces
+            .iter()
+            .find(|(id, _)| !m.domains.contains_key(id))
+            .unwrap()
+            .0;
+        live(&mut m.aspaces, other).units.insert(unit);
+        m.domains.insert(other, domain);
+    });
+    assert_eq!(broken, "39: domain number shared");
+}
+
+#[test]
+fn a_domain_number_lost_to_a_destroyed_iospace_and_taken_again_is_reported() {
+    let broken = spoiled_domain(|m, _, unit, domain| {
+        m.lost_domains.insert((unit, domain));
+    });
+    assert_eq!(broken, "39: domain number shared");
+}
+
+#[test]
+fn a_domain_number_of_an_iospace_on_no_unit_is_reported() {
+    let broken = spoiled_domain(|m, iospace, _, _| {
+        live(&mut m.aspaces, iospace).units.clear();
+    });
+    assert_eq!(broken, "39: domain number of an iospace on no unit");
+}
+
+/// 14: a thread waiting for a unit is the waiter of its entry of the unit
+/// request table, and an entry names only a thread that waits for it
+/// (ver2-AD D8; the cancelled wait's waiter).
+fn spoiled_unit_wait(spoil: impl FnOnce(&mut Model, ObjId, usize)) -> &'static str {
+    spoiled(|m, _| {
+        let boot = object(m, START_SLOT_THREAD);
+        let own = SlotAddr::own;
+        let retype = Syscall::UntypedRetype {
+            untyped: own(UNTYPED),
+            kind: ObjectKind::IoSpace,
+            size: 0,
+            page: 0,
+            memory: 0,
+            destination: own(60),
+        };
+        while m.apply(boot, retype.clone()) == Err(Error::Again) {}
+        let attach = Syscall::IoSpaceAttach {
+            iommu: own(18),
+            iospace: own(60),
+            device: 0x10,
+        };
+        assert_eq!(m.apply(boot, attach), Ok(Output::Waits));
+        assert_eq!(m.check(), Ok(()), "the attach waits for its unit");
+        let Wait::Unit(index) = m.threads[&boot].wait else {
+            panic!("the thread waits for its unit");
+        };
+        spoil(m, boot, index);
+    })
+}
+
+#[test]
+fn a_wait_on_no_unit_request_is_reported() {
+    let broken = spoiled_unit_wait(|m, _, index| m.unit_requests[index] = None);
+    assert_eq!(broken, "14: a wait on no unit request");
+}
+
+#[test]
+fn a_unit_request_that_names_a_thread_that_does_not_wait_for_it_is_reported() {
+    let broken = spoiled_unit_wait(|m, boot, _| live(&mut m.threads, boot).wait = Wait::None);
+    assert_eq!(
+        broken,
+        "14: a unit request names a thread that does not wait for it"
+    );
 }
 
 // Pass 17 (the eighth model review, F15): each invariant that no test had
