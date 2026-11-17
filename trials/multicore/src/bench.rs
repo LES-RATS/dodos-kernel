@@ -431,6 +431,7 @@ fn base(o: &Opts) -> Params {
         rx_ns: 0,
         warmup: Duration::from_millis(20),
         dur: o.dur,
+        need: 0,
     }
 }
 

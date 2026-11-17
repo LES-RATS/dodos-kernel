@@ -80,6 +80,11 @@ pub struct Params {
     pub rx_ns: u64,
     pub warmup: Duration,
     pub dur: Duration,
+    /// Latency classes (bit `c` for class `c`) the window waits for: it
+    /// closes after `dur` once each has a measured operation. A host that
+    /// leaves a worker off its core for all of `dur` (fewer cores than
+    /// workers, or Miri) then still measures them. 0: `dur` alone.
+    pub need: u8,
 }
 
 /// The read path of a lookup.
@@ -332,6 +337,8 @@ struct Machine {
     waits: Box<[Padded<AtomicU64>]>,
     bye: Box<[Padded<AtomicBool>]>,
     phase: Padded<AtomicU8>,
+    /// The classes with a measured operation (bit `c` for class `c`).
+    seen: Padded<AtomicU8>,
     done: Padded<AtomicUsize>,
     drained: Padded<AtomicUsize>,
     p: Params,
@@ -507,6 +514,7 @@ impl Machine {
             waits: (0..n).map(pad).collect(),
             bye: (0..n).map(|_| Padded::default()).collect(),
             phase: Padded(AtomicU8::new(WARMUP)),
+            seen: Padded(AtomicU8::new(0)),
             done: Padded::default(),
             drained: Padded::default(),
             p,
@@ -516,6 +524,11 @@ impl Machine {
 
     fn node_of(&self, c: usize) -> usize {
         self.node_of[c].load(Ordering::Relaxed)
+    }
+
+    /// Whether every class in `need` has a measured operation.
+    fn measured(&self, need: u8) -> bool {
+        self.seen.load(Ordering::Relaxed) & need == need
     }
 }
 
@@ -675,6 +688,9 @@ impl<'m> Core<'m> {
         if self.m.phase.load(Ordering::Relaxed) == MEASURE {
             self.out.hist[class].record(ns);
             self.out.ops[class] += 1;
+            if self.out.ops[class] == 1 {
+                self.m.seen.fetch_or(1 << class, Ordering::Relaxed);
+            }
             self.sample_cpu();
         }
     }
@@ -1387,9 +1403,18 @@ pub fn run(
             m_ref.phase.store(MEASURE, Ordering::Relaxed);
             let t = Instant::now();
             rt::sleep(p.dur);
+            let since = Instant::now();
+            while !m_ref.measured(p.need) && since.elapsed() < STUCK {
+                rt::sleep(Duration::from_micros(100));
+            }
             m_ref.phase.store(STOP, Ordering::Relaxed);
             t.elapsed().as_secs_f64()
         },
+    );
+    assert!(
+        m.measured(p.need),
+        "classes {:#b} unmeasured for {STUCK:?}: a bug of the simulation",
+        p.need & !m.seen.load(Ordering::Relaxed)
     );
     check(&m, &outs);
     let mut r = RunOut {
@@ -1466,6 +1491,9 @@ mod tests {
             rx_ns: 300,
             warmup: Duration::from_millis(1),
             dur: Duration::from_millis(5),
+            // Class 0: every workload but the mixed, move and server ones
+            // measures it.
+            need: 1,
         }
     }
 
@@ -1500,8 +1528,12 @@ mod tests {
     /// Every workload ends under every candidate, with both settings of
     /// every switch, and passes the self-checks of `run` (which include
     /// that lazy additions reach every copy); each measures operations.
+    /// The window waits for the classes asserted, so the verdict does not
+    /// depend on the host's speed or number of cores.
     #[test]
+    #[cfg_attr(miri, ignore = "real-time simulation; Miri covers `sync`")]
     fn every_workload_runs_under_every_candidate() {
+        let _host = crate::host::alone();
         let works = [
             Workload::CapOps,
             Workload::Ipc,
@@ -1516,18 +1548,19 @@ mod tests {
                     assert!(r.ops.iter().sum::<u64>() > 0, "{w:?} {cand:?}");
                 }
             }
-            let r = run(
-                Workload::Mixed,
-                Cand::Fixed(2),
-                3,
-                4,
-                make(LockKind::Queue),
-                &[],
-            );
+            let p = Params {
+                need: 1 << 2,
+                ..make(LockKind::Queue)
+            };
+            let r = run(Workload::Mixed, Cand::Fixed(2), 3, 4, p, &[]);
             assert!(r.ops[2] > 0, "independent processes measured");
         }
         let mv = Workload::Move { rate: 2000 };
-        let r = run(mv, Cand::Sized, 2, 4, params(LockKind::Ttas), &[]);
+        let p = Params {
+            need: 1 << 1,
+            ..params(LockKind::Ttas)
+        };
+        let r = run(mv, Cand::Sized, 2, 4, p, &[]);
         assert!(r.ops[1] > 0, "moves measured");
         // The server, every candidate and layout, every policy; the run's
         // self-check also finds the endpoint idle at the end.
@@ -1537,6 +1570,7 @@ mod tests {
                     let p = Params {
                         policy,
                         dur: Duration::from_millis(20),
+                        need: 0b11,
                         ..params(LockKind::Queue)
                     };
                     let w = Workload::Server {
@@ -1558,7 +1592,12 @@ mod tests {
     /// too, unless the kernel lends the caller's context or refuses calls
     /// that cannot finish. The p90 is several times lower with either.
     #[test]
+    #[cfg_attr(miri, ignore = "real-time measurement")]
     fn lending_and_refusal_shorten_the_foreground_wait() {
+        let _host = crate::host::alone();
+        if !crate::host::cores_for(3, "lending_and_refusal") {
+            return;
+        }
         let p90 = |policy| {
             let p = Params {
                 policy,
@@ -1582,10 +1621,16 @@ mod tests {
     /// A lazy derive returns before the other copies have applied it; an
     /// eager one waits for all of them, so it is slower on four nodes.
     #[test]
+    #[cfg_attr(miri, ignore = "real-time measurement")]
     fn lazy_additions_wait_less_than_eager_ones() {
+        let _host = crate::host::alone();
+        if !crate::host::cores_for(4, "lazy_additions") {
+            return;
+        }
         let lazy = Params {
             change_pct: 100,
             ipi_ns: 2000,
+            need: 1 << 3,
             ..params(LockKind::Queue)
         };
         let eager = Params {

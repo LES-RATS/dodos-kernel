@@ -372,6 +372,7 @@ mod tests {
     /// its registration. A lost wake-up leaves a signal unseen.
     #[test]
     fn notify_loses_no_wake_up() {
+        let _host = crate::host::alone();
         let rounds = if cfg!(miri) { 50 } else { 20_000 };
         let n = Notify::new(LockKind::Queue);
         let woken = AtomicBool::new(false);
@@ -437,6 +438,7 @@ mod tests {
 
     #[test]
     fn every_lock_excludes() {
+        let _host = crate::host::alone();
         for kind in [LockKind::Ttas, LockKind::Ticket, LockKind::Queue] {
             assert_eq!(hammer(kind), 800, "{kind:?}");
         }
@@ -444,6 +446,7 @@ mod tests {
 
     #[test]
     fn ring_delivers_in_order_through_a_full_ring() {
+        let _host = crate::host::alone();
         let ring = Ring::default();
         let n = RING_SLOTS * 3;
         thread::scope(|s| {
