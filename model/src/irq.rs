@@ -71,6 +71,14 @@ impl Model {
         if claimed(&|irq| irq.core == position && irq.vector == vector) {
             return Err(Error::Busy);
         }
+        // A vector whose remapping entry's invalidation a unit answered
+        // *failed* stays claimed, with no irq, while the unit is failed
+        // (Interrupts, the irq, D-139).
+        let handle = u64::from(self.cores[position].number) * IRQ_TABLE_ENTRIES as u64
+            + u64::from(vector.saturating_sub(IRQ_VECTOR_FIRST));
+        if self.retired.contains(&(handle as u16)) {
+            return Err(Error::Busy);
+        }
         // A line whose word the rules of taking refuse to this node, or that
         // this node's current generation already holds: claimed on any core
         // and any vector of the machine (Interrupts, the owner word of a
@@ -340,7 +348,7 @@ impl Model {
         use crate::caps::Undone;
         let entry = self.irqs[&irq];
         if !entry.source.is_line() {
-            return Undone::Nothing;
+            return self.msi_removal(irq);
         }
         let gsi = entry.source.id();
         if self.line_asking(gsi) {
@@ -375,6 +383,98 @@ impl Model {
             true => Undone::Wait,
             false => Undone::Unit,
         }
+    }
+
+    /// The remapping handle of an irq: its core's number × 192 + (vector −
+    /// 48) (Interrupts, interrupt remapping).
+    pub(crate) fn handle_of(&self, irq: &Irq) -> u16 {
+        let core = u64::from(self.cores[irq.core].number);
+        (core * IRQ_TABLE_ENTRIES as u64 + u64::from(irq.vector - IRQ_VECTOR_FIRST)) as u16
+    }
+
+    /// The removal of an MSI's irq whose remapping entry the units of its
+    /// segment cache is a request too (Interrupts, the irq, D-137; pass 19
+    /// had left it out of the model): the step unbinds the irq, its gate
+    /// clears the remapping entry, and the invalidation of the interrupt
+    /// entry cache is asked of each unit that serves the source's segment,
+    /// one after another as for a claim; the next step removes the
+    /// capability once the last is answered. Served at once by a unit this
+    /// node holds. A handle whose invalidation a unit answered *failed* is
+    /// retired: not reused while the unit is failed (D-139).
+    fn msi_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
+        use crate::caps::Undone;
+        let entry = self.irqs[&irq];
+        let units = match self.machine.remapping {
+            true => self.segment_roles(entry.source.segment()),
+            false => Vec::new(),
+        };
+        let handle = self.handle_of(&entry);
+        if self.handle_asking(handle) {
+            return Undone::Wait;
+        }
+        let Some(&first) = units.first() else {
+            return Undone::Nothing;
+        };
+        if entry.removing {
+            return Undone::Nothing;
+        }
+        // Every unit of the segment held by this node itself: no holder is
+        // needed, and the removal is one unit of the step.
+        let held = |role: usize| {
+            let word = self.table.roles[role];
+            word.state() == dodos_abi::RoleState::Held && word.holder() == self.node
+        };
+        if units
+            .iter()
+            .all(|&role| held(role) && !self.unit_failed(role))
+        {
+            for &unit in &units {
+                self.table
+                    .units
+                    .entry(unit)
+                    .or_default()
+                    .remap
+                    .remove(&u32::from(handle));
+            }
+            return Undone::Nothing;
+        }
+        if self.unit_requests.iter().all(Option::is_some) {
+            return Undone::Wait;
+        }
+        self.unbind_irq(irq);
+        live(&mut self.irqs, irq).removing = true;
+        for &unit in &units {
+            self.table
+                .units
+                .entry(unit)
+                .or_default()
+                .remap
+                .remove(&u32::from(handle));
+        }
+        let op = crate::rings::UnitOp::InterruptCache { handle };
+        let chain = crate::units::Chain {
+            segment: Some(entry.source.segment()),
+            then: None,
+        };
+        let waiter = crate::units::Waiter::Thread(None);
+        if self
+            .unit_request_with(first, op, waiter, None, None, chain)
+            .is_err()
+        {
+            return Undone::Wait;
+        }
+        match self.handle_asking(handle) {
+            true => Undone::Wait,
+            false => Undone::Unit,
+        }
+    }
+
+    /// Whether an entry of the unit request table still asks the
+    /// invalidation of the interrupt entry cache for a handle.
+    fn handle_asking(&self, handle: u16) -> bool {
+        self.unit_requests.iter().flatten().any(
+            |e| matches!(e.op, crate::rings::UnitOp::InterruptCache { handle: h } if h == handle),
+        )
     }
 
     /// Whether an entry of the unit request table still asks something of

@@ -1622,7 +1622,17 @@ fn with_device(m: &mut Model) -> (ObjId, ObjId) {
         device: 0x10,
     };
     m.apply(boot, attach).unwrap();
-    (object(m, 60), object(m, 18))
+    // The device enters the header at the answer done of its attach, which
+    // the node, the holder of the unit's role, serves at a step (D-139).
+    let iospace = object(m, 60);
+    for _ in 0..4 {
+        if !m.iospaces[&iospace].is_empty() {
+            break;
+        }
+        m.unit_step();
+    }
+    assert!(!m.iospaces[&iospace].is_empty(), "the attach is answered");
+    (iospace, object(m, 18))
 }
 
 #[test]
@@ -2199,24 +2209,8 @@ fn clean_mark_over_memory_that_was_not_cleared_is_reported() {
 #[test]
 fn device_of_a_unit_missing_from_its_list_is_reported() {
     let broken = spoiled(|m, at| {
-        let thread = object(m, START_SLOT_THREAD);
         let _ = at;
-        let space = Syscall::UntypedRetype {
-            untyped: SlotAddr::own(UNTYPED),
-            kind: ObjectKind::IoSpace,
-            size: 0,
-            page: 0,
-            memory: 0,
-            destination: SlotAddr::own(300),
-        };
-        while m.apply(thread, space.clone()) == Err(Error::Again) {}
-        let attach = Syscall::IoSpaceAttach {
-            iommu: SlotAddr::own(18),
-            iospace: SlotAddr::own(300),
-            device: 0x10,
-        };
-        m.apply(thread, attach).unwrap();
-        let unit = object(m, 18);
+        let (_, unit) = with_device(m);
         live(&mut m.iommus, unit).order.clear();
     });
     assert_eq!(broken, "39: list of the devices of a unit");

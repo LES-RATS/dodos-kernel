@@ -377,14 +377,9 @@ impl Model {
                     continue;
                 }
                 let submitted = self.submit(entry.role, entry.op);
+                let at = self.membership_now();
                 let e = self.unit_requests[index].as_mut().expect("queued");
-                (e.epoch, e.stage) = (
-                    epoch,
-                    Stage::Local {
-                        submitted,
-                        at: self.now,
-                    },
-                );
+                (e.epoch, e.stage) = (epoch, Stage::Local { submitted, at });
                 // An operation the unit does not confirm is done at once.
                 if matches!(entry.op, UnitOp::Redirection { .. }) {
                     self.unit_complete(index, UnitResult::Done);
@@ -446,8 +441,14 @@ impl Model {
             }
             UnitOp::Redirection { gsi, claimed, .. } => {
                 match claimed {
-                    true => unit.lines.insert(gsi, requester),
-                    false => unit.lines.remove(&gsi),
+                    true => {
+                        unit.masked.remove(&gsi);
+                        unit.lines.insert(gsi, requester)
+                    }
+                    false => {
+                        unit.masked.remove(&gsi);
+                        unit.lines.remove(&gsi)
+                    }
                 };
             }
             UnitOp::Invalidate { .. } | UnitOp::InterruptCache { .. } => {}
@@ -517,7 +518,7 @@ impl Model {
                 if matches!(op, UnitOp::Redirection { .. }) {
                     return answer(self, UnitResult::Done);
                 }
-                Some((serial, self.now))
+                Some((serial, self.membership_now()))
             }
         };
         self.unit_service.insert(
@@ -577,9 +578,32 @@ impl Model {
             true => UnitResult::Failed,
             false => result,
         };
-        if let (UnitOp::Detach { device, .. }, UnitResult::Done) = (entry.op, result) {
-            self.detach_done(entry.role, device);
+        // The removal of an irq whose invalidation of the interrupt entry
+        // cache a unit answered *failed*: its handle and vector are not
+        // reused while the unit is failed (D-139).
+        if let UnitOp::InterruptCache { handle } = entry.op
+            && result == UnitResult::Failed
+            && self
+                .irqs
+                .values()
+                .any(|irq| irq.removing && self.handle_of(irq) == handle)
+        {
+            self.retired.insert(handle);
         }
+        // The attach word against every event (D-139): an attach or a
+        // detach is judged by the word at its answer; one that did not
+        // attach or detach ends its call with `busy`.
+        let result = match entry.op {
+            UnitOp::Attach { device, root, .. }
+                if !self.attach_answered(entry.role, device, root, result) =>
+            {
+                UnitResult::Failed
+            }
+            UnitOp::Detach { device, .. } if !self.detach_answered(entry.role, device, result) => {
+                UnitResult::Failed
+            }
+            _ => result,
+        };
         let record = match entry.waiter {
             Waiter::Record(cap) => Some(cap),
             Waiter::Thread(_) => entry.record,
@@ -635,7 +659,7 @@ impl Model {
                 self.detach_confirmed(entry.role, entry.op);
                 self.unit_complete(index, UnitResult::Done);
                 any = true;
-            } else if at + IOMMU_WAIT_NS <= self.now {
+            } else if at + IOMMU_WAIT_NS <= self.membership_now() {
                 self.fail_unit(entry.role);
                 any = true;
             }
@@ -650,7 +674,7 @@ impl Model {
             let result = if self.confirmed(entry.role, serial) {
                 self.detach_confirmed(entry.role, entry.op);
                 UnitResult::Done
-            } else if at + IOMMU_WAIT_NS <= self.now {
+            } else if at + IOMMU_WAIT_NS <= self.membership_now() {
                 self.fail_unit(entry.role);
                 continue;
             } else {

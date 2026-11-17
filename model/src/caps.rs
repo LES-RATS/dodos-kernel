@@ -990,7 +990,25 @@ impl Model {
             // confirmed; a unit that failed keeps the counts.
             ObjectKind::Irq => return self.irq_removal(object),
             ObjectKind::IoSpace => {
-                let device = self.iospaces[&object].last().copied();
+                // While an attach to the iospace is in flight, the step
+                // waits; the device its answer brings into the header is
+                // detached by a later step (D-139).
+                let root = self.aspaces[&object].root.unwrap_or(0);
+                if self.attaching(root).next().is_some() {
+                    return Undone::Wait;
+                }
+                // The most recently attached device whose detach is not
+                // yet in flight; a device already *detaching* is not asked
+                // again (one request at a time per device, D-139).
+                let header = &self.iospaces[&object];
+                let device = header
+                    .iter()
+                    .rev()
+                    .find(|(iommu, device)| !self.iommus[iommu].detaching.contains(device))
+                    .copied();
+                if device.is_none() && !header.is_empty() {
+                    return Undone::Wait;
+                }
                 match (device, self.aspaces[&object].records.last().copied()) {
                     (Some((iommu, device)), _) => {
                         if self.detach(iommu, device).is_err() {

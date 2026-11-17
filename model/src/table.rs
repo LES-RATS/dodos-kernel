@@ -151,6 +151,9 @@ pub(crate) struct UnitState {
     pub(crate) mapped: BTreeSet<u16>,
     /// An IOAPIC: the redirection entry of each line claimed, by GSI.
     pub(crate) lines: BTreeMap<u32, (u16, u32)>,
+    /// The lines whose entry a rebuild wrote masked, from the mask state
+    /// of their report (D-139).
+    pub(crate) masked: BTreeSet<u32>,
     /// A test's input: the unit never confirms again.
     pub(crate) broken: bool,
     /// The serial of the next submission.

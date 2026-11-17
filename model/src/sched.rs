@@ -296,9 +296,14 @@ impl Model {
         self.cores[at].events.0 += 1;
         let number = self.cores[at].number as usize;
         let (node, generation) = (self.node, self.table.generation(self.node));
+        // `idle_until` is written on the clock it is compared on: the
+        // monotonic instant of the next timer less the stopped time when
+        // the core goes idle (Two builds, and the debugger stub, D-139).
         let idle_until = match self.cores[at].running {
             Some(_) => 0,
-            None => self.hardware(at).unwrap_or(u64::MAX),
+            None => self
+                .hardware(at)
+                .map_or(u64::MAX, |t| t.saturating_sub(self.table.stopped_time)),
         };
         let beacon = &mut self.table.core_beacons[number];
         beacon.heartbeat.0 = self.cores[at].events.0;
@@ -614,7 +619,7 @@ impl Model {
         let answer = part
             .request
             .as_ref()
-            .map(|r| r.started + self.table.core_answer_ns);
+            .map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time);
         let beat = part
             .thread
             .map(|_| part.previous + self.table.stale_ns / 2)
@@ -643,7 +648,7 @@ impl Model {
         let late = self.cores[at]
             .request
             .as_ref()
-            .is_some_and(|r| r.started + self.table.core_answer_ns <= now);
+            .is_some_and(|r| r.started + self.table.core_answer_ns <= self.membership_now());
         if late {
             self.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
         }

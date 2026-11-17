@@ -62,8 +62,14 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   nodes, the replacement slot), `pass20.rs` (what D-138 left: the
   watermark's barrier, on ARM64 too and before a give or the destruction
   of a block, marks written under the node lock, the lock-free signal, the
-  bound of a request and its start-up check, and a fault of the model
-  older than the pass, a block of a run destroyed on two cores),
+  bound of a request and its start-up check, a fault of the model older
+  than the pass, a block of a run destroyed on two cores; then D-139, the
+  twelfth contract review: the attach word against every event, with a
+  device in the header only after its attach's done and a *detaching*
+  mark, the bound of the tables a change unhooks, a line's mask in its
+  `Report`, an MSI's removal as a request and the handle a failed unit
+  did not confirm retired, `idle_until`, the fence record and the waits on
+  the clock less the stopped time),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -120,4 +126,9 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
 - The debugger stub of a development image: only its release word and its
   stopped time, as `System::stub_stop` (a test's input) raises and lowers
   them; the clock of membership leaves the stop out for the observations,
-  the seal and the evidence, not yet for the fence record and the waits.
+  the seal, the evidence, the fence record, the waits (a request's start,
+  a unit's submission, a start, a hand-over) and `idle_until`.
+- The invalidation of the interrupt entry cache after the masking of a
+  line with interrupt remapping, at the removal of its `irq`: the model
+  masks the line; the requests for its remapping entry are modelled for
+  an MSI only.

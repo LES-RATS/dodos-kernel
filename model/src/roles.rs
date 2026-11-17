@@ -142,7 +142,7 @@ impl Model {
                     role,
                     Handover {
                         target,
-                        started: self.now,
+                        started: self.membership_now(),
                         caller: Some(thread),
                     },
                 );
@@ -200,7 +200,7 @@ impl Model {
                     role,
                     Handover {
                         target: successor as u16,
-                        started: self.now,
+                        started: self.membership_now(),
                         caller: None,
                     },
                 );
@@ -280,7 +280,7 @@ impl Model {
             self.confirmed(role, serial)
         };
         if !drained {
-            if self.now >= hand.started + IOMMU_WAIT_NS {
+            if self.membership_now() >= hand.started + IOMMU_WAIT_NS {
                 self.fail_unit(role);
                 finish(self, Err(Error::Busy));
                 return true;
@@ -368,7 +368,7 @@ impl Model {
         let Some(at) = self.take_over_due(role) else {
             return false;
         };
-        if self.now < at {
+        if self.membership_now() < at {
             return false;
         }
         // Take-over: held (S, e + 1), the unit mapped, then rebuilt from the
@@ -525,8 +525,9 @@ impl Model {
                     }
                 }
                 // A line's entry rewritten from the operands of its
-                // operation 5 claimed, checked as at that request (D-137).
-                Item::Line(gsi, level, low, target) => {
+                // operation 5 claimed, checked as at that request (D-137),
+                // masked unless its report says it is unmasked (D-139).
+                Item::Line(gsi, level, low, target, unmasked) => {
                     let op = crate::rings::UnitOp::Redirection {
                         gsi,
                         claimed: true,
@@ -537,36 +538,31 @@ impl Model {
                     if self.operands_allowed(role, op, (z, g)) {
                         let unit = self.table.units.entry(role).or_default();
                         unit.lines.insert(gsi, (z, g));
+                        match unmasked {
+                            true => unit.masked.remove(&gsi),
+                            false => unit.masked.insert(gsi),
+                        };
                     }
                 }
                 Item::Handle(_) => {}
             }
         }
         let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
-        rebuild.closing = Some((serial, self.now));
+        rebuild.closing = Some((serial, self.membership_now()));
         self.rebuilds.insert(role, rebuild);
         true
     }
 
     /// A rebuild's check of a reported device: its attach word reads
-    /// *attached* with the root, or *pinned* with it, which the new holder's
-    /// gate moves to *attached* (D-137).
+    /// *attached* with the root (D-137). A device whose attach is in flight
+    /// is in no header and no report; its kept attach is served once the
+    /// rebuild ends (the attach word against every event, D-139).
     fn rebuilt_attach(&mut self, role: usize, device: u16, root: u64) -> bool {
         let Some(key) = self.attach_key(role, device) else {
             return false;
         };
         let word = self.table.attach_word(key);
-        if word.root() != root {
-            return false;
-        }
-        match word.state() {
-            Some(dodos_abi::AttachState::Attached) => true,
-            Some(dodos_abi::AttachState::Pinned) => {
-                let attached = dodos_abi::AttachWord::new(dodos_abi::AttachState::Attached, root);
-                self.table.swap_attach(key, word, attached.expect("a root"))
-            }
-            _ => false,
-        }
+        word.root() == root && word.state() == Some(dodos_abi::AttachState::Attached)
     }
 
     /// The requests kept during a rebuild are served, first.
@@ -580,8 +576,9 @@ impl Model {
         for ((peer, credit), served) in kept {
             let requester = (peer, self.table.generation(peer));
             let serial = self.submit_for(role, served.op, requester);
+            let at = self.membership_now();
             if let Some(entry) = self.unit_service.get_mut(&(peer, credit)) {
-                entry.submitted = Some((serial, self.now));
+                entry.submitted = Some((serial, at));
             }
         }
         self.unit_send_queued();
@@ -612,11 +609,17 @@ impl Model {
                 })
                 .map(|irq| {
                     let target = self.line_target(irq.core, irq.vector);
+                    // The mask state: a level line is unmasked only while
+                    // its irq is armed, an edge line while it is not dying
+                    // (Interrupts; D-139).
+                    let unmasked = !irq.removing
+                        && (!irq.source.level() || irq.state == crate::IrqState::Armed);
                     Item::Line(
                         irq.source.id(),
                         irq.source.level(),
                         irq.source.active_low(),
                         target,
+                        unmasked,
                     )
                 })
                 .collect(),

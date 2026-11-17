@@ -689,6 +689,10 @@ struct Iommu {
     /// The same devices, most recently attached last: the list that the
     /// device entries of the iospaces' headers link.
     order: Vec<u16>,
+    /// The devices whose entry in their iospace's header is marked
+    /// *detaching*: a detach of it is in flight (IOMMU, the attach word
+    /// against every event, D-139).
+    detaching: BTreeSet<u16>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1074,6 +1078,10 @@ pub struct Model {
     /// The kernel epoch: one word of the node block, raised at the last
     /// destruction of an untyped's object (D-135, D-138).
     pub(crate) kernel_epoch: u64,
+    /// The remapping handles retired by the removal of an irq whose
+    /// invalidation a failed unit did not confirm: their vectors stay
+    /// claimed, with no irq (Interrupts, the irq, D-139).
+    pub(crate) retired: BTreeSet<u16>,
     /// The barrier epoch: the largest kernel epoch a complete barrier
     /// covers; a watermark ready at an epoch it covers returns (A node of
     /// several cores, D-138).

@@ -342,7 +342,7 @@ impl Model {
             flush,
             asked,
             acked: 0,
-            started: self.now,
+            started: self.membership_now(),
             completes,
             waiter,
         };
@@ -417,7 +417,7 @@ impl Model {
             flush: Flush::Nothing,
             asked,
             acked: 0,
-            started: self.now,
+            started: self.membership_now(),
             completes: Completes::Barrier(self.kernel_epoch),
             waiter: None,
         });
@@ -663,7 +663,8 @@ impl Model {
         if self.width() == 1 || !self.ready {
             return;
         }
-        let (now, stale, at) = (self.now, self.table.stale_ns, *self.at);
+        // Both sides of each comparison on the clock of membership (D-139).
+        let (now, stale, at) = (self.membership_now(), self.table.stale_ns, *self.at);
         let mut silent = false;
         for position in (0..self.width()).filter(|&p| p != at) {
             let number = self.cores[position].number as usize;

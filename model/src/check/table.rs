@@ -463,6 +463,19 @@ impl Model {
             {
                 tables.insert(at / page, None);
             }
+            // The tables a change unhooks are listed in its request, at most
+            // 2 × (L − 1); none is chained through its own first word, which
+            // a walker with a stale parent entry may still read (Address
+            // spaces and their tables, D-139).
+            let most = 2 * (self.levels(id) as usize).saturating_sub(1);
+            let listed = space
+                .unhooked
+                .iter()
+                .all(|(by, _)| space.unhooked.iter().filter(|(b, _)| b == by).count() <= most);
+            ensure(
+                listed,
+                "59: more tables unhooked by one change than its request lists",
+            )?;
             let taken = space.hooked.len() + space.free.len() + space.unhooked.len();
             let followed = space.root.is_none() || space.tables == taken as u64;
             ensure(followed, "59: tables of a space")?;

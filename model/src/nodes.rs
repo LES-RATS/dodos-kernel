@@ -246,7 +246,7 @@ impl Model {
                     generation: next,
                     request,
                     last: 0,
-                    since: self.now,
+                    since: self.membership_now(),
                 },
             );
         }
@@ -888,7 +888,9 @@ impl Model {
             self.fences.remove(&node);
             return false;
         }
-        let now = self.now;
+        // The instants of a fence record are read from the clock of
+        // membership (Two builds, and the debugger stub, D-137).
+        let now = self.membership_now();
         let cores = self.table.cores_of(node, g);
         let unconfirmed: Vec<usize> = cores
             .iter()
@@ -1415,7 +1417,7 @@ impl Model {
                         true => record.last_stop(core),
                         false => 0,
                     };
-                    if !self.park_confirmed(core) || self.now < last + SETTLE_NS {
+                    if !self.park_confirmed(core) || self.membership_now() < last + SETTLE_NS {
                         self.reclaims.entry(node).or_default().clear = Some(cursor);
                         *units += 1;
                         return before;
@@ -1690,7 +1692,7 @@ impl Model {
     /// stub confirms it (the stub's `started` in its core beacon equals the
     /// request), for at most `START_NS`.
     fn start_step(&mut self) -> bool {
-        let now = self.now;
+        let now = self.membership_now();
         let mut any = false;
         let cores: Vec<usize> = self.starts.keys().copied().collect();
         for core in cores {
@@ -1719,13 +1721,13 @@ impl Model {
         let current =
             member.state() == MemberState::Starting && member.generation() == start.generation;
         let confirmed = self.table.core_beacons[core].started == start.request;
-        !current || confirmed || self.now >= start.since + START_NS
+        !current || confirmed || self.membership_now() >= start.since + START_NS
     }
 
     /// Whether a start has work now: its end, its first wake, or the due
     /// event of its first core every `START_RETRY_NS` (D-135).
     fn start_due(&self, core: usize, start: &crate::nodes::Starting) -> bool {
-        let retry = start.last == 0 || self.now >= start.last + START_RETRY_NS;
+        let retry = start.last == 0 || self.membership_now() >= start.last + START_RETRY_NS;
         retry || self.start_over(core, start)
     }
 
@@ -1752,37 +1754,43 @@ impl Model {
         if self.others_exist() {
             instants.push(self.next_sweep);
         }
+        // The instants of membership and of the waits are on the clock
+        // less the stopped time; their due events on the monotonic clock
+        // are those instants plus the stopped time (D-137).
+        let mut membership: Vec<u64> = Vec::new();
         for fence in self.fences.values() {
-            instants.push(fence.last + FENCE_RETRY_NS);
+            membership.push(fence.last + FENCE_RETRY_NS);
         }
         for start in self.starts.values() {
-            instants.push(start.last + START_RETRY_NS);
-            instants.push(start.since + START_NS);
+            membership.push(start.last + START_RETRY_NS);
+            membership.push(start.since + START_NS);
         }
-        instants.extend(self.unit_deadline());
+        membership.extend(self.unit_deadline());
         let me = self.node as usize;
         for o in &self.table.beacons[me].observations {
-            instants.push(o.at + self.table.stale_ns.min(self.table.stuck_ns));
+            membership.push(o.at + self.table.stale_ns.min(self.table.stuck_ns));
         }
         for node in 0..self.table.nodes {
             let record = &self.table.fences[node as usize];
             if let Some(confirmed) = record.confirmed {
-                instants.push(confirmed + SETTLE_NS);
+                membership.push(confirmed + SETTLE_NS);
             }
             if let Some(started) = record.started {
-                instants.push(started + FENCE_NS + SETTLE_NS);
-                instants.push(started + FENCE_NS);
+                membership.push(started + FENCE_NS + SETTLE_NS);
+                membership.push(started + FENCE_NS);
             }
             for &last in record.last_stop.values() {
-                instants.push(last + SETTLE_NS);
+                membership.push(last + SETTLE_NS);
             }
             if let Some(sealed) = self.table.beacons[node as usize].sealed_at {
-                instants.push(sealed + self.table.seal_ns);
+                membership.push(sealed + self.table.seal_ns);
             }
         }
         for hand in self.handing.values() {
-            instants.push(hand.started + dodos_abi::IOMMU_WAIT_NS);
+            membership.push(hand.started + dodos_abi::IOMMU_WAIT_NS);
         }
+        let stopped = self.table.stopped_time;
+        instants.extend(membership.into_iter().map(|at| at.saturating_add(stopped)));
         // The reserve is a context of period 10 ms: its next step comes at
         // the latest one period after its last one, an instant that does
         // not move with the clock.

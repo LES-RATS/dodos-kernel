@@ -2228,7 +2228,11 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         if name == 2 || name == 3 {
             let after = model.census();
             reached.unmapped_by_removal += (after.mappings < before.mappings) as u32;
-            reached.detached_by_removal += (after.devices < before.devices) as u32;
+            // A removal detaches a device by a unit request: the device
+            // leaves the header at the answer, so a step that starts a
+            // detach counts as well as one that consumes its answer (D-139).
+            let detached = after.devices < before.devices || after.detaching > before.detaching;
+            reached.detached_by_removal += detached as u32;
         }
         if (name == 2 || name == 3) && outcome == Err(Error::Again) {
             reached.again += 1;
@@ -2615,7 +2619,11 @@ fn interrupts_and_marks_are_reached() {
 fn mappings_and_devices_are_reached_and_undone_by_removals() {
     let reached = all_seeds();
     // Measured: a mapping held after 121,858 steps, a device attached after
-    // 32,317; 463 removals undid a mapping and 70 detached a device.
+    // 32,317; 463 removals undid a mapping and 70 detached a device. Pass 20
+    // (D-139): a device leaves the header at its detach's answer, so the
+    // last count is of removals that start a detach or consume its answer,
+    // measured again at 68 (4 and 16 KB) and 103 (32 KB); three quarters of
+    // 68 is 51, and the floor stays 53, which holds.
     let counts = [
         reached.mapped,
         reached.attached,

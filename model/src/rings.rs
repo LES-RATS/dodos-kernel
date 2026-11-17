@@ -62,12 +62,14 @@ pub enum Target {
 /// unit (its identifier and the root its words name), a remapping handle
 /// it claimed, or a line with the operands of its operation 5 claimed (its
 /// trigger, its polarity and its target: D-137, the new holder rewrites
-/// the line's entry from them).
+/// the line's entry from them) and its mask state, bit 32 of the first
+/// word: unmasked only while a level line's irq is armed, or an edge
+/// line's irq is not dying (D-139).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Item {
     Device(u16, u64),
     Handle(u32),
-    Line(u32, bool, bool, Target),
+    Line(u32, bool, bool, Target, bool),
 }
 
 impl Item {

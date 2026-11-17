@@ -776,6 +776,9 @@ fn dying_iospace_is_gone_for_map_and_attach_and_its_devices_detach() {
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     k.no(iomap(30, 40, 0, 1, R), Error::Gone);
     k.no(attach(30, 0x11), Error::Gone);
+    // Its detach is in flight: one request at a time per device (D-139).
+    k.no(attach(0, 0x10), Error::Busy);
+    k.m.settle();
     k.ok(attach(0, 0x10));
 }
 
@@ -795,9 +798,11 @@ fn removing_the_iommu_root_destroys_nothing_and_keeps_the_devices() {
     assert_eq!(k.m.census().devices, 40);
     // Destroying an iospace still detaches its devices: its root goes once
     // their detaches are answered (D-137).
+    // A device leaves the header at its detach's answer (D-139).
     k.no(Syscall::CapDelete(s(32)), Error::Again);
-    assert_eq!(k.m.census().devices, 32);
+    assert_eq!(k.m.census().devices, 40);
     k.m.settle();
+    assert_eq!(k.m.census().devices, 32);
     k.ok(Syscall::CapDelete(s(32)));
 }
 

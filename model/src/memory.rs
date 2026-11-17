@@ -785,28 +785,41 @@ impl Model {
         let unit = &self.iommus[&iommu];
         let attached = unit.attached.get(&device).copied();
         let Some(iospace) = iospace else {
-            // With iospace 0: detached if attached, otherwise no effect. The
-            // context entry is cleared by the holder of the unit's role. A
-            // device attached by another live node is `denied`.
+            // With iospace 0, the state in this order (D-139): the unit has
+            // failed (`busy`); an attach of this node in flight, the attach
+            // word *pinned* (`busy`); a device of another node (`denied`); a
+            // device in no header of this node (no effect); a detach in
+            // flight, its entry *detaching* (`busy`). The device leaves the
+            // header at the answer, done or *failed* (the attach word against
+            // every event).
             let key = self.identifier_key(unit.unit, device);
-            if attached.is_none() && !self.holds_identifier(key) {
-                return Err(Error::Denied);
+            let role = self.unit_role(unit.unit);
+            if self.unit_failed(role) {
+                return Err(Error::Busy);
             }
-            if attached.is_some() {
-                let role = self.unit_role(self.iommus[&iommu].unit);
-                if self.unit_failed(role) {
-                    return Err(Error::Busy);
-                }
-                if self.unit_requests.iter().all(Option::is_some) {
-                    return Err(Error::Again);
-                }
-                let domain = self.detach_local(iommu, device);
-                let op = crate::rings::UnitOp::Detach { device, domain };
-                let waiter = crate::units::Waiter::Thread(Some(thread));
-                self.unit_request(role, op, waiter, None)?;
-                return Ok(Output::Waits);
+            let pinned =
+                self.table.attach_word(key).state() == Some(dodos_abi::AttachState::Pinned);
+            if pinned && self.holds_identifier(key) {
+                return Err(Error::Busy);
             }
-            return Ok(Output::Done);
+            let Some(from) = attached else {
+                return match self.holds_identifier(key) {
+                    true => Ok(Output::Done),
+                    false => Err(Error::Denied),
+                };
+            };
+            if unit.detaching.contains(&device) {
+                return Err(Error::Busy);
+            }
+            if self.unit_requests.iter().all(Option::is_some) {
+                return Err(Error::Again);
+            }
+            let domain = self.domains.get(&from).copied().unwrap_or(0);
+            live(&mut self.iommus, iommu).detaching.insert(device);
+            let op = crate::rings::UnitOp::Detach { device, domain };
+            let waiter = crate::units::Waiter::Thread(Some(thread));
+            self.unit_request(role, op, waiter, None)?;
+            return Ok(Output::Waits);
         };
         // The state, in this order, "the unit has failed (`busy`" first
         // (IOMMU, rules of `iospace_attach`, gap 11).
@@ -823,16 +836,25 @@ impl Model {
         if !self.holds_identifier(key) {
             return Err(Error::Denied);
         }
-        match attached {
-            Some(other) if other != iospace => return Err(Error::Busy),
-            Some(_) => return Ok(Output::Done),
-            None => {}
+        // Already attached to this iospace with no request in flight:
+        // success; otherwise an attach word not 0 is `busy` (an attach or a
+        // detach in flight, or another iospace: D-139).
+        let root = self.aspaces[&iospace].root.unwrap_or(0);
+        let word = self.table.attach_word(key);
+        let here = word.state() == Some(dodos_abi::AttachState::Attached) && word.root() == root;
+        if attached == Some(iospace) && here && !unit.detaching.contains(&device) {
+            return Ok(Output::Done);
         }
-        let served = &self.iospaces[&iospace];
-        if served.first().is_some_and(|&(other, _)| other != iommu) {
+        if attached.is_some() || word != dodos_abi::AttachWord::NONE {
             return Err(Error::Busy);
         }
-        if served.len() >= IOSPACE_MAX_DEVICES {
+        let served = &self.iospaces[&iospace];
+        let other_unit = served.first().is_some_and(|&(other, _)| other != iommu)
+            || self.attaching(root).any(|(r, _)| r != role);
+        if other_unit {
+            return Err(Error::Busy);
+        }
+        if usize::from(self.table.attached_to(root)) >= IOSPACE_MAX_DEVICES {
             return Err(Error::Busy);
         }
         // A domain number for the iospace on that unit, taken from this
@@ -842,12 +864,6 @@ impl Model {
             Some(&domain) => domain,
             None => self.free_domain(unit.unit).ok_or(Error::Busy)?,
         };
-        // A device whose attach word is not 0 is still being detached: its
-        // owner's gate pins a root only from 0 (IOMMU, the attach word,
-        // D-137).
-        if self.table.attach_word(key) != dodos_abi::AttachWord::NONE {
-            return Err(Error::Busy);
-        }
         // A call that finds no free entry of the unit request table returns
         // `again` with nothing changed.
         if self.unit_requests.iter().all(Option::is_some) {
@@ -861,22 +877,17 @@ impl Model {
         // pinned with the iospace's root, the root's count of devices
         // raised (D-137).
         self.table.write_identifier(self.node, key, Some(taken));
-        let root = self.aspaces[&iospace].root.unwrap_or(0);
         let pinned = dodos_abi::AttachWord::new(dodos_abi::AttachState::Pinned, root);
         let pinned = pinned.expect("a root aligned on a page");
         self.table
             .swap_attach(key, dodos_abi::AttachWord::NONE, pinned);
         self.set_root_class(root);
         self.domains.insert(iospace, domain);
-        live(&mut self.iospaces, iospace).push((iommu, device));
-        let unit = live(&mut self.iommus, iommu);
-        unit.attached.insert(device, iospace);
-        unit.order.push(device);
-        let unit = unit.unit;
+        let unit = self.iommus[&iommu].unit;
         live(&mut self.aspaces, iospace).units.insert(unit);
         // The context entry, written by the holder of the unit's role: a
-        // unit request, which the thread waits for.
-        let role = self.unit_role(unit);
+        // unit request, which the thread waits for. The device enters the
+        // iospace's header only at its answer done (D-139).
         let op = crate::rings::UnitOp::Attach {
             device,
             domain,
@@ -892,18 +903,102 @@ impl Model {
     /// changed when no entry of the unit request table is free.
     pub(crate) fn detach(&mut self, iommu: ObjId, device: u16) -> Result<(), Error> {
         let role = self.unit_role(self.iommus[&iommu].unit);
-        if !self.unit_failed(role) && self.unit_requests.iter().all(Option::is_some) {
+        // One request at a time per device: a detach in flight is waited
+        // for, not sent again (D-139).
+        if self.iommus[&iommu].detaching.contains(&device) {
             return Err(Error::Again);
         }
-        // The identifier word and the attach word change only at the answer
-        // (D-137); on a failed unit they stay as they are.
-        let failed = self.unit_failed(role);
-        let domain = self.detach_local(iommu, device);
-        if !failed {
-            let op = crate::rings::UnitOp::Detach { device, domain };
-            self.unit_request(role, op, crate::units::Waiter::Thread(None), None)?;
+        // On a failed unit the answer would be *failed*: the device leaves
+        // the header, its attach word and identifier word as they are.
+        if self.unit_failed(role) {
+            self.detach_local(iommu, device);
+            return Ok(());
         }
+        if self.unit_requests.iter().all(Option::is_some) {
+            return Err(Error::Again);
+        }
+        let iospace = self.iommus[&iommu].attached[&device];
+        let domain = self.domains.get(&iospace).copied().unwrap_or(0);
+        live(&mut self.iommus, iommu).detaching.insert(device);
+        let op = crate::rings::UnitOp::Detach { device, domain };
+        self.unit_request(role, op, crate::units::Waiter::Thread(None), None)?;
         Ok(())
+    }
+
+    /// The attaches in flight to the iospace whose root is `root`: the role
+    /// and device of each entry of the unit request table that asks one.
+    pub(crate) fn attaching(&self, root: u64) -> impl Iterator<Item = (usize, u16)> + '_ {
+        self.unit_requests
+            .iter()
+            .flatten()
+            .filter_map(move |e| match e.op {
+                crate::rings::UnitOp::Attach {
+                    device, root: r, ..
+                } if r == root => Some((e.role, device)),
+                _ => None,
+            })
+    }
+
+    /// The iommu object of the unit a role governs.
+    fn iommu_of(&self, role: usize) -> Option<ObjId> {
+        let record = self.table.role_records[role];
+        (record.governs == dodos_abi::Governs::IommuUnit).then_some(())?;
+        let unit = usize::from(record.object);
+        self.iommus
+            .iter()
+            .find(|(_, u)| u.unit == unit)
+            .map(|(&id, _)| id)
+    }
+
+    /// At the answer of an attach (the attach word against every event,
+    /// D-139): done with the word *attached* with its root, the device
+    /// enters its iospace's header; otherwise (done on *pinned*, the holder
+    /// having refused it, or *failed*) *pinned* goes back to 0 with the
+    /// root's count and the identifier word, and *attached* stays. Returns
+    /// whether the device entered the header.
+    pub(crate) fn attach_answered(
+        &mut self,
+        role: usize,
+        device: u16,
+        root: u64,
+        result: dodos_abi::UnitResult,
+    ) -> bool {
+        let (Some(key), Some(iommu)) = (self.attach_key(role, device), self.iommu_of(role)) else {
+            return false;
+        };
+        let iospace = self
+            .iospaces
+            .keys()
+            .copied()
+            .find(|id| self.aspaces[id].root == Some(root));
+        let word = self.table.attach_word(key);
+        let attached =
+            word.state() == Some(dodos_abi::AttachState::Attached) && word.root() == root;
+        if result == dodos_abi::UnitResult::Done && attached {
+            if let Some(iospace) = iospace {
+                live(&mut self.iospaces, iospace).push((iommu, device));
+                let unit = live(&mut self.iommus, iommu);
+                unit.attached.insert(device, iospace);
+                unit.order.push(device);
+            }
+            return true;
+        }
+        let pinned = word.state() == Some(dodos_abi::AttachState::Pinned) && word.root() == root;
+        if pinned
+            && self
+                .table
+                .swap_attach(key, word, dodos_abi::AttachWord::NONE)
+        {
+            self.table.write_identifier(self.node, key, None);
+            self.set_root_class(root);
+            if let Some(iospace) = iospace
+                && self.iospaces[&iospace].is_empty()
+                && self.attaching(root).next().is_none()
+            {
+                self.domains.remove(&iospace);
+            }
+        }
+        false
     }
 
     /// The class of an iospace's root: 48 + the devices whose attach word
@@ -915,27 +1010,45 @@ impl Model {
             .set_class(root / self.machine.geometry.page(), Some(class));
     }
 
-    /// At the answer done of a detach: the owner's gate writes the attach
-    /// word 0 from *pinned* or *detached*, never from *attached*, lowers the
-    /// root's count and writes the identifier word *free*, unclaimed
-    /// (D-137).
-    pub(crate) fn detach_done(&mut self, role: usize, device: u16) {
-        let Some(key) = self.attach_key(role, device) else {
-            return;
+    /// At the answer of a detach, done or *failed* (the attach word against
+    /// every event, D-139): the owner's gate writes the attach word 0 only
+    /// from *detached* with the root of the iospace the device's entry
+    /// names, lowers the root's count and writes the identifier word
+    /// *free*, unclaimed (D-137); the device leaves the header, unless a
+    /// done finds the word still *attached* (the holder refused the
+    /// request), which only clears its *detaching* mark. Returns whether
+    /// the device was detached.
+    pub(crate) fn detach_answered(
+        &mut self,
+        role: usize,
+        device: u16,
+        result: dodos_abi::UnitResult,
+    ) -> bool {
+        let (Some(key), Some(iommu)) = (self.attach_key(role, device), self.iommu_of(role)) else {
+            return false;
         };
+        live(&mut self.iommus, iommu).detaching.remove(&device);
+        let Some(&iospace) = self.iommus[&iommu].attached.get(&device) else {
+            return false;
+        };
+        let root = self.aspaces[&iospace].root.unwrap_or(0);
         let word = self.table.attach_word(key);
-        let ended = matches!(
-            word.state(),
-            Some(dodos_abi::AttachState::Pinned | dodos_abi::AttachState::Detached)
-        );
-        if ended
+        let detached =
+            word.state() == Some(dodos_abi::AttachState::Detached) && word.root() == root;
+        if detached
             && self
                 .table
                 .swap_attach(key, word, dodos_abi::AttachWord::NONE)
         {
             self.table.write_identifier(self.node, key, None);
-            self.set_root_class(word.root());
+            self.set_root_class(root);
         }
+        let refused = result == dodos_abi::UnitResult::Done
+            && word.state() == Some(dodos_abi::AttachState::Attached);
+        if !refused {
+            self.detach_local(iommu, device);
+        }
+        detached
     }
 
     /// The identifier word of the device of the unit that a role governs.
@@ -985,6 +1098,7 @@ impl Model {
     fn detach_local(&mut self, iommu: ObjId, device: u16) -> u16 {
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);
+        unit.detaching.remove(&device);
         let iospace = unit.attached.remove(&device);
         let iospace = iospace.expect("the device is attached");
         live(&mut self.iospaces, iospace).retain(|&found| found != (iommu, device));

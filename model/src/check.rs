@@ -41,6 +41,8 @@ pub struct Census {
     pub mappings: usize,
     /// Devices attached to an iospace.
     pub devices: usize,
+    /// Devices whose detach is in flight (D-139).
+    pub detaching: usize,
     /// Threads that wait on a fault, and of these, by the kind of their
     /// fault while it is queued.
     pub faulting: usize,
@@ -121,6 +123,7 @@ impl Model {
                 .filter(|cap| matches!(cap.record, Record::Mapping(_)))
                 .count(),
             devices: self.iospaces.values().map(Vec::len).sum(),
+            detaching: self.iommus.values().map(|u| u.detaching.len()).sum(),
             faulting: self.threads.values().filter(|t| t.faulting).count(),
             fault_kinds: {
                 let mut kinds = [0; 9];

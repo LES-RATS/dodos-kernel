@@ -205,7 +205,9 @@ impl Model {
             }
             let panicked = self.table.beacons[self.node as usize].panic.is_some();
             ensure(
-                panicked || self.now < request.started + self.table.core_answer_ns || core.silent,
+                panicked
+                    || self.membership_now() < request.started + self.table.core_answer_ns
+                    || core.silent,
                 "CORE_ANSWER_NS: a request older than the bound on a node that did not accuse itself",
             )?;
         }
