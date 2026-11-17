@@ -1004,3 +1004,95 @@ fn a_second_core_never_takes_a_lock_another_core_holds() {
         Err("L2: a lock waited for out of the order fixed by kind")
     );
 }
+
+// The verification of the tenth model review, missed fault 2: R5 is not
+// written while R2 still has remote capabilities to remove.
+
+#[test]
+fn r5_is_written_only_once_r2_removed_every_remote_capability_of_the_fenced_node() {
+    use crate::{Message, Range, Transfer};
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let reply = m.retype(1, ObjectKind::Reply, 0, 100);
+    m.ok(1, reply);
+    let rights = dodos_abi::Rights::READ
+        .union(dodos_abi::Rights::DERIVE)
+        .bits();
+    // Nine sends of four frames from node 2 to node 1: 36 grants, more
+    // remote capabilities than the 32 units of one step.
+    for round in 0..9u32 {
+        let first = 200 + 4 * round;
+        for n in 0..4 {
+            let frame = m.retype(2, ObjectKind::Frame, 1, first + n);
+            m.ok(2, frame);
+        }
+        let recv = Syscall::Recv {
+            endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+            reply: s(100),
+            range: Range {
+                first: s(400 + 4 * round),
+                count: 4,
+            },
+            wait: 0,
+        };
+        assert_eq!(m.call(1, recv), WAITS);
+        let send = Syscall::NodeSend {
+            node: node_cap(1),
+            message: Message {
+                label: 7,
+                words: vec![7],
+                caps: (0..4)
+                    .map(|n| Transfer::Derive(s(first + n), rights))
+                    .collect(),
+                ..Message::default()
+            },
+            doorbell: SlotAddr::NONE,
+        };
+        assert_eq!(m.call(2, send), WAITS);
+        m.settle();
+    }
+    let held = |m: &S| {
+        m.sys
+            .node(1)
+            .remotes
+            .values()
+            .filter(|r| r.node == 2)
+            .count()
+    };
+    assert_eq!(held(&m), 36);
+    m.ok(0, kill(2));
+    let generation = m.sys.member(2).generation();
+    for _ in 0..200_000 {
+        if m.sys.settle(1) == 0 {
+            let now = m.sys.now();
+            m.sys.advance(now + 50_000);
+        }
+        if m.sys.canonical().beacons[1].acked[2] == generation {
+            break;
+        }
+    }
+    assert_eq!(m.sys.canonical().beacons[1].acked[2], generation);
+    assert_eq!(held(&m), 0);
+}
+
+// The verification of the tenth model review, missed fault 3: a starting
+// node that never beats is accused with stale once START_NS has passed
+// since its observation, and not at STALE_NS (D-137).
+
+#[test]
+fn a_start_on_a_core_that_never_beats_is_accused_after_start_ns_and_not_before() {
+    use super::pass17::fresh;
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1]]));
+    m.ok(0, kill(1));
+    m.run(10 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    // Core 2 was never used: it never takes its wake.
+    m.sys.hang(2, true);
+    m.ok(0, fresh(1, 0b100));
+    let since = m.sys.now();
+    m.sys.advance(since + dodos_abi::START_NS - MS);
+    assert_eq!(m.state(1), MemberState::Starting);
+    let sweep = m.sys.canonical().sweep_ns;
+    m.sys.advance(since + dodos_abi::START_NS + 2 * sweep);
+    assert_ne!(m.state(1), MemberState::Starting);
+    assert_eq!(m.sys.member(1).evidence(), dodos_abi::Evidence::Stale);
+}

@@ -634,7 +634,14 @@ impl Model {
                 Watched::Heartbeat { core, heartbeat } => {
                     let named = self.table.core_word(core).is_some_and(|w| w.names(node, g));
                     let beacon = self.table.core_beacons[core];
+                    // A starting node is judged against START_NS, never
+                    // against STALE_NS: its cores may take longer than
+                    // STALE_NS to reach its first event (D-137, the
+                    // verification of the tenth model review, missed
+                    // fault 3).
+                    let starting_node = member.state() == MemberState::Starting;
                     let stale = named
+                        && !starting_node
                         && beacon.heartbeat.0 == heartbeat
                         && now >= observation.at + self.table.stale_ns
                         && now - self.table.stale_ns > beacon.idle_until.0;
@@ -721,9 +728,19 @@ impl Model {
         let me = self.node as usize;
         let life = OBSERVATION_LIFE * self.table.stale_ns;
         let before = self.table.beacons[me].observations.len();
-        self.table.beacons[me]
-            .observations
-            .retain(|o| now < o.at + life);
+        // An observation of a starting node lives until START_NS has passed
+        // since it was taken, so that the evidence of a start that never
+        // beats can hold (D-137).
+        let starting: Vec<u16> = (0..self.table.nodes)
+            .filter(|&z| self.table.member(z).state() == MemberState::Starting)
+            .collect();
+        self.table.beacons[me].observations.retain(|o| {
+            let life = match starting.contains(&o.node) {
+                true => life.max(START_NS + self.table.stale_ns),
+                false => life,
+            };
+            now < o.at + life
+        });
         let mut changed = before != self.table.beacons[me].observations.len();
         let swept = self.now >= self.next_sweep;
         for node in self.needed() {
@@ -1106,6 +1123,13 @@ impl Model {
                 return true;
             }
         }
+        // R2 is done only when no remote capability of the node remains: a
+        // step whose units ran out goes on at the next (the verification of
+        // the tenth model review, its missed fault 2: R5 was written with
+        // remote capabilities left).
+        if self.remotes.values().any(|r| r.node == node) {
+            return any;
+        }
         // R3: the grants made to its generation are pinned, and the records
         // of its use of them dropped.
         let me = self.node as usize;
@@ -1150,6 +1174,14 @@ impl Model {
                 self.containment_violated();
                 return true;
             }
+        }
+        // R4 is done only when every block is audited.
+        let audited = self.reclaims[&node]
+            .audit
+            .as_ref()
+            .is_some_and(Vec::is_empty);
+        if !audited {
+            return any;
         }
         // R5: its answer, a write to its own page; not before R1 is done on
         // every unit this node holds, and only for a fenced node (an

@@ -18,10 +18,17 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   root and the translations its TLB may hold), its locks (`locks.rs`: the
   trace of each event under variant L1 or L2; under L2 the locks in the
   order the event found them, a lock earlier than one held recorded as a
-  try, never sorted; a lock a test scripts as held by another core across
-  events makes a try fail, and the event then makes the contract's rounds:
-  the second round, `again` with nothing changed, the escalation to the
-  quiet word, a `signal` and an arrival that never return `again`), its
+  try, never sorted; another core in a kernel event, as a test scripts it
+  with `Model::hold`, is a second core: it holds the locks of its own trace,
+  checked by the same order, no lock is ever held by two cores, a try of
+  one of its locks fails, and a wait for one lets its event end with its
+  effect; the event then makes the contract's rounds: the second round,
+  `again` with nothing changed, the escalation to the quiet word, which
+  raises the kernel epoch and reads every other core's entry word, waiting
+  for the cores whose word is below the new epoch; a `signal`, an arrival
+  and the delivery of a fault never return `again`; a fault's and a
+  waiting thread's fields are locked by the object waited on, marks by
+  no lock), its
   rings (`rings.rs`: the
   check of every message received, credits, the reserve of answers), its
   grants (`grants.rs`), its unit requests and unit service table
@@ -52,7 +59,16 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   (the corrections of D-134), `pass18.rs` (the ninth model review judged,
   and what D-135 changed: line words, failed tries and the quiet word,
   the watermark ready to return, the state word of a request, the retry
-  of a start, the removal of the `Ping`), `mistral.rs` (one test per mutation of the
+  of a start, the removal of the `Ping`), `pass19.rs` (the tenth model
+  review judged finding by finding, and what D-137 changed: the classes of
+  an iospace by level and its root's count of devices, the attach words,
+  the rebuild from the reports of a device's root and a line's operands,
+  the quiet word's masked arrivals and its four orders, the closed bounds
+  and the start-up checks, marks without a lock, `recv` before its lends,
+  the new *k*, a fault as an event, `task_revoke`'s first call, the
+  removal of a line's `irq` as a request, tables freed after their
+  invalidation, the stopped time of the debugger, the sweep of sealed
+  nodes, the replacement slot), `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
   and of the machine; those of one node are in `check/tests.rs`), and
@@ -91,16 +107,16 @@ of an MSI asks every IOMMU unit of the source's segment, one after another
   firmware.
 - Nodes that take and give cores at run time: the contract only reserves
   words for it, and so does the model.
-- Real concurrency under L2: every event runs alone; a failed try comes
-  only from a lock a test scripts as held by another core (`Holder`), whose
-  event ends, with its effect, when the lock is waited for. The order of
-  the trace is the order in which the model's code touches the objects,
-  close to but not always a kernel's order of discovery; in particular the
-  model locks a woken thread and its reply object by their own words,
-  where the contract guards them by the lock of the object waited on.
-- The waits for the quiet word and for the entry words of other cores:
-  another core is in a kernel event only while a test makes it hold a
-  lock, and an escalation lets every such holder end its event.
-- The debugger stub and its release word (development images only): the
-  suspension of the clocks of membership while it is raised (D-135) has
-  no executable check.
+- Real concurrency under L2: every event runs alone; another core is in a
+  kernel event only as a test scripts it (`Model::hold`), a second core
+  that holds the locks it has taken and whose event ends, with its effect,
+  when a lock of it is waited for or an escalation reads its entry word.
+  The order of the trace is the order in which the model's code touches
+  the objects, close to but not always a kernel's order of discovery. The
+  store-load order of the entry word against the quiet word is checked by
+  `locks::entry_orders`, an explorer of the four orders of two cores'
+  accesses, not by the events themselves.
+- The debugger stub of a development image: only its release word and its
+  stopped time, as `System::stub_stop` (a test's input) raises and lowers
+  them; the clock of membership leaves the stop out for the observations,
+  the seal and the evidence, not yet for the fence record and the waits.

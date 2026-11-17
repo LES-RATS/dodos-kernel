@@ -18,17 +18,22 @@
 //!   every lock the event holds is waited for; a lock that comes before one
 //!   it holds is one it found by reading an object it holds, which the
 //!   contract has it *try* ("The order of L2 and its bound", D-134).
-//!   Every event still runs alone, but a test can script a lock that
-//!   another core holds across events (`Model::contended`, a `Holder`):
-//!   a try of it fails, and the event then makes the contract's rounds
-//!   (`contend`): it releases everything, waits for the locks it knows in
-//!   the order, reads again, and a call returns `again` with nothing
-//!   changed if a link changed or a try of its second round failed; a
-//!   `signal` and an arrival wait in the order and never return `again`;
-//!   a third such `again` in a row escalates to the quiet word (D-135).
-//!   The model locks a woken thread and its reply object by their own
-//!   words (tried, earlier in the order), where the contract guards them
-//!   by the lock of the object waited on: an over-approximation.
+//!   Every event still runs alone, but a test can put another core of the
+//!   node inside a kernel event (`Model::hold`, a `Holder`): a second core
+//!   that holds the locks of its trace, checked by the same order; no lock
+//!   is ever held by two cores. A try of one of its locks fails, and the
+//!   event then makes the contract's rounds (`contend`): it releases
+//!   everything, waits for the locks it knows in the order (a wait for a
+//!   held lock lets the other core's event end, with its effect), reads
+//!   again, and a call returns `again` with nothing changed if a link
+//!   changed or a try of its second round failed; a `signal`, an arrival
+//!   and the delivery of a fault wait in the order and never return
+//!   `again`; a third such `again` in a row escalates to the quiet word,
+//!   which raises the kernel epoch and reads every other core's entry
+//!   word, waiting for the event of each core whose word is below the new
+//!   epoch (D-135, D-137). A waiting thread's fields and the reply object
+//!   attached to it are locked by the object waited on (D-135); marks take
+//!   no lock (D-137).
 //!
 //! The order by kind is the contract's: that of `LockId`'s variants,
 //! objects of one kind by identity as by address. The bound *k* of a call
