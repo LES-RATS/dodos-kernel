@@ -446,6 +446,35 @@ fn exhausted_context_waits_for_its_replenishment_and_another_runs() {
     assert_eq!(k.m.running(), Some(thread));
 }
 
+/// "Destroying a context …: the first step marks it dying, takes it out of
+/// every queue of the scheduler": a throttled context whose destruction
+/// takes several calls keeps its replenishment instant, which passes with
+/// nothing to run it, and the state is valid (seed 329 of pass 23's long
+/// run reached it and the check refused it).
+#[test]
+fn a_throttled_context_that_dies_over_several_calls_is_never_replenished() {
+    let mut k = K::lowered(5 * MS);
+    k.context(40, MS, 4 * MS, 1);
+    let thread = k.thread(50, 40);
+    k.advance(MS);
+    assert_ne!(k.state(40) & SCHED_STATE_THROTTLED, 0);
+    // 33 copies: its removal takes two calls, and the first marks it dying.
+    for slot in 60..93 {
+        k.ok(Syscall::CapDerive {
+            source: s(40),
+            destination: s(slot),
+            rights: Rights::ALL.bits(),
+            badge: 0,
+        });
+    }
+    k.no(Syscall::CapDelete(s(40)), Error::Again);
+    assert!(!k.can_run(thread));
+    // Its replenishment instant, 4 ms, passes: nothing replenishes it.
+    k.advance(5 * MS);
+    assert!(!k.can_run(thread));
+    k.ok(Syscall::CapDelete(s(40)));
+}
+
 #[test]
 fn throttled_context_runs_on_slack_when_no_context_has_budget() {
     let mut k = K::lowered(MS);

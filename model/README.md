@@ -97,6 +97,12 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   parking its core, a spare core off on ARM64 and RISC-V, the gate
   reading its member word for every word it writes, and the check's
   invariants 3, 28 (the `memory_control`), 52 and G4 made exact),
+  `pass23.rs` (the rules the final review found held by no test or
+  only by a test's name: a request and a core's heartbeat judged across
+  a debugger stop on the clock less the stopped time, with no
+  accusation of itself while the release word is raised, which the model
+  made; the clearing of a rebuild's entries no report claims; each core's
+  generator seeded from its node's seed and its number),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -108,12 +114,22 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   of an exploration with its actions printed; `DODOS_COUNTS` prints what
   the explorations reached.
 - `tests/`: the calls on one node, judged argument by argument, and the
-  random walk of `property.rs` with its coverage floors (three quarters of
-  the counts measured on 17 November 2026, rounded up; the count of the
-  objects dying is sized by `ObjectKind::ALL`). `many_seeds`, ignored by
-  `verify`, walks 2,000 more seeds (`DODOS_PROPERTY_SEEDS` sets another
-  number) and names any seed that fails: `cargo test --release -p
+  random walk of `property.rs` with its coverage floors: three quarters
+  of the counts measured on 17 November 2026 (pass 23), rounded up, the
+  smallest of the three page sizes. The directed cases of each seed count
+  in no floor, so every floor is above what they give alone
+  (`DODOS_PROPERTY_STEPS=0` runs them alone); the kinds seen dying are
+  every kind made from an untyped, the irq, the role and the
+  memory_control, and a breakpoint hit (a fault of kind 9) is given and
+  waited on. `many_seeds`, ignored by `verify`, walks 2,000 more seeds
+  (`DODOS_PROPERTY_SEEDS` and `DODOS_PROPERTY_FIRST` set another number
+  and the first) and names any seed that fails: `cargo test --release -p
   dodos-model --test property many_seeds -- --ignored`.
+- The checker: each of its 219 rules that go through `ensure`, switched
+  off alone, makes at least one test fail (pass 23's sweep; the two it
+  found held by nothing have a test since); a check that cannot fail is
+  deleted or says which earlier rule shadows it, and the checker names an
+  invariant for a value of the state it would index, never panics.
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
 

@@ -21,8 +21,9 @@ impl Model {
     /// 43. a configured context has 10 µs ≤ budget ≤ period ≤ 2^36 ns (and
     ///     so do the parameters it waits to use), class 0 to 2, budget left
     ///     if and only if it is not throttled, and a replenishment instant
-    ///     after now; one that is not configured has nothing left, no
-    ///     deadline and is not throttled;
+    ///     after now unless it is dying or its core is silent; one that is
+    ///     not configured has nothing left, no deadline and is not
+    ///     throttled;
     /// 44. a home and its context name each other; a lend names a live
     ///     reply object, a live context whose chain holds it once, and a
     ///     live receiver without an own context, which receives no other
@@ -76,9 +77,14 @@ impl Model {
                 true => {
                     // A context placed on a core that stopped answering
                     // keeps its state: that core takes no timer interrupt
-                    // (until its node accuses itself).
+                    // (until its node accuses itself). So does a dying
+                    // context: the first step of its destruction takes it
+                    // out of every queue of the scheduler (Destroying a
+                    // context), so its replenishment never runs (found by
+                    // seed 329 of pass 23's long run).
                     let silent = self.cores.get(sched.core).is_some_and(|c| c.silent);
-                    let throttled = silent || sched.throttled.is_some_and(|(at, _)| at > self.now);
+                    let throttled =
+                        silent || dying || sched.throttled.is_some_and(|(at, _)| at > self.now);
                     valid((sched.budget, sched.period))
                         && sched.pending.is_none_or(valid)
                         && sched.class <= 2
