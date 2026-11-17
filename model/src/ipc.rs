@@ -328,7 +328,10 @@ impl Model {
         match endpoint {
             // Notifications: endpoint 0 removes the binding, and succeeds
             // if there is none.
+            // Under L2 the bound endpoint is found through the notify, which
+            // the call holds: it is tried, before anything is written (D-135).
             None => {
+                self.touch(crate::locks::LockId::Notify(notify));
                 if let Some(bound) = bound {
                     locked(&mut self.endpoints, &self.locks, bound).notify = None;
                 }

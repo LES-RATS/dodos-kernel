@@ -1056,6 +1056,9 @@ impl Model {
             node,
             table,
             cores: parts,
+            // The kernel epoch starts at 1, so an entry word of 0 means a
+            // core out of a kernel event (D-135).
+            kernel_epoch: 1,
             ..Self::default()
         };
         let thread = model.build(layout, &untypeds, start_pages);

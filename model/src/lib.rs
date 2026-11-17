@@ -582,6 +582,12 @@ struct Untyped {
     /// Objects, segments of capability spaces and tables of address spaces
     /// taken from it and not yet destroyed.
     live: u32,
+    /// Under L2 on several cores: the kernel epoch at which its watermark
+    /// became ready to return, at the destruction of its last object; it
+    /// returns at the first `untyped_retype` that finds every other core
+    /// out of the kernel event it was in then (word 6 of its root's slot,
+    /// D-135).
+    ready: Option<u64>,
 }
 
 /// What a block covers (`memory_take`).
@@ -1065,6 +1071,9 @@ pub struct Model {
     /// Locks of this node held by other cores across its events, as a test
     /// scripts them (variant L2): what makes a try fail (D-134, D-135).
     pub(crate) contended: BTreeMap<locks::LockId, locks::Holder>,
+    /// The kernel epoch: one word of the node block, raised at the last
+    /// destruction of an untyped's object and at an escalation (D-135).
+    pub(crate) kernel_epoch: u64,
     /// Under variant L2: the objects as they were before the event.
     before: Ephemeral<Option<Box<locks::Snapshot>>>,
     /// The pending interrupts of the cores are delivered by the caller

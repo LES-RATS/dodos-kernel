@@ -751,6 +751,8 @@ fn under_l2_a_failed_try_takes_a_second_round_in_the_order_and_the_call_goes_on(
         Holder {
             tries: 1,
             then: None,
+            core: 1,
+            ..Holder::default()
         },
     );
     assert_eq!(k.call(k.t, call), WAITS);
@@ -774,6 +776,8 @@ fn under_l2_a_link_changed_by_the_holder_makes_the_call_return_again_with_nothin
         Holder {
             tries: 1,
             then: Some((third, cancel.clone())),
+            core: 1,
+            ..Holder::default()
         },
     );
     // What the node is once the holder's event alone has run.
@@ -807,6 +811,8 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
             Holder {
                 tries: 2,
                 then: Some((third, cancel)),
+                core: 1,
+                ..Holder::default()
             },
         );
         assert_eq!(k.call(k.t, call.clone()), Err(Error::Again));
@@ -827,6 +833,8 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
         Holder {
             tries: 9,
             then: Some((third, cancel)),
+            core: 1,
+            ..Holder::default()
         },
     );
     let outcome = k.call(k.t, call);
@@ -866,6 +874,8 @@ fn under_l2_a_signal_whose_try_fails_never_returns_again() {
         Holder {
             tries: 5,
             then: Some((third, cancel)),
+            core: 1,
+            ..Holder::default()
         },
     );
     assert_eq!(k.call(k.t, signal), DONE);
@@ -973,6 +983,8 @@ fn under_l2_an_arrival_whose_try_fails_takes_its_locks_in_the_order_and_ends() {
         Holder {
             tries: 5,
             then: Some((third, cancel)),
+            core: 1,
+            ..Holder::default()
         },
     );
     k.m.interrupt_on(0, 48);
@@ -982,4 +994,104 @@ fn under_l2_an_arrival_whose_try_fails_takes_its_locks_in_the_order_and_ends() {
     // No receiver waits any more: the bits are pending in the notify.
     let notify = k.m.object_at(k.t, s(330)).unwrap();
     assert_ne!(k.m.notifies[&notify].word, 0);
+}
+
+#[test]
+fn under_l2_notify_bind_takes_the_endpoint_then_the_notify_and_tries_neither() {
+    let (mut k, receiver, _, _) = l2_delivery();
+    k.ok(k.retype(ObjectKind::Notify, 0, 330));
+    // A pending notification, delivered by the bind to the waiting receiver.
+    k.ok(Syscall::Signal(s(330)));
+    k.ok(Syscall::NotifyBind {
+        notify: s(330),
+        endpoint: s(310),
+    });
+    assert!(k.m.woken(receiver).is_some());
+    // The two objects it names are waited for, the endpoint first; neither
+    // is tried. (The model locks the woken receiver and its reply object by
+    // their own words, tried, where the contract guards them by the
+    // endpoint's lock: an over-approximation the check accepts.)
+    let steps = &k.m.locks.steps;
+    let named = |s: &Step| {
+        matches!(
+            s,
+            Step::Try(LockId::Endpoint(_) | LockId::Notify(_))
+                | Step::TryFailed(LockId::Endpoint(_) | LockId::Notify(_))
+        )
+    };
+    assert!(!steps.iter().any(named), "{steps:?}");
+    let endpoint = steps
+        .iter()
+        .position(|s| matches!(s, Step::Lock(LockId::Endpoint(_))));
+    let notify = steps
+        .iter()
+        .position(|s| matches!(s, Step::Lock(LockId::Notify(_))));
+    assert!(endpoint.is_some() && notify > endpoint, "{steps:?}");
+}
+
+#[test]
+fn under_l2_notify_bind_with_endpoint_0_tries_the_endpoint_it_finds_through_the_notify() {
+    let (mut k, _, _, _) = l2_delivery();
+    k.ok(k.retype(ObjectKind::Notify, 0, 330));
+    k.ok(Syscall::NotifyBind {
+        notify: s(330),
+        endpoint: s(310),
+    });
+    k.ok(Syscall::NotifyBind {
+        notify: s(330),
+        endpoint: SlotAddr::NONE,
+    });
+    let steps = &k.m.locks.steps;
+    let notify = steps
+        .iter()
+        .position(|s| matches!(s, Step::Lock(LockId::Notify(_))));
+    let tried = steps
+        .iter()
+        .position(|s| matches!(s, Step::Try(LockId::Endpoint(_))));
+    assert!(notify.is_some() && tried > notify, "{steps:?}");
+}
+
+// The watermark's return and the entry word (A node of several cores, the
+// memory of a destroyed object; Capabilities and objects, D-135).
+
+#[test]
+fn under_l2_a_watermark_returns_only_once_every_other_core_left_the_event_it_was_in() {
+    let (mut k, _, _, _) = l2_delivery();
+    k.ok(k.retype(ObjectKind::Untyped, 1 << 16, 350));
+    // A context of 256 bytes, then once it is gone a notify of 64: the
+    // notify lies at the start only if the watermark returned.
+    k.ok(retype_from(350, ObjectKind::Sched, 0, 351));
+    let untyped = k.m.object_at(k.t, s(350)).unwrap();
+    let mark = k.m.untypeds[&untyped].watermark;
+    assert!(mark > 0);
+    // Core 1 is inside a kernel event, holding a lock, entered at the
+    // present epoch.
+    let entered = k.m.kernel_epoch;
+    let held = LockId::Core(1);
+    let holder = Holder {
+        core: 1,
+        entered,
+        ..Holder::default()
+    };
+    k.m.contended.insert(held, holder);
+    k.ok(Syscall::CapDelete(s(351)));
+    // Ready to return: the destruction raised the epoch, core 1 is still in
+    // the event it entered before.
+    assert_eq!(k.m.untypeds[&untyped].ready, Some(entered + 1));
+    assert_eq!(k.m.untypeds[&untyped].watermark, mark);
+    let again = retype_from(350, ObjectKind::Notify, 0, 352);
+    assert_eq!(k.call(k.t, again.clone()), Err(Error::Again));
+    // Core 1 leaves its event and enters another, after the raise: the
+    // watermark returns at the next retype.
+    let later = Holder {
+        core: 1,
+        entered: k.m.kernel_epoch,
+        ..Holder::default()
+    };
+    k.m.contended.insert(held, later);
+    assert_eq!(k.call(k.t, again), DONE);
+    k.m.contended.clear();
+    let watermark = k.m.untypeds[&untyped].watermark;
+    assert_eq!(watermark, dodos_abi::NOTIFY_BYTES as u64);
+    assert_eq!(k.m.untypeds[&untyped].ready, None);
 }

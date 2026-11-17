@@ -428,6 +428,21 @@ impl Model {
         align: u64,
         clearing: Clearing,
     ) -> Result<Taken, Error> {
+        // A watermark ready to return: it returns once every other core of
+        // the node has left the kernel event it was in at the destruction
+        // (its entry word 0 or at least that epoch); until then
+        // `untyped_retype` returns `again` with nothing changed (A node of
+        // several cores, D-134, D-135).
+        if clearing != Clearing::WithinCall
+            && let Some(epoch) = self.untypeds[&untyped].ready
+        {
+            if self.entered_before(epoch) {
+                return Err(Error::Again);
+            }
+            let untyped = live(&mut self.untypeds, untyped);
+            (untyped.watermark, untyped.clean, untyped.ready) = (0, 0, None);
+            untyped.zero.clear();
+        }
         let untyped = live(&mut self.untypeds, untyped);
         let start = untyped.watermark.checked_next_multiple_of(align);
         let end = start.and_then(|start| start.checked_add(bytes));
@@ -468,12 +483,34 @@ impl Model {
     /// is destroyed the watermark returns to the start, and so does the
     /// clean mark; this is the only moment the memory becomes usable again.
     fn release(&mut self, untyped: ObjId) {
+        // Under L2 on several cores the watermark is only ready to return:
+        // the destroying core raises the kernel epoch (D-135).
+        let watched = self.locking_watched();
+        if watched && self.untypeds[&untyped].live == 1 {
+            self.kernel_epoch += 1;
+        }
+        let epoch = self.kernel_epoch;
         let untyped = live(&mut self.untypeds, untyped);
         untyped.live -= 1;
-        if untyped.live == 0 {
-            (untyped.watermark, untyped.clean) = (0, 0);
-            untyped.zero.clear();
+        match (untyped.live, watched) {
+            (0, true) => untyped.ready = Some(epoch),
+            (0, false) => {
+                (untyped.watermark, untyped.clean) = (0, 0);
+                untyped.zero.clear();
+            }
+            _ => {}
         }
+    }
+
+    /// Whether another core of the node is in a kernel event it entered
+    /// before `epoch`: its entry word is not 0 and below it. In the model a
+    /// core is in an event across this node's events only while it holds
+    /// a lock (`Model::contended`).
+    pub(crate) fn entered_before(&self, epoch: u64) -> bool {
+        let at = *self.at;
+        self.contended
+            .values()
+            .any(|h| h.core != at && h.entered != 0 && h.entered < epoch)
     }
 
     /// A new object and its root capability, in an empty slot. The parent
@@ -505,6 +542,7 @@ impl Model {
                     watermark: 0,
                     clean: 0,
                     live: 0,
+                    ready: None,
                 };
                 self.untypeds.insert(id, untyped);
             }

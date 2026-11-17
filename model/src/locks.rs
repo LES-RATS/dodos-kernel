@@ -17,9 +17,18 @@
 //!   where it touches objects (`live`), not sorted: a lock that comes after
 //!   every lock the event holds is waited for; a lock that comes before one
 //!   it holds is one it found by reading an object it holds, which the
-//!   contract has it *try* ("The order of L2 and its bound", D-134). In
-//!   the model every event runs alone, so a try never fails and the
-//!   second round of the contract's rule is never needed.
+//!   contract has it *try* ("The order of L2 and its bound", D-134).
+//!   Every event still runs alone, but a test can script a lock that
+//!   another core holds across events (`Model::contended`, a `Holder`):
+//!   a try of it fails, and the event then makes the contract's rounds
+//!   (`contend`): it releases everything, waits for the locks it knows in
+//!   the order, reads again, and a call returns `again` with nothing
+//!   changed if a link changed or a try of its second round failed; a
+//!   `signal` and an arrival wait in the order and never return `again`;
+//!   a third such `again` in a row escalates to the quiet word (D-135).
+//!   The model locks a woken thread and its reply object by their own
+//!   words (tried, earlier in the order), where the contract guards them
+//!   by the lock of the object waited on: an over-approximation.
 //!
 //! The order by kind is the contract's: that of `LockId`'s variants,
 //! objects of one kind by identity as by address. The bound *k* of a call
@@ -29,9 +38,12 @@
 //! pays no cost of several cores; under L1 every lock is the node lock or
 //! the gate lock inside it; under L2 a wait is only for a lock that comes
 //! after every lock held, a try only for one that comes before a lock
-//! held, the gate lock last, at most *k*, and every object the event
-//! changed was locked (compared with the state before the event); under
-//! both, no event spins for a unit or another node.
+//! held, the gate lock last, at most *k* held at once, every object the
+//! event changed was locked (compared with the state before the event), a
+//! failed try followed by the release of every lock before any other is
+//! taken, at most two rounds, and the quiet word taken with no lock held
+//! and no try under it; under both, no event spins for a unit or another
+//! node.
 
 use crate::ObjId;
 use std::cell::RefCell;
@@ -79,6 +91,10 @@ pub enum LockId {
 pub(crate) struct Holder {
     pub(crate) tries: u32,
     pub(crate) then: Option<(ObjId, crate::Syscall)>,
+    /// The holder's core, and its entry word: the kernel epoch it read
+    /// when it entered the event in which it holds the lock (D-135).
+    pub(crate) core: usize,
+    pub(crate) entered: u64,
 }
 
 /// The kinds of wait a thread enters at the end of an event, and the spin
@@ -546,6 +562,7 @@ impl crate::Model {
         let tries = self.threads.get(&thread).map_or(0, |t| t.again_tries);
         if tries >= 2 {
             steps.push(Step::Quiet(true));
+            self.kernel_epoch += 1;
             let held: Vec<LockId> = self.contended.keys().copied().collect();
             for lock in held {
                 self.let_go(lock);

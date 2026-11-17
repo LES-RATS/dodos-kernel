@@ -759,8 +759,13 @@ impl Model {
                 untyped.watermark.is_multiple_of(8),
                 "18: watermark on 8 bytes",
             )?;
-            let zero = (untyped.watermark == 0) == (untyped.live == 0);
+            // A watermark ready to return waits, above 0, with nothing live.
+            let zero = untyped.ready.is_some() || (untyped.watermark == 0) == (untyped.live == 0);
             ensure(zero, "18: watermark is zero when nothing is live")?;
+            ensure(
+                untyped.ready.is_none() || untyped.live == 0,
+                "18: a watermark ready to return under a live object",
+            )?;
             let clean = match untyped.device {
                 true => untyped.clean == 0,
                 false => (untyped.watermark..=untyped.bytes).contains(&untyped.clean),
