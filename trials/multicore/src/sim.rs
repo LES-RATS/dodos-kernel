@@ -16,12 +16,13 @@ mod srv;
 
 use crate::hist::Hist;
 use crate::platform;
+use crate::rt::{self, Barrier, Duration, Instant, Mutex};
 use crate::sync::{Guard, LockKind, MAX_CORES, Msg, Notify, Padded, Ring, Signalled, busy};
-use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
-use std::sync::{Barrier, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use alloc::{format, string::String, vec};
+use core::hint::black_box;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cand {
@@ -79,6 +80,11 @@ pub struct Params {
     pub rx_ns: u64,
     pub warmup: Duration,
     pub dur: Duration,
+    /// Latency classes (bit `c` for class `c`) the window waits for: it
+    /// closes after `dur` once each has a measured operation. A host that
+    /// leaves a worker off its core for all of `dur` (fewer cores than
+    /// workers, or Miri) then still measures them. 0: `dur` alone.
+    pub need: u8,
 }
 
 /// The read path of a lookup.
@@ -331,6 +337,8 @@ struct Machine {
     waits: Box<[Padded<AtomicU64>]>,
     bye: Box<[Padded<AtomicBool>]>,
     phase: Padded<AtomicU8>,
+    /// The classes with a measured operation (bit `c` for class `c`).
+    seen: Padded<AtomicU8>,
     done: Padded<AtomicUsize>,
     drained: Padded<AtomicUsize>,
     p: Params,
@@ -506,6 +514,7 @@ impl Machine {
             waits: (0..n).map(pad).collect(),
             bye: (0..n).map(|_| Padded::default()).collect(),
             phase: Padded(AtomicU8::new(WARMUP)),
+            seen: Padded(AtomicU8::new(0)),
             done: Padded::default(),
             drained: Padded::default(),
             p,
@@ -515,6 +524,11 @@ impl Machine {
 
     fn node_of(&self, c: usize) -> usize {
         self.node_of[c].load(Ordering::Relaxed)
+    }
+
+    /// Whether every class in `need` has a measured operation.
+    fn measured(&self, need: u8) -> bool {
+        self.seen.load(Ordering::Relaxed) & need == need
     }
 }
 
@@ -529,7 +543,7 @@ struct Core<'m> {
 }
 
 fn bits(mut mask: u64) -> impl Iterator<Item = usize> {
-    std::iter::from_fn(move || {
+    core::iter::from_fn(move || {
         (mask != 0).then(|| {
             let b = mask.trailing_zeros() as usize;
             mask &= mask - 1;
@@ -674,6 +688,9 @@ impl<'m> Core<'m> {
         if self.m.phase.load(Ordering::Relaxed) == MEASURE {
             self.out.hist[class].record(ns);
             self.out.ops[class] += 1;
+            if self.out.ops[class] == 1 {
+                self.m.seen.fetch_or(1 << class, Ordering::Relaxed);
+            }
             self.sample_cpu();
         }
     }
@@ -728,7 +745,7 @@ impl<'m> Core<'m> {
                 }
                 claimed = true;
             }
-            busy(m.p.ipi_ns);
+            platform::interrupt(m.p.ipi_ns);
         }
         let bells = if bell {
             node.doorbell.swap(0, Ordering::Acquire)
@@ -745,7 +762,7 @@ impl<'m> Core<'m> {
                 // Another core of the node may have taken it.
                 let Some(msg) = ring.pop() else { break };
                 if per_message {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 self.handle(msg);
             }
@@ -753,7 +770,7 @@ impl<'m> Core<'m> {
         if tlb {
             for origin in bits(m.mbox_tlb[self.id].swap(0, Ordering::Acquire)) {
                 if per_message {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 busy(m.p.tlb_ns);
                 self.ack(origin, Held::No);
@@ -992,7 +1009,7 @@ impl<'m> Core<'m> {
         loop {
             let s = seq.load(Ordering::Acquire);
             if !s.is_multiple_of(2) {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
             black_box(node.state[region * PROC_LINES + st * 2].load(Ordering::Relaxed));
@@ -1018,7 +1035,7 @@ impl<'m> Core<'m> {
             let s = seq.load(Ordering::Acquire);
             if !s.is_multiple_of(2) {
                 // A writer is in: wait for it (the time is in the latency).
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
             for j in 0..LINES {
@@ -1099,7 +1116,7 @@ impl<'m> Core<'m> {
             let got = m.mbox_ev[self.id].swap(0, Ordering::Acquire);
             if got != 0 {
                 if !charged {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 return got;
             }
@@ -1370,33 +1387,35 @@ pub fn run(
 ) -> RunOut {
     let m = Machine::new(w, cand, k, n, p);
     let start = Barrier::new(n + 1);
-    let (outs, secs) = thread::scope(|s| {
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let (m, start) = (&m, &start);
-                let cpu = cpus.get(i).copied().flatten();
-                s.spawn(move || {
-                    platform::prepare_worker(cpu);
-                    let mut core = Core::new(m, i);
-                    start.wait();
-                    core.run(m.roles[i]);
-                    core.out
-                })
-            })
-            .collect();
-        start.wait();
-        thread::sleep(p.warmup);
-        m.phase.store(MEASURE, Ordering::Relaxed);
-        let t = Instant::now();
-        thread::sleep(p.dur);
-        m.phase.store(STOP, Ordering::Relaxed);
-        let secs = t.elapsed().as_secs_f64();
-        let outs: Vec<CoreOut> = handles
-            .into_iter()
-            .map(|h| h.join().expect("worker panicked"))
-            .collect();
-        (outs, secs)
-    });
+    let (m_ref, start_ref) = (&m, &start);
+    let (outs, secs) = rt::scope(
+        n,
+        |i| {
+            platform::prepare_worker(cpus.get(i).copied().flatten());
+            let mut core = Core::new(m_ref, i);
+            start_ref.wait();
+            core.run(m_ref.roles[i]);
+            core.out
+        },
+        || {
+            start_ref.wait();
+            rt::sleep(p.warmup);
+            m_ref.phase.store(MEASURE, Ordering::Relaxed);
+            let t = Instant::now();
+            rt::sleep(p.dur);
+            let since = Instant::now();
+            while !m_ref.measured(p.need) && since.elapsed() < STUCK {
+                rt::sleep(Duration::from_micros(100));
+            }
+            m_ref.phase.store(STOP, Ordering::Relaxed);
+            t.elapsed().as_secs_f64()
+        },
+    );
+    assert!(
+        m.measured(p.need),
+        "classes {:#b} unmeasured for {STUCK:?}: a bug of the simulation",
+        p.need & !m.seen.load(Ordering::Relaxed)
+    );
     check(&m, &outs);
     let mut r = RunOut {
         secs,
@@ -1472,6 +1491,9 @@ mod tests {
             rx_ns: 300,
             warmup: Duration::from_millis(1),
             dur: Duration::from_millis(5),
+            // Class 0: every workload but the mixed, move and server ones
+            // measures it.
+            need: 1,
         }
     }
 
@@ -1506,8 +1528,12 @@ mod tests {
     /// Every workload ends under every candidate, with both settings of
     /// every switch, and passes the self-checks of `run` (which include
     /// that lazy additions reach every copy); each measures operations.
+    /// The window waits for the classes asserted, so the verdict does not
+    /// depend on the host's speed or number of cores.
     #[test]
+    #[cfg_attr(miri, ignore = "real-time simulation; Miri covers `sync`")]
     fn every_workload_runs_under_every_candidate() {
+        let _host = crate::host::alone();
         let works = [
             Workload::CapOps,
             Workload::Ipc,
@@ -1522,18 +1548,19 @@ mod tests {
                     assert!(r.ops.iter().sum::<u64>() > 0, "{w:?} {cand:?}");
                 }
             }
-            let r = run(
-                Workload::Mixed,
-                Cand::Fixed(2),
-                3,
-                4,
-                make(LockKind::Queue),
-                &[],
-            );
+            let p = Params {
+                need: 1 << 2,
+                ..make(LockKind::Queue)
+            };
+            let r = run(Workload::Mixed, Cand::Fixed(2), 3, 4, p, &[]);
             assert!(r.ops[2] > 0, "independent processes measured");
         }
         let mv = Workload::Move { rate: 2000 };
-        let r = run(mv, Cand::Sized, 2, 4, params(LockKind::Ttas), &[]);
+        let p = Params {
+            need: 1 << 1,
+            ..params(LockKind::Ttas)
+        };
+        let r = run(mv, Cand::Sized, 2, 4, p, &[]);
         assert!(r.ops[1] > 0, "moves measured");
         // The server, every candidate and layout, every policy; the run's
         // self-check also finds the endpoint idle at the end.
@@ -1543,6 +1570,7 @@ mod tests {
                     let p = Params {
                         policy,
                         dur: Duration::from_millis(20),
+                        need: 0b11,
                         ..params(LockKind::Queue)
                     };
                     let w = Workload::Server {
@@ -1564,7 +1592,12 @@ mod tests {
     /// too, unless the kernel lends the caller's context or refuses calls
     /// that cannot finish. The p90 is several times lower with either.
     #[test]
+    #[cfg_attr(miri, ignore = "real-time measurement")]
     fn lending_and_refusal_shorten_the_foreground_wait() {
+        let _host = crate::host::alone();
+        if !crate::host::cores_for(3, "lending_and_refusal") {
+            return;
+        }
         let p90 = |policy| {
             let p = Params {
                 policy,
@@ -1588,10 +1621,16 @@ mod tests {
     /// A lazy derive returns before the other copies have applied it; an
     /// eager one waits for all of them, so it is slower on four nodes.
     #[test]
+    #[cfg_attr(miri, ignore = "real-time measurement")]
     fn lazy_additions_wait_less_than_eager_ones() {
+        let _host = crate::host::alone();
+        if !crate::host::cores_for(4, "lazy_additions") {
+            return;
+        }
         let lazy = Params {
             change_pct: 100,
             ipi_ns: 2000,
+            need: 1 << 3,
             ..params(LockKind::Queue)
         };
         let eager = Params {
@@ -1599,11 +1638,7 @@ mod tests {
             ..lazy
         };
         let p50 = |p| run(Workload::CapOps, Cand::PerCore, 4, 4, p, &[]).hist[3].quantile(0.5);
-        assert!(
-            p50(lazy) * 2 < p50(eager),
-            "lazy {} eager {}",
-            p50(lazy),
-            p50(eager)
-        );
+        let (lazy, eager) = (p50(lazy), p50(eager));
+        assert!(lazy * 2 < eager, "lazy {lazy} eager {eager}");
     }
 }

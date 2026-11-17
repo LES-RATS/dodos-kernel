@@ -1,0 +1,30 @@
+[package]
+name = "dodos-trial-desktop"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Bare-metal measurement image for the reference desktop (UEFI application)"
+publish = false
+
+# Its own workspace: it builds only for x86_64-unknown-uefi (see
+# .cargo/config.toml), so it stays out of the host workspace's
+# `cargo test --workspace`; `verify` builds and lints it separately.
+[workspace]
+
+[dependencies]
+dodos-trial-multicore = { path = "../../multicore", default-features = false }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+wildcard_imports = "warn"

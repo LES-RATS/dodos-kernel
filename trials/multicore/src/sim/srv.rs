@@ -8,10 +8,13 @@
 //! the reply hands back what is left, so no node reads another node's state.
 
 use super::{CALL, Core, DISPATCH, FREE, Held, LEND, LINES, Machine, Mode, Policy, REPLY, Role};
+use crate::platform;
+use crate::rt::{Duration, Instant};
 use crate::sync::{MAX_CORES, Msg, busy};
-use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 /// A foreground request, and a background one.
 const SHORT_NS: u64 = 5_000;
@@ -364,7 +367,7 @@ impl Core<'_> {
             };
             if job.is_some() {
                 if !charged {
-                    busy(m.p.ipi_ns);
+                    platform::interrupt(m.p.ipi_ns);
                 }
                 return job;
             }

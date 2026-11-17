@@ -1,0 +1,96 @@
+I image name=dodos-trial-desktop boot=1 volume=true
+DodOS desktop measurements. Keys in the next 5 s:
+  S: skip the risky steps; R: forget the progress and start over;
+  Q: stop now; any other key: go on at once.
+I step setup begins
+I tsc hz=1000125724 source=pm-timer cpuid15_hz=0 cpuid16_base_mhz=0 pm_hz=1000125724 stall_hz=1117200000
+I x2apic switched=1 firmware-timer=runs
+I apic firmware-mode=xapic mode=x2apic x2apic-supported=true bsp-apic=0
+I trampoline page=0x9e000 vector=0x9e
+I smp started=27 cores=28
+I kinds faked=1 (fake_kinds=1): first half of the workers P, the rest E
+I core index=0 apic=0 thread=0 role=Bsp kind=P state=0
+I core index=1 apic=1 thread=1 role=Sibling kind=U state=1
+I core index=2 apic=2 thread=0 role=Worker kind=P state=1
+I core index=3 apic=3 thread=1 role=Sibling kind=U state=1
+I core index=4 apic=4 thread=0 role=Worker kind=P state=1
+I core index=5 apic=5 thread=1 role=Sibling kind=U state=1
+I core index=6 apic=6 thread=0 role=Worker kind=P state=1
+I core index=7 apic=7 thread=1 role=Sibling kind=U state=1
+I core index=8 apic=8 thread=0 role=Worker kind=P state=1
+I core index=9 apic=9 thread=1 role=Sibling kind=U state=1
+I core index=10 apic=10 thread=0 role=Worker kind=P state=1
+I core index=11 apic=11 thread=1 role=Sibling kind=U state=1
+I core index=12 apic=12 thread=0 role=Worker kind=P state=1
+I core index=13 apic=13 thread=1 role=Sibling kind=U state=1
+I core index=14 apic=14 thread=0 role=Worker kind=P state=1
+I core index=15 apic=15 thread=1 role=Sibling kind=U state=1
+I core index=16 apic=16 thread=0 role=Worker kind=E state=1
+I core index=17 apic=17 thread=1 role=Sibling kind=U state=1
+I core index=18 apic=18 thread=0 role=Worker kind=E state=1
+I core index=19 apic=19 thread=1 role=Sibling kind=U state=1
+I core index=20 apic=20 thread=0 role=Worker kind=E state=1
+I core index=21 apic=21 thread=1 role=Sibling kind=U state=1
+I core index=22 apic=22 thread=0 role=Worker kind=E state=1
+I core index=23 apic=23 thread=1 role=Sibling kind=U state=1
+I core index=24 apic=24 thread=0 role=Worker kind=E state=1
+I core index=25 apic=25 thread=1 role=Sibling kind=U state=1
+I core index=26 apic=26 thread=0 role=Worker kind=E state=1
+I core index=27 apic=27 thread=1 role=Watchdog kind=U state=1
+I step setup ends seconds=1
+I step identity skipped by configuration
+I step platform skipped by configuration
+I step stall skipped by configuration
+I step gate skipped by configuration
+I step cet skipped by configuration
+I step ipi skipped by configuration
+I step shoot begins
+R shoot initiator=2 initiator_kind=P others=1 set=same kinds=P targets=busy send=unicast bsp_target=0 n=50 min=3999.5 p50=44994.3 p99=161979.6 p999=161979.6 max=161979.6 mean=49013.8 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=same kinds=P targets=idle send=unicast bsp_target=0 n=50 min=8998.9 p50=28996.4 p99=93988.2 p999=93988.2 max=93988.2 mean=31796.0 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=same kinds=P targets=busy send=logical bsp_target=0 n=50 min=2999.6 p50=24996.9 p99=110986.0 p999=110986.0 max=110986.0 mean=29196.3 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=same kinds=P targets=idle send=logical bsp_target=0 n=50 min=7999.0 p50=19997.5 p99=59992.5 p999=59992.5 max=59992.5 mean=23577.0 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=other kinds=E targets=busy send=unicast bsp_target=0 n=50 min=3999.5 p50=39995.0 p99=227971.3 p999=227971.3 max=227971.3 mean=52873.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=other kinds=E targets=idle send=unicast bsp_target=0 n=50 min=10998.6 p50=45994.2 p99=6013244.0 p999=6013244.0 max=6013244.0 mean=185396.7 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=other kinds=E targets=busy send=logical bsp_target=0 n=50 min=4999.4 p50=47994.0 p99=292963.2 p999=292963.2 max=292963.2 mean=62872.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=other kinds=E targets=idle send=logical bsp_target=0 n=50 min=9998.7 p50=58992.6 p99=1082863.9 p999=1082863.9 max=1082863.9 mean=90508.6 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=mixed kinds=P targets=busy send=unicast bsp_target=0 n=50 min=1999.7 p50=121984.7 p99=3191598.7 p999=3191598.7 max=3191598.7 mean=401389.5 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=mixed kinds=P targets=idle send=unicast bsp_target=0 n=50 min=4999.4 p50=39995.0 p99=114861559.1 p999=114861559.1 max=114861559.1 mean=2729156.9 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=mixed kinds=P targets=busy send=logical bsp_target=0 n=50 min=3999.5 p50=26996.6 p99=1015872.3 p999=1015872.3 max=1015872.3 mean=52873.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=1 set=mixed kinds=P targets=idle send=logical bsp_target=0 n=50 min=4999.4 p50=26996.6 p99=208973.7 p999=208973.7 max=208973.7 mean=44734.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=same kinds=PP targets=busy send=unicast bsp_target=0 n=50 min=24996.9 p50=218972.5 p99=286743949.4 p999=286743949.4 max=286743949.4 mean=12067602.8 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=same kinds=PP targets=idle send=unicast bsp_target=0 n=50 min=21997.2 p50=39995.0 p99=8114979.8 p999=8114979.8 max=8114979.8 mean=222892.0 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=same kinds=PP targets=busy send=logical bsp_target=0 n=50 min=9998.7 p50=134983.0 p99=25230827.9 p999=25230827.9 max=25230827.9 mean=696592.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=same kinds=PP targets=idle send=logical bsp_target=0 n=50 min=10998.6 p50=28996.4 p99=14147221.4 p999=14147221.4 max=14147221.4 mean=513735.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=other kinds=EE targets=busy send=unicast bsp_target=0 n=50 min=16997.9 p50=71990.9 p99=235775357.4 p999=235775357.4 max=235775357.4 mean=5941453.0 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=other kinds=EE targets=idle send=unicast bsp_target=0 n=50 min=15998.0 p50=41994.7 p99=1418821.6 p999=1418821.6 max=1418821.6 mean=88848.8 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=other kinds=EE targets=busy send=logical bsp_target=0 n=50 min=11998.5 p50=31996.0 p99=75990.4 p999=75990.4 max=75990.4 mean=36075.5 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=other kinds=EE targets=idle send=logical bsp_target=0 n=50 min=9998.7 p50=28996.4 p99=1835769.2 p999=1835769.2 max=1835769.2 mean=68171.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=mixed kinds=PE targets=busy send=unicast bsp_target=0 n=50 min=13998.2 p50=43994.5 p99=250186545.5 p999=250186545.5 max=250186545.5 mean=29890002.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=mixed kinds=PE targets=idle send=unicast bsp_target=0 n=50 min=12998.4 p50=30996.1 p99=1084863.6 p999=1084863.6 max=1084863.6 mean=59252.6 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=mixed kinds=PE targets=busy send=logical bsp_target=0 n=50 min=9998.7 p50=41994.7 p99=93988.2 p999=93988.2 max=93988.2 mean=45134.3 unit=ns
+R shoot initiator=2 initiator_kind=P others=2 set=mixed kinds=PE targets=idle send=logical bsp_target=0 n=50 min=20997.4 p50=45994.2 p99=115985.4 p999=115985.4 max=115985.4 mean=52033.5 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=same kinds=PPPPP targets=busy send=unicast bsp_target=0 n=50 min=45994.2 p50=159979.9 p99=17051856.2 p999=17051856.2 max=17051856.2 mean=611983.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=same kinds=PPPPP targets=idle send=unicast bsp_target=0 n=50 min=31996.0 p50=40994.8 p99=4238467.1 p999=4238467.1 max=4238467.1 mean=336457.7 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=same kinds=PPPPP targets=busy send=logical bsp_target=0 n=50 min=39995.0 p50=231970.8 p99=2199723.4 p999=2199723.4 max=2199723.4 mean=385951.5 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=same kinds=PPPPP targets=idle send=logical bsp_target=0 n=50 min=28996.4 p50=38995.1 p99=3182599.9 p999=3182599.9 max=3182599.9 mean=151201.0 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=other kinds=EEEEE targets=busy send=unicast bsp_target=0 n=50 min=46994.1 p50=151980.9 p99=1175852.2 p999=1175852.2 max=1175852.2 mean=281664.6 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=other kinds=EEEEE targets=idle send=unicast bsp_target=0 n=50 min=38995.1 p50=54993.1 p99=17099850.1 p999=17099850.1 max=17099850.1 mean=444844.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=other kinds=EEEEE targets=busy send=logical bsp_target=0 n=50 min=94988.1 p50=699912.0 p99=255336898.0 p999=255336898.0 max=255336898.0 mean=42947180.5 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=other kinds=EEEEE targets=idle send=logical bsp_target=0 n=50 min=30996.1 p50=68991.3 p99=3384574.5 p999=3384574.5 max=3384574.5 mean=622161.8 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=mixed kinds=PEPEP targets=busy send=unicast bsp_target=0 n=50 min=32995.9 p50=83989.4 p99=262764964.1 p999=262764964.1 max=262764964.1 mean=11029293.4 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=mixed kinds=PEPEP targets=idle send=unicast bsp_target=0 n=50 min=36995.3 p50=73990.7 p99=4807395.6 p999=4807395.6 max=4807395.6 mean=389151.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=mixed kinds=PEPEP targets=busy send=logical bsp_target=0 n=50 min=25996.7 p50=137982.7 p99=209517658.6 p999=209517658.6 max=209517658.6 mean=6330704.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=5 set=mixed kinds=PEPEP targets=idle send=logical bsp_target=0 n=50 min=30996.1 p50=62992.1 p99=7559049.6 p999=7559049.6 max=7559049.6 mean=455302.8 unit=ns
+R shoot initiator=2 initiator_kind=P others=13 set=mixed kinds=PEPEPEPEPEPEP targets=busy send=unicast bsp_target=1 n=50 min=18736644.4 p50=132401354.0 p99=349554052.7 p999=349554052.7 max=349554052.7 mean=149532840.1 unit=ns
+R shoot initiator=2 initiator_kind=P others=13 set=mixed kinds=PEPEPEPEPEPEP targets=idle send=unicast bsp_target=1 n=50 min=53993.2 p50=598924.7 p99=2791649.0 p999=2791649.0 max=2791649.0 mean=756664.9 unit=ns
+R shoot initiator=2 initiator_kind=P others=13 set=mixed kinds=PEPEPEPEPEPEP targets=busy send=logical bsp_target=1 n=50 min=145981.6 p50=604923.9 p99=120169891.8 p999=120169891.8 max=120169891.8 mean=6901532.3 unit=ns
+R shoot initiator=2 initiator_kind=P others=13 set=mixed kinds=PEPEPEPEPEPEP targets=idle send=logical bsp_target=1 n=50 min=61992.2 p50=128983.8 p99=1853766.9 p999=1853766.9 max=1853766.9 mean=370953.4 unit=ns
+I step shoot ends seconds=20
+I step trial skipped by configuration
+I step trial-efirst skipped by configuration
+I step trial-alternate skipped by configuration
+I step ept skipped by configuration
+I step warm-reset skipped by configuration
+I step init skipped by configuration
+I step bsp skipped by configuration
+I run complete boot=1

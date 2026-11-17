@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["abi", "trials/multicore"]
+members = ["abi", "trials/multicore", "trials/desktop/tables"]
 
 [workspace.package]
 edition = "2024"

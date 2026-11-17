@@ -25,17 +25,31 @@ jobs:
           args: "-p dodos-abi"
   # Miri and the sanitizer need a nightly compiler, which Nix does not pin
   # here. dodos-model has no unsafe code and long random tests: it is left out.
+  # In trials/, Miri covers the multicore trial's locks, ring and notify
+  # (`sync`, under Miri's data-race and weak-memory checks) and its pure
+  # parts; the simulation's tests measure real time over threads that spin
+  # for milliseconds, which Miri cannot run usefully, so they are ignored
+  # under Miri (`cfg_attr(miri, ignore)`). The tables tool forbids unsafe
+  # code and its test parses the whole QEMU run (426 s under Miri): left
+  # out. The desktop image is a UEFI program, not a workspace member.
   miri:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: rustup toolchain install nightly --profile minimal --component miri
-      - run: cargo +nightly miri test --workspace --exclude dodos-model
+      - run: cargo +nightly miri test --workspace --exclude dodos-model --exclude dodos-trial-desktop-tables
   sanitizer:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: rustup toolchain install nightly --profile minimal --component rust-src
-      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --lib --tests --workspace --exclude dodos-model
+      # The multicore trial's two latency comparisons are skipped: the
+      # sanitizer slows the code between the modelled costs, so their ratios
+      # measure the instrumentation, not the model.
+      - run: >-
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --lib --tests --workspace --exclude dodos-model --
+          --skip sim::tests::lazy_additions_wait_less_than_eager_ones
+          --skip sim::tests::lending_and_refusal_shorten_the_foreground_wait
         env:
           RUSTFLAGS: -Zsanitizer=address

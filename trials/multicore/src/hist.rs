@@ -2,6 +2,9 @@
 //! (under 1.6 % of error), so recording is one increment and no sample is
 //! dropped.
 
+use alloc::boxed::Box;
+use alloc::vec;
+
 const SUB: u64 = 64;
 const BUCKETS: usize = 64 + 58 * 64;
 
@@ -56,7 +59,10 @@ impl Hist {
 
     /// The value at quantile `q` (0..=1), in ns; 0 if empty.
     pub fn quantile(&self, q: f64) -> u64 {
-        let rank = ((self.n as f64 * q).ceil() as u64).max(1);
+        // The ceiling of n × q, without `f64::ceil` (not in `core`).
+        let x = self.n as f64 * q;
+        let t = x as u64;
+        let rank = if (t as f64) < x { t + 1 } else { t }.max(1);
         let mut seen = 0;
         for (b, c) in self.counts.iter().enumerate() {
             seen += c;

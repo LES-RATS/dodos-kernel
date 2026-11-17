@@ -2,10 +2,11 @@
 //! locks a group kernel could use, the ring between kernels, and the
 //! busy wait that stands for kernel work.
 
-use std::hint::{black_box, spin_loop};
-use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use crate::rt::{Duration, Instant};
+use alloc::boxed::Box;
+use core::hint::{black_box, spin_loop};
+use core::ops::Deref;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// One value alone in its cache line. 128 bytes: the line of Apple cores, and
 /// two lines on x86-64, whose adjacent-line prefetcher pairs lines anyway.
@@ -371,6 +372,7 @@ mod tests {
     /// its registration. A lost wake-up leaves a signal unseen.
     #[test]
     fn notify_loses_no_wake_up() {
+        let _host = crate::host::alone();
         let rounds = if cfg!(miri) { 50 } else { 20_000 };
         let n = Notify::new(LockKind::Queue);
         let woken = AtomicBool::new(false);
@@ -436,6 +438,7 @@ mod tests {
 
     #[test]
     fn every_lock_excludes() {
+        let _host = crate::host::alone();
         for kind in [LockKind::Ttas, LockKind::Ticket, LockKind::Queue] {
             assert_eq!(hammer(kind), 800, "{kind:?}");
         }
@@ -443,6 +446,7 @@ mod tests {
 
     #[test]
     fn ring_delivers_in_order_through_a_full_ring() {
+        let _host = crate::host::alone();
         let ring = Ring::default();
         let n = RING_SLOTS * 3;
         thread::scope(|s| {
