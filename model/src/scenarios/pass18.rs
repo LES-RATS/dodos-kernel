@@ -375,7 +375,7 @@ fn the_holder_refuses_an_interrupt_entry_cache_invalidation_of_a_handle_of_no_co
 
 /// Node `node` claims line `gsi` on its own core (node n runs on core n)
 /// into slot `slot`, and its claim completes.
-fn claim_line(m: &mut S, node: u16, gsi: u32, slot: u32) -> crate::Outcome {
+pub(super) fn claim_line(m: &mut S, node: u16, gsi: u32, slot: u32) -> crate::Outcome {
     let line = dodos_abi::IrqSource::line(gsi, false, false).raw();
     let outcome = m.call(node, claim_on(u64::from(node), line, slot));
     match outcome {
@@ -806,6 +806,17 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
         wait: 8,
     };
     let receiver = k.m.object_at(k.t, s(300)).unwrap();
+    // A second receiver on core 2, made before the first thread's count of
+    // `again` starts (any other result of its calls sets it to 0).
+    let second = k.thread_on(340, 2);
+    let recv_second = Syscall::Recv {
+        endpoint: s(310),
+        reply: s(345),
+        range: crate::Range::NONE,
+        wait: 0,
+    };
+    k.ok(k.retype(ObjectKind::Reply, 0, 345));
+    k.interrupts();
     for round in 0..2 {
         let lock = first_try(&k, k.t, &call);
         let cancel = Syscall::ThreadCancel(s(300), 7 + round);
@@ -826,6 +837,10 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
     // core 1's event; its escalation takes the quiet word, raises the epoch,
     // reads core 2's entry word below it and waits for core 2's event to
     // end, then runs alone: it queues.
+    // A second receiver, on core 2, waits behind the first: the escalated
+    // call delivers to it, a wake across cores, the effect it makes once it
+    // holds its locks.
+    assert_eq!(k.call(second, recv_second), WAITS);
     let lock = first_try(&k, k.t, &call);
     let cancel = Syscall::ThreadCancel(s(300), 9);
     k.m.hold(1, &[lock], Some((third, cancel)))
@@ -853,6 +868,12 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
                 .map(|i| i + q)
         });
     assert!(read.is_some() && first_lock > read, "{steps:?}");
+    // The escalated call delivered to the second receiver, after its locks.
+    assert!(k.m.woken(second).is_some());
+    let paid = steps
+        .iter()
+        .rposition(|s| *s == Step::Pay(crate::locks::Cost::Interrupt));
+    assert!(paid > first_lock, "{steps:?}");
     assert_eq!(k.m.threads[&k.t].again_tries, 0);
     // Its two rounds would return `again` a third time: it escalates, and
     // under the quiet word it only waits, in the order.

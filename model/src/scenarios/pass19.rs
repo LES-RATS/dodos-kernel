@@ -875,3 +875,132 @@ fn under_l2_a_fault_waits_for_the_core_that_holds_its_endpoint_and_is_delivered(
     assert!(matches!(k.m.woken(receiver), Some(Ok(Output::Message(_)))));
     assert!(!k.m.locks.steps.contains(&Step::Quiet(true)));
 }
+
+// `recv` and `reply_recv` make every try before the release of their
+// lends (D-137).
+
+#[test]
+fn under_l2_a_recv_whose_try_fails_returns_again_with_its_lends_still_held() {
+    let mut machine = one_node(Arch::X86_64, 3);
+    machine.locking = crate::Locking::L2;
+    let mut k = N::on(&machine);
+    k.place_first(0);
+    let caller = k.thread_on(320, 1);
+    k.ok(k.retype(ObjectKind::Endpoint, 0, 310));
+    k.ok(k.retype(ObjectKind::Reply, 0, 311));
+    k.ok(k.retype(ObjectKind::Notify, 0, 360));
+    // A passive server: no context of its own.
+    k.ok(k.retype(ObjectKind::Frame, 1, 342));
+    k.ok(k.retype(ObjectKind::Thread, 0, 340));
+    k.ok(Syscall::ThreadConfigure {
+        thread: s(340),
+        cspace: SlotAddr::own(dodos_abi::START_SLOT_CSPACE),
+        aspace: s(dodos_abi::START_SLOT_ASPACE),
+        fault: SlotAddr::NONE,
+        page: s(342),
+    });
+    k.ok(Syscall::ThreadResume(s(340)));
+    let server = k.m.object_at(k.t, s(340)).unwrap();
+    let recv = |range| Syscall::Recv {
+        endpoint: s(310),
+        reply: s(311),
+        range,
+        wait: 0,
+    };
+    assert_eq!(k.call(server, recv(crate::Range::NONE)), WAITS);
+    // The first thread calls: the server runs on its lent context.
+    let call = |caps| Syscall::Call {
+        endpoint: s(310),
+        message: crate::Message {
+            caps,
+            ..crate::Message::default()
+        },
+        range: crate::Range::NONE,
+        wait: 0,
+    };
+    assert_eq!(k.call(k.t, call(vec![])), WAITS);
+    // It answers through the reply object and keeps the lend until it
+    // receives again.
+    let answer = Syscall::Send {
+        target: s(311),
+        message: crate::Message::default(),
+    };
+    assert_eq!(k.call(server, answer), Ok(Output::Sent { flags: 0 }));
+    let lends = k.m.lends.clone();
+    assert!(!lends.is_empty());
+    // A second caller queues, moving a capability.
+    assert_eq!(
+        k.call(caller, call(vec![crate::Transfer::Move(s(360))])),
+        WAITS
+    );
+    // The server receives: it would release its lend, then take the
+    // queued caller, whose capability's segment it tries. Core 1 holds the
+    // context the lend returns to, core 2 that segment: the first try fails,
+    // the second round waits for core 1's event and its try of the segment
+    // fails again, so the call returns `again`, having released no lend.
+    let again = recv(crate::Range {
+        first: s(380),
+        count: 1,
+    });
+    let lock = super::pass18::first_try(&k, server, &again);
+    assert!(matches!(lock, LockId::Sched(_)), "{lock:?}");
+    k.m.hold(1, &[lock], None).expect("a second core");
+    let segment = LockId::Segment(
+        k.m.object_at(k.t, s(dodos_abi::START_SLOT_CSPACE)).unwrap(),
+        2,
+    );
+    k.m.hold(2, &[segment], None).expect("a third core");
+    assert_eq!(k.call(server, again), Err(Error::Again));
+    assert_eq!(k.m.lends, lends);
+}
+
+// The `Report` of a line carries the operands of its operation 5 claimed;
+// a new holder rewrites the line's entry from them (D-137).
+
+#[test]
+fn a_new_holder_of_an_ioapic_rewrites_a_reported_lines_entry_from_its_operands() {
+    let (mut m, _, _, _) = holder_requester_third();
+    let role = m.sys.node(0).ioapic_role(5).unwrap();
+    let holder = m.sys.role(role).holder();
+    let a = (0..3).find(|&n| n != holder).unwrap();
+    let killer = (0..3).find(|&n| n != holder && n != a).unwrap();
+    assert!(super::pass18::claim_line(&mut m, a, 5, 210).is_ok());
+    // The holder dies with the entry lost: the successor rebuilds it from
+    // a's report.
+    m.sys.edit_table(|t| {
+        t.units.entry(role).or_default().lines.remove(&5);
+    });
+    m.ok(killer, kill(holder));
+    m.run(30 * MS);
+    assert_ne!(m.sys.role(role).holder(), holder);
+    let generation = m.sys.member(a).generation();
+    let unit = &m.sys.canonical().units[&role];
+    assert_eq!(unit.lines.get(&5), Some(&(a, generation)));
+}
+
+// Two cores never hold one lock (D-137: a scripted holder is a second
+// core).
+
+#[test]
+fn a_second_core_never_takes_a_lock_another_core_holds() {
+    let (mut k, _, _, _) = super::pass18::l2_delivery();
+    let lock = LockId::Core(0);
+    k.m.hold(1, &[lock], None).expect("a second core");
+    assert_eq!(
+        k.m.hold(2, &[lock], None),
+        Err("two cores never hold one lock")
+    );
+    assert_eq!(
+        k.m.hold(1, &[LockId::Core(2)], None),
+        Err("a core is in one kernel event at a time")
+    );
+    // A holder whose trace breaks the order is reported.
+    k.m.contended.get_mut(&1).unwrap().steps.extend([
+        Step::Pay(crate::locks::Cost::Lock),
+        Step::Lock(LockId::Thread(k.t)),
+    ]);
+    assert_eq!(
+        k.m.check(),
+        Err("L2: a lock waited for out of the order fixed by kind")
+    );
+}
