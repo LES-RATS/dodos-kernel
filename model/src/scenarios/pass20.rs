@@ -728,3 +728,84 @@ fn a_detach_answered_failed_takes_the_device_out_of_the_header_and_leaves_the_wo
     let word = m.sys.canonical().attach_word(DEVICE as u32);
     assert_eq!(word.state(), Some(dodos_abi::AttachState::Attached));
 }
+
+// Mistral's eleventh model review: its surviving mutations killed (findings
+// 4, 5 and 6; 1, 2 and 3 left with L2).
+
+#[test]
+fn the_holders_gate_writes_detached_only_from_attached() {
+    use super::units::{DEVICE, IOMMU_ROLE};
+    let (mut m, _) = attach_in_flight();
+    let holder = m.sys.role(IOMMU_ROLE).holder();
+    let before = m.sys.canonical().attach_word(DEVICE as u32);
+    assert_eq!(before.state(), Some(dodos_abi::AttachState::Pinned));
+    let op = crate::rings::UnitOp::Detach {
+        device: DEVICE as u16,
+        domain: 0,
+    };
+    m.sys.node_mut(holder).detach_confirmed(IOMMU_ROLE, op);
+    assert_eq!(m.sys.node(holder).table.attach_word(DEVICE as u32), before);
+}
+
+#[test]
+fn no_gate_records_an_observation_while_the_release_word_is_raised() {
+    let mut m = S::two();
+    m.sys.hang(1, false);
+    m.sys.edit_table(|t| t.release = true);
+    let (sweep, stale) = (m.sys.canonical().sweep_ns, m.sys.canonical().stale_ns);
+    m.run(sweep + stale + 10 * MS);
+    assert!(m.sys.canonical().beacons[0].observations.is_empty());
+    assert_eq!(m.state(1), MemberState::Live);
+    m.sys.edit_table(|t| t.release = false);
+    m.run(sweep + 2 * stale + 10 * MS);
+    assert_ne!(m.state(1), MemberState::Live);
+}
+
+#[test]
+fn a_table_unhooked_by_a_record_whose_invalidation_is_in_flight_stays_off_the_free_list() {
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    let page = k.m.geometry().page();
+    let entries = u64::from(k.m.geometry().entries);
+    // An aspace made from an untyped: its tables come from it and go to
+    // its free list (the start-up space's tables are the kernel's).
+    k.ok(k.retype(ObjectKind::ASpace, 0, 360));
+    let space = k.m.object_at(k.t, s(360)).unwrap();
+    let mut caps = Vec::new();
+    for (slot, at) in [
+        (350u32, 4 * page * entries * entries),
+        (351, 8 * page * entries * entries),
+    ] {
+        k.ok(k.retype(ObjectKind::Frame, 1, slot));
+        k.ok(Syscall::ASpaceMap(crate::Map {
+            space: s(360),
+            frame: s(slot),
+            untyped: s(k.ut),
+            address: at,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        }));
+        caps.push(k.m.cap(k.t, s(slot), Rights::NONE).unwrap());
+    }
+    // Both records cleared, as by two changes whose invalidations are in
+    // flight (on x86-64 in a node of several cores); then the first one's
+    // completes.
+    k.m.clear_mapping_pub(caps[0]);
+    k.m.clear_mapping_pub(caps[1]);
+    let of = |k: &N, cap| {
+        k.m.aspaces[&space]
+            .unhooked
+            .iter()
+            .filter(|&&(by, _)| by == cap)
+            .count()
+    };
+    let second = of(&k, caps[1]);
+    assert!(of(&k, caps[0]) > 0 && second > 0);
+    k.m.finish_unmapping(caps[0]);
+    assert_eq!(of(&k, caps[0]), 0);
+    assert_eq!(
+        of(&k, caps[1]),
+        second,
+        "the second change's tables stay unhooked"
+    );
+}

@@ -693,7 +693,7 @@ impl Model {
     /// The holder's gate, once the invalidation that follows the clearing of
     /// a detached device's context entry is confirmed: the attach word
     /// *attached* becomes *detached* (D-137).
-    fn detach_confirmed(&mut self, role: usize, op: UnitOp) {
+    pub(crate) fn detach_confirmed(&mut self, role: usize, op: UnitOp) {
         let UnitOp::Detach { device, .. } = op else {
             return;
         };
