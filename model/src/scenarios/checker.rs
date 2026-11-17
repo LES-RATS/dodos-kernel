@@ -10,7 +10,7 @@ use crate::cores::{Completes, Flush, Request};
 use crate::locks::{Cost, LockId, Step};
 use crate::nodes::HwAction;
 use crate::table::{FenceStep, GrantState};
-use dodos_abi::{CHECK_MUL, CoreWord, Member, RoleWord};
+use dodos_abi::{CHECK_MUL, CoreWord, RoleWord};
 
 /// A node of two cores alone.
 fn node2() -> N {
@@ -439,6 +439,7 @@ fn a_grant_entry_unanswered_with_nothing_in_flight_is_reported() {
         t.grants[0].insert(
             7,
             crate::table::GrantEntry {
+                anchor: crate::table::Anchor::test(),
                 grantee: 1,
                 generation,
                 serial: 1,
@@ -517,35 +518,9 @@ fn a_word_marked_before_its_park_request_inside_the_event_is_reported() {
     );
 }
 
-#[test]
-fn a_grant_freed_while_its_holder_translates_to_it_is_reported() {
-    let mut m = S::two();
-    // A use entry of node 1 that counts a leaf under a grant of node 0 that
-    // node 0 no longer has.
-    let generation = m.sys.member(0).generation();
-    m.sys.edit_table(|t| {
-        t.uses[1].insert(
-            4,
-            crate::table::UseEntry {
-                granter: 0,
-                grant: 9,
-                serial: 1,
-                generation,
-                root: crate::ObjId(0),
-                leaves: 1,
-                release_pending: false,
-                signal_pending: false,
-            },
-        );
-    });
-    let report = m.sys.check().expect_err("spoiled");
-    assert!(
-        report.ends_with("G6: a grant freed while its holder translates to it")
-            || report.contains("58"),
-        "{report}"
-    );
-    let _ = Member::new;
-}
+// G6 is guarded by pass 18's `a_grant_freed_while_an_unfenced_holder_
+// translates_to_it_is_reported_by_g6`: on a running holder node invariant
+// 58 names the fault first (ver2-D 7 found the test here vacuous).
 
 #[test]
 fn a_thread_on_two_cores_is_reported() {

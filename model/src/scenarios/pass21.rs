@@ -577,9 +577,10 @@ fn deepseek12_m20_a_rebuild_writes_no_entry_for_a_report_whose_root_differs_from
     attached(&mut m, 0);
     let root = m.sys.canonical().attach_word(DEVICE as u32).root();
     let holder = m.sys.role(IOMMU_ROLE).holder();
+    let owner = (0, m.sys.canonical().generation(0));
     let node = m.sys.node_mut(holder);
-    assert!(node.rebuilt_attach(IOMMU_ROLE, DEVICE as u16, root));
-    assert!(!node.rebuilt_attach(IOMMU_ROLE, DEVICE as u16, root + 0x1000));
+    assert!(node.rebuilt_attach(IOMMU_ROLE, DEVICE as u16, root, owner));
+    assert!(!node.rebuilt_attach(IOMMU_ROLE, DEVICE as u16, root + 0x1000, owner));
 }
 
 #[test]

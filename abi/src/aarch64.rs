@@ -179,7 +179,27 @@ pub const fn exception_use(syndrome: u64) -> Option<ExceptionUse> {
     if ec == EC_IABT_LOWER || ec == EC_DABT_LOWER {
         return abort_use((syndrome & 0x3F) as u8);
     }
+    if ec == EC_SME {
+        return sme_use((syndrome & 0x7) as u8);
+    }
     class_use(ec)
+}
+
+/// An SME exception, by its trap code (`ESR_ELx` bits 2:0, Arm DDI 0487,
+/// D24.2, read in M.d): 0b000 SME trapped, the feature SME; 0b100 the
+/// register ZT0 trapped, the feature `SME2_ZT0`; 0b001, 0b010 and 0b011 an
+/// instruction refused by the thread's streaming or ZA state, an undefined
+/// instruction whatever the mask (the final review's verification of lot A,
+/// H1: every code read as SME, so a ZT0 trap looped). `None` for a reserved
+/// code.
+const fn sme_use(code: u8) -> Option<ExceptionUse> {
+    use crate::ExceptionUse::{Fault, Feature};
+    match code {
+        0b000 => Some(Feature(SME)),
+        0b100 => Some(Feature(SME2_ZT0)),
+        0b001..=0b011 => Some(Fault(FaultKind::Undefined)),
+        _ => None,
+    }
 }
 
 /// What an exception of class `ec` other than an abort from EL0 is.

@@ -37,7 +37,9 @@ impl Model {
     /// 47. an armed timer is listed once by its live notify and fires after
     ///     now; a notify lists only the armed timers that name it.
     pub(super) fn check_sched(&self) -> Check {
-        let runs = |thread: &ObjId| Self::runnable_thread(&self.threads[thread]);
+        // A lend to a thread that does not exist is named by 44 (or an
+        // earlier rule), never a panic of the check.
+        let runs = |thread: &ObjId| self.threads.get(thread).is_some_and(Self::runnable_thread);
         let mut entered = BTreeSet::new();
         let mut sums = vec![0u64; self.width()];
         for (&id, sched) in &self.scheds {
@@ -47,7 +49,8 @@ impl Model {
             let top = sched.chain.last().and_then(|reply| self.lends.get(reply));
             let holder = home.or(top.map(|&(_, receiver)| receiver));
             let dying = self.marked(id);
-            let eligible = sched.configured && !dying && holder.is_some_and(|h| runs(&h));
+            let eligible =
+                sched.configured && !sched.moving && !dying && holder.is_some_and(|h| runs(&h));
             let wanted = match (sched.configured && !dying, eligible, sched.throttled) {
                 (false, ..) => None,
                 (true, true, None) => Some((Queue::Ready, sched.deadline)),

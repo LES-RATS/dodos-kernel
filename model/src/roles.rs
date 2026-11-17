@@ -8,8 +8,8 @@ use crate::rings::{Body, Completes, Item, REPORT_ITEMS};
 use crate::units::Rebuild;
 use crate::{Model, ObjId, Outcome, Output, Wait, live};
 use dodos_abi::{
-    Error, FENCE_NS, IOMMU_WAIT_NS, MemberState, OwnState, Owner, Ownership, REPORT_END, Rights,
-    RoleKind, RoleState, RoleWord, SETTLE_NS, SlotAddr,
+    Error, FENCE_NS, MemberState, OwnState, Owner, Ownership, REPORT_END, Rights, RoleKind,
+    RoleState, RoleWord, SETTLE_NS, SlotAddr,
 };
 
 /// A planned hand-over of a unit role this node holds, steps 1 to 4: the
@@ -110,6 +110,13 @@ impl Model {
         }
         let word = self.table.roles[role];
         if word.state() != RoleState::Held || word.holder() != self.node {
+            return Err(Error::Busy);
+        }
+        // A role already in a hand-over, or rebuilding, is on its way out
+        // or not yet served: `busy`, as `hand_all_units` judges it (the
+        // final review's verification of lot C, O18 and H17: a second call
+        // orphaned the first, which never returned).
+        if self.handing.contains_key(&role) || self.rebuilds.contains_key(&role) {
             return Err(Error::Busy);
         }
         if target == Some(self.node) {
@@ -270,8 +277,12 @@ impl Model {
             finish(self, Err(Error::Busy));
             return true;
         }
+        // A request kept during a rebuild has asked the unit nothing: only
+        // a submitted one is begun (H17).
         let begun =
-            self.unit_service.values().any(|s| s.role == role)
+            self.unit_service
+                .values()
+                .any(|s| s.role == role && s.submitted.is_some())
                 || self.unit_requests.iter().flatten().any(|e| {
                     e.role == role && matches!(e.stage, crate::units::Stage::Local { .. })
                 });
@@ -280,7 +291,7 @@ impl Model {
             self.confirmed(role, serial)
         };
         if !drained {
-            if self.membership_now() >= hand.started + IOMMU_WAIT_NS {
+            if self.unit_overdue(hand.started) {
                 self.fail_unit(role);
                 finish(self, Err(Error::Busy));
                 return true;
@@ -393,6 +404,17 @@ impl Model {
         let mine = self.node;
         for node in (0..self.table.nodes).filter(|&z| z != mine) {
             let member = self.table.member(node);
+            // A dead node too (Roles, R1 at every change of holder: "fencing,
+            // fenced, unfenced or dead"): its entries on the unit are
+            // cleared, with no acknowledgement to withdraw (H12).
+            if member.state() == MemberState::Dead {
+                let g = member.generation();
+                let unit = self.table.units.entry(role).or_default();
+                unit.entries.retain(|_, &mut (n, e)| !(n == node && e == g));
+                unit.remap.retain(|_, &mut (n, e)| !(n == node && e == g));
+                unit.lines.retain(|_, &mut (n, e)| !(n == node && e == g));
+                continue;
+            }
             if !matches!(
                 member.state(),
                 MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
@@ -458,6 +480,9 @@ impl Model {
                 continue;
             }
             if !self.table.writes(z) {
+                if self.table.member(z).state() == MemberState::Sealed {
+                    rebuild.sealed.insert(z);
+                }
                 rebuild.node += 1;
                 continue;
             }
@@ -477,7 +502,10 @@ impl Model {
             let asked = self.write_message(z, body, Some(Completes::Report { role }), None);
             rebuild.asked = asked.is_ok();
             self.rebuilds.insert(role, rebuild);
-            return true;
+            // An ask that found no room or no credit is no progress, so a
+            // step does not spend its units on it (the final review's
+            // verification of lot C, H14).
+            return asked.is_ok();
         }
         // Every report is in: keep the entries that match, rewrite those
         // that differ, keep without a report the entries of a sealed node,
@@ -485,8 +513,12 @@ impl Model {
         // whole unit.
         let reported: Vec<(u16, Item)> = rebuild.items.clone();
         let generation = |model: &Self, z: u16| model.table.generation(z);
+        // The nodes passed over as sealed, and those sealed now (a node that
+        // sealed after its turn reported before it sealed).
         let sealed: Vec<u16> = (0..self.table.nodes)
-            .filter(|&z| self.table.member(z).state() == MemberState::Sealed)
+            .filter(|&z| {
+                rebuild.sealed.contains(&z) || self.table.member(z).state() == MemberState::Sealed
+            })
             .collect();
         let entries: Vec<(u16, (u16, u32))> = self
             .table
@@ -503,6 +535,16 @@ impl Model {
                 unit.entries.remove(&device);
             }
         }
+        // The remapping entries no report claims are cleared too (O17).
+        let remaps: Vec<(u32, (u16, u32))> = unit.remap.iter().map(|(&h, &e)| (h, e)).collect();
+        for (handle, (node, _)) in remaps {
+            let claimed = reported
+                .iter()
+                .any(|&(z, i)| z == node && i == Item::Handle(handle));
+            if !claimed && !sealed.contains(&node) {
+                unit.remap.remove(&handle);
+            }
+        }
         let lines: Vec<(u32, (u16, u32))> = unit.lines.iter().map(|(&l, &e)| (l, e)).collect();
         for (line, (node, _)) in lines {
             let claimed = reported
@@ -516,12 +558,24 @@ impl Model {
             let g = generation(self, z);
             match item {
                 // A context entry only for a device whose attach word reads
-                // *attached*, or *pinned* (moved to *attached* first, as at
-                // an attach), with the root the report names (D-137).
+                // *attached* with the root the report names (D-137) and
+                // whose identifier word names the reporter with its
+                // generation (D-141); an item that fails is traced and
+                // claims nothing.
                 Item::Device(device, root) => {
-                    if self.rebuilt_attach(role, device, root) {
-                        let unit = self.table.units.entry(role).or_default();
-                        unit.entries.insert(device, (z, g));
+                    let unit_entry = self.rebuilt_attach(role, device, root, (z, g));
+                    let unit = self.table.units.entry(role).or_default();
+                    match unit_entry {
+                        true => {
+                            unit.entries.insert(device, (z, g));
+                        }
+                        // A claimed entry whose report fails the check is
+                        // cleared, not kept with its old root (O19).
+                        false => {
+                            if unit.entries.get(&device).is_some_and(|&(n, _)| n == z) {
+                                unit.entries.remove(&device);
+                            }
+                        }
                     }
                 }
                 // A line's entry rewritten from the operands of its
@@ -544,7 +598,17 @@ impl Model {
                         };
                     }
                 }
-                Item::Handle(_) => {}
+                // A handle in the range of a core whose word names the
+                // reporter, checked as at its request (operation 4).
+                Item::Handle(handle) => {
+                    let op = crate::rings::UnitOp::InterruptCache {
+                        handle: handle as u16,
+                    };
+                    if self.operands_allowed(role, op, (z, g)) {
+                        let unit = self.table.units.entry(role).or_default();
+                        unit.remap.insert(handle, (z, g));
+                    }
+                }
             }
         }
         let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
@@ -554,15 +618,36 @@ impl Model {
     }
 
     /// A rebuild's check of a reported device: its attach word reads
-    /// *attached* with the root (D-137). A device whose attach is in flight
-    /// is in no header and no report; its kept attach is served once the
-    /// rebuild ends (the attach word against every event, D-139).
-    pub(crate) fn rebuilt_attach(&mut self, role: usize, device: u16, root: u64) -> bool {
+    /// *attached* with the root (D-137), and its identifier word names the
+    /// reporter with its generation, the check of operation 1 (D-141: a
+    /// faulty node could report another node's device under a domain number
+    /// of its own range). A device whose attach is in flight is in no header
+    /// and no report; its kept attach is served once the rebuild ends (the
+    /// attach word against every event, D-139).
+    pub(crate) fn rebuilt_attach(
+        &mut self,
+        role: usize,
+        device: u16,
+        root: u64,
+        (reporter, generation): (u16, u32),
+    ) -> bool {
         let Some(key) = self.attach_key(role, device) else {
             return false;
         };
         let word = self.table.attach_word(key);
-        word.root() == root && word.state() == Some(dodos_abi::AttachState::Attached)
+        let owned = self.table.identifiers.get(&key).is_some_and(|&raw| {
+            dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
+                w.state() == dodos_abi::OwnState::Taken
+                    && w.owner() == dodos_abi::Owner::Node(reporter)
+                    && w.generation() == generation
+            })
+        });
+        let good =
+            owned && word.root() == root && word.state() == Some(dodos_abi::AttachState::Attached);
+        if !good {
+            self.refuse_trace(reporter, dodos_abi::NodeMessage::Report, device);
+        }
+        good
     }
 
     /// The requests kept during a rebuild are served, first.
@@ -590,6 +675,9 @@ impl Model {
     pub(crate) fn items(&self, role: usize) -> Vec<Item> {
         let record = self.table.role_records[role];
         let mut items: Vec<Item> = match record.governs {
+            // Its devices, then the remapping handles it claimed whose entry
+            // the unit holds (the final review's verification of lot C,
+            // O17: no handle was ever reported).
             dodos_abi::Governs::IommuUnit => self
                 .iommus
                 .values()
@@ -600,6 +688,14 @@ impl Model {
                         Item::Device(d, root)
                     })
                 })
+                .chain(self.irqs.values().filter_map(|irq| {
+                    let handle = self.handle_of(irq);
+                    let entry = self.table.irq_tables.get(&handle)?;
+                    entry
+                        .units
+                        .contains(&role)
+                        .then_some(Item::Handle(u32::from(handle)))
+                }))
                 .collect(),
             dodos_abi::Governs::IoApic => self
                 .irqs
@@ -670,17 +766,38 @@ impl Model {
         let Completes::Report { role } = taken.completes else {
             return;
         };
-        let Some(rebuild) = self.rebuilds.get_mut(&role) else {
+        let Some(rebuild) = self.rebuilds.get(&role) else {
             return;
         };
-        rebuild.items.extend(items.into_iter().map(|i| (from, i)));
+        // The holder takes a `Report` only if it holds at most 28 items
+        // whose keys rise strictly from the key asked, and a next key, unless
+        // end, above the last of them; otherwise it traces it and treats
+        // that node's report as ended (D-141: a next key that did not
+        // advance kept the rebuild asking for ever).
+        let asked = rebuild.key;
+        let mut last = None;
+        let rising = items.iter().all(|item| {
+            let key = item.key();
+            let above = last.map_or(key >= asked, |l| key > l);
+            last = Some(key);
+            above
+        });
+        let advances = next == REPORT_END || last.map_or(next > asked, |l| next > l);
+        let good = items.len() <= REPORT_ITEMS && rising && advances;
+        if !good {
+            self.refuse_trace(from, dodos_abi::NodeMessage::Report, role as u16);
+        }
+        let rebuild = self.rebuilds.get_mut(&role).expect("a rebuild");
+        if good {
+            rebuild.items.extend(items.into_iter().map(|i| (from, i)));
+        }
         rebuild.asked = false;
         match next {
-            REPORT_END => {
+            key if good && key != REPORT_END => rebuild.key = key,
+            _ => {
                 rebuild.node = from + 1;
                 rebuild.key = 0;
             }
-            key => rebuild.key = key,
         }
     }
 }

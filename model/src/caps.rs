@@ -384,7 +384,7 @@ impl Model {
         let top = chain.last().and_then(|top| self.caps.get(top));
         let offset = top
             .and_then(|top| self.remotes.get(&top.object))
-            .map_or(0, |remote| remote.depth - 1);
+            .map_or(0, |remote| remote.depth.saturating_sub(1));
         chain.len() + offset
     }
 
@@ -392,7 +392,8 @@ impl Model {
     /// capability is placed in a slot of `space`: the tree is at most 64
     /// deep, and a capability space holds only what is deeper than itself.
     /// The root capability of another space must be deeper than the root
-    /// capability of `space`, and an untyped capability not less deep.
+    /// capability of `space`, and an untyped or `memory_control` capability
+    /// not less deep (D-141).
     pub(crate) fn fits(&self, space: ObjId, source: CapId, placing: Placing) -> Result<(), Error> {
         let own = self.objects[&space].root;
         let kind = self.objects[&self.caps[&source].object].kind;
@@ -404,7 +405,12 @@ impl Model {
             Placing::Retyped(kind) => (kind, true, self.depth(source) + 1),
         };
         let deep_enough = match kind {
-            ObjectKind::Untyped => depth >= self.depth(own),
+            // An `untyped` or a `memory_control` (a root or a copy) is
+            // placed only if its depth is not smaller than the root's: a
+            // `memory_control` derives untypeds, so a space made from one of
+            // its blocks could hold it otherwise, a cycle (D-103 amended by
+            // D-141).
+            ObjectKind::Untyped | ObjectKind::MemoryControl => depth >= self.depth(own),
             ObjectKind::CSpace if root => depth > self.depth(own),
             _ => true,
         };
@@ -556,6 +562,7 @@ impl Model {
                     watermark: 0,
                     clean: 0,
                     live: 0,
+                    lost: 0,
                     ready: None,
                 };
                 self.untypeds.insert(id, untyped);
@@ -971,24 +978,26 @@ impl Model {
                 None => return Undone::Nothing,
             },
             // Destroying a context clears its lends from the top of the
-            // chain down; destroying a notify disarms its armed timers.
+            // chain down.
             ObjectKind::Sched if self.clear_lend(object) => {}
             // Destroying a notify: its armed timers are disarmed, then its
-            // bound irqs unbound; destroying a task detaches its threads.
-            // Then its watch slots, one unit each (Cores).
+            // bound irqs unbound, then its watch slots cleared (Cores), then
+            // the grants that name it as a doorbell leave its list, one unit
+            // each.
             ObjectKind::Notify
                 if self.disarm_one(object)
                     || self.unbind_one_irq(object)
                     || self.unwatch_one(object)
                     || self.undoorbell_one(object) => {}
+            // Destroying a task detaches its threads.
             ObjectKind::Task if self.detach_one(object) => {}
+            ObjectKind::Irq => return self.irq_removal(object),
             // IOMMU: the destruction of an iospace first detaches each of its
             // devices, most recently attached first, then empties each record
             // of its list, most recently mapped first.
             // Once its devices are detached, it serves none, and its records
             // are emptied with their counts lowered once the detaches are
             // confirmed; a unit that failed keeps the counts.
-            ObjectKind::Irq => return self.irq_removal(object),
             ObjectKind::IoSpace => {
                 // While an attach to the iospace is in flight, the step
                 // waits; the device its answer brings into the header is
@@ -1009,47 +1018,36 @@ impl Model {
                 if device.is_none() && !header.is_empty() {
                     return Undone::Wait;
                 }
+                // Once no device is left to detach, a detach still in flight
+                // on a unit of the iospace holds the records and the root
+                // (D-137, D-139).
+                let units = self.aspaces[&object].units.clone();
+                let roles: Vec<usize> = units.iter().map(|&u| self.unit_role(u)).collect();
+                let pending = self.unit_requests.iter().flatten().any(|e| {
+                    roles.contains(&e.role) && matches!(e.op, crate::rings::UnitOp::Detach { .. })
+                });
+                if device.is_none() && pending {
+                    return Undone::Wait;
+                }
                 match (device, self.aspaces[&object].records.last().copied()) {
                     (Some((iommu, device)), _) => {
                         if self.detach(iommu, device).is_err() {
                             return Undone::Wait;
                         }
                     }
-                    (None, Some(cap)) => {
-                        let units = self.aspaces[&object].units.clone();
-                        let roles: Vec<usize> = units.iter().map(|&u| self.unit_role(u)).collect();
-                        let pending = self.unit_requests.iter().flatten().any(|e| {
-                            roles.contains(&e.role)
-                                && matches!(e.op, crate::rings::UnitOp::Detach { .. })
-                        });
-                        if pending {
-                            return Undone::Wait;
+                    (None, Some(cap)) => match self.caps[&cap].record {
+                        Record::Unmapping(_) => return Undone::Wait,
+                        _ if roles.iter().any(|&r| self.unit_failed(r)) => {
+                            self.clear_mapping(cap);
+                            self.freeze_unmapping(cap);
                         }
-                        match self.caps[&cap].record {
-                            Record::Unmapping(_) => return Undone::Wait,
-                            _ if roles.iter().any(|&r| self.unit_failed(r)) => {
-                                self.clear_mapping_pub(cap);
-                                self.freeze_unmapping(cap);
-                            }
-                            _ => self.empty_mapping(cap),
-                        }
-                    }
+                        _ => self.empty_mapping(cap),
+                    },
                     // A detach is a unit request: the root is not removed
                     // while one is in flight, so the attach words of its
                     // devices read 0 (or the unit failed) before the root
                     // can turn back into data (D-137).
-                    (None, None) => {
-                        let units = self.aspaces[&object].units.clone();
-                        let roles: Vec<usize> = units.iter().map(|&u| self.unit_role(u)).collect();
-                        let pending = self.unit_requests.iter().flatten().any(|e| {
-                            roles.contains(&e.role)
-                                && matches!(e.op, crate::rings::UnitOp::Detach { .. })
-                        });
-                        if pending {
-                            return Undone::Wait;
-                        }
-                        return Undone::Nothing;
-                    }
+                    (None, None) => return Undone::Nothing,
                 }
             }
             _ => return Undone::Nothing,
@@ -1142,7 +1140,10 @@ impl Model {
             ObjectKind::ASpace | ObjectKind::IoSpace => {
                 let space = self.aspaces.remove(&id).expect("names a live entry");
                 self.iospaces.remove(&id);
-                self.domains.remove(&id);
+                let domain = self.domains.remove(&id);
+                if let (Some(iommu), Some(domain)) = (self.kept.remove(&id), domain) {
+                    self.lost_domains.insert((self.iommus[&iommu].unit, domain));
+                }
                 // G2: the gate turns the table pages back into data, only
                 // once the root's count of devices is 0; a detach answered
                 // *failed* leaves the attach word *attached*, and the pages
@@ -1151,6 +1152,16 @@ impl Model {
                 let pinned = space.root.is_some_and(|r| self.table.attached_to(r) > 0);
                 for at in space.table_pages().filter(|_| !pinned) {
                     self.table.set_class(at / page, None);
+                }
+                // A pinned space's pages stay live pieces of their untyped,
+                // lost, so its watermark never returns over a root a context
+                // entry of a failed unit may still name (D-141; the final
+                // review's verification of lot B, finding 3).
+                if pinned {
+                    if let Some(from) = object.from {
+                        live(&mut self.untypeds, from).lost += 1 + space.tables as u32;
+                    }
+                    return;
                 }
                 for untyped in object
                     .from

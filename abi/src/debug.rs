@@ -25,7 +25,7 @@ pub const TRACE_BURST: u32 = 16;
 pub const TRACE_BURST_NS: u64 = 1_000_000;
 /// The pacing of the console: bytes per due event, and its period.
 pub const CONSOLE_STEP_BYTES: usize = 16;
-pub const CONSOLE_TICK_NS: u64 = 1_000_000;
+pub const CONSOLE_TICK_NS: u64 = 1_500_000;
 /// A core that does not stop for the stub within this is shown as running.
 pub const STUB_STOP_NS: u64 = 10_000_000;
 /// Entries of each ring copied into a core record.
@@ -56,6 +56,9 @@ pub enum TraceCode {
     BadWord = 10,
     /// A message between kernels refused: its sender may not send it.
     Refused = 11,
+    /// A debug area cleared at a core's start, because its header's next
+    /// sequences could not be continued (D-141).
+    AreaCleared = 12,
     UserText = 16,
     UserEmit = 17,
 }

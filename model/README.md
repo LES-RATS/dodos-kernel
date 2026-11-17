@@ -78,7 +78,25 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   barrier, the start instant of a request read under the lock, the route
   of a line on ARM64 and RISC-V, a refused detach at a destruction step,
   the invalidation of a line's remapping entry at its removal; then the
-  twelfth model review judged finding by finding),
+  twelfth model review judged finding by finding), `pass22.rs` (D-141,
+  the final review of pull request 3: a message's sender is its ring's
+  writer; a grant freed only when the holder's use entry counts no leaf,
+  and the holder maps only after the `SendAnswer` is consumed; the remote
+  frame read from the anchor in the grant entry, its rights and depth
+  included; `memory_control` placed only as the depth rule allows; a
+  debug area or crash header of another boot judged as faulty data; the
+  credits and the answer's room, the ring's indices, 16 entries per
+  interrupt; then the faults of the model the attacks and the code read
+  found: the start-up refusing the machine values out of range instead
+  of panicking, the start-up page and its copied frames counted at their
+  sizes and places, reserves and frozen entries, the rebuild of a unit
+  from its reports (handles, sealed nodes, roots), roles handed twice, a
+  core that goes idle answering a request that wakes a thread onto it,
+  the resume consuming its rings before it is live and finishing R2 and
+  R3 of a generation that ended while it was sealed, a refused start
+  parking its core, a spare core off on ARM64 and RISC-V, the gate
+  reading its member word for every word it writes, and the check's
+  invariants 3, 28 (the `memory_control`), 52 and G4 made exact),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -91,7 +109,11 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   the explorations reached.
 - `tests/`: the calls on one node, judged argument by argument, and the
   random walk of `property.rs` with its coverage floors (three quarters of
-  the counts measured on 17 November 2026, rounded up).
+  the counts measured on 17 November 2026, rounded up; the count of the
+  objects dying is sized by `ObjectKind::ALL`). `many_seeds`, ignored by
+  `verify`, walks 2,000 more seeds (`DODOS_PROPERTY_SEEDS` sets another
+  number) and names any seed that fails: `cargo test --release -p
+  dodos-model --test property many_seeds -- --ignored`.
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
 

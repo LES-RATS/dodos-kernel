@@ -694,21 +694,26 @@ fn iospace_attach_needs_manage_on_the_iommu_and_on_the_iospace() {
 
 #[test]
 fn unit_without_a_free_domain_number_is_busy() {
-    // One domain number for each node slot: number 0 is never used and the
-    // last is the kernel's own (Devices and shared hardware, D-134).
+    // The fewest domain numbers a unit has, 16 (VT-d's ND = 0; the start-up
+    // refuses fewer, D-141), shared out by node slot: number 0 is never used
+    // and the last is the kernel's own (Devices and shared hardware, D-134).
     let mut machine = Machine::example();
-    machine.iommus[0].domains = 2 + machine.nodes() as u32;
+    machine.iommus[0].domains = 16;
+    let per = (16 - 2) / machine.nodes() as u32;
     let mut k = K::on(&machine);
-    k.retype(UT, IoSpace, 0, 30);
-    k.retype(UT, IoSpace, 0, 31);
-    k.ok(attach(30, 0x10));
-    // The second device of the same iospace needs no new number.
-    k.ok(attach(30, 0x11));
-    k.no(attach(31, 0x12), Error::Busy);
+    for i in 0..=per {
+        k.retype(UT, IoSpace, 0, 30 + i);
+    }
+    for i in 0..per {
+        k.ok(attach(30 + i, 0x10 + u64::from(i)));
+    }
+    // A second device of the same iospace needs no new number.
+    k.ok(attach(30, 0x40));
+    k.no(attach(30 + per, 0x41), Error::Busy);
     // The number is freed with the last device.
     k.ok(attach(0, 0x10));
-    k.ok(attach(0, 0x11));
-    k.ok(attach(31, 0x12));
+    k.ok(attach(0, 0x40));
+    k.ok(attach(30 + per, 0x41));
 }
 
 #[test]
@@ -716,7 +721,7 @@ fn iospace_serves_devices_of_one_unit() {
     let mut machine = Machine::example();
     machine.iommus.push(IommuUnit {
         segment: 1,
-        domains: 4,
+        domains: 16,
     });
     let mut k = K::on(&machine);
     // The second unit's capability is in slot 19, then the roles (one more

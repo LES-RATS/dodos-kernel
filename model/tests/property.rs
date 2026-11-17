@@ -1629,7 +1629,7 @@ struct Reached {
     deepest: usize,
     longest_walk: usize,
     /// Steps after which an object of each kind was dying, by kind.
-    dying: [u32; 19],
+    dying: [u32; ObjectKind::ALL.len()],
     /// Steps after which a capability under `cap_delete` was dying while its
     /// object was not.
     dying_copies: u32,
@@ -2649,4 +2649,67 @@ fn same_seed_gives_the_same_state() {
 fn different_seeds_give_different_states() {
     let states = seeds().1.lock().unwrap();
     assert_ne!(states[1], states[2]);
+}
+
+/// A memory_control dying under a removal of more than one step is counted
+/// by its kind: the counter of dying kinds has a place for every kind
+/// (`dying` was 19 places for 21 kinds; the final review's verification of
+/// lot F1, D1).
+#[test]
+fn a_dying_memory_control_is_counted() {
+    let (mut model, first) = start();
+    let endpoints = (4000..4040).map(|slot| Syscall::UntypedRetype {
+        untyped: MEMORY,
+        kind: ObjectKind::Endpoint,
+        size: 0,
+        page: 0,
+        memory: 0,
+        destination: own(slot),
+    });
+    for call in endpoints {
+        assert_eq!(model.apply(first, call), Ok(Output::Done));
+    }
+    let delete = model.apply(first, Syscall::CapDelete(own(START_SLOT_MEMORY_CONTROL)));
+    assert_eq!(delete, Err(Error::Again));
+    let mut reached = Reached::default();
+    reached.count(&model);
+    assert_eq!(reached.dying[ObjectKind::MemoryControl as usize], 1);
+}
+
+/// The long run, outside `verify`: `DODOS_PROPERTY_SEEDS` seeds (2,000 if
+/// unset), as many at once as the machine has cores, every invariant
+/// checked after every call; the seeds that fail are named. Run with
+/// `cargo test --release -p dodos-model --test property many_seeds --
+/// --ignored`.
+#[test]
+#[ignore]
+fn many_seeds() {
+    let count: u64 = std::env::var("DODOS_PROPERTY_SEEDS")
+        .map(|s| s.parse().expect("DODOS_PROPERTY_SEEDS is a number"))
+        .unwrap_or(2000);
+    let width = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
+    let next = std::sync::atomic::AtomicU64::new(SEEDS);
+    let failed = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..width {
+            scope.spawn(|| {
+                loop {
+                    let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if seed >= SEEDS + count {
+                        break;
+                    }
+                    let one = std::panic::catch_unwind(|| {
+                        let mut reached = Reached::default();
+                        run(seed, &mut reached);
+                    });
+                    if one.is_err() {
+                        failed.lock().unwrap().push(seed);
+                    }
+                }
+            });
+        }
+    });
+    let mut failed = failed.into_inner().unwrap();
+    failed.sort();
+    assert!(failed.is_empty(), "failing seeds: {failed:?}");
 }

@@ -14,14 +14,23 @@ use dodos_abi::{
 /// 88: a ring whose next sequence is `next` holds each entry of sequence s
 /// at index (s − 1) mod N, the greatest being next − 1.
 fn ring_holds(ring: &[TraceEntry], next: u64, entries: u64) -> bool {
+    // A next sequence of 0, or an entry whose window passes 2^64, is
+    // reported, never a panic of the check (the final review's
+    // verifications of lots D and AD).
+    if next == 0 {
+        return false;
+    }
     let placed = ring.iter().enumerate().all(|(index, entry)| {
         entry.seq == 0
             || (entry.seq < next
-                && entry.seq + entries >= next
+                && entry
+                    .seq
+                    .checked_add(entries)
+                    .is_some_and(|top| top >= next)
                 && (entry.seq - 1) % entries == index as u64)
     });
     let last = next == 1 || ring[((next - 2) % entries) as usize].seq == next - 1;
-    next >= 1 && placed && last
+    placed && last
 }
 
 impl Model {
@@ -36,7 +45,8 @@ impl Model {
     /// 91. in each window of the rate limit (opened by an entry 1 ms after
     ///     the previous window), at most 16 entries of one code other than
     ///     3 and 6; the header counts every suppressed entry, reported by
-    ///     an entry of code 3 or still counted in the node block;
+    ///     an entry of code 3 or still counted in the core's part of the
+    ///     node block;
     /// 92. a committed core record of this boot has the boot identifier as
     ///     its commit; the previous crash area is never written;
     /// 93 (in `check_tree`) and: no port access touched a port refused to

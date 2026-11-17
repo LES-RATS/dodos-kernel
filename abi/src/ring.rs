@@ -221,10 +221,12 @@ impl RingHeader {
         }
     }
 
-    /// The credit and its serial, `None` for a message without one.
+    /// The credit and its serial, `None` for a message without one or for
+    /// an index that is no credit: 0 to 15 are the request credits, 16 to
+    /// 23 the send credits, 31 none, and no other value is a credit (D-141).
     pub const fn credit(&self) -> Option<(u8, u32)> {
         let index = (self.credit & 0x1f) as u8;
-        if index == CREDIT_NONE {
+        if index as usize >= REQUESTS_PER_PEER + SENDS_PER_PEER {
             None
         } else {
             Some((index, self.credit >> 5))
@@ -289,6 +291,23 @@ pub enum UnitOperation {
 mod proofs {
     use super::*;
 
+    /// A header's credit is a request or a send credit, or none (D-141).
+    #[kani::proof]
+    fn a_credit_is_one_of_the_credits() {
+        let header = RingHeader {
+            kind: kani::any(),
+            length: kani::any(),
+            sender: kani::any(),
+            sender_generation: kani::any(),
+            receiver_generation: kani::any(),
+            credit: kani::any(),
+        };
+        if let Some((index, serial)) = header.credit() {
+            assert!((index as usize) < REQUESTS_PER_PEER + SENDS_PER_PEER);
+            assert!(serial == header.credit >> 5);
+        }
+    }
+
     /// The ring indices: a message that fits leaves the producer at most
     /// the ring's entries ahead of the consumer, and its reserve free; a
     /// resynchronised consumer is never more than the ring's entries behind
@@ -332,12 +351,13 @@ mod proofs {
         }
     }
 
-    /// The credit and its serial read back, and a header with no credit
-    /// reads none.
+    /// A credit (an index below 24, D-141) and its serial read back, and a
+    /// header with no credit reads none.
     #[kani::proof]
     fn a_header_reads_back_its_credit() {
         let (index, serial): (u8, u32) = (kani::any(), kani::any());
-        kani::assume(index < CREDIT_NONE && serial <= CREDIT_SERIAL_MASK);
+        kani::assume((index as usize) < REQUESTS_PER_PEER + SENDS_PER_PEER);
+        kani::assume(serial <= CREDIT_SERIAL_MASK);
         let kind = NodeMessage::Revoke;
         let header = RingHeader::new(
             kind,

@@ -26,6 +26,10 @@ fn judge_write(write: &crate::table::WordWrite) -> Check {
         return ensure_write(false);
     };
     let writer = write.writer;
+    // The writer's gate read its member word first and let it write.
+    if !write.writes {
+        return ensure_write(false);
+    }
     let reserve = (0xFFF0..0xFFF8).contains(&owner);
     // The word as its writer held it: taken by its generation, or by a
     // reserve whose role it held.
@@ -44,7 +48,10 @@ fn judge_write(write: &crate::table::WordWrite) -> Check {
                     m.state() == dodos_abi::MemberState::Dead || state == 2 && m.generation() != g
                 }),
             };
-            let named = after_owner == writer || after_owner == owner;
+            // Taken in the writer's name, or a reserve's word in the
+            // reserve's name; never in the old owner's or unclaimed
+            // (ver2-D 1).
+            let named = after_owner == writer || reserve && after_owner == owner;
             ensure_write(state != 0 && allowed && named && after_g == write.generation)
         }
         // A release or a give: the word was held by the writer; or

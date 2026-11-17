@@ -259,6 +259,17 @@ impl Model {
         };
         if self.threads.get(&thread).is_some_and(|t| t.leaving) {
             live(&mut self.threads, thread).leaving = false;
+            // The context it ran on, moved meanwhile, may run on its new
+            // core from now on (D-141).
+            if let Some((context, _)) = self.cores[at].running
+                && let Some(sched) = self.scheds.get_mut(&context)
+                && sched.moving
+            {
+                sched.moving = false;
+                if !self.change_list.contains(&context) {
+                    self.change_list.push(context);
+                }
+            }
             self.cores[at].thread = None;
             self.cores[at].running = None;
             self.observe();
@@ -600,11 +611,18 @@ impl Model {
         if !allowed {
             return false;
         }
-        let page = address / self.page() * self.page();
+        // The base of the translation that covers the address, which is
+        // the key the core's TLB holds it by: a large page is invalidated
+        // whole (the final review's verification of lot C, H5).
+        let (&base, _) = self.aspaces[&space]
+            .translations
+            .range(..=address)
+            .next_back()
+            .expect("translated");
         let core = self.core_of(thread);
         let flush = Flush::Range {
             space,
-            addresses: vec![page],
+            addresses: vec![base],
         };
         self.invalidate_on(core, &flush);
         true
@@ -778,7 +796,6 @@ impl Model {
         };
         let part = &mut self.cores[position];
         part.silent = false;
-        let part = &mut self.cores[position];
         part.tlb.clear();
         part.kernel_tlb.clear();
         part.cached.0 = (u64::MAX, None);

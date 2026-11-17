@@ -74,7 +74,12 @@ impl Model {
                 && frame.pages == 1
                 && frame.memory == MemoryType::WriteBack
         });
-        if self.objects[&object].kind == ObjectKind::Frame && !one_page {
+        // A remote frame is refused, judged with its kind: the kernel
+        // reaches the page through its own mapping of memory its node holds
+        // (Grants, using a remote frame capability; the final review's
+        // verification of lot B, finding 5).
+        let remote = self.remotes.contains_key(&object);
+        if self.objects[&object].kind == ObjectKind::Frame && (!one_page || remote) {
             return Err(Error::Invalid);
         }
         self.is(cap, ObjectKind::Frame, Rights::READ.union(Rights::WRITE))?;
@@ -169,7 +174,10 @@ impl Model {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
         let needed = self.thread_size(mask)?;
         let changed = &self.threads[&target];
-        if !changed.suspended || changed.wait != Wait::None {
+        // A thread marked *leaving its core* still has its state on another
+        // core: `busy`, as for the register calls (A node of several cores;
+        // the final review's verification of lot B, O24).
+        if !changed.suspended || changed.wait != Wait::None || changed.leaving {
             return Err(Error::Busy);
         }
         if needed > changed.area {

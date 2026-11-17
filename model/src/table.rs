@@ -205,12 +205,45 @@ impl FenceRecord {
     }
 }
 
-/// A grant entry of the granting node: the grantee and its generation,
-/// the serial, the state, the use index and the bit *answered* written
-/// from the `SendAnswer`, and the doorbell (a notify of the granting node
-/// and the bits it sets). Its anchor is a slot of the granting node.
+/// What the anchor of a grant says, in the 64 bytes of its slot inside the
+/// grant entry, which every node reads: the frame (its address, page size,
+/// pages and memory type), its rights and its depth. A remote frame
+/// capability takes all of them from here, never from the `Send` (Grants,
+/// a remote frame capability, D-141).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Anchor {
+    pub(crate) frame: crate::Frame,
+    pub(crate) rights: dodos_abi::Rights,
+    pub(crate) depth: usize,
+}
+
+impl Anchor {
+    /// An anchor of one page of ordinary memory at depth 2, for the tests
+    /// that write a grant entry by hand.
+    #[cfg(test)]
+    pub(crate) fn test() -> Self {
+        Self {
+            frame: crate::Frame {
+                page: dodos_abi::PageSize::Page,
+                pages: 1,
+                memory: dodos_abi::MemoryType::WriteBack,
+                base: 0,
+                kept: false,
+            },
+            rights: dodos_abi::Rights::READ,
+            depth: 2,
+        }
+    }
+}
+
+/// A grant entry of the granting node: its anchor, the grantee and its
+/// generation, the serial, the state, the use index and the bit *answered*
+/// written from the `SendAnswer`, and the doorbell (a notify of the
+/// granting node and the bits it sets). The anchor's slot is also in the
+/// granting node's derivation list.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GrantEntry {
+    pub(crate) anchor: Anchor,
     pub(crate) grantee: u16,
     pub(crate) generation: u32,
     pub(crate) serial: u32,
@@ -263,6 +296,9 @@ pub(crate) struct WordWrite {
     pub(crate) owner: Option<Member>,
     pub(crate) holds: bool,
     pub(crate) holder: Option<Member>,
+    /// Whether the writer's member word let its gate write (starting,
+    /// live or sealing), read before the write.
+    pub(crate) writes: bool,
     pub(crate) before: u64,
     pub(crate) after: u64,
 }
@@ -469,7 +505,9 @@ impl Table {
         )
     }
 
-    /// The gate writes a member word, by compare-and-swap.
+    /// The gate writes a member word. The model runs one event at a time,
+    /// so no other writer can change the word between its read and this
+    /// write; the caller reads the word it replaces (ver-B O20).
     pub(crate) fn write_member(&mut self, writer: u16, node: u16, to: Member) {
         let before = self.members[node as usize];
         self.members[node as usize] = to;
@@ -601,6 +639,7 @@ impl Table {
             owner,
             holds: reserve.is_some_and(|j| self.holds_reserve(writer, j)),
             holder,
+            writes: self.member(writer).writes(),
             before,
             after,
         }
@@ -644,7 +683,7 @@ impl Table {
         before: u64,
         after: Ownership,
     ) {
-        if self.owners[chunk as usize] != before {
+        if !self.member(writer).writes() || self.owners[chunk as usize] != before {
             return;
         }
         let write = self.journal(writer, Word::Chunk(chunk), before, after.raw());
@@ -668,6 +707,11 @@ impl Table {
     /// writer's generation, or `None` for *free*, unclaimed (a word not
     /// listed).
     pub(crate) fn write_identifier(&mut self, writer: u16, key: u32, after: Option<Ownership>) {
+        // Every write through a gate first reads the writer's member word
+        // (ver-B O21).
+        if !self.member(writer).writes() {
+            return;
+        }
         let unclaimed = Ownership::free(Owner::Unclaimed).raw();
         let before = self.identifiers.get(&key).copied().unwrap_or(unclaimed);
         let after_raw = after.map_or(unclaimed, Ownership::raw);
@@ -726,6 +770,9 @@ impl Table {
     /// or `None` for *free*, unclaimed; also R6's clearing of a word that a
     /// generation that is over took, to its cleared value.
     pub(crate) fn write_line(&mut self, writer: u16, gsi: u32, after: Option<Ownership>) {
+        if !self.member(writer).writes() {
+            return;
+        }
         let unclaimed = Ownership::free(Owner::Unclaimed).raw();
         let before = self.lines.get(&gsi).copied().unwrap_or(unclaimed);
         let after_raw = after.map_or(unclaimed, Ownership::raw);

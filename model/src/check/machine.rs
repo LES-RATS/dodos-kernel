@@ -146,10 +146,19 @@ impl System {
             let counted = if alive { held == count } else { held <= count };
             ensure(counted, "G4: a map count is not the leaves of its chunk")?;
         }
+        // A device entry as a chunk: its count is its leaves while the node
+        // that owns it runs, and at least them otherwise (a frozen count,
+        // G5; ver2-D 5).
         for (entry, &held) in entries.iter().enumerate() {
+            let count = table.device_leaves[entry];
+            let word = table.devices[entry].owner;
+            let alive = word.state() == dodos_abi::OwnState::Taken
+                && matches!(word.owner(), dodos_abi::Owner::Node(n)
+                    if self.has_generation(n, word.generation()) && self.running_node(n));
+            let counted = if alive { held == count } else { held <= count };
             ensure(
-                held <= table.device_leaves[entry],
-                "G4: a leaf count below its leaves",
+                counted,
+                "G4: a device leaf count is not the leaves of its entry",
             )?;
         }
         Ok(())

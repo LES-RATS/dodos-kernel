@@ -254,9 +254,9 @@ impl Model {
                 },
             );
         }
-        self.start_image = (image == dodos_abi::NODE_IMAGE_REPLACEMENT, module);
         if mode == NODE_START_RESUME {
-            self.table.resume_replacement[target as usize] = self.start_image.0;
+            self.table.resume_replacement[target as usize] =
+                image == dodos_abi::NODE_IMAGE_REPLACEMENT;
         }
         Ok(Output::Done)
     }
@@ -1093,7 +1093,7 @@ impl Model {
                 && self.table.units[&role]
                     .queue
                     .iter()
-                    .any(|&(s, at)| s == serial && at + dodos_abi::IOMMU_WAIT_NS <= self.now)
+                    .any(|&(s, at)| s == serial && self.unit_overdue(at))
             {
                 self.fail_unit(role);
             }
@@ -1280,7 +1280,7 @@ impl Model {
         (untyped.base >> shift..(untyped.base + untyped.bytes) >> shift).all(|c| {
             dodos_abi::Ownership::from_raw(self.table.owners[c as usize]).is_some_and(|w| {
                 w.state() == dodos_abi::OwnState::Taken
-                    && (w.owner() == me || matches!(w.owner(), dodos_abi::Owner::Reserve(_)))
+                    && w.owner() == me
                     && w.generation() == generation
             })
         })
@@ -1432,7 +1432,7 @@ impl Model {
                                 .remove(&grant)
                                 .expect("listed");
                             self.table.serials[node as usize]
-                                .insert(grant, (entry.serial + 1) & 0x3FFF_FFFF);
+                                .insert(grant, crate::grants::next_serial(entry.serial));
                         }
                         None => cursor = Clear { phase: 3, index: 0 },
                     }
@@ -1705,6 +1705,51 @@ impl Model {
                     self.r0_effects(node, old);
                 }
                 any |= self.drop_ended(node, old, units);
+                // R2 and R3 finish before the node goes on, as a reclaim
+                // does (H8).
+                if self.stale_remote(node).is_some() || self.pinned_over() {
+                    return any;
+                }
+            }
+        }
+        // Then it consumes what waited in its rings under the check, one
+        // message a unit, and only then becomes live (`node_start` mode
+        // resume; H8). What waited: the entries before the producer index
+        // read now, so that a peer that keeps writing does not hold the
+        // resume.
+        let me = self.node;
+        let marks = self.resume_marks.clone().unwrap_or_else(|| {
+            (0..self.table.nodes)
+                .map(|from| match from == me {
+                    true => (0, 0),
+                    false => (
+                        self.ring_of(from, me, false).produced,
+                        self.ring_of(from, me, true).produced,
+                    ),
+                })
+                .collect()
+        });
+        self.resume_marks = Some(marks.clone());
+        for from in (0..self.table.nodes).filter(|&f| f != me) {
+            let (kernel, user) = marks[from as usize];
+            for (is_user, mark, size) in [
+                (false, kernel, dodos_abi::RING_KERNEL_ENTRIES),
+                (true, user, dodos_abi::RING_USER_ENTRIES),
+            ] {
+                loop {
+                    let left = mark.wrapping_sub(self.consumed(from, me, is_user));
+                    if left == 0 || left > size {
+                        break;
+                    }
+                    if *units == 0 {
+                        return any;
+                    }
+                    *units -= 1;
+                    any = true;
+                    if self.consume(from, is_user, 1) == 0 {
+                        break;
+                    }
+                }
             }
         }
         if self.cores.iter().all(|c| !c.silent) {
@@ -1712,6 +1757,7 @@ impl Model {
             self.resuming = false;
             self.sealed_view.clear();
             self.ended_done.clear();
+            self.resume_marks = None;
             let live = Member::new(
                 MemberState::Live,
                 member.evidence(),
@@ -1747,15 +1793,7 @@ impl Model {
         }
         let mut any = false;
         while *units > 0 {
-            let me = self.node as usize;
-            let stale = self.remotes.iter().find(|(_, r)| {
-                let used = self.table.uses[me].get(&r.use_entry);
-                r.node == node
-                    && used.is_none_or(|u| {
-                        u.generation != self.table.generation(node) || !self.table.writes(node)
-                    })
-            });
-            let Some(root) = stale.map(|(&o, _)| self.objects[&o].root) else {
+            let Some(root) = self.stale_remote(node) else {
                 break;
             };
             *units -= 1;
@@ -1766,6 +1804,28 @@ impl Model {
             }
         }
         any | self.unpin(units)
+    }
+
+    /// The root of a remote capability of `node` whose use entry is gone or
+    /// belongs to a generation that is over.
+    fn stale_remote(&self, node: u16) -> Option<crate::CapId> {
+        let me = self.node as usize;
+        let stale = self.remotes.iter().find(|(_, r)| {
+            let used = self.table.uses[me].get(&r.use_entry);
+            r.node == node
+                && used.is_none_or(|u| {
+                    u.generation != self.table.generation(node) || !self.table.writes(node)
+                })
+        });
+        stale.map(|(&o, _)| self.objects[&o].root)
+    }
+
+    /// Whether a grant of this node is pinned to a grantee whose generation
+    /// is over (R3 left to do).
+    fn pinned_over(&self) -> bool {
+        self.table.grants[self.node as usize]
+            .values()
+            .any(|e| e.state == crate::table::GrantState::Pinned && self.grantee_over(e))
     }
 
     /// The starts this node drives: each core's start request written, and
@@ -1899,9 +1959,7 @@ impl Model {
                     MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
                 )
         });
-        let pinned = self.table.grants[self.node as usize]
-            .values()
-            .any(|e| e.state == crate::table::GrantState::Pinned && self.grantee_over(e));
+        let pinned = self.pinned_over();
         let pending = self.table.uses[self.node as usize]
             .values()
             .any(|u| u.release_pending || u.signal_pending);
@@ -1922,11 +1980,15 @@ impl Model {
             || self.starts.iter().any(|(&core, s)| self.start_due(core, s))
     }
 
-    /// One step of the recovery reserve, on the node's first core: at most
-    /// 32 units of work, in this order: membership, the seal or the resume,
-    /// the starts it drives, the fences, the reclaims and R6, the roles,
-    /// the units, the kernel rings, the pending releases and signals, the
-    /// observations and accusations.
+    /// One step of the recovery reserve, on the node's first core, in this
+    /// order: membership, the seal or the resume, the starts it drives, the
+    /// fences, the reclaims and R6, the pinned grants, the units, the kernel
+    /// rings, the roles, the pending releases and signals, the observations
+    /// and accusations. At most 32 units of work are taken by the seal or
+    /// resume, the reclaims, the pinned grants, the kernel rings and the
+    /// roles; the starts, the fences, the units, the pending messages (at
+    /// most `PENDING_STEP`) and the observations take a bounded amount
+    /// beside them (O15).
     pub(crate) fn reserve_step(&mut self) {
         let mut units = REMOVAL_STEP;
         let seen = self.seen.clone();

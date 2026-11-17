@@ -75,13 +75,15 @@ pub enum Item {
 }
 
 impl Item {
-    /// The key of an item in the fixed order of a report: the devices by
-    /// identifier, then the handles, then the lines.
+    /// The key of an item in the fixed order of a report: its kind in bits
+    /// 61-63 (0 a device, 1 a remapping handle, 2 a line), its identifier
+    /// below, so keys compare as numbers in that order (the words of a
+    /// `Report`, D-141).
     pub(crate) fn key(self) -> u64 {
         match self {
             Item::Device(d, _) => u64::from(d),
-            Item::Handle(h) => 1 << 32 | u64::from(h),
-            Item::Line(l, ..) => 2 << 32 | u64::from(l),
+            Item::Handle(h) => 1 << 61 | u64::from(h),
+            Item::Line(l, ..) => 2 << 61 | u64::from(l),
         }
     }
 }
@@ -168,7 +170,9 @@ impl Body {
             Body::Signal { .. } | Body::Handed { .. } => 1,
             Body::UnitRequest { .. } => 3,
             Body::UnitAnswer { .. } | Body::ReportAsk { .. } => 2,
-            Body::Report { items, .. } => 1 + 3 * items.len(),
+            // The number of items, the next key, then three words each
+            // (D-141).
+            Body::Report { items, .. } => 2 + 3 * items.len(),
             Body::SendAnswer { uses, .. } => 1 + uses.len(),
             Body::Send { grants, words, .. } => 3 + grants.len() + words.len(),
         }
@@ -269,7 +273,7 @@ pub(crate) enum Full {
 
 impl Model {
     /// The ring pair `from` → `to`.
-    fn ring_of(&self, from: u16, to: u16, user: bool) -> &crate::table::Ring {
+    pub(crate) fn ring_of(&self, from: u16, to: u16, user: bool) -> &crate::table::Ring {
         let pair = &self.table.rings[from as usize][to as usize];
         if user { &pair.user } else { &pair.kernel }
     }
@@ -371,12 +375,16 @@ impl Model {
     }
 
     /// The one check on every message received (D-124, D-129, D-131), in
-    /// one function and before anything changes. `None` passes; `Some`
-    /// names what it named, for the trace (code 11).
-    pub(crate) fn refused(&self, message: &Message) -> Option<u64> {
+    /// one function and before anything changes, on a message read from the
+    /// ring `from` → this node. `None` passes; `Some` names what it named,
+    /// for the trace (code 11).
+    pub(crate) fn refused(&self, from: u16, message: &Message) -> Option<u64> {
         let header = &message.header;
         let sender = header.sender;
-        if sender >= self.table.nodes {
+        // The sender the header names is the node whose ring the message
+        // was read from: the gate maps that ring writable in that node's
+        // kernel alone, so the ring says who wrote it (D-141).
+        if sender != from || sender >= self.table.nodes {
             return Some(0);
         }
         // The sender's member word is starting, live, sealing or sealed
@@ -399,6 +407,40 @@ impl Model {
         }
         let generation = header.sender_generation;
         let me = self.node as usize;
+        // A request names a credit of its kind's range (a `UnitRequest`
+        // one whose entry of the unit service table is free), and its answer
+        // fits in the free entries of the kernel ring toward its sender
+        // (D-141).
+        let kind = message.body.kind();
+        let answer = NodeMessage::ALL
+            .into_iter()
+            .find(|k| k.answers() == Some(kind));
+        if let Some(answer) = answer {
+            let send = kind == NodeMessage::Send;
+            let range = match send {
+                false => 0..REQUESTS_PER_PEER,
+                true => REQUESTS_PER_PEER..REQUESTS_PER_PEER + SENDS_PER_PEER,
+            };
+            let Some((index, _)) = header
+                .credit()
+                .filter(|(i, _)| range.contains(&(*i as usize)))
+            else {
+                return Some(u64::from(header.credit));
+            };
+            if matches!(message.body, Body::UnitRequest { .. })
+                && self.unit_service.contains_key(&(sender, index))
+            {
+                return Some(u64::from(header.credit));
+            }
+            let most = match answer {
+                NodeMessage::Report => dodos_abi::RING_MESSAGE_ENTRIES_MAX as u64,
+                NodeMessage::SendAnswer => message_entries(1 + dodos_abi::SEND_GRANTS_MAX) as u64,
+                _ => message_entries(2) as u64,
+            };
+            if !self.ring_room(sender, answer, most) {
+                return Some(u64::from(header.credit));
+            }
+        }
         // By kind.
         match &message.body {
             // A message that names a grant matches the entry it names: the
@@ -455,9 +497,48 @@ impl Model {
             // A `Send`'s stamp carries 0 (a sender attached to no task) or
             // a task identifier of the sender's node with a counter that is
             // not 0 (D-134).
-            Body::Send { stamp, .. } => {
+            Body::Send {
+                header: inner,
+                stamp,
+                grants,
+                words,
+            } => {
                 let task = dodos_abi::TaskId::from_raw(stamp.0);
-                (stamp.0 != 0 && (task.counter() == 0 || task.node() != sender)).then_some(stamp.0)
+                if stamp.0 != 0 && (task.counter() == 0 || task.node() != sender) {
+                    return Some(stamp.0);
+                }
+                // Its marks have no reserved bit, and its header is one a
+                // local `send` accepts with no flag, with as many
+                // capabilities as the grants it names (D-141).
+                let local = Header::new(inner.label(), words.len(), grants.len(), 0);
+                if dodos_abi::Marks::from_bits(stamp.1).is_err()
+                    || local.ok() != Some(*inner)
+                    || grants.len() > dodos_abi::SEND_GRANTS_MAX
+                {
+                    return Some(stamp.1);
+                }
+                // Each grant it names is an entry of the sender's grant
+                // table, live, to this node with its current generation,
+                // with that serial, not answered, with the rights stated,
+                // and an anchor of depth 1 to 64; none is named twice.
+                let mine = self.table.generation(self.node);
+                let table = &self.table.grants[sender as usize];
+                for (i, granted) in grants.iter().enumerate() {
+                    let good = table.get(&granted.grant).is_some_and(|e| {
+                        e.state == crate::table::GrantState::Live
+                            && e.grantee == self.node
+                            && e.generation == mine
+                            && e.serial == granted.serial
+                            && !e.answered
+                            && e.anchor.rights == granted.rights
+                            && (1..=dodos_abi::TREE_DEPTH).contains(&e.anchor.depth)
+                    });
+                    let twice = grants[..i].iter().any(|g| g.grant == granted.grant);
+                    if !good || twice {
+                        return Some(u64::from(granted.grant));
+                    }
+                }
+                None
             }
             // An answer names a credit of this node toward the sender that
             // is in use, with that serial and the kind of request it
@@ -470,14 +551,36 @@ impl Model {
                 let in_use = header
                     .credit()
                     .is_some_and(|(index, serial)| self.credit_in_use(sender, index, serial, kind));
-                (!in_use).then_some(u64::from(header.credit))
+                if !in_use {
+                    return Some(u64::from(header.credit));
+                }
+                // A `SendAnswer` gives one word per grant of the send it
+                // answers, none of them a use index if nothing was
+                // delivered (D-141).
+                if let Body::SendAnswer {
+                    delivered, uses, ..
+                } = &message.body
+                {
+                    let (index, _) = header.credit().expect("in use");
+                    let sent = match &self.peers[sender as usize].credits[index as usize] {
+                        Some(Credit {
+                            completes: Completes::Send { grants, .. },
+                            ..
+                        }) => grants.len(),
+                        _ => usize::MAX,
+                    };
+                    if uses.len() != sent || (!delivered && uses.iter().any(Option::is_some)) {
+                        return Some(u64::from(header.credit));
+                    }
+                }
+                None
             }
         }
     }
 
     /// Consumes at most `step` messages of one ring into this node, each
     /// under the check; returns how many entries remain.
-    fn consume(&mut self, from: u16, user: bool, step: u64) -> u64 {
+    pub(crate) fn consume(&mut self, from: u16, user: bool, step: u64) -> u64 {
         let size = if user {
             RING_USER_ENTRIES
         } else {
@@ -490,7 +593,14 @@ impl Model {
             let mut consumed = self.consumed(from, me, user);
             // A producer index more than the ring's entries ahead first
             // moves the consumer index to the producer minus the entries.
-            let start = ring_resync(produced, consumed, size);
+            // A producer index behind the consumer index moves the consumer
+            // index to it; every difference is taken modulo 2^64 (D-141).
+            let behind =
+                produced.wrapping_sub(consumed) > size && consumed.wrapping_sub(produced) <= size;
+            let start = match behind {
+                true => produced,
+                false => ring_resync(produced, consumed, size),
+            };
             if start != consumed {
                 self.refused.0 += 1;
                 self.trace(TraceCode::Refused, None, [u64::from(from), 0, 0]);
@@ -500,7 +610,7 @@ impl Model {
                 self.set_consumed(from, user, consumed);
                 return 0;
             }
-            let available = produced - consumed;
+            let available = produced.wrapping_sub(consumed);
             let entry = self.ring_of(from, me, user).at(consumed).cloned();
             let (length, message) = match entry {
                 Some(RingEntry::Message(m)) if m.header.readable(available) => {
@@ -509,10 +619,12 @@ impl Model {
                 // A header it cannot read is consumed as one entry.
                 _ => (1, None),
             };
-            self.set_consumed(from, user, consumed + length);
-            served += 1;
+            self.set_consumed(from, user, consumed.wrapping_add(length));
+            // The step counts entries, as the contract counts them, not
+            // messages (D-141).
+            served += length;
             match message {
-                Some(message) => match self.refused(&message) {
+                Some(message) => match self.refused(from, &message) {
                     None => self.receive_message(message),
                     Some(named) => {
                         self.refused.0 += 1;
@@ -675,6 +787,23 @@ impl Model {
                 if self.write_message(entry.granter, body, None, None).is_ok() {
                     self.table.uses[me].remove(&index);
                     sent += 1;
+                }
+                continue;
+            }
+            // A pending signal to a generation that is over died with it:
+            // the flag is cleared, as R0 drops it (the final review's
+            // verification of lot C, H6: it kept the reserve busy for ever).
+            let over = self.table.generation(entry.granter) != entry.generation
+                || !matches!(
+                    self.table.member(entry.granter).state(),
+                    MemberState::Starting
+                        | MemberState::Live
+                        | MemberState::Sealing
+                        | MemberState::Sealed
+                );
+            if entry.signal_pending && over {
+                if let Some(used) = self.table.uses[me].get_mut(&index) {
+                    used.signal_pending = false;
                 }
                 continue;
             }

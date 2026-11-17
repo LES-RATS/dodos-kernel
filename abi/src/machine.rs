@@ -359,10 +359,11 @@ pub const STALE_RANGE_NS: (u64, u64) = (10_000_000, 1_000_000_000);
 pub const SWEEP_NS: u64 = 1_000_000_000;
 pub const SWEEP_RANGE_NS: (u64, u64) = (100_000_000, 60_000_000_000);
 pub const NMI_GRACE_NS: u64 = 1_000_000;
-/// 20 ms since D-129 (it was 10 ms, less than the SDM's example of INIT and
-/// SIPI alone), within 10 ms to 1 s.
-pub const FENCE_NS: u64 = 20_000_000;
-pub const FENCE_RANGE_NS: (u64, u64) = (10_000_000, 1_000_000_000);
+/// 30 ms since D-141, two rounds of the fence (it was 10 ms, less than the
+/// SDM's example of INIT and SIPI alone, then 20 ms, less than two rounds),
+/// within 12 ms to 1 s.
+pub const FENCE_NS: u64 = 30_000_000;
+pub const FENCE_RANGE_NS: (u64, u64) = (12_000_000, 1_000_000_000);
 pub const SETTLE_NS: u64 = 1_000_000;
 pub const START_NS: u64 = 1_000_000_000;
 /// The period at which the node that starts a core sends its wake again
@@ -485,7 +486,11 @@ impl Owner {
         match self {
             Self::Node(node) => node,
             Self::Unclaimed => OWNER_UNCLAIMED,
-            Self::Reserve(j) => OWNER_RESERVE_BASE + j,
+            Self::Reserve(j) => {
+                // A reserve's index is below `RESERVES_MAX`.
+                assert!((j as u64) < RESERVES_MAX as u64);
+                OWNER_RESERVE_BASE + j
+            }
         }
     }
 
@@ -516,6 +521,13 @@ impl Ownership {
     const fn check(state: u64, owner: u16, generation: u32) -> u64 {
         let v = state | (owner as u64) << 2 | (generation as u64) << 18;
         v.wrapping_mul(CHECK_MUL) >> 50
+    }
+
+    /// A word with any owner code and a right check field, for the tests
+    /// of what a code that names nothing allows.
+    #[cfg(test)]
+    pub(crate) const fn make_raw_for_tests(state: OwnState, owner: u16, generation: u32) -> Self {
+        Self::make(state, owner, generation)
     }
 
     const fn make(state: OwnState, owner: u16, generation: u32) -> Self {
@@ -604,7 +616,9 @@ impl Ownership {
         holds_reserve: bool,
     ) -> bool {
         let state = self.state();
-        if matches!(state, OwnState::None) {
+        // A word whose owner code names nothing is no one's to take, not
+        // unclaimed (the final review's verification of lot A, 7.2).
+        if matches!(state, OwnState::None) || Owner::from_code((self.0 >> 16) as u16).is_none() {
             return false;
         }
         match self.owner() {
@@ -636,7 +650,10 @@ impl DeviceEntry {
 
     /// A used entry of `1 << log2` bytes at `base`, unclaimed.
     pub const fn used(base: u64, log2: u32) -> Self {
-        assert!(log2 < 64 && base & ((1 << log2) - 1) == 0);
+        // At least one page (12 bits), as the entry's base word keeps its
+        // low bits for the size and the bit *used* (the final review's
+        // verification of lot A, H4).
+        assert!(log2 >= 12 && log2 < 64 && base & ((1 << log2) - 1) == 0);
         Self {
             range: base | log2 as u64 | Self::USED,
             owner: Ownership::free(Owner::Unclaimed),
@@ -1308,24 +1325,26 @@ pub const fn module_frames(
         phys,
         virt,
         offset: 0,
-        end: len.div_ceil(page) * page,
+        // Saturated: a length that passes the addresses gives frames up to
+        // the end of them, never an overflow (M2).
+        end: len.div_ceil(page).saturating_mul(page),
         geometry,
     }
 }
 
 impl ModuleFrames {
     /// The largest supported size that suits position `offset` with `left`
-    /// bytes left, and that is above `above` if given.
+    /// bytes left.
     fn size_at(&self, offset: u64, left: u64) -> PageSize {
         let mut best = PageSize::Page;
         for size in PageSize::ALL {
             let Some(bytes) = self.geometry.bytes(size) else {
                 continue;
             };
-            let aligned = (self.phys + offset).is_multiple_of(bytes)
+            let aligned = self.phys.wrapping_add(offset).is_multiple_of(bytes)
                 && self
                     .virt
-                    .is_none_or(|virt| (virt + offset).is_multiple_of(bytes));
+                    .is_none_or(|virt| virt.wrapping_add(offset).is_multiple_of(bytes));
             if aligned && bytes <= left {
                 best = size;
             }
@@ -1347,7 +1366,7 @@ impl Iterator for ModuleFrames {
         let mut pages = 0;
         let mut at = start;
         let entries = u64::from(self.geometry.entries);
-        while pages < entries && at + bytes <= self.end {
+        while pages < entries && at.checked_add(bytes).is_some_and(|end| end <= self.end) {
             if pages > 0 && self.size_at(at, self.end - at) > size {
                 break;
             }

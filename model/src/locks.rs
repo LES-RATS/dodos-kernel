@@ -6,7 +6,8 @@
 //! The model runs every event of a node alone, as the node lock makes the
 //! events of a node run one at a time; what it records is what a kernel
 //! takes: the node lock from the entry of the event (after its lock-free
-//! part) to its exit, and the gate lock inside it for each gate call. A
+//! part) to its exit, and the gate lock inside it once for an event that
+//! makes one gate call or more (one `Lock(Gate)`, one `Unlock(Gate)`). A
 //! `signal` that wakes no one takes no lock (the lock-free signal).
 //!
 //! The lock per object of the earlier text (variant L2: the order by kind,

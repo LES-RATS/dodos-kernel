@@ -228,7 +228,7 @@ impl Model {
     /// The entries of a mapping record are cleared and the tables left
     /// empty unhooked; the record is *unmapping*, its leaves still counted.
     /// Returns the addresses of its pages.
-    fn clear_mapping(&mut self, cap: CapId) -> Option<Vec<u64>> {
+    pub(crate) fn clear_mapping(&mut self, cap: CapId) -> Option<Vec<u64>> {
         let Record::Mapping(mapping) = self.caps[&cap].record else {
             return None;
         };
@@ -244,11 +244,6 @@ impl Model {
         live(&mut self.caps, cap).record = Record::Unmapping(mapping);
         self.rehook_by(mapping.space, Some(cap));
         Some(addresses)
-    }
-
-    /// `clear_mapping` for the destruction of an iospace whose unit failed.
-    pub(crate) fn clear_mapping_pub(&mut self, cap: CapId) {
-        self.clear_mapping(cap);
     }
 
     /// The completion of an unmapping: through the gate the counts of its
@@ -318,8 +313,8 @@ impl Model {
             self.empty_mapping(cap);
             return Ok(Unmapped::Done);
         }
-        if let Some(served) = self.iospaces.get(&space) {
-            let Some(&(iommu, _)) = served.first() else {
+        if self.iospaces.contains_key(&space) {
+            let Some(iommu) = self.unit_of_space(space) else {
                 self.empty_mapping(cap);
                 return Ok(Unmapped::Done);
             };
@@ -528,7 +523,11 @@ impl Model {
         let hooked = tables(held.iter().copied(), levels, geometry);
         let pages = (done..done + step).map(|n| (map.address + n * size, frame.page));
         let wanted = tables(held.into_iter().chain(pages), levels, geometry).len() as u64;
-        let free = aspace.tables - hooked.len() as u64;
+        // The free list holds the tables neither hooked nor unhooked: an
+        // unhooked table joins it only at the completion of the invalidation
+        // of its unhooking (D-137; the final review's verification of lot B,
+        // O16 = D1: counted as free, they made `rehook` pop an empty list).
+        let free = aspace.tables - hooked.len() as u64 - aspace.unhooked.len() as u64;
         let missing = (wanted - hooked.len() as u64).saturating_sub(free);
         let table = self.page();
         let supplied = untyped.map_or(0, |untyped| {
@@ -538,6 +537,15 @@ impl Model {
         });
         if missing > supplied {
             return Err(Error::NoMemory);
+        }
+        // Where the units cache entries that are not present, a map of an
+        // iospace that serves devices asks the holder to invalidate, and its
+        // last state check is `again` with nothing changed when the unit
+        // request table is full (D-141).
+        let asks =
+            self.machine.caching_mode && self.iospaces.get(&space).is_some_and(|s| !s.is_empty());
+        if asks && self.unit_requests.iter().all(Option::is_some) {
+            return Err(Error::Again);
         }
         // The barrier's dependency: bit X of `maps_of` is set through the
         // gate before the first translation to memory of node X. Under a
@@ -550,6 +558,17 @@ impl Model {
                 e.state == crate::table::GrantState::Live && e.serial == remote.serial
             });
             if !live_grant {
+                return Err(Error::Gone);
+            }
+            // The holder's gate counts a leaf only in the use entry the
+            // grant entry records once answered: before the granting node
+            // has consumed the `SendAnswer`, `again` with nothing changed
+            // (Grants, the count says what the holder translates, D-141).
+            let entry = entry.expect("live");
+            if !entry.answered {
+                return Err(Error::Again);
+            }
+            if entry.use_index != Some(remote.use_entry) {
                 return Err(Error::Gone);
             }
             let granter = remote.node as usize;
@@ -584,10 +603,21 @@ impl Model {
             };
             self.record_mapping(cap, space, mapping);
         }
-        match partial {
-            true => Err(Error::Again),
-            false => Ok(Output::Done),
+        if partial {
+            return Err(Error::Again);
         }
+        // The last step asks the unit (operation 3, the iospace's domain
+        // number) and waits in *waiting for a unit*: done ends the call, a
+        // unit found failed `busy` with the mapping kept and counted.
+        if asks && let Some(iommu) = self.unit_of_space(space) {
+            let role = self.unit_role(self.iommus[&iommu].unit);
+            let domain = self.domains.get(&space).copied();
+            let op = crate::rings::UnitOp::Invalidate { domain };
+            let waiter = crate::units::Waiter::Thread(Some(thread));
+            self.unit_request(role, op, waiter, None)?;
+            return Ok(Output::Waits);
+        }
+        Ok(Output::Done)
     }
 
     /// The class of a page of a frame (G2): device memory is of class
@@ -675,13 +705,9 @@ impl Model {
             // The unit of an iospace that serves devices has failed: `busy`,
             // and the record is emptied with its counts kept.
             Record::Mapping(mapping)
-                if self
-                    .iospaces
-                    .get(&mapping.space)
-                    .and_then(|s| s.first())
-                    .is_some_and(|&(iommu, _)| {
-                        self.unit_failed(self.unit_role(self.iommus[&iommu].unit))
-                    }) =>
+                if self.unit_of_space(mapping.space).is_some_and(|iommu| {
+                    self.unit_failed(self.unit_role(self.iommus[&iommu].unit))
+                }) =>
             {
                 self.clear_mapping(cap);
                 self.freeze_unmapping(cap);
@@ -904,10 +930,13 @@ impl Model {
         Ok(Output::Waits)
     }
 
-    /// IOMMU, in a removal step: the device leaves the header of its
-    /// iospace, its identifier word becomes free, and its context entry is
-    /// cleared by a unit request no thread waits for. `Again` with nothing
-    /// changed when no entry of the unit request table is free.
+    /// IOMMU, in a removal step: the context entry of the device is
+    /// cleared by a unit request no thread waits for; at its answer
+    /// (`detach_answered`) the device leaves the header of its iospace and
+    /// its identifier word becomes free (D-139). On a failed unit the
+    /// device leaves the header at once, its words as they are. `Again`
+    /// with nothing changed when no entry of the unit request table is
+    /// free.
     pub(crate) fn detach(&mut self, iommu: ObjId, device: u16) -> Result<(), Error> {
         let role = self.unit_role(self.iommus[&iommu].unit);
         // One request at a time per device: a detach in flight is waited
@@ -1100,30 +1129,55 @@ impl Model {
     /// The lowest domain number of this node slot's range on a unit that
     /// none of its iospaces holds, if any is left.
     fn free_domain(&self, unit: usize) -> Option<u16> {
+        let lost = self
+            .lost_domains
+            .iter()
+            .filter(|&&(u, _)| u == unit)
+            .map(|&(_, domain)| domain);
         let used: BTreeSet<u16> = self
             .domains
             .iter()
             .filter(|(space, _)| self.aspaces[space].units.contains(&unit))
             .map(|(_, &domain)| domain)
+            .chain(lost)
             .collect();
         self.domain_range(unit, self.node)
             .find(|domain| !used.contains(domain))
     }
 
-    /// The node's own record of a detach, and its report; the identifier
-    /// word becomes free and unclaimed. Returns the iospace's domain
-    /// number, freed with its last device.
-    fn detach_local(&mut self, iommu: ObjId, device: u16) -> u16 {
+    /// The node's own record of a detach: the device leaves the unit's
+    /// order and the iospace's header; the iospace keeps the unit and its
+    /// domain number while the device's word still reads *attached*
+    /// (D-141), and frees the domain number with its last device otherwise.
+    /// The words are written by the caller (`detach_answered`), not here.
+    fn detach_local(&mut self, iommu: ObjId, device: u16) {
         let unit = live(&mut self.iommus, iommu);
         unit.order.retain(|&other| other != device);
         unit.detaching.remove(&device);
         let iospace = unit.attached.remove(&device);
+        let index = unit.unit;
         let iospace = iospace.expect("the device is attached");
         live(&mut self.iospaces, iospace).retain(|&found| found != (iommu, device));
-        let domain = self.domains.get(&iospace).copied().unwrap_or(0);
-        if self.iospaces[&iospace].is_empty() {
+        // A device that leaves with its word still *attached* may still
+        // reach the iospace's tables: the iospace keeps the unit and its
+        // domain number (D-141).
+        let key = self.identifier_key(index, device);
+        if self.table.attach_word(key).state() == Some(dodos_abi::AttachState::Attached) {
+            self.kept.insert(iospace, iommu);
+        }
+        if self.iospaces[&iospace].is_empty() && !self.kept.contains_key(&iospace) {
             self.domains.remove(&iospace);
         }
-        domain
+    }
+
+    /// The unit through which an unmap in a space is invalidated: the unit
+    /// of the devices its header lists, or the unit it keeps for a device
+    /// that left with its word *attached*; none for an aspace.
+    pub(crate) fn unit_of_space(&self, space: ObjId) -> Option<ObjId> {
+        let served = self.iospaces.get(&space)?;
+        served
+            .first()
+            .map(|&(iommu, _)| iommu)
+            .or_else(|| self.kept.get(&space).copied())
     }
 }

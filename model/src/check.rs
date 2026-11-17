@@ -195,8 +195,9 @@ impl Model {
     /// 24. the walk to the next capability to remove was always shorter than
     ///     192 capabilities: at most `LONGEST_WALK`;
     /// 28. a capability space holds only what is deeper than itself: an
-    ///     untyped capability it holds is not less deep than its root
-    ///     capability, and the root capability of another space is deeper.
+    ///     untyped or `memory_control` capability it holds is not less deep
+    ///     than its root capability (D-141), and the root capability of
+    ///     another space is deeper.
     ///
     /// Slots:
     /// 5. slot 0 of every capability space is empty;
@@ -436,8 +437,11 @@ impl Model {
             let row = cap.rights == read_derive || cap.rights == read_derive.union(Rights::EXEC);
             let every = cap.rights.contains(Rights::ALL.without(Rights::EXEC));
             // A root remote capability has the rights of its anchor.
-            let remote = self.remotes.contains_key(&cap.object);
-            let rights = remote || if kept { row } else { every };
+            let rights = match self.remotes.get(&cap.object) {
+                Some(remote) => cap.rights == remote.rights,
+                None if kept => row,
+                None => every,
+            };
             // The root of an `ioports` object holds every port.
             let root_badge = match object.kind {
                 ObjectKind::IoPorts => 0xFFFF << 16,
@@ -533,7 +537,9 @@ impl Model {
                 let of = self.objects.get(&held.object);
                 let other_root = of.is_some_and(|of| of.root == cap) && cap != root;
                 let deep_enough = match of.map(|of| of.kind) {
-                    Some(ObjectKind::Untyped) => depth(cap) >= depth(root),
+                    Some(ObjectKind::Untyped | ObjectKind::MemoryControl) => {
+                        depth(cap) >= depth(root)
+                    }
                     Some(ObjectKind::CSpace) if other_root => depth(cap) > depth(root),
                     _ => true,
                 };
@@ -813,7 +819,10 @@ impl Model {
                 .iter()
                 .filter(|(_, object)| object.from == Some(id));
             let live: usize = taken.map(|(object, _)| 1 + segments(object)).sum();
-            ensure(untyped.live as usize == live, "19: live count")?;
+            ensure(
+                untyped.live as usize == live + untyped.lost as usize,
+                "19: live count",
+            )?;
             ensure(untyped.watermark <= untyped.bytes, "18: watermark within")?;
             ensure(
                 untyped.watermark.is_multiple_of(8),

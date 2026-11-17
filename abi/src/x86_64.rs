@@ -101,7 +101,12 @@ pub const fn dr7_valid(word: u64) -> bool {
     }
     let mut n = 0;
     while n < HW_BREAKPOINTS {
-        if word >> (16 + 4 * n) & 0b11 == DR7_CONDITION_IO {
+        let condition = word >> (16 + 4 * n) & 0b11;
+        let length = word >> (18 + 4 * n) & 0b11;
+        // An I/O breakpoint (`CR4.DE` set), a length of 10 (undefined on
+        // most processors) and a length on an execution breakpoint are
+        // refused (Intel SDM §20.2.4; D-141).
+        if condition == DR7_CONDITION_IO || length == 0b10 || (condition == 0 && length != 0) {
             return false;
         }
         n += 1;
@@ -134,7 +139,9 @@ pub const fn msi_remapped(handle: u64) -> u64 {
 /// mode, edge (Interrupts, without interrupt remapping): `None` for an APIC
 /// ID above 255, which this format cannot reach.
 pub const fn msi_direct(apic_id: u32, vector: u8) -> Option<(u64, u64)> {
-    if apic_id > 255 {
+    // 255 is the broadcast to every local APIC (Intel SDM §13.6.2.1), so it
+    // names no core (D-141).
+    if apic_id >= 255 {
         return None;
     }
     Some((0xFEE0_0000 | (apic_id as u64) << 12, vector as u64))

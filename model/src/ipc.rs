@@ -40,10 +40,6 @@ impl Message {
     /// needs a message page the thread does not have (D-110), it is
     /// `invalid` before any other capability argument is looked at.
     pub(crate) fn check_header(&self, page: bool) -> Result<(), Error> {
-        self.check(page)
-    }
-
-    fn check(&self, page: bool) -> Result<(), Error> {
         let header = Header::new(self.label, self.words.len(), self.caps.len(), self.flags)?;
         let add_marks = header.flags() == Header::FLAG_ADD_MARKS;
         if header.flags() & !Header::FLAG_ADD_MARKS != 0 {
@@ -133,7 +129,7 @@ impl Model {
         message: Message,
         range: Range,
     ) -> Outcome {
-        message.check(self.has_page(thread))?;
+        message.check_header(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
         let parcel = Parcel::new(thread, message, badge);
@@ -194,7 +190,7 @@ impl Model {
         // IPC: `send` on the reply object, then as `recv` with it.
         let rights = message.rights().union(Rights::RECV);
         let reply = self.object(thread, reply, ObjectKind::Reply, rights)?;
-        message.check(self.has_page(thread))?;
+        message.check_header(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let window = self.window(thread, range)?;
@@ -233,7 +229,7 @@ impl Model {
         message: Message,
     ) -> Outcome {
         // IPC: a reply carries badge 0, the badge of every reply capability.
-        message.check(self.has_page(thread))?;
+        message.check_header(self.has_page(thread))?;
         self.listed(thread, &message.caps)?;
         let parcel = Parcel::new(thread, message, badge);
         let flags = if kind == ObjectKind::Reply {

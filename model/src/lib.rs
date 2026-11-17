@@ -1,4 +1,5 @@
-//! Executable reference model of the DodOS kernel, for one core.
+//! Executable reference model of the DodOS kernel: the kernel of one node
+//! of *N* cores ([`Model`]) and the machine of several nodes (`System`).
 //!
 //! The contract is `architecture/kernel-interface.md` in the documentation
 //! repository. A comment that names a section names a section of its "Call
@@ -13,12 +14,12 @@
 //! thread, so a harness applies the calls of `running`.
 //!
 //! Not modelled: the contents of memory (the start-up page is sized, not
-//! written); the hardware (translations are a map; the invalidations of the
-//! TLB and of the IOMMU are done before a call returns; masking, the end of
-//! interrupt and the entropy pool are not seen); the kernel's own time,
-//! taken as zero; more than one node (the waiting-for-the-core-group state
-//! is never entered); and the groups not specified (cores, debugging,
-//! `ioports`), whose calls return `unsupported`.
+//! written); the hardware below what the contract names (translations are
+//! a map, the TLB a set of cached translations per core; masking, the end
+//! of interrupt and the entropy pool are not seen); the kernel's own time,
+//! taken as zero; real concurrency (every event runs alone, as the node
+//! lock makes them). `model/README.md`, "What it does not model", has the
+//! whole list.
 //!
 //! `CONTRACT-GAP` marks a behaviour that the contract does not fix; none is
 //! left since the contract settled the sixteen of pass 15 (pass 16, D-133),
@@ -582,6 +583,11 @@ struct Untyped {
     /// Objects, segments of capability spaces and tables of address spaces
     /// taken from it and not yet destroyed.
     live: u32,
+    /// Of those, the pages of iospaces destroyed while a device of a failed
+    /// unit may still reach them (the root's count of devices above 0):
+    /// lost to the node until the machine restarts, they stay live pieces,
+    /// so the watermark never returns over them (IOMMU, D-139, D-141).
+    lost: u32,
     /// On several cores: the kernel epoch at which its watermark became
     /// ready to return, at the destruction of its last object; it returns
     /// at the first `untyped_retype` once a complete barrier covers that
@@ -904,6 +910,10 @@ struct Sched {
     /// A node of several cores: the position of the core of its node where
     /// it is placed, admitted and queued.
     core: usize,
+    /// Moved by `sched_configure` while its holder ran on its old core: not
+    /// eligible, whatever its holder, until that core has left it (the
+    /// leave interrupt clears it; D-141).
+    moving: bool,
     /// Signed nanoseconds left in the current period.
     remaining: i64,
     deadline: u64,
@@ -1046,6 +1056,15 @@ pub struct Model {
     /// taken from this node slot's range at its first device and freed with
     /// its last (Devices and shared hardware, D-134).
     domains: BTreeMap<ObjId, u16>,
+    /// The unit an iospace keeps for a device that left its header with its
+    /// attach word *attached* (an answer *failed*, or a detach a holder
+    /// refused at a step of a destruction): its unmaps are invalidated
+    /// through that unit as for a device in the header, and its domain
+    /// number stays taken (the attach word's table, D-141).
+    kept: BTreeMap<ObjId, ObjId>,
+    /// The domain numbers of destroyed iospaces whose root still counts a
+    /// device: lost to the node until the machine restarts, by unit.
+    lost_domains: BTreeSet<(usize, u16)>,
     iommus: BTreeMap<ObjId, Iommu>,
     scheds: BTreeMap<ObjId, Sched>,
     /// Timers: `None` while idle.
@@ -1135,12 +1154,15 @@ pub struct Model {
     /// The generations that ended while this node was sealed whose R0 its
     /// resume has done, once each.
     ended_done: BTreeSet<(u16, u32)>,
+    /// The producer index of each ring into this node (kernel, user) when
+    /// its resume finished its reclaims: what waited in its rings, which it
+    /// consumes before it writes live.
+    resume_marks: Option<Vec<(u64, u64)>>,
     /// The runs of R0 for each generation of each node, which the check
     /// holds to at most one (`node_start` mode resume: "R0 once for that
     /// generation"; finding 8 of the tenth model review).
     r0_runs: BTreeMap<(u16, u32), u32>,
     starts: BTreeMap<usize, nodes::Starting>,
-    start_image: (bool, u64),
     handing: BTreeMap<usize, roles::Handover>,
     unit_order: u64,
     revoking: bool,
@@ -1337,7 +1359,12 @@ impl Model {
     pub fn chunked_or_kept(&self, at: u64) -> bool {
         let shift = self.table.geometry.chunk_shift();
         let inside = |ranges: &[(u64, u64)]| ranges.iter().any(|&(s, e)| s <= at && at < e);
-        self.table.owners.get((at >> shift) as usize) != Some(&dodos_abi::Ownership::none().raw())
+        // An address past the ownership words is in no chunk (ver-B O5).
+        let none = dodos_abi::Ownership::none().raw();
+        self.table
+            .owners
+            .get((at >> shift) as usize)
+            .is_some_and(|&w| w != none)
             || self.table.floors.iter().any(|f| inside(f))
             || inside(&self.table.kept)
     }

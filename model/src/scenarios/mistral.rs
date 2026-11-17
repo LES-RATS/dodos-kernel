@@ -160,6 +160,7 @@ fn f6_a_remote_capability_whose_use_entry_names_another_generation_is_invalid() 
         t.grants[0].insert(
             3,
             crate::table::GrantEntry {
+                anchor: crate::table::Anchor::test(),
                 state: GrantState::Live,
                 serial: 9,
                 grantee: 1,
@@ -189,6 +190,7 @@ fn f6_a_remote_capability_whose_use_entry_names_another_generation_is_invalid() 
         serial: 9,
         use_entry: 5,
         depth: 1,
+        rights: Rights::READ,
     };
     assert!(!m.sys.node(1).valid(&remote));
     m.sys
@@ -358,6 +360,7 @@ fn f12_at_most_32_pending_signals_are_sent_in_one_event() {
             t.grants[0].insert(
                 grant,
                 crate::table::GrantEntry {
+                    anchor: crate::table::Anchor::test(),
                     state: GrantState::Live,
                     serial: 1,
                     grantee: 1,

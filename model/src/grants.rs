@@ -7,7 +7,7 @@
 //! delivery of a `Send`, a `Revoke`'s step, the release, `grant_signal`).
 
 use crate::rings::{Body, Completes};
-use crate::table::{GrantEntry, GrantState, UseEntry};
+use crate::table::{Anchor, GrantEntry, GrantState, UseEntry};
 use crate::{
     Cap, CapId, Delivery, Frame, Message, Model, ObjId, Object, Outcome, Output, Place, Record,
     Slot, Transfer, Wait, live,
@@ -25,18 +25,21 @@ pub(crate) struct Remote {
     pub(crate) use_entry: u16,
     /// The depth of the anchor: the root remote capability has it.
     pub(crate) depth: usize,
+    /// The rights of the anchor: the root remote capability has them
+    /// (invariant 3; ver2-D 4).
+    pub(crate) rights: Rights,
 }
 
-/// A grant as the holder learns it from a `Send` and the anchor it names
-/// in the granting node's grant table: the entry, the serial, the anchor's
-/// rights and depth, and its frame.
+/// A grant as a `Send` names it: the entry, its serial and the rights the
+/// message states, which must be the anchor's. The frame, the rights and
+/// the depth of the remote capability are read from the anchor in the
+/// granting node's grant entry, never from the message (Grants, a remote
+/// frame capability, D-141).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Granted {
     pub grant: u16,
     pub serial: u32,
     pub rights: Rights,
-    pub(crate) depth: usize,
-    pub(crate) frame: Frame,
 }
 
 /// The index, in the kernel space of a node, of the anchor of grant `g`.
@@ -112,7 +115,7 @@ impl Model {
     pub(crate) fn free_grant(&mut self, grant: u16) {
         let node = self.node as usize;
         if let Some(entry) = self.table.grants[node].remove(&grant) {
-            self.table.serials[node].insert(grant, (entry.serial + 1) & 0x3FFF_FFFF);
+            self.table.serials[node].insert(grant, next_serial(entry.serial));
             if let Some((notify, _)) = entry.doorbell
                 && let Some(notify) = self.notifies.get_mut(&notify)
             {
@@ -175,9 +178,6 @@ impl Model {
             false => {
                 let held = self.held(thread, doorbell, ObjectKind::Notify, Rights::SEND)?;
                 let (object, badge) = (held.object, held.badge);
-                if self.remotes.contains_key(&object) {
-                    return Err(Error::Invalid);
-                }
                 Some((object, if badge == 0 { 1 } else { badge }))
             }
         };
@@ -206,7 +206,20 @@ impl Model {
             if listed.iter().any(|&(c, _)| c == cap) {
                 return Err(Error::Invalid);
             }
+            // A capability at depth 64 cannot be derived: its anchor would
+            // be deeper than the tree allows (D-141).
+            if self.depth(cap) >= dodos_abi::TREE_DEPTH {
+                return Err(Error::Invalid);
+            }
             listed.push((cap, rights));
+        }
+        // The gate writes an anchor only over memory its node holds (G3
+        // (2), D-141): a refusal here is the gate's, before any entry.
+        if !listed
+            .iter()
+            .all(|&(cap, _)| self.holds_frame(self.frames[&self.caps[&cap].object]))
+        {
+            return Err(Error::Busy);
         }
         // The state: the sends in flight to the node (two kept for a
         // capability with `manage`), the room in the user ring, the free
@@ -224,14 +237,6 @@ impl Model {
             grant: 0,
             serial: 0,
             rights: Rights::NONE,
-            depth: 0,
-            frame: Frame {
-                page: dodos_abi::PageSize::Page,
-                pages: 1,
-                memory: dodos_abi::MemoryType::WriteBack,
-                base: 0,
-                kept: false,
-            },
         };
         let probe = Body::Send {
             header,
@@ -317,9 +322,15 @@ impl Model {
         let node = self.node as usize;
         let serial = self.table.serials[node].get(&grant).copied().unwrap_or(0);
         let generation = self.table.generation(grantee);
+        let anchor_says = Anchor {
+            frame: self.frames[&self.caps[&cap].object],
+            rights,
+            depth: self.depth(anchor),
+        };
         self.table.grants[node].insert(
             grant,
             GrantEntry {
+                anchor: anchor_says,
                 grantee,
                 generation,
                 serial,
@@ -332,14 +343,69 @@ impl Model {
         if let Some((notify, _)) = doorbell {
             live(&mut self.notifies, notify).doorbells.push(grant);
         }
-        let frame = self.frames[&self.caps[&cap].object];
         Granted {
             grant,
             serial,
             rights,
-            depth: self.depth(anchor),
-            frame,
         }
+    }
+
+    /// Whether this node holds every chunk of a frame, as the gate reads it
+    /// before it writes an anchor (G3 (2)): a chunk taken by this node with
+    /// its generation (with its own code, or a reserve's whose role it
+    /// holds), its floor, a device entry it owns, or the global read-only
+    /// set (a kept frame).
+    pub(crate) fn holds_frame(&self, frame: Frame) -> bool {
+        let me = self.node;
+        let generation = self.table.generation(me);
+        let taken_here = |raw: u64| {
+            dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
+                w.state() == dodos_abi::OwnState::Taken
+                    && w.generation() == generation
+                    && match w.owner() {
+                        dodos_abi::Owner::Node(n) => n == me,
+                        dodos_abi::Owner::Reserve(j) => self.table.holds_reserve(me, j),
+                        dodos_abi::Owner::Unclaimed => false,
+                    }
+            })
+        };
+        match self.leaf_target(frame) {
+            crate::memory::Target::Nothing => frame.kept,
+            crate::memory::Target::Entry(index) => {
+                taken_here(self.table.devices[index].owner.raw())
+            }
+            crate::memory::Target::Chunks => {
+                let chunk = self.machine.geometry.chunk();
+                let end = frame.base + frame.pages * self.bytes(frame.page);
+                (frame.base / chunk..end.div_ceil(chunk)).all(|c| {
+                    self.table.holds_page(c * chunk, me, generation)
+                        || self
+                            .table
+                            .owners
+                            .get(c as usize)
+                            .is_some_and(|&raw| taken_here(raw))
+                })
+            }
+        }
+    }
+
+    /// The count of the holder's use entry under a grant of this node, read
+    /// as a revocation reads it: counted only if the entry at the use index
+    /// the grant entry records names this node, the grant, its serial and
+    /// this node's generation, and 0 otherwise (Grants, D-141). The holder's
+    /// gate counts a leaf only in that entry, and frees it only at 0.
+    pub(crate) fn holder_count(&self, grant: u16, entry: &GrantEntry) -> u64 {
+        let generation = self.table.generation(self.node);
+        entry
+            .use_index
+            .and_then(|u| self.table.uses[entry.grantee as usize].get(&u))
+            .filter(|u| {
+                u.granter == self.node
+                    && u.grant == grant
+                    && u.serial == entry.serial
+                    && u.generation == generation
+            })
+            .map_or(0, |u| u.leaves)
     }
 
     /// A `Send` received: delivered to the first thread that waits to
@@ -450,11 +516,12 @@ impl Model {
                 signal_pending: false,
             },
         );
+        let anchor = self.table.grants[granter as usize][&granted.grant].anchor;
         self.caps.insert(
             cap,
             Cap {
                 object: id,
-                rights: granted.rights,
+                rights: anchor.rights,
                 badge: 0,
                 parent: None,
                 children: Vec::new(),
@@ -473,13 +540,14 @@ impl Model {
             },
         );
         live(&mut self.cspaces, place.space).slots[place.index as usize] = Slot::Full(cap);
-        self.frames.insert(id, granted.frame);
+        self.frames.insert(id, anchor.frame);
         let remote = Remote {
             node: granter,
             grant: granted.grant,
             serial: granted.serial,
             use_entry,
-            depth: granted.depth,
+            depth: anchor.depth,
+            rights: anchor.rights,
         };
         self.remotes.insert(id, remote);
         use_entry
@@ -564,11 +632,14 @@ impl Model {
             grant: remote.grant,
             serial: remote.serial,
         };
-        if self.write_message(remote.node, body, None, None).is_err() {
-            let me = self.node as usize;
-            if let Some(entry) = self.table.uses[me].get_mut(&remote.use_entry) {
-                entry.signal_pending = true;
-            }
+        // A signal to a granting node whose generation is over is dropped:
+        // it would only be dropped again (H6).
+        let me = self.node as usize;
+        if self.valid(&remote)
+            && self.write_message(remote.node, body, None, None).is_err()
+            && let Some(entry) = self.table.uses[me].get_mut(&remote.use_entry)
+        {
+            entry.signal_pending = true;
         }
         Ok(Output::Done)
     }
@@ -645,26 +716,17 @@ impl Model {
         // count of the grantee's use entry at the use index is read, counted
         // only if that entry names this node, this grant, its serial and
         // this node's generation.
-        let generation = self.table.generation(self.node);
         let grantee = entry.grantee;
         if let Some(e) = self.table.grants[me].get_mut(&grant) {
             e.state = GrantState::Revoking;
         }
-        let count = entry
-            .use_index
-            .and_then(|u| self.table.uses[grantee as usize].get(&u))
-            .filter(|u| {
-                u.granter == self.node
-                    && u.grant == grant
-                    && u.serial == entry.serial
-                    && u.generation == generation
-            })
-            .map_or(0, |u| u.leaves);
+        let count = self.holder_count(grant, &entry);
         if count == 0 {
             self.free_grant(grant);
             return Ok(true);
         }
-        // A `Revoke` already in flight for this grant: wait for its answer.
+        // A `Revoke` already in flight for this grant: `again`, with no
+        // second message and no wait, until its answer.
         let in_flight = self.peers[grantee as usize]
             .credits
             .iter()
@@ -738,8 +800,16 @@ impl Model {
         let Completes::Revoke { grant } = taken.completes else {
             return;
         };
+        // The root reported removed frees the entry only if the holder's
+        // use entry counts no leaf (D-141); otherwise it stays revoking and
+        // the next step sends `Revoke` again.
         if removed {
-            self.free_grant(grant);
+            let me = self.node as usize;
+            match self.table.grants[me].get(&grant).copied() {
+                Some(entry) if self.holder_count(grant, &entry) == 0 => self.free_grant(grant),
+                Some(_) => self.refuse_trace(from, dodos_abi::NodeMessage::RevokeStep, grant),
+                None => {}
+            }
         }
         self.wake_remover(from, index);
     }
@@ -809,6 +879,13 @@ impl Model {
         let Some(entry) = self.table.grants[me].get(&grant).copied() else {
             return;
         };
+        // A `Release` frees the entry only if the holder's use entry counts
+        // no leaf under it; otherwise the entry stays and the message is
+        // traced (Grants, release by the holder, D-141).
+        if self.holder_count(grant, &entry) != 0 {
+            self.refuse_trace(from, dodos_abi::NodeMessage::Release, grant);
+            return;
+        }
         if entry.state == GrantState::Revoking {
             self.free_grant(grant);
             let credit = self.peers[from as usize].credits.iter().position(|c| {
@@ -822,9 +899,27 @@ impl Model {
             }
             return;
         }
-        let anchor = self.anchor(grant);
-        if anchor.is_some_and(|a| self.caps[&a].children.is_empty()) {
-            self.free_with_anchor(grant);
-        }
+        // The entry is freed; its anchor is removed if it has no
+        // descendant, and otherwise stays, held by nobody.
+        self.free_with_anchor(grant);
     }
+
+    /// A message the check passed but whose effect a word written by
+    /// another node's gate refuses: it changes nothing, and is traced as a
+    /// refusal (code 11).
+    pub(crate) fn refuse_trace(&mut self, from: u16, kind: dodos_abi::NodeMessage, named: u16) {
+        self.refused.0 += 1;
+        let who = u64::from(from) | u64::from(self.table.generation(from)) << 32;
+        self.trace(
+            dodos_abi::TraceCode::Refused,
+            None,
+            [who, kind as u64, u64::from(named)],
+        );
+    }
+}
+
+/// The serial of a grant index once its entry is freed: one more, on the 30
+/// bits a `Revoke`, `Release` or `Signal` carries (O8).
+pub(crate) fn next_serial(serial: u32) -> u32 {
+    (serial + 1) & 0x3FFF_FFFF
 }

@@ -161,7 +161,7 @@ pub const LEVELS_MIN: u32 = 2;
 /// Devices that one `iospace` serves, at most.
 pub const IOSPACE_MAX_DEVICES: usize = 16;
 /// Nanoseconds within which an IOMMU unit confirms an invalidation.
-pub const IOMMU_WAIT_NS: u64 = 1_000_000;
+pub const IOMMU_WAIT_NS: u64 = 10_000_000;
 /// Bytes of `entropy_read`, at most (Entropy).
 pub const ENTROPY_MAX_BYTES: u64 = 64;
 
@@ -496,12 +496,16 @@ impl Geometry {
             return false;
         }
         let per_level = self.entries.trailing_zeros() as u8;
-        let mut sizes = s[1] == s[0] + per_level && self.levels > 1;
+        let mut sizes = s[1] as u16 == s[0] as u16 + per_level as u16 && self.levels > 1;
         let mut i = 2;
         while i < 4 {
             // Present only after a present size, one level up, below the
             // level of the root, and at most E chunks (index 2 at most).
-            if s[i] != 0 && (s[i - 1] == 0 || s[i] != s[i - 1] + per_level || i > 2) {
+            // Compared in 16 bits: a shift near 255 refuses the geometry
+            // instead of overflowing (the final review's verification of
+            // lot A, M1).
+            let next = s[i - 1] as u16 + per_level as u16;
+            if s[i] != 0 && (s[i - 1] == 0 || s[i] as u16 != next || i > 2) {
                 sizes = false;
             }
             if s[i] != 0 && i as u32 >= self.levels {
@@ -785,7 +789,7 @@ impl FaultKind {
 }
 
 /// What an exception taken from a user thread is (Faults), as the tables of
-/// each architecture classify it (`aarch64::ec_use`, `riscv64::cause_use`).
+/// each architecture classify it (`aarch64::exception_use`, `riscv64::exception_use`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExceptionUse {
     /// A fault of this kind, delivered on the thread's fault endpoint.
@@ -884,6 +888,9 @@ pub const fn firing_instant(deadline: u64, tolerance: u64) -> u64 {
     if deadline == 0 {
         return 0;
     }
+    // Every instant given to a call is below 2^63 (Clock); `timer_set`
+    // refuses another first.
+    assert!(deadline < TIME_LIMIT);
     let sum = deadline.saturating_add(tolerance);
     let x = if sum < TIME_LIMIT - 1 {
         sum
@@ -892,7 +899,7 @@ pub const fn firing_instant(deadline: u64, tolerance: u64) -> u64 {
     };
     let differ = (deadline - 1) ^ x;
     // The index of the highest bit in which deadline − 1 and x differ;
-    // they differ, since x ≥ deadline.
+    // they differ, since deadline ≤ x.
     let m = 63 - differ.leading_zeros();
     x >> m << m
 }
@@ -918,6 +925,12 @@ impl ClockPage {
     /// Nanoseconds at a counter value: `ns_base + ((counter − counter_base)
     /// × mult >> shift)`, the product taken in 128 bits.
     pub const fn nanoseconds(&self, counter: u64) -> u64 {
+        // A shift of 128 or more is a faulty kernel's page: the reader
+        // reads 0 rather than trapping (the final review's verification of
+        // lot A, finding 8).
+        if self.shift >= 128 {
+            return 0;
+        }
         let elapsed = counter.wrapping_sub(self.counter_base) as u128;
         let scaled = (elapsed * self.mult as u128) >> self.shift;
         self.ns_base.wrapping_add(scaled as u64)
@@ -1149,6 +1162,51 @@ mod proofs {
         let raw: u64 = kani::any();
         if let Ok(h) = Header::from_raw(raw) {
             assert!(h.words() <= MAX_WORDS && h.caps() <= MAX_CAPS && h.raw() == raw);
+        }
+    }
+
+    /// `Geometry::valid` refuses what it refuses without an overflow,
+    /// whatever the words of a boot image (D-141).
+    #[kani::proof]
+    fn geometry_valid_holds_on_every_input() {
+        let g = Geometry {
+            page_shift: kani::any(),
+            entries: kani::any(),
+            levels: kani::any(),
+            user_end: kani::any(),
+        };
+        if g.valid() {
+            assert!(g.page() >= 4096 && g.chunk() > g.page());
+            assert!(g.root_entry() <= 1 << (g.address_bits() - 1));
+        }
+    }
+
+    /// `dr7_valid` accepts a control word only within the user mask, with
+    /// no I/O condition, no length of 10 and no length on an execution
+    /// breakpoint (D-141).
+    #[kani::proof]
+    fn dr7_valid_refuses_what_the_contract_refuses() {
+        let word: u64 = kani::any();
+        if x86_64::dr7_valid(word) {
+            assert!(word & !x86_64::DR7_USER_MASK == 0);
+            let n: u64 = kani::any::<u64>() % 4;
+            let condition = word >> (16 + 4 * n) & 0b11;
+            let length = word >> (18 + 4 * n) & 0b11;
+            assert!(condition != 0b10 && length != 0b10);
+            assert!(condition != 0 || length == 0);
+        }
+    }
+
+    /// `msi_direct` never names the broadcast or an ID of more than 8 bits.
+    #[kani::proof]
+    fn msi_direct_reaches_a_core_of_an_eight_bit_id_below_255() {
+        let (apic, vector): (u32, u8) = (kani::any(), kani::any());
+        match x86_64::msi_direct(apic, vector) {
+            Some((address, data)) => {
+                assert!(apic < 255);
+                assert!(address == 0xFEE0_0000 | (apic as u64) << 12 && data == vector as u64);
+            }
+            None => assert!(apic >= 255),
         }
     }
 

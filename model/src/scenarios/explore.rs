@@ -26,20 +26,24 @@ fn once() -> bool {
     std::env::var("DODOS_PAGE").is_err()
 }
 
+/// The seed `DODOS_SEED` names, read once: a value that does not parse is
+/// refused, never taken as unset (ver2-D 7).
+fn replayed() -> Option<u64> {
+    let seed = std::env::var("DODOS_SEED").ok()?;
+    Some(seed.parse().expect("DODOS_SEED is a seed number"))
+}
+
 /// The seeds of a scenario: `DODOS_SEED` replays one, with its actions
 /// printed.
 fn seeds(count: u64) -> Vec<u64> {
-    match std::env::var("DODOS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
+    match replayed() {
         Some(seed) => vec![seed],
         None => (0..count).collect(),
     }
 }
 
 fn say(what: std::fmt::Arguments) {
-    if std::env::var("DODOS_SEED").is_ok() {
+    if replayed().is_some() {
         eprintln!("{what}");
     }
 }
@@ -175,7 +179,7 @@ fn reached(what: &str, count: usize) {
     if std::env::var("DODOS_COUNTS").is_ok() {
         eprintln!("reached {what}: {count}");
     }
-    if std::env::var("DODOS_SEED").is_err() {
+    if replayed().is_none() {
         assert!(count >= 1, "the seeds never reach {what}");
     }
 }

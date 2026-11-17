@@ -55,7 +55,8 @@ impl Model {
     /// Faults: delivery is a `call` by the faulting thread on its fault
     /// endpoint, with an empty receive range and wait number 0, sent even
     /// when its capability space is dying. Without a fault endpoint, or with
-    /// a dying one, the thread is suspended at once and the fault dropped.
+    /// a dying one, the thread is suspended at once and the fault recorded in
+    /// the thread.
     pub(crate) fn raise(&mut self, thread: ObjId, kind: FaultKind, exception: [u64; 3]) {
         self.event.raised.push((thread, kind as u32));
         let faulting = &self.threads[&thread];

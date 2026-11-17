@@ -120,6 +120,12 @@ pub struct Machine {
     pub ioapics: Vec<IoApic>,
     pub remapping: bool,
     pub x2apic: bool,
+    /// x86-64: the end of interrupt can be directed (every local APIC can
+    /// suppress its broadcast and every IOAPIC has an EOI register: entry
+    /// `Interrupts`, flags bit 2), so a level line can be held by its
+    /// IOAPIC's Remote IRR on a node that does not hold the IOAPIC's role
+    /// (Interrupts, Nodes, D-141).
+    pub directed_eoi: bool,
     /// The ranges the kernel keeps, base and length, on page boundaries:
     /// the first is the living part of the machine table, the second its
     /// fixed part (the frames of slots 13 and 14).
@@ -146,6 +152,11 @@ pub struct Machine {
     /// Unlike cores: whether the processor signals a change of the feedback
     /// table or of the performance capabilities (source kind 3).
     pub core_events: bool,
+    /// A unit caches entries that are not present (VT-d's CM = 1) or needs
+    /// write-buffer flushing: bit 0 of the flags of the entry `Memory`, and
+    /// every `iospace_map` of an iospace that serves devices asks the
+    /// unit's holder to invalidate (Devices and shared hardware, D-141).
+    pub caching_mode: bool,
     /// Instructions retired, on demand: the architecture layer names a
     /// counter (x86-64: a fixed counter of the PMU); without one the count
     /// reads 0. The model's cores retire one instruction per nanosecond.
@@ -183,7 +194,7 @@ pub struct Machine {
     /// `BootNodes`: the number of node slots and the nodes the machine
     /// start-up starts, each as the window and mask of its cores; `None`
     /// for the default, one node per usable core.
-    pub boot_nodes: Option<(u16, Vec<(u64, u64)>)>,
+    pub boot_nodes: Option<(u32, Vec<(u64, u64)>)>,
     /// The cores per node the kernel image supports (entry `Node`).
     pub cores_supported: u32,
     /// The longest hold of a node's lock measured for the image, *H*, and
@@ -234,6 +245,15 @@ pub const THIRTY_TWO_KB: Geometry = Geometry {
 };
 
 impl Machine {
+    /// The previous crash area the first stage hands over: one whose
+    /// header's sequence is 2^64 - 1 is not valid, and there is then none
+    /// (How the record reaches the next boot, rule 3, D-141).
+    fn previous(&self) -> Option<&crate::debug::CrashArea> {
+        self.previous_crash
+            .as_ref()
+            .filter(|p| p.sequence != u64::MAX)
+    }
+
     /// The machine of the tests on the geometry that the environment
     /// variable `DODOS_PAGE` names: `16k` for [`SIXTEEN_KB`], `32k` for
     /// [`THIRTY_TWO_KB`], otherwise the reference machine, x86-64 with four
@@ -307,6 +327,8 @@ impl Machine {
                 segment: 0,
             }],
             remapping: true,
+            directed_eoi: true,
+            caching_mode: false,
             x2apic: false,
             kept: vec![(mb, mb / 4), (mb + mb / 4, mb / 4)],
             image_base: mb + mb / 2,
@@ -390,7 +412,7 @@ impl Machine {
     pub fn nodes(&self) -> usize {
         match (&self.boot_nodes, self.single()) {
             (_, true) => 1,
-            (Some((slots, _)), false) => usize::from(*slots),
+            (Some((slots, _)), false) => *slots as usize,
             (None, false) => self.cores.len(),
         }
     }
@@ -472,7 +494,8 @@ pub enum Refusal {
     /// The start-up page would need more than 63 pages.
     StartPage,
     /// The floors, the reserves and the kept memory do not fit, k is out of
-    /// its range, or a time of `BootMembership` is out of its range.
+    /// its range, a time of `BootMembership` is out of its range, or the
+    /// plain roles reach `ROLES_PLAIN_MAX` (O3).
     Floors,
     /// *E* would be more than 4,096, or the values of the machine are out
     /// of range, or there are more usable cores than `NODES_MAX`.
@@ -555,6 +578,22 @@ pub(crate) struct Layout {
 
 /// The start-up page: a header, a table of entries, then their contents,
 /// each on an 8-byte boundary. Its bytes, from the counts it lists.
+/// The bytes of the start-up page of node 0 of a machine, for the tests.
+#[cfg(test)]
+pub(crate) fn start_page_bytes_of(machine: &Machine) -> u64 {
+    let layout = machine.layout().expect("a layout");
+    let untypeds = layout.floors[0]
+        .iter()
+        .flat_map(|&range| blocks(range))
+        .count();
+    start_page_bytes(
+        machine,
+        &layout,
+        untypeds as u64,
+        layout.nodes[0].len() as u64,
+    )
+}
+
 fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u64) -> u64 {
     let modules = (machine.segments.len() + machine.files.len()) as u64;
     let names: u64 = machine
@@ -567,22 +606,26 @@ fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u6
     let reserves: u64 = layout.reserves.iter().map(|r| r.len() as u64).sum();
     let kept = machine.kept.len() as u64 + 3 + machine.feedback.len() as u64;
     let kinds = machine.kinds.len() as u64;
+    // The fixed records by the sizes of `abi/`, so the budget cannot drift
+    // from them (the final review's verification of lot C, H1 = O2: 40 and
+    // 80 stood for 48 and 96, and a table no machine lists for 8 bytes).
+    let size = |bytes: usize| bytes as u64;
     let mut contents = vec![
         21 * 8,
         16 * untypeds,
         32 * machine.cores.len() as u64,
-        8,
+        0,
         8 + u64::from(machine.descriptor_size) * machine.memory.len() as u64,
         64,
-        40,
-        40,
+        size(std::mem::size_of::<dodos_abi::StartBootTimes>()),
+        size(std::mem::size_of::<dodos_abi::StartProcess>()),
         40 * modules + names,
         24 + 4 * cores,
         24 * floors,
         16 + 8 * machine.ioapics.len() as u64,
         16 * kept,
-        56,
-        80,
+        size(std::mem::size_of::<dodos_abi::StartMemory>()),
+        size(std::mem::size_of::<dodos_abi::StartMachine>()),
         8 * layout.roles.len() as u64,
         24 * reserves,
         48,
@@ -621,6 +664,60 @@ impl Machine {
         sorted(kept)
     }
 
+    /// The values of the machine in their ranges, judged before any of them
+    /// is used (Start-up state, D-141: each of these reached a panic of the
+    /// model instead of a refusal): no two memory ranges overlap and none
+    /// passes 2^64; MAXPHYADDR from the chunk's shift to 63 and above every
+    /// usable range; every core of a kind the entry `Kinds` lists; every
+    /// window of `BootNodes` below 1024; the iospaces' width from the page's
+    /// shift to 63; a unit's domain numbers from 16 to 65,536; each crash
+    /// area on a chunk boundary, apart from the other.
+    fn values_in_range(&self) -> bool {
+        let geometry = self.geometry;
+        let chunk_shift = geometry.chunk_shift();
+        let mut ranges: Vec<(u64, Option<u64>)> = self
+            .memory
+            .iter()
+            .map(|r| (r.base, r.base.checked_add(r.len)))
+            .collect();
+        ranges.sort();
+        let ends_fit = ranges.iter().all(|(_, end)| end.is_some());
+        let apart = ranges
+            .windows(2)
+            .all(|w| w[0].1.is_some_and(|end| end <= w[1].0));
+        let width = (chunk_shift..64).contains(&self.phys_bits)
+            && self
+                .memory
+                .iter()
+                .filter(|r| r.kind == RegionKind::Usable)
+                .all(|r| {
+                    r.base
+                        .checked_add(r.len)
+                        .is_some_and(|end| end <= 1u64 << self.phys_bits)
+                });
+        let kinds = self
+            .cores
+            .iter()
+            .all(|c| usize::from(c.kind) < self.kinds.len());
+        let windows = self.boot_nodes.as_ref().is_none_or(|(_, nodes)| {
+            nodes
+                .iter()
+                .all(|&(window, _)| window < dodos_abi::CORE_WINDOWS)
+        });
+        let io_width = (u32::from(geometry.page_shift[0])..64).contains(&self.io_width);
+        let domains = self
+            .iommus
+            .iter()
+            .all(|u| (16..=65_536).contains(&u.domains));
+        let chunk = geometry.chunk();
+        let crash = self.crash.0.is_multiple_of(chunk)
+            && self
+                .crash
+                .1
+                .is_none_or(|p| p.is_multiple_of(chunk) && p != self.crash.0);
+        ends_fit && apart && width && kinds && windows && io_width && domains && crash
+    }
+
     /// The refusals of the start-up, and the layout of the machine table.
     pub(crate) fn layout(&self) -> Result<Layout, Refusal> {
         let geometry = self.geometry;
@@ -632,6 +729,7 @@ impl Machine {
             || self.cores.is_empty()
             || self.cores.len() > NODES_MAX
             || booted.len() != 1
+            || !self.values_in_range()
         {
             return Err(Refusal::MachineValues);
         }
@@ -703,9 +801,19 @@ impl Machine {
                 .filter_map(|&size| geometry.bytes(size))
                 .filter(|&bytes| bytes <= len)
                 .max();
-            at = at.next_multiple_of(large.unwrap_or(page));
-            modules.push((at, vaddr, len, copied));
-            at += len.next_multiple_of(page);
+            // A module that passes the end of the addresses does not fit
+            // in the ordinary memory: refusal 5, not an overflow (the final
+            // review's verifications of lots A and AD, A2).
+            let placed = at.checked_next_multiple_of(large.unwrap_or(page));
+            let end = placed.and_then(|p| {
+                len.checked_next_multiple_of(page)
+                    .and_then(|bytes| p.checked_add(bytes))
+            });
+            let (Some(placed), Some(end)) = (placed, end) else {
+                return Err(Refusal::Floors);
+            };
+            modules.push((placed, vaddr, len, copied));
+            at = end;
         }
         let image = (self.image_base, at);
         // A debug area per physical core (D-129).
@@ -959,10 +1067,10 @@ impl Machine {
             resume_replacement: vec![false; n],
             crash: std::sync::Arc::new(crate::debug::CrashArea::new(
                 self.boot_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
-                self.previous_crash.as_ref().map_or(0, |p| p.sequence),
+                self.previous().map_or(0, |p| p.sequence),
                 cores,
             )),
-            previous: self.previous_crash.clone(),
+            previous: self.previous().cloned(),
             ports: Default::default(),
             stale_ns: u64::from(self.membership.stale_ms) * 1_000_000,
             stuck_ns: u64::from(self.membership.stuck_ms) * 1_000_000,
@@ -1083,13 +1191,18 @@ impl Model {
             kernel_epoch: 1,
             ..Self::default()
         };
-        let thread = model.build(layout, &untypeds, start_pages);
+        let thread = model.build(layout, &untypeds, start_pages)?;
         Ok((model, thread))
     }
 
     /// Slots: the start-up space and what it holds, in the order of the
     /// table of Start-up state.
-    fn build(&mut self, layout: &Layout, untypeds: &[(u64, u64)], start_pages: u64) -> ObjId {
+    fn build(
+        &mut self,
+        layout: &Layout,
+        untypeds: &[(u64, u64)],
+        start_pages: u64,
+    ) -> Result<ObjId, Refusal> {
         let machine = self.machine.clone();
         let geometry = machine.geometry;
         let page = geometry.page();
@@ -1102,13 +1215,24 @@ impl Model {
         // The number of slots: the multiple of 128 at or above 16 + every
         // capability that depends on the machine + 4,096.
         let frames_of = |phys, virt, len| module_frames(phys, virt, len, geometry).count();
-        let start_at = untypeds[0].0;
-        let copied: usize = layout
-            .modules
-            .iter()
-            .filter(|m| m.3)
-            .map(|m| frames_of(start_at, m.1, m.2))
-            .sum();
+        // A floor that holds no block of a page has no start-up untyped
+        // (refusal 5; the final review's verification of lot C, H3).
+        let Some(&(start_at, _)) = untypeds.first() else {
+            return Err(Refusal::Floors);
+        };
+        // The copied frames counted where they are placed: each segment
+        // from the start-up untyped's watermark as the frames before it
+        // left it, each frame at its own alignment (H2).
+        let mut watermark = 0u64;
+        let mut copied = 0;
+        for &(_, vaddr, len, _) in layout.modules.iter().filter(|m| m.3) {
+            let Some(vaddr) = vaddr else { continue };
+            for frame in module_frames(start_at + watermark, Some(vaddr), len, geometry) {
+                let bytes = self.bytes(frame.size);
+                watermark = watermark.next_multiple_of(bytes) + frame.pages * bytes;
+                copied += 1;
+            }
+        }
         let kept: usize = layout
             .modules
             .iter()
@@ -1217,9 +1341,12 @@ impl Model {
         // `exec`.
         let child = |model: &mut Self, size: PageSize, pages: u64, index: u32| {
             let bytes = model.bytes(size);
+            // The frames of the node start-up that do not fit in the
+            // start-up untyped are a refusal of the start-up, never a panic
+            // (D-141; the final review's verification of lot C, finding 1).
             let taken = model
                 .take(start_untyped, pages * bytes, bytes, Clearing::None)
-                .expect("the start-up untyped holds the frames of the start-up");
+                .ok()?;
             let place = Place { space, index };
             let cap = model.create(ObjectKind::Frame, pages, Some(start_cap), all, place);
             live(&mut model.objects, model.caps[&cap].object).boot = true;
@@ -1232,7 +1359,7 @@ impl Model {
                 kept: false,
             };
             model.frames.insert(model.caps[&cap].object, frame);
-            cap
+            Some(cap)
         };
         let mut mappings = Vec::new();
         for &(_, vaddr, len, copied) in &layout.modules {
@@ -1242,13 +1369,15 @@ impl Model {
             let untyped = &self.untypeds[&start_untyped];
             let at = untyped.base + untyped.watermark;
             for frame in module_frames(at, Some(vaddr), len, geometry) {
-                let cap = child(self, frame.size, frame.pages, next());
+                let cap = child(self, frame.size, frame.pages, next()).ok_or(Refusal::Floors)?;
                 let rights = Rights::READ.union(Rights::WRITE);
                 mappings.push((cap, vaddr + frame.offset, rights));
             }
         }
-        let start_page = child(self, PageSize::Page, start_pages, START_SLOT_START_PAGE);
-        let message_page = child(self, PageSize::Page, 1, START_SLOT_MESSAGE_PAGE);
+        let start_page = child(self, PageSize::Page, start_pages, START_SLOT_START_PAGE)
+            .ok_or(Refusal::Floors)?;
+        let message_page =
+            child(self, PageSize::Page, 1, START_SLOT_MESSAGE_PAGE).ok_or(Refusal::Floors)?;
         let place = Place {
             space,
             index: START_SLOT_MESSAGE_PAGE_MAP,
@@ -1271,8 +1400,11 @@ impl Model {
                 };
                 let base = phys + frame.offset;
                 let cap = self.kept_frame(place, base, frame.size, frame.pages, image_rights);
+                // A segment is mapped "always read, plus write or execute"
+                // (Start-up state, address space; the final review's
+                // verification of lot C's attack, finding 6).
                 if let (Some(vaddr), Some(rights), false) = (vaddr, rights, copied) {
-                    mappings.push((cap, vaddr + frame.offset, rights));
+                    mappings.push((cap, vaddr + frame.offset, rights.union(Rights::READ)));
                 }
             }
         }
@@ -1342,7 +1474,7 @@ impl Model {
         self.enter_debug_areas();
         let text = u64::from_le_bytes(*b"start\0\0\0");
         self.trace(dodos_abi::TraceCode::Text, None, [text, 0, 0]);
-        thread
+        Ok(thread)
     }
 
     /// A kept frame: ordinary memory, write-back, never cleared, made from

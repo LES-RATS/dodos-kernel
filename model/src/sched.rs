@@ -254,6 +254,16 @@ impl Model {
         self.leave();
         self.choose(entry);
         let at = *self.at;
+        // A core that goes idle answers its pending set first; a completed
+        // request can wake its waiter onto this core, so the choice is made
+        // again and the core that finds a thread leaves idle (D-141).
+        if self.cores[at].thread.is_none() && !self.cores[at].pending.is_empty() {
+            self.go_idle();
+            self.choose(None);
+            if self.cores[at].thread.is_some() {
+                self.wake_core();
+            }
+        }
         self.publish_counters();
         // Instructions retired: when a counted context stops running, the
         // kernel reads the processor's class of the code it ran.
@@ -367,7 +377,7 @@ impl Model {
             self.cores[at].running = picked;
             self.cores[at].thread = picked.and_then(|(context, _)| self.holder(context));
             let Some(holder) = self.cores[at].thread else {
-                *self.last_event = self.last_event.map(|(kind, _)| (kind, entered));
+                *self.last_event = self.last_event.map(|(kind, n)| (kind, n + entered));
                 return;
             };
             // Tasks and marks: a thread of a revoked task never runs again;
@@ -381,7 +391,7 @@ impl Model {
             }
             let aspace = self.threads[&holder].aspace;
             if aspace.is_some_and(|aspace| !self.dying(aspace)) {
-                *self.last_event = self.last_event.map(|(kind, _)| (kind, entered));
+                *self.last_event = self.last_event.map(|(kind, n)| (kind, n + entered));
                 return;
             }
             self.raise(holder, FaultKind::NoAddressSpace, [0; 3]);
@@ -447,6 +457,7 @@ impl Model {
     fn eligible(&self, context: ObjId) -> bool {
         let holder = self.holder(context);
         self.scheds[&context].configured
+            && !self.scheds[&context].moving
             && !self.dying(context)
             && holder.is_some_and(|holder| Self::runnable_thread(&self.threads[&holder]))
     }
@@ -592,13 +603,6 @@ impl Model {
             .map(|context| (context, false))
     }
 
-    /// Due events and the hardware timer of a core: after the choice, the
-    /// earliest of the instant the running context's budget ends, the
-    /// first replenishment instant of its throttled queues, the first
-    /// firing instant of its timer queue, the due event of its invalidation
-    /// request (`CORE_ANSWER_NS` after its start), and, while the core runs
-    /// a thread, its previous event + `STALE_NS` / 2, an event that only
-    /// beats (D-131). An idle core with nothing armed sets no timer.
     /// The due event of the core's invalidation request, on the hardware
     /// clock: `CORE_ANSWER_NS` after its start, which is read on the clock
     /// less the stopped time, so the stops already counted are added back
@@ -610,6 +614,15 @@ impl Model {
             .map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time)
     }
 
+    /// Due events and the hardware timer of a core: after the choice, the
+    /// earliest of the instant the running context's budget ends, the
+    /// first replenishment instant of its throttled queues, the first
+    /// firing instant of its timer queue, the due event of its invalidation
+    /// request (`CORE_ANSWER_NS` after its start), on the node's first core
+    /// the due step of its recovery reserve (`reserve_due`), and, while the
+    /// core runs a thread, its previous event + `STALE_NS` / 2, an event
+    /// that only beats (D-131). An idle core with nothing armed sets no
+    /// timer.
     pub(crate) fn hardware(&self, core: usize) -> Option<u64> {
         let part = &self.cores[core];
         let budget = part.running.and_then(|(context, ready)| {
@@ -799,10 +812,13 @@ impl Model {
         self.cores[placed].admitted -= before;
         self.cores[target].admitted += bandwidth(budget, period);
         if placed != target {
-            if let Some(holder) = self.holder(context) {
-                self.mark_leaving(holder);
-            }
+            // A move of a context whose holder runs on its old core marks
+            // the context moving with that thread's leave (D-141).
+            let moving = self
+                .holder(context)
+                .is_some_and(|holder| self.mark_leaving(holder));
             let sched = live(&mut self.scheds, context);
+            sched.moving |= moving;
             sched.core = target;
             sched.queue = None;
             if !self.change_list.contains(&context) {
@@ -817,7 +833,11 @@ impl Model {
         }
         let sched = live(&mut self.scheds, context);
         if off {
+            // "With budget 0: the context is not configured, r = 0, d = 0,
+            // consumed = 0" (the final review's verification of lot B,
+            // finding 9).
             sched.configured = false;
+            sched.consumed = 0;
             (sched.remaining, sched.deadline, sched.throttled) = (0, 0, None);
             (sched.budget, sched.period, sched.pending) = (0, 0, None);
         } else if !sched.configured {

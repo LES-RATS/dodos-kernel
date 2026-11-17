@@ -794,8 +794,8 @@ fn a_table_unhooked_by_a_record_whose_invalidation_is_in_flight_stays_off_the_fr
     // Both records cleared, as by two changes whose invalidations are in
     // flight (on x86-64 in a node of several cores); then the first one's
     // completes.
-    k.m.clear_mapping_pub(caps[0]);
-    k.m.clear_mapping_pub(caps[1]);
+    k.m.clear_mapping(caps[0]);
+    k.m.clear_mapping(caps[1]);
     let of = |k: &N, cap| {
         k.m.aspaces[&space]
             .unhooked

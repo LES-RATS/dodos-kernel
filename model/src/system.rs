@@ -125,7 +125,13 @@ impl System {
                     .is_some_and(|w| w.state() == CoreState::Owned)
                 {
                     true => Hardware::Running,
-                    false => Hardware::Stub { window: false },
+                    // A spare core waits in the park stub on x86-64; on
+                    // ARM64 and RISC-V it is off until `CPU_ON` or
+                    // `sbi_hart_start` (H15).
+                    false => match machine.arch {
+                        Arch::X86_64 => Hardware::Stub { window: false },
+                        Arch::Aarch64 | Arch::Riscv64 => Hardware::Off,
+                    },
                 }
             })
             .collect();
@@ -643,8 +649,6 @@ impl System {
             }
             (Arch::X86_64, _) => {}
             // ARM64: SDEI event 0 to a core whose kernel registered its
-            // handler, which completes the event and calls `CPU_OFF`.
-            // ARM64: SDEI event 0 to a core whose kernel registered its
             // handler; the handler writes `parked` and completes the event
             // to the park routine, which calls `CPU_OFF` (a later event).
             // The fence is confirmed by OFF after the request, never by the
@@ -801,9 +805,17 @@ impl System {
                 return;
             }
             let table = self.table().clone();
+            // A start the node refuses (its start-up page does not fit)
+            // leaves no core in a state no event leaves: the core parks
+            // again, or goes off, and the starter's `START_NS` ends the
+            // start (O22).
             let Ok((mut model, _)) =
                 Model::start(&self.machine, &self.layout, table, node, &joining)
             else {
+                match self.machine.arch {
+                    Arch::X86_64 => self.park(core),
+                    _ => self.hardware[core] = Hardware::Off,
+                }
                 return;
             };
             model.shared = true;

@@ -29,7 +29,7 @@ impl Model {
         let place = self.destination(thread, destination)?;
         // The plain arguments, after the destination: the source as its
         // format allows, a GSI that an IOAPIC serves (judged with the
-        // source), then the vector.
+        // source), then the core number, then the vector (O12).
         let source = IrqSource::from_raw(source)?;
         let served = |gsi: u32| {
             self.machine
@@ -51,8 +51,28 @@ impl Model {
         // core of number 341 or more.
         let apic = self.machine.core_list()[core as usize].hw_id;
         let remapped_core = core >= u64::from(IRQ_MAX_CORES_REMAPPED);
-        if !self.machine.remapping && apic > 255 || self.machine.remapping && remapped_core {
+        // An APIC ID of 255 is the broadcast (Intel SDM §13.6.2.1, D-141).
+        if !self.machine.remapping && apic >= 255 || self.machine.remapping && remapped_core {
             return Err(Error::Unsupported);
+        }
+        // A level line claimed on a node that does not hold its
+        // controller's role is held by the controller until acknowledged:
+        // on x86-64 only where the end of interrupt is directed, on ARM64 by
+        // the SPI's active state; on RISC-V not at all (Interrupts, Nodes,
+        // D-141).
+        if source.level() {
+            let holder = self
+                .ioapic_role(source.id())
+                .map(|r| self.table.roles[r].holder());
+            let held_here = holder == Some(self.node);
+            let held_away = match self.machine.arch {
+                crate::Arch::X86_64 => self.machine.directed_eoi,
+                crate::Arch::Aarch64 => true,
+                crate::Arch::Riscv64 => false,
+            };
+            if !held_here && !held_away {
+                return Err(Error::Unsupported);
+            }
         }
         // A line beyond the last line word (Interrupts, D-135).
         if source.is_line() && source.id() as usize >= dodos_abi::IRQ_LINES_MAX {
@@ -74,9 +94,8 @@ impl Model {
         // A vector whose bit is set in the core's retired word, in the
         // living part: a failed unit may still hold its remapping entry
         // (Interrupts, the irq, D-139, D-140).
-        let handle = u64::from(self.cores[position].number) * IRQ_TABLE_ENTRIES as u64
-            + u64::from(vector.saturating_sub(IRQ_VECTOR_FIRST));
-        if self.table.retired.contains(&(handle as u16)) {
+        let handle = remap_handle(u64::from(self.cores[position].number), vector);
+        if self.table.retired.contains(&handle) {
             return Err(Error::Busy);
         }
         // A line whose word the rules of taking refuse to this node, or that
@@ -112,7 +131,10 @@ impl Model {
                 .map_or(0, |io| io.segment),
             false => source.segment(),
         };
-        let units = match self.machine.remapping {
+        // A core event is raised by no device: it writes no remapping entry
+        // and asks no unit, and its claim returns 0 and 0 (D-141; the final
+        // review's verification of lot C, H7).
+        let units = match self.machine.remapping && !source.is_core_event() {
             true => self.segment_roles(segment),
             false => Vec::new(),
         };
@@ -145,7 +167,7 @@ impl Model {
             generation,
             units: units.clone(),
         };
-        self.table.irq_tables.insert(handle as u16, kept);
+        self.table.irq_tables.insert(handle, kept);
         if source.is_line() {
             let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation);
             self.table.write_line(self.node, source.id(), Some(taken));
@@ -153,8 +175,9 @@ impl Model {
         // The fixed remapping entry of the vector on that core: handle
         // core number × 192 + (vector − 48), written by this node's gate.
         let entry = u64::from(vector - IRQ_VECTOR_FIRST);
-        let handle = core * IRQ_TABLE_ENTRIES as u64 + entry;
+        let handle = u64::from(remap_handle(core, vector));
         let (address, data) = match (source.is_line(), self.machine.remapping) {
+            _ if source.is_core_event() => (0, 0),
             (true, _) => (0, 0),
             (false, true) => (dodos_abi::x86_64::msi_remapped(handle), 0),
             (false, false) => {
@@ -286,12 +309,9 @@ impl Model {
     /// the vector and the core's APIC ID without (Interrupts, x86-64).
     pub(crate) fn line_target(&self, position: usize, vector: u8) -> crate::rings::Target {
         let core = u64::from(self.cores[position].number);
-        let handle = core * IRQ_TABLE_ENTRIES as u64 + u64::from(vector - IRQ_VECTOR_FIRST);
+        let handle = remap_handle(core, vector);
         match self.machine.remapping {
-            true => crate::rings::Target::Remapped {
-                handle: handle as u16,
-                vector,
-            },
+            true => crate::rings::Target::Remapped { handle, vector },
             false => crate::rings::Target::Direct {
                 vector,
                 apic: self.machine.core_list()[core as usize].hw_id as u32,
@@ -431,8 +451,7 @@ impl Model {
     /// The remapping handle of an irq: its core's number × 192 + (vector −
     /// 48) (Interrupts, interrupt remapping).
     pub(crate) fn handle_of(&self, irq: &Irq) -> u16 {
-        let core = u64::from(self.cores[irq.core].number);
-        (core * IRQ_TABLE_ENTRIES as u64 + u64::from(irq.vector - IRQ_VECTOR_FIRST)) as u16
+        remap_handle(u64::from(self.cores[irq.core].number), irq.vector)
     }
 
     /// The removal of an MSI's irq whose remapping entry the units of its
@@ -447,7 +466,7 @@ impl Model {
     fn msi_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
         use crate::caps::Undone;
         let entry = self.irqs[&irq];
-        let units = match self.machine.remapping {
+        let units = match self.machine.remapping && !entry.source.is_core_event() {
             true => self.segment_roles(entry.source.segment()),
             false => Vec::new(),
         };
@@ -612,4 +631,12 @@ impl Model {
             }
         }
     }
+}
+
+/// The fixed remapping handle of `vector` on the core of number `core`:
+/// core number × 192 + (vector − 48), the one formula (Interrupts,
+/// interrupt remapping; O11). A vector below the claimable range counts as
+/// 48.
+pub(crate) fn remap_handle(core: u64, vector: u8) -> u16 {
+    (core * IRQ_TABLE_ENTRIES as u64 + u64::from(vector.saturating_sub(IRQ_VECTOR_FIRST))) as u16
 }

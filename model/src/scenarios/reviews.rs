@@ -402,6 +402,7 @@ fn deepseek_15_node_send_is_busy_when_the_grant_table_has_fewer_free_entries_tha
     let mut k = N::on(&machine(Arch::X86_64, 2, &[&[0], &[1]]));
     k.ok(k.retype(ObjectKind::Frame, 1, 200));
     let taken = crate::table::GrantEntry {
+        anchor: crate::table::Anchor::test(),
         grantee: 1,
         generation: 1,
         serial: 1,

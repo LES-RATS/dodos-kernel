@@ -745,14 +745,18 @@ fn the_holder_of_an_ioapic_refuses_a_redirection_entry_aimed_at_another_nodes_co
 
 #[test]
 fn the_start_up_refuses_a_unit_with_fewer_domain_numbers_than_node_slots() {
-    let mut machine = machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]);
-    machine.iommus[0].domains = 4;
-    assert_eq!(
-        System::boot(&machine).err(),
-        Some(crate::boot::Refusal::Nodes)
-    );
-    machine.iommus[0].domains = 5;
-    assert!(System::boot(&machine).is_ok());
+    // The fewest domain numbers a unit has is 16 (D-141): 14 for the node
+    // slots, so 15 slots get none each.
+    let layout: Vec<Vec<usize>> = (0..15).map(|c| vec![c]).collect();
+    let nodes: Vec<&[usize]> = layout.iter().map(Vec::as_slice).collect();
+    let mut machine = machine(crate::Arch::X86_64, 15, &nodes);
+    machine.iommus[0].domains = 16;
+    assert_eq!(machine.layout().err(), Some(crate::boot::Refusal::Nodes));
+    let layout: Vec<Vec<usize>> = (0..14).map(|c| vec![c]).collect();
+    let nodes: Vec<&[usize]> = layout.iter().map(Vec::as_slice).collect();
+    let mut machine = super::machine(crate::Arch::X86_64, 14, &nodes);
+    machine.iommus[0].domains = 16;
+    assert!(machine.layout().is_ok());
 }
 
 #[test]

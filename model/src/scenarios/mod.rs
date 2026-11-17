@@ -15,6 +15,7 @@ mod pass18;
 mod pass19;
 mod pass20;
 mod pass21;
+mod pass22;
 mod reviews;
 mod units;
 
@@ -61,7 +62,7 @@ pub(crate) fn machine(arch: Arch, cores: usize, nodes: &[&[usize]]) -> Machine {
             (window, mask)
         })
         .collect();
-    machine.boot_nodes = Some((nodes.len() as u16, layout));
+    machine.boot_nodes = Some((nodes.len() as u32, layout));
     machine
 }
 

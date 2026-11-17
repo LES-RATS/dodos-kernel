@@ -3,12 +3,15 @@
 //! kernel ring, counted per core, the core record and the stop record, `debug_write` and `trace_emit`; the
 //! I/O ports of x86-64; `entropy_read`.
 //!
-//! What the kernel traces in the model: its start (code 1), a fault
-//! recorded in a thread (5), a failure of the node (6), a transition of a
-//! member or role word it made (9), an ownership word that failed its
-//! check when the gate read it (10), and the entries suppressed (3). DMA
-//! faults (2), units that do not confirm (4), hardware errors (7) and
-//! interrupts on unclaimed vectors (8) have no source in the model.
+//! What the kernel traces in the model, in the kernel ring: its start
+//! (code 1), the entries suppressed (3), a unit that does not confirm (4),
+//! a fault recorded in a thread (5), a failure of the node (6), a
+//! transition of a member or role word it made (9), an ownership word that
+//! failed its check when the gate read it (10), a message refused by the
+//! check (11) and a debug area cleared at the start (12); in the user ring,
+//! `debug_write` (16) and `trace_emit` (17). DMA faults (2), hardware
+//! errors (7) and interrupts on unclaimed vectors (8) have no source in the
+//! model.
 
 use crate::{Model, ObjId, Outcome, Output, SlotAddr};
 use dodos_abi::{
@@ -47,7 +50,7 @@ pub(crate) struct Record {
 }
 
 /// A crash area: its header's boot identifier and sequence, its stop
-/// record, and the debug area of each node.
+/// record, and the debug area of each physical core (D-129).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CrashArea {
     pub(crate) boot_id: u64,
@@ -70,6 +73,18 @@ impl DebugArea {
             kernel: vec![TraceEntry::default(); TRACE_KERNEL_ENTRIES as usize],
             user: vec![TraceEntry::default(); TRACE_USER_ENTRIES as usize],
         }
+    }
+
+    /// Whether a kept area's next sequences can be continued: each at least
+    /// 1, below 2^63, and 1 or the sequence of the entry before it in its
+    /// ring (D-141).
+    fn continues(&self) -> bool {
+        let holds = |ring: &[TraceEntry], next: u64, entries: u64| {
+            (1..1 << 63).contains(&next)
+                && (next == 1 || ring[trace_index(next - 1, entries) as usize].seq == next - 1)
+        };
+        holds(&self.kernel, self.next_kernel, TRACE_KERNEL_ENTRIES)
+            && holds(&self.user, self.next_user, TRACE_USER_ENTRIES)
     }
 
     /// Writes one entry as it is, for the tests of the invariants.
@@ -102,7 +117,9 @@ impl CrashArea {
     pub(crate) fn new(boot_id: u64, previous: u64, cores: usize) -> Self {
         Self {
             boot_id,
-            sequence: previous + 1,
+            // A previous header of sequence 2^64 - 1 is not valid: the
+            // area of this boot then follows none (D-141).
+            sequence: previous.checked_add(1).unwrap_or(1),
             stop: None,
             areas: (0..cores).map(|_| DebugArea::new(1)).collect(),
         }
@@ -133,8 +150,9 @@ impl CrashArea {
     }
 }
 
-/// The rate limit of one code of the kernel ring, in the node block: the
-/// start of its window, its entries in it, the entries it suppressed.
+/// The rate limit of one code of the kernel ring, in the core's part of the
+/// node block: the start of its window, its entries in it, the entries it
+/// suppressed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Limit {
     pub(crate) window: Option<u64>,
@@ -256,9 +274,11 @@ impl Model {
     }
 
     /// Each core that starts in the node keeps its debug area if the
-    /// header's magic and version are right, with the node slot and the
-    /// generation, and goes on from the next sequences found there;
-    /// otherwise it clears the area and starts at 1.
+    /// header's magic and version are right and each next sequence is at
+    /// least 1, below 2^63 and agrees with its ring, with the node slot and
+    /// the generation, and goes on from the next sequences found there;
+    /// otherwise it clears the area, starts at 1 and writes one entry of
+    /// code 12 (D-141: the header is a faulty kernel's data).
     pub(crate) fn enter_debug_areas(&mut self) {
         let generation = self.table.generation(self.node);
         for core in self
@@ -267,12 +287,28 @@ impl Model {
             .map(|c| c.number as usize)
             .collect::<Vec<_>>()
         {
+            let found = {
+                let area = &self.table.crash.areas[core];
+                (area.next_kernel, area.next_user)
+            };
+            let cleared = self.cleared_entry(found);
             let area = &mut std::sync::Arc::make_mut(&mut self.table.crash).areas[core];
-            if area.magic != DEBUG_AREA_MAGIC || area.version != DEBUG_AREA_VERSION {
+            let right = area.magic == DEBUG_AREA_MAGIC && area.version == DEBUG_AREA_VERSION;
+            if !right || !area.continues() {
                 *area = DebugArea::new(generation);
+                if right {
+                    area.write(false, cleared);
+                }
             }
             (area.generation, area.slot) = (generation, self.node);
         }
+    }
+
+    /// The entry of code 12 that a cleared area starts with.
+    fn cleared_entry(&self, (kernel, user): (u64, u64)) -> TraceEntry {
+        let mut entry = self.entry(TraceCode::AreaCleared, 0, (0, 0), [kernel, user, 0]);
+        entry.seq = 0;
+        entry
     }
 
     /// A trace ring of the node's first core, oldest entry first, as a
@@ -408,9 +444,15 @@ impl Model {
 
     /// The range an `ioports` capability carries.
     fn ports_of(&self, thread: ObjId, slot: SlotAddr, right: Rights) -> Result<IoPortRange, Error> {
-        let cap = self.cap(thread, slot, right)?;
+        // Through a `cspace` capability, reading a slot as the target of a
+        // call needs `read` (Slots and addresses): the right of the call is
+        // judged on the `ioports` capability itself (the final review's
+        // verification of lot B, O9).
+        let cap = self.cap(thread, slot, Rights::READ)?;
         let held = self.is(cap, ObjectKind::IoPorts, right)?;
-        Ok(range_of(held.badge))
+        // A word that names no range admits no port: `busy`, as a port
+        // refused to the node, never every port.
+        range_of(held.badge).ok_or(Error::Busy)
     }
 
     /// `ioport_in` and `ioport_out`.
@@ -471,7 +513,7 @@ impl Model {
         }
         let parent = self.cap(thread, ioports, Rights::READ)?;
         let held = self.is(parent, ObjectKind::IoPorts, Rights::DERIVE)?;
-        let (rights, range) = (held.rights, range_of(held.badge));
+        let (rights, range) = (held.rights, range_of(held.badge).ok_or(Error::Invalid)?);
         let place = self.destination(thread, destination)?;
         let new = IoPortRange::new(first, last).ok_or(Error::Invalid)?;
         if new.first() < range.first() || new.last() > range.last() {
@@ -520,8 +562,8 @@ impl Model {
 
 /// The range in the word of an `ioports` slot: first in bits 0-15, last in
 /// bits 16-31.
-pub(crate) fn range_of(badge: u64) -> IoPortRange {
-    IoPortRange::new(badge & 0xFFFF, badge >> 16 & 0xFFFF).unwrap_or(IoPortRange::ALL)
+pub(crate) fn range_of(badge: u64) -> Option<IoPortRange> {
+    IoPortRange::new(badge & 0xFFFF, badge >> 16 & 0xFFFF)
 }
 
 #[cfg(test)]

@@ -157,16 +157,18 @@ impl Model {
     }
 
     /// Whether a word is taken by this node's current generation: for a
-    /// reserve's word, by a live block of this node.
+    /// reserve's word, taken with this node's generation while this node
+    /// holds the reserve's role (`role_claim`: such a word "was taken by the
+    /// node the role word names, with the generation the word holds"; the
+    /// final review's verification of lot B, finding 1).
     fn taken_here(&self, word: Ownership) -> bool {
         if word.state() != OwnState::Taken {
             return false;
         }
+        let current = word.generation() == self.table.generation(self.node);
         match word.owner() {
-            Owner::Node(owner) => {
-                owner == self.node && word.generation() == self.table.generation(self.node)
-            }
-            Owner::Reserve(_) => false,
+            Owner::Node(owner) => owner == self.node && current,
+            Owner::Reserve(j) => current && self.table.holds_reserve(self.node, j),
             Owner::Unclaimed => false,
         }
     }
@@ -223,7 +225,7 @@ impl Model {
         // (D-131): the words are written at the completion. Nothing is sent
         // to the other node.
         let freed = self.take_block(object, Freed::Given(node as u16), false);
-        self.remove_block_cap(cap);
+        self.remove_leaf(cap);
         let Some(freed) = freed else {
             return Ok(Output::Done);
         };
@@ -295,6 +297,11 @@ impl Model {
         }
         self.idle_block(cap, object)?;
         self.return_watermark(object)?;
+        // G5: a split destroys the block, so the entry's leaf count must be
+        // 0 (D-141; the final review's verification of lot B, finding 2).
+        if self.mapped_block(object) {
+            return Err(Error::Busy);
+        }
         let unclaimed = Ownership::free(Owner::Unclaimed);
         let spare = self
             .table
@@ -318,7 +325,7 @@ impl Model {
         assert!(self.table.write_entry(self.node, spare, upper));
         assert!(self.table.write_entry(self.node, index, lower));
         live(&mut self.untypeds, object).block = None;
-        self.remove_block_cap(cap);
+        self.remove_leaf(cap);
         Ok(Output::Index(spare as u64))
     }
 
@@ -398,12 +405,6 @@ impl Model {
         {
             untyped.block = None;
         }
-    }
-
-    /// The capability of a block, removed by `memory_give` or
-    /// `memory_split`: its slot becomes empty and the untyped is destroyed.
-    fn remove_block_cap(&mut self, cap: crate::CapId) {
-        self.remove_leaf(cap);
     }
 }
 

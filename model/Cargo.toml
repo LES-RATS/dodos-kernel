@@ -3,7 +3,7 @@ name = "dodos-model"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
-description = "Executable reference model of the DodOS kernel, one core"
+description = "Executable reference model of the DodOS kernel contract: nodes of N cores and the machine"
 
 [dependencies]
 dodos-abi = { path = "../abi" }

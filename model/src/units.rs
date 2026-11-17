@@ -97,6 +97,10 @@ pub(crate) struct Rebuild {
     pub(crate) key: u64,
     pub(crate) asked: bool,
     pub(crate) items: Vec<(u16, crate::rings::Item)>,
+    /// The nodes the rebuild passed over because they were sealed: their
+    /// entries are kept without a report, even if they resume before the
+    /// rebuild ends (the final review's verification of lot C, H11).
+    pub(crate) sealed: std::collections::BTreeSet<u16>,
     /// The drain and the final invalidation of the whole unit: its
     /// submission, once made.
     pub(crate) closing: Option<(u64, u64)>,
@@ -275,6 +279,17 @@ impl Model {
             })
         };
         let state = self.table.units.get(&role);
+        // The holder serves an operation only on a unit of its kind:
+        // operations 1 to 4 on an IOMMU unit, 5 on an IOAPIC (D-141).
+        let iommu_op = !matches!(op, UnitOp::Redirection { .. });
+        let kind_fits = match record.governs {
+            dodos_abi::Governs::IommuUnit => iommu_op,
+            dodos_abi::Governs::IoApic => !iommu_op,
+            _ => false,
+        };
+        if !kind_fits {
+            return false;
+        }
         match op {
             UnitOp::Attach {
                 device,
@@ -339,9 +354,13 @@ impl Model {
                 target,
                 ..
             } => {
+                // With the generation the word holds, as for a claim: a word
+                // a generation that is over took is not the requester's
+                // (D-141; the final review's verification of lot C, H16).
                 let word = self.table.line_word(gsi);
                 let free = word.state() == dodos_abi::OwnState::Free;
-                let names = word.owner() == dodos_abi::Owner::Node(node);
+                let names =
+                    word.owner() == dodos_abi::Owner::Node(node) && word.generation() == generation;
                 target == crate::rings::Target::Masked && (free || names)
             }
             // Claimed: the line's word names the requester with its
@@ -436,7 +455,10 @@ impl Model {
     }
 
     pub(crate) fn submit_for(&mut self, role: usize, op: UnitOp, requester: (u16, u32)) -> u64 {
-        let now = self.now;
+        // The instant of a submission is on the clock of membership, as
+        // every unit wait (Two builds, and the debugger stub; the final
+        // review's verification of lot C, O13).
+        let now = self.membership_now();
         let word = self.table.roles[role];
         self.submitted.0.push((role, word));
         // The holder's gate writes the attach word *attached* before the
@@ -485,8 +507,11 @@ impl Model {
     }
 
     /// Whether the unit has confirmed a submission. A unit that works
-    /// confirms what was submitted before the current instant's check; a
-    /// broken one confirms nothing.
+    /// confirms everything submitted up to the check, the same instant
+    /// included: the queue holds only what `submit_for` wrote to the unit,
+    /// and the contract bounds the unit's wait from above only
+    /// (`IOMMU_WAIT_NS`), so a fast unit is a legal one (O20). A broken one
+    /// confirms nothing.
     pub(crate) fn confirmed(&mut self, role: usize, serial: u64) -> bool {
         let unit = self.table.units.entry(role).or_default();
         if !unit.broken {
@@ -684,7 +709,7 @@ impl Model {
                 self.detach_confirmed(entry.role, entry.op);
                 self.unit_complete(index, UnitResult::Done);
                 any = true;
-            } else if at + IOMMU_WAIT_NS <= self.membership_now() {
+            } else if self.unit_overdue(at) {
                 self.fail_unit(entry.role);
                 any = true;
             }
@@ -699,7 +724,7 @@ impl Model {
             let result = if self.confirmed(entry.role, serial) {
                 self.detach_confirmed(entry.role, entry.op);
                 UnitResult::Done
-            } else if at + IOMMU_WAIT_NS <= self.membership_now() {
+            } else if self.unit_overdue(at) {
                 self.fail_unit(entry.role);
                 continue;
             } else {
@@ -733,6 +758,14 @@ impl Model {
         }
     }
 
+    /// Whether a submission of `at` is past `IOMMU_WAIT_NS` on the clock of
+    /// membership; never while the debugger stub's release word is raised,
+    /// when every wait suspends (Two builds, and the debugger stub, D-135;
+    /// the final review's verification of lot C, O13).
+    pub(crate) fn unit_overdue(&self, at: u64) -> bool {
+        !self.table.release && at + IOMMU_WAIT_NS <= self.membership_now()
+    }
+
     /// The earliest instant a unit wait ends by time: `IOMMU_WAIT_NS` after
     /// the oldest submission not yet confirmed.
     pub(crate) fn unit_deadline(&self) -> Option<u64> {
@@ -748,7 +781,21 @@ impl Model {
             .unit_service
             .values()
             .filter_map(|s| s.submitted.map(|(_, at)| at));
-        own.chain(served).min().map(|at| at + IOMMU_WAIT_NS)
+        // The submissions of the units this node holds, R1's among them:
+        // their failure is judged by time too (O13).
+        let held = self
+            .table
+            .units
+            .iter()
+            .filter(|&(&role, _)| {
+                let word = self.table.roles[role];
+                word.state() == dodos_abi::RoleState::Held && word.holder() == self.node
+            })
+            .flat_map(|(_, unit)| unit.queue.iter().map(|&(_, at)| at));
+        own.chain(served)
+            .chain(held)
+            .min()
+            .map(|at| at + IOMMU_WAIT_NS)
     }
 
     /// Whether a step of the unit requests could make progress now.

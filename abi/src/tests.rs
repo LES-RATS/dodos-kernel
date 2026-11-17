@@ -425,7 +425,7 @@ fn sizes_and_limits_have_their_values() {
     );
     assert_eq!((ASPACE_PAGES, IOSPACE_PAGES), (2, 2));
     assert_eq!((TABLE_ENTRIES_MAX, LEVELS_MIN), (4096, 2));
-    assert_eq!((IOSPACE_MAX_DEVICES, IOMMU_WAIT_NS), (16, 1_000_000));
+    assert_eq!((IOSPACE_MAX_DEVICES, IOMMU_WAIT_NS), (16, 10_000_000));
     assert_eq!(ENTROPY_MAX_BYTES, 64);
 }
 
@@ -447,8 +447,9 @@ fn numbers_of_the_multi_node_part_have_their_values() {
         (1_000_000_000, (100_000_000, 60_000_000_000))
     );
     let fence = [NMI_GRACE_NS, FENCE_NS, SETTLE_NS, START_NS];
-    assert_eq!(fence, [1_000_000, 20_000_000, 1_000_000, 1_000_000_000]);
-    assert_eq!(FENCE_RANGE_NS, (10_000_000, 1_000_000_000));
+    // D-141: two rounds of a fence (11.2 ms each) and their stub.
+    assert_eq!(fence, [1_000_000, 30_000_000, 1_000_000, 1_000_000_000]);
+    assert_eq!(FENCE_RANGE_NS, (12_000_000, 1_000_000_000));
     assert_eq!(
         (SEAL_NS, SEAL_RANGE_NS),
         (1_000_000_000, (10_000_000, 60_000_000_000))
@@ -1716,7 +1717,7 @@ fn debug_values_have_their_numbers() {
     assert_eq!((TRACE_BURST, TRACE_BURST_NS), (16, 1_000_000));
     assert_eq!(
         (CONSOLE_STEP_BYTES, CONSOLE_TICK_NS, STUB_STOP_NS),
-        (16, 1_000_000, 10_000_000)
+        (16, 1_500_000, 10_000_000)
     );
     assert_eq!(
         (CRASH_RECORD_KERNEL_ENTRIES, CRASH_RECORD_USER_ENTRIES),
@@ -1735,6 +1736,7 @@ fn debug_values_have_their_numbers() {
         Transition,
         BadWord,
         Refused,
+        AreaCleared,
     ];
     for (number, code) in codes.into_iter().enumerate() {
         assert_eq!(code as u16, number as u16 + 1);
@@ -1969,7 +1971,9 @@ fn msi_addresses_follow_the_remappable_and_the_direct_formats() {
     assert_eq!(msi_remapped(0x7FFF), 0xFEE0_0000 | 0x7FFF << 5 | 1 << 4);
     assert_eq!(msi_remapped(0x8000), 0xFEE0_0014);
     assert_eq!(msi_direct(1, 48), Some((0xFEE0_1000, 48)));
-    assert_eq!(msi_direct(255, 239), Some((0xFEE0_0000 | 255 << 12, 239)));
+    assert_eq!(msi_direct(254, 239), Some((0xFEE0_0000 | 254 << 12, 239)));
+    // 255 is the broadcast to every local APIC (D-141).
+    assert_eq!(msi_direct(255, 239), None);
     assert_eq!(msi_direct(256, 48), None);
 }
 
@@ -2252,6 +2256,12 @@ fn arm64_and_riscv_exceptions_map_to_the_kinds_of_faults() {
         (esr(a::EC_SYS64, 0), Fault(Undefined)),
         (esr(a::EC_SVE, 0), Feature(a::SVE)),
         (esr(a::EC_SME, 0), Feature(a::SME)),
+        // The SME trap code (D-141): ZT0 is its own feature; an instruction
+        // refused by the streaming or ZA state is undefined.
+        (esr(a::EC_SME, 0b100), Feature(a::SME2_ZT0)),
+        (esr(a::EC_SME, 0b001), Fault(Undefined)),
+        (esr(a::EC_SME, 0b010), Fault(Undefined)),
+        (esr(a::EC_SME, 0b011), Fault(Undefined)),
         (esr(a::EC_FP_SIMD, 0), Own),
         (esr(a::EC_FP_TRAP64, 0), Fault(Arithmetic)),
         (esr(a::EC_SVC64, 0), Call),
@@ -2479,4 +2489,89 @@ fn a_fence_record_indexes_its_last_stops_by_core_number_modulo_64() {
     assert_eq!(FenceRecord::stop_index(64 + 5), 5);
     let window: Vec<usize> = (128..192).map(FenceRecord::stop_index).collect();
     assert_eq!(window, (0..64).collect::<Vec<_>>());
+}
+
+/// The pass-22 corrections of `abi/` (D-141), one behaviour each.
+#[test]
+fn a_geometry_with_a_shift_near_255_is_refused_not_an_overflow() {
+    let g = Geometry {
+        page_shift: [12, 255, 1, 0],
+        entries: 512,
+        levels: 4,
+        user_end: 1 << 30,
+    };
+    assert!(!g.valid());
+    let g = Geometry {
+        page_shift: [12, 21, 250, 0],
+        ..g
+    };
+    assert!(!g.valid());
+}
+
+#[test]
+fn dr7_refuses_an_io_breakpoint_a_length_of_ten_and_a_length_on_an_execution_breakpoint() {
+    use x86_64::dr7_valid;
+    assert!(dr7_valid(1));
+    assert!(dr7_valid(1 | 0b01 << 16 | 0b11 << 18));
+    assert!(!dr7_valid(1 | 0b10 << 16));
+    assert!(!dr7_valid(1 | 0b01 << 16 | 0b10 << 18));
+    assert!(!dr7_valid(1 | 0b11 << 18));
+}
+
+#[test]
+fn a_credit_index_past_the_credits_is_none() {
+    for index in 0..32u8 {
+        let header = RingHeader::new(NodeMessage::Revoke, 1, (0, 1), 1, Some((index, 1)));
+        let credit = header.credit();
+        assert_eq!(
+            credit.is_some(),
+            (index as usize) < REQUESTS_PER_PEER + SENDS_PER_PEER
+        );
+    }
+}
+
+#[test]
+fn a_clock_page_with_a_shift_of_128_reads_0() {
+    let page = ClockPage {
+        version: 1,
+        seq: 0,
+        shift: 128,
+        flags: 0,
+        mult: 1,
+        counter_base: 0,
+        ns_base: 5,
+    };
+    assert_eq!(page.nanoseconds(100), 0);
+}
+
+#[test]
+#[should_panic]
+fn a_deadline_at_the_time_limit_is_outside_firing_instant() {
+    firing_instant(TIME_LIMIT, 0);
+}
+
+#[test]
+#[should_panic]
+fn a_device_entry_below_a_page_is_refused() {
+    DeviceEntry::used(64, 6);
+}
+
+#[test]
+fn a_word_whose_owner_names_nothing_is_no_ones_to_take() {
+    let word = Ownership::make_raw_for_tests(OwnState::Taken, 0x2000, 1);
+    let live = Member::new(MemberState::Live, Evidence::None, 0, 1);
+    assert!(!word.may_take(0, 1, live, true));
+}
+
+#[test]
+fn module_frames_of_a_length_beyond_the_addresses_does_not_overflow() {
+    let frames = module_frames(0, None, u64::MAX, x86_64::GEOMETRY);
+    assert!(frames.take(3).count() == 3);
+    let frames = module_frames(u64::MAX - 4095, None, 4096, x86_64::GEOMETRY);
+    assert_eq!(frames.count(), 1);
+}
+
+#[test]
+fn the_crash_area_magic_is_fixed() {
+    assert_eq!(CRASH_AREA_MAGIC.to_le_bytes(), *b"DodOScr\0");
 }

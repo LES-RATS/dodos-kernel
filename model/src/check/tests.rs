@@ -845,6 +845,22 @@ fn untyped_capability_less_deep_than_the_space_that_holds_it_is_reported() {
 }
 
 #[test]
+fn memory_control_capability_less_deep_than_the_space_that_holds_it_is_reported() {
+    let broken = spoiled(|m, at| {
+        let inner = inner_space(m, at, 60);
+        let control = cap(m, dodos_abi::START_SLOT_MEMORY_CONTROL);
+        m.place(
+            control,
+            Place {
+                space: inner,
+                index: 1,
+            },
+        );
+    });
+    assert_eq!(broken, "28: depth of what a space holds");
+}
+
+#[test]
 fn root_capability_of_a_space_held_in_a_space_of_the_same_depth_is_reported() {
     let broken = spoiled(|m, at| {
         let (first, second) = (inner_space(m, at, 60), inner_space(m, at, 61));
