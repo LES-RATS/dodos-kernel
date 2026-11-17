@@ -1229,6 +1229,9 @@ fn slot_layout_has_its_bits() {
         (SLOT_UNTYPED_LOG2_SHIFT, SLOT_UNTYPED_ENTRY_SHIFT),
         (25, 35)
     );
+    // Word 6 of an untyped's root slot: the epoch its watermark became
+    // ready to return at (D-135).
+    assert_eq!(SLOT_UNTYPED_READY_WORD, 6);
     let remote = RemoteRef::new(1023, 4095, (1 << 30) - 1, 4095);
     assert_eq!(remote.raw(), u64::MAX);
     let remote = RemoteRef::new(5, 6, 7, 8);

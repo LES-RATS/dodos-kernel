@@ -1070,7 +1070,7 @@ pub struct Model {
     locks: Ephemeral<locks::Trace>,
     /// Locks of this node held by other cores across its events, as a test
     /// scripts them (variant L2): what makes a try fail (D-134, D-135).
-    pub(crate) contended: BTreeMap<locks::LockId, locks::Holder>,
+    pub(crate) contended: BTreeMap<usize, locks::Holder>,
     /// The kernel epoch: one word of the node block, raised at the last
     /// destruction of an untyped's object and at an escalation (D-135).
     pub(crate) kernel_epoch: u64,
@@ -1400,6 +1400,12 @@ impl Model {
         self.locks.bound = Some(locks::bound(&call));
         self.locks.lock_free = matches!(call, Syscall::Signal(_));
         let outcome = self.made(thread, call);
+        // Any result of a call other than the `again` of the rule of tries
+        // sets the thread's count of them to 0 (D-135; finding 5 of the
+        // tenth model review: only a call under contention reset it).
+        if let Some(t) = self.threads.get_mut(&thread) {
+            t.again_tries = 0;
+        }
         self.end(entry);
         self.auto_deliver();
         outcome

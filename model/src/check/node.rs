@@ -286,6 +286,8 @@ impl Model {
                 _ => None,
             })
             .collect();
+        self.check_epoch()?;
+        self.check_holders()?;
         match self.machine.locking {
             Locking::L1 => {
                 let mut node = false;
@@ -312,62 +314,13 @@ impl Model {
                 // releases every lock before anything else is taken; a call
                 // makes at most two rounds; the quiet word is taken with no
                 // lock held, and no try fails under it (D-135).
-                let mut held: Vec<LockId> = Vec::new();
-                let (mut failed, mut releasing, mut quiet, mut most) = (0, false, false, 0);
-                for step in steps {
-                    let takes = matches!(
-                        step,
-                        Step::Lock(_) | Step::Try(_) | Step::TryFailed(_) | Step::Quiet(true)
-                    );
-                    if takes {
-                        ensure(
-                            !releasing || held.is_empty(),
-                            "L2: a lock taken after a failed try before every lock held was released",
-                        )?;
-                        releasing = false;
-                    }
-                    match *step {
-                        Step::Lock(lock) => {
-                            ensure(
-                                held.iter().all(|&h| h < lock),
-                                "L2: a lock waited for out of the order fixed by kind",
-                            )?;
-                            held.push(lock);
-                        }
-                        Step::Try(lock) | Step::TryFailed(lock) => {
-                            ensure(
-                                held.iter().any(|&h| lock < h) && !held.contains(&lock),
-                                "L2: a lock tried that is not before a lock held",
-                            )?;
-                            ensure(!quiet, "L2: a try under the quiet word")?;
-                            match *step {
-                                Step::Try(_) => held.push(lock),
-                                _ => (failed, releasing) = (failed + 1, true),
-                            }
-                        }
-                        Step::Unlock(lock) => held.retain(|&h| h != lock),
-                        Step::Quiet(true) => {
-                            ensure(
-                                held.is_empty(),
-                                "L2: the quiet word taken while a lock is held",
-                            )?;
-                            quiet = true;
-                        }
-                        Step::Quiet(false) => quiet = false,
-                        _ => {}
-                    }
-                    most = most.max(held.len());
-                }
-                ensure(failed <= 2, "L2: more than two rounds of locks in one call")?;
-                ensure(!quiet, "L2: the quiet word held past the end of an event")?;
+                let escalation = (self.width(), *self.at);
+                crate::locks::order(steps, self.locks.bound, Some(escalation))?;
                 if let Some(&last) = locks.last() {
                     ensure(
                         !locks.contains(&LockId::Gate) || last == LockId::Gate,
                         "L2: the gate lock is not the last of the order",
                     )?;
-                }
-                if let Some(bound) = self.locks.bound {
-                    ensure(most <= bound, "L2: more than k locks in one call")?;
                 }
                 let paid = steps
                     .iter()
@@ -381,6 +334,80 @@ impl Model {
                     paid == locks.len() + tried,
                     "L2: a lock taken without its instruction",
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The kernel epoch (A node of several cores, D-135, D-137): it rises
+    /// by one at each raise, an escalation's (right after the quiet word is
+    /// taken) or the last destruction of an untyped's object's (followed by
+    /// the watermark ready to return at that epoch), and nowhere else; the
+    /// last raise of the event is the epoch; an entry word and word 6 of an
+    /// untyped's root slot never pass it.
+    fn check_epoch(&self) -> Check {
+        let steps = &self.locks.steps;
+        let mut last: Option<u64> = None;
+        for (index, step) in steps.iter().enumerate() {
+            let Step::Epoch(epoch) = *step else {
+                continue;
+            };
+            ensure(
+                last.is_none_or(|l| epoch == l + 1),
+                "epoch: raised by more than one at a time",
+            )?;
+            last = Some(epoch);
+            let escalation = index > 0 && steps[index - 1] == Step::Quiet(true);
+            let ready = matches!(steps.get(index + 1), Some(Step::Ready(_)));
+            ensure(
+                escalation || ready,
+                "epoch: raised neither by an escalation nor at the last destruction of an untyped",
+            )?;
+        }
+        ensure(
+            last.is_none_or(|l| l == self.kernel_epoch),
+            "epoch: the node's epoch is not its last raise",
+        )?;
+        for untyped in self.untypeds.values() {
+            ensure(
+                untyped
+                    .ready
+                    .is_none_or(|e| e >= 1 && e <= self.kernel_epoch && untyped.live == 0),
+                "epoch: word 6 of an untyped's root slot is not the epoch its watermark became ready at",
+            )?;
+        }
+        for holder in self.contended.values() {
+            ensure(
+                holder.entered <= self.kernel_epoch,
+                "epoch: an entry word beyond the epoch",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The other cores in an event (D-137): each on a core of the node, not
+    /// the core of the last event, with a trace that keeps the order; no
+    /// lock held by two cores.
+    fn check_holders(&self) -> Check {
+        let mut all: Vec<LockId> = Vec::new();
+        for (&core, holder) in &self.contended {
+            ensure(
+                core == holder.core && core < self.width(),
+                "holders: a core in an event that is not a core of the node",
+            )?;
+            ensure(
+                self.locks.steps.is_empty() || core != *self.at,
+                "holders: an event on a core that is inside another event",
+            )?;
+            crate::locks::order(&holder.steps, None, None)?;
+            let taken =
+                self.locks.steps.iter().any(
+                    |s| matches!(s, Step::Lock(l) | Step::Try(l) if holder.held().contains(l)),
+                );
+            ensure(!taken, "holders: an event took a lock another core holds")?;
+            for lock in holder.held() {
+                ensure(!all.contains(&lock), "holders: two cores hold one lock")?;
+                all.push(lock);
             }
         }
         Ok(())

@@ -485,15 +485,24 @@ impl Model {
     fn release(&mut self, untyped: ObjId) {
         // Under L2 on several cores the watermark is only ready to return:
         // the destroying core raises the kernel epoch (D-135).
-        let watched = self.locking_watched();
+        // The rule holds under both variants on a node of several cores:
+        // under L1 the lock-free paths reach object memory before the node
+        // lock (D-137).
+        let watched = self.width() > 1;
         if watched && self.untypeds[&untyped].live == 1 {
             self.kernel_epoch += 1;
+            let epoch = self.kernel_epoch;
+            self.locks.steps.push(crate::locks::Step::Epoch(epoch));
         }
         let epoch = self.kernel_epoch;
+        let id = untyped;
         let untyped = live(&mut self.untypeds, untyped);
         untyped.live -= 1;
         match (untyped.live, watched) {
-            (0, true) => untyped.ready = Some(epoch),
+            (0, true) => {
+                untyped.ready = Some(epoch);
+                self.locks.steps.push(crate::locks::Step::Ready(id));
+            }
             (0, false) => {
                 (untyped.watermark, untyped.clean) = (0, 0);
                 untyped.zero.clear();
@@ -504,8 +513,8 @@ impl Model {
 
     /// Whether another core of the node is in a kernel event it entered
     /// before `epoch`: its entry word is not 0 and below it. In the model a
-    /// core is in an event across this node's events only while it holds
-    /// a lock (`Model::contended`).
+    /// core is in an event across this node's events only as a test makes
+    /// it (`Model::hold`).
     pub(crate) fn entered_before(&self, epoch: u64) -> bool {
         let at = *self.at;
         self.contended

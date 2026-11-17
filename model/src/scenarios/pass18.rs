@@ -695,14 +695,17 @@ fn the_core_that_completes_a_request_writes_its_state_word_done() {
 // contract makes can fail, the second round, a changed link and `again`
 // are reached.
 
-use crate::locks::{Holder, LockId, Step};
+use crate::locks::{LockId, Step};
 
-/// A node of two cores under L2: a receiver (slot 300, core 0) waits on an
-/// endpoint (310) with wait number 7, and a third thread (320) runs on core
-/// 1; returns the node and the call of the first thread that delivers to
-/// the receiver.
+/// A node of three cores under L2: a receiver (slot 300, core 0) waits on
+/// an endpoint (310) with wait number 7 and a receive range of one slot
+/// (380), a third thread (320) runs on core 1, and core 2 is free; returns
+/// the node and the call of the first thread that delivers to the receiver,
+/// moving it a notify (360), so that the delivery tries the segment of the
+/// receiver's range (D-137: the receiver's own fields are guarded by the
+/// endpoint's lock, so a delivery with no capability tries nothing).
 fn l2_delivery() -> (N, ObjId, ObjId, Syscall) {
-    let mut machine = one_node(Arch::X86_64, 2);
+    let mut machine = one_node(Arch::X86_64, 3);
     machine.locking = crate::Locking::L2;
     // An MSI's claim then asks no unit, so it ends in its call.
     machine.remapping = false;
@@ -712,16 +715,23 @@ fn l2_delivery() -> (N, ObjId, ObjId, Syscall) {
     let third = k.thread_on(320, 1);
     k.ok(k.retype(ObjectKind::Endpoint, 0, 310));
     k.ok(k.retype(ObjectKind::Reply, 0, 311));
+    k.ok(k.retype(ObjectKind::Notify, 0, 360));
     let recv = Syscall::Recv {
         endpoint: s(310),
         reply: s(311),
-        range: crate::Range::NONE,
+        range: crate::Range {
+            first: s(380),
+            count: 1,
+        },
         wait: 7,
     };
     assert_eq!(k.call(receiver, recv), WAITS);
     let call = Syscall::Call {
         endpoint: s(310),
-        message: crate::Message::default(),
+        message: crate::Message {
+            caps: vec![crate::Transfer::Move(s(360))],
+            ..crate::Message::default()
+        },
         range: crate::Range::NONE,
         wait: 0,
     };
@@ -746,16 +756,10 @@ fn first_try(k: &N, thread: ObjId, call: &Syscall) -> LockId {
 fn under_l2_a_failed_try_takes_a_second_round_in_the_order_and_the_call_goes_on() {
     let (mut k, receiver, _, call) = l2_delivery();
     let lock = first_try(&k, k.t, &call);
-    k.m.contended.insert(
-        lock,
-        Holder {
-            tries: 1,
-            then: None,
-            core: 1,
-            ..Holder::default()
-        },
-    );
+    // Core 1 is in an event that holds the lock and changes nothing more.
+    k.m.hold(1, &[lock], None).expect("a second core");
     assert_eq!(k.call(k.t, call), WAITS);
+    assert!(k.m.contended.is_empty());
     // Delivered: the receiver has the message.
     assert!(k.m.woken(receiver).is_some());
     let steps = &k.m.locks.steps;
@@ -771,15 +775,8 @@ fn under_l2_a_link_changed_by_the_holder_makes_the_call_return_again_with_nothin
     // The holder's event cancels the receiver's wait: the queue the call
     // read no longer leads to the same thread.
     let cancel = Syscall::ThreadCancel(s(300), 7);
-    k.m.contended.insert(
-        lock,
-        Holder {
-            tries: 1,
-            then: Some((third, cancel.clone())),
-            core: 1,
-            ..Holder::default()
-        },
-    );
+    k.m.hold(1, &[lock], Some((third, cancel.clone())))
+        .expect("a second core");
     // What the node is once the holder's event alone has run.
     let mut expected = k.m.clone();
     expected.contended.clear();
@@ -806,15 +803,8 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
     for round in 0..2 {
         let lock = first_try(&k, k.t, &call);
         let cancel = Syscall::ThreadCancel(s(300), 7 + round);
-        k.m.contended.insert(
-            lock,
-            Holder {
-                tries: 2,
-                then: Some((third, cancel)),
-                core: 1,
-                ..Holder::default()
-            },
-        );
+        k.m.hold(1, &[lock], Some((third, cancel)))
+            .expect("a second core");
         assert_eq!(k.call(k.t, call.clone()), Err(Error::Again));
         // The receiver waits again, with the next wait number.
         let mut again = recv.clone();
@@ -824,22 +814,39 @@ fn under_l2_a_third_again_of_tries_escalates_to_the_quiet_word_and_runs_alone() 
         assert_eq!(k.call(receiver, again), WAITS);
     }
     assert_eq!(k.m.threads[&k.t].again_tries, 2);
-    // A third time: the call takes the quiet word, the holder's event ends
-    // (it cancels the receiver), and the call runs alone: it queues.
+    // A third time: core 1 holds the lock the call tries and cancels the
+    // receiver; core 2 is in a kernel event too, holding its own core's
+    // lock, entered before the escalation. The call's second round ends
+    // core 1's event; its escalation takes the quiet word, raises the epoch,
+    // reads core 2's entry word below it and waits for core 2's event to
+    // end, then runs alone: it queues.
     let lock = first_try(&k, k.t, &call);
     let cancel = Syscall::ThreadCancel(s(300), 9);
-    k.m.contended.insert(
-        lock,
-        Holder {
-            tries: 9,
-            then: Some((third, cancel)),
-            core: 1,
-            ..Holder::default()
-        },
-    );
+    k.m.hold(1, &[lock], Some((third, cancel)))
+        .expect("a second core");
+    k.m.hold(2, &[LockId::Core(2)], None).expect("a third core");
+    let epoch = k.m.kernel_epoch;
     let outcome = k.call(k.t, call);
     assert_ne!(outcome, Err(Error::Again));
     assert!(k.m.contended.is_empty());
+    assert_eq!(k.m.kernel_epoch, epoch + 1);
+    let steps = &k.m.locks.steps;
+    let read = steps.iter().position(|s| {
+        *s == Step::Entry {
+            core: 2,
+            waited: true,
+        }
+    });
+    let first_lock = steps
+        .iter()
+        .rposition(|s| *s == Step::Quiet(true))
+        .and_then(|q| {
+            steps[q..]
+                .iter()
+                .position(|s| matches!(s, Step::Lock(_)))
+                .map(|i| i + q)
+        });
+    assert!(read.is_some() && first_lock > read, "{steps:?}");
     assert_eq!(k.m.threads[&k.t].again_tries, 0);
     // Its two rounds would return `again` a third time: it escalates, and
     // under the quiet word it only waits, in the order.
@@ -869,15 +876,8 @@ fn under_l2_a_signal_whose_try_fails_never_returns_again() {
     // The holder cancels the receiver: the binding still holds, but no
     // receiver waits; the signal still ends, its bits pending.
     let cancel = Syscall::ThreadCancel(s(300), 7);
-    k.m.contended.insert(
-        lock,
-        Holder {
-            tries: 5,
-            then: Some((third, cancel)),
-            core: 1,
-            ..Holder::default()
-        },
-    );
+    k.m.hold(1, &[lock], Some((third, cancel)))
+        .expect("a second core");
     assert_eq!(k.call(k.t, signal), DONE);
     let notify = k.m.object_at(k.t, s(330)).unwrap();
     assert_ne!(k.m.notifies[&notify].word, 0);
@@ -938,20 +938,64 @@ fn the_check_refuses_the_orders_that_the_rounds_of_l2_forbid() {
         k.m.check(),
         Err("L2: the quiet word taken while a lock is held")
     );
-    k.m.locks.steps = vec![
-        Step::Quiet(true),
+    let epoch = k.m.kernel_epoch;
+    let entries = [
+        Step::Entry {
+            core: 1,
+            waited: false,
+        },
+        Step::Entry {
+            core: 2,
+            waited: false,
+        },
+    ];
+    let mut quiet = vec![Step::Quiet(true), Step::Epoch(epoch)];
+    quiet.extend(entries);
+    quiet.extend([
         pay,
         Step::Lock(LockId::Core(0)),
         pay,
         Step::Try(LockId::Thread(thread)),
         Step::Quiet(false),
-    ];
+    ]);
+    k.m.locks.steps = quiet.clone();
     assert_eq!(k.m.check(), Err("L2: a try under the quiet word"));
+    // An escalation that does not raise the epoch, or that does not read
+    // the entry word of every other core first (findings 2 and 3 of the
+    // tenth model review).
+    k.m.locks.steps = vec![Step::Quiet(true), pay, Step::Lock(LockId::Core(0))];
+    k.m.locks.steps.push(Step::Quiet(false));
+    assert_eq!(
+        k.m.check(),
+        Err("L2: an escalation that does not raise the kernel epoch")
+    );
+    k.m.locks.steps = vec![Step::Quiet(true), Step::Epoch(epoch), entries[0]];
+    k.m.locks
+        .steps
+        .extend([pay, Step::Lock(LockId::Core(0)), Step::Quiet(false)]);
+    assert_eq!(
+        k.m.check(),
+        Err("L2: an escalation that does not read the entry word of every other core")
+    );
+    // The effect of the escalated call before its locks (finding 13).
+    let mut early = vec![Step::Quiet(true), Step::Epoch(epoch)];
+    early.extend(entries);
+    early.extend([
+        Step::Wait(crate::locks::WaitKind::Cores),
+        pay,
+        Step::Lock(LockId::Core(0)),
+        Step::Quiet(false),
+    ]);
+    k.m.locks.steps = early;
+    assert_eq!(
+        k.m.check(),
+        Err("L2: the effect of an escalated call before its locks")
+    );
 }
 
 #[test]
 fn under_l2_an_arrival_whose_try_fails_takes_its_locks_in_the_order_and_ends() {
-    let (mut k, _, third, _) = l2_delivery();
+    let (mut k, receiver, _, _) = l2_delivery();
     // An MSI on core 0, bound to a notify bound to the endpoint the receiver
     // waits on.
     k.ok(k.retype(ObjectKind::Notify, 0, 330));
@@ -977,23 +1021,17 @@ fn under_l2_an_arrival_whose_try_fails_takes_its_locks_in_the_order_and_ends() {
             _ => None,
         })
         .expect("the arrival tries a lock");
-    let cancel = Syscall::ThreadCancel(s(300), 7);
-    k.m.contended.insert(
-        lock,
-        Holder {
-            tries: 5,
-            then: Some((third, cancel)),
-            core: 1,
-            ..Holder::default()
-        },
-    );
+    // Core 1 is in an event that holds only the notify's lock (a second
+    // core never holds a lock the arrival waits for in the order, or the
+    // arrival would wait for that event first).
+    k.m.hold(1, &[lock], None).expect("a second core");
     k.m.interrupt_on(0, 48);
     assert_eq!(k.m.check(), Ok(()));
     let steps = &k.m.locks.steps;
     assert!(steps.contains(&Step::TryFailed(lock)), "{steps:?}");
-    // No receiver waits any more: the bits are pending in the notify.
-    let notify = k.m.object_at(k.t, s(330)).unwrap();
-    assert_ne!(k.m.notifies[&notify].word, 0);
+    // Its second round waited for the notify, then woke the receiver.
+    assert!(k.m.contended.is_empty());
+    assert!(k.m.woken(receiver).is_some());
 }
 
 #[test]
@@ -1068,12 +1106,7 @@ fn under_l2_a_watermark_returns_only_once_every_other_core_left_the_event_it_was
     // present epoch.
     let entered = k.m.kernel_epoch;
     let held = LockId::Core(1);
-    let holder = Holder {
-        core: 1,
-        entered,
-        ..Holder::default()
-    };
-    k.m.contended.insert(held, holder);
+    k.m.hold(1, &[held], None).expect("a second core");
     k.ok(Syscall::CapDelete(s(351)));
     // Ready to return: the destruction raised the epoch, core 1 is still in
     // the event it entered before.
@@ -1083,12 +1116,8 @@ fn under_l2_a_watermark_returns_only_once_every_other_core_left_the_event_it_was
     assert_eq!(k.call(k.t, again.clone()), Err(Error::Again));
     // Core 1 leaves its event and enters another, after the raise: the
     // watermark returns at the next retype.
-    let later = Holder {
-        core: 1,
-        entered: k.m.kernel_epoch,
-        ..Holder::default()
-    };
-    k.m.contended.insert(held, later);
+    k.m.contended.clear();
+    k.m.hold(1, &[held], None).expect("a second core");
     assert_eq!(k.call(k.t, again), DONE);
     k.m.contended.clear();
     let watermark = k.m.untypeds[&untyped].watermark;

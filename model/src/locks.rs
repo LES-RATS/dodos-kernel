@@ -82,19 +82,36 @@ pub enum LockId {
     Gate,
 }
 
-/// A lock of this node that another core holds across this node's events,
-/// as a test scripts it: the tries of other cores it makes fail before its
-/// event ends, and what that event does when it ends (a call of a thread
-/// of the node, on the holder's core), if anything. A wait for the lock
-/// lets the holder's event end: a lock is held for one bounded event.
+/// Another core of this node inside a kernel event, across this node's
+/// events, as a test scripts it (`Model::hold`, D-137): its entry word,
+/// the locks it has taken so far, in the order it took them (its trace,
+/// checked by the same rules as every event's), and the call its event
+/// makes when it ends, if any. A try of a lock it holds fails; a wait for
+/// a lock it holds, or an escalation that reads its entry word below the
+/// new epoch, lets its event end, with its effect. No other core holds a
+/// lock it holds: two cores never hold one lock.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Holder {
-    pub(crate) tries: u32,
-    pub(crate) then: Option<(ObjId, crate::Syscall)>,
-    /// The holder's core, and its entry word: the kernel epoch it read
-    /// when it entered the event in which it holds the lock (D-135).
+    /// Its core, and its entry word: the kernel epoch it read when it
+    /// entered the event (D-135).
     pub(crate) core: usize,
     pub(crate) entered: u64,
+    /// Its steps so far: its locks, waited for or tried, in its order.
+    pub(crate) steps: Vec<Step>,
+    pub(crate) then: Option<(ObjId, crate::Syscall)>,
+}
+
+impl Holder {
+    /// The locks it holds.
+    pub(crate) fn held(&self) -> Vec<LockId> {
+        self.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Lock(l) | Step::Try(l) => Some(*l),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// The kinds of wait a thread enters at the end of an event, and the spin
@@ -141,9 +158,23 @@ pub enum Step {
     /// other (D-134).
     TryFailed(LockId),
     Unlock(LockId),
-    /// The node's quiet word taken (`true`) or cleared (`false`) by a call
+    /// The node's quiet word taken (`true`) or released (`false`) by a call
     /// that escalates after two `again` of the rule of tries (D-135).
     Quiet(bool),
+    /// The kernel epoch raised to this value, by an atomic add: at an
+    /// escalation, or at the destruction of the last object of an untyped
+    /// (D-135, D-137).
+    Epoch(u64),
+    /// The watermark of this untyped became ready to return, at the epoch
+    /// raised just before (word 6 of its root slot).
+    Ready(ObjId),
+    /// An escalation read the entry word of another core of the node, and
+    /// waited for that core's event to end if the word was not 0 and below
+    /// the new epoch (D-135).
+    Entry {
+        core: usize,
+        waited: bool,
+    },
     /// A thread entered a wait at the end of the event.
     Wait(WaitKind),
     /// The event waited inside its hold (never, in a correct kernel).
@@ -160,6 +191,10 @@ pub(crate) struct Trace {
     pub(crate) lock_free: bool,
     /// The bound *k* of the event's call, if it is a call.
     pub(crate) bound: Option<usize>,
+    /// The threads the event acts on by their own capability, which it
+    /// locks by their own word even while they wait (D-135, A node of
+    /// several cores: `thread_cancel`, `thread_suspend`, `task_revoke`).
+    pub(crate) own: RefCell<Vec<ObjId>>,
 }
 
 impl Trace {
@@ -196,16 +231,34 @@ locked!(crate::Sched, Sched);
 locked!(crate::Task, Task);
 locked!(crate::ASpace, ASpace);
 
-/// The bound *k* of a call under L2: the locks its rules can make it take,
-/// the gate lock counted (gap 5). A step of a removal undoes at
-/// most 32 links and wakes at most 64 threads, each with its object, its
-/// context and its core; a step of `task_revoke` stops 32 threads.
+/// The bound *k* of a call under L2, the most locks it holds at once in
+/// its second round, the gate lock counted (A node of several cores, "The
+/// bound k", counted again by D-137 from pieces each tied to a rule):
+/// placing a capability takes 3 segments, moving one 7 (4 segments, and
+/// for a full record 2 neighbours in its space's list and the space or the
+/// bound thread), removing one with its record 8; four capabilities of a
+/// message moved take 26. The marks of a delivery take no lock (D-137).
 pub(crate) fn bound(call: &crate::Syscall) -> usize {
     use crate::Syscall as S;
     match call {
-        S::CapDelete(_) | S::CapRevoke(_) => 4 * (32 + 64) + 8,
-        S::TaskRevoke(_) => 4 * 32 + 8,
-        S::Call { .. } | S::ReplyRecv { .. } | S::Send { .. } | S::NodeSend { .. } => 16,
+        // 32 units of at most 8, 64 woken threads of 2, the segments of
+        // 128 examined slots, the gate.
+        S::CapDelete(_) | S::CapRevoke(_) => 32 * 8 + 64 * 2 + 2 + 1,
+        // The task, 32 detached threads of 6, the gate (the first unit,
+        // 1 + 63 + 63 + 1 = 128, is smaller).
+        S::TaskRevoke(_) => 1 + 32 * 6 + 1,
+        // The endpoint, the receiver's reply object, the lent context and
+        // the top of its chain, the 26, two cores and the gate.
+        S::Call { .. } => 33,
+        // The endpoint or the reply object, the 26, a core and the gate.
+        S::Send { .. } => 29,
+        // The endpoint and the reply object, two lends released of 4, the
+        // bound notify, the 26, a lend and its chain's top, the core.
+        S::Recv { .. } => 40,
+        // The answer (29) and the receive (38), taken before either writes.
+        S::ReplyRecv { .. } => 67,
+        // The thread, three lists of bound threads of 6, two message pages.
+        S::ThreadConfigure { .. } => 21,
         _ => 12,
     }
 }
@@ -254,6 +307,7 @@ impl crate::Model {
     pub(crate) fn begin_locks(&mut self) {
         self.locks.steps.clear();
         self.locks.touched.borrow_mut().clear();
+        self.locks.own.borrow_mut().clear();
         self.locks.lock_free = false;
         self.locks.bound = None;
         self.stalled = None;
@@ -302,13 +356,22 @@ impl crate::Model {
                 // the objects it changed without touching them, then the
                 // gate lock.
                 let mut found: Vec<LockId> = self.locks.touched.borrow().clone();
-                if let Some(before) = self.before.take() {
-                    for lock in before.changed(self) {
-                        if !found.contains(&lock) {
-                            found.push(lock);
-                        }
+                let before = self.before.take();
+                if let Some(before) = &before {
+                    found.extend(before.changed(self));
+                }
+                // The fields of a thread that waits, and the reply object
+                // attached to a thread that waits to receive, are guarded
+                // by the lock of the object waited on, not by their own
+                // (D-135; finding 6 of the tenth model review).
+                let mut guarded: Vec<LockId> = Vec::new();
+                for lock in found {
+                    let lock = self.guard_of(lock, before.as_deref());
+                    if !guarded.contains(&lock) {
+                        guarded.push(lock);
                     }
                 }
+                let mut found = guarded;
                 found.retain(|&l| l != LockId::Gate);
                 if gate {
                     found.push(LockId::Gate);
@@ -331,6 +394,51 @@ impl crate::Model {
             }
         }
         self.locks.steps = steps;
+    }
+
+    /// The lock that guards what `lock` names: the object a thread waits on
+    /// (before the event or after it) for a waiting thread's fields, unless
+    /// the event acts on that thread by its own capability; the endpoint a
+    /// thread waits to receive on, for the reply object attached to it.
+    fn guard_of(&self, lock: LockId, before: Option<&Snapshot>) -> LockId {
+        let waited = |wait: &crate::Wait| match *wait {
+            crate::Wait::Call { endpoint, .. } | crate::Wait::Recv { endpoint, .. } => {
+                Some(LockId::Endpoint(endpoint))
+            }
+            crate::Wait::Reply(reply) => Some(LockId::Reply(reply)),
+            crate::Wait::Notify(notify) => Some(LockId::Notify(notify)),
+            _ => None,
+        };
+        let waits_on = |thread: ObjId| {
+            let old = before.and_then(|b| b.threads.get(&thread)).map(|t| &t.wait);
+            let new = self.threads.get(&thread).map(|t| &t.wait);
+            old.and_then(waited).or_else(|| new.and_then(waited))
+        };
+        match lock {
+            LockId::Thread(t) if !self.locks.own.borrow().contains(&t) => {
+                waits_on(t).unwrap_or(lock)
+            }
+            LockId::Reply(r) => {
+                let attached = |state: Option<&crate::ReplyState>| match state {
+                    Some(crate::ReplyState::Attached(t)) => Some(*t),
+                    _ => None,
+                };
+                let old = attached(before.and_then(|b| b.replies.get(&r)));
+                let thread = old.or_else(|| attached(self.replies.get(&r)));
+                match thread.and_then(waits_on) {
+                    Some(endpoint @ LockId::Endpoint(_)) => endpoint,
+                    _ => lock,
+                }
+            }
+            _ => lock,
+        }
+    }
+
+    /// The event acts on `thread` by its own capability: it holds the
+    /// thread's own lock even while the thread waits.
+    pub(crate) fn touch_own(&self, thread: ObjId) {
+        self.locks.own.borrow_mut().push(thread);
+        self.touch(LockId::Thread(thread));
     }
 
     /// The lock-free signal of L1 woke no one: only the notify's word
@@ -396,23 +504,82 @@ impl crate::Model {
         }
     }
 
-    /// A try of a lock that another core holds fails while that holder
-    /// still makes tries fail.
-    fn try_fails(&mut self, lock: LockId) -> bool {
-        match self.contended.get_mut(&lock) {
-            Some(holder) if holder.tries > 0 => {
-                holder.tries -= 1;
-                true
-            }
-            _ => false,
+    /// Another core of the node enters a kernel event and takes, in the
+    /// order of L2, the locks of `prefix`, then those of its call (as the
+    /// call takes them with no lock held elsewhere), which it makes when
+    /// its event ends (D-137: a scripted holder is a second core). Refused
+    /// if the core is not one of the node's, is already in an event, or is
+    /// not the core of the call's thread; if a lock is held by another
+    /// core; or if the holder's trace breaks the order.
+    #[cfg(test)]
+    pub(crate) fn hold(
+        &mut self,
+        core: usize,
+        prefix: &[LockId],
+        then: Option<(ObjId, crate::Syscall)>,
+    ) -> Result<(), &'static str> {
+        if core >= self.width() || self.contended.contains_key(&core) {
+            return Err("a core is in one kernel event at a time");
         }
+        let mut found: Vec<LockId> = prefix.to_vec();
+        if let Some((thread, call)) = &then {
+            if self.core_of(*thread) != core {
+                return Err("the holder's call runs on the holder's core");
+            }
+            found.extend(self.dry_found(&Contended::Call(*thread, call.clone())));
+        }
+        let mut steps = Vec::new();
+        let mut held: Vec<LockId> = Vec::new();
+        for lock in found {
+            if held.contains(&lock) {
+                continue;
+            }
+            if self.contended.values().any(|h| h.held().contains(&lock)) {
+                return Err("two cores never hold one lock");
+            }
+            steps.push(Step::Pay(Cost::Lock));
+            match held.iter().all(|&h| h < lock) {
+                true => steps.push(Step::Lock(lock)),
+                false => steps.push(Step::Try(lock)),
+            }
+            held.push(lock);
+        }
+        order(&steps, None, None)?;
+        let entered = self.kernel_epoch;
+        self.contended.insert(
+            core,
+            Holder {
+                core,
+                entered,
+                steps,
+                then,
+            },
+        );
+        Ok(())
+    }
+
+    /// A try of a lock fails while another core holds it.
+    fn try_fails(&self, lock: LockId) -> bool {
+        self.contended.values().any(|h| h.held().contains(&lock))
     }
 
     /// The event of the core that holds `lock` ends, with its effect: a wait
     /// for the lock is a wait for that event. Returns whether it changed
     /// the node.
     fn let_go(&mut self, lock: LockId) -> bool {
-        let Some(holder) = self.contended.remove(&lock) else {
+        let core = self
+            .contended
+            .values()
+            .find(|h| h.held().contains(&lock))
+            .map(|h| h.core);
+        core.is_some_and(|core| self.end_holder(core))
+    }
+
+    /// The event another core is in ends, with its effect, which takes no
+    /// lock but those it holds (they were found by the same run). Returns
+    /// whether it changed the node.
+    fn end_holder(&mut self, core: usize) -> bool {
+        let Some(holder) = self.contended.remove(&core) else {
             return false;
         };
         let Some((thread, call)) = holder.then else {
@@ -430,9 +597,11 @@ impl crate::Model {
             }
             steps.push(Step::Pay(Cost::Lock));
             if held.iter().all(|&h| h < lock) {
+                // The holder's event ends before this core holds the lock.
+                let changed = self.let_go(lock);
                 steps.push(Step::Lock(lock));
                 held.push(lock);
-                if self.let_go(lock) {
+                if changed {
                     return Round::Changed(held);
                 }
             } else if self.try_fails(lock) {
@@ -464,7 +633,8 @@ impl crate::Model {
     /// An event under contention, by the rule of tries.
     fn contend(&mut self, event: Contended) -> crate::Outcome {
         if !self.locking_watched() {
-            self.contended.clear();
+            // Under L1 a core in an event holds no lock of an object: the
+            // event runs, and the other core stays in its event.
             return self.run_once(&event);
         }
         let mut steps = Vec::new();
@@ -561,11 +731,21 @@ impl crate::Model {
         };
         let tries = self.threads.get(&thread).map_or(0, |t| t.again_tries);
         if tries >= 2 {
+            // It takes the quiet word, raises the epoch by an atomic add,
+            // and reads the entry word of every other core of the node,
+            // waiting for the event of each core whose word is not 0 and
+            // below the new epoch (D-135, D-137).
             steps.push(Step::Quiet(true));
             self.kernel_epoch += 1;
-            let held: Vec<LockId> = self.contended.keys().copied().collect();
-            for lock in held {
-                self.let_go(lock);
+            steps.push(Step::Epoch(self.kernel_epoch));
+            let at = self.core_of(thread);
+            for core in (0..self.width()).filter(|&c| c != at) {
+                let entry = self.contended.get(&core).map_or(0, |h| h.entered);
+                let waited = entry != 0 && entry < self.kernel_epoch;
+                steps.push(Step::Entry { core, waited });
+                if waited {
+                    self.end_holder(core);
+                }
             }
             let mut alone = self.dry_found(&event);
             alone.sort();
@@ -606,6 +786,105 @@ impl Contended {
     fn never_again(&self) -> bool {
         !matches!(self, Self::Call(_, call) if !matches!(call, crate::Syscall::Signal(_)))
     }
+}
+
+/// The order of L2 on one core's steps (A node of several cores, D-134,
+/// D-135, D-137): a wait is for a lock after every lock held; a lock that
+/// comes before one held is tried; a failed try releases every lock before
+/// anything else is taken; at most two rounds; at most `bound` locks held
+/// at once; the quiet word is taken with no lock held and no try under
+/// it, and, given the node's width and the event's core, it is followed by
+/// the raise of the epoch and the read of the entry word of every other
+/// core of the node before the first lock, and the effect of the call
+/// under it comes after a lock (findings 2 and 13 of the tenth model
+/// review). Judged in the order the steps were taken, never sorted.
+pub(crate) fn order(
+    steps: &[Step],
+    bound: Option<usize>,
+    escalation: Option<(usize, usize)>,
+) -> Result<(), &'static str> {
+    let ensure = |ok: bool, what: &'static str| if ok { Ok(()) } else { Err(what) };
+    let mut held: Vec<LockId> = Vec::new();
+    let (mut failed, mut releasing, mut quiet, mut most) = (0, false, false, 0);
+    let mut locked_under_quiet = false;
+    for (index, step) in steps.iter().enumerate() {
+        let takes = matches!(
+            step,
+            Step::Lock(_) | Step::Try(_) | Step::TryFailed(_) | Step::Quiet(true)
+        );
+        if takes {
+            ensure(
+                !releasing || held.is_empty(),
+                "L2: a lock taken after a failed try before every lock held was released",
+            )?;
+            releasing = false;
+        }
+        match *step {
+            Step::Lock(lock) => {
+                ensure(
+                    held.iter().all(|&h| h < lock),
+                    "L2: a lock waited for out of the order fixed by kind",
+                )?;
+                held.push(lock);
+                locked_under_quiet |= quiet;
+            }
+            Step::Try(lock) | Step::TryFailed(lock) => {
+                ensure(
+                    held.iter().any(|&h| lock < h) && !held.contains(&lock),
+                    "L2: a lock tried that is not before a lock held",
+                )?;
+                ensure(!quiet, "L2: a try under the quiet word")?;
+                match *step {
+                    Step::Try(_) => held.push(lock),
+                    _ => (failed, releasing) = (failed + 1, true),
+                }
+            }
+            Step::Unlock(lock) => held.retain(|&h| h != lock),
+            Step::Quiet(true) => {
+                ensure(
+                    held.is_empty(),
+                    "L2: the quiet word taken while a lock is held",
+                )?;
+                quiet = true;
+                locked_under_quiet = false;
+                if let Some((width, core)) = escalation {
+                    let raised = matches!(steps.get(index + 1), Some(Step::Epoch(_)));
+                    ensure(
+                        raised,
+                        "L2: an escalation that does not raise the kernel epoch",
+                    )?;
+                    let read: Vec<usize> = steps[index + 2..]
+                        .iter()
+                        .take_while(|s| matches!(s, Step::Entry { .. }))
+                        .filter_map(|s| match s {
+                            Step::Entry { core, .. } => Some(*core),
+                            _ => None,
+                        })
+                        .collect();
+                    let others: Vec<usize> = (0..width).filter(|&c| c != core).collect();
+                    ensure(
+                        read == others,
+                        "L2: an escalation that does not read the entry word of every other core",
+                    )?;
+                }
+            }
+            Step::Quiet(false) => quiet = false,
+            Step::Wait(_)
+            | Step::Pay(Cost::Interrupt | Cost::Broadcast | Cost::IdleWord)
+            | Step::Pay(Cost::Request | Cost::LoadedSet) => ensure(
+                !quiet || locked_under_quiet,
+                "L2: the effect of an escalated call before its locks",
+            )?,
+            _ => {}
+        }
+        most = most.max(held.len());
+    }
+    ensure(failed <= 2, "L2: more than two rounds of locks in one call")?;
+    ensure(!quiet, "L2: the quiet word held past the end of an event")?;
+    if let Some(bound) = bound {
+        ensure(most <= bound, "L2: more than k locks in one call")?;
+    }
+    Ok(())
 }
 
 /// The releases of the locks held, in the reverse order.

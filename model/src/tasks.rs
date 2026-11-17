@@ -120,15 +120,34 @@ impl Model {
     pub(crate) fn task_revoke(&mut self, thread: ObjId, task: SlotAddr) -> Outcome {
         let cap = self.cap(thread, task, Rights::READ)?;
         let task = self.is(cap, ObjectKind::Task, Rights::MANAGE)?.object;
-        locked(&mut self.tasks, &self.locks, task).revoked = true;
-        // A node of several cores: each thread of the task that runs on
-        // another core is marked *leaving its core* and its core sent the
-        // leave interrupt; every call returns `again` while one is marked,
-        // and a marked thread is detached only once it has left.
-        let mut marked = false;
-        for attached in self.tasks[&task].threads.clone() {
-            marked |= self.mark_leaving(attached) || self.threads[&attached].leaving;
+        // The first call on a live task writes the flag and marks the threads
+        // of the task that other cores of the node run, each *leaving its
+        // core* with the leave interrupt sent: work bounded by the cores, not
+        // by the threads, and its whole step; it detaches nothing (Tasks and
+        // marks, D-137).
+        if !self.tasks[&task].revoked {
+            locked(&mut self.tasks, &self.locks, task).revoked = true;
+            let at = *self.at;
+            for core in (0..self.width()).filter(|&c| c != at) {
+                let Some(running) = self.cores[core].thread else {
+                    continue;
+                };
+                if self.threads[&running].task == Some(task) {
+                    self.touch_own(running);
+                    self.mark_leaving(running);
+                }
+            }
+            return match self.tasks[&task].threads.is_empty() {
+                true => Ok(Output::Done),
+                false => Err(Error::Again),
+            };
         }
+        // Every later call returns `again` while a thread of the task is
+        // marked, and a marked thread is detached only once it has left.
+        let marked = self.tasks[&task]
+            .threads
+            .iter()
+            .any(|t| self.threads[t].leaving);
         if marked {
             return Err(Error::Again);
         }
@@ -149,6 +168,7 @@ impl Model {
     pub(crate) fn stop(&mut self, thread: ObjId) {
         // A thread that waits for another node, a unit or its node's cores
         // is stopped when its call returns: its wait is not ended.
+        self.touch_own(thread);
         let wait = &self.threads[&thread].wait;
         if *wait != Wait::None && !self.threads[&thread].bounded() {
             self.unlink(thread);

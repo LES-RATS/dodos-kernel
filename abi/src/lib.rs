@@ -57,9 +57,10 @@ pub use machine::{
     SLOT_RECORD_UNMAPPING, SLOT_REMOTE, SLOT_REMOTE_GRANT_SHIFT, SLOT_REMOTE_SERIAL_SHIFT,
     SLOT_REMOTE_USE_SHIFT, SLOT_RIGHTS_SHIFT, SLOT_ROOT, SLOT_STATE_MASK, SLOT_UNTYPED_BLOCK,
     SLOT_UNTYPED_CLEAN, SLOT_UNTYPED_DEVICE, SLOT_UNTYPED_ENTRY, SLOT_UNTYPED_ENTRY_SHIFT,
-    SLOT_UNTYPED_LOG2_SHIFT, STALE_NS, STALE_RANGE_NS, START_NS, START_RETRY_NS, STUCK_NS,
-    SWEEP_NS, SWEEP_RANGE_NS, Transition, USE_ENTRY_BYTES, barrier, best_class, clear_step,
-    clear_steps, floors, ioport_check, member_transition, module_frames, ports_meet, successor,
+    SLOT_UNTYPED_LOG2_SHIFT, SLOT_UNTYPED_READY_WORD, STALE_NS, STALE_RANGE_NS, START_NS,
+    START_RETRY_NS, STUCK_NS, SWEEP_NS, SWEEP_RANGE_NS, Transition, USE_ENTRY_BYTES, barrier,
+    best_class, clear_step, clear_steps, floors, ioport_check, member_transition, module_frames,
+    ports_meet, successor,
 };
 pub use ring::{
     CREDIT_NONE, CREDIT_SERIAL_MASK, NodeMessage, PENDING_STEP, REPORT_END, REQUESTS_PER_PEER,

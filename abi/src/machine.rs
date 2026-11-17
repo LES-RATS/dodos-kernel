@@ -54,6 +54,10 @@ pub const SLOT_UNTYPED_CLEAN: u64 = 1 << 32;
 pub const SLOT_UNTYPED_BLOCK: u64 = 1 << 33;
 pub const SLOT_UNTYPED_ENTRY: u64 = 1 << 34;
 pub const SLOT_UNTYPED_ENTRY_SHIFT: u32 = 35;
+/// An untyped's root slot, word 6: 0, or the kernel epoch at which its
+/// watermark became ready to return, raised by the destruction of its last
+/// object (A node of several cores, D-135).
+pub const SLOT_UNTYPED_READY_WORD: usize = 6;
 /// A remote capability, word 1: the granting node (0-9), the grant index
 /// (10-21), the serial (22-51), the index of its use entry (52-63).
 pub const SLOT_REMOTE_GRANT_SHIFT: u32 = 10;

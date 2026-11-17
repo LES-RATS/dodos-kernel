@@ -107,6 +107,7 @@ impl Model {
     /// mark is set, so one that succeeds has a thread that executes nothing.
     pub(crate) fn thread_suspend(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
+        self.touch_own(target);
         locked(&mut self.threads, &self.locks, target).suspended = true;
         self.observe();
         if self.mark_leaving(target) || self.threads[&target].leaving {
@@ -135,6 +136,7 @@ impl Model {
         number: u64,
     ) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
+        self.touch_own(target);
         let cancelled = locked(&mut self.threads, &self.locks, target);
         cancelled.cancelled_up_to = cancelled.cancelled_up_to.max(number);
         let ended = match number {

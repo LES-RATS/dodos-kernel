@@ -279,6 +279,11 @@ fn task_revoke_stops_its_threads_32_per_call() {
     k.ok(mark(40, U));
     // A waiting thread: its wait ends with `gone`.
     assert_eq!(k.on(threads[32], recv()), Ok(Output::Waits));
+    // The first call writes the flag (and marks the threads other cores
+    // run): its whole step, it detaches nothing (D-137).
+    k.no(Syscall::TaskRevoke(s(40)), Error::Again);
+    assert_eq!(k.m.woken(threads[32]), None);
+    assert_eq!(k.read(40), (2, U, TaskFlags::REVOKED, 33));
     k.no(Syscall::TaskRevoke(s(40)), Error::Again);
     assert_eq!(k.m.woken(threads[32]), Some(&Err(Error::Gone)));
     assert_eq!(k.read(40), (2, U, TaskFlags::REVOKED, 1));
@@ -441,6 +446,8 @@ fn destroying_a_revoked_task_stops_the_threads_still_attached() {
     k.make(Task, 41);
     let threads: Vec<ObjId> = (0..33).map(|n| k.thread(200 + 2 * n, 41)).collect();
     k.no(Syscall::TaskRevoke(s(41)), Error::Again);
+    // 33 threads still attached: two steps of the removal.
+    k.no(Syscall::CapDelete(s(41)), Error::Again);
     k.ok(Syscall::CapDelete(s(41)));
     assert!(
         threads
