@@ -155,16 +155,7 @@ impl Model {
             let remap = &mut self.table.units.entry(unit).or_default().remap;
             remap.insert(handle as u32, (self.node, generation));
         }
-        let target = match self.machine.remapping {
-            true => crate::rings::Target::Remapped {
-                handle: handle as u16,
-                vector,
-            },
-            false => crate::rings::Target::Direct {
-                vector,
-                apic: apic as u32,
-            },
-        };
+        let target = self.line_target(position, vector);
         let redirection = ioapic.map(|io| {
             let op = crate::rings::UnitOp::Redirection {
                 gsi: source.id(),
@@ -258,6 +249,25 @@ impl Model {
             IrqState::Fired => entry.state = IrqState::Armed,
         }
         Ok(Output::Done)
+    }
+
+    /// Where a line claimed on the core at `position` with `vector` points
+    /// its redirection entry: its fixed remapping handle (core number × 192
+    /// + vector − 48) and the vector with interrupt remapping, the vector
+    /// and the core's APIC ID without (Interrupts, x86-64).
+    pub(crate) fn line_target(&self, position: usize, vector: u8) -> crate::rings::Target {
+        let core = u64::from(self.cores[position].number);
+        let handle = core * IRQ_TABLE_ENTRIES as u64 + u64::from(vector - IRQ_VECTOR_FIRST);
+        match self.machine.remapping {
+            true => crate::rings::Target::Remapped {
+                handle: handle as u16,
+                vector,
+            },
+            false => crate::rings::Target::Direct {
+                vector,
+                apic: self.machine.core_list()[core as usize].hw_id as u32,
+            },
+        }
     }
 
     /// An arrival: the vector of a claimed entry arrives on its core. An

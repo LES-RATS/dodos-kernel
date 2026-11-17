@@ -14,12 +14,12 @@ use dodos_abi::{
 
 /// The roles of the reference machine, by index: the IOMMU unit, the
 /// IOAPIC, two reserves, the plain role `platform`.
-const IOMMU_ROLE: usize = 0;
-const IOAPIC_ROLE: usize = 1;
+pub(super) const IOMMU_ROLE: usize = 0;
+pub(super) const IOAPIC_ROLE: usize = 1;
 const RESERVE: usize = 2;
 const PLATFORM: usize = 4;
-const IOSPACE: u32 = 150;
-const DEVICE: u64 = 0x10;
+pub(super) const IOSPACE: u32 = 150;
+pub(super) const DEVICE: u64 = 0x10;
 
 /// The slot of role `index` in a start-up space.
 fn role_slot(m: &S, node: u16, index: usize) -> SlotAddr {
@@ -32,7 +32,7 @@ fn iommu_slot(m: &S, node: u16) -> SlotAddr {
     s(slots_of(m.sys.node(node), m.t[node as usize], ObjectKind::Iommu)[0])
 }
 
-fn attach(m: &S, node: u16, iospace: u32, device: u64) -> Syscall {
+pub(super) fn attach(m: &S, node: u16, iospace: u32, device: u64) -> Syscall {
     Syscall::IoSpaceAttach {
         iommu: iommu_slot(m, node),
         iospace: if iospace == 0 {
@@ -53,13 +53,13 @@ fn kill(n: u16) -> Syscall {
 }
 
 /// Three nodes of one core each, all of fence class 2 but node 0.
-fn three() -> S {
+pub(super) fn three() -> S {
     S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]))
 }
 
 /// Node `node` makes an iospace and attaches the device through the
 /// unit's holder; every message settles.
-fn attached(m: &mut S, node: u16) {
+pub(super) fn attached(m: &mut S, node: u16) {
     let iospace = m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
     m.ok(node, iospace);
     let call = attach(m, node, IOSPACE, DEVICE);

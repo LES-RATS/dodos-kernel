@@ -498,7 +498,7 @@ impl Model {
         for (device, (node, _)) in entries {
             let claimed = reported
                 .iter()
-                .any(|&(z, i)| z == node && i == Item::Device(device));
+                .any(|&(z, i)| z == node && matches!(i, Item::Device(d, _) if d == device));
             if !claimed && !sealed.contains(&node) {
                 unit.entries.remove(&device);
             }
@@ -507,26 +507,66 @@ impl Model {
         for (line, (node, _)) in lines {
             let claimed = reported
                 .iter()
-                .any(|&(z, i)| z == node && i == Item::Line(line));
+                .any(|&(z, i)| z == node && matches!(i, Item::Line(l, ..) if l == line));
             if !claimed && !sealed.contains(&node) {
                 unit.lines.remove(&line);
             }
         }
         for &(z, item) in &reported {
-            if let Item::Device(device) = item {
-                let g = generation(self, z);
-                self.table
-                    .units
-                    .entry(role)
-                    .or_default()
-                    .entries
-                    .insert(device, (z, g));
+            let g = generation(self, z);
+            match item {
+                // A context entry only for a device whose attach word reads
+                // *attached*, or *pinned* (moved to *attached* first, as at
+                // an attach), with the root the report names (D-137).
+                Item::Device(device, root) => {
+                    if self.rebuilt_attach(role, device, root) {
+                        let unit = self.table.units.entry(role).or_default();
+                        unit.entries.insert(device, (z, g));
+                    }
+                }
+                // A line's entry rewritten from the operands of its
+                // operation 5 claimed, checked as at that request (D-137).
+                Item::Line(gsi, level, low, target) => {
+                    let op = crate::rings::UnitOp::Redirection {
+                        gsi,
+                        claimed: true,
+                        level,
+                        low,
+                        target,
+                    };
+                    if self.operands_allowed(role, op, (z, g)) {
+                        let unit = self.table.units.entry(role).or_default();
+                        unit.lines.insert(gsi, (z, g));
+                    }
+                }
+                Item::Handle(_) => {}
             }
         }
         let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
         rebuild.closing = Some((serial, self.now));
         self.rebuilds.insert(role, rebuild);
         true
+    }
+
+    /// A rebuild's check of a reported device: its attach word reads
+    /// *attached* with the root, or *pinned* with it, which the new holder's
+    /// gate moves to *attached* (D-137).
+    fn rebuilt_attach(&mut self, role: usize, device: u16, root: u64) -> bool {
+        let Some(key) = self.attach_key(role, device) else {
+            return false;
+        };
+        let word = self.table.attach_word(key);
+        if word.root() != root {
+            return false;
+        }
+        match word.state() {
+            Some(dodos_abi::AttachState::Attached) => true,
+            Some(dodos_abi::AttachState::Pinned) => {
+                let attached = dodos_abi::AttachWord::new(dodos_abi::AttachState::Attached, root);
+                self.table.swap_attach(key, word, attached.expect("a root"))
+            }
+            _ => false,
+        }
     }
 
     /// The requests kept during a rebuild are served, first.
@@ -557,7 +597,12 @@ impl Model {
                 .iommus
                 .values()
                 .filter(|u| u.unit == usize::from(record.object))
-                .flat_map(|u| u.attached.keys().map(|&d| Item::Device(d)))
+                .flat_map(|u| {
+                    u.attached.iter().map(|(&d, io)| {
+                        let root = self.aspaces.get(io).and_then(|a| a.root).unwrap_or(0);
+                        Item::Device(d, root)
+                    })
+                })
                 .collect(),
             dodos_abi::Governs::IoApic => self
                 .irqs
@@ -565,7 +610,10 @@ impl Model {
                 .filter(|irq| {
                     irq.source.is_line() && self.ioapic_role(irq.source.id()) == Some(role)
                 })
-                .map(|irq| Item::Line(irq.source.id()))
+                .map(|irq| {
+                    let target = self.line_target(irq.core, irq.vector);
+                    Item::Line(irq.source.id(), irq.source.level(), irq.source.active_low(), target)
+                })
                 .collect(),
             _ => Vec::new(),
         };

@@ -51,7 +51,7 @@ pub enum UnitOp {
 /// vector of its remapping entry; without remapping a vector and an APIC
 /// ID; nothing for a masked entry (Devices and shared hardware, the
 /// operands of each operation, D-134).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
     Remapped { handle: u16, vector: u8 },
     Direct { vector: u8, apic: u32 },
@@ -59,12 +59,15 @@ pub enum Target {
 }
 
 /// One item of a `Report`: a device the asked node attached through the
-/// unit (its identifier), a remapping handle it claimed, or a line.
+/// unit (its identifier and the root its words name), a remapping handle
+/// it claimed, or a line with the operands of its operation 5 claimed (its
+/// trigger, its polarity and its target: D-137, the new holder rewrites
+/// the line's entry from them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Item {
-    Device(u16),
+    Device(u16, u64),
     Handle(u32),
-    Line(u32),
+    Line(u32, bool, bool, Target),
 }
 
 impl Item {
@@ -72,9 +75,9 @@ impl Item {
     /// identifier, then the handles, then the lines.
     pub(crate) fn key(self) -> u64 {
         match self {
-            Item::Device(d) => u64::from(d),
+            Item::Device(d, _) => u64::from(d),
             Item::Handle(h) => 1 << 32 | u64::from(h),
-            Item::Line(l) => 2 << 32 | u64::from(l),
+            Item::Line(l, ..) => 2 << 32 | u64::from(l),
         }
     }
 }
