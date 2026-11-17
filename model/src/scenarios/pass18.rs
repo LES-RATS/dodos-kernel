@@ -1095,3 +1095,11 @@ fn under_l2_a_watermark_returns_only_once_every_other_core_left_the_event_it_was
     assert_eq!(watermark, dodos_abi::NOTIFY_BYTES as u64);
     assert_eq!(k.m.untypeds[&untyped].ready, None);
 }
+
+#[test]
+fn a_line_word_taken_with_no_irq_of_its_node_is_reported() {
+    let mut m = S::two();
+    super::pass17::hold_line(&mut m, 0, 5);
+    let report = m.sys.check().expect_err("spoiled");
+    assert_eq!(report, "node 0: 96: line words and claimed lines");
+}
