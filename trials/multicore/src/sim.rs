@@ -1638,11 +1638,7 @@ mod tests {
             ..lazy
         };
         let p50 = |p| run(Workload::CapOps, Cand::PerCore, 4, 4, p, &[]).hist[3].quantile(0.5);
-        assert!(
-            p50(lazy) * 2 < p50(eager),
-            "lazy {} eager {}",
-            p50(lazy),
-            p50(eager)
-        );
+        let (lazy, eager) = (p50(lazy), p50(eager));
+        assert!(lazy * 2 < eager, "lazy {lazy} eager {eager}");
     }
 }
