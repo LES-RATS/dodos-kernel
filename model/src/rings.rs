@@ -619,6 +619,14 @@ impl Model {
                 // A header it cannot read is consumed as one entry.
                 _ => (1, None),
             };
+            // A message that would carry the step past its last entry waits
+            // for the next interrupt: "at most 16 entries per ring per
+            // interrupt" (Processing). The first message is always served,
+            // so each interrupt makes progress.
+            if served > 0 && served + length > step {
+                self.set_consumed(from, user, consumed);
+                break;
+            }
             self.set_consumed(from, user, consumed.wrapping_add(length));
             // The step counts entries, as the contract counts them, not
             // messages (D-141).

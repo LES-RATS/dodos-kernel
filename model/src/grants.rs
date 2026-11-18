@@ -248,8 +248,12 @@ impl Model {
             return Err(Error::Busy);
         }
         let me = self.node as usize;
+        // An entry is free only once its anchor is gone too: an anchor
+        // held by nobody keeps its entry used (Grants, release by the
+        // holder), and the anchor a `RevokeStep` leaves stays until the
+        // removal step's next call removes it (Revocation).
         let free: Vec<u16> = (0..GRANTS as u16)
-            .filter(|g| !self.table.grants[me].contains_key(g))
+            .filter(|&g| !self.table.grants[me].contains_key(&g) && self.anchor(g).is_none())
             .take(SEND_GRANTS_MAX)
             .collect();
         if free.len() < listed.len() {

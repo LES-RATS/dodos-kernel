@@ -651,6 +651,13 @@ fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u6
 }
 
 impl Machine {
+    /// The bytes of one crash area: a page, then a debug area per physical
+    /// core (D-129), in whole chunks.
+    pub(crate) fn crash_len(&self) -> u64 {
+        let cores = self.cores.len() as u64;
+        (4096 + cores * DEBUG_AREA_BYTES as u64).next_multiple_of(self.geometry.chunk())
+    }
+
     /// The ranges the kernel keeps: the kept ranges, the kept image, the
     /// crash areas and the feedback tables.
     fn kept_ranges(&self, image: (u64, u64), crash_len: u64) -> Ranges {
@@ -668,10 +675,11 @@ impl Machine {
     /// is used (Start-up state, D-141: each of these reached a panic of the
     /// model instead of a refusal): no two memory ranges overlap and none
     /// passes 2^64; MAXPHYADDR from the chunk's shift to 63 and above every
-    /// usable range; every core of a kind the entry `Kinds` lists; every
-    /// window of `BootNodes` below 1024; the iospaces' width from the page's
-    /// shift to 63; a unit's domain numbers from 16 to 65,536; each crash
-    /// area on a chunk boundary, apart from the other.
+    /// usable or kept range; every core of a kind the entry `Kinds` lists;
+    /// every window of `BootNodes` below 1024; the iospaces' width from the
+    /// page's shift to 63; a unit's domain numbers from 16 to 65,536; each
+    /// crash area on a chunk boundary, its range clear of every other kept
+    /// range (the other crash area, the kept ranges, the feedback tables).
     fn values_in_range(&self) -> bool {
         let geometry = self.geometry;
         let chunk_shift = geometry.chunk_shift();
@@ -685,16 +693,16 @@ impl Machine {
         let apart = ranges
             .windows(2)
             .all(|w| w[0].1.is_some_and(|end| end <= w[1].0));
+        let usable = self
+            .memory
+            .iter()
+            .filter(|r| r.kind == RegionKind::Usable)
+            .map(|r| (r.base, r.len));
         let width = (chunk_shift..64).contains(&self.phys_bits)
-            && self
-                .memory
-                .iter()
-                .filter(|r| r.kind == RegionKind::Usable)
-                .all(|r| {
-                    r.base
-                        .checked_add(r.len)
-                        .is_some_and(|end| end <= 1u64 << self.phys_bits)
-                });
+            && usable.chain(self.kept.iter().copied()).all(|(base, len)| {
+                base.checked_add(len)
+                    .is_some_and(|end| end <= 1u64 << self.phys_bits)
+            });
         let kinds = self
             .cores
             .iter()
@@ -710,11 +718,26 @@ impl Machine {
             .iter()
             .all(|u| (16..=65_536).contains(&u.domains));
         let chunk = geometry.chunk();
+        let crash_len = self.crash_len();
+        let others: Vec<(u64, u64)> = self
+            .kept
+            .iter()
+            .copied()
+            .chain(self.feedback.iter().map(|&(_, b, l)| (b, l)))
+            .map(|(b, l)| (b, b.saturating_add(l)))
+            .collect();
+        let clear = |base: u64, others: &[(u64, u64)]| {
+            let end = base.saturating_add(crash_len);
+            others.iter().all(|&(b, e)| e <= base || end <= b)
+        };
+        let previous = self.crash.1.map(|p| (p, p.saturating_add(crash_len)));
         let crash = self.crash.0.is_multiple_of(chunk)
+            && clear(self.crash.0, &others)
+            && clear(self.crash.0, previous.as_slice())
             && self
                 .crash
                 .1
-                .is_none_or(|p| p.is_multiple_of(chunk) && p != self.crash.0);
+                .is_none_or(|p| p.is_multiple_of(chunk) && clear(p, &others));
         ends_fit && apart && width && kinds && windows && io_width && domains && crash
     }
 
@@ -816,9 +839,7 @@ impl Machine {
             at = end;
         }
         let image = (self.image_base, at);
-        // A debug area per physical core (D-129).
-        let cores = self.cores.len() as u64;
-        let crash_len = (4096 + cores * DEBUG_AREA_BYTES as u64).next_multiple_of(chunk);
+        let crash_len = self.crash_len();
         // Ordinary memory: usable RAM without what is kept, shrunk inwards
         // to pages, then cut into chunks; the parts of a range smaller than
         // a chunk are left out.

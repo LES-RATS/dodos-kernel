@@ -468,7 +468,7 @@ fn one_interrupt_serves_sixteen_entries_of_a_user_ring_not_sixteen_messages() {
 
 const CONTROL: u32 = dodos_abi::START_SLOT_MEMORY_CONTROL;
 
-fn take(kind: u64, place: u64, size: u64, destination: u32) -> Syscall {
+pub(super) fn take(kind: u64, place: u64, size: u64, destination: u32) -> Syscall {
     Syscall::MemoryTake {
         control: s(CONTROL),
         kind,
@@ -509,7 +509,7 @@ fn a_reserve_chunk_taken_by_this_generation_is_busy() {
 /// Node 0 maps a device frame into its iospace, the unit fails, the unmap
 /// keeps the leaf counted, the frame goes; on the block of device entry
 /// `index`.
-fn frozen_device_leaf(index: u64) -> S {
+pub(super) fn frozen_device_leaf(index: u64) -> S {
     use super::units::{IOMMU_ROLE, IOSPACE, attached, three};
     let mut m = three();
     let ut = untyped_slot(m.sys.node(0), m.t[0]);
@@ -647,7 +647,7 @@ fn a_previous_crash_area_of_sequence_max_is_not_valid() {
 
 /// Node 1 is killed and dead; what its faulty generation left in the
 /// header of its core's area is `edit`; node 2 starts node 1 again there.
-fn restart_over(edit: impl FnOnce(&mut crate::debug::DebugArea)) -> S {
+pub(super) fn restart_over(edit: impl FnOnce(&mut crate::debug::DebugArea)) -> S {
     use super::units::three;
     let mut m = three();
     let kill = Syscall::NodeStop {
@@ -1365,7 +1365,7 @@ fn a_claim_on_a_core_of_apic_id_255_without_remapping_is_unsupported() {
 
 // `iospace_map` where the units cache entries that are not present.
 
-fn caching_iospace() -> (S, u32, u32) {
+pub(super) fn caching_iospace() -> (S, u32, u32) {
     use super::units::{IOSPACE, attached};
     let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
     machine.caching_mode = true;
@@ -1376,7 +1376,7 @@ fn caching_iospace() -> (S, u32, u32) {
     (m, ut, IOSPACE)
 }
 
-fn io_map(ut: u32, iospace: u32) -> Syscall {
+pub(super) fn io_map(ut: u32, iospace: u32) -> Syscall {
     Syscall::IoSpaceMap(Map {
         space: s(iospace),
         frame: s(160),

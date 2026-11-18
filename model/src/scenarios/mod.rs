@@ -19,6 +19,7 @@ mod pass22;
 mod pass23;
 mod reviews;
 mod units;
+mod verify13;
 
 use crate::boot::{Core, Machine};
 use crate::system::{Rng, System};
@@ -64,6 +65,13 @@ pub(crate) fn machine(arch: Arch, cores: usize, nodes: &[&[usize]]) -> Machine {
         })
         .collect();
     machine.boot_nodes = Some((nodes.len() as u32, layout));
+    // From 31 cores a crash area takes more than a chunk: the two areas
+    // end where the example's end, apart by their length (Start-up state).
+    let (chunk, len) = (machine.geometry.chunk(), machine.crash_len());
+    if len > chunk {
+        let end = machine.crash.0 + 2 * chunk;
+        machine.crash = (end - 2 * len, Some(end - len));
+    }
     machine
 }
 
