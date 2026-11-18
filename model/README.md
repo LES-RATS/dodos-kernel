@@ -115,7 +115,20 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   another node's unit to R2's request completes the record, or is
   *failed* and keeps the count, a message of an ended generation is
   still refused, and an answer wakes its thread, which runs only once
-  the resume ends),
+  the resume ends), `pass24_deepseek.rs` (DeepSeek's verification of
+  pass 24, its eleven tests named after what they hold, each failing when
+  the code it guards is reverted: among them the first map before the
+  answer, `again` while the granting node is live or sealed and `gone`
+  once it is accused, and a block of a device entry under a live grant,
+  `busy` for a give and a split), `pass25.rs` (the tables of each VT-d
+  unit kept at start-up among the kept ranges, and a machine with no room
+  for them refused; then the faults the combined exploration found, each
+  with the seed that found it: a rebuild whose last invalidation a unit
+  never confirms, a request answered *elsewhere* sent again at once, an
+  observation of a generation that ended, a heartbeat counted again from
+  0, a node started afresh with its clock at 0 and its cores choosing
+  nothing, its debug areas' suppressed entries; and gap 18 held as
+  implemented),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -127,7 +140,23 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   resumed, its R2 asking another node's unit (and never accused
   stuck), asserted over the seeds; the
   one-node walk of `tests/property.rs` holds no remote frame, so D-142's
-  exploration is there). `DODOS_SEED=<n>` replays one seed
+  exploration is there), and `combinations.rs` (pass 25: five nodes
+  with two grants, one of 32 frames, two devices, a line claimed in
+  turn, chunks given and an entry split, the IOMMU role handed, and every
+  node accused by each kind of evidence, fenced or not, sealed, resumed
+  and started again, at the low end of the times of membership; each
+  seed takes three of thirteen drivers of rare states, every triple in
+  turn; 26 events probed after every step, and the seeds that reach each
+  pair, each triple of a resume and two others and each triple of a
+  death and two others counted; each seed ends with no node accused that
+  was not harmed and no wait left; `verify` runs 26 seeds, and `cargo
+  test --release -p dodos-model --lib every_combination -- --ignored`
+  explores 858, `DODOS_COMBINATION_SEEDS` another number, and fails on
+  a combination no seed reaches that `IMPOSSIBLE` does not exclude; on
+  18 November 2026, 1,716 seeds reached 661 of the 772 combinations not
+  excluded and left 111, one pair, 105 triples of a resume, which most
+  often ends within one event, and five of a death; so that run fails).
+  `DODOS_SEED=<n>` replays one seed
   of an exploration with its actions printed; `DODOS_COUNTS` prints what
   the explorations reached.
 - `tests/`: the calls on one node, judged argument by argument, and the
@@ -148,7 +177,10 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   granting generation over under a counted leaf, and invariant 58 counting
   a frozen use entry, each have one); a check that cannot fail is
   deleted or says which earlier rule shadows it, and the checker names an
-  invariant for a value of the state it would index, never panics.
+  invariant for a value of the state it would index, never panics. Two
+  rules leave a case of an open gap unjudged: SERVED, R1's invalidation
+  during a hand-over (gap 17), and CREDIT, a request a fresh start
+  skipped (gap 20).
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
 
@@ -178,10 +210,19 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
 
 A behaviour the contract does not fix is marked `CONTRACT-GAP` and a number
 in the code, and written in a draft of the documentation repository with
-the reading implemented and the text proposed. None is open: the sixteen of
-pass 15 (`research/drafts/model-15-contract-gaps.md`) are settled in the
-contract since pass 16 (D-133), and each branch that applies one names the
-contract's sentence and "gap *n*". Two were settled otherwise than the
+the reading implemented and the text proposed. The sixteen of pass 15
+(`research/drafts/model-15-contract-gaps.md`) are settled in the contract
+since pass 16 (D-133), and each branch that applies one names the
+contract's sentence and "gap *n*". Four are open since pass 25, found by
+the combined exploration and not yet decided (the model implements the
+text as it reads, and the exploration counts them without judging them):
+17, whether the node that hands a unit role runs R1 during steps 1 to 3
+(`Model::r1`); 18, a request answered *elsewhere* by a hand-over that
+ends without step 4 stays queued for ever (`Model::unit_send_queued`);
+19, evidence stuck against a node whose start lasts longer than
+`STUCK_NS` (`Model::evidence`); 20, a request to a starting node's new
+generation skipped by its fresh start, its credit never answered
+(`Model::skip_rings`). Two were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the claim
 of an MSI asks every IOMMU unit of the source's segment, one after another
