@@ -230,7 +230,7 @@ fn start_up_untyped_is_taken_after_the_message_page() {
     let copied_pages = m.frame_at(t, own(26)).unwrap().1;
     assert_eq!(start, copied + copied_pages * page);
     assert_eq!(message, start + start_pages * page);
-    assert_eq!(copied, Machine::example().memory[4].base);
+    assert_eq!(copied, Machine::example().memory[5].base);
     // An endpoint goes right after the message page: a frame retyped after
     // it lies one page later (the final review's F2 Opus 4: where it went
     // was not read).
@@ -290,7 +290,7 @@ fn segments_that_are_not_writable_are_mapped_from_the_kept_image() {
     let image = Machine::example().image_base;
     assert_eq!(m.frame_at(t, own(27)).unwrap().2, image);
     let copied = m.frame_at(t, own(26)).unwrap().2;
-    assert!(copied >= Machine::example().memory[4].base);
+    assert!(copied >= Machine::example().memory[5].base);
     let (mut m, t) = (m, t);
     let unmap = Syscall::ASpaceUnmap(own(27));
     assert_eq!(m.apply(t, unmap), Ok(Output::Done));
@@ -430,7 +430,7 @@ fn ownership_words_are_none_in_floors_reserves_name_their_reserve() {
     let (m, _) = boot(&Machine::example());
     let geometry = m.geometry();
     let chunk = geometry.chunk_shift();
-    let ram = Machine::example().memory[4].base >> chunk;
+    let ram = Machine::example().memory[5].base >> chunk;
     // Floors of three chunks for nodes 0 and 1: none.
     for c in ram..ram + 6 {
         assert_eq!(m.ownership(c), 0, "chunk {c}");
@@ -449,7 +449,7 @@ fn ownership_words_are_none_in_floors_reserves_name_their_reserve() {
         Ownership::free(Owner::Unclaimed).raw()
     );
     // The crash areas at the top are kept: none.
-    let top = (Machine::example().memory[4].base + Machine::example().memory[4].len) >> chunk;
+    let top = (Machine::example().memory[5].base + Machine::example().memory[5].len) >> chunk;
     assert_eq!(m.ownership(top - 1), 0);
     assert_eq!(
         m.ownership(top - 3),
@@ -464,15 +464,15 @@ fn device_memory_is_every_address_that_is_not_ram_kept_or_unusable() {
     let machine = with(|m| {
         let region = |base, len, kind| Region { base, len, kind };
         let mb = 1 << 20;
-        let low = m.memory[3].base + m.memory[3].len;
-        m.memory[2] = region(2 * mb, mb, RegionKind::Unusable);
-        m.memory[3] = region(3 * mb, 4 * mb, RegionKind::Reserved);
-        m.memory
-            .insert(4, region(7 * mb, low - 7 * mb, RegionKind::Unusable));
+        let low = m.memory[4].base + m.memory[4].len;
+        m.memory[2] = region(3 * mb, 4 * mb, RegionKind::Reserved);
+        m.memory[3] = region(7 * mb, low - 7 * mb, RegionKind::Unusable);
+        m.memory.remove(4);
     });
     let (m, _) = boot(&machine);
-    // The entries below 2 MB hold the part of the usable second megabyte
-    // left out of the chunks (Argon F2); then the device ranges.
+    // The entries below 2 MB hold the part of the usable memory from 1 MB
+    // left out of the chunks and of the kept ranges, the tables of the
+    // IOMMU unit among them (Argon F2); then the device ranges.
     let used = m.device_count() - DEVICE_TABLE_SPARE;
     let low = (0..used)
         .filter(|&i| m.device_entry(i).base() < 2 << 20)

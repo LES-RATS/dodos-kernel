@@ -1107,7 +1107,7 @@ fn the_start_up_refuses_the_values_of_the_machine_out_of_range() {
         (
             "two usable ranges that overlap",
             Box::new(|m| {
-                let first = m.memory[4];
+                let first = m.memory[5];
                 m.memory.push(first);
             }),
             MachineValues,
@@ -1167,9 +1167,11 @@ fn the_start_up_page_counts_its_records_at_the_sizes_of_the_abi() {
     // for `StartBootTimes` (48), 80 for `StartMachine` (96) and 8 for a
     // table of firmware tables the model never lists (an empty entry): the
     // final review's verification of lot C, H1 = O2.
+    // Pass 25: the example lists one more memory range (a descriptor of 48
+    // bytes) and keeps the tables of its IOMMU unit (16 bytes in `Kept`).
     let machine = Machine::example();
     let bytes = crate::boot::start_page_bytes_of(&machine);
-    assert_eq!(bytes, 2168 + (48 - 40) + (96 - 80) - 8);
+    assert_eq!(bytes, 2168 + (48 - 40) + (96 - 80) - 8 + 48 + 16);
     assert_eq!(std::mem::size_of::<dodos_abi::StartBootTimes>(), 48);
     assert_eq!(std::mem::size_of::<dodos_abi::StartMachine>(), 96);
 }

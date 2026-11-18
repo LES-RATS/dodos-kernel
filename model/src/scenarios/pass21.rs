@@ -590,7 +590,7 @@ fn deepseek12_11_the_destruction_of_a_device_block_whose_watermark_is_ready_wait
 {
     let mut k = N::on(&one_node(Arch::X86_64, 2));
     let index = (0..k.m.device_count())
-        .find(|&i| k.m.device_entry(i).base() == 2 << 20)
+        .find(|&i| k.m.device_entry(i).base() == Machine::DEVICES)
         .expect("the device range") as u64;
     k.ok(Syscall::MemoryTake {
         control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),

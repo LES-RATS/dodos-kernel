@@ -40,7 +40,7 @@ pub const fn slot(index: u32) -> u32 {
 /// chunks are device entries too).
 pub fn take_device(model: &mut Model, thread: ObjId) {
     let index = (0..model.device_count())
-        .find(|&i| model.device_entry(i).base() == 2 << 20)
+        .find(|&i| model.device_entry(i).base() == dodos_model::Machine::DEVICES)
         .expect("the 2 MB device range");
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(START_SLOT_MEMORY_CONTROL),
@@ -59,7 +59,7 @@ pub fn take_run(model: &mut Model, thread: ObjId, log2: u32, slot: u32) {
     let geometry = model.geometry();
     let chunk = geometry.chunk();
     let machine = dodos_model::Machine::example_on(geometry);
-    let ram = machine.memory[4].base;
+    let ram = machine.memory[5].base;
     // Floors of 2 × 3 chunks and 2 reserves of 1 chunk: 8 chunks.
     let free = ram + 8 * chunk;
     let place = free.next_multiple_of(1 << log2);

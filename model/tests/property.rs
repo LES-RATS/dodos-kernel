@@ -106,7 +106,7 @@ fn geometry() -> Geometry {
 
 /// The base of the ordinary memory of the machine past its floors' start.
 fn ram() -> u64 {
-    Machine::example_on(geometry()).memory[4].base
+    Machine::example_on(geometry()).memory[5].base
 }
 
 fn page() -> u64 {
@@ -120,7 +120,7 @@ fn device_index() -> u64 {
     *INDEX.get_or_init(|| {
         let (m, _) = Model::boot(&Machine::example()).unwrap();
         (0..m.device_count())
-            .find(|&i| m.device_entry(i).base() == 2 << 20)
+            .find(|&i| m.device_entry(i).base() == Machine::DEVICES)
             .unwrap() as u64
     })
 }

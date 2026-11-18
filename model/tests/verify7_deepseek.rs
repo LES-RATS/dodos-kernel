@@ -372,7 +372,7 @@ fn f5_gate_word_bits_32_to_44_count_non_data_pages() {
     let chunk_shift = k.m.geometry().chunk_shift();
     let chunk_size = k.m.geometry().chunk();
     let machine = Machine::example_on(k.m.geometry());
-    let base = (machine.memory[4].base + 8 * chunk_size).next_multiple_of(1 << chunk_shift);
+    let base = (machine.memory[5].base + 8 * chunk_size).next_multiple_of(1 << chunk_shift);
     let chunk = base >> chunk_shift;
 
     common::take_run(&mut k.m, k.t, chunk_shift, common::slot(40));
@@ -509,7 +509,7 @@ fn f9_completed_stepped_mapping_is_not_partial_and_hits_protect_fifth_clause() {
     } else {
         let mut k = NodeHarness::on(&default_m);
         let chunk = k.m.geometry().chunk();
-        let ram = default_m.memory[4].base;
+        let ram = default_m.memory[5].base;
         let place = (ram + 8 * chunk).next_multiple_of(2 * large2);
         k.err(
             Syscall::MemoryTake {
@@ -695,7 +695,7 @@ fn n4_iospace_device_leaf_and_two_node_kept_mappings_write_none_chunk_gate_word(
     // 1. `iospace_map` of a device frame writes `table.maps[dev_chunk]`:
     let dev_delta = {
         let index = (0..sys.sys.node(0).device_count())
-            .find(|&i| sys.sys.node(0).device_entry(i).base() == 2 << 20)
+            .find(|&i| sys.sys.node(0).device_entry(i).base() == Machine::DEVICES)
             .unwrap();
         sys.ok(
             0,

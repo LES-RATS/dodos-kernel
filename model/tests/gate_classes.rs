@@ -82,7 +82,7 @@ fn with_space(kind: ObjectKind) -> (Model, ObjId, u64) {
 /// The physical base of the block: the run `take_run` takes.
 fn block_base(m: &Model) -> u64 {
     let geometry = m.geometry();
-    let ram = Machine::example_on(geometry).memory[4].base;
+    let ram = Machine::example_on(geometry).memory[5].base;
     (ram + 8 * geometry.chunk()).next_multiple_of(geometry.chunk())
 }
 
@@ -208,7 +208,7 @@ fn a_device_leaf_counts_in_its_device_entry_and_in_no_chunk() {
         let (mut m, t, _) = with_space(kind);
         common::take_device(&mut m, t);
         let index = (0..m.device_count())
-            .find(|&i| m.device_entry(i).base() == 2 << 20)
+            .find(|&i| m.device_entry(i).base() == Machine::DEVICES)
             .unwrap();
         let counts = |m: &Model| -> Vec<u64> { (0..64).map(|c| m.map_count(c)).collect() };
         ok(

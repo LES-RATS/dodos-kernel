@@ -272,11 +272,18 @@ impl Machine {
     /// machine; more where a run of the second large page past the floors
     /// would not fit, as with pages of 32 KB) from the first multiple of 4 GB
     /// that is aligned on the
-    /// second large page, whose top two chunks hold the crash areas, a 2 MB
-    /// device range at 2 MB, the kept ranges and the modules in the second
-    /// megabyte, and a first service of two segments from the first large
-    /// page with one other file. Its floors are three chunks, cut into
-    /// blocks of two chunks and one; its two reserves are one chunk each.
+    /// second large page, whose top two chunks hold the crash areas; below
+    /// 4 GB, as a PC has it, 2 MB of usable memory from 1 MB, which holds
+    /// the kept ranges, the modules and the tables of the IOMMU unit and
+    /// holds no chunk, and a 2 MB device range at `DEVICES`, the
+    /// chipset's (IOAPIC, HPET and the unit's registers); and a first
+    /// service of two segments from the first large page with one other
+    /// file. Its floors are three chunks, cut into blocks of two chunks and
+    /// one; its two reserves are one chunk each.
+    /// The base of the example's device range: the chipset's on a PC, where
+    /// the IOAPIC (0xFEC0_0000), the HPET and the VT-d unit's registers lie.
+    pub const DEVICES: u64 = 0xFEC0_0000;
+
     pub fn example_on(geometry: Geometry) -> Self {
         let region = |base, len, kind| Region { base, len, kind };
         let (mb, gb): (u64, u64) = (1 << 20, 1 << 30);
@@ -308,9 +315,14 @@ impl Machine {
             arch: Arch::X86_64,
             memory: vec![
                 region(0, mb, RegionKind::Unusable),
-                region(mb, mb, RegionKind::Usable),
-                region(2 * mb, 2 * mb, RegionKind::Reserved),
-                region(4 * mb, ram - 4 * mb, RegionKind::Unusable),
+                region(mb, 2 * mb, RegionKind::Usable),
+                region(3 * mb, Self::DEVICES - 3 * mb, RegionKind::Unusable),
+                region(Self::DEVICES, 2 * mb, RegionKind::Reserved),
+                region(
+                    Self::DEVICES + 2 * mb,
+                    ram - Self::DEVICES - 2 * mb,
+                    RegionKind::Unusable,
+                ),
                 region(ram, size, RegionKind::Usable),
                 region(ram + size, top - ram - size, RegionKind::Unusable),
             ],
@@ -566,6 +578,8 @@ pub(crate) struct Layout {
     modules: Vec<(u64, Option<u64>, u64, bool)>,
     image: (u64, u64),
     crash_len: u64,
+    /// The tables of the IOMMU units, one range per unit (IOMMU).
+    unit_tables: Ranges,
     floors: Vec<Ranges>,
     reserves: Vec<Ranges>,
     owners: Vec<u64>,
@@ -604,7 +618,12 @@ fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u6
         .sum();
     let floors: u64 = layout.floors.iter().map(|f| f.len() as u64).sum();
     let reserves: u64 = layout.reserves.iter().map(|r| r.len() as u64).sum();
-    let kept = machine.kept.len() as u64 + 3 + machine.feedback.len() as u64;
+    // The entry `Kept` lists every kept range, the tables of the IOMMU
+    // units among them (Start-up state, rule 1).
+    let kept = machine.kept.len() as u64
+        + 3
+        + machine.feedback.len() as u64
+        + layout.unit_tables.len() as u64;
     let kinds = machine.kinds.len() as u64;
     // The fixed records by the sizes of `abi/`, so the budget cannot drift
     // from them (the final review's verification of lot C, H1 = O2: 40 and
@@ -659,9 +678,10 @@ impl Machine {
     }
 
     /// The ranges the kernel keeps: the kept ranges, the kept image, the
-    /// crash areas and the feedback tables.
-    fn kept_ranges(&self, image: (u64, u64), crash_len: u64) -> Ranges {
+    /// crash areas, the feedback tables and the tables of the IOMMU units.
+    fn kept_ranges(&self, image: (u64, u64), crash_len: u64, unit_tables: &Ranges) -> Ranges {
         let mut kept: Ranges = self.kept.iter().map(|&(b, l)| (b, b + l)).collect();
+        kept.extend(unit_tables.iter().copied());
         kept.push(image);
         kept.push((self.crash.0, self.crash.0 + crash_len));
         if let Some(previous) = self.crash.1 {
@@ -669,6 +689,56 @@ impl Machine {
         }
         kept.extend(self.feedback.iter().map(|&(_, b, l)| (b, b + l)));
         sorted(kept)
+    }
+
+    /// The tables of the IOMMU units, kept by the kernel at start, once
+    /// (IOMMU: on x86-64 a root table of 4 KB and 256 context tables of
+    /// 4 KB per unit, `VTD_UNIT_TABLE_BYTES`, D-142), each on a page
+    /// boundary of usable memory clear of every other kept range: where it
+    /// takes the fewest chunks out of the ordinary memory, then as high as
+    /// it can, so that the floors, cut from the lowest chunks, keep their
+    /// alignment. `None` if one does not fit, refusal 4 (Start-up state:
+    /// "the kept memory do not fit in the ordinary memory"). The contract
+    /// gives the size on x86-64 only, so on ARM64 and RISC-V the model
+    /// keeps none.
+    fn unit_tables(&self, kept: &Ranges) -> Option<Ranges> {
+        if self.arch != Arch::X86_64 {
+            return Some(Vec::new());
+        }
+        let (page, chunk) = (self.geometry.page(), self.geometry.chunk());
+        let bytes = dodos_abi::x86_64::VTD_UNIT_TABLE_BYTES.next_multiple_of(page);
+        let chunks = |(start, end): (u64, u64)| (end / chunk).saturating_sub(start.div_ceil(chunk));
+        let usable = sorted(
+            self.memory
+                .iter()
+                .filter(|r| r.kind == RegionKind::Usable)
+                .map(|r| (r.base, r.base + r.len))
+                .collect(),
+        );
+        let mut taken = kept.clone();
+        let mut tables = Vec::new();
+        for _ in &self.iommus {
+            let free = without(&usable, &sorted(taken.clone()));
+            // In each gap, its lowest and its highest place.
+            let places = free.iter().flat_map(|&(start, end)| {
+                let low = start.next_multiple_of(page);
+                let high = end.checked_sub(bytes).map(|at| at / page * page);
+                [Some(low), high]
+                    .into_iter()
+                    .flatten()
+                    .filter(move |&at| {
+                        at >= start && at.checked_add(bytes).is_some_and(|e| e <= end)
+                    })
+                    .map(move |at| {
+                        let left = chunks((start, at)) + chunks((at + bytes, end));
+                        (chunks((start, end)) - left, at)
+                    })
+            });
+            let (_, at) = places.max_by_key(|&(lost, at)| (std::cmp::Reverse(lost), at))?;
+            tables.push((at, at + bytes));
+            taken.push((at, at + bytes));
+        }
+        Some(tables)
     }
 
     /// The values of the machine in their ranges, judged before any of them
@@ -843,7 +913,10 @@ impl Machine {
         // Ordinary memory: usable RAM without what is kept, shrunk inwards
         // to pages, then cut into chunks; the parts of a range smaller than
         // a chunk are left out.
-        let kept = self.kept_ranges(image, crash_len);
+        let unit_tables = self
+            .unit_tables(&self.kept_ranges(image, crash_len, &Vec::new()))
+            .ok_or(Refusal::Floors)?;
+        let kept = self.kept_ranges(image, crash_len, &unit_tables);
         let regions = |kind| {
             let regions = self.memory.iter().filter(|region| region.kind == kind);
             sorted(regions.map(|r| (r.base, r.base + r.len)).collect())
@@ -983,6 +1056,7 @@ impl Machine {
             modules,
             image,
             crash_len,
+            unit_tables,
             floors,
             reserves,
             owners,
@@ -1062,7 +1136,7 @@ impl Machine {
             floors: layout.floors.clone(),
             reserves: layout.reserves.clone(),
             role_records: layout.roles.clone(),
-            kept: self.kept_ranges(layout.image, layout.crash_len),
+            kept: self.kept_ranges(layout.image, layout.crash_len, &layout.unit_tables),
             none: std::sync::Arc::new(layout.none.iter().copied().collect()),
             fence,
             booted,

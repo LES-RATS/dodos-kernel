@@ -138,7 +138,7 @@ impl S {
     fn free_run(&self) -> (u64, u64) {
         let geometry = self.sys.node(0).geometry();
         let chunk = geometry.chunk();
-        let ram = Machine::example_on(geometry).memory[4].base;
+        let ram = Machine::example_on(geometry).memory[5].base;
         (ram + 64 * chunk, u64::from(chunk.trailing_zeros()))
     }
 
@@ -146,7 +146,7 @@ impl S {
     fn device_index(&self) -> u64 {
         let node = self.sys.node(0);
         (0..node.device_count())
-            .find(|&i| node.device_entry(i).base() == 2 << 20)
+            .find(|&i| node.device_entry(i).base() == Machine::DEVICES)
             .unwrap() as u64
     }
 }

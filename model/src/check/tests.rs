@@ -1945,7 +1945,7 @@ fn irq_whose_root_capability_is_not_a_child_of_an_irq_control_is_reported() {
 fn with_block(m: &mut Model) -> (ObjId, u64) {
     let thread = object(m, START_SLOT_THREAD);
     let geometry = m.machine.geometry;
-    let place = m.machine.memory[4].base + 8 * geometry.chunk();
+    let place = m.machine.memory[5].base + 8 * geometry.chunk();
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
         kind: 0,
@@ -2067,7 +2067,7 @@ fn translation_to_a_free_word_is_reported() {
 fn word_changed_from_none_is_reported() {
     let broken = spoiled(|m, _| {
         // A chunk of the floor of node 1.
-        let chunk = (m.machine.memory[4].base >> m.machine.geometry.chunk_shift()) + 3;
+        let chunk = (m.machine.memory[5].base >> m.machine.geometry.chunk_shift()) + 3;
         std::sync::Arc::make_mut(&mut m.table.owners)[chunk as usize] =
             Ownership::taken(Owner::Node(1), 1).raw();
     });
@@ -2522,7 +2522,7 @@ fn the_gate_refuses_to_give_a_block_whose_map_count_is_not_zero() {
 fn the_gate_refuses_to_give_a_device_block_whose_leaf_count_is_not_zero() {
     let (mut m, t) = Model::boot(&Machine::example()).unwrap();
     let index = (0..m.device_count())
-        .find(|&i| m.device_entry(i).base() == 2 << 20)
+        .find(|&i| m.device_entry(i).base() == Machine::DEVICES)
         .unwrap();
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),

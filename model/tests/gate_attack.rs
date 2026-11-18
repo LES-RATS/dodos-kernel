@@ -104,7 +104,7 @@ fn start(n: u32, mode: u64) -> Syscall {
 /// chunks, aligned on the size of the run.
 fn free_run(geometry: Geometry, log2: u32) -> u64 {
     let machine = Machine::example_on(geometry);
-    let ram = machine.memory[4].base;
+    let ram = machine.memory[5].base;
     let free = ram + 8 * geometry.chunk();
     free.next_multiple_of(1 << log2)
 }
