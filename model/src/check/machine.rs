@@ -286,8 +286,15 @@ impl System {
                         Completes::Revoke { grant } => self.released(y, x, grant),
                         _ => false,
                     };
+                    // CONTRACT-GAP 20: a request the receiver's fresh start
+                    // skipped is not judged.
+                    let skipped = self.has(y)
+                        && self
+                            .node(y)
+                            .skipped
+                            .contains(&(x, index as u8, credit.serial));
                     ensure(
-                        request || answer || kept || released,
+                        request || answer || kept || released || skipped,
                         "CREDIT: a credit in use with neither its request nor its answer in flight",
                     )?;
                 }

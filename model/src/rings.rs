@@ -853,9 +853,30 @@ impl Model {
     /// The rings into this node at a fresh start: every consumer index is
     /// set to its ring's producer index, so the node consumes nothing sent
     /// before (What crosses between nodes, G13).
+    ///
+    /// CONTRACT-GAP 20 (pass 25): a message written to this generation
+    /// after its member word read *starting* and before this, a
+    /// `ReportAsk` of a rebuild that pulls "every node that is starting",
+    /// is skipped too, and its sender's credit is never answered (CREDIT).
+    /// Implemented as the sentence reads; the skipped requests are
+    /// recorded, so that the check does not judge their credits.
     pub(crate) fn skip_rings(&mut self) {
+        let generation = self.table.generation(self.node);
         for from in 0..self.table.nodes {
             for user in [false, true] {
+                let ring = self.ring_of(from, self.node, user);
+                let start = self.consumed(from, self.node, user);
+                let skipped: Vec<(u16, u8, u32)> = (start..ring.produced)
+                    .filter_map(|at| match ring.at(at) {
+                        Some(crate::table::RingEntry::Message(m))
+                            if m.header.receiver_generation == generation =>
+                        {
+                            m.header.credit().map(|(i, s)| (from, i, s))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                self.skipped.0.extend(skipped);
                 let produced = self.ring_of(from, self.node, user).produced;
                 self.set_consumed(from, user, produced);
             }

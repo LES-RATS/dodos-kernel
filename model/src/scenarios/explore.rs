@@ -23,33 +23,33 @@ use dodos_abi::NODE_START_RESUME;
 
 const SEEDS: u64 = 24;
 
-fn once() -> bool {
+pub(super) fn once() -> bool {
     std::env::var("DODOS_PAGE").is_err()
 }
 
 /// The seed `DODOS_SEED` names, read once: a value that does not parse is
 /// refused, never taken as unset (ver2-D 7).
-fn replayed() -> Option<u64> {
+pub(super) fn replayed() -> Option<u64> {
     let seed = std::env::var("DODOS_SEED").ok()?;
     Some(seed.parse().expect("DODOS_SEED is a seed number"))
 }
 
 /// The seeds of a scenario: `DODOS_SEED` replays one, with its actions
 /// printed.
-fn seeds(count: u64) -> Vec<u64> {
+pub(super) fn seeds(count: u64) -> Vec<u64> {
     match replayed() {
         Some(seed) => vec![seed],
         None => (0..count).collect(),
     }
 }
 
-fn say(what: std::fmt::Arguments) {
+pub(super) fn say(what: std::fmt::Arguments) {
     if replayed().is_some() {
         eprintln!("{what}");
     }
 }
 
-fn resume(n: u16) -> Syscall {
+pub(super) fn resume(n: u16) -> Syscall {
     Syscall::NodeStart {
         node: node_cap(n),
         mode: NODE_START_RESUME,
@@ -62,7 +62,7 @@ fn resume(n: u16) -> Syscall {
 
 /// A call by a node's first thread if it can run and its node runs; the
 /// outcome is not judged (the check after it is).
-fn try_call(m: &mut S, node: u16, call: Syscall) -> Option<Outcome> {
+pub(super) fn try_call(m: &mut S, node: u16, call: Syscall) -> Option<Outcome> {
     if !m.sys.has(node) || m.state(node) != MemberState::Live {
         return None;
     }
@@ -98,7 +98,7 @@ fn quiet(m: &mut S) {
 }
 
 /// A node's thread that waits for another node, a unit or its cores.
-fn waits_bounded(m: &S, node: u16) -> bool {
+pub(super) fn waits_bounded(m: &S, node: u16) -> bool {
     m.sys.has(node)
         && m.sys
             .node(node)
@@ -108,7 +108,7 @@ fn waits_bounded(m: &S, node: u16) -> bool {
 }
 
 /// After a death, a node that started again has a new first thread.
-fn refresh(m: &mut S) {
+pub(super) fn refresh(m: &mut S) {
     for node in 0..m.t.len() as u16 {
         if m.sys.has(node) {
             let first = m

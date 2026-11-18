@@ -1,0 +1,1451 @@
+//! A seeded exploration of the combined recovery states between nodes
+//! (pass 25): the rare events of the contract between nodes, steered so
+//! that they are in progress together. Five nodes of one core; two grants
+//! (node 0 to node 2, mapped in an iospace behind the IOMMU unit, and
+//! node 3 to node 4, mapped in an address space), each with a doorbell;
+//! a device attached by nodes 2 and 4; a line that nodes 1 and 3 claim in
+//! turn; a chunk that nodes 1 and 3 give each other and a device entry
+//! node 1 splits; the IOMMU role handed between nodes; and every node
+//! accused by each kind of evidence, fenced or left unfenced, sealed and
+//! resumed, started again. The whole check runs after every step, as in
+//! `explore.rs`.
+//!
+//! After every step the exploration notes which events are in progress
+//! (`probe`), and counts the seeds that reach each pair of them, each
+//! triple of a resume and two others, and each triple of a death and two
+//! others (`Reach`). A combination no seed reaches fails the test, unless
+//! `IMPOSSIBLE` shows from the contract that it cannot happen. Then the
+//! machine runs until it is quiet, and its liveness is asserted: no node is
+//! accused that was not harmed (killed, failed, hung, retired or sealed past
+//! `SEAL_NS`), and no wait of a live node for another node, a unit or its
+//! cores is left.
+//!
+//! `DODOS_SEED=<n>` replays one seed with its actions printed;
+//! `DODOS_COUNTS` prints the table of combinations.
+
+use super::explore::{refresh, replayed, say, try_call, waits_bounded};
+use super::pass17::{fresh, kill, resume, seal};
+use super::units::{IOMMU_ROLE, IOSPACE};
+use super::*;
+use crate::rings::{Body, UnitOp};
+use crate::system::Hardware;
+use crate::table::{GrantState, RingEntry, Table};
+use crate::{Message, Range, Transfer};
+use dodos_abi::{
+    AttachState, AttachWord, Evidence, IrqSource, Member, NODE_STOP_RETIRE, OwnState, Owner,
+    Ownership, RoleState,
+};
+use std::collections::BTreeSet;
+
+const NODES: u16 = 5;
+const REPLY: u32 = 100;
+const BELL: u32 = 102;
+const BLOCK: u32 = 160;
+const ENTRY: u32 = 170;
+const IRQ: u32 = 210;
+const RECEIVER: u32 = 300;
+const STEPS: usize = 120;
+
+/// A grant between two nodes: the granting node and its frames from
+/// `obj`, the holder and the slots it receives them in from `got`, and
+/// whether the holder maps the first in its iospace (else in its address
+/// space).
+#[derive(Clone, Copy)]
+struct Pair {
+    granter: u16,
+    holder: u16,
+    io: bool,
+    obj: u32,
+    got: u32,
+    frames: u32,
+}
+
+/// Node 0 grants node 2 one frame, mapped behind the IOMMU unit; node 3
+/// grants node 4 32 frames, so that their releases at once fill the
+/// kernel ring to node 3 (64 entries, 34 kept for answers).
+const PAIRS: [Pair; 2] = [
+    Pair {
+        granter: 0,
+        holder: 2,
+        io: true,
+        obj: 101,
+        got: 110,
+        frames: 1,
+    },
+    Pair {
+        granter: 3,
+        holder: 4,
+        io: false,
+        obj: 400,
+        got: 500,
+        frames: 32,
+    },
+];
+/// The nodes that attach a device, each its own.
+const DEVICES: [(u16, u64); 2] = [(2, 0x10), (4, 0x11)];
+/// The nodes that claim the line in turn, and its GSI.
+const LINERS: [u16; 2] = [1, 3];
+const GSI: u32 = 5;
+
+/// The events, each a state in progress somewhere on the machine.
+const KILLED: usize = 0;
+const SELF: usize = 1;
+const STALE: usize = 2;
+const STUCK: usize = 3;
+const RETIRED: usize = 4;
+const SEAL_LATE: usize = 5;
+const FENCED: usize = 6;
+const UNFENCED: usize = 7;
+const SEALED: usize = 8;
+const RESUME: usize = 9;
+const FRESH: usize = 10;
+const FAILED_UNIT: usize = 11;
+const HANDING: usize = 12;
+const HAND_DEATH: usize = 13;
+const UNANSWERED: usize = 14;
+const REVOKING: usize = 15;
+const RELEASE: usize = 16;
+const CROSSING: usize = 17;
+const RELEASE_PENDING: usize = 18;
+const SIGNAL_PENDING: usize = 19;
+const GIVEN: usize = 20;
+const SPLIT: usize = 21;
+const ATTACHED: usize = 22;
+const DETACHED: usize = 23;
+const MID_ATTACH: usize = 24;
+const LINE: usize = 25;
+const EVENTS: usize = 26;
+
+const NAMES: [&str; EVENTS] = [
+    "accused kill",
+    "accused self",
+    "accused stale",
+    "accused stuck",
+    "accused retire",
+    "accused seal",
+    "fenced",
+    "unfenced",
+    "sealed",
+    "resume",
+    "fresh start",
+    "failed unit",
+    "role handing",
+    "holder's death mid-hand",
+    "grant unanswered",
+    "revoking",
+    "release",
+    "release crossing revoke",
+    "release pending",
+    "signal pending",
+    "chunk given",
+    "entry split",
+    "device attached",
+    "device detached",
+    "mid-attach",
+    "line moving",
+];
+
+/// The accusations: a node fencing, fenced or unfenced.
+fn accused(state: MemberState) -> bool {
+    matches!(
+        state,
+        MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
+    )
+}
+
+/// The messages of the kernel ring from `from` to `to` not yet consumed.
+fn waiting(table: &Table, from: u16, to: u16) -> impl Iterator<Item = &Body> {
+    let ring = &table.rings[from as usize][to as usize].kernel;
+    let start = table.beacons[to as usize].consumed[from as usize].0;
+    (start..ring.produced).filter_map(|at| match ring.at(at) {
+        Some(RingEntry::Message(message)) => Some(&message.body),
+        _ => None,
+    })
+}
+
+/// A `Release` of grant `grant` of `granter` from its holder, in flight or
+/// pending in the holder's use entry.
+fn releasing(table: &Table, granter: u16, holder: u16, grant: u16) -> bool {
+    let sent = waiting(table, holder, granter)
+        .any(|b| matches!(b, Body::Release { grant: g, .. } if *g == grant));
+    let pending = table.uses[holder as usize]
+        .values()
+        .any(|u| u.granter == granter && u.grant == grant && u.release_pending);
+    sent || pending
+}
+
+/// The events in progress now, as a mask.
+fn probe(m: &S, splittable: usize) -> u32 {
+    let mut at = 0u32;
+    let mut set = |event: usize, holds: bool| {
+        if holds {
+            at |= 1 << event;
+        }
+    };
+    let table = m.sys.canonical();
+    for n in 0..NODES {
+        let member = m.sys.member(n);
+        let state = member.state();
+        if accused(state) {
+            let kind = match member.evidence() {
+                Evidence::Kill => KILLED,
+                Evidence::SelfReported => SELF,
+                Evidence::Stale => STALE,
+                Evidence::Stuck => STUCK,
+                Evidence::Retire => RETIRED,
+                Evidence::Seal => SEAL_LATE,
+                Evidence::None => continue,
+            };
+            set(kind, true);
+        }
+        set(FENCED, state == MemberState::Fenced);
+        set(UNFENCED, state == MemberState::Unfenced);
+        set(
+            SEALED,
+            matches!(state, MemberState::Sealing | MemberState::Sealed),
+        );
+        if state == MemberState::Starting && m.sys.has(n) {
+            let resuming = m.sys.node(n).resuming;
+            set(RESUME, resuming);
+            set(FRESH, !resuming);
+        }
+        if m.sys.has(n) {
+            let node = m.sys.node(n);
+            for entry in node.unit_requests.iter().flatten() {
+                set(MID_ATTACH, matches!(entry.op, UnitOp::Attach { .. }));
+                set(LINE, matches!(entry.op, UnitOp::Redirection { .. }));
+            }
+            set(LINE, node.irqs.values().any(|i| i.removing));
+            set(
+                DETACHED,
+                node.iommus.values().any(|u| !u.detaching.is_empty()),
+            );
+        }
+    }
+    let word = m.sys.role(IOMMU_ROLE);
+    set(FAILED_UNIT, word.failed());
+    if word.state() == RoleState::Handing {
+        set(HANDING, true);
+        let dying = |n: u16| m.state(n) != MemberState::Live;
+        set(HAND_DEATH, dying(word.holder()) || dying(word.target()));
+    }
+    for granter in 0..NODES {
+        for (&grant, entry) in &table.grants[granter as usize] {
+            set(
+                UNANSWERED,
+                entry.state == GrantState::Live && !entry.answered,
+            );
+            if entry.state == GrantState::Revoking {
+                set(REVOKING, true);
+                set(CROSSING, releasing(table, granter, entry.grantee, grant));
+            }
+        }
+        for holder in 0..NODES {
+            let sent = waiting(table, holder, granter).any(|b| matches!(b, Body::Release { .. }));
+            set(RELEASE, sent);
+        }
+    }
+    for uses in &table.uses {
+        for u in uses.values() {
+            set(RELEASE, u.release_pending);
+            set(RELEASE_PENDING, u.release_pending);
+            set(SIGNAL_PENDING, u.signal_pending);
+        }
+    }
+    let given = |&w: &u64| {
+        Ownership::from_raw(w)
+            .is_some_and(|o| o.state() == OwnState::Free && matches!(o.owner(), Owner::Node(_)))
+    };
+    set(GIVEN, table.owners.iter().any(given));
+    set(
+        SPLIT,
+        table.devices.iter().filter(|e| e.is_used()).count() > splittable,
+    );
+    for &raw in table.attach.values() {
+        match AttachWord::from_raw(raw).and_then(AttachWord::state) {
+            Some(AttachState::Attached) => set(ATTACHED, true),
+            Some(AttachState::Detached) => set(DETACHED, true),
+            Some(AttachState::Pinned) => set(MID_ATTACH, true),
+            None => {}
+        }
+    }
+    at
+}
+
+/// The seeds that reach each combination, summed over the seeds.
+struct Reach {
+    /// The seeds that reached gaps 18, 19 and 20.
+    gaps: [usize; 3],
+    pairs: Vec<Vec<usize>>,
+    resume: Vec<Vec<usize>>,
+    death: Vec<Vec<usize>>,
+    events: Vec<usize>,
+}
+
+/// What one seed reached.
+#[derive(Default)]
+struct Seen {
+    pairs: BTreeSet<(usize, usize)>,
+    resume: BTreeSet<(usize, usize)>,
+    death: BTreeSet<(usize, usize)>,
+    events: BTreeSet<usize>,
+}
+
+/// The death of a node, around which the triples are counted: any
+/// accusation. Its two others are among the events that are not an
+/// accusation's evidence or outcome.
+const DEATH_OTHERS: std::ops::Range<usize> = SEALED..EVENTS;
+const DEATHS: [usize; 6] = [KILLED, SELF, STALE, STUCK, RETIRED, SEAL_LATE];
+
+impl Seen {
+    fn note(&mut self, mask: u32) {
+        let on: Vec<usize> = (0..EVENTS).filter(|&e| mask & 1 << e != 0).collect();
+        for (i, &a) in on.iter().enumerate() {
+            self.events.insert(a);
+            for &b in &on[i + 1..] {
+                self.pairs.insert((a, b));
+            }
+        }
+        if mask & 1 << RESUME != 0 {
+            let others: Vec<usize> = on.iter().copied().filter(|&e| e != RESUME).collect();
+            for (i, &a) in others.iter().enumerate() {
+                for &b in &others[i + 1..] {
+                    self.resume.insert((a, b));
+                }
+            }
+        }
+        if DEATHS.iter().any(|&d| mask & 1 << d != 0) {
+            let others: Vec<usize> = on
+                .iter()
+                .copied()
+                .filter(|e| DEATH_OTHERS.contains(e))
+                .collect();
+            for (i, &a) in others.iter().enumerate() {
+                for &b in &others[i + 1..] {
+                    self.death.insert((a, b));
+                }
+            }
+        }
+    }
+}
+
+impl Reach {
+    fn new() -> Self {
+        let square = || vec![vec![0; EVENTS]; EVENTS];
+        Self {
+            gaps: [0; 3],
+            pairs: square(),
+            resume: square(),
+            death: square(),
+            events: vec![0; EVENTS],
+        }
+    }
+
+    fn add(&mut self, seen: &Seen) {
+        for &(a, b) in &seen.pairs {
+            self.pairs[a][b] += 1;
+        }
+        for &(a, b) in &seen.resume {
+            self.resume[a][b] += 1;
+        }
+        for &(a, b) in &seen.death {
+            self.death[a][b] += 1;
+        }
+        for &e in &seen.events {
+            self.events[e] += 1;
+        }
+    }
+}
+
+/// What steers a seed toward a rare state. Each seed takes three, every
+/// triple of them in turn (`drivers`), beside the random actions of every
+/// part of the machine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Driver {
+    Kill,
+    Fail,
+    Stale,
+    Stuck,
+    Retire,
+    /// A node sealed and left past `SEAL_NS`, which nobody resumes.
+    SealLate,
+    /// The bootstrap core hangs where no stop reaches it.
+    Unfence,
+    /// A node sealed and resumed, again and again.
+    Resume,
+    /// A node killed and started afresh.
+    Fresh,
+    FailUnit,
+    /// The IOMMU role handed, and its holder or target killed meanwhile.
+    HandDeath,
+    /// The 32 frames of the second pair released at once.
+    ReleasePending,
+    /// The user ring to a granting node flooded with signals.
+    SignalPending,
+}
+
+const DRIVERS: [Driver; 13] = [
+    Driver::Kill,
+    Driver::Fail,
+    Driver::Stale,
+    Driver::Stuck,
+    Driver::Retire,
+    Driver::SealLate,
+    Driver::Unfence,
+    Driver::Resume,
+    Driver::Fresh,
+    Driver::FailUnit,
+    Driver::HandDeath,
+    Driver::ReleasePending,
+    Driver::SignalPending,
+];
+
+/// The drivers of a seed: the triples of `DRIVERS` in turn.
+fn drivers(seed: u64) -> [Driver; 3] {
+    let n = DRIVERS.len();
+    let triples: Vec<[Driver; 3]> = (0..n)
+        .flat_map(|a| (a + 1..n).flat_map(move |b| (b + 1..n).map(move |c| [a, b, c])))
+        .map(|[a, b, c]| [DRIVERS[a], DRIVERS[b], DRIVERS[c]])
+        .collect();
+    triples[seed as usize % triples.len()]
+}
+
+/// The exploration of one seed.
+struct Run {
+    m: S,
+    rng: Rng,
+    seen: Seen,
+    drivers: [Driver; 3],
+    /// The used entries of the device table at start.
+    splittable: usize,
+    /// The nodes harmed, with the generation harmed: killed, failed, a
+    /// core hung, a core retired, a thread suspended.
+    harmed: BTreeSet<(u16, u32)>,
+    /// The nodes sealed, with the generation, until they are live again.
+    sealed: BTreeSet<(u16, u32)>,
+    /// The receiving thread of each holder.
+    receivers: Vec<Option<ObjId>>,
+    /// The drivers done once: the unit broken, the bootstrap core hung, a
+    /// node sealed past `SEAL_NS`.
+    once: BTreeSet<usize>,
+    /// The gaps the run reached: 18 (its end), 19 and 20.
+    gaps: [bool; 3],
+    /// The node sealed past `SEAL_NS`, which nobody resumes, and the
+    /// granting node a driver keeps sealed until it acts again.
+    late: Option<u16>,
+    kept: Option<u16>,
+    /// The member words last printed by a replay.
+    members: Vec<Member>,
+    /// The member words at the last step.
+    last: Vec<Member>,
+}
+
+impl Run {
+    fn new(seed: u64) -> Self {
+        let cores: Vec<Vec<usize>> = (0..NODES as usize).map(|c| vec![c]).collect();
+        let layout: Vec<&[usize]> = cores.iter().map(Vec::as_slice).collect();
+        // The times of membership at the low end of their ranges, so that a
+        // seal outlives `SEAL_NS` and a silent core is found stale within
+        // the steps of a seed (Numbers: `SWEEP_NS` from 100 ms, `SEAL_NS`
+        // and `STALE_NS` from 10 ms; `STUCK_NS` above the reserve's period
+        // and `CORE_ANSWER_NS`).
+        let mut machine = machine(Arch::X86_64, NODES as usize, &layout);
+        machine.membership.sweep_ms = 100;
+        machine.membership.seal_ms = 30;
+        machine.membership.stale_ms = 40;
+        machine.membership.stuck_ms = 40;
+        let m = S::on(&machine);
+        let splittable = m
+            .sys
+            .canonical()
+            .devices
+            .iter()
+            .filter(|e| e.is_used())
+            .count();
+        let mut run = Self {
+            m,
+            rng: Rng(seed + 701),
+            seen: Seen::default(),
+            drivers: drivers(seed),
+            splittable,
+            harmed: BTreeSet::new(),
+            sealed: BTreeSet::new(),
+            receivers: vec![None; NODES as usize],
+            once: BTreeSet::new(),
+            gaps: [false; 3],
+            late: None,
+            kept: None,
+            members: Vec::new(),
+            last: Vec::new(),
+        };
+        say(format_args!("drivers {:?}", run.drivers));
+        run.set_up();
+        run
+    }
+
+    fn note(&mut self) {
+        if replayed().is_some() {
+            self.print_members();
+        }
+        // CONTRACT-GAP 19: a starting node accused with evidence stuck is
+        // counted, not judged.
+        for n in 0..NODES {
+            let member = self.m.sys.member(n);
+            let was = self.last.get(n as usize).map(|m| m.state());
+            if was == Some(MemberState::Starting)
+                && accused(member.state())
+                && member.evidence() == Evidence::Stuck
+            {
+                self.gaps[1] = true;
+                self.harmed.insert((n, member.generation()));
+            }
+        }
+        self.last = (0..NODES).map(|n| self.m.sys.member(n)).collect();
+        let mask = probe(&self.m, self.splittable);
+        self.seen.note(mask);
+        // A sealed node that is live again is no longer harmed.
+        for n in 0..NODES {
+            if self.m.state(n) == MemberState::Live {
+                let g = self.m.sys.member(n).generation();
+                self.sealed.remove(&(n, g));
+            }
+        }
+    }
+
+    /// A replay prints every change of a member word, and for a new
+    /// accusation the observations its driver held of the node.
+    fn print_members(&mut self) {
+        let members: Vec<Member> = (0..NODES).map(|n| self.m.sys.member(n)).collect();
+        if members == self.members {
+            return;
+        }
+        let table = self.m.sys.canonical();
+        for (n, member) in members.iter().enumerate() {
+            let was = self.members.get(n).map(|m| accused(m.state()));
+            if accused(member.state()) && was == Some(false) {
+                let beacons = table.beacons.get(usize::from(member.driver()));
+                let held =
+                    beacons.map(|b| b.observations.iter().filter(|o| usize::from(o.node) == n));
+                let observations: Vec<_> = held.into_iter().flatten().collect();
+                eprintln!(
+                    "  node {n} accused by {}: {observations:?}",
+                    member.driver()
+                );
+            }
+        }
+        eprintln!("{} members {members:?}", self.m.sys.now());
+        self.members = members;
+    }
+
+    fn call(&mut self, node: u16, call: Syscall) -> Option<Outcome> {
+        let outcome = try_call(&mut self.m, node, call);
+        self.note();
+        outcome
+    }
+
+    fn set_up(&mut self) {
+        let m = &mut self.m;
+        for (node, device) in DEVICES {
+            let iospace = m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
+            m.ok(node, iospace);
+            let call = attach_call(m, node, device, true);
+            if m.call(node, call) == WAITS {
+                m.run(30 * MS);
+            }
+        }
+        for pair in PAIRS {
+            let reply = m.retype(pair.holder, ObjectKind::Reply, 0, REPLY);
+            m.ok(pair.holder, reply);
+            for i in 0..pair.frames {
+                let frame = m.retype(pair.granter, ObjectKind::Frame, 1, pair.obj + i);
+                m.ok(pair.granter, frame);
+            }
+            let bell = m.retype(pair.granter, ObjectKind::Notify, 0, BELL);
+            m.ok(pair.granter, bell);
+            let holder = pair.holder;
+            m.ok(holder, super::place_first(holder, u64::from(holder)));
+            let receiver = m.thread_on(holder, RECEIVER, u64::from(holder));
+            self.receivers[holder as usize] = Some(receiver);
+        }
+        for pair in PAIRS {
+            for group in 0..pair.frames.div_ceil(4) {
+                self.grant(pair, group);
+                self.m.settle();
+            }
+        }
+        for pair in PAIRS {
+            let map = map_call(&self.m, pair);
+            let _ = self.call(pair.holder, map);
+        }
+    }
+
+    /// The holder's receiver waits for up to four frames from `group`, and
+    /// the granting node sends them, with its doorbell.
+    fn grant(&mut self, pair: Pair, group: u32) {
+        if self.receive(pair, group) {
+            self.send(pair, group);
+        }
+    }
+
+    /// The frames of a group: the first and how many.
+    fn group(pair: Pair, group: u32) -> (u32, u32) {
+        let first = 4 * group;
+        (first, (pair.frames - first).min(4))
+    }
+
+    /// The holder's receiver waits for the frames of `group` in their
+    /// slots, if it can and they are empty; whether it waits.
+    fn receive(&mut self, pair: Pair, group: u32) -> bool {
+        let holder = pair.holder;
+        let Some(receiver) = self.receivers[holder as usize] else {
+            return false;
+        };
+        let (first, count) = Self::group(pair, group);
+        let m = &self.m;
+        let t = m.t[holder as usize];
+        let ready = m.sys.has(holder)
+            && m.state(holder) == MemberState::Live
+            && m.sys.node(holder).threads.contains_key(&receiver)
+            && m.sys.node(holder).runnable().contains(&receiver)
+            && !m
+                .sys
+                .node(holder)
+                .is_silent(m.sys.node(holder).core_of(receiver))
+            && (first..first + count)
+                .all(|i| m.sys.node(holder).object_at(t, s(pair.got + i)).is_none());
+        if !ready {
+            return false;
+        }
+        let recv = Syscall::Recv {
+            endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+            reply: s(REPLY),
+            range: Range {
+                first: s(pair.got + first),
+                count,
+            },
+            wait: 0,
+        };
+        say(format_args!("{} node {holder}: receive", self.m.sys.now()));
+        let _ = self.m.call_by(holder, receiver, recv);
+        self.note();
+        true
+    }
+
+    /// The granting node sends the frames of `group`, with its doorbell.
+    fn send(&mut self, pair: Pair, group: u32) {
+        let (first, count) = Self::group(pair, group);
+        let rights = Rights::READ.union(Rights::WRITE).union(Rights::SEND).bits();
+        let send = Syscall::NodeSend {
+            node: node_cap(pair.holder),
+            message: Message {
+                caps: (first..first + count)
+                    .map(|i| Transfer::Derive(s(pair.obj + i), rights))
+                    .collect(),
+                ..Message::default()
+            },
+            doorbell: s(BELL),
+        };
+        let _ = self.call(pair.granter, send);
+    }
+
+    /// The granting node a driver kept sealed is resumed.
+    fn release_kept(&mut self) {
+        if let Some(node) = self.kept.take()
+            && self.m.state(node) == MemberState::Sealed
+            && let Some(actor) = self.live_other(node)
+        {
+            let _ = self.call(actor, resume(node));
+        }
+    }
+
+    /// The frames of a group released by the holder, then granted again.
+    fn regrant(&mut self, pair: Pair, group: u32) {
+        let (first, count) = Self::group(pair, group);
+        for i in first..first + count {
+            let _ = self.call(pair.holder, Syscall::CapDelete(s(pair.got + i)));
+        }
+        self.grant(pair, group);
+    }
+
+    /// Every frame of a pair the holder does not hold granted again, one
+    /// message of four at a time, each delivered before the next.
+    fn grant_all(&mut self, pair: Pair) {
+        let holds = |run: &Self, i: u32| {
+            run.m.sys.has(pair.holder)
+                && run
+                    .m
+                    .sys
+                    .node(pair.holder)
+                    .object_at(run.m.t[pair.holder as usize], s(pair.got + i))
+                    .is_some()
+        };
+        for group in 0..pair.frames.div_ceil(4) {
+            if holds(self, 4 * group) {
+                continue;
+            }
+            self.grant(pair, group);
+            for _ in 0..8 {
+                if holds(self, 4 * group) {
+                    break;
+                }
+                self.churn();
+            }
+        }
+    }
+
+    /// Events at the current instant, each followed by the check and the
+    /// probe, then time moves by up to 3 ms.
+    fn churn(&mut self) {
+        for _ in 0..self.rng.below(12) {
+            let events = self.m.sys.events();
+            if events.is_empty() || self.m.sys.stopped {
+                break;
+            }
+            let event = events[self.rng.below(events.len())];
+            say(format_args!("{} event {event:?}", self.m.sys.now()));
+            self.m.sys.fire(event);
+            assert_eq!(self.m.sys.check(), Ok(()), "after {event:?}");
+            self.note();
+        }
+        if self.rng.below(2) == 0 {
+            let ns = 1 + self.rng.below(3_000_000) as u64;
+            self.run(ns);
+        }
+    }
+
+    /// Time passes `ns`, checked and probed every `step`.
+    fn run_by(&mut self, ns: u64, step: u64) {
+        say(format_args!("{} run {ns}", self.m.sys.now()));
+        let to = self.m.sys.now() + ns;
+        while self.m.sys.now() < to && !self.m.sys.stopped {
+            let at = (self.m.sys.now() + step).min(to);
+            self.m.sys.advance(at);
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.note();
+        }
+    }
+
+    /// Time passes `ns`, checked and probed every 100 µs.
+    fn run(&mut self, ns: u64) {
+        self.run_by(ns, 100_000);
+    }
+
+    /// Whether a node is live and unharmed in its generation.
+    fn healthy(&self, n: u16) -> bool {
+        let member = self.m.sys.member(n);
+        member.state() == MemberState::Live && !self.harmed.contains(&(n, member.generation()))
+    }
+
+    /// A node in `state`, chosen by the generator.
+    fn any_in(&mut self, state: MemberState) -> Option<u16> {
+        let nodes: Vec<u16> = (0..NODES).filter(|&n| self.m.state(n) == state).collect();
+        (!nodes.is_empty()).then(|| nodes[self.rng.below(nodes.len())])
+    }
+
+    /// A healthy node other than `not`, chosen by the generator.
+    fn live_other(&mut self, not: u16) -> Option<u16> {
+        let live: Vec<u16> = (0..NODES)
+            .filter(|&n| n != not && self.healthy(n))
+            .collect();
+        (!live.is_empty()).then(|| live[self.rng.below(live.len())])
+    }
+
+    /// Whether one more node may be harmed: at most three of the five are
+    /// harmed or not live at once, so that two healthy nodes are left to
+    /// recover them.
+    fn may_harm(&self) -> bool {
+        (0..NODES).filter(|&n| !self.healthy(n)).count() < 3
+    }
+
+    /// A healthy node to harm and a healthy node to act on it.
+    fn victim(&mut self) -> Option<(u16, u16)> {
+        if !self.may_harm() {
+            return None;
+        }
+        let healthy: Vec<u16> = (0..NODES).filter(|&n| self.healthy(n)).collect();
+        let victim = healthy[self.rng.below(healthy.len())];
+        let actor = self.live_other(victim)?;
+        Some((victim, actor))
+    }
+
+    fn harmed_now(&mut self, node: u16) {
+        let g = self.m.sys.member(node).generation();
+        self.harmed.insert((node, g));
+    }
+
+    fn kill(&mut self) {
+        if let Some((victim, actor)) = self.victim() {
+            self.harmed_now(victim);
+            let _ = self.call(actor, kill(victim));
+        }
+    }
+
+    fn fail(&mut self) {
+        if let Some((victim, _)) = self.victim() {
+            say(format_args!("{} node {victim} fails", self.m.sys.now()));
+            self.harmed_now(victim);
+            self.m.sys.fail(victim, 0);
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.note();
+        }
+    }
+
+    /// A core hangs; `nmi` whether its kernel can still run the fence's
+    /// handler (on the bootstrap core, without it, no stop reaches it).
+    fn hang(&mut self, victim: u16, nmi: bool) {
+        let core = victim as usize;
+        say(format_args!(
+            "{} hang core {core} nmi {nmi}",
+            self.m.sys.now()
+        ));
+        self.harmed_now(victim);
+        self.m.sys.hang(core, nmi);
+        assert_eq!(self.m.sys.check(), Ok(()));
+        self.note();
+    }
+
+    /// Stuck: the node's first thread suspends itself, so that its core
+    /// is idle once its other threads wait; the core hangs, and a message
+    /// waits in its ring.
+    fn stuck(&mut self) {
+        let Some((victim, actor)) = self.victim() else {
+            return;
+        };
+        self.harmed_now(victim);
+        let suspend = Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD));
+        let _ = self.call(victim, suspend);
+        if self.m.state(victim) == MemberState::Live
+            && self.m.sys.node(victim).runnable().is_empty()
+        {
+            self.hang(victim, false);
+            let send = Syscall::NodeSend {
+                node: node_cap(victim),
+                message: Message::default(),
+                doorbell: SlotAddr::NONE,
+            };
+            let _ = self.call(actor, send);
+        }
+    }
+
+    fn retire(&mut self) {
+        if let Some((victim, actor)) = self.victim() {
+            self.harmed_now(victim);
+            let retire = Syscall::NodeStop {
+                node: node_cap(victim),
+                mode: NODE_STOP_RETIRE,
+                core: u64::from(victim),
+            };
+            let _ = self.call(actor, retire);
+        }
+    }
+
+    fn seal(&mut self) -> Option<u16> {
+        let (victim, _) = self.victim()?;
+        self.seal_node(victim)
+    }
+
+    /// `node` sealed by a healthy node, if it is healthy and one more node
+    /// may be harmed.
+    fn seal_node(&mut self, victim: u16) -> Option<u16> {
+        if !self.healthy(victim) || !self.may_harm() {
+            return None;
+        }
+        let actor = self.live_other(victim)?;
+        let g = self.m.sys.member(victim).generation();
+        (self.call(actor, seal(victim)) == Some(DONE)).then(|| {
+            self.sealed.insert((victim, g));
+            victim
+        })
+    }
+
+    /// A sealed node resumed, or a dead one started afresh, by a live
+    /// node.
+    fn recover(&mut self, state: MemberState) {
+        let (late, kept) = (self.late, self.kept);
+        let protected = move |n: u16| Some(n) == late || Some(n) == kept;
+        let Some(target) = self.any_in(state).filter(|&n| !protected(n)) else {
+            return;
+        };
+        let Some(actor) = self.live_other(target) else {
+            return;
+        };
+        match state {
+            MemberState::Sealed => {
+                let _ = self.call(actor, resume(target));
+            }
+            _ => {
+                // The wake of the start lost once, so that the start lasts
+                // a retry (`START_RETRY_NS`).
+                if matches!(self.m.sys.hardware(target as usize), Hardware::Stub { .. }) {
+                    self.m.sys.set_window(target as usize);
+                }
+                if self.call(actor, fresh(target, 1 << target)) == Some(DONE) {
+                    self.receivers[target as usize] = None;
+                    // A grant between two other nodes during the start.
+                    let pair = PAIRS[self.rng.below(PAIRS.len())];
+                    self.regrant(pair, 0);
+                }
+            }
+        }
+    }
+
+    fn drive(&mut self, driver: Driver) {
+        let first = |run: &mut Self| run.once.insert(driver as usize);
+        match driver {
+            Driver::Kill => self.kill(),
+            Driver::Fail => self.fail(),
+            Driver::Stale => {
+                if let Some((victim, _)) = self.victim() {
+                    self.hang(victim, true);
+                }
+            }
+            Driver::Stuck => self.stuck(),
+            Driver::Retire => self.retire(),
+            // Sealed, then time passes until the node is accused with
+            // evidence seal (within `SEAL_NS` + `SWEEP_NS`).
+            Driver::SealLate => {
+                if first(self)
+                    && let Some(node) = self.seal()
+                {
+                    self.late = Some(node);
+                    let table = self.m.sys.canonical();
+                    let end = self.m.sys.now() + table.seal_ns + table.sweep_ns;
+                    while self.m.sys.now() < end && !accused(self.m.state(node)) {
+                        self.run_by(5 * MS, 5 * MS);
+                    }
+                }
+            }
+            Driver::Unfence => {
+                if self.healthy(0) && self.may_harm() && first(self) {
+                    self.hang(0, false);
+                }
+            }
+            // A holder sealed over what it holds, its granting node killed
+            // one time in two meanwhile, then resumed: the resume's R2 has
+            // remote capabilities to remove (Grants, "Generations").
+            // One time in two the holder first releases its first frames
+            // and waits for them again, and the granting node sends them
+            // just before the seal: the grant is unanswered through the
+            // seal and the resume.
+            Driver::Resume => match self.any_in(MemberState::Sealed) {
+                Some(_) => self.recover(MemberState::Sealed),
+                None => {
+                    let pair = PAIRS[self.rng.below(PAIRS.len())];
+                    // Sent while the holder is live, and sealed before it
+                    // serves its user ring.
+                    if self.rng.below(2) == 0 {
+                        self.regrant(pair, 0);
+                    }
+                    let sealed = self.seal_node(pair.holder).is_some();
+                    let resume_now = self.rng.below(2) == 0;
+                    if sealed
+                        && self.rng.below(2) == 0
+                        && self.healthy(pair.granter)
+                        && self.may_harm()
+                        && let Some(actor) = self.live_other(pair.granter)
+                    {
+                        self.harmed_now(pair.granter);
+                        let _ = self.call(actor, kill(pair.granter));
+                    }
+                    // One time in two resumed as soon as it is sealed.
+                    if sealed && resume_now {
+                        let holder = pair.holder;
+                        for _ in 0..10 {
+                            if self.m.state(holder) == MemberState::Sealed {
+                                break;
+                            }
+                            self.churn();
+                        }
+                        self.recover(MemberState::Sealed);
+                    }
+                }
+            },
+            Driver::Fresh => match self.any_in(MemberState::Dead) {
+                Some(_) => self.recover(MemberState::Dead),
+                None => self.kill(),
+            },
+            Driver::FailUnit => {
+                if first(self) {
+                    say(format_args!("{} unit fails", self.m.sys.now()));
+                    self.m.sys.break_unit(IOMMU_ROLE);
+                    self.note();
+                }
+            }
+            // Handed, and once the word reads handing, its holder or its
+            // target killed.
+            Driver::HandDeath => {
+                if self.hand() {
+                    let handing = |m: &S| m.sys.role(IOMMU_ROLE).state() != RoleState::Held;
+                    for _ in 0..20 {
+                        if handing(&self.m) {
+                            break;
+                        }
+                        self.churn();
+                    }
+                }
+                let word = self.m.sys.role(IOMMU_ROLE);
+                if word.state() == RoleState::Handing {
+                    let victim = match self.rng.below(2) {
+                        0 => word.holder(),
+                        _ => word.target(),
+                    };
+                    if victim < NODES
+                        && self.may_harm()
+                        && self.healthy(victim)
+                        && let Some(actor) = self.live_other(victim)
+                    {
+                        self.harmed_now(victim);
+                        let _ = self.call(actor, kill(victim));
+                    }
+                }
+            }
+            Driver::ReleasePending => {
+                let pair = PAIRS[1];
+                let held = |run: &Self| {
+                    let node = run
+                        .m
+                        .sys
+                        .has(pair.holder)
+                        .then(|| run.m.sys.node(pair.holder));
+                    let t = run.m.t[pair.holder as usize];
+                    (0..pair.frames)
+                        .filter(|&i| {
+                            node.is_some_and(|n| n.object_at(t, s(pair.got + i)).is_some())
+                        })
+                        .count() as u32
+                };
+                self.release_kept();
+                if held(self) == pair.frames {
+                    // The granting node sealed one time in two, and kept
+                    // so, so that the ring stays full and the release
+                    // pending.
+                    if self.rng.below(2) == 0 && self.seal_node(pair.granter).is_some() {
+                        self.kept = Some(pair.granter);
+                    }
+                    for i in 0..pair.frames {
+                        let _ = self.call(pair.holder, Syscall::CapDelete(s(pair.got + i)));
+                    }
+                } else {
+                    self.grant_all(pair);
+                }
+            }
+            Driver::SignalPending => {
+                let pair = PAIRS[self.rng.below(PAIRS.len())];
+                self.release_kept();
+                self.grant_all(pair);
+                if self.rng.below(2) == 0 && self.seal_node(pair.granter).is_some() {
+                    self.kept = Some(pair.granter);
+                }
+                for _ in 0..70 {
+                    let signal = Syscall::GrantSignal(s(pair.got));
+                    if self.call(pair.holder, signal) != Some(DONE) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One action of a grant: a map, an unmap, a release, a revocation,
+    /// the two at once, a new grant, or a signal.
+    fn grants(&mut self) {
+        let pair = PAIRS[self.rng.below(PAIRS.len())];
+        let i = self.rng.below(pair.frames as usize) as u32;
+        let (granter, holder) = (pair.granter, pair.holder);
+        match self.rng.below(7) {
+            0 if self.m.sys.has(holder) => {
+                let map = map_call(&self.m, pair);
+                let _ = self.call(holder, map);
+            }
+            1 => {
+                let unmap = match pair.io {
+                    true => Syscall::IoSpaceUnmap(s(pair.got)),
+                    false => Syscall::ASpaceUnmap(s(pair.got)),
+                };
+                let _ = self.call(holder, unmap);
+            }
+            2 => {
+                let _ = self.call(holder, Syscall::CapDelete(s(pair.got + i)));
+            }
+            3 => {
+                let _ = self.call(granter, Syscall::CapRevoke(s(pair.obj + i)));
+            }
+            // The first frame mapped, then its revocation and its release
+            // at once: a revocation of a frame the holder counts no leaf
+            // under frees the grant with no `Revoke`.
+            4 if self.m.sys.has(holder) => {
+                let map = map_call(&self.m, pair);
+                let _ = self.call(holder, map);
+                let _ = self.call(granter, Syscall::CapRevoke(s(pair.obj)));
+                let _ = self.call(holder, Syscall::CapDelete(s(pair.got)));
+            }
+            5 => self.regrant(pair, i / 4),
+            _ => {
+                let _ = self.call(holder, Syscall::GrantSignal(s(pair.got + i)));
+            }
+        }
+    }
+
+    /// A device attached or detached by its node.
+    fn devices(&mut self) {
+        let (node, device) = DEVICES[self.rng.below(DEVICES.len())];
+        if !self.m.sys.has(node) {
+            return;
+        }
+        let attach = self.rng.below(2) == 0;
+        let t = self.m.t[node as usize];
+        if self.m.sys.node(node).object_at(t, s(IOSPACE)).is_none() {
+            let iospace = self.m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
+            let _ = self.call(node, iospace);
+            return;
+        }
+        let call = attach_call(&self.m, node, device, attach);
+        let _ = self.call(node, call);
+    }
+
+    /// The line claimed by one of its two nodes, or removed.
+    fn line(&mut self) {
+        let node = LINERS[self.rng.below(LINERS.len())];
+        if !self.m.sys.has(node) {
+            return;
+        }
+        let t = self.m.t[node as usize];
+        let call = match self.m.sys.node(node).object_at(t, s(IRQ)) {
+            Some(_) => Syscall::CapDelete(s(IRQ)),
+            None => Syscall::IrqClaim {
+                control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                source: IrqSource::line(GSI, false, false).raw(),
+                core: u64::from(node),
+                vector: 48,
+                destination: s(IRQ),
+            },
+        };
+        let _ = self.call(node, call);
+    }
+
+    /// The IOMMU role handed by its holder to another node; whether it was
+    /// asked.
+    fn hand(&mut self) -> bool {
+        let word = self.m.sys.role(IOMMU_ROLE);
+        let holder = word.holder();
+        if word.state() != RoleState::Held || holder >= NODES || !self.m.sys.has(holder) {
+            return false;
+        }
+        let Some(target) = self.live_other(holder) else {
+            return false;
+        };
+        let t = self.m.t[holder as usize];
+        let roles = slots_of(self.m.sys.node(holder), t, ObjectKind::Role);
+        let hand = Syscall::RoleHand {
+            role: s(roles[IOMMU_ROLE]),
+            node: node_cap(target),
+        };
+        self.call(holder, hand).is_some()
+    }
+
+    /// A chunk taken and given between nodes 1 and 3, or a device entry
+    /// taken and split by one of them.
+    fn memory(&mut self) {
+        let node = LINERS[self.rng.below(LINERS.len())];
+        if !self.m.sys.has(node) {
+            return;
+        }
+        let other = LINERS.iter().copied().find(|&n| n != node).expect("two");
+        let control = s(dodos_abi::START_SLOT_MEMORY_CONTROL);
+        let table = self.m.sys.canonical();
+        if self.rng.below(4) == 0 {
+            let page = table.geometry.page().trailing_zeros();
+            let free = |e: &&dodos_abi::DeviceEntry| e.owner.state() == OwnState::Free;
+            let Some(index) = table
+                .devices
+                .iter()
+                .position(|e| e.is_used() && e.log2() > page && free(&e))
+            else {
+                return;
+            };
+            if self.call(node, super::pass22::take(1, index as u64, 0, ENTRY)) == Some(DONE) {
+                let split = Syscall::MemorySplit {
+                    control,
+                    untyped: s(ENTRY),
+                };
+                let _ = self.call(node, split);
+            }
+            return;
+        }
+        let t = self.m.t[node as usize];
+        if self.m.sys.node(node).object_at(t, s(BLOCK)).is_some() {
+            let give = Syscall::MemoryGive {
+                control,
+                untyped: s(BLOCK),
+                node: u64::from(other),
+            };
+            let _ = self.call(node, give);
+            return;
+        }
+        let shift = table.geometry.chunk_shift();
+        let mine = Ownership::free(Owner::Node(node)).raw();
+        let free = Ownership::free(Owner::Unclaimed).raw();
+        let chunk = table
+            .owners
+            .iter()
+            .position(|&w| w == mine)
+            .or_else(|| table.owners.iter().position(|&w| w == free));
+        if let Some(chunk) = chunk {
+            let take = super::pass22::take(0, (chunk as u64) << shift, u64::from(shift), BLOCK);
+            let _ = self.call(node, take);
+        }
+    }
+
+    /// One step: a driver one time in three, an action of the machine's
+    /// other parts, then events and time.
+    fn step(&mut self) {
+        // A node started afresh has a new first thread once it runs.
+        refresh(&mut self.m);
+        if self.rng.below(3) == 0 {
+            let driver = self.drivers[self.rng.below(3)];
+            self.drive(driver);
+        }
+        match self.rng.below(10) {
+            0..=3 => self.grants(),
+            4 => self.devices(),
+            5 => self.line(),
+            6 => {
+                let _ = self.hand();
+            }
+            7 => self.memory(),
+            8 => self.recover(MemberState::Sealed),
+            _ => self.recover(MemberState::Dead),
+        }
+        self.churn();
+    }
+
+    /// The machine runs until it is quiet; then no node is accused that was
+    /// not harmed, and no live node waits for another node, a unit or its
+    /// cores.
+    fn liveness(&mut self, seed: u64) {
+        for n in 0..NODES {
+            if self.m.state(n) == MemberState::Sealed
+                && let Some(actor) = self.live_other(n)
+            {
+                let _ = self.call(actor, resume(n));
+            }
+        }
+        let sweep = self.m.sys.canonical().sweep_ns;
+        self.run_by(sweep + 300 * MS, MS);
+        let skipped = |n: u16| self.m.sys.has(n) && !self.m.sys.node(n).skipped.is_empty();
+        let gap_20 = (0..NODES).any(skipped);
+        self.gaps[2] = gap_20;
+        for n in 0..NODES {
+            let member = self.m.sys.member(n);
+            let g = member.generation();
+            let harmed = self.harmed.contains(&(n, g)) || self.sealed.contains(&(n, g));
+            let down = accused(member.state()) || member.state() == MemberState::Dead;
+            assert!(
+                !down || harmed,
+                "seed {seed}: node {n} accused unharmed: {member:?}, hardware {:?}",
+                (0..NODES as usize)
+                    .map(|c| self.m.sys.hardware(c))
+                    .collect::<Vec<_>>(),
+            );
+            if member.state() == MemberState::Live && waits_bounded(&self.m, n) {
+                // CONTRACT-GAP 18: a request answered *elsewhere* by a
+                // hand-over that ended without step 4 stays queued; counted,
+                // not judged, until the contract settles it.
+                if gap_18(&self.m, n) {
+                    self.gaps[0] = true;
+                    continue;
+                }
+                // CONTRACT-GAP 20: a request a fresh start skipped is never
+                // answered, and a rebuild that sent it waits for ever.
+                if gap_20 {
+                    continue;
+                }
+                let node = self.m.sys.node(n);
+                let waits: Vec<_> = node.threads.values().map(|t| t.wait.clone()).collect();
+                panic!(
+                    "seed {seed}: a wait of node {n} never ended: {waits:?}, members {:?}, \
+                     role {:?}, requests {:?}, rebuilds {:?}, handing {:?}",
+                    (0..NODES).map(|n| self.m.sys.member(n)).collect::<Vec<_>>(),
+                    self.m.sys.role(IOMMU_ROLE),
+                    node.unit_requests.iter().flatten().collect::<Vec<_>>(),
+                    node.rebuilds,
+                    node.handing,
+                );
+            }
+        }
+    }
+}
+
+/// CONTRACT-GAP 18: a unit request of `node` answered *elsewhere* while
+/// the role word still reads held with the epoch it was sent with.
+fn gap_18(m: &S, node: u16) -> bool {
+    m.sys.node(node).unit_requests.iter().flatten().any(|e| {
+        let word = m.sys.role(e.role);
+        e.elsewhere && word.state() == RoleState::Held && word.epoch() == e.epoch
+    })
+}
+
+/// The attach of a node's device into its iospace, or its detach.
+fn attach_call(m: &S, node: u16, device: u64, attach: bool) -> Syscall {
+    let iommu = slots_of(m.sys.node(node), m.t[node as usize], ObjectKind::Iommu)[0];
+    Syscall::IoSpaceAttach {
+        iommu: s(iommu),
+        iospace: if attach { s(IOSPACE) } else { SlotAddr::NONE },
+        device,
+    }
+}
+
+/// The holder's map of the first frame it holds.
+fn map_call(m: &S, pair: Pair) -> Syscall {
+    let map = |space, untyped| crate::Map {
+        space,
+        frame: s(pair.got),
+        untyped,
+        address: 0x1000_0000,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    };
+    match pair.io {
+        true => {
+            let ut = untyped_slot(m.sys.node(pair.holder), m.t[pair.holder as usize]);
+            Syscall::IoSpaceMap(map(s(IOSPACE), s(ut)))
+        }
+        false => Syscall::ASpaceMap(map(s(dodos_abi::START_SLOT_ASPACE), SlotAddr::NONE)),
+    }
+}
+
+/// One seed explored: what it reached, and whether it ended in the state
+/// of gap 18.
+fn explore_one(seed: u64) -> (Seen, [bool; 3]) {
+    say(format_args!("seed {seed}"));
+    let explored = std::panic::catch_unwind(|| {
+        let mut run = Run::new(seed);
+        for _ in 0..STEPS {
+            run.step();
+        }
+        run.liveness(seed);
+        (run.seen, run.gaps)
+    });
+    explored.unwrap_or_else(|panic| {
+        eprintln!("seed {seed} fails; DODOS_SEED={seed} replays it");
+        std::panic::resume_unwind(panic)
+    })
+}
+
+/// The seeds, explored on every core of the machine that runs the tests
+/// (they are independent); the combinations reached. `DODOS_SEED`
+/// replays one instead.
+fn explore(seeds: Vec<u64>) -> Reach {
+    let seeds = match replayed() {
+        Some(seed) => vec![seed],
+        None => seeds,
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let runs: Vec<(Seen, [bool; 3])> = std::thread::scope(|scope| {
+        let seeds = &seeds;
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let mine = seeds.iter().skip(i).step_by(threads);
+                scope.spawn(move || mine.map(|&s| explore_one(s)).collect::<Vec<_>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    let mut reach = Reach::new();
+    for (seen, gaps) in &runs {
+        reach.add(seen);
+        for (count, &gap) in reach.gaps.iter_mut().zip(gaps) {
+            *count += usize::from(gap);
+        }
+    }
+    reach
+}
+
+/// The pairs no seed can reach, each with the sentences of the contract
+/// that exclude it; a triple that holds such a pair is excluded too.
+const IMPOSSIBLE: &[(usize, usize)] = &[
+    // A failed unit is never handed (Roles; IOMMU). It failed because a
+    // submission was not confirmed within `IOMMU_WAIT_NS`, and that
+    // submission stays in its queue; step 2 of a hand-over "waits until
+    // the unit's queue is drained ... (a unit that does not drain has
+    // failed)", so step 4, which writes handing, never comes, and
+    // `role_hand` returns `busy` "if the unit has failed". Nor does a unit
+    // fail while its word reads handing: the node that hands neither maps
+    // nor serves it from step 4, and the target serves nothing before it
+    // writes held at step 5, so nothing is submitted that could be
+    // overdue.
+    (FAILED_UNIT, HANDING),
+    (FAILED_UNIT, HAND_DEATH),
+];
+
+fn report(reach: &Reach) -> Vec<String> {
+    let mut missing = Vec::new();
+    let print = std::env::var("DODOS_COUNTS").is_ok();
+    let excluded = |a: usize, b: usize| IMPOSSIBLE.contains(&(a, b));
+    if print {
+        let [g18, g19, g20] = reach.gaps;
+        eprintln!("seeds that reach gap 18: {g18}, gap 19: {g19}, gap 20: {g20}");
+        for e in 0..EVENTS {
+            eprintln!("event {:>26}: {}", NAMES[e], reach.events[e]);
+        }
+    }
+    for (anchor, table, range) in [
+        ("pair", &reach.pairs, 0..EVENTS),
+        ("resume", &reach.resume, 0..EVENTS),
+        ("death", &reach.death, DEATH_OTHERS),
+    ] {
+        for a in range.clone() {
+            for b in a + 1..range.end {
+                if anchor == "resume" && (a == RESUME || b == RESUME) {
+                    continue;
+                }
+                let count = table[a][b];
+                if print {
+                    eprintln!("{anchor} + {} + {}: {count}", NAMES[a], NAMES[b]);
+                }
+                if count == 0 && !excluded(a, b) {
+                    missing.push(format!("{anchor} + {} + {}", NAMES[a], NAMES[b]));
+                }
+            }
+        }
+    }
+    missing
+}
+
+/// The run of `verify`: 26 seeds spread over the triples of drivers, so
+/// that each driver is among them; the check after every step and the
+/// liveness of each seed are asserted, and each event is reached.
+#[test]
+fn combined_recovery_states_between_nodes() {
+    if !super::explore::once() {
+        return;
+    }
+    let triples = 286;
+    let reach = explore((0..26).map(|i| i * triples / 26).collect());
+    let _ = report(&reach);
+    if replayed().is_none() {
+        for e in 0..EVENTS {
+            assert!(reach.events[e] > 0, "the seeds never reach {}", NAMES[e]);
+        }
+    }
+}
+
+/// The long run: three rounds of the 286 triples of drivers by default
+/// (`DODOS_COMBINATION_SEEDS` sets another number); every combination not
+/// shown impossible is reached by a seed.
+#[test]
+#[ignore = "long: run with --release; DODOS_COMBINATION_SEEDS"]
+fn every_combination_of_recovery_states_is_reached() {
+    let count = std::env::var("DODOS_COMBINATION_SEEDS")
+        .ok()
+        .map_or(858, |n| n.parse().expect("a number of seeds"));
+    let reach = explore((0..count).collect());
+    let missing = report(&reach);
+    if replayed().is_none() {
+        assert!(missing.is_empty(), "never reached: {missing:#?}");
+    }
+}

@@ -5,6 +5,7 @@
 //! alone (`Model`), and every step is followed by the whole check.
 
 mod checker;
+mod combinations;
 mod cores;
 mod crossing;
 mod explore;

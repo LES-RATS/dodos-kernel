@@ -661,6 +661,13 @@ impl Model {
                         return Some(Evidence::Stale);
                     }
                 }
+                // CONTRACT-GAP 19 (pass 25): a starting node consumes no
+                // ring before it is ready, and a start may take up to
+                // `START_NS`; the contract bounds evidence stale against a
+                // starting node by `START_NS` (D-137), not evidence stuck,
+                // so a message waiting in a ring to a node whose start
+                // lasts longer than `STUCK_NS` accuses it. Implemented as
+                // the row of evidence stuck reads.
                 Watched::Ring { user, consumed } => {
                     if self.ring_consumed(node, user) == consumed
                         && self.ring_watch(node).is_some()
