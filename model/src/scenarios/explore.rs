@@ -248,6 +248,137 @@ fn crossing_a_release_and_a_revoke_of_one_grant_in_every_order() {
     reached("a Release crossing a Revoke", crossings);
 }
 
+// D-142: a granted frame mapped in an iospace whose unit fails, at any
+// point of a map, an unmap, a removal by the holder, a revocation and the
+// granting node's death.
+
+/// Whether the holder (node 2) counts a leaf under a grant of node 0 while
+/// the IOMMU unit has failed: the state D-142 is about.
+fn failed_under_a_remote_frame(m: &S) -> bool {
+    let failed = m.sys.role(super::units::IOMMU_ROLE).failed();
+    failed
+        && m.sys.canonical().uses[2]
+            .values()
+            .any(|u| u.granter == 0 && u.leaves > 0)
+}
+
+#[test]
+fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
+    if !once() {
+        return;
+    }
+    let (mut reached_failed, mut pinned) = (0, 0);
+    for seed in seeds(SEEDS) {
+        say(format_args!("seed {seed}"));
+        let mut rng = Rng(seed + 401);
+        // Node 1 holds the unit's role; node 2 holds the grant and maps it
+        // into an iospace with a device behind the unit.
+        let mut m = super::units::three();
+        super::units::attached(&mut m, 2);
+        let reply = m.retype(2, ObjectKind::Reply, 0, 100);
+        m.ok(2, reply);
+        let frame = m.retype(0, ObjectKind::Frame, 1, 101);
+        m.ok(0, frame);
+        let recv = Syscall::Recv {
+            endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+            reply: s(100),
+            range: crate::Range {
+                first: s(110),
+                count: 1,
+            },
+            wait: 0,
+        };
+        assert_eq!(m.call(2, recv), WAITS);
+        let send = Syscall::NodeSend {
+            node: node_cap(2),
+            message: crate::Message {
+                caps: vec![crate::Transfer::Derive(s(101), Rights::READ.bits())],
+                ..crate::Message::default()
+            },
+            doorbell: SlotAddr::NONE,
+        };
+        assert_eq!(m.call(0, send), WAITS);
+        m.settle();
+        let ut = untyped_slot(m.sys.node(2), m.t[2]);
+        let map = Syscall::IoSpaceMap(crate::Map {
+            space: s(super::units::IOSPACE),
+            frame: s(110),
+            untyped: s(ut),
+            address: 0x1000_0000,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        });
+        // Steered: mapped first, so that most seeds fail the unit under a
+        // leaf.
+        let _ = try_call(&mut m, 2, map.clone());
+        let (mut broken, mut killed, mut seen) = (false, false, false);
+        for _ in 0..40 {
+            match rng.below(9) {
+                0 => {
+                    let _ = try_call(&mut m, 2, map.clone());
+                }
+                1 => {
+                    let _ = try_call(&mut m, 2, Syscall::IoSpaceUnmap(s(110)));
+                }
+                2 => {
+                    let _ = try_call(&mut m, 2, Syscall::CapDelete(s(110)));
+                }
+                3 => {
+                    let _ = try_call(&mut m, 0, Syscall::CapRevoke(s(101)));
+                }
+                4 if !broken => {
+                    say(format_args!("{} unit fails", m.sys.now()));
+                    m.sys.break_unit(super::units::IOMMU_ROLE);
+                    broken = true;
+                }
+                5 if !killed && rng.below(4) == 0 => {
+                    killed = try_call(&mut m, 1, kill(0)) == Some(DONE);
+                }
+                _ => churn(&mut m, &mut rng),
+            }
+            seen |= failed_under_a_remote_frame(&m);
+        }
+        for _ in 0..3 {
+            quiet(&mut m);
+            let _ = try_call(&mut m, 0, Syscall::CapRevoke(s(101)));
+        }
+        quiet(&mut m);
+        seen |= failed_under_a_remote_frame(&m);
+        reached_failed += usize::from(seen);
+        // A count the failed unit kept: the grant is pinned while the
+        // granting node lives, and a dead granting node never is (C1, C2).
+        // Otherwise every revocation ends and a death is reclaimed.
+        let kept = m.sys.canonical().uses[2]
+            .values()
+            .any(|u| u.granter == 0 && u.leaves > 0 && u.root.is_none());
+        let state = m.state(0);
+        if kept {
+            assert_ne!(state, MemberState::Dead, "seed {seed}: C2");
+            if state == MemberState::Live {
+                let entries = &m.sys.canonical().grants[0];
+                assert!(
+                    entries
+                        .values()
+                        .all(|e| e.state == crate::table::GrantState::Pinned),
+                    "seed {seed}: C1, {entries:?}"
+                );
+                pinned += usize::from(!entries.is_empty());
+            }
+        } else if killed {
+            assert_eq!(state, MemberState::Dead, "seed {seed}: never reclaimed");
+        }
+        if state == MemberState::Live {
+            assert!(
+                !waits_bounded(&m, 0),
+                "seed {seed}: a revocation never ended"
+            );
+        }
+    }
+    reached("a failed unit under a remote frame", reached_failed);
+    reached("a grant pinned by a failed unit", pinned);
+}
+
 // The node-protocol explorer: `unit`.
 
 #[test]

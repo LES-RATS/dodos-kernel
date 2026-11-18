@@ -1023,7 +1023,7 @@ impl Model {
             let entry = self.table.uses[me].get_mut(&index).expect("listed");
             entry.signal_pending = false;
             if entry.release_pending {
-                self.table.uses[me].remove(&index);
+                self.free_use(index);
             }
         }
         self.unit_send_queued();
@@ -1174,12 +1174,24 @@ impl Model {
         // its root remote capabilities of the node's grants, one removal
         // step each; done when no record under them remains unmapping.
         while *units > 0 {
-            let root = self
+            let object = self
                 .remotes
                 .iter()
                 .find(|(_, r)| r.node == node)
-                .map(|(&o, _)| self.objects[&o].root);
-            let Some(root) = root else { break };
+                .map(|(&o, _)| o);
+            let Some(object) = object else { break };
+            // A record left unmapping is completed by its request: until it
+            // answers, a removal step changes nothing, and is no progress
+            // (the reserve ran it again at the same instant for ever while
+            // another node's unit had the request, pass 24).
+            let waits = self
+                .caps
+                .values()
+                .any(|c| c.object == object && matches!(c.record, crate::Record::Unmapping(_)));
+            if waits {
+                return any;
+            }
+            let root = self.objects[&object].root;
             live(&mut self.caps, root).dying = true;
             *units -= 1;
             any = true;
@@ -1190,8 +1202,9 @@ impl Model {
         // R2 is done only when no remote capability of the node remains: a
         // step whose units ran out goes on at the next (the verification of
         // the tenth model review, its missed fault 2: R5 was written with
-        // remote capabilities left).
-        if self.remotes.values().any(|r| r.node == node) {
+        // remote capabilities left); and never while a failed unit keeps a
+        // count in a use entry of its generation (Reclaim, R2, D-142).
+        if self.remotes.values().any(|r| r.node == node) || self.kept_count(node, g) {
             return any;
         }
         // R3: the grants made to its generation are pinned, and the records
@@ -1261,13 +1274,28 @@ impl Model {
     }
 
     /// Whether R2 to R4 of this node's reclaim of `node` are done: no
-    /// remote capability of it left, R3 written, every block audited.
+    /// remote capability of it left, R3 written, every block audited. A
+    /// count a failed unit kept under its generation leaves R2 undone
+    /// (D-142): `reclaim_step` writes R3 only after R2, so R3 written
+    /// says it already (a guard on `kept_count` here changes nothing in
+    /// any state, pass 24).
     fn audited(&self, node: u16) -> bool {
         let reclaim = self.reclaims.get(&node);
         let audit = reclaim.and_then(|r| r.audit.as_ref());
         reclaim.is_some_and(|r| r.r3)
             && audit.is_some_and(Vec::is_empty)
             && !self.remotes.values().any(|r| r.node == node)
+    }
+
+    /// Whether a use entry of this node names generation `g` of `node` and
+    /// counts a leaf: only a failed unit leaves one once the remote
+    /// capabilities are gone, and it holds R2 undone, so this node never
+    /// acknowledges that generation and its memory stays frozen until the
+    /// machine restarts (Reclaim, R2, D-142).
+    fn kept_count(&self, node: u16, g: u32) -> bool {
+        self.table.uses[self.node as usize]
+            .values()
+            .any(|u| u.granter == node && u.generation == g && u.leaves > 0)
     }
 
     /// R4 for one block: every ownership word it covers still reads taken

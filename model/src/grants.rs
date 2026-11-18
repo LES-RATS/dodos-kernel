@@ -514,7 +514,7 @@ impl Model {
                 grant: granted.grant,
                 serial: granted.serial,
                 generation,
-                root: id,
+                root: Some(id),
                 leaves: 0,
                 release_pending: false,
                 signal_pending: false,
@@ -760,13 +760,30 @@ impl Model {
         Err(Ok(Output::Waits))
     }
 
+    /// The holder frees a use entry only at a count of 0 (G6, D-142): an
+    /// entry whose count a failed unit kept stays, with no root, until the
+    /// machine restarts. The gate counts no new leaf in it (no remote
+    /// capability names it any more) and a `Send` never writes it for
+    /// another grant (it is not free). A pending release is dropped.
+    pub(crate) fn free_use(&mut self, index: u16) {
+        let uses = &mut self.table.uses[self.node as usize];
+        match uses.get_mut(&index) {
+            Some(entry) if entry.leaves == 0 => {
+                uses.remove(&index);
+            }
+            Some(entry) => entry.release_pending = false,
+            None => {}
+        }
+    }
+
     /// A `Revoke` received by the holder: one removal step of at most 32
     /// units on its root remote capability of the grant; answered at once
     /// with `RevokeStep`. A record whose invalidation needs other cores or
     /// a unit is left *unmapping* and ends the step; the root is not
     /// removed while a record under it is unmapping. A `Revoke` that finds
-    /// the root already removed (its release pending) answers removed,
-    /// drops the pending release and frees the use entry.
+    /// the root already removed (its release pending, or no root) answers
+    /// removed, drops a pending release and frees the use entry if its
+    /// count is 0 (D-142).
     pub(crate) fn revoke_received(
         &mut self,
         from: u16,
@@ -775,13 +792,14 @@ impl Model {
     ) {
         let me = self.node as usize;
         let entry = self.table.uses[me][&use_index];
-        let removed = match entry.release_pending || !self.objects.contains_key(&entry.root) {
-            true => {
-                self.table.uses[me].remove(&use_index);
+        let root = entry.root.filter(|r| self.objects.contains_key(r));
+        let removed = match (entry.release_pending, root) {
+            (true, _) | (_, None) => {
+                self.free_use(use_index);
                 true
             }
-            false => {
-                let root = self.objects[&entry.root].root;
+            (false, Some(root)) => {
+                let root = self.objects[&root].root;
                 live(&mut self.caps, root).dying = true;
                 self.revoking = true;
                 let step = self.remove_root(root);
@@ -794,8 +812,9 @@ impl Model {
 
     /// The `RevokeStep`, applied in the event that consumes it whether or
     /// not the thread still waits: a step that reports the root removed
-    /// frees the grant entry; any other makes the removal step return
-    /// `again`, and its next call sends `Revoke` again.
+    /// frees the grant entry, or pins it while the holder's use entry still
+    /// counts a leaf; any other makes the removal step return `again`, and
+    /// its next call sends `Revoke` again.
     pub(crate) fn revoke_answered(&mut self, from: u16, credit: Option<(u8, u32)>, removed: bool) {
         let Some((index, _)) = credit else { return };
         let Some(taken) = self.take_credit(from, index) else {
@@ -805,13 +824,18 @@ impl Model {
             return;
         };
         // The root reported removed frees the entry only if the holder's
-        // use entry counts no leaf (D-141); otherwise it stays revoking and
-        // the next step sends `Revoke` again.
+        // use entry counts no leaf (D-141); otherwise a failed unit kept the
+        // count, the grant is pinned until the machine restarts and the
+        // step traced (D-142): the removal step then returns `again` with
+        // no message.
         if removed {
             let me = self.node as usize;
             match self.table.grants[me].get(&grant).copied() {
                 Some(entry) if self.holder_count(grant, &entry) == 0 => self.free_grant(grant),
-                Some(_) => self.refuse_trace(from, dodos_abi::NodeMessage::RevokeStep, grant),
+                Some(_) => {
+                    self.pin(grant);
+                    self.refuse_trace(from, dodos_abi::NodeMessage::RevokeStep, grant);
+                }
                 None => {}
             }
         }
@@ -837,22 +861,25 @@ impl Model {
     /// the granting node a `Release` and frees its use entry once the
     /// message is in the ring, or keeps the entry with *release pending*
     /// while the ring has no room beyond the reserve. A use entry of a
-    /// generation of the granting node that is over sends nothing.
+    /// generation of the granting node that is over sends nothing. Every
+    /// path frees the use entry only at a count of 0 (D-142).
     pub(crate) fn remote_destroyed(&mut self, object: ObjId) {
         let Some(remote) = self.remotes.remove(&object) else {
             return;
         };
         let me = self.node as usize;
-        let Some(entry) = self.table.uses[me].get(&remote.use_entry).copied() else {
+        let Some(entry) = self.table.uses[me].get_mut(&remote.use_entry) else {
             return;
         };
+        entry.root = None;
+        let entry = *entry;
         let current = self.table.writes(remote.node)
             || self.table.member(remote.node).state() == MemberState::Sealed;
         let current = current && self.table.generation(remote.node) == entry.generation;
         // A removal done for a `Revoke` sends no `Release`: its last
         // `RevokeStep` stands for it.
         if self.revoking || !current {
-            self.table.uses[me].remove(&remote.use_entry);
+            self.free_use(remote.use_entry);
             return;
         }
         let body = Body::Release {
@@ -860,9 +887,7 @@ impl Model {
             serial: remote.serial,
         };
         match self.write_message(remote.node, body, None, None) {
-            Ok(_) => {
-                self.table.uses[me].remove(&remote.use_entry);
-            }
+            Ok(_) => self.free_use(remote.use_entry),
             Err(_) => {
                 if let Some(entry) = self.table.uses[me].get_mut(&remote.use_entry) {
                     entry.release_pending = true;
@@ -877,7 +902,9 @@ impl Model {
     /// `RevokeStep` reporting the root removed would: the entry is freed,
     /// a `Revoke` of it still in flight stops counting as in flight (its
     /// credit freed, its thread woken with `again`), and the removal step
-    /// finds the entry freed at its next call.
+    /// finds the entry freed at its next call; or, at a count above 0, the
+    /// entry is pinned and the credit stays in use until its answer
+    /// (D-142).
     pub(crate) fn release_received(&mut self, from: u16, grant: u16, _serial: u32) {
         let me = self.node as usize;
         let Some(entry) = self.table.grants[me].get(&grant).copied() else {
@@ -885,8 +912,13 @@ impl Model {
         };
         // A `Release` frees the entry only if the holder's use entry counts
         // no leaf under it; otherwise the entry stays and the message is
-        // traced (Grants, release by the holder, D-141).
+        // traced (Grants, release by the holder, D-141), and a *revoking*
+        // entry is pinned: only a failed unit leaves the root removed with
+        // the count above 0 (D-142).
         if self.holder_count(grant, &entry) != 0 {
+            if entry.state == GrantState::Revoking {
+                self.pin(grant);
+            }
             self.refuse_trace(from, dodos_abi::NodeMessage::Release, grant);
             return;
         }
@@ -906,6 +938,14 @@ impl Model {
         // The entry is freed; its anchor is removed if it has no
         // descendant, and otherwise stays, held by nobody.
         self.free_with_anchor(grant);
+    }
+
+    /// A grant whose holder removed its root while a failed unit kept its
+    /// use entry's count: pinned until the machine restarts (D-142).
+    fn pin(&mut self, grant: u16) {
+        if let Some(entry) = self.table.grants[self.node as usize].get_mut(&grant) {
+            entry.state = GrantState::Pinned;
+        }
     }
 
     /// A message the check passed but whose effect a word written by

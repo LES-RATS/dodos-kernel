@@ -102,15 +102,24 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   a debugger stop on the clock less the stopped time, with no
   accusation of itself while the release word is raised, which the model
   made; the clearing of a rebuild's entries no report claims; each core's
-  generator seeded from its node's seed and its number),
+  generator seeded from its node's seed and its number), `verify13.rs`
+  (the corrections of the thirteenth model review's verification and a
+  test for each of its eleven surviving mutations), `pass24.rs` (D-142: a
+  granted frame mapped in an iospace whose unit fails during the holder's
+  removal, during a revocation, with a `Release` crossing a `Revoke` and
+  before the map; the use entry kept with no root, the grant pinned, the
+  granting node's death that is never reclaimed and its control case, and
+  the resume that never ends R2 for an unfenced granting node),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
   and of the machine; those of one node are in `check/tests.rs`), and
   `explore.rs` (seeded explorations that port the two explorers of the
   research drafts, steered so that each reaches a full ring, a release
-  crossing a revoke, a core stopping in a request and an applied
-  `Handed`, asserted over the seeds). `DODOS_SEED=<n>` replays one seed
+  crossing a revoke, a core stopping in a request, an applied `Handed`
+  and a failed unit under a granted frame, asserted over the seeds; the
+  one-node walk of `tests/property.rs` holds no remote frame, so D-142's
+  exploration is there). `DODOS_SEED=<n>` replays one seed
   of an exploration with its actions printed; `DODOS_COUNTS` prints what
   the explorations reached.
 - `tests/`: the calls on one node, judged argument by argument, and the
@@ -125,15 +134,22 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   (`DODOS_PROPERTY_SEEDS` and `DODOS_PROPERTY_FIRST` set another number
   and the first) and names any seed that fails: `cargo test --release -p
   dodos-model --test property many_seeds -- --ignored`.
-- The checker: each of its 219 rules that go through `ensure`, switched
+- The checker: each of its 220 rules that go through `ensure`, switched
   off alone, makes at least one test fail (pass 23's sweep; the two it
-  found held by nothing have a test since); a check that cannot fail is
+  found held by nothing have a test since; pass 24's rule of G6 for a
+  granting generation over under a counted leaf, and invariant 58 counting
+  a frozen use entry, each have one); a check that cannot fail is
   deleted or says which earlier rule shadows it, and the checker names an
   invariant for a value of the state it would index, never panics.
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
 
 ## Mutations shown equivalent
+
+- C2 of D-142 in `audited` (no use entry naming the generation counts a
+  leaf) is equivalent: `reclaim_step` writes R3 only once R2 is done, and
+  R2 is not done under such a count, so `audited`, which needs R3, reads
+  false already; the guard is written once, in `reclaim_step` (pass 24).
 
 - The clause of `reclaim_step` that drops, in state dead, a reclaim
   record of an older generation (`r.generation != g`; the tenth model

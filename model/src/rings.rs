@@ -76,15 +76,17 @@ pub enum Item {
 
 impl Item {
     /// The key of an item in the fixed order of a report: its kind in bits
-    /// 61-63 (0 a device, 1 a remapping handle, 2 a line), its identifier
-    /// below, so keys compare as numbers in that order (the words of a
-    /// `Report`, D-141).
+    /// 61-63 (0 a device, 1 a remapping handle, 2 a line; the ITS kinds 3
+    /// and 4 are not modelled), its identifier below, so keys compare as
+    /// numbers in that order (the words of a `Report`, D-141).
     pub(crate) fn key(self) -> u64 {
-        match self {
-            Item::Device(d, _) => u64::from(d),
-            Item::Handle(h) => 1 << 61 | u64::from(h),
-            Item::Line(l, ..) => 2 << 61 | u64::from(l),
-        }
+        use dodos_abi::{REPORT_KIND_DEVICE, REPORT_KIND_HANDLE, REPORT_KIND_LINE};
+        let (kind, id) = match self {
+            Item::Device(d, _) => (REPORT_KIND_DEVICE, u64::from(d)),
+            Item::Handle(h) => (REPORT_KIND_HANDLE, u64::from(h)),
+            Item::Line(l, ..) => (REPORT_KIND_LINE, u64::from(l)),
+        };
+        kind << dodos_abi::REPORT_KIND_SHIFT | id
     }
 }
 
@@ -785,7 +787,7 @@ impl Model {
                 && self.table.generation(entry.granter) == entry.generation;
             if entry.release_pending {
                 if !current {
-                    self.table.uses[me].remove(&index);
+                    self.free_use(index);
                     continue;
                 }
                 let body = Body::Release {
@@ -793,7 +795,7 @@ impl Model {
                     serial: entry.serial,
                 };
                 if self.write_message(entry.granter, body, None, None).is_ok() {
-                    self.table.uses[me].remove(&index);
+                    self.free_use(index);
                     sent += 1;
                 }
                 continue;

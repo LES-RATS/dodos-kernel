@@ -188,7 +188,19 @@ impl System {
                 // A unit that failed keeps the leaves counted for ever, and
                 // the grant stays: G6 holds then too (IOMMU: "a frame
                 // another node granted stays pinned").
-                if used.leaves == 0 || over {
+                if used.leaves == 0 {
+                    continue;
+                }
+                // Nor does the granting generation end under such a count:
+                // a holder whose kernel runs leaves R2 undone and never
+                // acknowledges it, so its barrier never holds (Reclaim, R2,
+                // D-142). A fenced holder's leaves count no more once every
+                // live node acknowledged it (the barrier).
+                ensure(
+                    !over || !self.running_node(slot),
+                    "G6: a granting generation over while a running holder counts a leaf",
+                )?;
+                if over {
                     continue;
                 }
                 let entry = table.grants[used.granter as usize].get(&used.grant);
@@ -250,8 +262,13 @@ impl System {
                 );
                 // A sealed or resuming node keeps its credits toward a peer
                 // whose generation ended while it was sealed until its
-                // resume runs R0 for it (Grants, "Generations").
+                // resume runs R0 for it (Grants, "Generations"). An accused
+                // node's credits are not judged: it runs nothing, and the
+                // peer's R0 drops its requests unanswered ("What ends with
+                // a generation"; pass 24, a `Revoke` in flight when the
+                // granting node was killed).
                 if !answering
+                    || !self.running_node(x)
                     || !self.has_generation(y, member.generation())
                     || model.ended_while_sealed(y).is_some()
                 {

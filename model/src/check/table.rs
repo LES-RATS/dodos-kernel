@@ -439,8 +439,11 @@ impl Model {
             }
         };
         ensure(counted, "58: map count")?;
+        // A use entry counts its frozen leaves too, which a failed unit
+        // kept after its root went (D-142).
         for (&entry, used) in &table.uses[node as usize] {
-            let counted = granted.get(&entry).copied().unwrap_or(0);
+            let frozen = self.frozen_uses.get(&entry).copied().unwrap_or(0);
+            let counted = granted.get(&entry).copied().unwrap_or(0) + frozen;
             ensure(used.leaves == counted, "58: leaves of a use entry")?;
         }
         // 59: the table pages, with their classes: the root of a space of

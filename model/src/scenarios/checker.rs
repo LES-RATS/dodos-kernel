@@ -788,7 +788,7 @@ fn a_use_entry_that_names_a_granter_past_the_table_is_reported() {
                 grant: 3,
                 serial: 1,
                 generation: 1,
-                root: crate::ObjId(0),
+                root: Some(crate::ObjId(0)),
                 leaves: 0,
                 release_pending: false,
                 signal_pending: false,

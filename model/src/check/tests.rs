@@ -2568,7 +2568,7 @@ fn a_use_entry_that_counts_leaves_its_node_does_not_hold_is_reported() {
                 grant: 0,
                 serial: 0,
                 generation: 1,
-                root: crate::ObjId(u32::MAX),
+                root: Some(crate::ObjId(u32::MAX)),
                 leaves: 1,
                 release_pending: false,
                 signal_pending: false,

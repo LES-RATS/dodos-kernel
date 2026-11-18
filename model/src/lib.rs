@@ -1187,9 +1187,11 @@ pub struct Model {
     built: u32,
     /// IOMMU: counts of leaves whose invalidation a failed unit never
     /// confirmed, which are never lowered (IOMMU): by chunk, and by entry
-    /// of the device table.
+    /// of the device table, and by use entry for a frame another node
+    /// granted (D-142).
     frozen: BTreeMap<u64, u64>,
     frozen_entries: BTreeMap<usize, u64>,
+    frozen_uses: BTreeMap<u16, u64>,
     /// The start-up space of the node.
     start_space: Option<ObjId>,
     /// Other models of the machine share its table (`System`): the map

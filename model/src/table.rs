@@ -255,15 +255,16 @@ pub(crate) struct GrantEntry {
 
 /// A use entry of the holding node: the granting node, the grant, the
 /// serial, the granting node's generation, the root remote capability on
-/// this node (its object), the leaves of its tables under the grant (G6),
-/// and the flags *release pending* and *signal pending*.
+/// this node (its object; none once it is removed while a failed unit kept
+/// the count above 0, D-142), the leaves of its tables under the grant
+/// (G6), and the flags *release pending* and *signal pending*.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct UseEntry {
     pub(crate) granter: u16,
     pub(crate) grant: u16,
     pub(crate) serial: u32,
     pub(crate) generation: u32,
-    pub(crate) root: crate::ObjId,
+    pub(crate) root: Option<crate::ObjId>,
     pub(crate) leaves: u64,
     pub(crate) release_pending: bool,
     pub(crate) signal_pending: bool,

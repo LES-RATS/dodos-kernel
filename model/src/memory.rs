@@ -267,7 +267,9 @@ impl Model {
     }
 
     /// An unmapping a failed unit never confirmed: the record is emptied
-    /// with its counts kept, which are never lowered (IOMMU).
+    /// with its counts kept, which are never lowered (IOMMU); under a grant
+    /// the count is the use entry's, which the holder then never frees
+    /// (D-142).
     pub(crate) fn freeze_unmapping(&mut self, cap: CapId) {
         let Some(Record::Unmapping(mapping)) = self.caps.get(&cap).map(|c| c.record) else {
             return;
@@ -276,10 +278,12 @@ impl Model {
             aspace.records.retain(|&other| other != cap);
         }
         live(&mut self.caps, cap).record = Record::Empty;
-        let frame = self.frames[&self.caps[&cap].object];
-        if self.remotes.contains_key(&self.caps[&cap].object) {
+        let object = self.caps[&cap].object;
+        if let Some(remote) = self.remotes.get(&object) {
+            *self.frozen_uses.entry(remote.use_entry).or_default() += mapping.count;
             return;
         }
+        let frame = self.frames[&object];
         match self.leaf_target(frame) {
             Target::Chunks => {
                 for chunk in self.leaf_chunks(frame, mapping.first, mapping.count) {
@@ -569,6 +573,15 @@ impl Model {
                 return Err(Error::Again);
             }
             if entry.use_index != Some(remote.use_entry) {
+                return Err(Error::Gone);
+            }
+            // A use entry whose root is removed counts no new leaf (Grants,
+            // the count says what the holder translates, D-142).
+            let uses = &self.table.uses[self.node as usize];
+            if uses
+                .get(&remote.use_entry)
+                .is_some_and(|u| u.root.is_none())
+            {
                 return Err(Error::Gone);
             }
             let granter = remote.node as usize;
