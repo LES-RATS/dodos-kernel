@@ -40,6 +40,16 @@ pub const CREDIT_NONE: u8 = 31;
 pub const CREDIT_SERIAL_MASK: u32 = (1 << 27) - 1;
 /// The key of a `Report` with no next item.
 pub const REPORT_END: u64 = u64::MAX;
+/// A `Report` key holds its kind in bits 61-63 and its identifier in bits
+/// 0-60, so keys compare as numbers in the fixed order of a report.
+pub const REPORT_KIND_SHIFT: u32 = 61;
+/// The kinds of a `Report` key, as the contract numbers them (D-141, kept
+/// by D-142).
+pub const REPORT_KIND_DEVICE: u64 = 0;
+pub const REPORT_KIND_HANDLE: u64 = 1;
+pub const REPORT_KIND_LINE: u64 = 2;
+pub const REPORT_KIND_ITS_DEVICE: u64 = 3;
+pub const REPORT_KIND_ITS_EVENT: u64 = 4;
 
 /// The ring a kind travels on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,8 +72,9 @@ pub enum Ring {
 /// - `UnitAnswer`: the result (`UnitResult`), then its value.
 /// - `Handed`, `ReportAsk`: the role (0-15) and the epoch (16-44); a
 ///   `ReportAsk` adds the key it asks from.
-/// - `Report`: the key of the next item, or `REPORT_END`; then three words
-///   per item.
+/// - `Report`: the number of items (bits 0-4, at most 28); then the key of
+///   the next item, or `REPORT_END`; then three words per item, its key
+///   first (`REPORT_KIND_SHIFT`).
 /// - `SendAnswer`: 1 if delivered, with `caps_dropped` in bit 1; then one
 ///   word per frame, the use index or `u64::MAX` if not delivered.
 /// - `Send`: the message header, the task identifier and the marks of the

@@ -63,11 +63,12 @@ pub use machine::{
     ports_meet, successor,
 };
 pub use ring::{
-    CREDIT_NONE, CREDIT_SERIAL_MASK, NodeMessage, PENDING_STEP, REPORT_END, REQUESTS_PER_PEER,
-    RING_ANSWER_RESERVE, RING_ENTRY_BYTES, RING_HEADER_BYTES, RING_KERNEL_ENTRIES,
-    RING_MESSAGE_ENTRIES_MAX, RING_USER_ENTRIES, RING_USER_STEP, Ring, RingHeader, SEND_GRANTS_MAX,
-    SENDS_PER_PEER, SENDS_RESERVED_FOR_MANAGE, UNIT_REQUESTS, UnitOperation, UnitResult,
-    message_entries, ring_fits, ring_free, ring_resync,
+    CREDIT_NONE, CREDIT_SERIAL_MASK, NodeMessage, PENDING_STEP, REPORT_END, REPORT_KIND_DEVICE,
+    REPORT_KIND_HANDLE, REPORT_KIND_ITS_DEVICE, REPORT_KIND_ITS_EVENT, REPORT_KIND_LINE,
+    REPORT_KIND_SHIFT, REQUESTS_PER_PEER, RING_ANSWER_RESERVE, RING_ENTRY_BYTES, RING_HEADER_BYTES,
+    RING_KERNEL_ENTRIES, RING_MESSAGE_ENTRIES_MAX, RING_USER_ENTRIES, RING_USER_STEP, Ring,
+    RingHeader, SEND_GRANTS_MAX, SENDS_PER_PEER, SENDS_RESERVED_FOR_MANAGE, UNIT_REQUESTS,
+    UnitOperation, UnitResult, message_entries, ring_fits, ring_free, ring_resync,
 };
 pub use start::{
     RETIRED_WORD_BYTES, START_CORE_BOOTED, START_CORE_FENCE_SHIFT, START_FREE_SLOTS,
@@ -1371,6 +1372,39 @@ mod proofs {
             let length = word >> (18 + 4 * n) & 0b11;
             assert!(condition != 0b10 && length != 0b10);
             assert!(condition != 0 || length == 0);
+        }
+    }
+
+    /// `dbgbcr_valid` accepts 0 or a word within the user mask that
+    /// generates exceptions at EL0 only, for A64 instructions (D-142).
+    #[kani::proof]
+    fn dbgbcr_valid_accepts_only_an_el0_address_match() {
+        let word: u64 = kani::any();
+        if aarch64::dbgbcr_valid(word) && word != 0 {
+            assert!(word & !aarch64::DBGBCR_USER_MASK == 0);
+            assert!(word >> 1 & 0b11 == 0b10);
+            assert!(word >> 5 & 0b1111 == 0b1111);
+        }
+    }
+
+    /// `dbgwcr_valid` accepts 0 or a word within the user mask that
+    /// generates exceptions at EL0 only, with no reserved LSC, BAS or MASK
+    /// (D-142).
+    #[kani::proof]
+    fn dbgwcr_valid_accepts_only_an_el0_address_match() {
+        let word: u64 = kani::any();
+        if aarch64::dbgwcr_valid(word) && word != 0 {
+            assert!(word & !aarch64::DBGWCR_USER_MASK == 0);
+            assert!(word >> 1 & 0b11 == 0b10);
+            assert!(word >> 3 & 0b11 != 0);
+            let bas = word >> 5 & 0xFF;
+            assert!(bas != 0);
+            // No 0 between two set bits of BAS.
+            let n: u64 = kani::any::<u64>() % 8;
+            let (below, at, above) = (bas & ((1 << n) - 1), bas >> n & 1, bas >> (n + 1));
+            assert!(at == 1 || below == 0 || above == 0);
+            let mask = word >> 24 & 0b1_1111;
+            assert!(mask != 1 && mask != 2);
         }
     }
 

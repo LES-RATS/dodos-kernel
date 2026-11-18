@@ -447,9 +447,11 @@ fn numbers_of_the_multi_node_part_have_their_values() {
         (1_000_000_000, (100_000_000, 60_000_000_000))
     );
     let fence = [NMI_GRACE_NS, FENCE_NS, SETTLE_NS, START_NS];
-    // D-141: two rounds of a fence (11.2 ms each) and their stub.
+    // D-141: two rounds of a fence (11.2 ms each) and their stub; the range
+    // from those two rounds and the stub since D-142.
     assert_eq!(fence, [1_000_000, 30_000_000, 1_000_000, 1_000_000_000]);
-    assert_eq!(FENCE_RANGE_NS, (12_000_000, 1_000_000_000));
+    assert_eq!(FENCE_RANGE_NS, (23_000_000, 1_000_000_000));
+    assert!(FENCE_RANGE_NS.0 > 2 * 11_200_000);
     assert_eq!(
         (SEAL_NS, SEAL_RANGE_NS),
         (1_000_000_000, (10_000_000, 60_000_000_000))
@@ -765,6 +767,78 @@ fn x86_64_values_have_their_numbers() {
     );
     assert_eq!(KERNEL_PORTS, [(0x20, 0x21), (0xA0, 0xA1)]);
     assert_eq!((PCI_CONFIG_PORTS, UART_PORTS), ((0xCF8, 0xCFF), 8));
+}
+
+#[test]
+fn the_kinds_of_a_report_key_are_the_contracts_numbers() {
+    let kinds = [
+        REPORT_KIND_DEVICE,
+        REPORT_KIND_HANDLE,
+        REPORT_KIND_LINE,
+        REPORT_KIND_ITS_DEVICE,
+        REPORT_KIND_ITS_EVENT,
+    ];
+    assert_eq!(kinds, [0, 1, 2, 3, 4]);
+    assert_eq!(REPORT_KIND_SHIFT, 61);
+    // Every kind fits bits 61-63, and the largest key of each is below the
+    // next kind's first and below `REPORT_END`.
+    for kind in kinds {
+        let last = kind << REPORT_KIND_SHIFT | ((1 << REPORT_KIND_SHIFT) - 1);
+        assert_eq!(last >> REPORT_KIND_SHIFT, kind);
+        assert!(last < (kind + 1) << REPORT_KIND_SHIFT && last < REPORT_END);
+    }
+}
+
+#[test]
+fn a_vtd_unit_keeps_1_mb_and_4_kb_of_tables() {
+    assert_eq!(x86_64::VTD_UNIT_TABLE_BYTES, (1 << 20) + 4096);
+}
+
+#[test]
+fn the_arm64_breakpoint_control_word_has_its_user_mask() {
+    use aarch64::{DBGBCR_USER_MASK, dbgbcr_valid};
+    assert_eq!(DBGBCR_USER_MASK, 0x1E7);
+    // Disabled, and an enabled A64 address match at EL0 only.
+    assert!(dbgbcr_valid(0) && dbgbcr_valid(0x1E4) && dbgbcr_valid(0x1E5));
+    // PMC other than 0b10 (EL1, both, none); BAS for T32 or none.
+    for word in [0x1E3, 0x1E7, 0x1E1, 0x065, 0x185, 0x005] {
+        assert!(!dbgbcr_valid(word), "{word:#x}");
+    }
+    // BT2 (3), bit 4, the reserved bits 12:9, HMC (13), SSC (14, 15), LBN
+    // (16), BT (20, a linked or context match), MASK (24), SSCE (29),
+    // LBNX (30), bit 32.
+    for bit in [3, 4, 9, 12, 13, 14, 15, 16, 20, 21, 24, 29, 30, 32, 63] {
+        assert!(!dbgbcr_valid(0x1E5 | 1 << bit), "bit {bit}");
+    }
+}
+
+#[test]
+fn the_arm64_watchpoint_control_word_has_its_user_mask() {
+    use aarch64::{DBGWCR_USER_MASK, dbgwcr_valid};
+    assert_eq!(DBGWCR_USER_MASK, 0x1F00_1FFF);
+    // PAC 0b10 (0x4), LSC load and store (0x18), BAS one byte (0x20) or
+    // all eight (0x1FE0), MASK 3 or 31.
+    let good = 0x4 | 0x18 | 0x20 | 1;
+    assert!(dbgwcr_valid(0) && dbgwcr_valid(good));
+    assert!(dbgwcr_valid(0x4 | 0x8 | 0x1FE0) && dbgwcr_valid(0x4 | 0x10 | 0x60));
+    assert!(dbgwcr_valid(good | 3 << 24) && dbgwcr_valid(good | 31 << 24));
+    // PAC 0b01 or 0b11; LSC 0b00; BAS 0 or not contiguous; MASK 1 or 2.
+    for word in [
+        0x2 | 0x18 | 0x20,
+        0x6 | 0x18 | 0x20,
+        0x4 | 0x20,
+        0x4 | 0x18,
+        0x4 | 0x18 | 0xA0,
+        good | 1 << 24,
+        good | 2 << 24,
+    ] {
+        assert!(!dbgwcr_valid(word), "{word:#x}");
+    }
+    // HMC (13), SSC (14, 15), LBN (16), WT (20, linked), bit 21, WT2 (22,
+    // a mismatch), bit 23, SSCE (29), LBNX (30), bit 32.
+    for bit in [13, 14, 15, 16, 20, 21, 22, 23, 29, 30, 32, 63] {
+        assert!(!dbgwcr_valid(good | 1 << bit), "bit {bit}");
+    }
 }
 
 #[test]

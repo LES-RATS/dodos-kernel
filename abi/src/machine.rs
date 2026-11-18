@@ -361,9 +361,10 @@ pub const SWEEP_RANGE_NS: (u64, u64) = (100_000_000, 60_000_000_000);
 pub const NMI_GRACE_NS: u64 = 1_000_000;
 /// 30 ms since D-141, two rounds of the fence (it was 10 ms, less than the
 /// SDM's example of INIT and SIPI alone, then 20 ms, less than two rounds),
-/// within 12 ms to 1 s.
+/// within 23 ms to 1 s since D-142: two rounds of 11.2 ms and the stub (the
+/// range started at 12 ms, below its own reason).
 pub const FENCE_NS: u64 = 30_000_000;
-pub const FENCE_RANGE_NS: (u64, u64) = (12_000_000, 1_000_000_000);
+pub const FENCE_RANGE_NS: (u64, u64) = (23_000_000, 1_000_000_000);
 pub const SETTLE_NS: u64 = 1_000_000;
 pub const START_NS: u64 = 1_000_000_000;
 /// The period at which the node that starts a core sends its wake again

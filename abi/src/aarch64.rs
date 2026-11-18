@@ -12,6 +12,77 @@ pub const FEATURES: FeatureList = FeatureList {
     large: 1 << SME,
 };
 
+// The control words of a user thread's hardware breakpoints and
+// watchpoints (Debugging a component, D-142): `DBGBCR<n>_EL1` and
+// `DBGWCR<n>_EL1`, their fields read in Arm DDI 0487 M.d, D24.3.2 and
+// D24.3.11. A thread's word generates exceptions at EL0 only: HMC 0, SSCE
+// 0, SSC 0b00 and PMC or PAC 0b10 (D2.8.4, Table D2-8; D2.9.4, Table
+// D2-13); an unlinked address match, with no linking and no context
+// matching (BT 0b0000 and BT2 0; WT 0 and WT2 0); the linked numbers LBN
+// and LBNX 0.
+
+/// `DBGBCR<n>_EL1`: E (bit 0), PMC (bits 2:1), BAS (bits 8:5).
+pub const DBGBCR_E: u64 = 1;
+pub const DBGBCR_PMC_SHIFT: u32 = 1;
+pub const DBGBCR_BAS_SHIFT: u32 = 5;
+/// `DBGWCR<n>_EL1`: E (bit 0), PAC (bits 2:1), LSC (bits 4:3), BAS (bits
+/// 12:5), MASK (bits 28:24).
+pub const DBGWCR_E: u64 = 1;
+pub const DBGWCR_PAC_SHIFT: u32 = 1;
+pub const DBGWCR_LSC_SHIFT: u32 = 3;
+pub const DBGWCR_BAS_SHIFT: u32 = 5;
+pub const DBGWCR_MASK_SHIFT: u32 = 24;
+/// PMC and PAC 0b10: EL0 only, with HMC 0 and SSC 0b00.
+pub const DEBUG_EL0: u64 = 0b10;
+/// The bits a user thread's word may set: E, PMC and BAS of a breakpoint;
+/// E, PAC, LSC, BAS and MASK of a watchpoint. HMC (13), SSC (15:14), LBN
+/// (19:16), BT (23:20) or WT (20) and WT2 (22), SSCE (29), LBNX (31:30),
+/// a breakpoint's BT2 (3) and MASK (28:24), and bits 63:32 stay 0.
+pub const DBGBCR_USER_MASK: u64 = DBGBCR_E | 0b11 << DBGBCR_PMC_SHIFT | 0b1111 << DBGBCR_BAS_SHIFT;
+pub const DBGWCR_USER_MASK: u64 = DBGWCR_E
+    | 0b11 << DBGWCR_PAC_SHIFT
+    | 0b11 << DBGWCR_LSC_SHIFT
+    | 0xFF << DBGWCR_BAS_SHIFT
+    | 0b1_1111 << DBGWCR_MASK_SHIFT;
+
+/// Whether a breakpoint control word is one a user thread may set: 0 (no
+/// breakpoint), or within the user mask with PMC 0b10 and BAS 0b1111, the
+/// value for A64 instructions (D24.3.2: "Use for A64 and A32
+/// instructions"; the other values are for T32, which a thread of this
+/// kernel does not run).
+pub const fn dbgbcr_valid(word: u64) -> bool {
+    word == 0
+        || (word & !DBGBCR_USER_MASK == 0
+            && word >> DBGBCR_PMC_SHIFT & 0b11 == DEBUG_EL0
+            && word >> DBGBCR_BAS_SHIFT & 0b1111 == 0b1111)
+}
+
+/// Whether a watchpoint control word is one a user thread may set: 0 (no
+/// watchpoint), or within the user mask with PAC 0b10, LSC not 0b00 (a
+/// reserved value), BAS nonzero with its set bits contiguous ("All other
+/// values are reserved and must not be used by software", D24.3.11), and
+/// MASK 0 or 3 to 31 ("All other values are reserved").
+pub const fn dbgwcr_valid(word: u64) -> bool {
+    if word == 0 {
+        return true;
+    }
+    let bas = word >> DBGWCR_BAS_SHIFT & 0xFF;
+    let mask = word >> DBGWCR_MASK_SHIFT & 0b1_1111;
+    // Contiguous: shifted down to its lowest set bit, one more is a power
+    // of two.
+    let low = if bas == 0 {
+        0
+    } else {
+        bas >> bas.trailing_zeros()
+    };
+    word & !DBGWCR_USER_MASK == 0
+        && word >> DBGWCR_PAC_SHIFT & 0b11 == DEBUG_EL0
+        && word >> DBGWCR_LSC_SHIFT & 0b11 != 0
+        && bas != 0
+        && (low + 1).is_power_of_two()
+        && (mask == 0 || mask >= 3)
+}
+
 // The exception classes of `ESR_ELx.EC`, bits 31:26 of the syndrome
 // register, and what each is when taken from a user thread (Faults).
 // Rebuilt from Arm DDI 0487 K.a (March 2024): the field EC of ESR_EL1,

@@ -114,6 +114,13 @@ pub const fn dr7_valid(word: u64) -> bool {
     true
 }
 
+/// The memory the kernel keeps at start for the tables of one VT-d unit in
+/// legacy translation mode: a root table of 4 KB and 256 context tables of
+/// 4 KB ("The root-table is 4-KByte in size and contains 256 root-entries",
+/// "Each context-table contains 256 entries", VT-d §3.4.2), 1 MB and 4 KB
+/// (IOMMU, D-142: "1 MB in all" left out the root table).
+pub const VTD_UNIT_TABLE_BYTES: u64 = 4096 + 256 * 4096;
+
 /// The words that must be canonical addresses.
 pub const REGS_CANONICAL: [usize; 4] = [REG_RIP, REG_RSP, REG_FS_BASE, REG_GS_BASE];
 /// The bits of rflags that user code can change: CF, PF, AF, ZF, SF, TF, DF,
