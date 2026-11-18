@@ -107,6 +107,52 @@ pub(super) fn waits_bounded(m: &S, node: u16) -> bool {
             .any(|t| matches!(t.wait, Wait::Node { .. } | Wait::Unit(_) | Wait::Cores(_)))
 }
 
+/// The liveness every exploration ends with, once its machine is quiet
+/// (pass 26): no node accused that a harm does not explain (`Harm`), and no
+/// live node whose thread waits for another node, a unit or its cores.
+#[track_caller]
+pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
+    for n in 0..nodes {
+        let member = m.sys.member(n);
+        let state = member.state();
+        let down = matches!(
+            state,
+            MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced | MemberState::Dead
+        );
+        assert!(
+            !down || m.harm.accepts(n, member),
+            "seed {seed}: node {n} accused unharmed: {member:?}, harmed {:?}, sealed {:?}",
+            m.harm.harmed,
+            m.harm.sealed
+        );
+        if state == MemberState::Live && waits_bounded(m, n) && !gap_21(m) {
+            let node = m.sys.node(n);
+            let waits: Vec<_> = node.threads.values().map(|t| t.wait.clone()).collect();
+            panic!(
+                "seed {seed}: a wait of node {n} never ended: {waits:?}, requests {:?}, \
+                 rebuilds {:?}, handing {:?}, roles {:?}, members {:?}",
+                node.unit_requests.iter().flatten().collect::<Vec<_>>(),
+                node.rebuilds,
+                node.handing,
+                (0..2).map(|r| m.sys.role(r)).collect::<Vec<_>>(),
+                (0..nodes).map(|n| m.sys.member(n)).collect::<Vec<_>>(),
+            );
+        }
+    }
+}
+
+/// CONTRACT-GAP 21: a failed unit's role held by a sealing node, whose
+/// seal never ends and whose unit's requesters are answered *elsewhere*;
+/// counted, not judged, until the contract settles it.
+pub(super) fn gap_21(m: &S) -> bool {
+    (0..m.sys.canonical().roles.len()).any(|role| {
+        let word = m.sys.role(role);
+        word.failed()
+            && word.state() == dodos_abi::RoleState::Held
+            && m.state(word.holder()) == MemberState::Sealing
+    })
+}
+
 /// After a death, a node that started again has a new first thread.
 pub(super) fn refresh(m: &mut S) {
     for node in 0..m.t.len() as u16 {
@@ -244,6 +290,7 @@ fn crossing_a_release_and_a_revoke_of_one_grant_in_every_order() {
             m.sys.node(0).grant_entries().is_empty(),
             "seed {seed}: the grant outlived its revocation"
         );
+        assert_live(&m, seed, 2);
     }
     reached("a Release crossing a Revoke", crossings);
 }
@@ -441,6 +488,7 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
                 "seed {seed}: a revocation never ended"
             );
         }
+        assert_live(&m, seed, 3);
     }
     reached("a failed unit under a remote frame", reached_failed);
     reached("a grant pinned by a failed unit", pinned);
@@ -527,6 +575,7 @@ fn unit_a_request_across_a_hand_over_and_the_deaths_of_its_parties() {
         );
         let unit = &m.sys.canonical().units[&0];
         assert!(unit.entries.contains_key(&0x10), "seed {seed}");
+        assert_live(&m, seed, 4);
     }
     reached("a Handed applied", handed);
 }
@@ -613,6 +662,7 @@ fn rings_a_send_and_a_signal_while_the_sender_seals_and_the_receiver_dies_and_st
         if m.sys.has(0) && m.state(0) == MemberState::Live {
             assert!(!waits_bounded(&m, 0), "seed {seed}: a wait never ended");
         }
+        assert_live(&m, seed, 3);
     }
 }
 
@@ -673,6 +723,7 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
         // node 0 toward node 1 is in use.
         assert!(!waits_bounded(&m, 0), "seed {seed}");
         assert_eq!(m.sys.node(0).peers[1].sends().0, 0, "seed {seed}");
+        assert_live(&m, seed, 3);
     }
 }
 
@@ -728,7 +779,7 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
                     {
                         let nmi = rng.below(2) == 0;
                         say(format_args!("{} hang core {core} nmi {nmi}", m.sys.now()));
-                        m.sys.hang(core, nmi);
+                        m.hang(core, nmi);
                         hung = true;
                         unstoppable =
                             !nmi && (arch == Arch::Aarch64 || (arch == Arch::X86_64 && core == 0));
@@ -766,6 +817,7 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
                 "seed {seed}: node {n} unfenced with every core stoppable"
             );
         }
+        assert_live(&m, seed, 3);
     }
 }
 
@@ -783,7 +835,7 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
         // Steered: in half of the seeds node 1's core stops answering, so
         // that its user ring fills until a send no longer fits.
         if seed % 2 == 0 {
-            m.sys.hang(1, true);
+            m.hang(1, true);
         }
         m.ok(0, super::place_first(0, 0));
         let senders: Vec<ObjId> = (0..10).map(|i| m.thread_on(0, 300 + 4 * i, 0)).collect();
@@ -842,6 +894,7 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
         }
         quiet(&mut m);
         assert!(!waits_bounded(&m, 0), "seed {seed}");
+        assert_live(&m, seed, 3);
     }
     reached("a full ring", full);
 }
@@ -892,7 +945,7 @@ fn a_core_stops_in_the_middle_of_a_request_of_another_core() {
                                 .is_some_and(|r| r.asked & 0b10 != 0 && r.acked & 0b10 == 0)
                         });
                     if asks {
-                        m.sys.hang(2, rng.below(2) == 0);
+                        m.hang(2, rng.below(2) == 0);
                         hung = true;
                         stopped_in_request += 1;
                     }
@@ -915,6 +968,7 @@ fn a_core_stops_in_the_middle_of_a_request_of_another_core() {
                 || m.state(1) != MemberState::Live,
             "seed {seed}"
         );
+        assert_live(&m, seed, 2);
     }
     reached(
         "a core stopping in the middle of a request",

@@ -1416,8 +1416,23 @@ fn member_words_read_back_and_refuse_what_is_never_written() {
         (MemberState::Fencing, Evidence::Stale, 4, 9)
     );
     assert_eq!(Member::never().raw(), 0xFFFF << 16);
-    for raw in [8, 15, 7 << 4, 3 << 7, 1 << 9, 1 << 15] {
+    for raw in [8, 15, 7 << 4, 3 << 7, 1 << 9, 1 << 10, 1 << 15] {
         assert_eq!(Member::from_raw(raw), None, "{raw:#x}");
+    }
+    // Bit 9, the resume bit, only in a starting word (D-144).
+    assert_eq!(MEMBER_RESUME, 1 << 9);
+    let resuming = Member::new(MemberState::Starting, Evidence::None, DRIVER_NONE, 3).with_resume();
+    assert_eq!(Member::from_raw(resuming.raw()), Some(resuming));
+    assert!(resuming.resuming());
+    assert!(!Member::new(MemberState::Starting, Evidence::None, DRIVER_NONE, 3).resuming());
+    for state in [
+        MemberState::Live,
+        MemberState::Sealed,
+        MemberState::Dead,
+        MemberState::Fenced,
+    ] {
+        let raw = Member::new(state, Evidence::None, DRIVER_NONE, 3).raw() | MEMBER_RESUME;
+        assert_eq!(Member::from_raw(raw), None, "{state:?}");
     }
     // Bits 7-8 hold the node's fence class (D-129), 0 to 2.
     let classed = word.with_class(2);

@@ -23,7 +23,7 @@
 //! `DODOS_SEED=<n>` replays one seed with its actions printed;
 //! `DODOS_COUNTS` prints the table of combinations.
 
-use super::explore::{refresh, replayed, say, try_call, waits_bounded};
+use super::explore::{refresh, replayed, say, try_call};
 use super::pass17::{fresh, kill, resume, seal};
 use super::units::{IOMMU_ROLE, IOSPACE};
 use super::*;
@@ -274,8 +274,8 @@ fn probe(m: &S, splittable: usize) -> u32 {
 
 /// The seeds that reach each combination, summed over the seeds.
 struct Reach {
-    /// The seeds that reached gaps 18, 19 and 20.
-    gaps: [usize; 3],
+    /// The seeds that ended in the state of gap 21.
+    gap_21: usize,
     pairs: Vec<Vec<usize>>,
     resume: Vec<Vec<usize>>,
     death: Vec<Vec<usize>>,
@@ -333,7 +333,7 @@ impl Reach {
     fn new() -> Self {
         let square = || vec![vec![0; EVENTS]; EVENTS];
         Self {
-            gaps: [0; 3],
+            gap_21: 0,
             pairs: square(),
             resume: square(),
             death: square(),
@@ -418,26 +418,19 @@ struct Run {
     drivers: [Driver; 3],
     /// The used entries of the device table at start.
     splittable: usize,
-    /// The nodes harmed, with the generation harmed: killed, failed, a
-    /// core hung, a core retired, a thread suspended.
-    harmed: BTreeSet<(u16, u32)>,
-    /// The nodes sealed, with the generation, until they are live again.
-    sealed: BTreeSet<(u16, u32)>,
     /// The receiving thread of each holder.
     receivers: Vec<Option<ObjId>>,
     /// The drivers done once: the unit broken, the bootstrap core hung, a
     /// node sealed past `SEAL_NS`.
     once: BTreeSet<usize>,
-    /// The gaps the run reached: 18 (its end), 19 and 20.
-    gaps: [bool; 3],
     /// The node sealed past `SEAL_NS`, which nobody resumes, and the
     /// granting node a driver keeps sealed until it acts again.
     late: Option<u16>,
     kept: Option<u16>,
     /// The member words last printed by a replay.
     members: Vec<Member>,
-    /// The member words at the last step.
-    last: Vec<Member>,
+    /// The run ended in the state of gap 21.
+    gap_21: bool,
 }
 
 impl Run {
@@ -468,15 +461,12 @@ impl Run {
             seen: Seen::default(),
             drivers: drivers(seed),
             splittable,
-            harmed: BTreeSet::new(),
-            sealed: BTreeSet::new(),
             receivers: vec![None; NODES as usize],
             once: BTreeSet::new(),
-            gaps: [false; 3],
             late: None,
             kept: None,
             members: Vec::new(),
-            last: Vec::new(),
+            gap_21: false,
         };
         say(format_args!("drivers {:?}", run.drivers));
         run.set_up();
@@ -487,29 +477,8 @@ impl Run {
         if replayed().is_some() {
             self.print_members();
         }
-        // CONTRACT-GAP 19: a starting node accused with evidence stuck is
-        // counted, not judged.
-        for n in 0..NODES {
-            let member = self.m.sys.member(n);
-            let was = self.last.get(n as usize).map(|m| m.state());
-            if was == Some(MemberState::Starting)
-                && accused(member.state())
-                && member.evidence() == Evidence::Stuck
-            {
-                self.gaps[1] = true;
-                self.harmed.insert((n, member.generation()));
-            }
-        }
-        self.last = (0..NODES).map(|n| self.m.sys.member(n)).collect();
         let mask = probe(&self.m, self.splittable);
         self.seen.note(mask);
-        // A sealed node that is live again is no longer harmed.
-        for n in 0..NODES {
-            if self.m.state(n) == MemberState::Live {
-                let g = self.m.sys.member(n).generation();
-                self.sealed.remove(&(n, g));
-            }
-        }
     }
 
     /// A replay prints every change of a member word, and for a new
@@ -733,7 +702,8 @@ impl Run {
     /// Whether a node is live and unharmed in its generation.
     fn healthy(&self, n: u16) -> bool {
         let member = self.m.sys.member(n);
-        member.state() == MemberState::Live && !self.harmed.contains(&(n, member.generation()))
+        member.state() == MemberState::Live
+            && !self.m.harm.harmed.contains(&(n, member.generation()))
     }
 
     /// A node in `state`, chosen by the generator.
@@ -768,14 +738,8 @@ impl Run {
         Some((victim, actor))
     }
 
-    fn harmed_now(&mut self, node: u16) {
-        let g = self.m.sys.member(node).generation();
-        self.harmed.insert((node, g));
-    }
-
     fn kill(&mut self) {
         if let Some((victim, actor)) = self.victim() {
-            self.harmed_now(victim);
             let _ = self.call(actor, kill(victim));
         }
     }
@@ -783,9 +747,7 @@ impl Run {
     fn fail(&mut self) {
         if let Some((victim, _)) = self.victim() {
             say(format_args!("{} node {victim} fails", self.m.sys.now()));
-            self.harmed_now(victim);
-            self.m.sys.fail(victim, 0);
-            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.fail(victim);
             self.note();
         }
     }
@@ -798,9 +760,7 @@ impl Run {
             "{} hang core {core} nmi {nmi}",
             self.m.sys.now()
         ));
-        self.harmed_now(victim);
-        self.m.sys.hang(core, nmi);
-        assert_eq!(self.m.sys.check(), Ok(()));
+        self.m.hang(core, nmi);
         self.note();
     }
 
@@ -811,7 +771,6 @@ impl Run {
         let Some((victim, actor)) = self.victim() else {
             return;
         };
-        self.harmed_now(victim);
         let suspend = Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD));
         let _ = self.call(victim, suspend);
         if self.m.state(victim) == MemberState::Live
@@ -829,7 +788,6 @@ impl Run {
 
     fn retire(&mut self) {
         if let Some((victim, actor)) = self.victim() {
-            self.harmed_now(victim);
             let retire = Syscall::NodeStop {
                 node: node_cap(victim),
                 mode: NODE_STOP_RETIRE,
@@ -851,11 +809,7 @@ impl Run {
             return None;
         }
         let actor = self.live_other(victim)?;
-        let g = self.m.sys.member(victim).generation();
-        (self.call(actor, seal(victim)) == Some(DONE)).then(|| {
-            self.sealed.insert((victim, g));
-            victim
-        })
+        (self.call(actor, seal(victim)) == Some(DONE)).then_some(victim)
     }
 
     /// A sealed node resumed, or a dead one started afresh, by a live
@@ -944,7 +898,6 @@ impl Run {
                         && self.may_harm()
                         && let Some(actor) = self.live_other(pair.granter)
                     {
-                        self.harmed_now(pair.granter);
                         let _ = self.call(actor, kill(pair.granter));
                     }
                     // One time in two resumed as soon as it is sealed.
@@ -994,7 +947,6 @@ impl Run {
                         && self.healthy(victim)
                         && let Some(actor) = self.live_other(victim)
                     {
-                        self.harmed_now(victim);
                         let _ = self.call(actor, kill(victim));
                     }
                 }
@@ -1230,59 +1182,15 @@ impl Run {
                 let _ = self.call(actor, resume(n));
             }
         }
+        // A wait for a node starting afresh ends by `START_NS` (D-144).
         let sweep = self.m.sys.canonical().sweep_ns;
         self.run_by(sweep + 300 * MS, MS);
-        let skipped = |n: u16| self.m.sys.has(n) && !self.m.sys.node(n).skipped.is_empty();
-        let gap_20 = (0..NODES).any(skipped);
-        self.gaps[2] = gap_20;
-        for n in 0..NODES {
-            let member = self.m.sys.member(n);
-            let g = member.generation();
-            let harmed = self.harmed.contains(&(n, g)) || self.sealed.contains(&(n, g));
-            let down = accused(member.state()) || member.state() == MemberState::Dead;
-            assert!(
-                !down || harmed,
-                "seed {seed}: node {n} accused unharmed: {member:?}, hardware {:?}",
-                (0..NODES as usize)
-                    .map(|c| self.m.sys.hardware(c))
-                    .collect::<Vec<_>>(),
-            );
-            if member.state() == MemberState::Live && waits_bounded(&self.m, n) {
-                // CONTRACT-GAP 18: a request answered *elsewhere* by a
-                // hand-over that ended without step 4 stays queued; counted,
-                // not judged, until the contract settles it.
-                if gap_18(&self.m, n) {
-                    self.gaps[0] = true;
-                    continue;
-                }
-                // CONTRACT-GAP 20: a request a fresh start skipped is never
-                // answered, and a rebuild that sent it waits for ever.
-                if gap_20 {
-                    continue;
-                }
-                let node = self.m.sys.node(n);
-                let waits: Vec<_> = node.threads.values().map(|t| t.wait.clone()).collect();
-                panic!(
-                    "seed {seed}: a wait of node {n} never ended: {waits:?}, members {:?}, \
-                     role {:?}, requests {:?}, rebuilds {:?}, handing {:?}",
-                    (0..NODES).map(|n| self.m.sys.member(n)).collect::<Vec<_>>(),
-                    self.m.sys.role(IOMMU_ROLE),
-                    node.unit_requests.iter().flatten().collect::<Vec<_>>(),
-                    node.rebuilds,
-                    node.handing,
-                );
-            }
+        if (0..NODES).any(|n| self.m.state(n) == MemberState::Starting) {
+            self.run_by(dodos_abi::START_NS + sweep, MS);
         }
+        self.gap_21 = super::explore::gap_21(&self.m);
+        super::explore::assert_live(&self.m, seed, NODES);
     }
-}
-
-/// CONTRACT-GAP 18: a unit request of `node` answered *elsewhere* while
-/// the role word still reads held with the epoch it was sent with.
-fn gap_18(m: &S, node: u16) -> bool {
-    m.sys.node(node).unit_requests.iter().flatten().any(|e| {
-        let word = m.sys.role(e.role);
-        e.elsewhere && word.state() == RoleState::Held && word.epoch() == e.epoch
-    })
 }
 
 /// The attach of a node's device into its iospace, or its detach.
@@ -1316,8 +1224,8 @@ fn map_call(m: &S, pair: Pair) -> Syscall {
 }
 
 /// One seed explored: what it reached, and whether it ended in the state
-/// of gap 18.
-fn explore_one(seed: u64) -> (Seen, [bool; 3]) {
+/// of gap 21.
+fn explore_one(seed: u64) -> (Seen, bool) {
     say(format_args!("seed {seed}"));
     let explored = std::panic::catch_unwind(|| {
         let mut run = Run::new(seed);
@@ -1325,7 +1233,7 @@ fn explore_one(seed: u64) -> (Seen, [bool; 3]) {
             run.step();
         }
         run.liveness(seed);
-        (run.seen, run.gaps)
+        (run.seen, run.gap_21)
     });
     explored.unwrap_or_else(|panic| {
         eprintln!("seed {seed} fails; DODOS_SEED={seed} replays it");
@@ -1342,7 +1250,7 @@ fn explore(seeds: Vec<u64>) -> Reach {
         None => seeds,
     };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let runs: Vec<(Seen, [bool; 3])> = std::thread::scope(|scope| {
+    let runs: Vec<(Seen, bool)> = std::thread::scope(|scope| {
         let seeds = &seeds;
         let handles: Vec<_> = (0..threads)
             .map(|i| {
@@ -1356,11 +1264,9 @@ fn explore(seeds: Vec<u64>) -> Reach {
             .collect()
     });
     let mut reach = Reach::new();
-    for (seen, gaps) in &runs {
+    for (seen, gap_21) in &runs {
         reach.add(seen);
-        for (count, &gap) in reach.gaps.iter_mut().zip(gaps) {
-            *count += usize::from(gap);
-        }
+        reach.gap_21 += usize::from(*gap_21);
     }
     reach
 }
@@ -1387,8 +1293,7 @@ fn report(reach: &Reach) -> Vec<String> {
     let print = std::env::var("DODOS_COUNTS").is_ok();
     let excluded = |a: usize, b: usize| IMPOSSIBLE.contains(&(a, b));
     if print {
-        let [g18, g19, g20] = reach.gaps;
-        eprintln!("seeds that reach gap 18: {g18}, gap 19: {g19}, gap 20: {g20}");
+        eprintln!("seeds ending in gap 21: {}", reach.gap_21);
         for e in 0..EVENTS {
             eprintln!("event {:>26}: {}", NAMES[e], reach.events[e]);
         }

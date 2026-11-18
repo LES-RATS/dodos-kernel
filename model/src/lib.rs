@@ -23,12 +23,9 @@
 //!
 //! `CONTRACT-GAP` marks a behaviour that the contract does not fix; the
 //! contract settled the sixteen of pass 15 (pass 16, D-133), and each such
-//! branch names the contract's sentence, "gap *n*". Open since pass 25:
-//! gap 17, R1 by a node that hands a unit role over (`Model::r1`); gap 18,
-//! a request answered *elsewhere* by a hand-over that ends without step 4
-//! (`Model::unit_send_queued`); gap 19, evidence stuck against a starting
-//! node (`Model::evidence`); gap 20, a request to a starting node's
-//! generation skipped by its fresh start (`Model::skip_rings`).
+//! branch names the contract's sentence, "gap *n*". The four of pass 25,
+//! 17 to 20, are settled by D-144. Open since pass 26: gap 21, the seal
+//! of the holder of a failed unit's role (`Model::hand_all_units`).
 
 #![forbid(unsafe_code)]
 
@@ -1186,10 +1183,6 @@ pub struct Model {
     /// submission to a unit with the role word it read and its operation,
     /// and each message applied with its header.
     submitted: Ephemeral<Vec<(usize, dodos_abi::RoleWord, crate::rings::UnitOp)>>,
-    /// CONTRACT-GAP 20: the requests and sends to this node's generation
-    /// that its fresh start skipped (sender, credit, serial), written after
-    /// its member word read *starting* and before it built its state.
-    skipped: Ephemeral<Vec<(u16, u8, u32)>>,
     applied: Ephemeral<Vec<(dodos_abi::RingHeader, dodos_abi::Member)>>,
     steps_at: Ephemeral<u64>,
     steps_now: Ephemeral<u64>,

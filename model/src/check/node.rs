@@ -40,15 +40,17 @@ impl Model {
                 word.state() == dodos_abi::RoleState::Held && word.holder() == self.node,
                 "SERVED: a unit operation submitted by a node the role word does not name as holder",
             )?;
-            // CONTRACT-GAP 17 (pass 25): R1 is not a request, and the
-            // contract does not say whether the node that hands a unit
-            // role runs it during steps 1 to 3 for a node accused then
-            // (Roles: R1 at every change of holder names the target at
-            // step 5 and a take-over only). Its whole-unit invalidation is
-            // not judged here.
+            // The node that hands a unit role is the holder until step 4:
+            // during steps 1 to 3 it still runs R1, while it maps the unit
+            // (before step 3), and nothing else (Roles, D-144).
             let r1 = matches!(op, crate::rings::UnitOp::Invalidate { domain: None });
+            let mapped = self
+                .table
+                .units
+                .get(&role)
+                .is_some_and(|u| u.mapped.contains(&self.node));
             ensure(
-                r1 || !self.handing.contains_key(&role),
+                r1 && mapped || !self.handing.contains_key(&role),
                 "SERVED: a unit operation submitted after step 1 of a hand-over",
             )?;
         }

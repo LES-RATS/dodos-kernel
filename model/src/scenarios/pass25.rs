@@ -162,16 +162,16 @@ fn a_request_kept_by_a_rebuild_whose_unit_never_confirms_is_answered_failed() {
     assert_eq!(m.woken(0), Some(&Err(Error::Busy)));
 }
 
-// CONTRACT-GAP 18, the combined exploration's seed 20: a request answered
+// Gap 18, the combined exploration's seed 20: a request answered
 // *elsewhere* during steps 1 to 3 of a hand-over is kept queued while the
 // role word reads the epoch it was sent with (Roles, D-141). A hand-over
-// that ends without step 4, here because the unit fails during the drain
-// (`role_hand` returns `busy`), leaves the word held by the same node with
-// the same epoch: the request is never sent again and its thread waits for
-// ever. The test holds the reading the model implements until the
-// contract settles it.
+// that ended without step 4, here because the unit fails during the drain
+// (`role_hand` returns `busy`), left the word with the same epoch, and the
+// request was never sent again. Every end of a hand-over now changes the
+// epoch: the abandoned one writes held (node 1, e + 1), and the request is
+// sent again and answered, *failed* since the unit has failed (D-144).
 #[test]
-fn gap_18_a_request_answered_elsewhere_by_a_hand_over_that_ends_without_step_4_stays_queued() {
+fn a_request_answered_elsewhere_by_an_abandoned_hand_over_is_sent_again_and_answered() {
     use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach, attached, three};
     let mut m = three();
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
@@ -206,13 +206,11 @@ fn gap_18_a_request_answered_elsewhere_by_a_hand_over_that_ends_without_step_4_s
     m.run(10 * dodos_abi::IOMMU_WAIT_NS);
     assert_eq!(m.woken(1), Some(&Err(Error::Busy)));
     let word = m.sys.role(IOMMU_ROLE);
-    assert!(word.failed() && word.holder() == 1 && word.epoch() == epoch);
-    // The request is still queued, and node 2's thread still waits.
-    assert!(elsewhere(&m));
-    assert!(matches!(
-        m.sys.node(2).threads[&m.t[2]].wait,
-        crate::Wait::Unit(_)
-    ));
+    assert_eq!(word.state(), dodos_abi::RoleState::Held);
+    assert!(word.failed() && word.holder() == 1 && word.epoch() == epoch + 1);
+    // The request was sent again with the new epoch and answered.
+    assert!(!elsewhere(&m));
+    assert_eq!(m.woken(2), Some(&Err(Error::Busy)));
 }
 
 // The combined exploration's seeds 12 and 20: a requester answered

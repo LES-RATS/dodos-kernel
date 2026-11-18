@@ -199,6 +199,12 @@ impl Model {
                 continue;
             }
             done = false;
+            // CONTRACT-GAP 21 (pass 26): a failed unit cannot be handed
+            // (its queue never drains, step 2; `role_hand` is `busy` on
+            // it), yet the seal hands every unit role and a sealed node
+            // holds none: the seal of its holder never ends. Implemented
+            // as the text reads: the hand-over starts again at every step,
+            // each abandoned one writing a new epoch (D-144).
             if word.state() == RoleState::Held && !self.handing.contains_key(&role) {
                 let Some(successor) = dodos_abi::successor(&self.table.members, me as usize) else {
                     continue;
@@ -293,6 +299,7 @@ impl Model {
         if !drained {
             if self.unit_overdue(hand.started) {
                 self.fail_unit(role);
+                self.abandon(role);
                 finish(self, Err(Error::Busy));
                 return true;
             }
@@ -308,6 +315,7 @@ impl Model {
             if let Some(unit) = self.table.units.get_mut(&role) {
                 unit.mapped.insert(self.node);
             }
+            self.abandon(role);
             finish(self, Err(Error::Busy));
             return true;
         }
@@ -321,6 +329,18 @@ impl Model {
         let _ = self.write_message(hand.target, body, None, None);
         finish(self, Ok(Output::Epoch(handing.epoch())));
         true
+    }
+
+    /// A hand-over that ends without step 4 writes held (this node, a new
+    /// epoch) in one gate write before its call returns, so that every
+    /// requester it answered *elsewhere* sends its request again (Roles,
+    /// D-144: the word kept its epoch, and such a request stayed queued for
+    /// ever). The new epoch is the next one: no handing word was written
+    /// with it, and a later change of holder writes the one after.
+    fn abandon(&mut self, role: usize) {
+        let word = self.table.roles[role];
+        let held = word.keeping_failed(RoleWord::held(self.node, word.epoch().wrapping_add(1)));
+        self.table.write_role(self.node, role, held);
     }
 
     /// A `Handed` received: step 5, as at every read of a handing word that

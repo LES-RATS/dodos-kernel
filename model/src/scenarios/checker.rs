@@ -282,6 +282,48 @@ fn a_unit_operation_submitted_by_a_node_that_is_not_the_holder_is_reported() {
 }
 
 #[test]
+fn a_member_word_with_the_resume_bit_in_another_state_than_starting_is_reported() {
+    let mut m = S::two();
+    let live = m.sys.member(1);
+    assert_eq!(live.state(), MemberState::Live);
+    m.sys.edit_table(|t| t.members[1] = live.with_resume());
+    assert_eq!(
+        m.sys.check(),
+        Err("member word: a word that fails its check".to_string())
+    );
+}
+
+/// R1's invalidation during a hand-over: judged by whether the node that
+/// hands still maps the unit (D-144).
+#[test]
+fn r1_submitted_during_a_hand_over_is_reported_once_the_unit_is_unmapped() {
+    let spoiled = |mapped: bool| {
+        let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
+        let op = crate::rings::UnitOp::Invalidate { domain: None };
+        k.m.submitted.push((0, RoleWord::held(0, 5), op));
+        k.m.handing.insert(
+            0,
+            crate::roles::Handover {
+                target: 1,
+                started: 0,
+                caller: None,
+            },
+        );
+        let unit = k.m.table.units.entry(0).or_default();
+        match mapped {
+            true => unit.mapped.insert(0),
+            false => unit.mapped.remove(&0),
+        };
+        k
+    };
+    assert_eq!(spoiled(true).m.check(), Ok(()));
+    reported(
+        &spoiled(false),
+        "SERVED: a unit operation submitted after step 1 of a hand-over",
+    );
+}
+
+#[test]
 fn a_unit_operation_submitted_after_step_1_of_a_hand_over_is_reported() {
     let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
     let op = crate::rings::UnitOp::Invalidate { domain: Some(0) };

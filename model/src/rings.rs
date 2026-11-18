@@ -271,6 +271,9 @@ pub(crate) enum Full {
     Ring,
     /// No credit of the kind is free toward the peer.
     Credit,
+    /// The receiver's member word reads starting by a fresh start: nothing
+    /// but an answer is written toward it until it reads live (D-144).
+    Starting,
 }
 
 impl Model {
@@ -319,6 +322,19 @@ impl Model {
     ) -> Result<Option<(u8, u32)>, Full> {
         let kind = body.kind();
         let entries = body.entries();
+        // No node writes into a ring toward a node whose member word reads
+        // starting with the resume bit clear, until it reads live: a fresh
+        // start sets its consumer indices to the producers', which would
+        // drop what was written meanwhile. A message for it waits in its
+        // sender, as one for a sealed node does; an answer to a message the
+        // starting generation sent is written, since it sends only after
+        // its reset. A resuming node kept its indices and is written to as
+        // a live node (What crosses between nodes, a fresh start, D-144: a
+        // rebuild's `ReportAsk` was skipped, and its credit never answered).
+        let member = self.table.member(to);
+        if member.state() == MemberState::Starting && !member.resuming() && !kind.is_answer() {
+            return Err(Full::Starting);
+        }
         if !self.ring_room(to, kind, entries) {
             return Err(Full::Ring);
         }
@@ -852,31 +868,11 @@ impl Model {
 
     /// The rings into this node at a fresh start: every consumer index is
     /// set to its ring's producer index, so the node consumes nothing sent
-    /// before (What crosses between nodes, G13).
-    ///
-    /// CONTRACT-GAP 20 (pass 25): a message written to this generation
-    /// after its member word read *starting* and before this, a
-    /// `ReportAsk` of a rebuild that pulls "every node that is starting",
-    /// is skipped too, and its sender's credit is never answered (CREDIT).
-    /// Implemented as the sentence reads; the skipped requests are
-    /// recorded, so that the check does not judge their credits.
+    /// before (What crosses between nodes, G13); nothing but an answer was
+    /// written toward it while it was starting (D-144).
     pub(crate) fn skip_rings(&mut self) {
-        let generation = self.table.generation(self.node);
         for from in 0..self.table.nodes {
             for user in [false, true] {
-                let ring = self.ring_of(from, self.node, user);
-                let start = self.consumed(from, self.node, user);
-                let skipped: Vec<(u16, u8, u32)> = (start..ring.produced)
-                    .filter_map(|at| match ring.at(at) {
-                        Some(crate::table::RingEntry::Message(m))
-                            if m.header.receiver_generation == generation =>
-                        {
-                            m.header.credit().map(|(i, s)| (from, i, s))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                self.skipped.0.extend(skipped);
                 let produced = self.ring_of(from, self.node, user).produced;
                 self.set_consumed(from, user, produced);
             }

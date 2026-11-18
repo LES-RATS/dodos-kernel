@@ -418,12 +418,9 @@ impl Model {
             // A requester answered *elsewhere* keeps the request queued
             // while the word reads the epoch it sent, and sends it once
             // the word does (Roles, D-141; pass 25: it sent it again at
-            // once to the node that hands, at every step, for ever).
-            // CONTRACT-GAP 18 (pass 25): a hand-over that ends without
-            // step 4 (refused, or the unit failed during the drain) leaves
-            // the word held by the same node with the same epoch, so such
-            // a request stays queued for ever; the contract gives it no
-            // other rule.
+            // once to the node that hands, at every step, for ever). Every
+            // end of a hand-over changes the epoch, an abandoned one too
+            // (D-144).
             if entry.elsewhere && epoch == entry.epoch {
                 continue;
             }

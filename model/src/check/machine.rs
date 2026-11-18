@@ -53,6 +53,14 @@ impl System {
     /// check; a free word names no node.
     fn check_cores(&self) -> Check {
         let table = self.canonical();
+        // A member word passes its check: the resume bit only in a starting
+        // word (D-144).
+        for member in &table.members {
+            ensure(
+                dodos_abi::Member::from_raw(member.raw()).is_some(),
+                "member word: a word that fails its check",
+            )?;
+        }
         for core in 0..table.core_words.len() {
             let word = CoreWord::from_raw(table.core_words[core]);
             ensure(word.is_some(), "core word: a word that fails its check")?;
@@ -286,15 +294,8 @@ impl System {
                         Completes::Revoke { grant } => self.released(y, x, grant),
                         _ => false,
                     };
-                    // CONTRACT-GAP 20: a request the receiver's fresh start
-                    // skipped is not judged.
-                    let skipped = self.has(y)
-                        && self
-                            .node(y)
-                            .skipped
-                            .contains(&(x, index as u8, credit.serial));
                     ensure(
-                        request || answer || kept || released || skipped,
+                        request || answer || kept || released,
                         "CREDIT: a credit in use with neither its request nor its answer in flight",
                     )?;
                 }

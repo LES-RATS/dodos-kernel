@@ -21,6 +21,7 @@ mod pass23;
 mod pass24;
 mod pass24_deepseek;
 mod pass25;
+mod pass26;
 mod reviews;
 mod units;
 mod verify13;
@@ -234,16 +235,54 @@ pub(crate) fn place_first(node: u16, core: u64) -> Syscall {
     }
 }
 
-/// A whole machine: its system and the first thread of each node.
+/// A whole machine: its system, the first thread of each node, and the
+/// harm a test did to its nodes.
 pub(crate) struct S {
     pub(crate) sys: System,
     pub(crate) t: Vec<ObjId>,
+    pub(crate) harm: Harm,
+}
+
+/// The nodes a test harmed, each with the generation harmed: killed or a
+/// core retired by a call that succeeded, a core hung, a failure found;
+/// and the nodes sealed. An exploration's liveness judges an accusation
+/// by them (`Harm::accepts`).
+#[derive(Default)]
+pub(crate) struct Harm {
+    pub(crate) harmed: std::collections::BTreeSet<(u16, u32)>,
+    pub(crate) sealed: std::collections::BTreeSet<(u16, u32)>,
+    /// Each start or resume that succeeded: the node and generation
+    /// started, and its starter with its generation.
+    pub(crate) starts: std::collections::BTreeMap<(u16, u32), (u16, u32)>,
+}
+
+impl Harm {
+    /// Whether the accusation of `node` in `member` is one a harm explains:
+    /// the node harmed in that generation, or sealed and accused with
+    /// evidence seal.
+    pub(crate) fn accepts(&self, node: u16, member: dodos_abi::Member) -> bool {
+        let at = (node, member.generation());
+        // A start or a resume whose starter was harmed may never end:
+        // nobody wakes its cores again, and it is accused stale at
+        // `START_NS`.
+        let orphan = self
+            .starts
+            .get(&at)
+            .is_some_and(|starter| self.harmed.contains(starter));
+        self.harmed.contains(&at)
+            || self.sealed.contains(&at) && member.evidence() == dodos_abi::Evidence::Seal
+            || orphan && member.evidence() == dodos_abi::Evidence::Stale
+    }
 }
 
 impl S {
     pub(crate) fn on(machine: &Machine) -> Self {
         let (sys, t) = System::boot(machine).expect("the machine boots");
-        let s = Self { sys, t };
+        let s = Self {
+            sys,
+            t,
+            harm: Harm::default(),
+        };
         assert_eq!(s.sys.check(), Ok(()));
         s
     }
@@ -261,9 +300,59 @@ impl S {
 
     #[track_caller]
     pub(crate) fn call_by(&mut self, node: u16, thread: ObjId, call: Syscall) -> Outcome {
+        // A stop of a node that succeeds is a harm (kill, retire) or a seal.
+        let stop = match call {
+            Syscall::NodeStop {
+                node: target, mode, ..
+            } => target
+                .index()
+                .checked_sub(START_SLOT_FIRST)
+                .map(|n| (n as u16, mode)),
+            _ => None,
+        };
+        let generation = stop.map(|(n, _)| self.sys.member(n).generation());
+        let started = match call {
+            Syscall::NodeStart { node: target, .. } => target
+                .index()
+                .checked_sub(START_SLOT_FIRST)
+                .map(|n| n as u16),
+            _ => None,
+        };
+        let starter = (node, self.sys.member(node).generation());
         let outcome = self.sys.apply(node, thread, call);
         assert_eq!(self.sys.check(), Ok(()));
+        if let (Some(target), DONE) = (started, outcome.clone()) {
+            let started = (target, self.sys.member(target).generation());
+            self.harm.starts.insert(started, starter);
+        }
+        if let (Some((target, mode)), Some(generation), DONE) = (stop, generation, outcome.clone())
+        {
+            match mode {
+                dodos_abi::NODE_STOP_SEAL => self.harm.sealed.insert((target, generation)),
+                _ => self.harm.harmed.insert((target, generation)),
+            };
+        }
         outcome
+    }
+
+    /// A core hangs (`System::hang`), a harm of the node it runs.
+    #[track_caller]
+    pub(crate) fn hang(&mut self, core: usize, nmi: bool) {
+        let word = dodos_abi::CoreWord::from_raw(self.sys.core_word(core));
+        if let Some(word) = word.filter(|w| w.state() == dodos_abi::CoreState::Owned) {
+            self.harm.harmed.insert((word.slot(), word.generation()));
+        }
+        self.sys.hang(core, nmi);
+        assert_eq!(self.sys.check(), Ok(()));
+    }
+
+    /// A node finds a failure in itself (`System::fail`), a harm.
+    #[track_caller]
+    pub(crate) fn fail(&mut self, node: u16) {
+        let generation = self.sys.member(node).generation();
+        self.harm.harmed.insert((node, generation));
+        self.sys.fail(node, 0);
+        assert_eq!(self.sys.check(), Ok(()));
     }
 
     #[track_caller]

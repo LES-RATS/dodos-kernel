@@ -716,9 +716,16 @@ pub enum Evidence {
 /// The driver field of a member word with no driver.
 pub const DRIVER_NONE: u16 = 0xFFFF;
 
+/// The resume bit of a member word, bit 9: the node is starting by a
+/// resume, so it kept the consumer indices of its rings and is written to
+/// as a live node is; set by the write sealed (g) to starting (g), clear in
+/// a fresh start's starting (g + 1) and in every other state (D-144).
+pub const MEMBER_RESUME: u64 = 1 << 9;
+
 /// The member word of a node: state (0-3), evidence (4-6), the node's fence
-/// class (7-8, the lowest class of its cores, written when it starts), zero
-/// (9-15), driver (16-31), generation (32-63).
+/// class (7-8, the lowest class of its cores, written when it starts), the
+/// resume bit (9, starting only), zero (10-15), driver (16-31), generation
+/// (32-63).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Member(u64);
@@ -743,14 +750,29 @@ impl Member {
         Self(self.0 & !(0b11 << 7) | ((class & 0b11) as u64) << 7)
     }
 
-    /// `None` for a state 8 to 15, an evidence 7, a class 3, or a bit 9-15
-    /// set: "a word with 3 fails its check, as a state 8 to 15 does" (The
-    /// states of a node, the member word, gap 1).
+    /// `None` for a state 8 to 15, an evidence 7, a class 3, a bit 10-15
+    /// set, or the resume bit in a state other than starting: "a word with 3
+    /// fails its check, as a state 8 to 15 does" (The states of a node, the
+    /// member word, gap 1; D-144).
     pub const fn from_raw(raw: u64) -> Option<Self> {
-        if raw & 0xf >= 8 || raw >> 4 & 0x7 == 7 || raw >> 7 & 0b11 == 3 || raw >> 9 & 0x7f != 0 {
+        let resume = raw & MEMBER_RESUME != 0 && raw & 0xf != MemberState::Starting as u64;
+        if raw & 0xf >= 8 || raw >> 4 & 0x7 == 7 || raw >> 7 & 0b11 == 3 || raw >> 10 & 0x3f != 0 {
+            return None;
+        }
+        if resume {
             return None;
         }
         Some(Self(raw))
+    }
+
+    /// The same starting word with the resume bit set (D-144).
+    pub const fn with_resume(self) -> Self {
+        Self(self.0 | MEMBER_RESUME)
+    }
+
+    /// Whether the resume bit is set: the node is starting by a resume.
+    pub const fn resuming(self) -> bool {
+        self.0 & MEMBER_RESUME != 0
     }
 
     /// The node's fence class, bits 7-8.
@@ -1493,6 +1515,23 @@ mod attach_word_proofs {
             assert_eq!(AttachWord::from_raw(word.raw()), Some(word));
             assert_eq!(word.state(), Some(state));
             assert_eq!(word.root(), root);
+        }
+    }
+}
+
+#[cfg(kani)]
+mod member_proofs {
+    use super::{MEMBER_RESUME, Member, MemberState};
+
+    /// A member word is accepted with its resume bit only in state
+    /// starting, and reads back what it holds (D-144).
+    #[kani::proof]
+    fn a_member_word_holds_the_resume_bit_only_while_starting() {
+        let raw: u64 = kani::any();
+        if let Some(word) = Member::from_raw(raw) {
+            assert_eq!(word.raw(), raw);
+            assert!(!word.resuming() || word.state() as u8 == MemberState::Starting as u8);
+            assert_eq!(word.resuming(), raw & MEMBER_RESUME != 0);
         }
     }
 }

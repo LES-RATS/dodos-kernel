@@ -228,13 +228,16 @@ impl Model {
                 (next, cores)
             }
             _ => {
+                // A resume: starting (g) with the resume bit, so that other
+                // nodes write to it as to a live node (D-144).
                 let starting = Member::new(
                     MemberState::Starting,
                     Evidence::None,
                     DRIVER_NONE,
                     generation,
                 )
-                .with_class(member.class());
+                .with_class(member.class())
+                .with_resume();
                 self.table.write_member(self.node, target, starting);
                 (generation, self.table.cores_of(target, generation))
             }
@@ -661,17 +664,18 @@ impl Model {
                         return Some(Evidence::Stale);
                     }
                 }
-                // CONTRACT-GAP 19 (pass 25): a starting node consumes no
-                // ring before it is ready, and a start may take up to
-                // `START_NS`; the contract bounds evidence stale against a
-                // starting node by `START_NS` (D-137), not evidence stuck,
-                // so a message waiting in a ring to a node whose start
-                // lasts longer than `STUCK_NS` accuses it. Implemented as
-                // the row of evidence stuck reads.
+                // A starting node consumes no ring before it is ready, and
+                // a start may take up to `START_NS`: while it is starting,
+                // evidence stuck uses `START_NS` in place of `STUCK_NS`
+                // (the larger of the two), as stale does (D-137, D-144).
                 Watched::Ring { user, consumed } => {
+                    let wait = match member.state() {
+                        MemberState::Starting => START_NS.max(self.table.stuck_ns),
+                        _ => self.table.stuck_ns,
+                    };
                     if self.ring_consumed(node, user) == consumed
                         && self.ring_watch(node).is_some()
-                        && now >= observation.at + self.table.stuck_ns
+                        && now >= observation.at + wait
                     {
                         return Some(Evidence::Stuck);
                     }
@@ -1043,11 +1047,12 @@ impl Model {
     /// invalidated; R1 is done when the unit confirms (never on a unit that
     /// has failed).
     ///
-    /// CONTRACT-GAP 17 (pass 25): this runs whether or not the node is
-    /// handing the role over (steps 1 to 3 of a planned hand-over); the
-    /// contract fixes R1 at step 5 by the target and at a take-over, not
-    /// by the node that hands, and not whether it still writes the unit's
-    /// entries after its step 3 unmapped them.
+    /// The node that hands a unit role is its holder until step 4 and runs
+    /// R1 during steps 1 to 3 too; the drain waits for R1's invalidation,
+    /// and `acked` is written only once R1 is done (Roles, D-144). Its step
+    /// 3 and step 4 run in one step here (`hand_step`), so it never holds
+    /// the role unmapped between two events, and the case "unmapped before
+    /// step 4" of D-144 does not arise.
     pub(crate) fn r1(&mut self, node: u16, generation: u32) {
         let held: Vec<usize> = (0..self.table.roles.len())
             .filter(|&r| {
