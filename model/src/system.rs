@@ -820,6 +820,11 @@ impl System {
             };
             model.shared = true;
             model.manual = true;
+            // The clock is the machine's (Clock): a kernel started at run
+            // time reads it as the others do (pass 25: it read 0 until
+            // the clock next moved, and stamped its first observations at
+            // instant 0).
+            model.set_now(self.now);
             model.begin_fresh();
             self.nodes[node as usize] = Some(model);
         } else if (0..self.model(node).core_count()).all(|p| self.model(node).is_silent(p)) {

@@ -637,7 +637,7 @@ impl Model {
         for observation in self.table.beacons[me]
             .observations
             .iter()
-            .filter(|o| o.node == node)
+            .filter(|o| o.node == node && o.generation == g)
         {
             match observation.watched {
                 Watched::Heartbeat { core, heartbeat } => {
@@ -771,7 +771,7 @@ impl Model {
                 let observations = &mut self.table.beacons[me].observations;
                 if observations
                     .iter()
-                    .any(|o| o.node == node && o.watched == watched)
+                    .any(|o| o.node == node && o.generation == g && o.watched == watched)
                 {
                     continue;
                 }
@@ -792,6 +792,7 @@ impl Model {
                 if observations.len() < OBSERVATIONS_MAX {
                     observations.push(Observation {
                         node,
+                        generation: g,
                         watched,
                         at: now,
                     });
@@ -1034,6 +1035,12 @@ impl Model {
     /// remapping entries and the lines of `node` are cleared, and the unit
     /// invalidated; R1 is done when the unit confirms (never on a unit that
     /// has failed).
+    ///
+    /// CONTRACT-GAP 17 (pass 25): this runs whether or not the node is
+    /// handing the role over (steps 1 to 3 of a planned hand-over); the
+    /// contract fixes R1 at step 5 by the target and at a take-over, not
+    /// by the node that hands, and not whether it still writes the unit's
+    /// entries after its step 3 unmapped them.
     pub(crate) fn r1(&mut self, node: u16, generation: u32) {
         let held: Vec<usize> = (0..self.table.roles.len())
             .filter(|&r| {

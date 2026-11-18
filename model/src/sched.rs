@@ -303,7 +303,6 @@ impl Model {
     /// largest value if none), so that it need not beat while idle.
     fn beat(&mut self) {
         let at = *self.at;
-        self.cores[at].events.0 += 1;
         let number = self.cores[at].number as usize;
         let (node, generation) = (self.node, self.table.generation(self.node));
         // `idle_until` is written on the clock it is compared on: the
@@ -316,7 +315,12 @@ impl Model {
                 .map_or(u64::MAX, |t| t.saturating_sub(self.table.stopped_time)),
         };
         let beacon = &mut self.table.core_beacons[number];
-        beacon.heartbeat.0 = self.cores[at].events.0;
+        // The heartbeat is the beacon's counter, which outlives the node's
+        // generations: a kernel started on the core goes on from it (Cores,
+        // Beacons: "a counter written at the exit of every kernel event";
+        // pass 25: each kernel counted from 0, so a value another node had
+        // observed came back and accused a node that beat).
+        beacon.heartbeat.0 = beacon.heartbeat.0.wrapping_add(1);
         beacon.idle_until.0 = idle_until;
         beacon.ran = (node, generation);
     }

@@ -273,7 +273,8 @@ fn a_thread_waiting_for_an_answer_no_credit_expects_is_reported() {
 #[test]
 fn a_unit_operation_submitted_by_a_node_that_is_not_the_holder_is_reported() {
     let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
-    k.m.submitted.push((0, RoleWord::held(1, 5)));
+    let op = crate::rings::UnitOp::Invalidate { domain: Some(0) };
+    k.m.submitted.push((0, RoleWord::held(1, 5), op));
     reported(
         &k,
         "SERVED: a unit operation submitted by a node the role word does not name as holder",
@@ -283,7 +284,8 @@ fn a_unit_operation_submitted_by_a_node_that_is_not_the_holder_is_reported() {
 #[test]
 fn a_unit_operation_submitted_after_step_1_of_a_hand_over_is_reported() {
     let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
-    k.m.submitted.push((0, RoleWord::held(0, 5)));
+    let op = crate::rings::UnitOp::Invalidate { domain: Some(0) };
+    k.m.submitted.push((0, RoleWord::held(0, 5), op));
     k.m.handing.insert(
         0,
         crate::roles::Handover {

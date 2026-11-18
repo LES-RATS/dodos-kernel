@@ -200,6 +200,7 @@ fn hydrogen_11_a_core_idle_with_no_armed_timer_is_never_stale() {
         .observations
         .push(crate::table::Observation {
             node: 1,
+            generation,
             watched: crate::table::Watched::Heartbeat {
                 core: 1,
                 heartbeat: k.m.table.core_beacons[1].heartbeat.0,

@@ -138,6 +138,7 @@ fn f5_a_heartbeat_unchanged_for_exactly_stale_ns_is_stale_evidence() {
         t.core_beacons[1].idle_until.0 = 0;
         t.beacons[0].observations.push(Observation {
             node: 1,
+            generation: t.members[1].generation(),
             watched: Watched::Heartbeat { core: 1, heartbeat },
             at,
         });

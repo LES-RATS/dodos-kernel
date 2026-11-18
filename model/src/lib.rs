@@ -21,9 +21,12 @@
 //! lock makes them). `model/README.md`, "What it does not model", has the
 //! whole list.
 //!
-//! `CONTRACT-GAP` marks a behaviour that the contract does not fix; none is
-//! left since the contract settled the sixteen of pass 15 (pass 16, D-133),
-//! and each such branch names the contract's sentence, "gap *n*".
+//! `CONTRACT-GAP` marks a behaviour that the contract does not fix; the
+//! contract settled the sixteen of pass 15 (pass 16, D-133), and each such
+//! branch names the contract's sentence, "gap *n*". Open since pass 25:
+//! gap 17, R1 by a node that hands a unit role over (`Model::r1`), and gap
+//! 18, a request answered *elsewhere* by a hand-over that ends without
+//! step 4 (`Model::unit_send_queued`).
 
 #![forbid(unsafe_code)]
 
@@ -1178,9 +1181,9 @@ pub struct Model {
     /// last event (the model's bookkeeping, not the kernel's).
     added: Ephemeral<u64>,
     /// What the current event did that the checks of crossing judge: each
-    /// submission to a unit with the role word it read, and each message
-    /// applied with its header.
-    submitted: Ephemeral<Vec<(usize, dodos_abi::RoleWord)>>,
+    /// submission to a unit with the role word it read and its operation,
+    /// and each message applied with its header.
+    submitted: Ephemeral<Vec<(usize, dodos_abi::RoleWord, crate::rings::UnitOp)>>,
     applied: Ephemeral<Vec<(dodos_abi::RingHeader, dodos_abi::Member)>>,
     steps_at: Ephemeral<u64>,
     steps_now: Ephemeral<u64>,

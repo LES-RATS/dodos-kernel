@@ -35,13 +35,20 @@ impl Model {
     /// a later generation of its receiver (RECEIVER), and none of a
     /// generation that is over is applied, a signal included (SENDER).
     fn check_crossing(&self) -> Check {
-        for &(role, word) in self.submitted.iter() {
+        for &(role, word, op) in self.submitted.iter() {
             ensure(
                 word.state() == dodos_abi::RoleState::Held && word.holder() == self.node,
                 "SERVED: a unit operation submitted by a node the role word does not name as holder",
             )?;
+            // CONTRACT-GAP 17 (pass 25): R1 is not a request, and the
+            // contract does not say whether the node that hands a unit
+            // role runs it during steps 1 to 3 for a node accused then
+            // (Roles: R1 at every change of holder names the target at
+            // step 5 and a take-over only). Its whole-unit invalidation is
+            // not judged here.
+            let r1 = matches!(op, crate::rings::UnitOp::Invalidate { domain: None });
             ensure(
-                !self.handing.contains_key(&role),
+                r1 || !self.handing.contains_key(&role),
                 "SERVED: a unit operation submitted after step 1 of a hand-over",
             )?;
         }

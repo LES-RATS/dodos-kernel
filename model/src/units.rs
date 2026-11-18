@@ -66,6 +66,9 @@ pub(crate) struct UnitEntry {
     /// For the claim of a remapped line, its redirection entry, asked of
     /// the holder of the IOAPIC's role after the last unit (D-134).
     pub(crate) then: Option<(usize, UnitOp)>,
+    /// Answered *elsewhere* at `epoch`: sent again only once the role word
+    /// reads another epoch (Roles, D-141).
+    pub(crate) elsewhere: bool,
 }
 
 /// What follows the first unit of a claim: the segment whose later units
@@ -183,6 +186,7 @@ impl Model {
             segment: chain.segment,
             failed: false,
             then: chain.then,
+            elsewhere: false,
         });
         if let Waiter::Thread(Some(thread)) = waiter {
             live(&mut self.threads, thread).wait = Wait::Unit(index);
@@ -229,6 +233,7 @@ impl Model {
             segment,
             failed,
             then,
+            elsewhere: false,
             ..entry
         });
         self.unit_send_queued();
@@ -410,6 +415,18 @@ impl Model {
                 continue;
             }
             let epoch = word.epoch();
+            // A requester answered *elsewhere* keeps the request queued
+            // while the word reads the epoch it sent, and sends it once
+            // the word does (Roles, D-141; pass 25: it sent it again at
+            // once to the node that hands, at every step, for ever).
+            // CONTRACT-GAP 18 (pass 25): a hand-over that ends without
+            // step 4 (refused, or the unit failed during the drain) leaves
+            // the word held by the same node with the same epoch, so such
+            // a request stays queued for ever; the contract gives it no
+            // other rule.
+            if entry.elsewhere && epoch == entry.epoch {
+                continue;
+            }
             if holder == self.node {
                 if !self.serves_role(entry.role) {
                     continue;
@@ -437,6 +454,7 @@ impl Model {
             if let Ok(Some((credit, _))) = self.write_message(holder, body, Some(completes), None) {
                 let e = self.unit_requests[index].as_mut().expect("queued");
                 (e.epoch, e.stage) = (epoch, Stage::Sent { to: holder, credit });
+                e.elsewhere = false;
             }
         }
     }
@@ -460,7 +478,7 @@ impl Model {
         // review's verification of lot C, O13).
         let now = self.membership_now();
         let word = self.table.roles[role];
-        self.submitted.0.push((role, word));
+        self.submitted.0.push((role, word, op));
         // The holder's gate writes the attach word *attached* before the
         // context entry (D-137).
         if let UnitOp::Attach { device, root, .. } = op
@@ -583,7 +601,8 @@ impl Model {
     /// A `UnitAnswer` received by the requester, applied in the event that
     /// consumes it whether or not a thread still waits: done completes the
     /// entry, *failed* ends it with its counts kept, *elsewhere* queues it
-    /// again, sent at once if the role word now reads held by a live node.
+    /// again, sent once the role word reads held by a live node with
+    /// another epoch than the one it was sent with.
     pub(crate) fn unit_answered(
         &mut self,
         from: u16,
@@ -601,6 +620,7 @@ impl Model {
             UnitResult::Elsewhere => {
                 if let Some(e) = self.unit_requests[entry].as_mut() {
                     e.stage = Stage::Queued;
+                    e.elsewhere = true;
                 }
                 self.unit_send_queued();
             }

@@ -39,10 +39,15 @@ pub(crate) enum Watched {
 }
 
 /// An observation of a node, written by the gate only, stamped with the
-/// clock.
+/// clock, of the generation it was taken for: it is evidence against that
+/// generation only (Cores, Detection: "a core whose word names X's
+/// generation"; pass 25: an observation of a generation that ended accused
+/// the next, whose heartbeat, a count of its kernel's events, read the
+/// value observed again).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Observation {
     pub(crate) node: u16,
+    pub(crate) generation: u32,
     pub(crate) watched: Watched,
     pub(crate) at: u64,
 }

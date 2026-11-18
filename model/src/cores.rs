@@ -149,8 +149,6 @@ pub(crate) struct CorePart {
     /// Idle, slack and kernel time, published in its core beacon.
     pub(crate) idle_ns: Ephemeral<u64>,
     pub(crate) slack_ns: Ephemeral<u64>,
-    /// Its heartbeat: one more at the exit of every event of the core.
-    pub(crate) events: Ephemeral<u64>,
     /// What a core enables for a thread, as the last switch wrote it.
     pub(crate) enabled: u32,
     /// Debugging: the rate limit of each code of its kernel ring, the
@@ -807,6 +805,14 @@ impl Model {
         part.running = None;
         part.thread = None;
         part.ipis.clear();
+        // The header of the core's debug area counts the entries
+        // suppressed since machine start (Debugging, the trace rings): a
+        // kernel that starts on the core counts those of the earlier
+        // kernels as reported already (pass 25: invariant 91 failed after
+        // a fresh start).
+        if !self.resuming {
+            self.cores[position].reported = self.table.crash.areas[number].suppressed;
+        }
         let generation = self.table.generation(self.node);
         let before = self.table.core_words[number];
         let joining = CoreWordOf::from_raw(before)
@@ -857,6 +863,15 @@ impl Model {
             .with_class(member.class());
             self.table.write_member(self.node, self.node, live);
             self.ready = true;
+            // The node is ready, at no event of its cores: each core whose
+            // choice is not what it runs takes a reschedule, at which it
+            // chooses (pass 25: a core of a fresh start ran nothing with
+            // the first thread ready, invariant 46).
+            for p in 0..self.width() {
+                if self.pick(p).map(|w| w.0) != self.cores[p].running.map(|r| r.0) {
+                    self.cores[p].ipis.insert(Ipi::Reschedule);
+                }
+            }
         }
         if !fresh && position == 0 {
             self.stalled = None;

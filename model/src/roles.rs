@@ -451,12 +451,25 @@ impl Model {
             self.rebuilds.remove(&role);
             return true;
         }
-        if let Some((serial, _)) = rebuild.closing {
-            if !self.confirmed(role, serial) {
-                return false;
+        if let Some((serial, at)) = rebuild.closing {
+            // A unit that does not confirm within `IOMMU_WAIT_NS` has
+            // failed: the rebuild ends, and the requests it kept are
+            // answered *failed* (IOMMU, D-131; pass 25: it waited for the
+            // confirmation for ever, and the requests with it).
+            if !self.confirmed(role, serial) && !self.unit_failed(role) {
+                if !self.unit_overdue(at) {
+                    return false;
+                }
+                self.fail_unit(role);
             }
             self.rebuilds.remove(&role);
-            self.serve_kept(role);
+            match self.unit_failed(role) {
+                true => {
+                    self.fail_unit(role);
+                    self.unit_send_queued();
+                }
+                false => self.serve_kept(role),
+            }
             return true;
         }
         if rebuild.asked {

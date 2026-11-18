@@ -588,6 +588,7 @@ fn the_removal_of_a_lines_irq_waits_while_an_entry_still_asks_for_that_line() {
         words: None,
         segment: None,
         failed: false,
+        elsewhere: false,
         then: None,
     });
     assert_eq!(node.check(), Ok(()), "the entry is one the check accepts");
