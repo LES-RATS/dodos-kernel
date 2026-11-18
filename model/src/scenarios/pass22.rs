@@ -1345,7 +1345,9 @@ fn a_level_line_on_a_node_without_the_ioapics_role_needs_a_directed_end_of_inter
         level_line_claim(Arch::X86_64, true),
         Err(Error::Unsupported)
     );
-    assert_eq!(
+    // RISC-V: any node may claim a level line, its gate writing the
+    // APLIC's registers by number (D-146; `unsupported` before).
+    assert_ne!(
         level_line_claim(Arch::Riscv64, true),
         Err(Error::Unsupported)
     );

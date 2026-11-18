@@ -83,16 +83,53 @@ impl Model {
                 !(irq.source.level() && irq.pending),
                 "51: pending level source",
             )?;
-            // D-143, RISC-V: an armed level line whose input is high has its
-            // source pending at the APLIC, so it is forwarded again.
-            let lost = irq.state == IrqState::Armed
+            // D-143, D-146, RISC-V: an armed level line whose input is high
+            // has an MSI on its way, the acknowledgement or the bind having
+            // written `setipnum` and then `setienum`; a fired one is masked
+            // at its APLIC, by the mask at its arrival.
+            let riscv_level = self.machine.arch == crate::Arch::Riscv64
                 && irq.source.is_line()
+                && irq.source.level();
+            let line = self
+                .table
+                .aplic
+                .get(&irq.source.id())
+                .copied()
+                .unwrap_or_default();
+            let lost = riscv_level
+                && irq.state == IrqState::Armed
                 && !self.line_masked(irq.source)
-                && self
-                    .aplic
-                    .get(&irq.source.id())
-                    .is_some_and(|line| line.high && !line.pending);
-            ensure(!lost, "SETIPNUM: an armed level line high and not pending")?;
+                && line.high
+                && line.sent == 0;
+            ensure(
+                !lost,
+                "SETIPNUM: an armed level line high and no MSI on its way",
+            )?;
+            ensure(
+                !(riscv_level && irq.state == IrqState::Fired && line.enabled),
+                "CLRIENUM: a fired level line enabled at its APLIC",
+            )?;
+        }
+        // A level source sends one MSI at a time: a line that fell and rose
+        // while masked gives one arrival, not two (D-146).
+        ensure(
+            self.table.aplic.values().all(|line| line.sent <= 1),
+            "APLIC: two MSIs of one level source on their way",
+        )?;
+        // G9: this event wrote an APLIC register only for a level source
+        // whose line word this node holds and that a core of it claimed.
+        for &gsi in &self.event.aplic {
+            let word = self.table.line_word(gsi);
+            let held = word.owner() == dodos_abi::Owner::Node(self.node)
+                && word.generation() == self.table.generation(self.node);
+            let claimed = self
+                .irqs
+                .values()
+                .any(|irq| irq.source.is_line() && irq.source.level() && irq.source.id() == gsi);
+            ensure(
+                held && claimed,
+                "G9: an APLIC register written for a line the node does not hold",
+            )?;
         }
         for (&id, notify) in &self.notifies {
             let bound = notify.irqs.iter().all(|irq| {

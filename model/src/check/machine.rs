@@ -41,6 +41,7 @@ impl System {
         )?;
         self.check_cores()?;
         self.check_fence_order()?;
+        self.check_fence_rounds()?;
         self.check_counts()?;
         self.check_grants()?;
         self.check_rings()?;
@@ -116,13 +117,15 @@ impl System {
                     || in_flight,
                 "PARKED: a core runs with its park request raised and no stop or park in flight",
             )?;
-            // A core on its way to sleep or asleep runs nothing of its node.
+            // A core on its way to sleep or asleep runs nothing of its node,
+            // unless the interrupt that will wake it is pending (a placement
+            // from another core and its reschedule interrupt).
             if matches!(
                 self.hardware(core),
                 Hardware::Suspending { .. } | Hardware::Asleep { .. }
             ) {
                 let runs = self.models().any(|(n, m)| {
-                    n == word.slot() && m.position(core as u64).is_some_and(|p| m.core_runs(p))
+                    n == word.slot() && m.position(core as u64).is_some_and(|p| m.runs_unwoken(p))
                 });
                 ensure(!runs, "SLEEP: a core asleep runs a thread of its node")?;
             }
@@ -362,6 +365,52 @@ impl System {
     /// the event, a core marked was raised before, and a core both marked
     /// and stopped was marked before it was stopped. The state after the
     /// event cannot tell the orders apart (the eighth model review).
+    /// The fence sends its stop again once per round to every core not
+    /// yet confirmed (ARM64, D-143; the RISC-V cooperative fence, D-146):
+    /// while a live driver whose first core runs fences a node, no
+    /// unconfirmed core of it went two rounds without a stop (one round,
+    /// and the driver's own lateness, a sleeping core's exit latency among
+    /// it).
+    fn check_fence_rounds(&self) -> Check {
+        let table = self.canonical();
+        for node in 0..table.nodes {
+            let member = table.member(node);
+            if member.state() != MemberState::Fencing {
+                continue;
+            }
+            let driver = member.driver();
+            let g = member.generation();
+            let Some(model) = self
+                .models()
+                .find(|&(slot, _)| slot == driver)
+                .map(|(_, m)| m)
+            else {
+                continue;
+            };
+            let record = &table.fences[node as usize];
+            // The rounds are due events of the driver's first core: a
+            // driver whose core hung or parked drives nothing.
+            let first = model.core_number(0);
+            if table.member(driver).state() != MemberState::Live
+                || model.is_silent(0)
+                || matches!(self.hardware(first), Hardware::Hung { .. } | Hardware::Off)
+                || !model.fences.contains_key(&node)
+                || record.begun(g).is_none()
+            {
+                continue;
+            }
+            let round = model.fence_round(node, g);
+            let now = model.membership_now();
+            for core in table.cores_of(node, g) {
+                ensure(
+                    model.park_confirmed(core) || record.last_stop(core) + 2 * round >= now,
+                    "FENCE ROUND: an unconfirmed core of a fenced node went two rounds without a stop",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_fence_order(&self) -> Check {
         use crate::table::FenceStep;
         let trace = &self.canonical().fence_trace;

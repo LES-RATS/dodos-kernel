@@ -10,6 +10,17 @@ use dodos_abi::x86_64::{
 };
 use dodos_abi::{Error, IrqSource, ObjectKind, Rights, SlotAddr};
 
+/// The APLIC registers a node's gate writes by number (G9, D-146).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AplicReg {
+    /// `setipnum`, offset 0x1CDC.
+    SetIp,
+    /// `setienum`, offset 0x1EDC.
+    SetIe,
+    /// `clrienum`, offset 0x1FDC.
+    ClrIe,
+}
+
 impl Model {
     /// `irq_claim`: one vector of one physical core of the node, bound to
     /// one source. Returns the address and the data a device must be given
@@ -58,17 +69,18 @@ impl Model {
         // A level line claimed on a node that does not hold its
         // controller's role is held by the controller until acknowledged:
         // on x86-64 only where the end of interrupt is directed, on ARM64 by
-        // the SPI's active state; on RISC-V not at all (Interrupts, Nodes,
-        // D-141).
+        // the SPI's active state; on RISC-V by the mask at its arrival
+        // (Interrupts, Nodes, D-141, D-146).
         if source.level() {
             let holder = self
                 .ioapic_role(source.id())
                 .map(|r| self.table.roles[r].holder());
             let held_here = holder == Some(self.node);
+            // RISC-V: on any node, its gate writing the APLIC's registers
+            // by number (D-146).
             let held_away = match self.machine.arch {
                 crate::Arch::X86_64 => self.machine.directed_eoi,
-                crate::Arch::Aarch64 => true,
-                crate::Arch::Riscv64 => false,
+                crate::Arch::Aarch64 | crate::Arch::Riscv64 => true,
             };
             if !held_here && !held_away {
                 return Err(Error::Unsupported);
@@ -265,41 +277,43 @@ impl Model {
     /// RISC-V, a level line on an APLIC in MSI mode: the APLIC does not
     /// signal again a source that stays asserted, so `irq_ack` and a bind
     /// that arm such an irq write its number to the domain's `setipnum`,
-    /// which sets the pending bit only while the input is high; a gate
-    /// write, the node holding the domain's role (Interrupts, D-143).
+    /// which sets the pending bit only while the input is high, then to
+    /// `setienum`, which enables it again: written in that order, a line
+    /// that fell and rose while masked sends one MSI, not two (Interrupts,
+    /// D-143, D-146).
     fn setipnum(&mut self, irq: ObjId) {
         let source = self.irqs[&irq].source;
         if self.machine.arch == crate::Arch::Riscv64 && source.is_line() && source.level() {
-            let line = self.aplic.entry(source.id()).or_default();
-            line.pending |= line.high;
+            self.aplic_write(source.id(), AplicReg::SetIp);
+            self.aplic_write(source.id(), AplicReg::SetIe);
         }
     }
 
-    /// RISC-V: the input of level line `gsi` driven by its device (a test's
-    /// input): a rising input sets the source pending, a low one clears it.
-    pub fn line_input(&mut self, gsi: u32, high: bool) {
-        assert_eq!(self.machine.arch, crate::Arch::Riscv64);
-        let line = self.aplic.entry(gsi).or_default();
-        line.pending = high && (line.pending || !line.high);
-        line.high = high;
-    }
-
-    /// RISC-V: the APLIC forwards pending level line `gsi` by MSI to the
-    /// core and vector its claim programmed, and clears its pending bit;
-    /// the arrival is an event of the kernel. Says whether it forwarded.
-    pub fn aplic_forward(&mut self, gsi: u32) -> bool {
-        let pending = self.aplic.get(&gsi).is_some_and(|line| line.pending);
-        let target = self
+    /// G9 on RISC-V: the claiming node's gate writes `setipnum`, `setienum`
+    /// or `clrienum` of an APLIC domain, whoever holds the domain's role,
+    /// only with the number of a level source whose line word the node
+    /// holds with its generation and that a core of the node claimed; it
+    /// refuses any other (D-146). Says whether it wrote.
+    pub(crate) fn aplic_write(&mut self, gsi: u32, register: AplicReg) -> bool {
+        let word = self.table.line_word(gsi);
+        let held = word.state() == dodos_abi::OwnState::Taken
+            && word.owner() == dodos_abi::Owner::Node(self.node)
+            && word.generation() == self.table.generation(self.node);
+        let claimed = self
             .irqs
             .values()
-            .find(|irq| irq.source.is_line() && irq.source.id() == gsi)
-            .filter(|irq| !self.line_masked(irq.source))
-            .map(|irq| (irq.core, irq.vector));
-        let (true, Some((core, vector))) = (pending, target) else {
+            .any(|irq| irq.source.is_line() && irq.source.level() && irq.source.id() == gsi);
+        if self.machine.arch != crate::Arch::Riscv64 || !held || !claimed {
             return false;
-        };
-        live(&mut self.aplic, gsi).pending = false;
-        self.interrupt_on(core, vector);
+        }
+        let line = self.table.aplic.entry(gsi).or_default();
+        match register {
+            AplicReg::SetIp => line.pending |= line.high,
+            AplicReg::SetIe => line.enabled = true,
+            AplicReg::ClrIe => line.enabled = false,
+        }
+        line.forward();
+        self.event.aplic.push(gsi);
         true
     }
 
@@ -382,7 +396,13 @@ impl Model {
             .iter()
             .find(|(_, irq)| irq.core == position && irq.vector == vector)
             .filter(|(_, irq)| !self.line_masked(irq.source));
-        if let Some((&id, _)) = found {
+        if let Some((&id, irq)) = found {
+            // RISC-V: a level source is masked at its APLIC at its arrival,
+            // by the claiming node's gate (Interrupts, rule 1, D-146).
+            let source = irq.source;
+            if source.is_line() && source.level() {
+                self.aplic_write(source.id(), AplicReg::ClrIe);
+            }
             let dying = self.irqs[&id]
                 .notify
                 .is_some_and(|(notify, _)| self.dying(notify));

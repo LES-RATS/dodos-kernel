@@ -951,11 +951,9 @@ fn a_dr6_left_with_a_cause_is_reported() {
     );
 }
 
-// D-143, RISC-V: an armed level line whose input is high and whose source
-// is not pending at the APLIC, as an acknowledgement without the
-// `setipnum` write leaves it.
-#[test]
-fn an_armed_level_line_high_and_not_pending_is_reported() {
+/// A level line of GSI 5 claimed and bound by the one node of a RISC-V
+/// machine.
+fn riscv_level_line() -> S {
     let mut m = S::on(&one_node(crate::Arch::Riscv64, 1));
     let claim = Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
@@ -968,8 +966,81 @@ fn an_armed_level_line_high_and_not_pending_is_reported() {
     let notify = m.retype(0, ObjectKind::Notify, 0, 211);
     m.ok(0, notify);
     super::pass28::bind(&mut m);
-    let node = m.sys.node_mut(0);
-    node.line_input(5, true);
-    node.aplic.get_mut(&5).unwrap().pending = false;
-    machine_reported(&m, "SETIPNUM: an armed level line high and not pending");
+    m
+}
+
+// D-143, RISC-V: an armed level line whose input is high and with no MSI on
+// its way, as an acknowledgement without the `setipnum` write leaves it.
+#[test]
+fn an_armed_level_line_high_and_no_msi_on_its_way_is_reported() {
+    let mut m = riscv_level_line();
+    m.sys.line_input(5, true);
+    m.sys.edit_table(|t| t.aplic.get_mut(&5).unwrap().sent = 0);
+    machine_reported(
+        &m,
+        "SETIPNUM: an armed level line high and no MSI on its way",
+    );
+}
+
+// D-146: a fired level line still enabled at its APLIC: its arrival did not
+// mask it.
+#[test]
+fn a_fired_level_line_enabled_at_its_aplic_is_reported() {
+    let mut m = riscv_level_line();
+    m.sys.line_input(5, true);
+    assert!(m.sys.aplic_deliver(5));
+    m.sys
+        .edit_table(|t| t.aplic.get_mut(&5).unwrap().enabled = true);
+    machine_reported(&m, "CLRIENUM: a fired level line enabled at its APLIC");
+}
+
+// D-146: two MSIs of one level source on their way, as `setienum` written
+// before `setipnum` sends for a line that fell and rose while masked.
+#[test]
+fn two_msis_of_one_level_source_on_their_way_are_reported() {
+    let mut m = riscv_level_line();
+    m.sys.line_input(5, true);
+    m.sys.edit_table(|t| t.aplic.get_mut(&5).unwrap().sent = 2);
+    machine_reported(&m, "APLIC: two MSIs of one level source on their way");
+}
+
+// G9, D-146: an event that wrote an APLIC register for a line the node does
+// not hold.
+#[test]
+fn an_aplic_write_for_a_line_the_node_does_not_hold_is_reported() {
+    let mut m = riscv_level_line();
+    m.sys.node_mut(0).event.aplic.push(6);
+    machine_reported(
+        &m,
+        "G9: an APLIC register written for a line the node does not hold",
+    );
+}
+
+// ARM64 and the RISC-V cooperative fence (D-143, D-146): a fenced node's
+// core not yet confirmed whose last stop is more than two rounds old, as a
+// fence that signals once leaves it.
+#[test]
+fn an_unconfirmed_core_two_rounds_without_a_stop_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::Aarch64, 2, &[&[0], &[1]]));
+    m.run(30 * MS);
+    m.ok(0, super::pass17::kill(1));
+    let sent = |m: &S| m.sys.canonical().fences[1].last_stop(1) != 0;
+    assert!(m.step_until(sent));
+    m.sys.edit_table(|t| t.fences[1].last_stop.clear());
+    machine_reported(
+        &m,
+        "FENCE ROUND: an unconfirmed core of a fenced node went two rounds without a stop",
+    );
+}
+
+// D-146: a suspend state in an idle table whose flag says it keeps the
+// context while its parameter says it loses it.
+#[test]
+fn an_idle_state_whose_flag_disagrees_with_its_parameter_is_reported() {
+    let mut k = N::on(&one_node(crate::Arch::Riscv64, 1));
+    k.m.cores[0].idle_table = vec![[10, 0, dodos_abi::IDLE_METHOD_SBI | 0x8000_0000 << 32, 0]];
+    reported(
+        &k,
+        "IDLE: a suspend state whose flag disagrees with its parameter",
+    );
 }

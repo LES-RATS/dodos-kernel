@@ -875,16 +875,6 @@ struct Irq {
     removing: bool,
 }
 
-/// A level source of an APLIC domain in MSI mode (the AIA, §4.7): its
-/// pending bit is set by a low-to-high transition of the input, or by a
-/// write of `setipnum` while the input is high, and cleared when the input
-/// is low or when the interrupt is forwarded by MSI.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Aplic {
-    high: bool,
-    pending: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum IrqState {
     /// Bound to no notify.
@@ -1029,6 +1019,9 @@ struct EventLog {
     kernel_entries: u32,
     user_entries: Option<(u64, u64, (u64, u64))>,
     ports: Option<(u64, u64)>,
+    /// RISC-V: the APLIC sources whose `setipnum`, `setienum` or `clrienum`
+    /// the event wrote (G9, D-146).
+    aplic: Vec<u32>,
 }
 
 /// The whole state of the kernel of one node: its shared state, and the
@@ -1211,10 +1204,6 @@ pub struct Model {
     /// Interrupts: the claimed entries of the interrupt tables of the
     /// node's cores.
     irqs: BTreeMap<ObjId, Irq>,
-    /// RISC-V: the level lines of the APLIC domain the node holds, in MSI
-    /// mode, by GSI: whether the input is high, and the source's pending
-    /// bit (a test's hardware, D-143).
-    aplic: BTreeMap<u32, Aplic>,
     tasks: BTreeMap<ObjId, Task>,
     /// Tasks and marks: the counter of the identifiers of the node.
     task_counter: u64,

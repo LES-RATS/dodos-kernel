@@ -756,10 +756,11 @@ impl Model {
         self.cores[position].silent
     }
 
-    /// Whether the core at `position` runs a context or a thread.
-    pub(crate) fn core_runs(&self, position: usize) -> bool {
+    /// Whether the core at `position` has a context or a thread to run and
+    /// no interrupt pending to wake it.
+    pub(crate) fn runs_unwoken(&self, position: usize) -> bool {
         let part = &self.cores[position];
-        part.running.is_some() || part.thread.is_some()
+        (part.running.is_some() || part.thread.is_some()) && part.ipis.is_empty()
     }
 
     /// The physical core number of the core at `position`.
@@ -799,9 +800,8 @@ impl Model {
             .iter()
             .rev()
             .find(|e| until.is_none_or(|u| e[0].saturating_add(e[1]) < u))?;
-        let method = entry[2] & 0xFFFF_FFFF;
-        let suspend = method == dodos_abi::IDLE_METHOD_PSCI || method == dodos_abi::IDLE_METHOD_SBI;
-        (suspend && entry[3] & dodos_abi::IDLE_FLAG_LOSES_CONTEXT != 0).then_some(entry[0])
+        // The gate decides from the parameter, never from the flag (D-146).
+        crate::nodes::loses_context(entry[2], &self.machine).then_some(entry[0])
     }
 
     /// Whether a core's timer is due at the current instant.

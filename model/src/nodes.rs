@@ -418,7 +418,7 @@ impl Model {
         words: &[u64],
     ) -> Outcome {
         let position = self.own_core(thread, node, core)?;
-        let table = idle_table(words, self.machine.arch)?;
+        let table = idle_table(words, &self.machine)?;
         self.cores[position].idle_table = table;
         Ok(Output::Done)
     }
@@ -931,14 +931,17 @@ impl Model {
         let started = self.table.fences[node as usize].begun(g);
         let period = match member.state() {
             MemberState::Unfenced => self.table.sweep_ns,
-            _ => self.fence_round(),
+            _ => self.fence_round(node, g),
         };
         // On ARM64 the driver reads `AFFINITY_INFO` at the start of each
         // round only, and signals the cores it finds not confirmed (The
         // fence, ARM64, D-143: "a core awake and unmasked parks at the
-        // first signal and is confirmed at the second round's read").
+        // first signal and is confirmed at the second round's read"); the
+        // RISC-V cooperative fence reads `sbi_hart_get_status` the same way
+        // (D-146).
         let round = started.is_none() || now >= fence.last + period;
-        let reads = round || self.machine.arch != crate::Arch::Aarch64;
+        let timed = self.machine.arch == crate::Arch::Aarch64 || self.cooperative(node, g);
+        let reads = round || !timed;
         if reads && unconfirmed.is_empty() && started.is_some() {
             for core in 0..self.table.start_requests.len() {
                 if crate::table::Table::started_node(self.table.start_requests[core])
@@ -1001,14 +1004,30 @@ impl Model {
         true
     }
 
-    /// The period between two rounds of a fence: 11.2 ms on ARM64 (D-143);
-    /// the model keeps 1 ms on x86-64 and RISC-V, whose stops it does not
-    /// time (the NMI grace and the SIPIs, the stop extension).
-    fn fence_round(&self) -> u64 {
+    /// The period between two rounds of a fence: 11.2 ms on ARM64 (D-143)
+    /// and for the RISC-V cooperative fence (D-146); the model keeps 1 ms on
+    /// x86-64 and for the stop extension, whose stops it does not time (the
+    /// NMI grace and the SIPIs, `fence_hart`).
+    pub(crate) fn fence_round(&self, node: u16, generation: u32) -> u64 {
         match self.machine.arch {
             crate::Arch::Aarch64 => FENCE_ROUND_ARM64_NS,
+            _ if self.cooperative(node, generation) => FENCE_ROUND_ARM64_NS,
             _ => FENCE_RETRY_NS,
         }
+    }
+
+    /// RISC-V: whether the fence of `node` is the cooperative one, a hart
+    /// of it having no stop extension (fence class 0): an interrupt whose
+    /// handler calls `sbi_hart_stop`, sent again once per round of 11.2 ms
+    /// to every hart not yet confirmed (The fence, RISC-V, D-146).
+    fn cooperative(&self, node: u16, generation: u32) -> bool {
+        let list = self.machine.core_list();
+        self.machine.arch == crate::Arch::Riscv64
+            && self
+                .table
+                .cores_of(node, generation)
+                .iter()
+                .any(|&core| list[core].fence == 0)
     }
 
     // Reclaim.
@@ -2001,8 +2020,8 @@ impl Model {
         // less the stopped time; their due events on the monotonic clock
         // are those instants plus the stopped time (D-137).
         let mut membership: Vec<u64> = Vec::new();
-        for fence in self.fences.values() {
-            membership.push(fence.last + self.fence_round());
+        for (&node, fence) in &self.fences {
+            membership.push(fence.last + self.fence_round(node, fence.generation));
         }
         for start in self.starts.values() {
             membership.push(start.last + START_RETRY_NS);
@@ -2151,8 +2170,27 @@ impl Model {
     }
 }
 
+/// Whether an idle state loses the core's context, read from its parameter
+/// (bits 32-63 of the method word), never from its flag (`node_idle`,
+/// D-146): ARM64 PSCI, the StateType bit of the power state, bit 30 in the
+/// extended StateID format and bit 16 in the original one (Arm DEN0022F.b,
+/// §5.4.2.1, §5.4.2.2); RISC-V SBI, bit 31 of the suspend type, the
+/// non-retentive types (SBI v3.0, §9.4). Other methods keep it.
+pub(crate) fn loses_context(method: u64, machine: &crate::boot::Machine) -> bool {
+    let parameter = method >> 32;
+    match method & 0xFFFF_FFFF {
+        IDLE_METHOD_PSCI => {
+            let bit = if machine.psci_extended { 30 } else { 16 };
+            parameter >> bit & 1 != 0
+        }
+        IDLE_METHOD_SBI => parameter >> 31 & 1 != 0,
+        _ => false,
+    }
+}
+
 /// The idle table of `node_idle`, judged entry by entry.
-fn idle_table(words: &[u64], arch: crate::boot::Arch) -> Result<Vec<[u64; 4]>, Error> {
+fn idle_table(words: &[u64], machine: &crate::boot::Machine) -> Result<Vec<[u64; 4]>, Error> {
+    let arch = machine.arch;
     if !words.len().is_multiple_of(IDLE_ENTRY_WORDS)
         || words.len() > IDLE_STATES_MAX * IDLE_ENTRY_WORDS
     {
@@ -2171,6 +2209,11 @@ fn idle_table(words: &[u64], arch: crate::boot::Arch) -> Result<Vec<[u64; 4]>, E
         let increasing = last.is_none_or(|l| latency > l);
         let known = methods.contains(&(method & 0xFFFF_FFFF));
         if !bounded || !increasing || !known || flags & !IDLE_FLAG_LOSES_CONTEXT != 0 {
+            return Err(Error::Invalid);
+        }
+        // For methods 2 and 3, flag bit 0 equals what the parameter says.
+        let suspend = matches!(method & 0xFFFF_FFFF, IDLE_METHOD_PSCI | IDLE_METHOD_SBI);
+        if suspend && (flags & IDLE_FLAG_LOSES_CONTEXT != 0) != loses_context(method, machine) {
             return Err(Error::Invalid);
         }
         last = Some(latency);

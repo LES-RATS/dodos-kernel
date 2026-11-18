@@ -70,6 +70,10 @@ pub enum Event {
     /// x86-64: the entry stub's next step: it installs the node kernel's
     /// NMI handler, then reads its core word and enters or parks again.
     EntryStep { core: usize },
+    /// ARM64 `CPU_SUSPEND` or RISC-V `sbi_hart_suspend` returns without
+    /// losing the context (refused, or a shallower state): the gate reads
+    /// the core word before it returns to the node (D-146).
+    ShallowReturn { core: usize },
     /// An idle core enters the state its idle table chooses that loses its
     /// context (`node_idle`, Idle): on ARM64 the gate masks the PE and
     /// reads the park request first.
@@ -332,6 +336,7 @@ impl System {
             }
             if matches!(hw, Hardware::Suspending { .. }) {
                 events.push(Event::PowerDown { core });
+                events.push(Event::ShallowReturn { core });
             }
             if matches!(hw, Hardware::Asleep { wake: Some(at), .. } if at <= self.now) {
                 events.push(Event::Wake { core });
@@ -370,7 +375,8 @@ impl System {
     /// gate, interrupts masked, calls `SDEI_PE_MASK`, then reads the park
     /// request: raised, it writes it into `parked` and runs the park routine
     /// with no unmask; otherwise `CPU_SUSPEND`. RISC-V: `sbi_hart_suspend`,
-    /// the park request read at the return (`node_idle`, D-143).
+    /// the park request read at the return (`node_idle`, D-143). Both pass
+    /// a window before the power-down where the fence's signal is lost.
     fn sleep(&mut self, core: usize) {
         let Some((node, position)) = self.position_of(core) else {
             return;
@@ -383,24 +389,18 @@ impl System {
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Parking;
             }
-            Arch::Aarch64 => {
+            _ => {
                 self.hardware[core] = Hardware::Suspending {
                     latency,
                     roused: false,
                 };
             }
-            _ => {
-                self.hardware[core] = Hardware::Asleep {
-                    latency,
-                    wake: None,
-                }
-            }
         }
         self.rouse();
     }
 
-    /// ARM64: the power-down of `CPU_SUSPEND`; a core roused on its way
-    /// wakes at once, after its exit latency.
+    /// The power-down of `CPU_SUSPEND` or `sbi_hart_suspend`; a core roused
+    /// on its way wakes at once, after its exit latency.
     fn power_down(&mut self, core: usize) {
         if let Hardware::Suspending { latency, roused } = self.hardware[core] {
             let wake = roused.then_some(self.now + latency);
@@ -413,8 +413,9 @@ impl System {
     /// else, then the park request read: raised, the gate writes it into
     /// `parked` and runs the park routine instead of returning to the node.
     /// RISC-V: the same read at the return from `sbi_hart_suspend`, and
-    /// `sbi_hart_stop` when it is raised. So a fence signal lost at a wake
-    /// still parks the core (`node_idle`, D-143).
+    /// `sbi_hart_stop` when it is raised, which writes nothing. So a fence
+    /// signal lost at a wake still parks the core (`node_idle`, D-143,
+    /// D-146).
     fn wake_from_sleep(&mut self, core: usize) {
         if !matches!(self.hardware[core], Hardware::Asleep { .. }) {
             return;
@@ -424,10 +425,7 @@ impl System {
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Parking;
             }
-            (_, true) => {
-                self.write_parked(core, true);
-                self.hardware[core] = Hardware::Off;
-            }
+            (_, true) => self.off_unanswered(core),
             (_, false) => self.hardware[core] = Hardware::Running,
         }
     }
@@ -535,7 +533,15 @@ impl System {
             Event::EntryStep { core } => self.entry_step(core),
             Event::Sleep { core } => self.sleep(core),
             Event::PowerDown { core } => self.power_down(core),
-            Event::Wake { core } => {
+            Event::Wake { core } | Event::ShallowReturn { core } => {
+                if let (Event::ShallowReturn { .. }, Hardware::Suspending { latency, .. }) =
+                    (event, self.hardware[core])
+                {
+                    self.hardware[core] = Hardware::Asleep {
+                        latency,
+                        wake: Some(self.now),
+                    };
+                }
                 self.wake_from_sleep(core);
                 // The timer interrupt that woke the core is taken at once,
                 // late by the exit latency (Idle: "An interrupt wakes it").
@@ -933,15 +939,23 @@ impl System {
             // RISC-V: the stop extension stops the hart whatever it does; the
             // gate sends it only to a marked word (G10).
             (Arch::Riscv64, _) if !self.marked(core) => {}
-            // The stopped hart writes nothing: `parked` keeps its value, and
-            // the machine answers the request (`fence_hart`).
-            (Arch::Riscv64, _) => {
-                let mut table = self.table().clone();
-                table.stopped[core] = table.park_requests[core];
-                self.share(table);
-                self.silence(core);
-                self.hardware[core] = Hardware::Off;
-            }
+            // The cooperative fence (a hart of fence class 0): an interrupt
+            // whose handler, if it runs, calls `sbi_hart_stop`; lost on the
+            // way into a non-retentive suspend, where nothing keeps it; it
+            // wakes a hart asleep, and the read at the return stops it; a
+            // hart already stopped reads STOPPED (D-146).
+            (Arch::Riscv64, hw) if self.machine.core_list()[core].fence == 0 => match hw {
+                Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Entering => {
+                    self.fence_record(core);
+                    self.off_unanswered(core);
+                }
+                Hardware::Asleep { .. } => self.rouse_one(core),
+                Hardware::Off => self.off_unanswered(core),
+                _ => {}
+            },
+            // `fence_hart`: the stopped hart writes nothing, and the
+            // extension answers the request.
+            (Arch::Riscv64, _) => self.off_unanswered(core),
         }
     }
 
@@ -951,13 +965,34 @@ impl System {
         if matches!(self.hardware[core], Hardware::Hung { .. }) {
             return;
         }
-        let off = self.machine.arch != Arch::X86_64;
-        self.write_parked(core, off);
-        self.hardware[core] = if off {
-            Hardware::Off
+        // ARM64 and RISC-V: a seal's own park (`CPU_OFF`, `sbi_hart_stop`)
+        // writes no `parked`, confirmed by `AFFINITY_INFO` or STOPPED; on
+        // x86-64 the park stub writes it (The fence, `node_idle`, D-146).
+        if self.machine.arch == Arch::X86_64 {
+            self.write_parked(core, false);
+            self.hardware[core] = Hardware::Stub { window: false };
         } else {
-            Hardware::Stub { window: false }
-        };
+            self.off_unanswered(core);
+        }
+    }
+
+    /// A core off with no write of `parked`: `AFFINITY_INFO` or the SBI
+    /// answers OFF, or STOPPED, to the park request it finds.
+    fn off_unanswered(&mut self, core: usize) {
+        let mut table = self.table().clone();
+        table.stopped[core] = table.park_requests[core];
+        self.share(table);
+        self.unstarted(core);
+        self.hardware[core] = Hardware::Off;
+    }
+
+    /// A core leaves its node: its `started` reads 0 again, and its node no
+    /// longer hears from it.
+    fn unstarted(&mut self, core: usize) {
+        let mut table = self.table().clone();
+        table.core_beacons[core].started = 0;
+        self.share(table);
+        self.silence(core);
     }
 
     /// The wake of a parked core for a start: x86-64 an NMI to the park
@@ -1119,6 +1154,40 @@ impl System {
     /// An action in flight, as if a node had asked for it.
     pub(crate) fn push_action(&mut self, node: u16, action: HwAction) {
         self.actions.push((node, action));
+    }
+
+    /// RISC-V: the device drives the input of level line `gsi` (a test's
+    /// input): a rising input sets the source pending, a low one clears it,
+    /// and an MSI is sent if the source is enabled.
+    pub fn line_input(&mut self, gsi: u32, high: bool) {
+        assert_eq!(self.machine.arch, Arch::Riscv64);
+        self.edit_table(|t| t.aplic.entry(gsi).or_default().input(high));
+    }
+
+    /// RISC-V: an MSI the APLIC sent for level line `gsi` reaches the core
+    /// and vector its claim programmed, an arrival on the claiming node.
+    /// Says whether one was in flight.
+    pub fn aplic_deliver(&mut self, gsi: u32) -> bool {
+        if self
+            .table()
+            .aplic
+            .get(&gsi)
+            .is_none_or(|line| line.sent == 0)
+        {
+            return false;
+        }
+        self.edit_table(|t| t.aplic.get_mut(&gsi).expect("in flight").sent -= 1);
+        let target = self.models().find_map(|(slot, m)| {
+            m.irqs
+                .values()
+                .find(|irq| irq.source.is_line() && irq.source.id() == gsi)
+                .map(|irq| (slot, irq.core, irq.vector))
+        });
+        if let Some((node, core, vector)) = target {
+            self.model(node).interrupt_on(core, vector);
+            self.after(node);
+        }
+        true
     }
 
     /// The hardware state of `core`, set by a checker test.

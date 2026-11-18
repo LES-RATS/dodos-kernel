@@ -15,7 +15,26 @@ impl Model {
         self.check_locks()?;
         self.check_credits()?;
         self.check_crossing()?;
-        self.check_window()
+        self.check_window()?;
+        self.check_idle()
+    }
+
+    /// `node_idle`: a state of method 2 or 3 says it loses the context in
+    /// its flag exactly when its parameter does (D-146), so the gate, which
+    /// reads the parameter, and the table never disagree.
+    fn check_idle(&self) -> Check {
+        use dodos_abi::{IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_PSCI, IDLE_METHOD_SBI};
+        for part in &self.cores {
+            for entry in &part.idle_table {
+                let suspend = matches!(entry[2] & 0xFFFF_FFFF, IDLE_METHOD_PSCI | IDLE_METHOD_SBI);
+                let flag = entry[3] & IDLE_FLAG_LOSES_CONTEXT != 0;
+                ensure(
+                    !suspend || flag == crate::nodes::loses_context(entry[2], &self.machine),
+                    "IDLE: a suspend state whose flag disagrees with its parameter",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// The calls, `node_start`: "The cores a node starts on lie in one

@@ -5,7 +5,7 @@
 //! same read at every return from `sbi_hart_suspend` (`node_idle`; The
 //! fence, ARM64 and RISC-V).
 
-use super::pass17::{fresh, kill, seal};
+use super::pass17::{fresh, kill, resume, seal};
 use super::*;
 use crate::system::{Event, Hardware};
 use dodos_abi::{IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_PSCI, IDLE_METHOD_SBI};
@@ -13,14 +13,20 @@ use dodos_abi::{IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_PSCI, IDLE_METHOD_SBI};
 /// The exit latency of the state that loses its context in the tests.
 const LATENCY: u64 = 200_000;
 
+/// The method word of a state that loses the context: PSCI with the
+/// StateType bit of the original format, or an SBI non-retentive type.
+fn lossy(arch: Arch) -> u64 {
+    match arch {
+        Arch::Aarch64 => IDLE_METHOD_PSCI | 1 << 16 << 32,
+        _ => IDLE_METHOD_SBI | 0x8000_0000 << 32,
+    }
+}
+
 /// Node 0 of core 0, node 1 of cores 1 and 2 on `arch`; core 2 has an idle
 /// table whose one state loses its context, and nothing to run.
 fn sleeper(arch: Arch) -> S {
     let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
-    let method = match arch {
-        Arch::Aarch64 => IDLE_METHOD_PSCI,
-        _ => IDLE_METHOD_SBI,
-    };
+    let method = lossy(arch);
     let idle = Syscall::NodeIdle {
         node: node_cap(1),
         core: 2,
@@ -204,16 +210,25 @@ fn reused_after_a_fence(arch: Arch) {
     }
     assert_eq!(m.state(1), MemberState::Live);
     m.restarted(1);
-    let method = match arch {
-        Arch::Aarch64 => IDLE_METHOD_PSCI,
-        _ => IDLE_METHOD_SBI,
-    };
+    survives_its_next_suspend(&mut m, arch, true);
+}
+
+/// Node 1 gives core 2 its idle state that loses the context; a thread on
+/// core 2 (its first thread when `first`, a new one otherwise) waits for a
+/// timer 2 ms ahead, so core 2 sleeps and its timer wakes it: the core runs
+/// the thread and node 1 stays live.
+fn survives_its_next_suspend(m: &mut S, arch: Arch, first: bool) {
+    let method = lossy(arch);
     let idle = Syscall::NodeIdle {
         node: node_cap(1),
         core: 2,
         words: vec![LATENCY, 100_000, method, IDLE_FLAG_LOSES_CONTEXT],
     };
     m.ok(1, idle);
+    let thread = match first {
+        true => m.t[1],
+        false => m.thread_on(1, 300, 2),
+    };
     let timer = m.retype(1, ObjectKind::Timer, 0, 310);
     m.ok(1, timer);
     let notify = m.retype(1, ObjectKind::Notify, 0, 311);
@@ -224,16 +239,14 @@ fn reused_after_a_fence(arch: Arch) {
         deadline: m.sys.now() + 2 * MS,
         tolerance: 0,
     };
-    assert!(m.call(1, set).is_ok());
-    assert_eq!(m.call(1, Syscall::Wait(s(311), 0)), WAITS);
+    assert!(m.call_by(1, thread, set).is_ok());
+    assert_eq!(m.call_by(1, thread, Syscall::Wait(s(311), 0)), WAITS);
     assert!(m.step_until(|m| asleep(m, 2)), "core 2 never sleeps");
     m.run(5 * MS);
     assert_eq!(m.state(1), MemberState::Live);
     assert_ne!(m.sys.hardware(2), Hardware::Off);
-    assert!(
-        m.woken(1).is_some_and(|o| o.is_ok()),
-        "the thread never woke"
-    );
+    let woken = m.sys.node(1).woken(thread);
+    assert!(woken.is_some_and(|o| o.is_ok()), "the thread never woke");
 }
 
 #[test]
@@ -244,6 +257,173 @@ fn a_hart_stopped_by_the_fence_and_reused_does_not_park_itself_at_its_wake() {
 #[test]
 fn a_core_already_off_at_a_fence_and_reused_does_not_park_itself_at_its_wake() {
     reused_after_a_fence(Arch::Aarch64);
+}
+
+// D-146, (a): a seal parks node 1's cores through its own kernel, which
+// writes no `parked` on ARM64 or RISC-V (`CPU_OFF`, `sbi_hart_stop`), so
+// after the resume each core's request differs from `parked`; the words
+// carry no mark, and core 2 survives its next suspend.
+fn resumed_after_a_seal(arch: Arch) {
+    let mut m = sleeper(arch);
+    m.ok(0, seal(1));
+    m.run(20 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    let table = m.sys.canonical();
+    assert_ne!(table.park_requests[2], table.core_beacons[2].parked);
+    m.ok(0, resume(1));
+    let start = m.sys.now();
+    while m.state(1) != MemberState::Live && m.sys.now() < start + 100 * MS {
+        m.run(100_000);
+    }
+    assert_eq!(m.state(1), MemberState::Live);
+    survives_its_next_suspend(&mut m, arch, false);
+}
+
+#[test]
+fn a_core_resumed_after_a_seal_survives_its_next_suspend_on_arm64() {
+    resumed_after_a_seal(Arch::Aarch64);
+}
+
+#[test]
+fn a_hart_resumed_after_a_seal_survives_its_next_suspend_on_riscv() {
+    resumed_after_a_seal(Arch::Riscv64);
+}
+
+/// Core 2 of node 1 on its way to sleep, node 1's other core hung and node
+/// 1 killed; events until the fence's stop of core 2 is in flight, its
+/// power-down held back; then the stop, lost in the window.
+fn signal_lost_on_the_way_to_sleep(m: &mut S) {
+    let suspending = |m: &S| matches!(m.sys.hardware(2), Hardware::Suspending { .. });
+    assert!(m.step_until(suspending), "core 2 never suspends");
+    m.hang(1, true);
+    m.ok(0, kill(1));
+    let stop = |m: &S| {
+        m.sys
+            .actions()
+            .iter()
+            .position(|&(_, a)| a == crate::nodes::HwAction::Stop { core: 2 })
+    };
+    for _ in 0..10_000 {
+        if stop(m).is_some() {
+            break;
+        }
+        let held = |e: &Event| {
+            matches!(
+                e,
+                Event::PowerDown { core: 2 } | Event::ShallowReturn { core: 2 }
+            )
+        };
+        match m.sys.events().into_iter().find(|e| !held(e)) {
+            Some(event) => m.sys.fire(event),
+            None => {
+                let next = m.sys.now() + 10_000;
+                m.sys.move_clock(next);
+            }
+        }
+        assert_eq!(m.sys.check(), Ok(()));
+    }
+    let index = stop(m).expect("a stop of core 2");
+    m.sys.fire(Event::Action(index));
+    assert!(suspending(m), "the signal was not lost");
+}
+
+// D-146: `CPU_SUSPEND` returns without losing the context (refused, or a
+// shallower state) after the fence's signal was lost on the way: the gate
+// unmasks and reads the word, finds the mark and parks the core, rather
+// than returning to the node with its word marked and nothing in flight.
+#[test]
+fn a_suspend_that_returns_without_losing_the_context_reads_the_mark() {
+    let mut m = sleeper(Arch::Aarch64);
+    signal_lost_on_the_way_to_sleep(&mut m);
+    m.sys.fire(Event::ShallowReturn { core: 2 });
+    assert_eq!(m.sys.check(), Ok(()));
+    assert_eq!(m.sys.hardware(2), Hardware::Parking);
+}
+
+// D-146, the RISC-V cooperative fence (hart 2 of fence class 0, no stop
+// extension): its interrupt, lost on the way into a non-retentive suspend,
+// is sent again at the next round of 11.2 ms; it wakes the hart, the read
+// at the return stops it, and the third round's `sbi_hart_get_status`
+// confirms it, within `FENCE_NS`. Sent once, the hart would sleep through
+// the fence.
+#[test]
+fn the_riscv_cooperative_fence_sends_its_interrupt_again_each_round() {
+    let mut machine = machine(Arch::Riscv64, 3, &[&[0], &[1, 2]]);
+    machine.cores[2].fence = 0;
+    machine.accept_unfenced = true;
+    let mut m = S::on(&machine);
+    let idle = Syscall::NodeIdle {
+        node: node_cap(1),
+        core: 2,
+        words: vec![
+            LATENCY,
+            100_000,
+            lossy(Arch::Riscv64),
+            IDLE_FLAG_LOSES_CONTEXT,
+        ],
+    };
+    m.ok(1, idle);
+    signal_lost_on_the_way_to_sleep(&mut m);
+    let took = fence_ends(&mut m, 1);
+    assert!(matches!(
+        m.state(1),
+        MemberState::Fenced | MemberState::Dead
+    ));
+    assert!(
+        took >= 11_200_000,
+        "confirmed before the second round: {took}"
+    );
+    assert!(took <= dodos_abi::FENCE_NS, "{took}");
+    assert_eq!(m.sys.hardware(2), Hardware::Off);
+}
+
+// D-146: whether a state loses the context is read from its parameter,
+// and `node_idle` refuses a method 2 or 3 entry whose flag disagrees: ARM64
+// the StateType bit, 16 in the original format and 30 in the extended one
+// the machine start-up read; RISC-V bit 31 of the suspend type.
+#[test]
+fn node_idle_refuses_a_suspend_state_whose_flag_disagrees_with_its_parameter() {
+    let idle = |method: u64, flag: u64| Syscall::NodeIdle {
+        node: node_cap(0),
+        core: 0,
+        words: vec![LATENCY, 100_000, method, flag],
+    };
+    let psci = |bits: u64| IDLE_METHOD_PSCI | bits << 32;
+    let sbi = |bits: u64| IDLE_METHOD_SBI | bits << 32;
+    let lose = IDLE_FLAG_LOSES_CONTEXT;
+    let mut k = N::on(&one_node(Arch::Aarch64, 1));
+    k.ok(idle(psci(1 << 16), lose));
+    k.ok(idle(psci(0), 0));
+    k.no(idle(psci(1 << 16), 0), Error::Invalid);
+    k.no(idle(psci(0), lose), Error::Invalid);
+    // Bit 30 says nothing in the original format.
+    k.no(idle(psci(1 << 30), lose), Error::Invalid);
+    let mut machine = one_node(Arch::Aarch64, 1);
+    machine.psci_extended = true;
+    let mut k = N::on(&machine);
+    k.ok(idle(psci(1 << 30), lose));
+    k.no(idle(psci(1 << 16), lose), Error::Invalid);
+    let mut k = N::on(&one_node(Arch::Riscv64, 1));
+    k.ok(idle(sbi(0x8000_0000), lose));
+    k.ok(idle(sbi(0), 0));
+    k.no(idle(sbi(0x8000_0000), 0), Error::Invalid);
+    k.no(idle(sbi(0), lose), Error::Invalid);
+}
+
+// The gate reads the parameter: a retentive SBI state, flag 0, is entered
+// as one that keeps the context, so no read at its return is due.
+#[test]
+fn a_state_that_keeps_the_context_by_its_parameter_is_no_lossy_sleep() {
+    let mut m = S::on(&machine(Arch::Riscv64, 3, &[&[0], &[1, 2]]));
+    let idle = Syscall::NodeIdle {
+        node: node_cap(1),
+        core: 2,
+        words: vec![LATENCY, 100_000, IDLE_METHOD_SBI, 0],
+    };
+    m.ok(1, idle);
+    m.run(5 * MS);
+    assert!(!m.sys.events().contains(&Event::Sleep { core: 2 }));
+    assert_eq!(m.sys.hardware(2), Hardware::Running);
 }
 
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
@@ -338,93 +518,198 @@ fn the_handler_resets_dr6_at_cpl3_as_well() {
     assert_eq!(k.m.cores[0].dr6, 0);
 }
 
-// The APLIC rule of D-143, RISC-V: a level line of GSI 5 on the APLIC
-// domain a machine of one node holds, in MSI mode.
+// The APLIC rules of D-143 and D-146, RISC-V: a level line of GSI 5 of an
+// APLIC domain in MSI mode, claimed by node `n` of a machine of `nodes`
+// nodes of one core each.
 
 const GSI: u32 = 5;
 
-fn claimed(level: bool) -> S {
-    let mut m = S::on(&one_node(Arch::Riscv64, 1));
+fn claimed_on(nodes: usize, n: u16, level: bool) -> S {
+    let groups: Vec<Vec<usize>> = (0..nodes).map(|c| vec![c]).collect();
+    let groups: Vec<&[usize]> = groups.iter().map(Vec::as_slice).collect();
+    let mut m = S::on(&machine(Arch::Riscv64, nodes, &groups));
     let claim = Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
         source: dodos_abi::IrqSource::line(GSI, level, false).raw(),
-        core: 0,
+        core: u64::from(n),
         vector: 48,
         destination: s(210),
     };
-    super::pass17::succeeds(&mut m, 0, claim, 30 * MS);
-    let notify = m.retype(0, ObjectKind::Notify, 0, 211);
-    m.ok(0, notify);
+    super::pass17::succeeds(&mut m, n, claim, 30 * MS);
+    let notify = m.retype(n, ObjectKind::Notify, 0, 211);
+    m.ok(n, notify);
     m
 }
 
-pub(super) fn bind(m: &mut S) {
+fn claimed(level: bool) -> S {
+    claimed_on(1, 0, level)
+}
+
+pub(super) fn bind_on(m: &mut S, n: u16) {
     let bind = Syscall::IrqBind {
         irq: s(210),
         notify: s(211),
     };
-    m.ok(0, bind);
+    m.ok(n, bind);
+}
+
+pub(super) fn bind(m: &mut S) {
+    bind_on(m, 0);
+}
+
+fn state_on(m: &S, n: u16) -> crate::IrqState {
+    m.sys.node(n).irqs.values().next().expect("the irq").state
 }
 
 fn state(m: &S) -> crate::IrqState {
-    m.sys.node(0).irqs.values().next().expect("the irq").state
+    state_on(m, 0)
 }
 
-fn forward(m: &mut S) -> bool {
-    let forwarded = m.sys.node_mut(0).aplic_forward(GSI);
-    assert_eq!(m.sys.check(), Ok(()));
-    forwarded
+/// The MSIs of the line on their way, delivered one by one: how many.
+fn deliver(m: &mut S) -> u32 {
+    let mut arrivals = 0;
+    while m.sys.aplic_deliver(GSI) {
+        assert_eq!(m.sys.check(), Ok(()));
+        arrivals += 1;
+    }
+    arrivals
 }
 
 fn input(m: &mut S, high: bool) {
-    m.sys.node_mut(0).line_input(GSI, high);
+    m.sys.line_input(GSI, high);
+    assert_eq!(m.sys.check(), Ok(()));
+}
+
+fn ack(m: &mut S, n: u16) {
+    m.ok(n, Syscall::IrqAck(s(210)));
 }
 
 // The driver acknowledges while its device still asserts the line (a second
-// event came while it served the first): `irq_ack` writes `setipnum`, the
-// source is pending again and forwarded, and the irq fires. Without the
-// write the APLIC never forwards it again, the line high and the irq armed
-// for ever (the AIA, §4.7, §4.9.2).
+// event came while it served the first): `irq_ack` writes `setipnum`, then
+// `setienum`; the source is pending again and enabled, an MSI is sent, and
+// the irq fires. Without the write the APLIC never sends it again, the line
+// high and the irq armed for ever (the AIA, §4.7, §4.9.2).
 #[test]
 fn the_acknowledgement_of_a_level_line_still_high_signals_it_again() {
     let mut m = claimed(true);
     bind(&mut m);
     input(&mut m, true);
-    assert!(forward(&mut m));
+    assert_eq!(deliver(&mut m), 1);
     assert_eq!(state(&m), crate::IrqState::Fired);
-    assert!(!forward(&mut m), "no second MSI while the input stays high");
-    m.ok(0, Syscall::IrqAck(s(210)));
-    assert!(forward(&mut m), "the source is pending again");
+    assert_eq!(
+        deliver(&mut m),
+        0,
+        "no second MSI while the input stays high"
+    );
+    ack(&mut m, 0);
+    assert_eq!(deliver(&mut m), 1, "the source is pending again");
     assert_eq!(state(&m), crate::IrqState::Fired);
     // Served: the line low, the acknowledgement arms the irq with nothing
     // pending.
     input(&mut m, false);
-    m.ok(0, Syscall::IrqAck(s(210)));
+    ack(&mut m, 0);
     assert_eq!(state(&m), crate::IrqState::Armed);
-    assert!(!forward(&mut m));
+    assert_eq!(deliver(&mut m), 0);
 }
 
-// A line raised before its irq is bound: the APLIC forwards it to an idle
-// irq, which ignores a level arrival; the bind that arms the irq writes
-// `setipnum`, and the line is signalled.
+// A line raised before its irq is bound: its source is not enabled, so
+// nothing is sent; the bind that arms the irq writes `setipnum` and
+// `setienum`, and the line is signalled once.
 #[test]
 fn a_bind_that_arms_a_level_line_already_high_signals_it() {
     let mut m = claimed(true);
     input(&mut m, true);
-    assert!(forward(&mut m));
+    assert_eq!(deliver(&mut m), 0);
     assert_eq!(state(&m), crate::IrqState::Idle);
     bind(&mut m);
-    assert!(forward(&mut m));
+    assert_eq!(deliver(&mut m), 1);
     assert_eq!(state(&m), crate::IrqState::Fired);
 }
 
-// An edge line gets no write: its acknowledgement leaves the APLIC as it
-// is.
+// An edge line gets no write.
 #[test]
 fn an_edge_line_gets_no_setipnum_write() {
     let mut m = claimed(false);
     bind(&mut m);
     m.sys.node_mut(0).interrupt_on(0, 48);
-    m.ok(0, Syscall::IrqAck(s(210)));
-    assert!(m.sys.node(0).aplic.is_empty());
+    ack(&mut m, 0);
+    assert!(m.sys.canonical().aplic.is_empty());
+}
+
+// D-146, the order: the line falls and rises while its source is masked
+// (the irq fired, not yet acknowledged); the rise sets the pending bit. The
+// acknowledgement writes `setipnum`, which finds it set, then `setienum`,
+// which sends one MSI. Enabled first, the source would send for the old
+// pending bit, and `setipnum` would set it again: two arrivals.
+#[test]
+fn a_level_line_that_fell_and_rose_while_masked_arrives_once() {
+    let mut m = claimed(true);
+    bind(&mut m);
+    input(&mut m, true);
+    assert_eq!(deliver(&mut m), 1);
+    assert!(
+        !m.sys.canonical().aplic[&GSI].enabled,
+        "masked at its arrival"
+    );
+    input(&mut m, false);
+    input(&mut m, true);
+    ack(&mut m, 0);
+    assert_eq!(m.sys.canonical().aplic[&GSI].sent, 1);
+    assert_eq!(deliver(&mut m), 1);
+    assert_eq!(state(&m), crate::IrqState::Fired);
+}
+
+// D-146: a level line claimed on a node that does not hold the APLIC
+// domain's role; its arrival masks it through the claiming node's gate,
+// with no request to the holder, and its acknowledgement signals it again.
+// The holder then hands the role on by a seal: the line works as before,
+// its writes never going through the holder.
+#[test]
+fn a_level_line_on_a_node_without_the_aplic_role_works_across_a_move_of_the_role() {
+    let probe = claimed_on(3, 0, true);
+    let role = probe
+        .sys
+        .node(0)
+        .ioapic_role(GSI)
+        .expect("an APLIC serves GSI 5");
+    let holder = probe.sys.role(role).holder();
+    let n = (0..3).find(|&n| n != holder).unwrap();
+    let mut m = claimed_on(3, n, true);
+    assert_ne!(m.sys.role(role).holder(), n);
+    bind_on(&mut m, n);
+    input(&mut m, true);
+    let asked = |m: &S| m.sys.node(n).unit_requests.iter().flatten().count();
+    let before = asked(&m);
+    assert_eq!(deliver(&mut m), 1);
+    assert_eq!(state_on(&m, n), crate::IrqState::Fired);
+    assert_eq!(asked(&m), before, "the arrival asks the holder nothing");
+    let other = (0..3).find(|&z| z != n && z != holder).unwrap();
+    m.ok(other, seal(holder));
+    m.run(20 * MS);
+    assert_eq!(m.state(holder), MemberState::Sealed);
+    assert_ne!(
+        m.sys.role(role).holder(),
+        holder,
+        "the seal handed the role"
+    );
+    ack(&mut m, n);
+    assert_eq!(deliver(&mut m), 1);
+    assert_eq!(state_on(&m, n), crate::IrqState::Fired);
+}
+
+// G9 on RISC-V: the gate writes the three registers only with the number of
+// a level source whose line word the node holds and that a core of it
+// claimed; another node's line is refused and the APLIC is unchanged.
+#[test]
+fn the_gate_refuses_an_aplic_write_for_a_line_the_node_does_not_hold() {
+    use crate::irq::AplicReg;
+    let mut m = claimed_on(2, 0, true);
+    bind_on(&mut m, 0);
+    let before = m.sys.canonical().aplic.clone();
+    for register in [AplicReg::SetIp, AplicReg::SetIe, AplicReg::ClrIe] {
+        assert!(!m.sys.node_mut(1).aplic_write(GSI, register));
+        assert!(!m.sys.node_mut(0).aplic_write(GSI + 1, register));
+    }
+    assert_eq!(m.sys.node(1).table.aplic, before);
+    assert_eq!(m.sys.node(0).table.aplic, before);
 }

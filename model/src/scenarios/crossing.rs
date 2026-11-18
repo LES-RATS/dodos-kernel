@@ -774,6 +774,7 @@ fn a_resume_keeps_its_consumer_indices_and_consumes_the_answers_that_waited() {
             | crate::system::Event::EntryStep { .. }
             | crate::system::Event::Sleep { .. }
             | crate::system::Event::PowerDown { .. }
+            | crate::system::Event::ShallowReturn { .. }
             | crate::system::Event::Wake { .. } => true,
         });
         match mine {

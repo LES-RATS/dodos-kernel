@@ -210,6 +210,39 @@ impl FenceRecord {
     }
 }
 
+/// RISC-V: a level source of an APLIC domain in MSI mode (the RISC-V AIA
+/// 1.0, §4.7, §4.9): whether its input is high; its pending bit, set by a
+/// low-to-high transition of the input or by a write of `setipnum` while
+/// the input is high, cleared while the input is low and when an MSI is
+/// sent; its enable bit (`setienum`, `clrienum`); the MSIs sent and not yet
+/// arrived. "An MSI is sent for a specific source only when the source's
+/// corresponding pending and enable bits are both one" (§4.9).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Aplic {
+    pub(crate) high: bool,
+    pub(crate) pending: bool,
+    pub(crate) enabled: bool,
+    pub(crate) sent: u32,
+}
+
+impl Aplic {
+    /// The APLIC sends an MSI as soon as the source is pending and enabled.
+    pub(crate) fn forward(&mut self) {
+        if self.pending && self.enabled {
+            self.pending = false;
+            self.sent += 1;
+        }
+    }
+
+    /// The device drives the input (a test's input).
+    #[cfg(test)]
+    pub(crate) fn input(&mut self, high: bool) {
+        self.pending = high && (self.pending || !self.high);
+        self.high = high;
+        self.forward();
+    }
+}
+
 /// What the anchor of a grant says, in the 64 bytes of its slot inside the
 /// grant entry, which every node reads: the frame (its address, page size,
 /// pages and memory type), its rights and its depth. A remote frame
@@ -368,6 +401,8 @@ pub(crate) struct Table {
     /// The line words, by GSI, as raw ownership words; one not listed is
     /// free and unclaimed (Interrupts, D-135).
     pub(crate) lines: BTreeMap<u32, u64>,
+    /// RISC-V: the level sources of the APLIC domains, by GSI (hardware).
+    pub(crate) aplic: BTreeMap<u32, Aplic>,
     pub(crate) members: Vec<Member>,
     pub(crate) roles: Vec<RoleWord>,
     /// The grant table and the use table of each node, by index, and the

@@ -210,6 +210,11 @@ pub struct Machine {
     /// The image accepts a core of fence class 0 beside other nodes (a
     /// development setting).
     pub accept_unfenced: bool,
+    /// ARM64: the PSCI power state uses the extended StateID format (bit 1
+    /// of the flags `PSCI_FEATURES` returns for `CPU_SUSPEND`), read once by
+    /// the machine start-up into the fixed part of the machine table: the
+    /// StateType bit is bit 30, otherwise bit 16 (`node_idle`, D-146).
+    pub psci_extended: bool,
     /// The kernel can read a processor source of entropy.
     pub processor_entropy: bool,
     /// The largest map count of a chunk (G4): `MAP_COUNT_MAX`, 32 bits; the
@@ -405,6 +410,7 @@ impl Machine {
             delivery_ns: 5_000,
             monitor: false,
             accept_unfenced: false,
+            psci_extended: false,
             processor_entropy: true,
             map_count_max: dodos_abi::MAP_COUNT_MAX,
             gate_chunks: u64::from(geometry.entries),
@@ -1130,6 +1136,7 @@ impl Machine {
         }
         Table {
             irq_tables: Default::default(),
+            aplic: Default::default(),
             retired: Default::default(),
             geometry: self.geometry,
             nodes: n as u16,
