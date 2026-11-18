@@ -435,26 +435,149 @@ fn a_holder_resumed_under_a_count_a_failed_unit_kept_runs_again_beside_an_unfenc
     live_and_the_granter_frozen(&mut g, MemberState::Unfenced);
 }
 
+/// Whether the holder has a record unmapping.
+fn unmapping(m: &S) -> bool {
+    m.sys
+        .node(Y)
+        .caps
+        .values()
+        .any(|c| matches!(c.record, Record::Unmapping(_)))
+}
+
 // The control case: the unit healthy, the holder's mapping is undone at the
-// resume by a request to the unit's holder; while the record is unmapping
-// the resume waits. (The answer comes on the holder's kernel ring, which a
-// resume reads only after R0 to R5: the resume never ends, a gap of the
-// contract reported with pass 24, so the test stops at the wait.)
+// resume by a request to the third node's unit; while the record is
+// unmapping the resume waits, it reads the unit's answer on its kernel
+// ring while R2 goes on (What crosses between nodes, "At a resume",
+// D-142), the record completes, the resume ends, and the granting node's
+// barrier holds: it is dead and its chunk can be taken by another node.
 #[test]
-fn a_resume_waits_while_a_record_under_the_dead_granters_grant_is_unmapping() {
-    let mut g = resumed_over_a_dead_granter(false, true);
-    let unmapping = |m: &S| {
-        m.sys
-            .node(Y)
-            .caps
-            .values()
-            .any(|c| matches!(c.record, Record::Unmapping(_)))
-    };
+fn a_resume_reads_the_answer_of_another_nodes_unit_during_r2_and_ends() {
+    let mut g = resumed_over_a_dead_granter(false, false);
     assert!(g.m.step_until(unmapping), "the resume never asked the unit");
     assert_eq!(g.m.state(Y), MemberState::Starting);
-    g.m.run(20 * MS);
-    assert!(unmapping(&g.m));
+    g.m.run(300 * MS);
+    assert!(!unmapping(&g.m));
+    assert_eq!(g.m.state(Y), MemberState::Live);
+    assert!(g.m.sys.canonical().uses[Y as usize].is_empty());
+    assert_eq!(g.m.state(X), MemberState::Dead);
+    let shift = g.m.sys.canonical().geometry.chunk_shift();
+    g.m.ok(THIRD, take(0, g.chunk << shift, u64::from(shift), 170));
+}
+
+// The same, with the third node's unit failing while the request is
+// pending: the answer is *failed*, the record is emptied with its count
+// kept, the holder becomes live, and the granting node never dies.
+#[test]
+fn a_resume_whose_unit_request_is_answered_failed_runs_again_and_the_granter_never_dies() {
+    let mut g = resumed_over_a_dead_granter(false, false);
+    assert!(g.m.step_until(unmapping), "the resume never asked the unit");
+    g.m.sys.break_unit(IOMMU_ROLE);
+    live_and_the_granter_frozen(&mut g, MemberState::Fenced);
+}
+
+// A message that waited from a generation that is over is refused when the
+// resume reads it during R2: node X's `Revoke`, written while the holder was
+// sealed, is read while the holder's record is still unmapping, after X was
+// killed.
+#[test]
+fn a_message_of_an_ended_generation_read_during_the_resumes_r2_is_refused() {
+    let mut g = granted(false);
+    let map = io_map(&g.m, GOT);
+    g.m.ok(Y, map);
+    g.m.ok(THIRD, super::pass17::seal(Y));
+    g.m.run(50 * MS);
+    assert_eq!(g.m.state(Y), MemberState::Sealed);
+    assert_eq!(g.m.call(X, Syscall::CapRevoke(s(OBJ))), WAITS);
+    g.m.run(MS);
+    let waiting = |m: &S| {
+        let ring = &m.sys.canonical().rings[X as usize][Y as usize].kernel;
+        ring.produced != m.sys.canonical().beacons[Y as usize].consumed[X as usize].0
+    };
+    assert!(
+        waiting(&g.m),
+        "the Revoke waits in the sealed holder's ring"
+    );
+    g.m.ok(THIRD, super::pass17::kill(X));
+    g.m.run(dodos_abi::FENCE_NS + MS);
+    assert_eq!(g.m.state(X), MemberState::Fenced);
+    let refused = g.m.sys.node(Y).refused.0;
+    g.m.ok(THIRD, super::pass17::resume(Y));
+    let read = g.m.step_until(|m| !waiting(m));
+    assert!(read && unmapping(&g.m), "not read during R2");
     assert_eq!(g.m.state(Y), MemberState::Starting);
+    assert_eq!(g.m.sys.node(Y).refused.0, refused + 1);
+}
+
+// An answer for a thread of the resuming node, read during R2, is applied
+// (the thread's wait ends) but the thread runs only once the resume ends.
+#[test]
+fn an_answer_read_during_the_resumes_r2_wakes_its_thread_which_runs_only_after_the_resume() {
+    let mut g = granted(false);
+    let map = io_map(&g.m, GOT);
+    g.m.ok(Y, map);
+    let send = Syscall::NodeSend {
+        node: node_cap(THIRD),
+        message: Message {
+            label: 9,
+            flags: 0,
+            words: vec![9],
+            caps: vec![],
+            marks: 0,
+        },
+        doorbell: SlotAddr::NONE,
+    };
+    assert_eq!(g.m.call(Y, send), WAITS);
+    g.m.ok(THIRD, super::pass17::seal(Y));
+    // The third node takes no interrupt until the holder is sealed, so the
+    // `Send` waits in its user ring and its answer comes after the seal.
+    for _ in 0..100_000 {
+        if g.m.state(Y) == MemberState::Sealed {
+            break;
+        }
+        let events = g.m.sys.events();
+        let next = events
+            .iter()
+            .copied()
+            .find(|e| !matches!(*e, crate::system::Event::Ipi { node, .. } if node == THIRD));
+        match next {
+            Some(event) => {
+                g.m.sys.fire(event);
+                assert_eq!(g.m.sys.check(), Ok(()));
+            }
+            None => {
+                let next = g.m.sys.now() + 100_000;
+                g.m.sys.move_clock(next);
+            }
+        }
+    }
+    assert_eq!(g.m.state(Y), MemberState::Sealed);
+    g.m.ok(THIRD, super::pass17::kill(X));
+    g.m.run(dodos_abi::FENCE_NS + MS);
+    let thread = g.m.t[Y as usize];
+    let waits = |m: &S| {
+        matches!(
+            m.sys.node(Y).threads[&m.t[Y as usize]].wait,
+            crate::Wait::Node { .. }
+        )
+    };
+    assert!(waits(&g.m), "the answer was read while sealed");
+    g.m.ok(THIRD, super::pass17::resume(Y));
+    let woken = g.m.step_until(|m| !waits(m));
+    assert!(woken && unmapping(&g.m), "not read during R2");
+    assert_eq!(g.m.woken(Y), Some(&Err(Error::WouldWait)));
+    assert_eq!(g.m.state(Y), MemberState::Starting);
+    // Event by event until the resume ends: the thread never runs before.
+    let ended = g.m.step_until(|m| {
+        let live = m.state(Y) == MemberState::Live;
+        assert!(
+            live || m.sys.node(Y).running() != Some(thread),
+            "ran during the resume"
+        );
+        live
+    });
+    assert!(ended, "the resume never ended");
+    let notify = g.m.retype(Y, ObjectKind::Notify, 0, 130);
+    g.m.ok(Y, notify);
 }
 
 // The checker's rule for C2: the granting generation of a leaf a running

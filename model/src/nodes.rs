@@ -1683,10 +1683,13 @@ impl Model {
         }
     }
 
-    /// The steps of a resume, before any thread runs: R0, R2 and R3 for
-    /// every node whose generation ended while this node was sealed, R4 and
-    /// R5 for those still fenced or unfenced; then the rings that waited
-    /// are consumed under the check, and the node becomes live.
+    /// The steps of a resume, before any thread runs: R0 for every node
+    /// accused and every generation that ended while this node was sealed;
+    /// then, while the rings that waited are consumed under the check (from
+    /// the end of R0 on, as a live node consumes them during its own R2 to
+    /// R5, D-142), R2 and R3 for every generation that ended, R2 to R5 for
+    /// the nodes still fenced or unfenced; the node becomes live once both
+    /// are done.
     fn resume_step(&mut self, units: &mut usize) -> bool {
         if self.ready || !self.resuming {
             return false;
@@ -1697,7 +1700,47 @@ impl Model {
             return false;
         }
         let mut any = false;
-        for node in (0..self.table.nodes).filter(|&z| z != me) {
+        let others: Vec<u16> = (0..self.table.nodes).filter(|&z| z != me).collect();
+        // R0 first, for every node: a node accused gets it as a reclaim
+        // does; a generation that was not over when this node sealed and is
+        // over now (dead, or started again: the member word names another
+        // generation) gets it once: its waits end with `gone`, its credits
+        // are freed. Not again if this node ran it before it sealed (the
+        // node was accused while this node sealed), which the explorations
+        // reached (pass 19, the count of finding 8 of the tenth model
+        // review); a later generation of the node keeps its own reclaim.
+        for &node in &others {
+            let member = self.table.member(node);
+            if matches!(
+                member.state(),
+                MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
+            ) {
+                self.r0(node, member.generation());
+            }
+            if let Some(old) = self.ended_while_sealed(node) {
+                let ran = self.r0_runs.contains_key(&(node, old));
+                if self.ended_done.insert((node, old)) && !ran {
+                    self.r0_effects(node, old);
+                }
+            }
+        }
+        // The end of R0: what waited is marked, and the rings are read from
+        // now on (below and in the reserve's own steps: `consumes`).
+        if self.resume_marks.is_none() {
+            let marks = (0..self.table.nodes)
+                .map(|from| match from == me {
+                    true => (0, 0),
+                    false => (
+                        self.ring_of(from, me, false).produced,
+                        self.ring_of(from, me, true).produced,
+                    ),
+                })
+                .collect();
+            self.resume_marks = Some(marks);
+        }
+        // R2 to R5, while the rings are read.
+        let mut steps = true;
+        for &node in &others {
             let state = self.table.member(node).state();
             if matches!(
                 state,
@@ -1721,52 +1764,30 @@ impl Model {
                         _ => true,
                     };
                 if !done {
-                    return any;
+                    steps = false;
+                    break;
                 }
             }
-            // A generation that was not over when this node sealed and is
-            // over now (dead, or started again: the member word names
-            // another generation) gets R0: its waits end with `gone`, its
-            // credits are freed; then its remote capabilities go, with no
-            // release, and the grants made to it are freed at once (R2,
-            // R3; Grants, "Generations").
-            // R0 once for that generation, which leaves the reclaim of a
-            // later generation of the node as it is.
-            // R0 once for that generation: not again if this node ran it
-            // before it sealed (the node was accused while this node
-            // sealed), which the explorations reached (pass 19, the count of
-            // finding 8 of the tenth model review).
+            // A generation that ended: its remote capabilities go, with no
+            // release, and the grants made to it are freed at once (R2, R3;
+            // Grants, "Generations"); they finish before the node goes on,
+            // as a reclaim does (H8).
             if let Some(old) = self.ended_while_sealed(node) {
-                let ran = self.r0_runs.contains_key(&(node, old));
-                if self.ended_done.insert((node, old)) && !ran {
-                    self.r0_effects(node, old);
-                }
                 any |= self.drop_ended(node, old, units);
-                // R2 and R3 finish before the node goes on, as a reclaim
-                // does (H8).
                 if self.stale_remote(node).is_some() || self.pinned_over() {
-                    return any;
+                    steps = false;
+                    break;
                 }
             }
         }
-        // Then it consumes what waited in its rings under the check, one
-        // message a unit, and only then becomes live (`node_start` mode
-        // resume; H8). What waited: the entries before the producer index
-        // read now, so that a peer that keeps writing does not hold the
-        // resume.
-        let me = self.node;
-        let marks = self.resume_marks.clone().unwrap_or_else(|| {
-            (0..self.table.nodes)
-                .map(|from| match from == me {
-                    true => (0, 0),
-                    false => (
-                        self.ring_of(from, me, false).produced,
-                        self.ring_of(from, me, true).produced,
-                    ),
-                })
-                .collect()
-        });
-        self.resume_marks = Some(marks.clone());
+        // It consumes what waited in its rings under the check, one message
+        // a unit, and becomes live only once they are drained and R2 to R5
+        // done (`node_start` mode resume; H8, D-142). What waited: the
+        // entries before the producer index read at the end of R0, so that
+        // a peer that keeps writing does not hold the resume; what comes
+        // later (the answer to a unit request R2 sent) is read as a live
+        // node reads it.
+        let marks = self.resume_marks.clone().expect("set at the end of R0");
         for from in (0..self.table.nodes).filter(|&f| f != me) {
             let (kernel, user) = marks[from as usize];
             for (is_user, mark, size) in [
@@ -1788,6 +1809,9 @@ impl Model {
                     }
                 }
             }
+        }
+        if !steps {
+            return any;
         }
         if self.cores.iter().all(|c| !c.silent) {
             self.ready = true;

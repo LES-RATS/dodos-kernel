@@ -262,12 +262,28 @@ fn failed_under_a_remote_frame(m: &S) -> bool {
             .any(|u| u.granter == 0 && u.leaves > 0)
 }
 
+/// Whether the holder (node 2) resumes with a record under node 0's grant
+/// unmapping: its R2 waits for the unit, whose role node 1 holds.
+fn resume_asks_a_unit(m: &S) -> bool {
+    m.sys.has(2)
+        && m.state(2) == MemberState::Starting
+        && m.sys.node(2).caps.values().any(|c| {
+            matches!(c.record, crate::Record::Unmapping(_))
+                && m.sys
+                    .node(2)
+                    .remotes
+                    .get(&c.object)
+                    .is_some_and(|r| r.node == 0)
+        })
+}
+
 #[test]
 fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
     if !once() {
         return;
     }
     let (mut reached_failed, mut pinned, mut resumed_kept) = (0, 0, 0);
+    let mut resume_asked_unit = 0;
     for seed in seeds(SEEDS) {
         say(format_args!("seed {seed}"));
         let mut rng = Rng(seed + 401);
@@ -313,7 +329,19 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
         // leaf.
         let _ = try_call(&mut m, 2, map.clone());
         let (mut broken, mut killed, mut seen) = (false, false, false);
-        let mut resumed = false;
+        let (mut resumed, mut asked) = (false, false);
+        // Steered, one seed in three: the holder sealed over its mapping,
+        // the granting node killed, then the holder resumed, so that R2 of
+        // the resume asks node 1's unit, then the random actions.
+        if seed % 3 == 0 {
+            let _ = try_call(&mut m, 1, seal(2));
+            m.run(50 * MS);
+            killed = try_call(&mut m, 1, kill(0)) == Some(DONE);
+            m.run(dodos_abi::FENCE_NS + MS);
+            if m.state(2) == MemberState::Sealed {
+                resumed |= try_call(&mut m, 1, resume(2)) == Some(DONE);
+            }
+        }
         for _ in 0..40 {
             match rng.below(11) {
                 0 => {
@@ -347,6 +375,7 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
                 _ => churn(&mut m, &mut rng),
             }
             seen |= failed_under_a_remote_frame(&m);
+            asked |= resume_asks_a_unit(&m);
         }
         for _ in 0..3 {
             quiet(&mut m);
@@ -355,9 +384,22 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
         if m.state(2) == MemberState::Sealed {
             resumed |= try_call(&mut m, 1, resume(2)) == Some(DONE);
         }
+        if !asked {
+            asked = m.step_until(|m| resume_asks_a_unit(m) || m.state(2) != MemberState::Starting)
+                && resume_asks_a_unit(&m);
+        }
         quiet(&mut m);
         seen |= failed_under_a_remote_frame(&m);
         reached_failed += usize::from(seen);
+        resume_asked_unit += usize::from(asked);
+        // A resume reads its rings from the end of R0 on, so the answer of
+        // the unit R2 asked comes and the holder is never accused stuck
+        // (What crosses between nodes, "At a resume", D-142).
+        assert_ne!(
+            m.sys.member(2).evidence(),
+            dodos_abi::Evidence::Stuck,
+            "seed {seed}: the holder was accused stuck"
+        );
         // A count the failed unit kept: the grant is pinned while the
         // granting node lives, and a dead granting node never is (C1, C2).
         // Otherwise every revocation ends and a death is reclaimed.
@@ -405,6 +447,10 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
     reached(
         "a holder resumed beside a dead granter's kept count",
         resumed_kept,
+    );
+    reached(
+        "a resume whose R2 asks another node's unit",
+        resume_asked_unit,
     );
 }
 

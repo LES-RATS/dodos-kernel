@@ -669,8 +669,11 @@ impl Model {
     /// Whether this node consumes from its rings: a node whose own gate
     /// writes, past the steps of its start or resume. A sealed node sends
     /// and consumes nothing.
+    /// Whether the node reads its rings: once ready, and during a resume
+    /// from the end of R0 on, while R2 to R5 go on (`resume_marks` is set
+    /// then; What crosses between nodes, "At a resume", D-142).
     pub(crate) fn consumes(&self) -> bool {
-        self.table.member(self.node).writes() && self.ready
+        self.table.member(self.node).writes() && (self.ready || self.resume_marks.is_some())
     }
 
     /// The user rings into this node, at the interrupt that signals them:

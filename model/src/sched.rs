@@ -373,7 +373,11 @@ impl Model {
         for _ in 0..=self.threads.len() {
             self.no_context();
             entered += self.requeue();
-            let picked = self.pick(at);
+            // A resuming node runs no thread until its resume ends (The
+            // node's life, `node_start` mode resume: "no thread runs before
+            // that"), though the answers it reads from the end of R0 on and
+            // R0's `gone` wake threads (D-142).
+            let picked = self.pick(at).filter(|_| !self.resuming);
             self.cores[at].running = picked;
             self.cores[at].thread = picked.and_then(|(context, _)| self.holder(context));
             let Some(holder) = self.cores[at].thread else {
