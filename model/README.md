@@ -127,8 +127,16 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   never confirms, a request answered *elsewhere* sent again at once, an
   observation of a generation that ended, a heartbeat counted again from
   0, a node started afresh with its clock at 0 and its cores choosing
-  nothing, its debug areas' suppressed entries; and gap 18 held as
-  implemented),
+  nothing, its debug areas' suppressed entries), `pass26.rs` (D-144, the
+  four gaps of pass 25 decided, each with a scenario that fails without
+  its correction: R1 by the node that hands a unit role during steps 1
+  to 3; a hand-over ended without step 4 writing held with a new epoch,
+  its two ends; evidence stuck against a starting node at `START_NS`;
+  nothing but an answer written toward a node starting afresh until it
+  is live, a rebuild's `ReportAsk` waiting for it or going on without
+  it, and the resume bit that keeps a resume under a rebuild from
+  waiting for ever; then gap 21 held as implemented, and the late report
+  of a rebuild),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -149,13 +157,20 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   turn; 26 events probed after every step, and the seeds that reach each
   pair, each triple of a resume and two others and each triple of a
   death and two others counted; each seed ends with no node accused that
-  was not harmed and no wait left; `verify` runs 26 seeds, and `cargo
-  test --release -p dodos-model --lib every_combination -- --ignored`
-  explores 858, `DODOS_COMBINATION_SEEDS` another number, and fails on
-  a combination no seed reaches that `IMPOSSIBLE` does not exclude; on
-  18 November 2026, 1,716 seeds reached 661 of the 772 combinations not
-  excluded and left 111, one pair, 105 triples of a resume, which most
-  often ends within one event, and five of a death; so that run fails).
+  was not harmed and no wait left; drivers hold the short states open: a
+  resume whose first wake is lost, under a rebuild, or beside an
+  accusation, and a pending release whose holder's events are held back;
+  `verify` runs 26 seeds, and `cargo test --release -p dodos-model --lib
+  every_combination -- --ignored` explores 858, `DODOS_COMBINATION_SEEDS`
+  another number and `DODOS_COMBINATION_FIRST` the first, and fails on a
+  combination no seed reaches that `IMPOSSIBLE` does not exclude; on 18
+  November 2026 (pass 26), 1,716 seeds in two ranges reached every pair
+  and 751 of the 772 combinations not excluded, and left 19 triples of a
+  resume and two of a death, so that run fails). Every exploration ends
+  with the same liveness (`explore::assert_live`): the harness records
+  each harm (a stop that succeeds, a hung core, a failure) and each start,
+  and a node accused without one, or a start whose starter was harmed or
+  sealed, fails the seed.
   `DODOS_SEED=<n>` replays one seed
   of an exploration with its actions printed; `DODOS_COUNTS` prints what
   the explorations reached.
@@ -171,16 +186,12 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   (`DODOS_PROPERTY_SEEDS` and `DODOS_PROPERTY_FIRST` set another number
   and the first) and names any seed that fails: `cargo test --release -p
   dodos-model --test property many_seeds -- --ignored`.
-- The checker: each of its 220 rules that go through `ensure`, switched
-  off alone, makes at least one test fail (pass 23's sweep; the two it
-  found held by nothing have a test since; pass 24's rule of G6 for a
-  granting generation over under a counted leaf, and invariant 58 counting
-  a frozen use entry, each have one); a check that cannot fail is
-  deleted or says which earlier rule shadows it, and the checker names an
-  invariant for a value of the state it would index, never panics. Two
-  rules leave a case of an open gap unjudged: SERVED, R1's invalidation
-  during a hand-over (gap 17), and CREDIT, a request a fresh start
-  skipped (gap 20).
+- The checker: each of its 224 rules that go through `ensure`, switched
+  off alone (its condition read as true), makes at least one test fail
+  (pass 26's sweep: 210 by a test of the checker, 14 by another test of
+  the library); a check that cannot fail is deleted or says which
+  earlier rule shadows it, and the checker names an invariant for a value
+  of the state it would index, never panics.
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
 
@@ -213,16 +224,12 @@ in the code, and written in a draft of the documentation repository with
 the reading implemented and the text proposed. The sixteen of pass 15
 (`research/drafts/model-15-contract-gaps.md`) are settled in the contract
 since pass 16 (D-133), and each branch that applies one names the
-contract's sentence and "gap *n*". Four are open since pass 25, found by
-the combined exploration and not yet decided (the model implements the
-text as it reads, and the exploration counts them without judging them):
-17, whether the node that hands a unit role runs R1 during steps 1 to 3
-(`Model::r1`); 18, a request answered *elsewhere* by a hand-over that
-ends without step 4 stays queued for ever (`Model::unit_send_queued`);
-19, evidence stuck against a node whose start lasts longer than
-`STUCK_NS` (`Model::evidence`); 20, a request to a starting node's new
-generation skipped by its fresh start, its credit never answered
-(`Model::skip_rings`). Two were settled otherwise than the
+contract's sentence and "gap *n*". The four found in pass 25 (17 to 20)
+are settled by D-144. One is open since pass 26, found by the combined
+exploration (the model implements the text as it reads, and the
+explorations count it without judging it): 21, the seal of the holder of
+a failed unit's role never ends, since a failed unit cannot be handed
+and a sealed node holds no unit role (`Model::hand_all_units`). Two were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the claim
 of an MSI asks every IOMMU unit of the source's segment, one after another

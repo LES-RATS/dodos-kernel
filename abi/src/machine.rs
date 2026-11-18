@@ -1663,6 +1663,11 @@ mod proofs {
                 member.generation(),
             )
             .with_class(member.class());
+            let again = if member.resuming() {
+                again.with_resume()
+            } else {
+                again
+            };
             assert!(again == member);
             assert!(member.class() < 3);
         }
