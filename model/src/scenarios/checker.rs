@@ -905,3 +905,71 @@ fn a_park_request_that_goes_back_is_reported() {
     m.sys.edit_table(|t| t.park_requests[1] = 0);
     machine_reported(&m, "fence: a park request went back");
 }
+
+// D-143: a core of ARM64 or RISC-V that runs with its park request raised,
+// its word marked (D-146), and neither the fence's stop nor its node's park
+// in flight: no read before a suspend or at a wake parked it.
+#[test]
+fn a_core_that_runs_with_its_park_request_raised_and_nothing_in_flight_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::Aarch64, 2, &[&[0], &[1]]));
+    let g = m.sys.member(1).generation();
+    m.sys.edit_table(|t| {
+        t.park_requests[1] += 1;
+        t.core_words[1] = CoreWord::owned(1, g).marked().raw();
+    });
+    machine_reported(
+        &m,
+        "PARKED: a core runs with its park request raised and no stop or park in flight",
+    );
+}
+
+// A core on its way to a sleep that loses its context, or asleep, while
+// its node still has a thread on it.
+#[test]
+fn a_core_asleep_that_runs_a_thread_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::Riscv64, 2, &[&[0], &[1]]));
+    m.ok(1, super::place_first(1, 1));
+    m.sys.set_hardware(
+        1,
+        crate::system::Hardware::Asleep {
+            latency: 1,
+            wake: None,
+        },
+    );
+    machine_reported(&m, "SLEEP: a core asleep runs a thread of its node");
+}
+
+// D-143: a core whose DR6 still holds a cause after an event: the #DB
+// handler did not load its reset value.
+#[test]
+fn a_dr6_left_with_a_cause_is_reported() {
+    let mut k = node2();
+    k.m.cores[1].dr6 = 1 << 14;
+    reported(
+        &k,
+        "DR6: a core's DR6 is not at its reset value after an event",
+    );
+}
+
+// D-143, RISC-V: an armed level line whose input is high and whose source
+// is not pending at the APLIC, as an acknowledgement without the
+// `setipnum` write leaves it.
+#[test]
+fn an_armed_level_line_high_and_not_pending_is_reported() {
+    let mut m = S::on(&one_node(crate::Arch::Riscv64, 1));
+    let claim = Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::line(5, true, false).raw(),
+        core: 0,
+        vector: 48,
+        destination: s(210),
+    };
+    super::pass17::succeeds(&mut m, 0, claim, 30 * MS);
+    let notify = m.retype(0, ObjectKind::Notify, 0, 211);
+    m.ok(0, notify);
+    super::pass28::bind(&mut m);
+    let node = m.sys.node_mut(0);
+    node.line_input(5, true);
+    node.aplic.get_mut(&5).unwrap().pending = false;
+    machine_reported(&m, "SETIPNUM: an armed level line high and not pending");
+}

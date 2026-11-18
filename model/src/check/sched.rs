@@ -215,10 +215,12 @@ impl Model {
                 .notifies
                 .get(&armed.notify)
                 .map(|notify| notify.timers.iter().filter(|&&timer| timer == id).count());
-            ensure(
-                listed == Some(1) && armed.instant > self.now,
-                "47: armed timer",
-            )?;
+            // A timer of a sleeping core is taken at its wake, up to the
+            // state's exit latency after its instant (Idle).
+            let late = self.cores.get(armed.core).map_or(0, |c| c.asleep);
+            let ahead = armed.instant > self.now
+                || late > 0 && armed.instant.saturating_add(late) >= self.now;
+            ensure(listed == Some(1) && ahead, "47: armed timer")?;
         }
         for (&id, notify) in &self.notifies {
             let armed = notify.timers.iter().all(|timer| {

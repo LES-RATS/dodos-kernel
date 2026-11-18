@@ -157,6 +157,14 @@ pub(crate) struct CorePart {
     /// final review's F2 M8: as bookkeeping, a boot that seeded it
     /// otherwise compared equal).
     pub(crate) limits: [crate::debug::Limit; 18],
+    /// x86-64: the causes DR6 holds above its reset value, set by the
+    /// processor at a #DB and never cleared by it for BD, BS and BT; the
+    /// handler loads the reset value, so it reads 0 after every event
+    /// (Debugging, D-143).
+    pub(crate) dr6: u64,
+    /// While the core sleeps, the exit latency of its state (`System`
+    /// writes it): its timer is taken at its wake, up to that latency late.
+    pub(crate) asleep: u64,
     pub(crate) reported: u64,
     pub(crate) entropy: u64,
 }
@@ -746,6 +754,54 @@ impl Model {
     /// yet entered).
     pub fn is_silent(&self, position: usize) -> bool {
         self.cores[position].silent
+    }
+
+    /// Whether the core at `position` runs a context or a thread.
+    pub(crate) fn core_runs(&self, position: usize) -> bool {
+        let part = &self.cores[position];
+        part.running.is_some() || part.thread.is_some()
+    }
+
+    /// The physical core number of the core at `position`.
+    pub(crate) fn core_number(&self, position: usize) -> usize {
+        self.cores[position].number as usize
+    }
+
+    /// The next instant the core at `position` must act: its hardware
+    /// timer.
+    pub(crate) fn timer_of(&self, position: usize) -> Option<u64> {
+        self.hardware(position)
+    }
+
+    /// The exit latency of the idle state that loses its context which the
+    /// core at `position` enters now, if any: the core is idle (it runs
+    /// nothing, no interrupt waits, nothing is due), and the deepest state
+    /// of its idle table whose exit latency plus minimum residency is
+    /// shorter than the time until its next instant, the deepest with none
+    /// armed, loses its context (Idle; `node_idle`, flags bit 0). Until a
+    /// table is given the core halts, which loses nothing.
+    pub(crate) fn sleep_state(&self, position: usize) -> Option<u64> {
+        let part = &self.cores[position];
+        if part.silent
+            || !self.ready
+            || part.running.is_some()
+            || part.thread.is_some()
+            || !part.ipis.is_empty()
+            || self.due_now(position)
+        {
+            return None;
+        }
+        let until = self
+            .hardware(position)
+            .map(|at| at.saturating_sub(self.now));
+        let entry = part
+            .idle_table
+            .iter()
+            .rev()
+            .find(|e| until.is_none_or(|u| e[0].saturating_add(e[1]) < u))?;
+        let method = entry[2] & 0xFFFF_FFFF;
+        let suspend = method == dodos_abi::IDLE_METHOD_PSCI || method == dodos_abi::IDLE_METHOD_SBI;
+        (suspend && entry[3] & dodos_abi::IDLE_FLAG_LOSES_CONTEXT != 0).then_some(entry[0])
     }
 
     /// Whether a core's timer is due at the current instant.

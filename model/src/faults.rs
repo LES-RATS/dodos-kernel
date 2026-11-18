@@ -9,6 +9,14 @@ use dodos_abi::{
     Error, FAULT_REPLY_REDIRECT, FAULT_REPLY_RESUME, FaultKind, ObjectKind, Rights, SlotAddr,
 };
 
+/// DR6's reset value, the upper 32 bits 0 (Intel SDM §20.2.3).
+pub(crate) const DR6_RESET: u64 = 0xFFFF_0FF0;
+/// The causes DR6 names: B0 to B3, BD, BS and BT.
+const DR6_BD: u64 = 1 << 13;
+const DR6_BS: u64 = 1 << 14;
+const DR6_BT: u64 = 1 << 15;
+pub(crate) const DR6_CAUSES: u64 = 0xF | DR6_BD | DR6_BS | DR6_BT;
+
 impl Model {
     /// A fault of `thread`, which runs: a page fault, another processor
     /// exception or a system call made outside the code page (kinds 1 to
@@ -35,12 +43,59 @@ impl Model {
         self.fault_once(thread, kind, exception);
     }
 
+    /// A #DB taken at CPL0 on the core that runs `thread`, x86-64 (D-143):
+    /// `causes` are the bits the processor sets in DR6 (B0 to B3, BD, BS,
+    /// BT); `at_entry`, whether the saved instruction pointer is the first
+    /// instruction of the system-call entry. The handler reads DR6 once and
+    /// loads its reset value; each cause it names is judged alone: an
+    /// enabled breakpoint of the thread is a fault of kind 9, BS at the
+    /// entry is ignored, BS elsewhere, BD or BT is a bug of the kernel. The
+    /// work of the entry the #DB landed on is the model's next event.
+    pub fn kernel_debug(&mut self, thread: ObjId, causes: u64, at_entry: bool) {
+        assert_eq!(self.machine.arch, crate::Arch::X86_64);
+        assert!(self.runnable().contains(&thread), "{thread:?} does not run");
+        assert_eq!(causes & !DR6_CAUSES, 0, "not a cause of DR6");
+        *self.last_event = None;
+        let core = self.core_of(thread);
+        let entry = self.begin_on(core);
+        self.cores[core].dr6 |= causes;
+        let read = self.read_dr6(core);
+        let control = self.threads[&thread].regs[REG_DR7];
+        let enabled = (0..4)
+            .filter(|i| control >> (2 * i) & 3 != 0)
+            .fold(0, |bits, i| bits | 1 << i);
+        let hit = read & 0xF & enabled;
+        let bug = read & (DR6_BD | DR6_BT) != 0 || read & DR6_BS != 0 && !at_entry;
+        if bug {
+            self.accuse_self(dodos_abi::CrashReason::KernelException as u32);
+        } else if hit != 0 {
+            live(&mut self.threads, thread).outcome = None;
+            self.raise(thread, FaultKind::HardwareBreakpoint, [1, hit, read]);
+        }
+        self.end(entry);
+        self.auto_deliver();
+    }
+
+    /// The #DB handler reads DR6 once and loads it with its reset value
+    /// (Intel SDM §20.2.3): the value read.
+    fn read_dr6(&mut self, core: usize) -> u64 {
+        DR6_RESET | std::mem::take(&mut self.cores[core].dr6)
+    }
+
     /// A fault, with no lock held by another core.
     pub(crate) fn fault_once(&mut self, thread: ObjId, kind: FaultKind, exception: [u64; 3]) {
         *self.last_event = None;
         let core = self.core_of(thread);
         let entry = self.begin_on(core);
         live(&mut self.threads, thread).outcome = None;
+        // A hardware breakpoint at CPL3: the processor sets the causes of
+        // word 4 in DR6, and the handler reads it once and loads its reset
+        // value, as at CPL0 (D-143); word 4 is the value read.
+        let mut exception = exception;
+        if kind == FaultKind::HardwareBreakpoint && self.machine.arch == crate::Arch::X86_64 {
+            self.cores[core].dr6 |= exception[2] & DR6_CAUSES;
+            exception[2] = self.read_dr6(core);
+        }
         // A spurious fault (D-129): a page fault on an address the node's
         // own tables translate with the access asked is resolved on the
         // faulting core, without a message.

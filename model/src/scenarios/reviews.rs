@@ -181,10 +181,11 @@ fn hydrogen_10_an_arm64_core_already_off_confirms_the_new_park_request() {
     m.ok(0, seal(1));
     m.run(5 * MS);
     assert_eq!(m.state(1), MemberState::Sealed);
-    // A sealed node accused with kill: its parked cores are confirmed at
-    // once by their answer to the new park request.
+    // A sealed node accused with kill: its parked cores are confirmed by
+    // their answer to the new park request, at the next round's read (11.2
+    // ms on ARM64, D-143).
     m.ok(0, kill(1));
-    m.run(10 * MS);
+    m.run(dodos_abi::FENCE_NS);
     assert_eq!(m.state(1), MemberState::Dead);
 }
 

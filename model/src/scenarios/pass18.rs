@@ -34,7 +34,7 @@ fn fire_action(m: &mut S, pick: impl Fn(&(u16, HwAction)) -> bool) {
 fn restarting(arch: Arch) -> S {
     let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
     m.ok(0, kill(1));
-    m.run(10 * MS);
+    m.run(dodos_abi::FENCE_NS);
     assert_eq!(m.state(1), MemberState::Dead);
     m.ok(0, fresh(1, 0b110));
     m

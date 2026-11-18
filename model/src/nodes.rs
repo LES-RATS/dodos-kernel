@@ -103,6 +103,12 @@ pub(crate) struct Starting {
 /// The fence repeats its stops every millisecond for a core not confirmed.
 pub(crate) const FENCE_RETRY_NS: u64 = 1_000_000;
 
+/// The round of the ARM64 fence: the x86-64 one, 11.2 ms (`NMI_GRACE_NS`,
+/// 10 ms and 200 µs), at the start of which the driver reads
+/// `AFFINITY_INFO` of each core not yet confirmed and signals those (The
+/// fence, ARM64, D-143).
+pub(crate) const FENCE_ROUND_ARM64_NS: u64 = 11_200_000;
+
 impl Model {
     /// The `node` capability of a call: its node slot.
     fn node_of(&self, thread: ObjId, node: SlotAddr, right: Rights) -> Result<u16, Error> {
@@ -923,7 +929,17 @@ impl Model {
             })
             .collect();
         let started = self.table.fences[node as usize].begun(g);
-        if unconfirmed.is_empty() && started.is_some() {
+        let period = match member.state() {
+            MemberState::Unfenced => self.table.sweep_ns,
+            _ => self.fence_round(),
+        };
+        // On ARM64 the driver reads `AFFINITY_INFO` at the start of each
+        // round only, and signals the cores it finds not confirmed (The
+        // fence, ARM64, D-143: "a core awake and unmasked parks at the
+        // first signal and is confirmed at the second round's read").
+        let round = started.is_none() || now >= fence.last + period;
+        let reads = round || self.machine.arch != crate::Arch::Aarch64;
+        if reads && unconfirmed.is_empty() && started.is_some() {
             for core in 0..self.table.start_requests.len() {
                 if crate::table::Table::started_node(self.table.start_requests[core])
                     == Some((node, g))
@@ -938,11 +954,7 @@ impl Model {
             self.fences.remove(&node);
             return true;
         }
-        let period = match member.state() {
-            MemberState::Unfenced => self.table.sweep_ns,
-            _ => crate::nodes::FENCE_RETRY_NS,
-        };
-        if started.is_some() && now < fence.last + period {
+        if !round {
             if member.state() == MemberState::Fencing
                 && started.is_some_and(|s| now >= s + FENCE_NS)
             {
@@ -987,6 +999,16 @@ impl Model {
             f.last = now;
         }
         true
+    }
+
+    /// The period between two rounds of a fence: 11.2 ms on ARM64 (D-143);
+    /// the model keeps 1 ms on x86-64 and RISC-V, whose stops it does not
+    /// time (the NMI grace and the SIPIs, the stop extension).
+    fn fence_round(&self) -> u64 {
+        match self.machine.arch {
+            crate::Arch::Aarch64 => FENCE_ROUND_ARM64_NS,
+            _ => FENCE_RETRY_NS,
+        }
     }
 
     // Reclaim.
@@ -1980,7 +2002,7 @@ impl Model {
         // are those instants plus the stopped time (D-137).
         let mut membership: Vec<u64> = Vec::new();
         for fence in self.fences.values() {
-            membership.push(fence.last + FENCE_RETRY_NS);
+            membership.push(fence.last + self.fence_round());
         }
         for start in self.starts.values() {
             membership.push(start.last + START_RETRY_NS);

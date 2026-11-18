@@ -257,8 +257,50 @@ impl Model {
         } else {
             entry.state = IrqState::Armed;
             self.unmask_line(irq);
+            self.setipnum(irq);
         }
         Ok(Output::Done)
+    }
+
+    /// RISC-V, a level line on an APLIC in MSI mode: the APLIC does not
+    /// signal again a source that stays asserted, so `irq_ack` and a bind
+    /// that arm such an irq write its number to the domain's `setipnum`,
+    /// which sets the pending bit only while the input is high; a gate
+    /// write, the node holding the domain's role (Interrupts, D-143).
+    fn setipnum(&mut self, irq: ObjId) {
+        let source = self.irqs[&irq].source;
+        if self.machine.arch == crate::Arch::Riscv64 && source.is_line() && source.level() {
+            let line = self.aplic.entry(source.id()).or_default();
+            line.pending |= line.high;
+        }
+    }
+
+    /// RISC-V: the input of level line `gsi` driven by its device (a test's
+    /// input): a rising input sets the source pending, a low one clears it.
+    pub fn line_input(&mut self, gsi: u32, high: bool) {
+        assert_eq!(self.machine.arch, crate::Arch::Riscv64);
+        let line = self.aplic.entry(gsi).or_default();
+        line.pending = high && (line.pending || !line.high);
+        line.high = high;
+    }
+
+    /// RISC-V: the APLIC forwards pending level line `gsi` by MSI to the
+    /// core and vector its claim programmed, and clears its pending bit;
+    /// the arrival is an event of the kernel. Says whether it forwarded.
+    pub fn aplic_forward(&mut self, gsi: u32) -> bool {
+        let pending = self.aplic.get(&gsi).is_some_and(|line| line.pending);
+        let target = self
+            .irqs
+            .values()
+            .find(|irq| irq.source.is_line() && irq.source.id() == gsi)
+            .filter(|irq| !self.line_masked(irq.source))
+            .map(|irq| (irq.core, irq.vector));
+        let (true, Some((core, vector))) = (pending, target) else {
+            return false;
+        };
+        live(&mut self.aplic, gsi).pending = false;
+        self.interrupt_on(core, vector);
+        true
     }
 
     /// An irq armed: a level line is unmasked at its controller, which
@@ -298,6 +340,7 @@ impl Model {
             IrqState::Fired => {
                 entry.state = IrqState::Armed;
                 self.unmask_line(irq);
+                self.setipnum(irq);
             }
         }
         Ok(Output::Done)
@@ -362,7 +405,7 @@ impl Model {
     /// Whether a line's redirection entry is masked at its IOAPIC as a
     /// rebuild wrote it from the line's `Report` (D-139): a masked entry
     /// raises nothing, so no arrival reaches the core.
-    fn line_masked(&self, source: dodos_abi::IrqSource) -> bool {
+    pub(crate) fn line_masked(&self, source: dodos_abi::IrqSource) -> bool {
         source.is_line()
             && self.ioapic_role(source.id()).is_some_and(|role| {
                 self.table

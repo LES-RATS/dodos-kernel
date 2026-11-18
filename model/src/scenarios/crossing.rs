@@ -771,7 +771,10 @@ fn a_resume_keeps_its_consumer_indices_and_consumes_the_answers_that_waited() {
             crate::system::Event::Action(i) => m.sys.actions()[i].0 == 0,
             crate::system::Event::StubHalt { .. }
             | crate::system::Event::CpuOff { .. }
-            | crate::system::Event::EntryStep { .. } => true,
+            | crate::system::Event::EntryStep { .. }
+            | crate::system::Event::Sleep { .. }
+            | crate::system::Event::PowerDown { .. }
+            | crate::system::Event::Wake { .. } => true,
         });
         match mine {
             Some(event) => {

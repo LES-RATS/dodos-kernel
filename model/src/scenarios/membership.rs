@@ -516,7 +516,8 @@ fn the_fence_of_each_architecture_confirms_every_core() {
     for arch in [Arch::Aarch64, Arch::Riscv64] {
         let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
         m.ok(0, stop(1, NODE_STOP_KILL));
-        m.run(10 * MS);
+        // ARM64 confirms at the second round's read, 11.2 ms (D-143).
+        m.run(dodos_abi::FENCE_NS);
         assert_eq!(m.state(1), MemberState::Dead, "{arch:?}");
         for core in [1, 2] {
             assert_eq!(m.sys.hardware(core), Hardware::Off);

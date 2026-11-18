@@ -56,6 +56,13 @@ impl Model {
     pub(super) fn check_debug(&self) -> Check {
         for position in 0..self.width() {
             self.check_area(position)?;
+            // D-143: the #DB handler loads DR6 with its reset value before
+            // it returns, at CPL0 and CPL3, so no cause is left for the
+            // next #DB to read.
+            ensure(
+                self.cores[position].dr6 == 0,
+                "DR6: a core's DR6 is not at its reset value after an event",
+            )?;
         }
         self.check_records()
     }

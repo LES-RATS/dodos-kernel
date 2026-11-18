@@ -41,6 +41,16 @@ pub enum Hardware {
     /// NMI handler, after which it reads its core word (Node slots and core
     /// words, the start request and the entry stub, D-134).
     EntryStub { installed: bool },
+    /// ARM64: on its way to a state that loses its context, between the
+    /// gate's `SDEI_PE_MASK` and read of the park request and the power-down
+    /// of `CPU_SUSPEND`: SDEI masked, so a fence signal that lands here is
+    /// lost (Trusted Firmware-A); `roused` if something woke it meanwhile
+    /// (`node_idle`, D-143).
+    Suspending { latency: u64, roused: bool },
+    /// In an idle state that loses its context (ARM64 `CPU_SUSPEND`, RISC-V
+    /// a non-retentive `sbi_hart_suspend`); `wake` is the instant its exit
+    /// latency ends, once its timer, an interrupt or a signal woke it.
+    Asleep { latency: u64, wake: Option<u64> },
 }
 
 /// One event that can happen now.
@@ -60,6 +70,15 @@ pub enum Event {
     /// x86-64: the entry stub's next step: it installs the node kernel's
     /// NMI handler, then reads its core word and enters or parks again.
     EntryStep { core: usize },
+    /// An idle core enters the state its idle table chooses that loses its
+    /// context (`node_idle`, Idle): on ARM64 the gate masks the PE and
+    /// reads the park request first.
+    Sleep { core: usize },
+    /// ARM64: the power-down of `CPU_SUSPEND` after the gate's read.
+    PowerDown { core: usize },
+    /// A core leaves its sleep, its exit latency over: the gate reads the
+    /// park request and parks the core if it is raised (D-143).
+    Wake { core: usize },
 }
 
 /// A deterministic generator (xorshift64*), seeded by the tests.
@@ -274,20 +293,33 @@ impl System {
                     node: slot as u16,
                     core,
                 };
-                if !events.contains(&event) && !model.is_silent(core) {
+                if !events.contains(&event) && !model.is_silent(core) && self.awake(model, core) {
                     events.push(event);
                 }
             }
             for core in 0..model.core_count() {
-                if !model.is_silent(core) && model.due_now(core) {
+                if !model.is_silent(core) && model.due_now(core) && self.awake(model, core) {
                     events.push(Event::Timer {
                         node: slot as u16,
                         core,
                     });
                 }
+                let number = model.core_number(core);
+                if self.hardware[number] == Hardware::Running
+                    && model.sleep_state(core).is_some()
+                    && matches!(self.machine.arch, Arch::Aarch64 | Arch::Riscv64)
+                {
+                    events.push(Event::Sleep { core: number });
+                }
             }
         }
-        events.extend((0..self.actions.len()).map(Event::Action));
+        // A park waiting for its roused core to wake is not a step.
+        let waits = |action: &HwAction| matches!(*action, HwAction::Park { core } if self.roused(core) == Some(true));
+        events.extend(
+            (0..self.actions.len())
+                .filter(|&i| !waits(&self.actions[i].1))
+                .map(Event::Action),
+        );
         for (core, &hw) in self.hardware.iter().enumerate() {
             if hw == (Hardware::Stub { window: true }) {
                 events.push(Event::StubHalt { core });
@@ -298,8 +330,181 @@ impl System {
             if matches!(hw, Hardware::EntryStub { .. }) {
                 events.push(Event::EntryStep { core });
             }
+            if matches!(hw, Hardware::Suspending { .. }) {
+                events.push(Event::PowerDown { core });
+            }
+            if matches!(hw, Hardware::Asleep { wake: Some(at), .. } if at <= self.now) {
+                events.push(Event::Wake { core });
+            }
         }
         events
+    }
+
+    /// Whether the core at `position` of `model` takes its interrupts: not
+    /// on its way to sleep or asleep, where an interrupt only wakes it.
+    fn awake(&self, model: &Model, position: usize) -> bool {
+        !matches!(
+            self.hardware[model.core_number(position)],
+            Hardware::Suspending { .. } | Hardware::Asleep { .. }
+        )
+    }
+
+    /// The node model and position of a physical core its word names.
+    fn position_of(&self, core: usize) -> Option<(u16, usize)> {
+        let word = CoreWord::from_raw(self.table().core_words[core])?;
+        let model = self.nodes.get(word.slot() as usize)?.as_ref()?;
+        Some((word.slot(), model.position(core as u64)?))
+    }
+
+    /// Whether the gate's read before a suspend that loses the context, or
+    /// at a way out of one, finds the park request raised: the core's word
+    /// carries the fence mark (D-146). Not "the request differs from
+    /// `parked`": a core already off at a fence, or stopped by
+    /// `sbi_hart_stop`, never wrote `parked`, and reused by a healthy node
+    /// would park itself at its first suspend.
+    fn park_raised(&self, core: usize) -> bool {
+        self.marked(core)
+    }
+
+    /// An idle core enters its state that loses its context. ARM64: the
+    /// gate, interrupts masked, calls `SDEI_PE_MASK`, then reads the park
+    /// request: raised, it writes it into `parked` and runs the park routine
+    /// with no unmask; otherwise `CPU_SUSPEND`. RISC-V: `sbi_hart_suspend`,
+    /// the park request read at the return (`node_idle`, D-143).
+    fn sleep(&mut self, core: usize) {
+        let Some((node, position)) = self.position_of(core) else {
+            return;
+        };
+        let Some(latency) = self.model(node).sleep_state(position) else {
+            return;
+        };
+        match self.machine.arch {
+            Arch::Aarch64 if self.park_raised(core) => {
+                self.write_parked(core, false);
+                self.hardware[core] = Hardware::Parking;
+            }
+            Arch::Aarch64 => {
+                self.hardware[core] = Hardware::Suspending {
+                    latency,
+                    roused: false,
+                };
+            }
+            _ => {
+                self.hardware[core] = Hardware::Asleep {
+                    latency,
+                    wake: None,
+                }
+            }
+        }
+        self.rouse();
+    }
+
+    /// ARM64: the power-down of `CPU_SUSPEND`; a core roused on its way
+    /// wakes at once, after its exit latency.
+    fn power_down(&mut self, core: usize) {
+        if let Hardware::Suspending { latency, roused } = self.hardware[core] {
+            let wake = roused.then_some(self.now + latency);
+            self.hardware[core] = Hardware::Asleep { latency, wake };
+        }
+        self.rouse();
+    }
+
+    /// A core leaves its sleep. ARM64: `SDEI_PE_UNMASK` before anything
+    /// else, then the park request read: raised, the gate writes it into
+    /// `parked` and runs the park routine instead of returning to the node.
+    /// RISC-V: the same read at the return from `sbi_hart_suspend`, and
+    /// `sbi_hart_stop` when it is raised. So a fence signal lost at a wake
+    /// still parks the core (`node_idle`, D-143).
+    fn wake_from_sleep(&mut self, core: usize) {
+        if !matches!(self.hardware[core], Hardware::Asleep { .. }) {
+            return;
+        }
+        match (self.machine.arch, self.park_raised(core)) {
+            (Arch::Aarch64, true) => {
+                self.write_parked(core, false);
+                self.hardware[core] = Hardware::Parking;
+            }
+            (_, true) => {
+                self.write_parked(core, true);
+                self.hardware[core] = Hardware::Off;
+            }
+            (_, false) => self.hardware[core] = Hardware::Running,
+        }
+    }
+
+    /// What wakes a sleeping core: its timer due, an interrupt pending for
+    /// it; then its exit latency runs.
+    fn rouse(&mut self) {
+        self.sync_sleep();
+        for core in 0..self.hardware.len() {
+            let Hardware::Asleep {
+                latency,
+                wake: None,
+            } = self.hardware[core]
+            else {
+                continue;
+            };
+            let Some((node, position)) = self.position_of(core) else {
+                continue;
+            };
+            let model = self.nodes[node as usize].as_ref().expect("a model");
+            let pending = model.pending_ipis().iter().any(|&(c, _)| c == position);
+            if pending || model.due_now(position) {
+                self.hardware[core] = Hardware::Asleep {
+                    latency,
+                    wake: Some(self.now + latency),
+                };
+            }
+        }
+    }
+
+    /// A fence signal, a park or a start's wake reaches a sleeping core: it
+    /// wakes (the signal itself is lost at the wake, D-143); on its way to
+    /// sleep (SDEI masked) it is roused, so that it wakes once down.
+    /// Whether `core` is on its way to sleep or asleep: then whether it was
+    /// roused already.
+    fn roused(&self, core: usize) -> Option<bool> {
+        match self.hardware[core] {
+            Hardware::Suspending { roused, .. } => Some(roused),
+            Hardware::Asleep { wake, .. } => Some(wake.is_some()),
+            _ => None,
+        }
+    }
+
+    fn rouse_one(&mut self, core: usize) {
+        match self.hardware[core] {
+            Hardware::Asleep {
+                latency,
+                wake: None,
+            } => {
+                self.hardware[core] = Hardware::Asleep {
+                    latency,
+                    wake: Some(self.now + latency),
+                };
+            }
+            Hardware::Suspending { latency, .. } => {
+                self.hardware[core] = Hardware::Suspending {
+                    latency,
+                    roused: true,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// The next instant something is due: a timer of a core awake, a sleeping
+    /// core's timer (which wakes it) or the end of its exit latency.
+    fn next_instant(&self) -> Option<u64> {
+        let timers = self.nodes.iter().flatten().flat_map(|m| {
+            (0..m.core_count())
+                .filter(|&p| !m.is_silent(p))
+                .filter_map(move |p| m.timer_of(p))
+        });
+        let wakes = self.hardware.iter().filter_map(|h| match *h {
+            Hardware::Asleep { wake, .. } => wake,
+            _ => None,
+        });
+        timers.chain(wakes).min()
     }
 
     /// Carries out one event.
@@ -328,6 +533,39 @@ impl System {
                 self.hardware[core] = Hardware::Off;
             }
             Event::EntryStep { core } => self.entry_step(core),
+            Event::Sleep { core } => self.sleep(core),
+            Event::PowerDown { core } => self.power_down(core),
+            Event::Wake { core } => {
+                self.wake_from_sleep(core);
+                // The timer interrupt that woke the core is taken at once,
+                // late by the exit latency (Idle: "An interrupt wakes it").
+                if self.hardware[core] == Hardware::Running
+                    && let Some((node, position)) = self.position_of(core)
+                    && self.node(node).due_now(position)
+                {
+                    self.model(node).timer_interrupt(position);
+                    self.after(node);
+                }
+            }
+        }
+        self.rouse();
+    }
+
+    /// Each node learns which of its cores sleep, and the exit latency of
+    /// the state: a timer of such a core is taken when it wakes, up to that
+    /// latency after its instant.
+    fn sync_sleep(&mut self) {
+        let hardware = self.hardware.clone();
+        for model in self.nodes.iter_mut().flatten() {
+            for position in 0..model.core_count() {
+                let latency = match hardware[model.core_number(position)] {
+                    Hardware::Suspending { latency, .. } | Hardware::Asleep { latency, .. } => {
+                        latency
+                    }
+                    _ => 0,
+                };
+                model.cores[position].asleep = latency;
+            }
         }
     }
 
@@ -362,20 +600,18 @@ impl System {
     pub fn advance(&mut self, to: u64) {
         loop {
             self.settle(10_000);
-            let next = self
-                .nodes
-                .iter()
-                .flatten()
-                .filter_map(|m| m.next_timer().map(|(at, _)| at))
-                .filter(|&at| at <= to)
-                .min();
+            let next = self.next_instant().filter(|&at| at <= to);
             let Some(at) = next else { break };
             self.set_clock(at.max(self.now));
             if self.events().is_empty() {
-                // A timer due at an instant already reached is taken.
+                // A timer due at an instant already reached is taken, on a
+                // core awake (a sleeping core's timer wakes it).
                 let due = self.nodes.iter().enumerate().find_map(|(slot, m)| {
-                    let (at, core) = m.as_ref()?.next_timer()?;
-                    (at <= self.now).then_some((slot as u16, core))
+                    let m = m.as_ref()?;
+                    (0..m.core_count())
+                        .filter(|&p| !m.is_silent(p) && self.awake(m, p))
+                        .find(|&p| m.timer_of(p).is_some_and(|at| at <= self.now))
+                        .map(|p| (slot as u16, p))
                 });
                 let Some((node, core)) = due else { break };
                 self.fire(Event::Timer { node, core });
@@ -406,6 +642,7 @@ impl System {
         for model in self.nodes.iter_mut().flatten() {
             model.set_now(now);
         }
+        self.rouse();
     }
 
     /// A physical core stops answering (a test's input): it runs nothing,
@@ -533,6 +770,13 @@ impl System {
         match action {
             HwAction::Stop { core } => self.stop(core),
             HwAction::Start { core } => self.wake(core),
+            // A sleeping core of the node is woken by the park's interrupt,
+            // and its kernel parks it once awake: the park stays in flight
+            // (D-146: the read at the wake finds no mark).
+            HwAction::Park { core } if self.roused(core).is_some() => {
+                self.rouse_one(core);
+                self.actions.push((from, action));
+            }
             HwAction::Park { core } => self.park(core),
             HwAction::Ring { node } => self.interrupt(node, crate::Ipi::Ring),
             HwAction::Interrupt { node } => self.interrupt(node, crate::Ipi::Reschedule),
@@ -559,6 +803,11 @@ impl System {
             table.stopped[core] = request;
         }
         self.share(table);
+        self.silence(core);
+    }
+
+    /// The node the core's word names no longer hears from the core.
+    fn silence(&mut self, core: usize) {
         if let Some(word) = CoreWord::from_raw(self.table().core_words[core])
             && let Some(Some(model)) = self.nodes.get_mut(word.slot() as usize)
             && let Some(position) = model.position(core as u64)
@@ -667,6 +916,12 @@ impl System {
                 self.write_parked(core, false);
                 self.hardware[core] = Hardware::Parking;
             }
+            // On its way to sleep, SDEI masked: the signal is lost (Trusted
+            // Firmware-A loses an event that reaches a masked PE); asleep, it
+            // wakes the core and is lost at the wake, firmware masking the PE
+            // there, and the read at the wake parks it (D-143).
+            (Arch::Aarch64, Hardware::Suspending { .. }) if self.marked(core) => {}
+            (Arch::Aarch64, Hardware::Asleep { .. }) if self.marked(core) => self.rouse_one(core),
             // A core already off answers OFF to the new request at once (no
             // `CPU_ON` was sent since).
             (Arch::Aarch64, Hardware::Off) => {
@@ -678,8 +933,13 @@ impl System {
             // RISC-V: the stop extension stops the hart whatever it does; the
             // gate sends it only to a marked word (G10).
             (Arch::Riscv64, _) if !self.marked(core) => {}
+            // The stopped hart writes nothing: `parked` keeps its value, and
+            // the machine answers the request (`fence_hart`).
             (Arch::Riscv64, _) => {
-                self.write_parked(core, true);
+                let mut table = self.table().clone();
+                table.stopped[core] = table.park_requests[core];
+                self.share(table);
+                self.silence(core);
                 self.hardware[core] = Hardware::Off;
             }
         }
@@ -859,6 +1119,12 @@ impl System {
     /// An action in flight, as if a node had asked for it.
     pub(crate) fn push_action(&mut self, node: u16, action: HwAction) {
         self.actions.push((node, action));
+    }
+
+    /// The hardware state of `core`, set by a checker test.
+    #[cfg(test)]
+    pub(crate) fn set_hardware(&mut self, core: usize, state: Hardware) {
+        self.hardware[core] = state;
     }
 
     /// The machine table, changed as every kernel then reads it.

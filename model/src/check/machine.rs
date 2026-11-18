@@ -100,6 +100,32 @@ impl System {
                 !word.is_marked() || table.park_requests[core] != 0,
                 "fence: a word marked before its park request was raised",
             )?;
+            // D-143, ARM64 and RISC-V: a core that runs its node's kernel
+            // with its park request raised, its word marked (D-146), has the
+            // fence's stop or its node's park in flight; a woken core with
+            // it raised was parked by the read at its wake (`node_idle`).
+            let raised = word.is_marked();
+            let in_flight = self.actions().iter().any(|&(_, a)| {
+                a == crate::nodes::HwAction::Stop { core }
+                    || a == crate::nodes::HwAction::Park { core }
+            });
+            ensure(
+                self.machine.arch == crate::Arch::X86_64
+                    || self.hardware(core) != Hardware::Running
+                    || !raised
+                    || in_flight,
+                "PARKED: a core runs with its park request raised and no stop or park in flight",
+            )?;
+            // A core on its way to sleep or asleep runs nothing of its node.
+            if matches!(
+                self.hardware(core),
+                Hardware::Suspending { .. } | Hardware::Asleep { .. }
+            ) {
+                let runs = self.models().any(|(n, m)| {
+                    n == word.slot() && m.position(core as u64).is_some_and(|p| m.core_runs(p))
+                });
+                ensure(!runs, "SLEEP: a core asleep runs a thread of its node")?;
+            }
             if self.hardware(core) != Hardware::Running {
                 continue;
             }

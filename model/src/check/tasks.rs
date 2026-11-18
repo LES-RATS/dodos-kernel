@@ -83,6 +83,16 @@ impl Model {
                 !(irq.source.level() && irq.pending),
                 "51: pending level source",
             )?;
+            // D-143, RISC-V: an armed level line whose input is high has its
+            // source pending at the APLIC, so it is forwarded again.
+            let lost = irq.state == IrqState::Armed
+                && irq.source.is_line()
+                && !self.line_masked(irq.source)
+                && self
+                    .aplic
+                    .get(&irq.source.id())
+                    .is_some_and(|line| line.high && !line.pending);
+            ensure(!lost, "SETIPNUM: an armed level line high and not pending")?;
         }
         for (&id, notify) in &self.notifies {
             let bound = notify.irqs.iter().all(|irq| {
