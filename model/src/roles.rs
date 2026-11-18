@@ -519,10 +519,16 @@ impl Model {
                 rebuild.node += 1;
                 continue;
             }
-            let busy = self
-                .rebuilds
+            // At most one `ReportAsk` in flight to each node, whatever the
+            // number of units rebuilt (Roles): an ask a rebuild abandoned,
+            // when the node it asked was accused or sealed, is in flight
+            // until its answer is consumed (pass 26: a second ask went to
+            // a node that resumed with the first one unanswered).
+            let busy = self.peers[z as usize]
+                .credits
                 .iter()
-                .any(|(&r, b)| r != role && b.asked && b.node == z);
+                .flatten()
+                .any(|c| c.kind == dodos_abi::NodeMessage::ReportAsk);
             if busy {
                 self.rebuilds.insert(role, rebuild);
                 return false;
@@ -799,7 +805,15 @@ impl Model {
         let Completes::Report { role } = taken.completes else {
             return;
         };
-        let Some(rebuild) = self.rebuilds.get(&role) else {
+        // A report of a node the rebuild no longer asks (it was skipped,
+        // accused or sealed, while its ask was in flight) is the answer of
+        // an abandoned ask: it frees the credit and moves nothing (pass
+        // 26: it moved the cursor back while another node was asked).
+        let Some(rebuild) = self
+            .rebuilds
+            .get(&role)
+            .filter(|r| r.asked && r.node == from)
+        else {
             return;
         };
         // The holder takes a `Report` only if it holds at most 28 items

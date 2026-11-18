@@ -204,10 +204,11 @@ fn probe(m: &S, splittable: usize) -> u32 {
             SEALED,
             matches!(state, MemberState::Sealing | MemberState::Sealed),
         );
-        if state == MemberState::Starting && m.sys.has(n) {
-            let resuming = m.sys.node(n).resuming;
-            set(RESUME, resuming);
-            set(FRESH, !resuming);
+        // A resume from the write of starting with the resume bit to live
+        // (D-144), a fresh start from its write of starting.
+        if state == MemberState::Starting {
+            set(RESUME, member.resuming());
+            set(FRESH, !member.resuming());
         }
         if m.sys.has(n) {
             let node = m.sys.node(n);
@@ -431,6 +432,8 @@ struct Run {
     members: Vec<Member>,
     /// The run ended in the state of gap 21.
     gap_21: bool,
+    /// A node whose events are held back, and for how many more churns.
+    deferred: Option<(u16, u32)>,
 }
 
 impl Run {
@@ -467,6 +470,7 @@ impl Run {
             kept: None,
             members: Vec::new(),
             gap_21: false,
+            deferred: None,
         };
         say(format_args!("drivers {:?}", run.drivers));
         run.set_up();
@@ -665,8 +669,27 @@ impl Run {
     /// Events at the current instant, each followed by the check and the
     /// probe, then time moves by up to 3 ms.
     fn churn(&mut self) {
+        // A node whose events are held back: none of its interrupts or
+        // timers is chosen, and time does not move, for a few steps (the
+        // generator chooses which event happens now).
+        let deferred = self
+            .deferred
+            .filter(|&(_, steps)| steps > 0)
+            .map(|(n, _)| n);
+        if let Some((node, steps)) = self.deferred {
+            self.deferred = (steps > 1).then_some((node, steps - 1));
+        }
         for _ in 0..self.rng.below(12) {
-            let events = self.m.sys.events();
+            let events: Vec<_> = self
+                .m
+                .sys
+                .events()
+                .into_iter()
+                .filter(|e| {
+                    !matches!(e, crate::system::Event::Ipi { node, .. }
+                        | crate::system::Event::Timer { node, .. } if Some(*node) == deferred)
+                })
+                .collect();
             if events.is_empty() || self.m.sys.stopped {
                 break;
             }
@@ -676,7 +699,7 @@ impl Run {
             assert_eq!(self.m.sys.check(), Ok(()), "after {event:?}");
             self.note();
         }
-        if self.rng.below(2) == 0 {
+        if deferred.is_none() && self.rng.below(2) == 0 {
             let ns = 1 + self.rng.below(3_000_000) as u64;
             self.run(ns);
         }
@@ -812,6 +835,23 @@ impl Run {
         (self.call(actor, seal(victim)) == Some(DONE)).then_some(victim)
     }
 
+    /// A healthy node sealed, then resumed as soon as it is sealed.
+    fn quick_resume(&mut self) {
+        let Some((victim, _)) = self.victim() else {
+            return;
+        };
+        if self.seal_node(victim).is_none() {
+            return;
+        }
+        for _ in 0..10 {
+            if self.m.state(victim) == MemberState::Sealed {
+                break;
+            }
+            self.churn();
+        }
+        self.recover(MemberState::Sealed);
+    }
+
     /// A sealed node resumed, or a dead one started afresh, by a live
     /// node.
     fn recover(&mut self, state: MemberState) {
@@ -824,7 +864,11 @@ impl Run {
             return;
         };
         match state {
+            // The resume's first wake lost, so that it lasts a retry.
             MemberState::Sealed => {
+                if matches!(self.m.sys.hardware(target as usize), Hardware::Stub { .. }) {
+                    self.m.sys.set_window(target as usize);
+                }
                 let _ = self.call(actor, resume(target));
             }
             _ => {
@@ -900,7 +944,11 @@ impl Run {
                     {
                         let _ = self.call(actor, kill(pair.granter));
                     }
-                    // One time in two resumed as soon as it is sealed.
+                    // One time in two resumed as soon as it is sealed; one
+                    // time in three of those, under a rebuild: the IOMMU
+                    // unit's holder killed, and the resume at its fence,
+                    // so that its successor's rebuild asks the resuming
+                    // node for its report (D-144).
                     if sealed && resume_now {
                         let holder = pair.holder;
                         for _ in 0..10 {
@@ -908,6 +956,21 @@ impl Run {
                                 break;
                             }
                             self.churn();
+                        }
+                        let unit = self.m.sys.role(IOMMU_ROLE).holder();
+                        if self.rng.below(3) == 0
+                            && unit < NODES
+                            && self.healthy(unit)
+                            && self.may_harm()
+                            && let Some(actor) = self.live_other(unit)
+                        {
+                            let _ = self.call(actor, kill(unit));
+                            for _ in 0..20 {
+                                if self.m.state(unit) != MemberState::Fencing {
+                                    break;
+                                }
+                                self.churn();
+                            }
                         }
                         self.recover(MemberState::Sealed);
                     }
@@ -977,6 +1040,10 @@ impl Run {
                     for i in 0..pair.frames {
                         let _ = self.call(pair.holder, Syscall::CapDelete(s(pair.got + i)));
                     }
+                    // The holder's events held back, so that its release
+                    // stays pending while the rest goes on, and its R0 of
+                    // a granting node accused meanwhile waits.
+                    self.deferred = Some((pair.holder, 4 + self.rng.below(5) as u32));
                 } else {
                     self.grant_all(pair);
                 }
@@ -1153,6 +1220,13 @@ impl Run {
     fn step(&mut self) {
         // A node started afresh has a new first thread once it runs.
         refresh(&mut self.m);
+        // While a node is accused, a resume beside it: a healthy node
+        // sealed and resumed at once (a resume lasts a few events, an
+        // accusation its fence and reclaim).
+        let accusation = (0..NODES).any(|n| accused(self.m.state(n)));
+        if accusation && self.drivers.contains(&Driver::Resume) && self.rng.below(2) == 0 {
+            self.quick_resume();
+        }
         if self.rng.below(3) == 0 {
             let driver = self.drivers[self.rng.below(3)];
             self.drive(driver);
@@ -1340,17 +1414,39 @@ fn combined_recovery_states_between_nodes() {
 }
 
 /// The long run: three rounds of the 286 triples of drivers by default
-/// (`DODOS_COMBINATION_SEEDS` sets another number); every combination not
-/// shown impossible is reached by a seed.
+/// (`DODOS_COMBINATION_SEEDS` sets another number, `DODOS_COMBINATION_FIRST`
+/// the first seed, for a run in ranges); every combination not shown
+/// impossible is reached by a seed.
 #[test]
 #[ignore = "long: run with --release; DODOS_COMBINATION_SEEDS"]
 fn every_combination_of_recovery_states_is_reached() {
-    let count = std::env::var("DODOS_COMBINATION_SEEDS")
-        .ok()
-        .map_or(858, |n| n.parse().expect("a number of seeds"));
-    let reach = explore((0..count).collect());
+    let number = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map_or(default, |n| n.parse().expect("a number of seeds"))
+    };
+    let (count, first) = (
+        number("DODOS_COMBINATION_SEEDS", 858),
+        number("DODOS_COMBINATION_FIRST", 0),
+    );
+    let reach = explore((first..first + count).collect());
     let missing = report(&reach);
     if replayed().is_none() {
         assert!(missing.is_empty(), "never reached: {missing:#?}");
     }
+}
+
+// Seed 1109 of the long run of pass 26: a rebuild's `ReportAsk` to a node
+// that sealed before reading it stayed in flight while the rebuild passed
+// the node over; the node resumed and answered, and the late report moved
+// the rebuild's cursor back while another node was asked, so that a second
+// `ReportAsk` went to a node with one in flight (RESERVE). A report of a
+// node no longer asked now frees its credit and moves nothing, and no ask
+// goes to a node with one in flight (Roles, the reports are pulled).
+#[test]
+fn a_late_report_of_a_node_passed_over_moves_no_rebuild() {
+    if !super::explore::once() {
+        return;
+    }
+    let _ = explore_one(1109);
 }

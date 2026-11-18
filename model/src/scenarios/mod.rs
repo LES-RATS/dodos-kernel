@@ -262,16 +262,21 @@ impl Harm {
     /// evidence seal.
     pub(crate) fn accepts(&self, node: u16, member: dodos_abi::Member) -> bool {
         let at = (node, member.generation());
-        // A start or a resume whose starter was harmed may never end:
-        // nobody wakes its cores again, and it is accused stale at
-        // `START_NS`.
+        // A start or a resume whose starter was harmed or sealed may never
+        // end: nobody wakes its cores again (a sealing node drives no
+        // start), and it is accused stale or stuck at `START_NS` (D-137,
+        // D-144).
         let orphan = self
             .starts
             .get(&at)
-            .is_some_and(|starter| self.harmed.contains(starter));
+            .is_some_and(|starter| self.harmed.contains(starter) || self.sealed.contains(starter));
         self.harmed.contains(&at)
             || self.sealed.contains(&at) && member.evidence() == dodos_abi::Evidence::Seal
-            || orphan && member.evidence() == dodos_abi::Evidence::Stale
+            || orphan
+                && matches!(
+                    member.evidence(),
+                    dodos_abi::Evidence::Stale | dodos_abi::Evidence::Stuck
+                )
     }
 }
 

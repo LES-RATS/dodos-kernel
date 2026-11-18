@@ -377,3 +377,34 @@ fn gap_21_the_seal_of_the_holder_of_a_failed_units_role_never_ends() {
         "the hand-over did not start again"
     );
 }
+
+// Seed 1109 of pass 26's long run, the late report: a `Report` of a node a
+// rebuild passed over while its ask was in flight frees the credit and
+// moves nothing; the cursor stays on the node asked now (Roles, the
+// reports are pulled).
+#[test]
+fn a_report_of_a_node_no_longer_asked_frees_its_credit_and_moves_no_cursor() {
+    let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]));
+    let holder = m.sys.role(IOMMU_ROLE).holder();
+    let node = m.sys.node_mut(holder);
+    // An ask left in flight to node 0, and the rebuild now asking node 3.
+    let ask = crate::rings::Body::ReportAsk {
+        role: IOMMU_ROLE as u16,
+        epoch: 0,
+        key: 0,
+    };
+    let completes = crate::rings::Completes::Report { role: IOMMU_ROLE };
+    let credit = node
+        .write_message(0, ask, Some(completes), None)
+        .expect("room");
+    let rebuild = crate::units::Rebuild {
+        node: 3,
+        asked: true,
+        ..Default::default()
+    };
+    node.rebuilds.insert(IOMMU_ROLE, rebuild);
+    node.report_received(0, credit, dodos_abi::REPORT_END, Vec::new());
+    let rebuild = &node.rebuilds[&IOMMU_ROLE];
+    assert_eq!((rebuild.node, rebuild.asked), (3, true));
+    assert!(node.peers[0].credits.iter().all(Option::is_none));
+}
