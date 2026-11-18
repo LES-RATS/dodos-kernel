@@ -307,6 +307,7 @@ fn r1_submitted_during_a_hand_over_is_reported_once_the_unit_is_unmapped() {
                 target: 1,
                 started: 0,
                 caller: None,
+                failed: false,
             },
         );
         let unit = k.m.table.units.entry(0).or_default();
@@ -324,6 +325,21 @@ fn r1_submitted_during_a_hand_over_is_reported_once_the_unit_is_unmapped() {
 }
 
 #[test]
+fn a_hand_over_of_a_failed_unit_that_outlives_its_step_is_reported() {
+    let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
+    k.m.handing.insert(
+        0,
+        crate::roles::Handover {
+            target: 1,
+            started: 0,
+            caller: None,
+            failed: true,
+        },
+    );
+    reported(&k, "HANDED: a hand-over of a failed unit waits for a drain");
+}
+
+#[test]
 fn a_unit_operation_submitted_after_step_1_of_a_hand_over_is_reported() {
     let mut k = N::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
     let op = crate::rings::UnitOp::Invalidate { domain: Some(0) };
@@ -334,6 +350,7 @@ fn a_unit_operation_submitted_after_step_1_of_a_hand_over_is_reported() {
             target: 1,
             started: 0,
             caller: None,
+            failed: false,
         },
     );
     reported(

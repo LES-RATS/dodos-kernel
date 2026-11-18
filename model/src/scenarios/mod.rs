@@ -22,6 +22,7 @@ mod pass24;
 mod pass24_deepseek;
 mod pass25;
 mod pass26;
+mod pass27;
 mod reviews;
 mod units;
 mod verify13;

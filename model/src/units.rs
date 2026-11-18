@@ -557,11 +557,13 @@ impl Model {
         let answer = |model: &mut Self, result| {
             let _ = model.write_message(from, Body::UnitAnswer { result }, None, credit);
         };
+        // The holder of a failed unit answers *failed*, during a hand-over
+        // too: the answer is final, no requester is turned away (D-145).
+        if held && self.unit_failed(role) {
+            return answer(self, UnitResult::Failed);
+        }
         if !held || self.handing.contains_key(&role) {
             return answer(self, UnitResult::Elsewhere);
-        }
-        if self.unit_failed(role) {
-            return answer(self, UnitResult::Failed);
         }
         // The holder's gate refuses operands that name what the requester
         // does not hold: nothing is written, the refusal is traced (code

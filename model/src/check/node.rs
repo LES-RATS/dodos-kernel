@@ -35,6 +35,12 @@ impl Model {
     /// a later generation of its receiver (RECEIVER), and none of a
     /// generation that is over is applied, a signal included (SENDER).
     fn check_crossing(&self) -> Check {
+        // Roles, D-145: a seal hands a unit failed at step 1 with no drain
+        // and no wait, so such a hand-over ends in the step that began it.
+        ensure(
+            self.handing.values().all(|h| !h.failed),
+            "HANDED: a hand-over of a failed unit waits for a drain",
+        )?;
         for &(role, word, op) in self.submitted.iter() {
             ensure(
                 word.state() == dodos_abi::RoleState::Held && word.holder() == self.node,

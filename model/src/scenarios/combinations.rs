@@ -227,7 +227,7 @@ fn probe(m: &S, splittable: usize) -> u32 {
     set(FAILED_UNIT, word.failed());
     if word.state() == RoleState::Handing {
         set(HANDING, true);
-        let dying = |n: u16| m.state(n) != MemberState::Live;
+        let dying = |n: u16| accused(m.state(n)) || m.state(n) == MemberState::Dead;
         set(HAND_DEATH, dying(word.holder()) || dying(word.target()));
     }
     for granter in 0..NODES {
@@ -275,8 +275,11 @@ fn probe(m: &S, splittable: usize) -> u32 {
 
 /// The seeds that reach each combination, summed over the seeds.
 struct Reach {
-    /// The seeds that ended in the state of gap 21.
+    /// The seeds that ended with a failed unit's role held by a sealing
+    /// node (gap 21 of pass 26), and those that saw a failed unit's role
+    /// handed (D-145).
     gap_21: usize,
+    handed_failed: usize,
     pairs: Vec<Vec<usize>>,
     resume: Vec<Vec<usize>>,
     death: Vec<Vec<usize>>,
@@ -335,6 +338,7 @@ impl Reach {
         let square = || vec![vec![0; EVENTS]; EVENTS];
         Self {
             gap_21: 0,
+            handed_failed: 0,
             pairs: square(),
             resume: square(),
             death: square(),
@@ -430,8 +434,10 @@ struct Run {
     kept: Option<u16>,
     /// The member words last printed by a replay.
     members: Vec<Member>,
-    /// The run ended in the state of gap 21.
+    /// The run ended in the state of gap 21 of pass 26, and saw a failed
+    /// unit's role handed.
     gap_21: bool,
+    handed_failed: bool,
     /// A node whose events are held back, and for how many more churns.
     deferred: Option<(u16, u32)>,
 }
@@ -470,6 +476,7 @@ impl Run {
             kept: None,
             members: Vec::new(),
             gap_21: false,
+            handed_failed: false,
             deferred: None,
         };
         say(format_args!("drivers {:?}", run.drivers));
@@ -483,6 +490,8 @@ impl Run {
         }
         let mask = probe(&self.m, self.splittable);
         self.seen.note(mask);
+        let word = self.m.sys.role(IOMMU_ROLE);
+        self.handed_failed |= word.failed() && word.state() == RoleState::Handing;
     }
 
     /// A replay prints every change of a member word, and for a new
@@ -1262,7 +1271,7 @@ impl Run {
         if (0..NODES).any(|n| self.m.state(n) == MemberState::Starting) {
             self.run_by(dodos_abi::START_NS + sweep, MS);
         }
-        self.gap_21 = super::explore::gap_21(&self.m);
+        self.gap_21 = super::explore::sealing_holds_a_failed_unit(&self.m);
         super::explore::assert_live(&self.m, seed, NODES);
     }
 }
@@ -1297,9 +1306,9 @@ fn map_call(m: &S, pair: Pair) -> Syscall {
     }
 }
 
-/// One seed explored: what it reached, and whether it ended in the state
-/// of gap 21.
-fn explore_one(seed: u64) -> (Seen, bool) {
+/// One seed explored: what it reached, whether it ended in the state of
+/// gap 21 of pass 26, and whether it handed a failed unit's role.
+fn explore_one(seed: u64) -> (Seen, [bool; 2]) {
     say(format_args!("seed {seed}"));
     let explored = std::panic::catch_unwind(|| {
         let mut run = Run::new(seed);
@@ -1307,7 +1316,7 @@ fn explore_one(seed: u64) -> (Seen, bool) {
             run.step();
         }
         run.liveness(seed);
-        (run.seen, run.gap_21)
+        (run.seen, [run.gap_21, run.handed_failed])
     });
     explored.unwrap_or_else(|panic| {
         eprintln!("seed {seed} fails; DODOS_SEED={seed} replays it");
@@ -1324,7 +1333,7 @@ fn explore(seeds: Vec<u64>) -> Reach {
         None => seeds,
     };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let runs: Vec<(Seen, bool)> = std::thread::scope(|scope| {
+    let runs: Vec<(Seen, [bool; 2])> = std::thread::scope(|scope| {
         let seeds = &seeds;
         let handles: Vec<_> = (0..threads)
             .map(|i| {
@@ -1338,29 +1347,20 @@ fn explore(seeds: Vec<u64>) -> Reach {
             .collect()
     });
     let mut reach = Reach::new();
-    for (seen, gap_21) in &runs {
+    for (seen, [gap_21, handed]) in &runs {
         reach.add(seen);
         reach.gap_21 += usize::from(*gap_21);
+        reach.handed_failed += usize::from(*handed);
     }
     reach
 }
 
 /// The pairs no seed can reach, each with the sentences of the contract
-/// that exclude it; a triple that holds such a pair is excluded too.
-const IMPOSSIBLE: &[(usize, usize)] = &[
-    // A failed unit is never handed (Roles; IOMMU). It failed because a
-    // submission was not confirmed within `IOMMU_WAIT_NS`, and that
-    // submission stays in its queue; step 2 of a hand-over "waits until
-    // the unit's queue is drained ... (a unit that does not drain has
-    // failed)", so step 4, which writes handing, never comes, and
-    // `role_hand` returns `busy` "if the unit has failed". Nor does a unit
-    // fail while its word reads handing: the node that hands neither maps
-    // nor serves it from step 4, and the target serves nothing before it
-    // writes held at step 5, so nothing is submitted that could be
-    // overdue.
-    (FAILED_UNIT, HANDING),
-    (FAILED_UNIT, HAND_DEATH),
-];
+/// that exclude it; a triple that holds such a pair is excluded too. None
+/// since D-145: a failed unit under a hand-over, excluded in pass 25
+/// (`role_hand` is `busy` on a failed unit, and a hand-over waited for a
+/// drain a failed unit never makes), is handed by a seal now.
+const IMPOSSIBLE: &[(usize, usize)] = &[];
 
 fn report(reach: &Reach) -> Vec<String> {
     let mut missing = Vec::new();
@@ -1368,6 +1368,7 @@ fn report(reach: &Reach) -> Vec<String> {
     let excluded = |a: usize, b: usize| IMPOSSIBLE.contains(&(a, b));
     if print {
         eprintln!("seeds ending in gap 21: {}", reach.gap_21);
+        eprintln!("seeds that hand a failed unit: {}", reach.handed_failed);
         for e in 0..EVENTS {
             eprintln!("event {:>26}: {}", NAMES[e], reach.events[e]);
         }

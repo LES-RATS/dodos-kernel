@@ -24,8 +24,7 @@
 //! `CONTRACT-GAP` marks a behaviour that the contract does not fix; the
 //! contract settled the sixteen of pass 15 (pass 16, D-133), and each such
 //! branch names the contract's sentence, "gap *n*". The four of pass 25,
-//! 17 to 20, are settled by D-144. Open since pass 26: gap 21, the seal
-//! of the holder of a failed unit's role (`Model::hand_all_units`).
+//! 17 to 20, are settled by D-144, and gap 21 of pass 26 by D-145.
 
 #![forbid(unsafe_code)]
 

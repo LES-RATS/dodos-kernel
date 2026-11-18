@@ -135,8 +135,12 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   nothing but an answer written toward a node starting afresh until it
   is live, a rebuild's `ReportAsk` waiting for it or going on without
   it, and the resume bit that keeps a resume under a rebuild from
-  waiting for ever; then gap 21 held as implemented, and the late report
-  of a rebuild),
+  waiting for ever; and the late report of a rebuild), `pass27.rs` (D-145,
+  gap 21 decided: a seal hands a failed unit's role without the drain,
+  the epoch stopping at e + 2; a unit that fails during a seal's drain
+  ends that hand-over and is handed at the seal's next step; a take-over
+  of a failed unit's role, held or handing, is not a rebuild; at step 1
+  the holder of a failed unit answers *failed*),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -164,9 +168,10 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   every_combination -- --ignored` explores 858, `DODOS_COMBINATION_SEEDS`
   another number and `DODOS_COMBINATION_FIRST` the first, and fails on a
   combination no seed reaches that `IMPOSSIBLE` does not exclude; on 18
-  November 2026 (pass 26), 1,716 seeds in two ranges reached every pair
-  and 751 of the 772 combinations not excluded, and left 19 triples of a
-  resume and two of a death, so that run fails). Every exploration ends
+  November 2026 (pass 27), 1,716 seeds in two ranges reached every pair
+  and 753 of the 778 combinations, none excluded since D-145 (a seal hands
+  a failed unit), and left 23 triples of a resume and two of a death, so
+  that run fails). Every exploration ends
   with the same liveness (`explore::assert_live`): the harness records
   each harm (a stop that succeeds, a hung core, a failure) and each start,
   and a node accused without one, or a start whose starter was harmed or
@@ -186,10 +191,10 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   (`DODOS_PROPERTY_SEEDS` and `DODOS_PROPERTY_FIRST` set another number
   and the first) and names any seed that fails: `cargo test --release -p
   dodos-model --test property many_seeds -- --ignored`.
-- The checker: each of its 224 rules that go through `ensure`, switched
+- The checker: each of its 225 rules that go through `ensure`, switched
   off alone (its condition read as true), makes at least one test fail
-  (pass 26's sweep: 210 by a test of the checker, 14 by another test of
-  the library); a check that cannot fail is deleted or says which
+  (pass 26's sweep of 224: 210 by a test of the checker, 14 by another
+  test of the library; pass 27's rule HANDED by its checker test); a check that cannot fail is deleted or says which
   earlier rule shadows it, and the checker names an invariant for a value
   of the state it would index, never panics.
 - `verify` runs the tests that depend on the page on three geometries (4,
@@ -225,11 +230,8 @@ the reading implemented and the text proposed. The sixteen of pass 15
 (`research/drafts/model-15-contract-gaps.md`) are settled in the contract
 since pass 16 (D-133), and each branch that applies one names the
 contract's sentence and "gap *n*". The four found in pass 25 (17 to 20)
-are settled by D-144. One is open since pass 26, found by the combined
-exploration (the model implements the text as it reads, and the
-explorations count it without judging it): 21, the seal of the holder of
-a failed unit's role never ends, since a failed unit cannot be handed
-and a sealed node holds no unit role (`Model::hand_all_units`). Two were settled otherwise than the
+are settled by D-144, and gap 21, found in pass 26 (the seal of the
+holder of a failed unit's role never ended), by D-145. None is open. Two were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the claim
 of an MSI asks every IOMMU unit of the source's segment, one after another

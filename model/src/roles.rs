@@ -13,13 +13,15 @@ use dodos_abi::{
 };
 
 /// A planned hand-over of a unit role this node holds, steps 1 to 4: the
-/// target, the instant of step 1, and the thread of `role_hand` that waits
-/// for the drain (none for a seal).
+/// target, the instant of step 1, the thread of `role_hand` that waits
+/// for the drain (none for a seal), and whether the unit had failed at
+/// step 1 (a seal then hands it without step 2, D-145).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Handover {
     pub(crate) target: u16,
     pub(crate) started: u64,
     pub(crate) caller: Option<ObjId>,
+    pub(crate) failed: bool,
 }
 
 impl Model {
@@ -151,6 +153,7 @@ impl Model {
                         target,
                         started: self.membership_now(),
                         caller: Some(thread),
+                        failed: false,
                     },
                 );
                 live(&mut self.threads, thread).wait = Wait::Hand(role);
@@ -199,12 +202,7 @@ impl Model {
                 continue;
             }
             done = false;
-            // CONTRACT-GAP 21 (pass 26): a failed unit cannot be handed
-            // (its queue never drains, step 2; `role_hand` is `busy` on
-            // it), yet the seal hands every unit role and a sealed node
-            // holds none: the seal of its holder never ends. Implemented
-            // as the text reads: the hand-over starts again at every step,
-            // each abandoned one writing a new epoch (D-144).
+            // A failed unit's role is handed too, without step 2 (D-145).
             if word.state() == RoleState::Held && !self.handing.contains_key(&role) {
                 let Some(successor) = dodos_abi::successor(&self.table.members, me as usize) else {
                     continue;
@@ -215,6 +213,7 @@ impl Model {
                         target: successor as u16,
                         started: self.membership_now(),
                         caller: None,
+                        failed: self.unit_failed(role),
                     },
                 );
             }
@@ -292,10 +291,16 @@ impl Model {
                 || self.unit_requests.iter().flatten().any(|e| {
                     e.role == role && matches!(e.stage, crate::units::Stage::Local { .. })
                 });
-        let drained = !begun && {
-            let serial = self.table.units.get(&role).map_or(0, |u| u.next);
-            self.confirmed(role, serial)
-        };
+        // Step 2, but on a unit failed at step 1, handed by a seal with no
+        // drain and no wait: it never drains, and every request it held was
+        // answered *failed* (D-145). A unit that fails during the drain
+        // ends the hand-over below, at `IOMMU_WAIT_NS` (D-144), and a seal
+        // hands it again at its next step, without the drain.
+        let drained = hand.failed
+            || !begun && {
+                let serial = self.table.units.get(&role).map_or(0, |u| u.next);
+                self.confirmed(role, serial)
+            };
         if !drained {
             if self.unit_overdue(hand.started) {
                 self.fail_unit(role);
@@ -387,7 +392,10 @@ impl Model {
         let word = self.table.roles[role];
         let me = self.node;
         if word.state() == RoleState::Handing && word.target() == me {
-            // Step 5: map the unit, check the queue, write held (e + 2).
+            // Step 5: map the unit, check the queue, write held (e + 2); a
+            // failed unit's queue is not checked (it is not here: the model
+            // has no queue check at step 5), the word keeps bit 63, and every
+            // request is answered *failed* as on any failed unit (D-145).
             if let Some(unit) = self.table.units.get_mut(&role) {
                 unit.mapped.insert(me);
             }
@@ -411,7 +419,18 @@ impl Model {
             unit.mapped.insert(me);
         }
         self.after_take(role);
-        self.rebuilds.insert(role, Rebuild::default());
+        // A unit whose bit 63 is set already is not rebuilt: no drain, no
+        // closing invalidation; every request, kept or sent again at R0, is
+        // answered *failed* at once (D-145).
+        match word.failed() {
+            true => {
+                self.fail_unit(role);
+                self.unit_send_queued();
+            }
+            false => {
+                self.rebuilds.insert(role, Rebuild::default());
+            }
+        }
         true
     }
 

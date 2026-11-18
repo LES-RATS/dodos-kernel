@@ -125,7 +125,7 @@ pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
             m.harm.harmed,
             m.harm.sealed
         );
-        if state == MemberState::Live && waits_bounded(m, n) && !gap_21(m) {
+        if state == MemberState::Live && waits_bounded(m, n) {
             let node = m.sys.node(n);
             let waits: Vec<_> = node.threads.values().map(|t| t.wait.clone()).collect();
             panic!(
@@ -141,10 +141,9 @@ pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
     }
 }
 
-/// CONTRACT-GAP 21: a failed unit's role held by a sealing node, whose
-/// seal never ends and whose unit's requesters are answered *elsewhere*;
-/// counted, not judged, until the contract settles it.
-pub(super) fn gap_21(m: &S) -> bool {
+/// A failed unit's role held by a sealing node: the state of gap 21 of
+/// pass 26, which a seal now leaves within its step (D-145).
+pub(super) fn sealing_holds_a_failed_unit(m: &S) -> bool {
     (0..m.sys.canonical().roles.len()).any(|role| {
         let word = m.sys.role(role);
         word.failed()

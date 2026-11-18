@@ -345,38 +345,6 @@ fn an_answer_to_a_message_of_a_node_starting_afresh_is_written_before_it_is_live
     assert_eq!(m.state(3), MemberState::Starting, "node 3 was live first");
     assert!(written(&m) > before, "the answer was not written");
 }
-// CONTRACT-GAP 21, the combined exploration's seed 278: a sealing node
-// hands each unit role it holds to its successor, and a sealed node holds
-// none (Cores, the seal; Roles); a failed unit cannot be handed, since its
-// queue never drains (step 2) and `role_hand` is `busy` on it. The seal of
-// the holder of a failed unit's role never ends: the hand-over is
-// abandoned at `IOMMU_WAIT_NS` and starts again, each time with a new epoch
-// (D-144), and a request to the unit is answered *elsewhere* at each.
-// The test holds the reading the model implements until the contract
-// settles it.
-#[test]
-fn gap_21_the_seal_of_the_holder_of_a_failed_units_role_never_ends() {
-    use super::units::{IOSPACE, attach, three};
-    let mut m = three();
-    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
-    let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
-    m.ok(0, iospace);
-    m.sys.break_unit(IOMMU_ROLE);
-    let call = attach(&m, 0, IOSPACE, 0x11);
-    assert_eq!(m.call(0, call), WAITS);
-    m.run(30 * MS);
-    assert!(m.sys.role(IOMMU_ROLE).failed());
-    let epoch = m.sys.role(IOMMU_ROLE).epoch();
-    m.ok(2, seal(1));
-    m.run(dodos_abi::SEAL_NS);
-    assert_eq!(m.state(1), MemberState::Sealing);
-    let word = m.sys.role(IOMMU_ROLE);
-    assert_eq!(word.holder(), 1);
-    assert!(
-        word.epoch() > epoch + 10,
-        "the hand-over did not start again"
-    );
-}
 
 // Seed 1109 of pass 26's long run, the late report: a `Report` of a node a
 // rebuild passed over while its ask was in flight frees the credit and
