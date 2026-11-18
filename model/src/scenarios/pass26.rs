@@ -309,13 +309,12 @@ fn the_node_that_hands_a_unit_role_runs_r1_for_a_node_accused_during_steps_1_to_
 
 // Gap 20, the one exception: an answer to a message the starting
 // generation itself sent is written while it is starting, since it sends
-// only after its reset. In the model no fresh start sends before it is live
-// (its first thread runs once the node is live), so the message is the test's
-// input: a `Send` written as node 3's new generation, once its first core
-// has built its state and while its second core's wake is lost.
+// only after its reset. The first thread of a fresh start runs once the core
+// at position 0 has built the state, before every core reads owned (pass
+// 28): node 3, of two cores, its second core's wake lost, sends node 0 a
+// message from its first thread and gets the answer while it is starting.
 #[test]
-fn an_answer_to_a_message_of_a_node_starting_afresh_is_written_before_it_is_live() {
-    use crate::rings::Body;
+fn the_first_thread_of_a_node_starting_afresh_sends_and_gets_its_answer_before_it_is_live() {
     let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
     m.ok(0, kill(3));
     m.run(100 * MS);
@@ -325,25 +324,20 @@ fn an_answer_to_a_message_of_a_node_starting_afresh_is_written_before_it_is_live
     m.ok(0, fresh(3, 1 << 3 | 1 << 4));
     let built = |m: &S| m.sys.has(3) && m.sys.node(3).generation_built() == old + 1;
     assert!(m.step_until(built));
+    m.restarted(3);
     assert_eq!(m.state(3), MemberState::Starting);
-    let body = Body::Send {
-        header: dodos_abi::Header::new(7, 1, 0, 0).expect("a header"),
-        stamp: (0, 0),
-        grants: vec![],
-        words: vec![7],
+    let send = Syscall::NodeSend {
+        node: node_cap(0),
+        message: crate::Message::default(),
+        doorbell: SlotAddr::NONE,
     };
-    let credit = Some((dodos_abi::REQUESTS_PER_PEER as u8, 1));
-    let send = super::pass22::forged(&m, dodos_abi::NodeMessage::Send, 3, 0, credit, body);
-    m.sys.inject(3, 0, send);
-    let written = |m: &S| {
-        let pair = &m.sys.canonical().rings[0][3];
-        pair.kernel.produced + pair.user.produced
-    };
-    let before = written(&m);
-    let answered = |m: &S| written(m) > before || m.state(3) != MemberState::Starting;
+    assert_eq!(m.call(3, send), WAITS);
+    let answered = |m: &S| m.woken(3).is_some() || m.state(3) != MemberState::Starting;
     assert!(m.step_until(answered));
     assert_eq!(m.state(3), MemberState::Starting, "node 3 was live first");
-    assert!(written(&m) > before, "the answer was not written");
+    assert!(m.woken(3).is_some(), "no answer");
+    m.run(5 * MS);
+    assert_eq!(m.state(3), MemberState::Live);
 }
 
 // Seed 1109 of pass 26's long run, the late report: a `Report` of a node a

@@ -844,16 +844,31 @@ impl Model {
             }
             self.end(entry);
         }
-        if self.ready {
-            return;
+        let fresh = !self.resuming;
+        // A fresh start: the core at position 0 built the start-up state, and
+        // the first thread runs from then on, on the cores that entered,
+        // before the node is live (Cores, `node_start`: "the first thread
+        // runs the chosen module; the node becomes live when every core
+        // reads owned"; pass 28: it ran only once the node was live). At no
+        // event of its cores: each core whose choice is not what it runs
+        // takes a reschedule, at which it chooses (pass 25, invariant 46).
+        if fresh && !self.ready && position == 0 {
+            self.ready = true;
+            let entered: Vec<usize> = (0..self.width())
+                .filter(|&p| !self.cores[p].silent)
+                .collect();
+            for p in entered {
+                if self.pick(p).map(|w| w.0) != self.cores[p].running.map(|r| r.0) {
+                    self.cores[p].ipis.insert(Ipi::Reschedule);
+                }
+            }
         }
         let owned = self.cores.iter().all(|c| {
             CoreWordOf::from_raw(self.table.core_words[c.number as usize])
                 .is_some_and(|w| w.state() == dodos_abi::CoreState::Owned)
         });
-        let fresh = !self.resuming;
-        if owned && fresh {
-            let member = self.table.member(self.node);
+        let member = self.table.member(self.node);
+        if owned && fresh && member.state() == dodos_abi::MemberState::Starting {
             let live = dodos_abi::Member::new(
                 dodos_abi::MemberState::Live,
                 member.evidence(),
@@ -862,16 +877,6 @@ impl Model {
             )
             .with_class(member.class());
             self.table.write_member(self.node, self.node, live);
-            self.ready = true;
-            // The node is ready, at no event of its cores: each core whose
-            // choice is not what it runs takes a reschedule, at which it
-            // chooses (pass 25: a core of a fresh start ran nothing with
-            // the first thread ready, invariant 46).
-            for p in 0..self.width() {
-                if self.pick(p).map(|w| w.0) != self.cores[p].running.map(|r| r.0) {
-                    self.cores[p].ipis.insert(Ipi::Reschedule);
-                }
-            }
         }
         if !fresh && position == 0 {
             self.stalled = None;
