@@ -109,7 +109,9 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   removal, during a revocation, with a `Release` crossing a `Revoke` and
   before the map; the use entry kept with no root, the grant pinned, the
   granting node's death that is never reclaimed and its control case, and
-  the resume that never ends R2 for an unfenced granting node),
+  a holder resumed beside a fenced or an unfenced granting node, which
+  runs again without waiting for the R2 the kept count leaves undone,
+  while a record still unmapping holds the resume),
   `mistral.rs` (one test per mutation of the
   eighth model review that left every test green), `checker.rs` (the
   checker fed a bad state, one per invariant of a node of several cores
@@ -117,7 +119,8 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   `explore.rs` (seeded explorations that port the two explorers of the
   research drafts, steered so that each reaches a full ring, a release
   crossing a revoke, a core stopping in a request, an applied `Handed`
-  and a failed unit under a granted frame, asserted over the seeds; the
+  and a failed unit under a granted frame with its holder sealed and
+  resumed, asserted over the seeds; the
   one-node walk of `tests/property.rs` holds no remote frame, so D-142's
   exploration is there). `DODOS_SEED=<n>` replays one seed
   of an exploration with its actions printed; `DODOS_COUNTS` prints what

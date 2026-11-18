@@ -1705,12 +1705,21 @@ impl Model {
             ) {
                 any |= self.reclaim_step(node, units);
                 // R4 and R5 for a fenced node, R2 to R4 for an unfenced one,
-                // whose memory stays frozen and which gets no `acked`.
-                let done = match state {
-                    MemberState::Fenced => self.reclaims.get(&node).is_some_and(|r| r.acked),
-                    MemberState::Unfenced => self.audited(node),
-                    _ => true,
-                };
+                // whose memory stays frozen and which gets no `acked`. Not
+                // an R2 that only a count a failed unit kept leaves undone:
+                // once the removals are complete (no remote capability of
+                // the node, so no record unmapping), the node goes on, R2 to
+                // R5 staying undone as on a node that was live (Grants,
+                // "Generations", D-142).
+                let generation = self.table.member(node).generation();
+                let held = !self.remotes.values().any(|r| r.node == node)
+                    && self.kept_count(node, generation);
+                let done = held
+                    || match state {
+                        MemberState::Fenced => self.reclaims.get(&node).is_some_and(|r| r.acked),
+                        MemberState::Unfenced => self.audited(node),
+                        _ => true,
+                    };
                 if !done {
                     return any;
                 }

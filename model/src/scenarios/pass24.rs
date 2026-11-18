@@ -364,45 +364,97 @@ fn a_granter_killed_with_its_holders_unit_healthy_is_dead() {
     assert_eq!(g.m.state(X), MemberState::Dead);
 }
 
-// C2 at a resume: the holder sealed with a count the failed unit kept, the
-// granting node is killed and left unfenced; the resume runs R2 to R4 for
-// it before any thread, and R2 is never done, so the holder never becomes
-// live again (Reclaim, R2; The calls, `node_start` mode resume).
-#[test]
-fn a_holder_resumed_under_a_count_a_failed_unit_kept_never_finishes_r2_for_an_unfenced_granter() {
+/// The holder sealed, the granting node killed (its core hung first when
+/// `unfenced`), then the holder resumed by the third node; `fail` breaks
+/// the unit and removes the holder's root first, so that its use entry
+/// keeps a count with no root.
+fn resumed_over_a_dead_granter(fail: bool, unfenced: bool) -> Granted {
     let mut g = granted(false);
     let map = io_map(&g.m, GOT);
     g.m.ok(Y, map);
-    g.m.sys.break_unit(IOMMU_ROLE);
-    until_done(&mut g.m, Y, Syscall::CapDelete(s(GOT)));
-    g.m.settle();
-    g.m.ok(THIRD, seal(Y, dodos_abi::NODE_STOP_SEAL));
+    if fail {
+        g.m.sys.break_unit(IOMMU_ROLE);
+        until_done(&mut g.m, Y, Syscall::CapDelete(s(GOT)));
+        g.m.settle();
+    }
+    g.m.ok(THIRD, super::pass17::seal(Y));
     g.m.run(50 * MS);
     assert_eq!(g.m.state(Y), MemberState::Sealed);
-    g.m.sys.hang(0, false);
+    if unfenced {
+        g.m.sys.hang(0, false);
+    }
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(dodos_abi::FENCE_NS + MS);
-    assert_eq!(g.m.state(X), MemberState::Unfenced);
-    let resume = Syscall::NodeStart {
-        node: node_cap(Y),
-        mode: dodos_abi::NODE_START_RESUME,
-        image: 0,
-        module: 0,
-        window: 0,
-        mask: 0,
+    let accused = if unfenced {
+        MemberState::Unfenced
+    } else {
+        MemberState::Fenced
     };
-    g.m.ok(THIRD, resume);
-    g.m.run(200 * MS);
-    assert_eq!(g.m.state(Y), MemberState::Starting);
-    kept_without_root(&g);
+    assert_eq!(g.m.state(X), accused);
+    g.m.ok(THIRD, super::pass17::resume(Y));
+    g
 }
 
-fn seal(node: u16, mode: u64) -> Syscall {
-    Syscall::NodeStop {
-        node: node_cap(node),
-        mode,
-        core: 0,
-    }
+/// The holder runs again: live, and its first thread's call done; the
+/// granting node is never dead, its chunk stays taken by its generation,
+/// no acknowledgement of it is written, and the kept use entry stays.
+#[track_caller]
+fn live_and_the_granter_frozen(g: &mut Granted, accused: MemberState) {
+    g.m.run(200 * MS);
+    assert_eq!(g.m.state(Y), MemberState::Live);
+    let notify = g.m.retype(Y, ObjectKind::Notify, 0, 130);
+    g.m.ok(Y, notify);
+    g.m.run(500 * MS);
+    assert_eq!(g.m.state(X), accused);
+    let generation = g.m.sys.member(X).generation();
+    assert_ne!(
+        g.m.sys.canonical().beacons[Y as usize].acked[X as usize],
+        generation
+    );
+    let word = dodos_abi::Ownership::from_raw(g.m.sys.canonical().owners[g.chunk as usize]);
+    let word = word.expect("a word");
+    assert_eq!(word.state(), dodos_abi::OwnState::Taken);
+    assert_eq!(word.generation(), generation);
+    kept_without_root(g);
+}
+
+// D-142 at a resume: the holder sealed with a count the failed unit kept,
+// the granting node killed and fenced; the resume does not wait for the R2
+// that count leaves undone: the holder runs its threads, and the granting
+// node's barrier never holds (Grants, "Generations").
+#[test]
+fn a_holder_resumed_under_a_count_a_failed_unit_kept_runs_again_beside_a_fenced_granter() {
+    let mut g = resumed_over_a_dead_granter(true, false);
+    live_and_the_granter_frozen(&mut g, MemberState::Fenced);
+}
+
+// The same with the granting node unfenced.
+#[test]
+fn a_holder_resumed_under_a_count_a_failed_unit_kept_runs_again_beside_an_unfenced_granter() {
+    let mut g = resumed_over_a_dead_granter(true, true);
+    live_and_the_granter_frozen(&mut g, MemberState::Unfenced);
+}
+
+// The control case: the unit healthy, the holder's mapping is undone at the
+// resume by a request to the unit's holder; while the record is unmapping
+// the resume waits. (The answer comes on the holder's kernel ring, which a
+// resume reads only after R0 to R5: the resume never ends, a gap of the
+// contract reported with pass 24, so the test stops at the wait.)
+#[test]
+fn a_resume_waits_while_a_record_under_the_dead_granters_grant_is_unmapping() {
+    let mut g = resumed_over_a_dead_granter(false, true);
+    let unmapping = |m: &S| {
+        m.sys
+            .node(Y)
+            .caps
+            .values()
+            .any(|c| matches!(c.record, Record::Unmapping(_)))
+    };
+    assert!(g.m.step_until(unmapping), "the resume never asked the unit");
+    assert_eq!(g.m.state(Y), MemberState::Starting);
+    g.m.run(20 * MS);
+    assert!(unmapping(&g.m));
+    assert_eq!(g.m.state(Y), MemberState::Starting);
 }
 
 // The checker's rule for C2: the granting generation of a leaf a running

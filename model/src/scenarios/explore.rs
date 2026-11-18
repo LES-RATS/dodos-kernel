@@ -267,7 +267,7 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
     if !once() {
         return;
     }
-    let (mut reached_failed, mut pinned) = (0, 0);
+    let (mut reached_failed, mut pinned, mut resumed_kept) = (0, 0, 0);
     for seed in seeds(SEEDS) {
         say(format_args!("seed {seed}"));
         let mut rng = Rng(seed + 401);
@@ -313,8 +313,9 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
         // leaf.
         let _ = try_call(&mut m, 2, map.clone());
         let (mut broken, mut killed, mut seen) = (false, false, false);
+        let mut resumed = false;
         for _ in 0..40 {
-            match rng.below(9) {
+            match rng.below(11) {
                 0 => {
                     let _ = try_call(&mut m, 2, map.clone());
                 }
@@ -335,6 +336,14 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
                 5 if !killed && rng.below(4) == 0 => {
                     killed = try_call(&mut m, 1, kill(0)) == Some(DONE);
                 }
+                // The holder sealed and resumed by node 1 (Grants,
+                // "Generations": a resume over a generation that ended).
+                6 => {
+                    let _ = try_call(&mut m, 1, seal(2));
+                }
+                7 if m.state(2) == MemberState::Sealed => {
+                    resumed |= try_call(&mut m, 1, resume(2)) == Some(DONE);
+                }
                 _ => churn(&mut m, &mut rng),
             }
             seen |= failed_under_a_remote_frame(&m);
@@ -342,6 +351,9 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
         for _ in 0..3 {
             quiet(&mut m);
             let _ = try_call(&mut m, 0, Syscall::CapRevoke(s(101)));
+        }
+        if m.state(2) == MemberState::Sealed {
+            resumed |= try_call(&mut m, 1, resume(2)) == Some(DONE);
         }
         quiet(&mut m);
         seen |= failed_under_a_remote_frame(&m);
@@ -353,6 +365,19 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
             .values()
             .any(|u| u.granter == 0 && u.leaves > 0 && u.root.is_none());
         let state = m.state(0);
+        // A resume does not wait for an R2 that only the kept count leaves
+        // undone (D-142): with no remote capability of node 0 left, the
+        // holder is live again.
+        let accused = matches!(state, MemberState::Fenced | MemberState::Unfenced);
+        let removed = m.sys.has(2) && !m.sys.node(2).remotes.values().any(|r| r.node == 0);
+        if kept && accused && resumed && removed {
+            assert_eq!(
+                m.state(2),
+                MemberState::Live,
+                "seed {seed}: the resume waited"
+            );
+            resumed_kept += 1;
+        }
         if kept {
             assert_ne!(state, MemberState::Dead, "seed {seed}: C2");
             if state == MemberState::Live {
@@ -365,7 +390,7 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
                 );
                 pinned += usize::from(!entries.is_empty());
             }
-        } else if killed {
+        } else if killed && matches!(m.state(2), MemberState::Live | MemberState::Dead) {
             assert_eq!(state, MemberState::Dead, "seed {seed}: never reclaimed");
         }
         if state == MemberState::Live {
@@ -377,6 +402,10 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
     }
     reached("a failed unit under a remote frame", reached_failed);
     reached("a grant pinned by a failed unit", pinned);
+    reached(
+        "a holder resumed beside a dead granter's kept count",
+        resumed_kept,
+    );
 }
 
 // The node-protocol explorer: `unit`.
