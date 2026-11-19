@@ -392,22 +392,27 @@ impl Machine {
     /// unpinned, cleared in the call; *k* above 4 `invalid`. As for a
     /// table: held, no anchor, G5's map count and no give in flight (D-153,
     /// gaps 28 and 30), and the kernel's view first (D-153, gap 29).
-    pub(crate) fn retype_its(&mut self, n: u16, first: Page, k: u8) -> Gated {
+    pub(crate) fn retype_its(
+        &mut self,
+        n: u16,
+        p: usize,
+        first: Page,
+        k: u8,
+        split: Option<Page>,
+    ) -> Gated {
         self.unit_writes(n)?;
         require(k <= ITS_K_MAX)?;
         let pages = run(first, k);
-        require(pages.end <= self.chunks * PAGES_PER_CHUNK)?;
+        // Aligned on its size, so within one chunk (16 pages at most in a
+        // chunk of 512 on the reference machine; the small machine's chunk
+        // holds 4, so k ≤ 2 here).
+        require(first.is_multiple_of(1 << k) && pages.end <= self.chunks * PAGES_PER_CHUNK)?;
+        require(Machine::chunk_of(first) == Machine::chunk_of(pages.end - 1))?;
         for page in pages.clone() {
             require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
             require(self.gate.classes[page as usize] == Class::Data)?;
         }
-        for page in pages {
-            self.cas_class(page, Class::Data, Class::ItsTable { pinned: false })?;
-            self.kernel.data.remove(&page);
-            self.kernel_view_read_only(n, page);
-        }
-        self.dev.its_objects.insert(first, k);
-        Ok(())
+        self.leave_data(n, p, pages.collect(), split, Target::Its { first, k })
     }
 
     /// The first `irq_claim` of an LPI of the device, naming an

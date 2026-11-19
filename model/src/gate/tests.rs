@@ -61,6 +61,7 @@ fn gate_exploration_coverage() {
     }
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let mut asked = 0;
+    let mut splits = 0;
     for seed in 0..200u64 {
         let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
         let mut rng = Rng(seed + 1);
@@ -72,6 +73,12 @@ fn gate_exploration_coverage() {
                     .entry(name.split(' ').next().unwrap().to_string())
                     .or_default() += 1;
             }
+            splits += m
+                .layout
+                .iter()
+                .flat_map(|l| m.gate.tables[&l.kernel_table])
+                .filter(|e| matches!(e, Entry::Table(_)))
+                .count();
             asked += m
                 .gate
                 .nodes
@@ -81,7 +88,9 @@ fn gate_exploration_coverage() {
                 .count();
         }
     }
-    eprintln!("{done:#?}\nsteps with a request asking a core: {asked}");
+    eprintln!(
+        "{done:#?}\nsteps with a request asking a core: {asked}\nsteps times split chunks: {splits}"
+    );
 }
 
 /// Runs `steps` on a machine with `old` rules; the first rule the checker
@@ -103,13 +112,23 @@ fn run(old: OldRules, steps: &[Op]) -> Result<Machine, (usize, String)> {
 fn space() -> Vec<Op> {
     vec![
         Op::Take { n: 0, chunk: 4 },
-        Op::RetypeRoot { n: 0, page: 2 },
+        Op::RetypeRoot {
+            n: 0,
+            p: 0,
+            page: 2,
+            split: None,
+        },
         Op::Bind {
             n: 0,
             tag: 1,
             root: 2,
         },
-        Op::TakeTable { n: 0, page: 3 },
+        Op::TakeTable {
+            n: 0,
+            p: 0,
+            page: 3,
+            split: None,
+        },
         Op::Hook {
             n: 0,
             root: 2,
@@ -144,7 +163,12 @@ fn space() -> Vec<Op> {
 fn a_dying_root_loaded_on_another_core_leaves_no_stale_translation() {
     let mut steps = space();
     steps.extend([
-        Op::RetypeRoot { n: 0, page: 4 },
+        Op::RetypeRoot {
+            n: 0,
+            p: 0,
+            page: 4,
+            split: None,
+        },
         Op::Bind {
             n: 0,
             tag: 2,
@@ -170,7 +194,12 @@ fn a_dying_root_loaded_on_another_core_leaves_no_stale_translation() {
             to: 1,
         },
         Op::Ack { n: 0, p: 1 },
-        Op::RetypeRoot { n: 0, page: 5 },
+        Op::RetypeRoot {
+            n: 0,
+            p: 0,
+            page: 5,
+            split: None,
+        },
         Op::Bind {
             n: 0,
             tag: 1,
@@ -258,13 +287,23 @@ fn a_fresh_start_leaves_no_request_of_the_dead_generation() {
         Op::Death { n: 0 },
         Op::Fresh { n: 0 },
         Op::Take { n: 0, chunk: 4 },
-        Op::RetypeRoot { n: 0, page: 2 },
+        Op::RetypeRoot {
+            n: 0,
+            p: 0,
+            page: 2,
+            split: None,
+        },
         Op::Bind {
             n: 0,
             tag: 1,
             root: 2,
         },
-        Op::TakeTable { n: 0, page: 3 },
+        Op::TakeTable {
+            n: 0,
+            p: 0,
+            page: 3,
+            split: None,
+        },
         Op::Hook {
             n: 0,
             root: 2,
@@ -325,7 +364,7 @@ fn a_give_invalidates_the_kernel_space_on_idle_cores() {
     };
     let broken = run(old, &steps).expect_err("the old rule broke nothing");
     assert_eq!(
-        broken.1, "G: a translation reaches memory its node does not hold",
+        broken.1, "G: the kernel's own view reaches memory its node does not hold",
         "{broken:?}"
     );
     let mut m = run(OldRules::default(), &steps).expect("the tables");
@@ -681,13 +720,23 @@ fn a_dead_granters_memory_is_not_reused_while_a_grantee_translates_it() {
             granter: 0,
             slot: 0,
         },
-        Op::RetypeRoot { n: 1, page: 10 },
+        Op::RetypeRoot {
+            n: 1,
+            p: 0,
+            page: 10,
+            split: None,
+        },
         Op::Bind {
             n: 1,
             tag: 1,
             root: 10,
         },
-        Op::TakeTable { n: 1, page: 11 },
+        Op::TakeTable {
+            n: 1,
+            p: 0,
+            page: 11,
+            split: None,
+        },
         Op::Hook {
             n: 1,
             root: 10,

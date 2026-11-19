@@ -164,24 +164,20 @@ impl Machine {
     }
 
     /// *data* → iospace root 40 + 0, *live*.
-    pub(crate) fn retype_ioroot(&mut self, n: u16, page: Page) -> Gated {
+    pub(crate) fn retype_ioroot(
+        &mut self,
+        n: u16,
+        p: usize,
+        page: Page,
+        split: Option<Page>,
+    ) -> Gated {
         self.unit_writes(n)?;
-        // The row *data* → iospace root, as for any table (with G5's map
-        // count and no give in flight, D-153 gaps 28 and 30, and the
-        // kernel's view first, gap 29).
+        // The row *data* → iospace root, as for any table (G5's map count
+        // and no give in flight, D-153 gaps 28 and 30; the kernel's view
+        // first, gap 29).
         require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
-        self.cas_class(
-            page,
-            Class::Data,
-            Class::IoRoot {
-                devices: 0,
-                dying: false,
-            },
-        )?;
-        self.gate.tables.insert(page, [Entry::Absent; ENTRIES]);
-        self.kernel.data.remove(&page);
-        self.kernel_view_read_only(n, page);
-        Ok(())
+        require(self.gate.classes.get(page as usize) == Some(&Class::Data))?;
+        self.leave_data(n, p, vec![page], split, Target::IoRoot)
     }
 
     /// Each node's iospace root at the last page of its floor, its device
@@ -200,7 +196,8 @@ impl Machine {
     pub(crate) fn attach_through_unit(&mut self, n: u16, device: u16) {
         let root = self.layout[usize::from(n)].floor.1 - 1;
         if self.gate.classes[root as usize] == Class::Data {
-            self.retype_ioroot(n, root).expect("an iospace root");
+            self.retype_ioroot(n, 0, root, None)
+                .expect("an iospace root");
         }
         let entry = (0..UNIT_ENTRIES)
             .find(|&e| self.unit.gate_records[usize::from(n)][e].is_none())
@@ -227,9 +224,10 @@ impl Machine {
     pub(crate) fn with_spaces(mut self) -> Self {
         for n in 0..self.layout.len() as u16 {
             let first = self.layout[usize::from(n)].floor.0;
-            self.retype_root(n, first + 2).expect("a root");
+            self.retype_root(n, 0, first + 2, None).expect("a root");
             self.bind(n, 1, first + 2).expect("bound");
-            self.take_table(n, first + 3, LEVELS - 1).expect("a table");
+            self.take_table(n, 0, first + 3, LEVELS - 1, None)
+                .expect("a table");
             self.hook(n, first + 2, 0, first + 3).expect("hooked");
         }
         self

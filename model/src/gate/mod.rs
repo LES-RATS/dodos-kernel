@@ -177,6 +177,11 @@ pub(crate) enum Entry {
     },
     /// A shared entry toward the node's kept kernel table.
     Shared(Page),
+    /// The kernel's large leaf of a chunk, in its kernel table: every page
+    /// of the chunk, writable (Gate words, kept kernel tables).
+    Large {
+        chunk: u64,
+    },
 }
 
 /// The tag table's entry: the root the tag is bound to and the set of the
@@ -204,6 +209,28 @@ pub(crate) enum Invalidates {
     KernelRun { chunk: u64, to: Option<u16> },
     /// Nothing: a barrier.
     Barrier,
+    /// Pages of a chunk leaving *data* (D-153, gap 29): their kernel leaves
+    /// made read-only (or the chunk's large leaf broken, with `split` the
+    /// page that becomes its level-1 table), the class bytes written at
+    /// the completion.
+    KernelPages {
+        chunk: u64,
+        pages: Vec<Page>,
+        split: Option<Page>,
+        target: Target,
+    },
+    /// The merge of a split chunk: its split table unhooked, *loose* then
+    /// *data* at the completion, the large leaf written.
+    KernelMerge { chunk: u64, split: Page },
+}
+
+/// What pages leaving *data* become at the completion of their request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    Table,
+    Root,
+    IoRoot,
+    Its { first: Page, k: u8 },
 }
 
 /// The gate's record of the clearing: the run of leaves cleared (their
@@ -265,6 +292,13 @@ pub(crate) struct Tlb {
     pub(crate) leaves: BTreeMap<(usize, (usize, usize)), (Page, bool)>,
     /// (tag, e0) → the level-1 table cached for it.
     pub(crate) tables: BTreeMap<(usize, usize), Page>,
+    /// The kernel's own space (global, whatever the tag): the large leaves
+    /// cached (kernel-table slot → chunk), the split tables cached (slot →
+    /// table), and the page leaves read through them ((slot, index) →
+    /// (page, writable)).
+    pub(crate) large: BTreeMap<usize, u64>,
+    pub(crate) splits: BTreeMap<usize, Page>,
+    pub(crate) kernel: BTreeMap<(usize, usize), (Page, bool)>,
 }
 
 /// The gate-written state of the machine.
@@ -293,6 +327,9 @@ pub(crate) struct Kernel {
     /// The contents a kernel wrote into data pages it maps writable: an
     /// arbitrary value, which a stale walk would read as entries.
     pub(crate) data: BTreeMap<Page, u64>,
+    /// For the checker: the stores the kernel made through its own view
+    /// into a page that was not *data*.
+    pub(crate) wrote_tables: Vec<(u16, Page)>,
 }
 
 /// The rules of an earlier text, each switched on to show that its attack
@@ -356,6 +393,19 @@ pub(crate) struct OldRules {
     /// An attach or a detach asked while the node's own record of the
     /// device is open (the reading before D-153, gap 38).
     pub(crate) concurrent_device_requests: bool,
+    /// The letter of D-153's split (CONTRACT-GAP 40): while a request
+    /// makes a chunk's pages leave *data*, writes that raise the chunk's
+    /// counts are not refused.
+    pub(crate) kernel_pages_unguarded: bool,
+    /// The letter (CONTRACT-GAP 41): a page leaves *data* while a split or
+    /// a merge of its chunk is in flight, the large leaf absent.
+    pub(crate) chunk_requests_unserialized: bool,
+    /// The letter (CONTRACT-GAP 42): a give of a chunk whose split is in
+    /// flight, the large leaf not required.
+    pub(crate) give_during_split: bool,
+    /// The letter (CONTRACT-GAP 43): a walk named by a call crosses a
+    /// shared entry into the kernel half and reaches a split table.
+    pub(crate) walks_through_shared: bool,
 }
 
 /// The small machine.
@@ -559,6 +609,36 @@ impl Machine {
                     }
                 }
             }
+            // The kernel's own space, through the kernel table: a large
+            // leaf, or a split table and the leaves it reads now (a stale
+            // cached split table walked too).
+            let kernel = self.layout[usize::from(n)].kernel_table;
+            let entries = self.gate.tables[&kernel];
+            for (slot, entry) in entries.iter().enumerate() {
+                match *entry {
+                    Entry::Large { chunk } => {
+                        self.tlb[core].large.insert(slot, chunk);
+                    }
+                    Entry::Table(split) => {
+                        self.tlb[core].splits.insert(slot, split);
+                    }
+                    _ => {}
+                }
+            }
+            let splits: Vec<(usize, Page)> = self.tlb[core]
+                .splits
+                .iter()
+                .map(|(&s, &t)| (s, t))
+                .collect();
+            for (slot, split) in splits {
+                if let Some(entries) = self.gate.tables.get(&split).copied() {
+                    for (i, entry) in entries.iter().enumerate() {
+                        if let Entry::Leaf { page, write } = *entry {
+                            self.tlb[core].kernel.insert((slot, i), (page, write));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -583,6 +663,9 @@ impl Machine {
             Flush::All => {
                 tlb.leaves.clear();
                 tlb.tables.clear();
+                tlb.large.clear();
+                tlb.splits.clear();
+                tlb.kernel.clear();
             }
             // The kernel's own space: what any tag cached through the
             // shared entry (global translations), nothing of the user half.
@@ -590,6 +673,9 @@ impl Machine {
                 let shared = ENTRIES - 1;
                 tlb.leaves.retain(|&(_, (e0, _)), _| e0 != shared);
                 tlb.tables.retain(|&(_, e0), _| e0 != shared);
+                tlb.large.clear();
+                tlb.splits.clear();
+                tlb.kernel.clear();
             }
         }
     }
@@ -606,6 +692,8 @@ pub(crate) enum Flush {
 
 #[cfg(test)]
 mod devices_tests;
+#[cfg(test)]
+mod kernel_view_tests;
 #[cfg(test)]
 mod settled_tests;
 #[cfg(test)]

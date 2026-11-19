@@ -24,13 +24,23 @@ fn run(old: OldRules, steps: &[Op]) -> Result<Machine, (usize, String)> {
 fn space(leaf: bool) -> Vec<Op> {
     let mut ops = vec![
         Op::Take { n: 0, chunk: 4 },
-        Op::RetypeRoot { n: 0, page: 2 },
+        Op::RetypeRoot {
+            n: 0,
+            p: 0,
+            page: 2,
+            split: None,
+        },
         Op::Bind {
             n: 0,
             tag: 1,
             root: 2,
         },
-        Op::TakeTable { n: 0, page: 3 },
+        Op::TakeTable {
+            n: 0,
+            p: 0,
+            page: 3,
+            split: None,
+        },
         Op::Hook {
             n: 0,
             root: 2,
@@ -132,7 +142,15 @@ fn an_unbind_asks_the_idle_cores_of_its_set() {
 #[test]
 fn a_mapped_page_never_becomes_a_table() {
     let mut steps = space(true);
-    steps.push(Op::TakeTable { n: 0, page: 16 });
+    steps.extend([
+        Op::TakeTable {
+            n: 0,
+            p: 0,
+            page: 16,
+            split: Some(17),
+        },
+        Op::Ack { n: 0, p: 1 },
+    ]);
     let broken = run(
         OldRules {
             class_change_ignores_map_count: true,
@@ -147,7 +165,12 @@ fn a_mapped_page_never_becomes_a_table() {
     );
     let mut m = run(OldRules::default(), &space(true)).expect("the space");
     assert_eq!(
-        m.step(&Op::TakeTable { n: 0, page: 16 }),
+        m.step(&Op::TakeTable {
+            n: 0,
+            p: 0,
+            page: 16,
+            split: Some(17),
+        }),
         Err(Refused::Condition)
     );
 }

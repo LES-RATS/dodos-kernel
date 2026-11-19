@@ -21,6 +21,7 @@ impl Machine {
         self.check_tags()?;
         self.check_counts()?;
         self.check_reach()?;
+        self.check_kernel_view()?;
         self.check_device_reach()?;
         self.check_devices()?;
         self.check_ports()?;
@@ -202,7 +203,13 @@ impl Machine {
     /// leaf a request in use cleared and has not yet seen invalidated.
     fn check_counts(&self) -> Check {
         let mut needed = vec![0u64; self.chunks as usize];
+        let splits = self.split_tables();
         for (page, entries) in &self.gate.tables {
+            // A split table's leaves are the kernel's own view, which no map
+            // count holds.
+            if splits.contains(page) {
+                continue;
+            }
             if matches!(
                 self.gate.classes[*page as usize],
                 Class::Table { .. } | Class::IoRoot { .. }
@@ -319,6 +326,137 @@ impl Machine {
                     present || counted.contains(&page),
                     "G: a stale translation whose count the gate lowered",
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The split tables every node's kernel table names, and those a merge
+    /// in flight unhooks.
+    pub(super) fn split_tables(&self) -> BTreeSet<Page> {
+        let merging = self
+            .gate
+            .nodes
+            .iter()
+            .flat_map(|n| &n.requests)
+            .filter_map(|r| match r {
+                Request::InUse {
+                    what: Invalidates::KernelMerge { split, .. },
+                    ..
+                } => Some(*split),
+                _ => None,
+            });
+        self.layout
+            .iter()
+            .flat_map(|l| self.gate.tables[&l.kernel_table])
+            .filter_map(|e| match e {
+                Entry::Table(s) => Some(s),
+                _ => None,
+            })
+            .chain(merging)
+            .collect()
+    }
+
+    /// The kernel's own view (Gate words, kept kernel tables; D-153, gap
+    /// 29): what each running core holds of it writes only *data* pages of
+    /// memory its node holds (a run being given excepted until the give
+    /// completes), and walks only split tables of its node; a large leaf
+    /// covers a chunk all of whose pages are *data*; a split table's
+    /// writable leaves target *data* pages; the kernel never stored into a
+    /// page that was not *data*.
+    fn check_kernel_view(&self) -> Check {
+        ensure(
+            self.kernel.wrote_tables.is_empty(),
+            "G: the kernel wrote a page that is not data through its own view",
+        )?;
+        let data = |page: Page| self.gate.classes.get(page as usize) == Some(&Class::Data);
+        for (n, layout) in self.layout.iter().enumerate() {
+            let n = n as u16;
+            if !self.gate.members[usize::from(n)].state.writes() {
+                continue;
+            }
+            for entry in self.gate.tables[&layout.kernel_table] {
+                match entry {
+                    Entry::Large { chunk } => {
+                        let first = chunk * PAGES_PER_CHUNK;
+                        ensure(
+                            (first..first + PAGES_PER_CHUNK).all(data),
+                            "KERNEL: a large leaf over a chunk with a page that is not data",
+                        )?;
+                    }
+                    Entry::Table(s) => {
+                        ensure(
+                            matches!(
+                                self.gate.classes[s as usize],
+                                Class::Table {
+                                    level: 1,
+                                    hook: Hook::Hooked
+                                }
+                            ),
+                            "KERNEL: a kernel table's entry toward no hooked split table",
+                        )?;
+                        for leaf in self.gate.tables[&s] {
+                            if let Entry::Leaf { page, write: true } = leaf {
+                                ensure(
+                                    data(page),
+                                    "KERNEL: a split table's writable leaf toward a page that is not data",
+                                )?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let giving: BTreeSet<u64> = self.gate.nodes[usize::from(n)]
+                .requests
+                .iter()
+                .filter_map(|r| match r {
+                    Request::InUse {
+                        what: Invalidates::KernelRun { chunk, .. },
+                        ..
+                    } => Some(*chunk),
+                    _ => None,
+                })
+                .collect();
+            let reach = |page: Page| self.holds(n, page) || giving.contains(&Self::chunk_of(page));
+            for &core in &layout.cores {
+                let tlb = &self.tlb[core];
+                for &chunk in tlb.large.values() {
+                    let first = chunk * PAGES_PER_CHUNK;
+                    for page in first..first + PAGES_PER_CHUNK {
+                        ensure(
+                            reach(page),
+                            "G: the kernel's own view reaches memory its node does not hold",
+                        )?;
+                        ensure(
+                            data(page),
+                            "G: the kernel's own view writes a page that is not data",
+                        )?;
+                    }
+                }
+                for &(page, write) in tlb.kernel.values() {
+                    ensure(
+                        reach(page),
+                        "G: the kernel's own view reaches memory its node does not hold",
+                    )?;
+                    ensure(
+                        !write || data(page),
+                        "G: the kernel's own view writes a page that is not data",
+                    )?;
+                }
+                for &s in tlb.splits.values() {
+                    ensure(
+                        self.holds(n, s)
+                            && matches!(
+                                self.gate.classes[s as usize],
+                                Class::Table {
+                                    level: 1,
+                                    hook: Hook::Hooked | Hook::Unhooking
+                                }
+                            ),
+                        "G: a core walks a cached kernel table that is no split table of its node",
+                    )?;
+                }
             }
         }
         Ok(())

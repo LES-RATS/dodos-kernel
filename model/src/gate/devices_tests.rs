@@ -139,8 +139,10 @@ fn its_mapped(old: OldRules) -> Machine {
         &[
             Op::ItsRetype {
                 n: 1,
+                p: 0,
                 first: 12,
                 k: 0,
+                split: None,
             },
             Op::ItsClaim {
                 n: 1,
@@ -204,8 +206,10 @@ fn the_holder_serves_an_its_unmapping_only_after_the_mapping() {
             &[
                 Op::ItsRetype {
                     n: 1,
+                    p: 0,
                     first: 12,
                     k: 0,
+                    split: None,
                 },
                 Op::ItsClaim {
                     n: 1,
@@ -474,8 +478,18 @@ fn a_stale_free_list_link_is_never_followed() {
     steps(
         &mut m,
         &[
-            Op::TakeTable { n: 0, page: 4 },
-            Op::TakeTable { n: 0, page: 5 },
+            Op::TakeTable {
+                n: 0,
+                p: 0,
+                page: 4,
+                split: None,
+            },
+            Op::TakeTable {
+                n: 0,
+                p: 0,
+                page: 5,
+                split: None,
+            },
             Op::TableLink {
                 n: 0,
                 table: 4,
