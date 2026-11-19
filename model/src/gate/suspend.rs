@@ -77,6 +77,19 @@ pub(crate) struct Variant {
     /// A node other than *S* may accuse itself at any step while the word
     /// is not 0 (evidence self).
     pub(crate) self_accusation: bool,
+    /// Q4: only the watchdog core (the first core of the lowest node after
+    /// *S*) parks keeping a wake, an alarm at `SUSPEND_PARK_NS` (ARM64
+    /// `CPU_SUSPEND`, RISC-V `sbi_hart_suspend`); every other core is off
+    /// (`CPU_OFF`, `sbi_hart_stop`), with no alarm.
+    pub(crate) alarm_on_watchdog_only: bool,
+    /// Q5 (x86-64): the PM1 write may seem not to sleep (the core reaches
+    /// the instruction after it, past a bound), the core goes to
+    /// *resuming*, and the platform may still enter the sleep later, during
+    /// the resume.
+    pub(crate) pm1_late_sleep: bool,
+    /// Q5: the waking vector accepts the word *resuming* as well as
+    /// *asleep* (the machine slept after the PM1 path gave up).
+    pub(crate) wake_accepts_resuming: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,6 +110,11 @@ pub(crate) struct State {
     /// Per core: the start request the resume path wrote (node,
     /// generation, the resume bit implied).
     pub(crate) requests: Vec<Option<(usize, u32)>>,
+    /// Q5: a PM1 write that did not seem to sleep, until the word is 0.
+    pub(crate) pm1_pending: bool,
+    /// Q5: the machine asleep after a late sleep, the word *resuming*: no
+    /// actor runs until a wake.
+    pub(crate) late_asleep: bool,
 }
 
 pub(crate) const S: usize = 0;
@@ -116,6 +134,8 @@ impl State {
             resume_core: None,
             members: vec![(Member::Live, 1); nodes],
             requests: vec![None; nodes * cores],
+            pm1_pending: false,
+            late_asleep: false,
         }
     }
 
@@ -190,6 +210,9 @@ pub(crate) enum Step {
     /// A node accuses itself (evidence self): fencing, its running cores
     /// stopped.
     SelfAccuse { node: usize },
+    /// Q5: the platform enters the sleep after the PM1 path gave up: every
+    /// core and unit loses its state, the word unchanged (*resuming*).
+    LateSleep,
 }
 
 impl State {
@@ -261,9 +284,11 @@ impl State {
                 if !self.bound {
                     out.push(Step::Bound);
                 }
-                if self.bound && v.alarm_wakes_parked {
-                    for (core, &(_, state)) in self.cores.iter().enumerate() {
-                        if state == CoreState::Parked {
+                if self.bound && (v.alarm_wakes_parked || v.alarm_on_watchdog_only) {
+                    let watchdog = self.watchdog_core();
+                    for (core, &(n, state)) in self.cores.iter().enumerate() {
+                        let keeps = !v.alarm_on_watchdog_only || Some(core) == watchdog;
+                        if state == CoreState::Parked && n != FREE && keeps {
                             out.push(Step::Alarm { core });
                         }
                     }
@@ -278,6 +303,23 @@ impl State {
                 }
             }
             Word::Resuming => {
+                // Q5: the platform slept late, after the PM1 path gave up;
+                // then nothing runs until a wake, which the draft's waking
+                // vector accepts only from *asleep*.
+                if self.late_asleep {
+                    if v.wake_accepts_resuming {
+                        for core in 0..self.cores.len() {
+                            out.push(Step::Wake { core });
+                        }
+                    }
+                    return out;
+                }
+                if v.pm1_late_sleep
+                    && self.pm1_pending
+                    && self.cores.iter().any(|&(_, st)| st == CoreState::Running)
+                {
+                    out.push(Step::LateSleep);
+                }
                 let units_on = self.units.iter().all(|&(_, failed, on)| failed || on);
                 for (u, &(_, failed, on)) in self.units.iter().enumerate() {
                     if !failed && !on {
@@ -338,9 +380,28 @@ impl State {
             Step::Park { core } => self.cores[core].1 = CoreState::Parked,
             Step::Hang { core } => self.cores[core].1 = CoreState::Hung,
             Step::Bound => self.bound = true,
-            Step::Abandon { .. } | Step::FirmwareReturns => {
+            Step::Abandon { .. } => {
                 self.word = Word::Resuming;
                 self.resume_core = None;
+            }
+            Step::FirmwareReturns => {
+                self.word = Word::Resuming;
+                self.resume_core = None;
+                // The firmware's return, or a PM1 write past its bound.
+                self.pm1_pending = true;
+            }
+            Step::LateSleep => {
+                for core in self.cores.iter_mut() {
+                    if matches!(core.1, CoreState::Running | CoreState::Starting) {
+                        core.1 = CoreState::Parked;
+                    }
+                }
+                for unit in &mut self.units {
+                    unit.2 = false;
+                }
+                self.requests.iter_mut().for_each(|r| *r = None);
+                self.pm1_pending = false;
+                self.late_asleep = true;
             }
             Step::Sleep { core } => {
                 self.cores[core].1 = CoreState::Parked;
@@ -352,6 +413,7 @@ impl State {
             }
             Step::Wake { core } => {
                 self.word = Word::Resuming;
+                self.late_asleep = false;
                 self.resume_core = Some(core);
             }
             Step::Enable { unit } => self.units[unit].2 = true,
@@ -391,6 +453,7 @@ impl State {
                 self.word = Word::Zero;
                 self.bound = false;
                 self.resume_core = None;
+                self.pm1_pending = false;
                 self.requests.iter_mut().for_each(|r| *r = None);
             }
         }

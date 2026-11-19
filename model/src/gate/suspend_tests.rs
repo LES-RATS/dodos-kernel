@@ -14,6 +14,9 @@ const BASE: Variant = Variant {
     stub_checks_member: true,
     start_free_cores: false,
     self_accusation: false,
+    alarm_on_watchdog_only: false,
+    pm1_late_sleep: false,
+    wake_accepts_resuming: false,
 };
 
 fn report(name: &str, start: &State, v: Variant) -> Findings {
@@ -327,4 +330,87 @@ fn q9_an_its_with_its_tables_on_chip() {
     m.check().expect("the rebuild holds (G)");
     assert_eq!(m.dev.its_mapped.get(&1), Some(&(12, 0)));
     eprintln!("Q9: a lost MAPD of an attached word is reissued by the rebuild");
+}
+
+// Q4, the two branches the draft leaves (SUSPEND_PARK_NS defined). (a) Every
+// parked core keeps a wake at the bound (pass 29): no wedge. (b) Only one
+// watchdog core parks keeping a wake, the others off: still no wedge,
+// since that one core, woken at the bound, abandons for a hung S. What the
+// model cannot show: that ARM64 `CPU_SUSPEND` or RISC-V `sbi_hart_suspend`
+// keeps a timer wake on the platform (a firmware fact), nor the cost of
+// the core that stays in a waking state.
+#[test]
+#[ignore = "experimental: the draft of whole-machine suspend"]
+fn q4_one_core_that_keeps_a_wake_is_enough() {
+    let start = State::new(3, 1, 1, &[]);
+    let all = report(
+        "Q4 every parked core keeps a wake",
+        &start,
+        Variant {
+            alarm_wakes_parked: true,
+            abandon_by_any_running: true,
+            ..BASE
+        },
+    );
+    assert!(all.wedge.is_none());
+    let one = report(
+        "Q4 one watchdog core keeps a wake, the others off",
+        &start,
+        Variant {
+            alarm_on_watchdog_only: true,
+            abandon_by_any_running: true,
+            ..BASE
+        },
+    );
+    assert!(
+        one.wedge.is_none(),
+        "{:?}",
+        one.wedge.map(|(p, s)| (p, s.cores))
+    );
+    assert!(one.isolation.is_none() && one.slept);
+    let none = report(
+        "Q4 no core keeps a wake",
+        &start,
+        Variant {
+            abandon_by_any_running: true,
+            ..BASE
+        },
+    );
+    assert!(none.wedge.is_some());
+}
+
+// Q5, second half: a PM1 write that does not sleep. The model can show what
+// the detection must lead to, not the detection itself: a core that
+// reaches the instruction after the write and, past a bound, goes to
+// *resuming* is the firmware's return, which holds; but if the platform
+// then enters the sleep late, during the resume, the waking vector finds
+// *resuming*, and the draft's resume path, which needs *asleep*, wedges the
+// machine. A waking vector that accepts *resuming* too, the machine
+// powered off, holds. What it cannot show: the bound after which a PM1
+// write is known not to sleep (a property of the chipset, outside the
+// model), nor whether a late entry into S3 can happen at all.
+#[test]
+#[ignore = "experimental: the draft of whole-machine suspend"]
+fn q5_a_pm1_write_that_sleeps_late() {
+    let start = State::new(2, 1, 1, &[]);
+    let late = report(
+        "Q5 a late sleep, the waking vector needing asleep",
+        &start,
+        Variant {
+            pm1_late_sleep: true,
+            ..BASE
+        },
+    );
+    eprintln!("Q5 late sleep wedge: {:?}", late.healthy_wedge);
+    assert!(late.healthy_wedge.is_some());
+    let accepting = report(
+        "Q5 a late sleep, the waking vector accepting resuming",
+        &start,
+        Variant {
+            pm1_late_sleep: true,
+            wake_accepts_resuming: true,
+            ..BASE
+        },
+    );
+    assert!(accepting.healthy_wedge.is_none() && accepting.isolation.is_none());
 }
