@@ -802,8 +802,20 @@ impl Model {
             let Some(entry) = self.table.uses[me].get(&index).copied() else {
                 continue;
             };
-            let current = self.table.writes(entry.granter)
-                && self.table.generation(entry.granter) == entry.generation;
+            // The granter's generation still running: starting, live,
+            // sealing or sealed. A message held for it is sent once its word
+            // no longer reads starting with the resume bit clear; a sealed
+            // granter reads its ring at its resume (D-147: a release held for
+            // a node that started fresh and sealed before the holder's next
+            // step was dropped).
+            let current = self.table.generation(entry.granter) == entry.generation
+                && matches!(
+                    self.table.member(entry.granter).state(),
+                    MemberState::Starting
+                        | MemberState::Live
+                        | MemberState::Sealing
+                        | MemberState::Sealed
+                );
             if entry.release_pending {
                 if !current {
                     self.free_use(index);
@@ -864,8 +876,10 @@ impl Model {
             && pending.into_iter().any(|used| {
                 let member = self.table.member(used.granter);
                 let writable = member.generation() == used.generation
-                    && (matches!(member.state(), MemberState::Live | MemberState::Sealing)
-                        || member.state() == MemberState::Starting && member.resuming());
+                    && (matches!(
+                        member.state(),
+                        MemberState::Live | MemberState::Sealing | MemberState::Sealed
+                    ) || member.state() == MemberState::Starting && member.resuming());
                 let kind = match used.release_pending {
                     true => NodeMessage::Release,
                     false => NodeMessage::Signal,

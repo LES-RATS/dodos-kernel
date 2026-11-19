@@ -500,6 +500,16 @@ impl Model {
                 unit.domains.remove(&device);
             }
             UnitOp::Redirection { gsi, claimed, .. } => {
+                // RISC-V: the APLIC source's `sourcecfg` and target written
+                // by the domain's holder: a claim activates the source, a
+                // mask is `sourcecfg` 0 (D-147).
+                if self.machine.arch == crate::Arch::Riscv64 {
+                    let line = self.table.aplic.entry(gsi).or_default();
+                    match claimed {
+                        true => line.active = true,
+                        false => line.deactivate(),
+                    }
+                }
                 match claimed {
                     true => {
                         unit.masked.remove(&gsi);

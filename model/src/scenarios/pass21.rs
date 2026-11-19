@@ -295,8 +295,22 @@ fn a_lines_vector_whose_invalidation_a_failed_unit_did_not_confirm_is_retired() 
 
 #[test]
 fn deepseek12_1_a_line_whose_entry_a_rebuild_wrote_masked_raises_nothing_until_it_is_armed() {
-    let (mut m, a, _) = line_claimed();
-    let role = m.sys.node(a).ioapic_role(5).unwrap();
+    // D-147: a claimed level line is left masked by a rebuild only on
+    // x86-64 without a directed end of interrupt, where the holder of the
+    // IOAPIC's role alone claims it and unmasks it when it arms it.
+    let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    machine.directed_eoi = false;
+    let mut m = S::on(&machine);
+    let role = m.sys.node(0).ioapic_role(5).unwrap();
+    let a = m.sys.role(role).holder();
+    let claim = Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::line(5, true, false).raw(),
+        core: u64::from(a),
+        vector: 48,
+        destination: s(210),
+    };
+    super::pass17::succeeds(&mut m, a, claim, 30 * MS);
     m.sys.edit_table(|t| {
         t.units.entry(role).or_default().masked.insert(5);
     });

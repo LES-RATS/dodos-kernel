@@ -610,6 +610,53 @@ fn an_observation_stamped_before_a_seal_does_not_accuse_the_node_after_its_resum
     );
 }
 
+// D-147: a closed observation frees its slot. Node 1 is sealed, and the
+// eight slots of node 0's observations hold observations of node 1 stamped
+// while it was live: all closed. Node 2's core hangs, and a thread of node 0
+// sends to node 2 and waits for it: node 0 observes node 2 at once, the
+// closed observations giving up their slots, and accuses it stale within
+// `STALE_NS` and a few steps. Kept until they expire (4 x `STALE_NS`), they
+// would delay the accusation past that.
+#[test]
+fn a_closed_observation_frees_its_slot() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let g = m.sys.member(1).generation();
+    m.ok(2, seal(1));
+    m.run(20 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    let at = m.sys.node(0).membership_now();
+    m.sys.edit_table(|t| {
+        t.beacons[0].observations = (0..dodos_abi::OBSERVATIONS_MAX as u64)
+            .map(|heartbeat| crate::table::Observation {
+                node: 1,
+                generation: g,
+                state: MemberState::Live,
+                resume: false,
+                watched: crate::table::Watched::Heartbeat { core: 1, heartbeat },
+                at,
+            })
+            .collect();
+    });
+    m.sys.hang(2, true);
+    let send = Syscall::NodeSend {
+        node: node_cap(2),
+        message: crate::Message::default(),
+        doorbell: SlotAddr::NONE,
+    };
+    assert_eq!(m.call(0, send), WAITS);
+    let start = m.sys.now();
+    let stale = m.sys.canonical().stale_ns;
+    let accused = |m: &S| m.state(2) != MemberState::Live;
+    while !accused(&m) && m.sys.now() < start + 3 * stale {
+        m.run(MS);
+    }
+    assert!(
+        accused(&m),
+        "node 2 still live after {} ns",
+        m.sys.now() - start
+    );
+}
+
 // D-146, item 9: messages held for a node that starts fresh are work of
 // the holder's recovery reserve, which reads the member word at each step
 // and sends once it reads live. Node 3 starts afresh, its first wake lost so
@@ -679,6 +726,269 @@ fn a_release_held_for_a_node_starting_afresh_is_sent_once_it_is_live() {
         m.sys.canonical().grants[3].is_empty(),
         "node 3 kept its grant"
     );
+}
+
+// D-147, item 4: a message held for a fresh start is sent once the word
+// no longer reads starting with the resume bit clear: live, sealing or
+// sealed of that generation. Node 3 starts afresh, the start of its second
+// core held back; its first thread grants node 1 a frame, which node 1
+// deletes: the `Release` is held. Then, at the same instant and with node
+// 1's events held back, node 3's second core enters, node 3 turns live and
+// node 2 seals it. Node 1's next reserve step sends the `Release` into the
+// ring of sealed node 3, which reads it at its resume and frees its grant.
+// (Dropped for a sealed granter, the grant stayed for ever.)
+#[test]
+fn a_release_held_for_a_fresh_start_that_seals_before_the_holders_step_is_sent() {
+    use crate::nodes::HwAction;
+    use crate::{Range, Transfer};
+    let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.ok(0, kill(3));
+    m.run(100 * MS);
+    let old = m.sys.member(3).generation();
+    // Events, none that `skip` refuses, until `until`; time moves by
+    // 100 us when none is left.
+    let fire = |m: &mut S, skip: &dyn Fn(&S, Event) -> bool, until: &dyn Fn(&S) -> bool| {
+        for _ in 0..200_000 {
+            if until(m) {
+                return;
+            }
+            let events = m.sys.events();
+            match events.iter().copied().find(|&e| !skip(m, e)) {
+                Some(event) => m.sys.fire(event),
+                None => {
+                    let at = m.sys.now() + 100_000;
+                    m.sys.move_clock(at);
+                }
+            }
+            assert_eq!(m.sys.check(), Ok(()));
+        }
+        panic!("never");
+    };
+    let second = |m: &S, e: Event| matches!(e, Event::Action(i) if m.sys.actions()[i].1 == HwAction::Start { core: 4 });
+    let holder =
+        |_: &S, e: Event| matches!(e, Event::Ipi { node: 1, .. } | Event::Timer { node: 1, .. });
+    m.ok(0, fresh(3, 1 << 3 | 1 << 4));
+    let built = |m: &S| m.sys.has(3) && m.sys.node(3).generation_built() == old + 1;
+    fire(&mut m, &second, &built);
+    m.restarted(3);
+    let reply = m.retype(1, ObjectKind::Reply, 0, 100);
+    m.ok(1, reply);
+    let recv = Syscall::Recv {
+        endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+        reply: s(100),
+        range: Range {
+            first: s(110),
+            count: 4,
+        },
+        wait: 0,
+    };
+    assert_eq!(m.call(1, recv), WAITS);
+    let frame = m.retype(3, ObjectKind::Frame, 1, 101);
+    m.ok(3, frame);
+    let send = Syscall::NodeSend {
+        node: node_cap(1),
+        message: crate::Message {
+            caps: vec![Transfer::Derive(s(101), Rights::READ.bits())],
+            ..crate::Message::default()
+        },
+        doorbell: SlotAddr::NONE,
+    };
+    assert_eq!(m.call(3, send), WAITS);
+    fire(&mut m, &second, &|m| m.woken(1).is_some());
+    assert_eq!(m.state(3), MemberState::Starting);
+    assert_eq!(m.call(1, Syscall::CapDelete(s(110))), DONE);
+    let held = |m: &S| {
+        m.sys.canonical().uses[1]
+            .values()
+            .any(|u| u.release_pending)
+    };
+    assert!(held(&m));
+    // Node 1's thread waits, so that nothing of node 1 comes due while its
+    // events are held back.
+    let notify = m.retype(1, ObjectKind::Notify, 0, 120);
+    m.ok(1, notify);
+    assert_eq!(m.call(1, Syscall::Wait(s(120), 0)), WAITS);
+    fire(&mut m, &holder, &|m| m.state(3) == MemberState::Live);
+    m.ok(2, seal(3));
+    fire(&mut m, &holder, &|m| m.state(3) == MemberState::Sealed);
+    assert!(held(&m), "sent before node 3 sealed");
+    m.run(5 * MS);
+    assert!(!held(&m), "the release still held");
+    m.ok(2, resume(3));
+    m.run(50 * MS);
+    assert_eq!(m.state(3), MemberState::Live);
+    assert!(
+        m.sys.canonical().grants[3].is_empty(),
+        "node 3 kept its grant"
+    );
+}
+
+// D-147, item 6: on x86-64 with a directed end of interrupt (and on
+// ARM64) no node masks a level line at its arrival, the holder of the
+// IOAPIC's role included; every claimer acknowledges by the EOI register;
+// the report reads a level line unmasked while its irq is not dying.
+
+/// A machine of three nodes; node `n` claims level line 5 and binds it.
+pub(super) fn line_bound_on(n_of: impl Fn(u16, usize, &S) -> u16) -> (S, u16, usize) {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let role = m
+        .sys
+        .node(0)
+        .ioapic_role(5)
+        .expect("an IOAPIC serves GSI 5");
+    let holder = m.sys.role(role).holder();
+    let n = n_of(holder, role, &m);
+    let claim = Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::line(5, true, false).raw(),
+        core: u64::from(n),
+        vector: 48,
+        destination: s(210),
+    };
+    super::pass17::succeeds(&mut m, n, claim, 30 * MS);
+    let notify = m.retype(n, ObjectKind::Notify, 0, 211);
+    m.ok(n, notify);
+    m.ok(
+        n,
+        Syscall::IrqBind {
+            irq: s(210),
+            notify: s(211),
+        },
+    );
+    (m, n, role)
+}
+
+fn irq_state(m: &S, n: u16) -> crate::IrqState {
+    m.sys.node(n).irqs.values().next().expect("the irq").state
+}
+
+// (a) A non-holder's level irq fired when the IOAPIC's holder dies: its
+// report reads the line unmasked, so the successor's rebuild does not mask
+// it, and once its claimer acknowledges it, it arrives again. Reported
+// masked while fired, the rebuild masked it, and the claimer's EOI never
+// unmasks a line.
+#[test]
+fn a_rebuild_after_the_holders_death_leaves_a_fired_level_line_of_another_node_open() {
+    let (mut m, n, role) = line_bound_on(|holder, _, _| (holder + 1) % 3);
+    let holder = m.sys.role(role).holder();
+    m.sys.node_mut(n).interrupt_on(0, 48);
+    assert_eq!(irq_state(&m, n), crate::IrqState::Fired);
+    let killer = (0..3).find(|&z| z != holder && z != n).unwrap();
+    m.ok(killer, kill(holder));
+    m.run(50 * MS);
+    assert_ne!(m.sys.role(role).holder(), holder, "the role was taken over");
+    m.ok(n, Syscall::IrqAck(s(210)));
+    m.sys.node_mut(n).interrupt_on(0, 48);
+    assert_eq!(m.sys.check(), Ok(()));
+    assert_eq!(
+        irq_state(&m, n),
+        crate::IrqState::Fired,
+        "the line stays masked"
+    );
+}
+
+// (b) The holder of the IOAPIC's role claims a level line, which arrives;
+// the role is handed to another node before the acknowledgement. The line
+// was not masked at its arrival, so the old holder's acknowledgement by the
+// EOI register leaves it working. Masked at the arrival, it stayed masked,
+// the old holder no longer able to unmask it.
+#[test]
+fn a_holder_that_loses_the_role_between_arrival_and_acknowledgement_keeps_its_line() {
+    let (mut m, n, role) = line_bound_on(|holder, _, _| holder);
+    m.sys.node_mut(n).interrupt_on(0, 48);
+    assert_eq!(irq_state(&m, n), crate::IrqState::Fired);
+    // A target of the best fence class (node 0's core is of class 1).
+    let target = (1..3).find(|&z| z != n).unwrap();
+    let hand = Syscall::RoleHand {
+        role: super::units::role_slot(&m, n, role),
+        node: node_cap(target),
+    };
+    let handed = m.call(n, hand);
+    m.run(50 * MS);
+    assert_eq!(
+        m.sys.role(role).holder(),
+        target,
+        "the role was handed: {handed:?}"
+    );
+    m.ok(n, Syscall::IrqAck(s(210)));
+    m.sys.node_mut(n).interrupt_on(0, 48);
+    assert_eq!(m.sys.check(), Ok(()));
+    assert_eq!(
+        irq_state(&m, n),
+        crate::IrqState::Fired,
+        "the line stays masked"
+    );
+}
+
+// D-147, item 5: an APLIC rebuild writes, for each reported level source,
+// its mode and target, then `setipnum`, then `setienum`, whatever the
+// report's enable says. Node `n`, not the APLIC domain's holder, claims a
+// level line, which arrives (masked at its arrival). The holder dies; the
+// successor's rebuild takes node `n`'s report, which reads the source
+// disabled. Node `n` acknowledges (the device served, the line low), then
+// the rebuild rewrites the source. The line rises again and arrives: had
+// the rebuild written the report's enable, the source stayed disabled.
+#[test]
+fn an_aplic_rebuild_leaves_a_level_line_acknowledged_after_its_report_working() {
+    // Four nodes: the holder, its successor, node `n`, and a node asked
+    // after `n`, so that the rewrite waits for its report.
+    let probe = claimed_on(4, 0, true);
+    let role = probe.sys.node(0).ioapic_role(GSI).expect("an APLIC");
+    let holder = probe.sys.role(role).holder();
+    let members: Vec<dodos_abi::Member> = (0..4).map(|z| probe.sys.member(z)).collect();
+    let mut after = members.clone();
+    after[holder as usize] = dodos_abi::Member::new(
+        MemberState::Fenced,
+        dodos_abi::Evidence::Kill,
+        0,
+        members[holder as usize].generation(),
+    );
+    let successor = dodos_abi::successor(&after, holder as usize).expect("a successor") as u16;
+    let others: Vec<u16> = (0..4).filter(|&z| z != holder && z != successor).collect();
+    let n = others[0];
+    let mut m = claimed_on(4, n, true);
+    bind_on(&mut m, n);
+    input(&mut m, true);
+    assert_eq!(deliver(&mut m), 1);
+    assert_eq!(state_on(&m, n), crate::IrqState::Fired);
+    let killer = others[1];
+    m.ok(killer, kill(holder));
+    let reported = |m: &S| {
+        (0..4u16).any(|z| {
+            m.sys.has(z)
+                && m.sys
+                    .node(z)
+                    .rebuilds
+                    .get(&role)
+                    .is_some_and(|r| r.items.iter().any(|&(from, _)| from == n))
+        })
+    };
+    // One event at a time (`advance` would settle the whole rebuild).
+    let step = |m: &mut S, until: &dyn Fn(&S) -> bool| {
+        for _ in 0..200_000 {
+            if until(m) {
+                return true;
+            }
+            match m.sys.events().first() {
+                Some(&event) => m.sys.fire(event),
+                None => {
+                    let at = m.sys.now() + 10_000;
+                    m.sys.move_clock(at);
+                }
+            }
+            assert_eq!(m.sys.check(), Ok(()));
+        }
+        false
+    };
+    assert!(step(&mut m, &reported), "no report of node {n}");
+    input(&mut m, false);
+    m.ok(n, Syscall::IrqAck(s(210)));
+    let rebuilt = |m: &S| (0..4u16).all(|z| !m.sys.has(z) || m.sys.node(z).rebuilds.is_empty());
+    assert!(step(&mut m, &rebuilt));
+    assert_ne!(m.sys.role(role).holder(), holder);
+    input(&mut m, true);
+    assert_eq!(deliver(&mut m), 1, "the line no longer arrives");
+    assert_eq!(state_on(&m, n), crate::IrqState::Fired);
 }
 
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
@@ -986,7 +1296,14 @@ fn an_edge_line_gets_no_setipnum_write() {
     bind(&mut m);
     m.sys.node_mut(0).interrupt_on(0, 48);
     ack(&mut m, 0);
-    assert!(m.sys.canonical().aplic.is_empty());
+    let line = m
+        .sys
+        .canonical()
+        .aplic
+        .get(&GSI)
+        .copied()
+        .unwrap_or_default();
+    assert!(!line.pending && !line.enabled, "a write to an edge source");
 }
 
 // D-146, the order: the line falls and rises while its source is masked

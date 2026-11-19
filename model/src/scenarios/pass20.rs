@@ -531,10 +531,14 @@ fn a_report_carries_a_lines_mask_and_the_new_holder_writes_an_idle_line_masked()
     m.ok(killer, super::pass17::kill(holder));
     m.run(30 * MS);
     assert_ne!(m.sys.role(role).holder(), holder);
+    // D-147: with a directed end of interrupt no node masks a level line
+    // at its arrival, and the report reads it unmasked while its irq is
+    // not dying, idle included: the new holder writes it unmasked, which
+    // its claimer, not the holder, could never undo otherwise.
     let unit = &m.sys.canonical().units[&role];
     assert!(unit.lines.contains_key(&5));
     assert!(
-        unit.masked.contains(&5),
+        !unit.masked.contains(&5),
         "an idle level line written masked"
     );
 }

@@ -308,8 +308,8 @@ impl Model {
         }
         let line = self.table.aplic.entry(gsi).or_default();
         match register {
-            AplicReg::SetIp => line.pending |= line.high,
-            AplicReg::SetIe => line.enabled = true,
+            AplicReg::SetIp => line.pending |= line.active && line.high,
+            AplicReg::SetIe => line.enabled |= line.active,
             AplicReg::ClrIe => line.enabled = false,
         }
         line.forward();
@@ -317,19 +317,37 @@ impl Model {
         true
     }
 
-    /// An irq armed: a level line is unmasked at its controller, which
-    /// takes back the mask a rebuild wrote from its `Report` (Interrupts,
-    /// the states of an irq; D-139).
+    /// An irq armed: a line is unmasked at its controller, which takes
+    /// back the mask a rebuild wrote from its `Report` (Interrupts, the
+    /// states of an irq; D-139), by the holder of the controller's role
+    /// only: elsewhere a claimer acknowledges by the EOI register or
+    /// `ICC_DIR_EL1`, and no node masks a level line at its arrival
+    /// (D-147).
     fn unmask_line(&mut self, irq: ObjId) {
         let source = self.irqs[&irq].source;
         if let Some(role) = source
             .is_line()
             .then(|| self.ioapic_role(source.id()))
             .flatten()
+            && self.holds_role(role)
             && let Some(unit) = self.table.units.get_mut(&role)
         {
             unit.masked.remove(&source.id());
         }
+    }
+
+    /// Whether this node holds role `role`.
+    fn holds_role(&self, role: usize) -> bool {
+        let word = self.table.roles[role];
+        word.state() == dodos_abi::RoleState::Held && word.holder() == self.node
+    }
+
+    /// x86-64 without a directed end of interrupt: the one architecture
+    /// where a level line is masked at its arrival, by the holder of its
+    /// controller's role, the only node that claims one, and unmasked at
+    /// its acknowledgement (D-147).
+    pub(crate) fn masks_at_arrival(&self) -> bool {
+        self.machine.arch == crate::Arch::X86_64 && !self.machine.directed_eoi
     }
 
     /// `irq_ack`: `busy` on an idle irq; nothing on an armed one; on a fired
@@ -402,6 +420,23 @@ impl Model {
             let source = irq.source;
             if source.is_line() && source.level() {
                 self.aplic_write(source.id(), AplicReg::ClrIe);
+                self.event.arrival_enabled |= self.machine.arch == crate::Arch::Riscv64
+                    && self
+                        .table
+                        .aplic
+                        .get(&source.id())
+                        .is_some_and(|l| l.enabled);
+                if self.masks_at_arrival()
+                    && let Some(role) = self.ioapic_role(source.id())
+                    && self.holds_role(role)
+                {
+                    self.table
+                        .units
+                        .entry(role)
+                        .or_default()
+                        .masked
+                        .insert(source.id());
+                }
             }
             let dying = self.irqs[&id]
                 .notify
@@ -673,7 +708,7 @@ impl Model {
 
     /// Whether an entry of the unit request table still asks something of
     /// a line: its redirection entry, or a claim's units before it.
-    fn line_asking(&self, gsi: u32) -> bool {
+    pub(crate) fn line_asking(&self, gsi: u32) -> bool {
         let names = |op: &crate::rings::UnitOp| matches!(*op, crate::rings::UnitOp::Redirection { gsi: g, .. } if g == gsi);
         self.unit_requests
             .iter()

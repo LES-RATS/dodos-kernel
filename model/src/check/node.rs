@@ -25,6 +25,10 @@ impl Model {
         // them left none toward a current granter that can be written to,
         // as judged at that step.
         ensure(
+            !self.event.closed_kept,
+            "OBSERVATION: a closed observation kept its slot after a step",
+        )?;
+        ensure(
             !self.event.held_after_step,
             "HELD: a message held after a step of the reserve that could send it",
         )?;

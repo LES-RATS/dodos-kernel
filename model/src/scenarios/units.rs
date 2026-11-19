@@ -21,7 +21,7 @@ pub(super) const IOSPACE: u32 = 150;
 pub(super) const DEVICE: u64 = 0x10;
 
 /// The slot of role `index` in a start-up space.
-fn role_slot(m: &S, node: u16, index: usize) -> SlotAddr {
+pub(super) fn role_slot(m: &S, node: u16, index: usize) -> SlotAddr {
     let slots = slots_of(m.sys.node(node), m.t[node as usize], ObjectKind::Role);
     s(slots[index])
 }

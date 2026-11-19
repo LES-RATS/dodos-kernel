@@ -834,6 +834,11 @@ impl Model {
                 }
             }
         }
+        let members = self.table.members.clone();
+        self.event.closed_kept = self.table.beacons[me]
+            .observations
+            .iter()
+            .any(|o| !o.holds(members[o.node as usize]));
         if swept {
             // The next sweep, at a due event of the first core's timer queue
             // (`reserve_due`): a live or sealing node is never idle with

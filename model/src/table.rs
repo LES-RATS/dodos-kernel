@@ -234,18 +234,29 @@ impl FenceRecord {
 /// sent; its enable bit (`setienum`, `clrienum`); the MSIs sent and not yet
 /// arrived. "An MSI is sent for a specific source only when the source's
 /// corresponding pending and enable bits are both one" (§4.9).
+///
+/// `active`: its `sourcecfg` names a mode; an inactive source (`sourcecfg`
+/// 0) ignores its input and has neither pending nor enable bit (§4.5.2).
+/// A claim makes it active; a mask by operation 5 and a rebuild that finds
+/// it claimed by nobody make it inactive (D-147).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Aplic {
     pub(crate) high: bool,
     pub(crate) pending: bool,
     pub(crate) enabled: bool,
     pub(crate) sent: u32,
+    pub(crate) active: bool,
 }
 
 impl Aplic {
+    /// `sourcecfg` 0: the source inactive, its bits cleared.
+    pub(crate) fn deactivate(&mut self) {
+        (self.active, self.pending, self.enabled) = (false, false, false);
+    }
+
     /// The APLIC sends an MSI as soon as the source is pending and enabled.
     pub(crate) fn forward(&mut self) {
-        if self.pending && self.enabled {
+        if self.active && self.pending && self.enabled {
             self.pending = false;
             self.sent += 1;
         }
@@ -254,7 +265,7 @@ impl Aplic {
     /// The device drives the input (a test's input).
     #[cfg(test)]
     pub(crate) fn input(&mut self, high: bool) {
-        self.pending = high && (self.pending || !self.high);
+        self.pending = self.active && high && (self.pending || !self.high);
         self.high = high;
         self.forward();
     }

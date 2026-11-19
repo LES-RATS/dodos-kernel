@@ -1285,7 +1285,12 @@ fn a_pending_signal_to_a_sealed_granter_waits() {
         generation,
     );
     model.send_pending();
-    assert!(m.sys.node(0).table.uses[0][&0].signal_pending);
+    // D-147: sent to a sealed node of that generation as to any sealed
+    // node: it waits in its ring until it resumes.
+    let model = m.sys.node(0);
+    assert!(!model.table.uses[0][&0].signal_pending);
+    let written = model.ring_of(0, 1, false).produced + model.ring_of(0, 1, true).produced;
+    assert_ne!(written, 0, "not in node 1's ring");
 }
 
 // Interrupts: a core event, a level line on another node, APIC ID 255.

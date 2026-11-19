@@ -982,16 +982,16 @@ fn an_armed_level_line_high_and_no_msi_on_its_way_is_reported() {
     );
 }
 
-// D-146: a fired level line still enabled at its APLIC: its arrival did not
-// mask it.
+// D-146: an arrival of a level line that left its source enabled at its
+// APLIC.
 #[test]
-fn a_fired_level_line_enabled_at_its_aplic_is_reported() {
+fn an_arrival_that_leaves_its_level_line_enabled_is_reported() {
     let mut m = riscv_level_line();
-    m.sys.line_input(5, true);
-    assert!(m.sys.aplic_deliver(5));
-    m.sys
-        .edit_table(|t| t.aplic.get_mut(&5).unwrap().enabled = true);
-    machine_reported(&m, "CLRIENUM: a fired level line enabled at its APLIC");
+    m.sys.node_mut(0).event.arrival_enabled = true;
+    machine_reported(
+        &m,
+        "CLRIENUM: an arrival left its level line enabled at its APLIC",
+    );
 }
 
 // D-146: two MSIs of one level source on their way, as `setienum` written
@@ -1124,5 +1124,30 @@ fn a_message_held_after_a_step_that_could_send_it_is_reported() {
     reported(
         &k,
         "HELD: a message held after a step of the reserve that could send it",
+    );
+}
+
+// D-147: a step that took observations kept one that no longer holds.
+#[test]
+fn a_closed_observation_kept_after_a_step_is_reported() {
+    let mut k = node2();
+    k.m.event.closed_kept = true;
+    reported(
+        &k,
+        "OBSERVATION: a closed observation kept its slot after a step",
+    );
+}
+
+// D-147: with a directed end of interrupt, a claimed, live level line left
+// masked at its IOAPIC, which its claimer could never unmask.
+#[test]
+fn a_claimed_live_level_line_masked_with_a_directed_end_of_interrupt_is_reported() {
+    let (mut m, _, role) = super::pass28::line_bound_on(|holder, _, _| (holder + 1) % 3);
+    m.sys.edit_table(|t| {
+        t.units.entry(role).or_default().masked.insert(5);
+    });
+    machine_reported(
+        &m,
+        "LINE MASK: a claimed, live level line masked at its controller",
     );
 }

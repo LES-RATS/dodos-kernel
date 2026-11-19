@@ -1033,6 +1033,11 @@ struct EventLog {
     /// A step of the recovery reserve in the event left a held message it
     /// could have sent (judged at the step: the granter's word and room).
     held_after_step: bool,
+    /// The node's observations, after a step that took them, kept one that
+    /// no longer holds (D-147: a closed one frees its slot).
+    closed_kept: bool,
+    /// RISC-V: an arrival of a level line left its APLIC source enabled.
+    arrival_enabled: bool,
 }
 
 /// The whole state of the kernel of one node: its shared state, and the

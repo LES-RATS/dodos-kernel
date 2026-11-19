@@ -612,6 +612,29 @@ impl Model {
                 unit.lines.remove(&line);
             }
         }
+        // RISC-V: the sources of the domain nobody claims made inactive,
+        // `sourcecfg` 0 (D-147).
+        if self.machine.arch == crate::Arch::Riscv64 {
+            let kept: Vec<u32> = self.table.units[&role].lines.keys().copied().collect();
+            let reported_lines: Vec<u32> = reported
+                .iter()
+                .filter_map(|&(_, i)| match i {
+                    Item::Line(l, ..) => Some(l),
+                    _ => None,
+                })
+                .collect();
+            let unclaimed: Vec<u32> = self
+                .table
+                .aplic
+                .keys()
+                .copied()
+                .filter(|&gsi| self.ioapic_role(gsi) == Some(role))
+                .filter(|gsi| !kept.contains(gsi) && !reported_lines.contains(gsi))
+                .collect();
+            for gsi in unclaimed {
+                self.table.aplic.get_mut(&gsi).expect("listed").deactivate();
+            }
+        }
         for &(z, item) in &reported {
             let g = generation(self, z);
             match item {
@@ -648,12 +671,32 @@ impl Model {
                         target,
                     };
                     if self.operands_allowed(role, op, (z, g)) {
+                        let riscv = self.machine.arch == crate::Arch::Riscv64;
                         let unit = self.table.units.entry(role).or_default();
                         unit.lines.insert(gsi, (z, g));
-                        match unmasked {
+                        // RISC-V masks a source by its enable, below.
+                        match unmasked || riscv {
                             true => unit.masked.remove(&gsi),
                             false => unit.masked.insert(gsi),
                         };
+                        // RISC-V: the source's mode and target rewritten,
+                        // then for a level source `setipnum`, then
+                        // `setienum`, whatever the report's enable says (a
+                        // report older than the claimer's last write would
+                        // undo it); an edge source's enable from the report
+                        // (D-147).
+                        if riscv {
+                            let line = self.table.aplic.entry(gsi).or_default();
+                            line.active = true;
+                            match level {
+                                true => {
+                                    line.pending |= line.high;
+                                    line.enabled = true;
+                                }
+                                false => line.enabled = unmasked,
+                            }
+                            line.forward();
+                        }
                     }
                 }
                 // A handle in the range of a core whose word names the
@@ -763,11 +806,22 @@ impl Model {
                 })
                 .map(|irq| {
                     let target = self.line_target(irq.core, irq.vector);
-                    // The mask state: a level line is unmasked only while
-                    // its irq is armed, an edge line while it is not dying
-                    // (Interrupts; D-139).
-                    let unmasked = !irq.removing
-                        && (!irq.source.level() || irq.state == crate::IrqState::Armed);
+                    // The mask state: an edge line is unmasked while its irq
+                    // is not dying; a level line only while its irq is armed
+                    // on x86-64 without a directed end of interrupt, and
+                    // elsewhere while it is not dying, its claimer never
+                    // unmasking it (Interrupts; D-139, D-147).
+                    // RISC-V: the enable of the APLIC source as it reads,
+                    // which a rebuild ignores for a level source (D-147).
+                    let level_masked = match self.machine.arch {
+                        crate::Arch::Riscv64 => !self
+                            .table
+                            .aplic
+                            .get(&irq.source.id())
+                            .is_some_and(|line| line.enabled),
+                        _ => self.masks_at_arrival() && irq.state != crate::IrqState::Armed,
+                    };
+                    let unmasked = !irq.removing && !(irq.source.level() && level_masked);
                     Item::Line(
                         irq.source.id(),
                         irq.source.level(),

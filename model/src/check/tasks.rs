@@ -105,16 +105,47 @@ impl Model {
                 !lost,
                 "SETIPNUM: an armed level line high and no MSI on its way",
             )?;
+            // (A rebuild may enable a fired one again: D-147.)
+            // D-147: a claimed RISC-V line's source is active; an inactive
+            // source has no pending or enable bit and sends nothing.
             ensure(
-                !(riscv_level && irq.state == IrqState::Fired && line.enabled),
-                "CLRIENUM: a fired level line enabled at its APLIC",
+                self.machine.arch != crate::Arch::Riscv64
+                    || !irq.source.is_line()
+                    || irq.removing
+                    || self.line_asking(irq.source.id())
+                    || line.active,
+                "SOURCECFG: a claimed line's APLIC source inactive",
+            )?;
+            // D-147: but on x86-64 without a directed end of interrupt, no
+            // node masks a level line at its arrival, and a rebuild never
+            // leaves a claimed, live one masked that only its claimer could
+            // unmask.
+            ensure(
+                self.masks_at_arrival()
+                    || !irq.source.is_line()
+                    || !irq.source.level()
+                    || irq.removing
+                    || !self.line_masked(irq.source),
+                "LINE MASK: a claimed, live level line masked at its controller",
             )?;
         }
         // A level source sends one MSI at a time: a line that fell and rose
         // while masked gives one arrival, not two (D-146).
+        // D-146: a level line is masked at its APLIC at its arrival.
+        ensure(
+            !self.event.arrival_enabled,
+            "CLRIENUM: an arrival left its level line enabled at its APLIC",
+        )?;
         ensure(
             self.table.aplic.values().all(|line| line.sent <= 1),
             "APLIC: two MSIs of one level source on their way",
+        )?;
+        ensure(
+            self.table
+                .aplic
+                .values()
+                .all(|line| line.active || !line.pending && !line.enabled),
+            "SOURCECFG: an inactive APLIC source pending or enabled",
         )?;
         // G9: this event wrote an APLIC register only for a level source
         // whose line word this node holds and that a core of it claimed.
