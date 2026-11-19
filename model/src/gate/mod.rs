@@ -25,6 +25,8 @@ pub(crate) mod check;
 pub(crate) mod cpu;
 pub(crate) mod events;
 pub(crate) mod faulty;
+pub(crate) mod parks;
+pub(crate) mod unit;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -90,8 +92,17 @@ pub(crate) struct Member {
 /// An ownership word (chunks).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Owner {
-    Free { node: Option<u16> },
-    Taken { node: u16, generation: u32 },
+    Free {
+        node: Option<u16>,
+    },
+    Taken {
+        node: u16,
+        generation: u32,
+    },
+    /// A chunk of a node's floor: never taken, never given.
+    Floor {
+        node: u16,
+    },
 }
 
 /// The hook state of a table below a root.
@@ -125,6 +136,9 @@ pub(crate) enum Class {
     /// byte in the contract, its class following from where it lies; one
     /// state, *fixed*: never hooked to, never loose, never data.
     Kernel,
+    /// An iospace root, *live* (the small machine's iospaces have one
+    /// level: its entries are leaves).
+    IoRoot,
 }
 
 /// An entry of a table (gate-written: a table page is mapped writable by
@@ -272,6 +286,17 @@ pub(crate) struct OldRules {
     pub(crate) fresh_keeps_gate_part: bool,
     /// A root bound under a second tag.
     pub(crate) root_under_two_tags: bool,
+    /// A fresh start that resets its request records' serials.
+    pub(crate) serial_reset_at_fresh: bool,
+    /// A requester that rewrites an *open* record (restarting the entry).
+    pub(crate) words_while_open: bool,
+    /// A holder whose compare-and-swap expects a value nobody writes.
+    pub(crate) holder_expects_void: bool,
+    /// Drop bits keyed on the INTID, never reset when the line word moves.
+    pub(crate) drop_bit_per_intid: bool,
+    /// A seal whose park requests a later call raises, which a faulty
+    /// kernel may skip.
+    pub(crate) park_requests_by_later_call: bool,
 }
 
 /// The small machine.
@@ -286,6 +311,12 @@ pub(crate) struct Machine {
     pub(crate) tlb: Vec<Tlb>,
     /// The nodes whose kernel is faulty.
     pub(crate) faulty: BTreeSet<u16>,
+    /// The unit side's words.
+    pub(crate) unit: unit::UnitGate,
+    /// The unit's cache: (domain, entry) → page.
+    pub(crate) iotlb: BTreeMap<(u16, usize), Page>,
+    /// The interrupt and park side's words.
+    pub(crate) parks: parks::ParkGate,
     /// Memory reused since a translation could reach it: a page given
     /// away or turned into a table (for the checker).
     pub(crate) chunks: u64,
@@ -317,10 +348,7 @@ impl Machine {
             tables.insert(kernel_root, root);
             tables.insert(kernel_table, [Entry::Absent; ENTRIES]);
             for c in 0..2 {
-                owners[(u64::from(n) * 2 + c) as usize] = Owner::Taken {
-                    node: n,
-                    generation: 1,
-                };
+                owners[(u64::from(n) * 2 + c) as usize] = Owner::Floor { node: n };
             }
             layout.push(NodeLayout {
                 cores: (0..cores).map(|p| usize::from(n) * cores + p).collect(),
@@ -370,8 +398,17 @@ impl Machine {
             kernel: Kernel::default(),
             tlb: vec![Tlb::default(); usize::from(nodes) * cores],
             faulty: BTreeSet::new(),
+            unit: unit::UnitGate::new(nodes),
+            iotlb: BTreeMap::new(),
+            parks: parks::ParkGate::new(nodes, cores),
             chunks,
         }
+    }
+
+    /// Node `n`'s kernel faulty (it skips what it likes; the gate model's
+    /// operations are open to every node anyway).
+    pub(crate) fn make_faulty_for_test(&mut self, n: u16) {
+        self.faulty.insert(n);
     }
 
     pub(crate) fn chunk_of(page: Page) -> u64 {

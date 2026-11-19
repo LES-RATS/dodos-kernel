@@ -21,6 +21,29 @@ impl Machine {
             self.invalidate(core, Flush::All);
         }
         self.gate.members[usize::from(n)].state = NodeState::Fenced;
+        // R1 by the unit's holder: the node's devices detached, their
+        // domain invalidated at the unit's confirmation; on a failed unit a
+        // device stays attached and the node stays fenced (the barrier
+        // never holds).
+        let devices: Vec<u16> = self
+            .unit
+            .devices
+            .iter()
+            .filter(|&(_, &owner)| owner == n)
+            .map(|(&d, _)| d)
+            .collect();
+        if !devices.is_empty() && self.unit.failed {
+            return Ok(());
+        }
+        for device in devices {
+            self.unit.contexts.remove(&device);
+            self.unit.devices.remove(&device);
+        }
+        self.iotlb.retain(|&(domain, _), _| domain != n);
+        self.unit.domains[usize::from(n)] = None;
+        // The holder drops its services of the node's records at its own
+        // R0, later: a late answer may still come, judged by the record's
+        // compare-and-swap.
         // R6, the barrier holding.
         let (start, end) = self.layout[usize::from(n)].floor;
         let layout = self.layout[usize::from(n)].clone();
@@ -108,6 +131,12 @@ impl Machine {
             let core = self.core(n, p);
             self.invalidate(core, Flush::All);
         }
+        self.fresh_unit(n);
+        self.parks.drop[usize::from(n)] = [false; parks::SPIS];
+        for p in 0..layout.cores.len() {
+            let core = self.core(n, p);
+            self.parks.parked[core] = false;
+        }
         self.gate.members[usize::from(n)].state = NodeState::Live;
         Ok(())
     }
@@ -119,13 +148,16 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state == NodeState::Live)?;
         let node = &self.gate.nodes[usize::from(n)];
         require(node.requests.iter().all(|r| *r == Request::Free))?;
-        self.gate.members[usize::from(n)].state = NodeState::Sealing;
+        self.sealing(n)?;
         let kernel = self.layout[usize::from(n)].kernel_root;
-        for p in 0..self.layout[usize::from(n)].cores.len() {
+        let cores = self.layout[usize::from(n)].cores.len();
+        for p in 0..cores {
             self.gate.nodes[usize::from(n)].loaded[p] = (kernel, 0);
+            if p + 1 < cores {
+                self.park_call(n, p)?;
+            }
         }
-        self.gate.members[usize::from(n)].state = NodeState::Sealed;
-        Ok(())
+        self.sealed_call(n, cores - 1)
     }
 
     /// **Resume**: sealed → starting (*g*), resume bit 1 → live; the
@@ -134,7 +166,18 @@ impl Machine {
     /// whole TLB as it enters.
     pub(crate) fn resume(&mut self, n: u16) -> Gated {
         require(self.gate.members[usize::from(n)].state == NodeState::Sealed)?;
+        // A resume needs `seal_parked` equal to the park request on every
+        // core.
+        let parked = (0..self.layout[usize::from(n)].cores.len()).all(|p| {
+            let core = self.core(n, p);
+            self.parks.seal_parked[core] == self.parks.park_requests[core]
+        });
+        require(parked)?;
         self.gate.members[usize::from(n)].state = NodeState::Starting { resume: true };
+        for p in 0..self.layout[usize::from(n)].cores.len() {
+            let core = self.core(n, p);
+            self.parks.parked[core] = false;
+        }
         for p in 0..self.layout[usize::from(n)].cores.len() {
             let core = self.core(n, p);
             self.invalidate(core, Flush::All);

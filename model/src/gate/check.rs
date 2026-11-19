@@ -19,7 +19,60 @@ impl Machine {
         self.check_classes()?;
         self.check_tags()?;
         self.check_counts()?;
-        self.check_reach()
+        self.check_reach()?;
+        self.check_device_reach()?;
+        self.check_parks()
+    }
+
+    /// Drop bits: a gate deactivates only a line its line word names its
+    /// node (D-152: keyed on the line). Seals: a sealed node's cores are
+    /// all parked (the sealing call raised their park requests).
+    fn check_parks(&self) -> Check {
+        for &(n, _, line) in &self.parks.deactivated {
+            ensure(
+                line.map(|(owner, _)| owner) == Some(n),
+                "DROP: a node deactivated a line it does not hold",
+            )?;
+        }
+        for (n, member) in self.gate.members.iter().enumerate() {
+            if member.state != NodeState::Sealed {
+                continue;
+            }
+            for p in 0..self.layout[n].cores.len() {
+                let core = self.core(n as u16, p);
+                ensure(
+                    self.parks.parked[core],
+                    "SEAL: a sealed node's core still runs",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// (G) on the device side: what the unit's cache holds for a domain
+    /// reaches only memory the domain's node holds, and a cached leaf no
+    /// longer present is still counted by that node's gate record (its
+    /// count not lowered, so its memory cannot be reused).
+    fn check_device_reach(&self) -> Check {
+        for (&(domain, e), &page) in &self.iotlb {
+            ensure(
+                self.holds(domain, page),
+                "G: a device's translation reaches memory its node does not hold",
+            )?;
+            let present = self.unit.domains[usize::from(domain)]
+                .and_then(|root| self.gate.tables.get(&root))
+                .is_some_and(|entries| entries[e] == Entry::Leaf { page, write: true });
+            let counted = self.unit.gate_records[usize::from(domain)]
+                .iter()
+                .flatten()
+                .any(|g| g.leaves.contains(&page))
+                || self.unit.kept.contains(&(domain, page));
+            ensure(
+                present || counted,
+                "G: a device's stale translation whose count the gate lowered",
+            )?;
+        }
+        Ok(())
     }
 
     /// The class byte and the non-data count.
@@ -92,12 +145,32 @@ impl Machine {
     fn check_counts(&self) -> Check {
         let mut needed = vec![0u64; self.chunks as usize];
         for (page, entries) in &self.gate.tables {
-            if matches!(self.gate.classes[*page as usize], Class::Table { .. }) {
+            if matches!(
+                self.gate.classes[*page as usize],
+                Class::Table { .. } | Class::IoRoot
+            ) {
                 for entry in entries {
                     if let Entry::Leaf { page, .. } = entry {
                         needed[Self::chunk_of(*page) as usize] += 1;
                     }
                 }
+            }
+        }
+        for (n, records) in self.unit.gate_records.iter().enumerate() {
+            if !self.gate.members[n].state.writes()
+                && self.gate.members[n].state != NodeState::Sealed
+            {
+                continue;
+            }
+            for record in records.iter().flatten() {
+                for &page in &record.leaves {
+                    needed[Self::chunk_of(page) as usize] += 1;
+                }
+            }
+        }
+        for &(n, page) in &self.unit.kept {
+            if self.gate.members[usize::from(n)].state.writes() {
+                needed[Self::chunk_of(page) as usize] += 1;
             }
         }
         for (n, node) in self.gate.nodes.iter().enumerate() {

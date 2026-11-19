@@ -43,7 +43,7 @@ impl Machine {
     /// page the node maps writable becomes one of its own tables, and its
     /// kernel writes translations into it (the exploration's seed 8). The
     /// model adds G5's condition.
-    fn unmapped(&self, page: Page) -> bool {
+    pub(super) fn unmapped(&self, page: Page) -> bool {
         self.gate.map_counts[Self::chunk_of(page) as usize] == 0 && !self.giving(page)
     }
 
@@ -56,7 +56,7 @@ impl Machine {
     /// root (the exploration's seed 151). The model refuses every write
     /// that would raise a count of a chunk whose give or destruction the
     /// gate's record names.
-    fn giving(&self, page: Page) -> bool {
+    pub(super) fn giving(&self, page: Page) -> bool {
         let chunk = Self::chunk_of(page);
         self.gate.nodes.iter().flat_map(|n| &n.requests).any(|r| {
             matches!(r, Request::InUse { what: Invalidates::KernelRun { chunk: c, .. }, .. } if *c == chunk)
@@ -66,7 +66,7 @@ impl Machine {
     /// Whether a live, revoking or pinned grant's anchor covers `page`:
     /// the grant count when 0 (the small machine has no grant entries on
     /// its CPU side yet, so the count is the whole answer).
-    fn anchored(&self, page: Page) -> bool {
+    pub(super) fn anchored(&self, page: Page) -> bool {
         self.gate.grant_counts[Self::chunk_of(page) as usize] != 0
     }
 
@@ -126,7 +126,7 @@ impl Machine {
     /// one: the class change rewrites the page's kernel-space leaf read-only
     /// and invalidates it on every core of the node, idle ones included,
     /// in the same call (as ARM64's broadcast does).
-    fn kernel_view_read_only(&mut self, n: u16, page: Page) {
+    pub(super) fn kernel_view_read_only(&mut self, n: u16, page: Page) {
         let kernel = self.layout[usize::from(n)].kernel_table;
         let chunk = Self::chunk_of(page);
         let slot = (chunk % ENTRIES as u64) as usize;
@@ -687,6 +687,7 @@ impl Machine {
                 let m = self.gate.members[usize::from(node)];
                 m.generation != generation || m.state == NodeState::Dead
             }
+            Owner::Floor { .. } => false,
         };
         require(takeable)?;
         let kernel = self.layout[usize::from(n)].kernel_table;

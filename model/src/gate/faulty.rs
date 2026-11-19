@@ -91,6 +91,72 @@ pub(crate) enum Op {
         n: u16,
         p: usize,
     },
+    IoRoot {
+        n: u16,
+        page: Page,
+    },
+    ClaimSpi {
+        n: u16,
+        spi: usize,
+    },
+    SpiArrives {
+        spi: usize,
+    },
+    AckSpi {
+        n: u16,
+        spi: usize,
+    },
+    RemoveSpi {
+        n: u16,
+        spi: usize,
+    },
+    Sealing {
+        n: u16,
+    },
+    ParkCall {
+        n: u16,
+        p: usize,
+    },
+    SealedCall {
+        n: u16,
+        p: usize,
+    },
+    IoMap {
+        n: u16,
+        e: usize,
+        page: Page,
+    },
+    IoUnmap {
+        n: u16,
+        entry: usize,
+        e: usize,
+    },
+    Accept {
+        h: u16,
+        slot: u16,
+        entry: usize,
+    },
+    Submit {
+        h: u16,
+    },
+    /// The unit performs a submission (hardware).
+    UnitCompletes {
+        id: usize,
+    },
+    Answer {
+        h: u16,
+        service: usize,
+    },
+    Release {
+        n: u16,
+        entry: usize,
+    },
+    UnitFails,
+    Refuse {
+        h: u16,
+        slot: u16,
+        entry: usize,
+    },
     /// The global events, made by another node or the machine.
     Death {
         n: u16,
@@ -157,6 +223,23 @@ impl Machine {
             Op::Teardown { n, root } => self.teardown(n, root),
             Op::Take { n, chunk } => self.take(n, chunk),
             Op::Barrier { n, p } => self.barrier(n, p),
+            Op::IoRoot { n, page } => self.retype_ioroot(n, page),
+            Op::ClaimSpi { n, spi } => self.claim_spi(n, spi),
+            Op::SpiArrives { spi } => self.spi_arrives(spi),
+            Op::AckSpi { n, spi } => self.ack_spi(n, spi),
+            Op::RemoveSpi { n, spi } => self.remove_spi(n, spi),
+            Op::Sealing { n } => self.sealing(n),
+            Op::ParkCall { n, p } => self.park_call(n, p),
+            Op::SealedCall { n, p } => self.sealed_call(n, p),
+            Op::IoMap { n, e, page } => self.io_map(n, e, page),
+            Op::IoUnmap { n, entry, e } => self.io_unmap(n, entry, e),
+            Op::Accept { h, slot, entry } => self.accept(h, slot, entry),
+            Op::Submit { h } => self.submit(h),
+            Op::UnitCompletes { id } => self.unit_completes(id),
+            Op::Answer { h, service } => self.answer(h, service),
+            Op::Release { n, entry } => self.release(n, entry),
+            Op::UnitFails => self.unit_fails(),
+            Op::Refuse { h, slot, entry } => self.refuse(h, slot, entry),
             Op::Death { n } => self.death(n),
             Op::Fresh { n } => self.fresh(n),
             Op::Seal { n } => self.seal(n),
@@ -179,6 +262,7 @@ impl Machine {
     pub(crate) fn step(&mut self, op: &Op) -> Gated {
         let outcome = self.apply(op);
         self.fill();
+        self.fill_unit();
         outcome
     }
 }
@@ -273,7 +357,11 @@ impl Machine {
                 }
             }
         }
-        match rng.below(15) {
+        let category = match rng.below(3) {
+            0 => 15,
+            _ => rng.below(15),
+        };
+        match category {
             0 => Op::TakeTable { n, page },
             1 => Op::RetypeRoot { n, page },
             2 => Op::Hook { n, root, e0, child },
@@ -309,6 +397,70 @@ impl Machine {
                 0 => Op::Destroy { n, p, root },
                 _ => Op::Teardown { n, root },
             },
+            15 => {
+                let mut entry = rng.below(unit::UNIT_ENTRIES as u64) as usize;
+                let mut slot = rng.below(nodes) as u16;
+                let mut e1 = e1;
+                // Mostly the unit's actual state: a present leaf, an open
+                // record, a submitted service, a gate record.
+                if rng.below(4) != 0 {
+                    if let Some(entries) = self.unit.domains[usize::from(n)]
+                        .and_then(|root| self.gate.tables.get(&root))
+                    {
+                        let present: Vec<usize> = (0..ENTRIES)
+                            .filter(|&i| matches!(entries[i], Entry::Leaf { .. }))
+                            .collect();
+                        if !present.is_empty() && rng.below(2) == 0 {
+                            e1 = present[rng.below(present.len() as u64) as usize];
+                        }
+                    }
+                    let open: Vec<(u16, usize)> = (0..nodes as u16)
+                        .flat_map(|s| (0..unit::UNIT_ENTRIES).map(move |i| (s, i)))
+                        .filter(|&(s, i)| {
+                            self.unit.records[usize::from(s)][i].state == unit::RecordState::Open
+                        })
+                        .collect();
+                    if !open.is_empty() {
+                        (slot, entry) = open[rng.below(open.len() as u64) as usize];
+                    }
+                    let mine: Vec<usize> = (0..unit::UNIT_ENTRIES)
+                        .filter(|&i| self.unit.gate_records[usize::from(n)][i].is_some())
+                        .collect();
+                    if !mine.is_empty() && rng.below(2) == 0 {
+                        entry = mine[rng.below(mine.len() as u64) as usize];
+                    }
+                }
+                match rng.below(7) {
+                    0 => Op::IoMap { n, e: e1, page },
+                    1 => Op::IoUnmap { n, entry, e: e1 },
+                    2 => Op::Accept { h: n, slot, entry },
+                    3 if rng.below(20) == 0 => Op::UnitFails,
+                    3 if rng.below(4) == 0 => Op::Refuse { h: n, slot, entry },
+                    3 if rng.below(4) == 0 => Op::IoRoot { n, page },
+                    3 => Op::Submit { h: n },
+                    4 if rng.below(2) == 0 => Op::IoMap { n, e: e1, page },
+                    4 => Op::UnitCompletes {
+                        id: rng.below(self.unit.submissions.len() as u64 + 1) as usize,
+                    },
+                    5 => Op::Answer {
+                        h: n,
+                        service: rng.below(self.unit.services.len() as u64 + 1) as usize,
+                    },
+                    _ => Op::Release { n, entry },
+                }
+            }
+            14 if rng.below(3) == 0 => {
+                let spi = rng.below(parks::SPIS as u64) as usize;
+                match rng.below(7) {
+                    0 => Op::ClaimSpi { n, spi },
+                    1 => Op::SpiArrives { spi },
+                    2 => Op::AckSpi { n, spi },
+                    3 => Op::RemoveSpi { n, spi },
+                    4 => Op::Sealing { n },
+                    5 => Op::ParkCall { n, p },
+                    _ => Op::SealedCall { n, p },
+                }
+            }
             14 if rng.below(8) == 0 => match rng.below(5) {
                 0 => Op::Death { n },
                 1 => Op::Fresh { n },
