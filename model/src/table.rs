@@ -44,12 +44,29 @@ pub(crate) enum Watched {
 /// generation"; pass 25: an observation of a generation that ended accused
 /// the next, whose heartbeat, a count of its kernel's events, read the
 /// value observed again).
+///
+/// It is stamped with the member word the gate read of the node observed,
+/// and holds only while that word still reads the same state, generation
+/// and resume bit; none is taken of a sealed node (D-146: an observation
+/// taken while the node was sealed counted against it once it resumed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Observation {
     pub(crate) node: u16,
     pub(crate) generation: u32,
+    pub(crate) state: MemberState,
+    pub(crate) resume: bool,
     pub(crate) watched: Watched,
     pub(crate) at: u64,
+}
+
+impl Observation {
+    /// Whether the member word `member` still reads what the observation
+    /// was stamped with.
+    pub(crate) fn holds(&self, member: Member) -> bool {
+        self.generation == member.generation()
+            && self.state == member.state()
+            && self.resume == member.resuming()
+    }
 }
 
 /// A node beacon, written only by the kernel of that node, on any of its

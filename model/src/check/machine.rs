@@ -42,6 +42,16 @@ impl System {
         self.check_cores()?;
         self.check_fence_order()?;
         self.check_fence_rounds()?;
+        // D-146: no observation is taken of a sealed node.
+        let table = self.canonical();
+        ensure(
+            table
+                .beacons
+                .iter()
+                .flat_map(|b| &b.observations)
+                .all(|o| o.state != MemberState::Sealed),
+            "OBSERVATION: an observation taken of a sealed node",
+        )?;
         self.check_counts()?;
         self.check_grants()?;
         self.check_rings()?;
@@ -340,6 +350,23 @@ impl System {
         for unit in table.units.values() {
             let running = unit.mapped.iter().filter(|&&n| table.writes(n)).count();
             ensure(running <= 1, "ONE-HOLDER: two nodes map a unit's registers")?;
+        }
+        // A starting node holds no unit role, held or as the target of a
+        // handing (D-146; its plain and reserve roles are named by no
+        // message).
+        for (role, word) in table.roles.iter().enumerate() {
+            if table.role_records[role].kind != dodos_abi::RoleKind::Unit {
+                continue;
+            }
+            let named = match word.state() {
+                dodos_abi::RoleState::Held => Some(word.holder()),
+                dodos_abi::RoleState::Handing => Some(word.target()),
+                _ => None,
+            };
+            ensure(
+                named.is_none_or(|n| table.member(n).state() != MemberState::Starting),
+                "UNIT ROLE: a starting node holds a unit role",
+            )?;
         }
         Ok(())
     }

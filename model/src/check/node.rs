@@ -16,7 +16,67 @@ impl Model {
         self.check_credits()?;
         self.check_crossing()?;
         self.check_window()?;
-        self.check_idle()
+        self.check_idle()?;
+        self.check_acked()?;
+        // Messages held in the use entries (a `Release` or a signal for a
+        // node starting afresh, or with no room) are work of the recovery
+        // reserve, which reads the member word at each step and sends once
+        // it can (D-146): a step of the reserve that had room for all of
+        // them left none toward a current granter that can be written to,
+        // as judged at that step.
+        ensure(
+            !self.event.held_after_step,
+            "HELD: a message held after a step of the reserve that could send it",
+        )?;
+        // `node_stop` and the watchers: only a live or sealing node writes
+        // fencing (D-146).
+        ensure(
+            self.event.accusers.iter().all(|s| {
+                matches!(
+                    s,
+                    dodos_abi::MemberState::Live | dodos_abi::MemberState::Sealing
+                )
+            }),
+            "ACCUSE: a node that is not live or sealing accused",
+        )
+    }
+
+    /// Reclaim, R5 (D-146): `acked[X]` is written by R5 alone, after R2 to
+    /// R4, only for a fenced node, and not before R1 is done on every unit
+    /// this node holds; on a failed unit R1 is never done for a node that
+    /// had a device behind it. So an acknowledgement of X's generation
+    /// names a fenced or dead X, with R1 done here.
+    fn check_acked(&self) -> Check {
+        use dodos_abi::{MemberState, RoleState};
+        let me = self.node as usize;
+        for x in (0..self.table.nodes).filter(|&x| x != self.node) {
+            let member = self.table.member(x);
+            let g = member.generation();
+            if g == 0 || self.table.beacons[me].acked[x as usize] != g {
+                continue;
+            }
+            ensure(
+                matches!(member.state(), MemberState::Fenced | MemberState::Dead),
+                "ACKED: an acknowledgement of a node that is not fenced",
+            )?;
+            let reclaim = self.reclaims.get(&x).filter(|r| r.generation == g);
+            for (role, word) in self.table.roles.iter().enumerate() {
+                if word.state() != RoleState::Held
+                    || word.holder() != self.node
+                    || self.table.role_records[role].kind != dodos_abi::RoleKind::Unit
+                {
+                    continue;
+                }
+                let done = reclaim.is_none_or(|r| r.r1.get(&role).is_none_or(Option::is_none));
+                let blocked =
+                    reclaim.is_some_and(|r| r.devices.contains(&role)) && self.unit_failed(role);
+                ensure(
+                    done && !blocked,
+                    "ACKED: an acknowledgement before R1 is done on a unit this node holds",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// `node_idle`: a state of method 2 or 3 says it loses the context in

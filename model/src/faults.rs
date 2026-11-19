@@ -1,6 +1,6 @@
 //! Threads: faults, and the register calls.
 
-use crate::{Model, ObjId, Outcome, Output, Parcel, Wait, Window, live};
+use crate::{Model, ObjId, Outcome, Output, Parcel, Syscall, Wait, Window, live};
 use dodos_abi::x86_64::{
     REG_DR0, REG_DR3, REG_DR7, REG_RFLAGS, REG_RIP, REG_RSP, REG_UINTR, REGS_CANONICAL, REGS_WORDS,
     dr7_valid, rflags,
@@ -43,21 +43,51 @@ impl Model {
         self.fault_once(thread, kind, exception);
     }
 
-    /// A #DB taken at CPL0 on the core that runs `thread`, x86-64 (D-143):
-    /// `causes` are the bits the processor sets in DR6 (B0 to B3, BD, BS,
-    /// BT); `at_entry`, whether the saved instruction pointer is the first
-    /// instruction of the system-call entry. The handler reads DR6 once and
-    /// loads its reset value; each cause it names is judged alone: an
-    /// enabled breakpoint of the thread is a fault of kind 9, BS at the
-    /// entry is ignored, BS elsewhere, BD or BT is a bug of the kernel. The
-    /// work of the entry the #DB landed on is the model's next event.
-    pub fn kernel_debug(&mut self, thread: ObjId, causes: u64, at_entry: bool) {
+    /// A #DB taken at CPL0 on the first instruction of the system-call
+    /// entry of `thread`, then the call, in one event (x86-64, D-143,
+    /// D-146): `causes` are the bits the processor sets in DR6. `None` if
+    /// the #DB is a bug of the kernel: the node accuses itself and the call
+    /// is not made.
+    pub fn call_with_debug(
+        &mut self,
+        thread: ObjId,
+        causes: u64,
+        call: Syscall,
+    ) -> Option<Outcome> {
+        self.debug_entry(thread, causes, true)
+            .then(|| self.apply(thread, call))
+    }
+
+    /// A #DB taken at CPL0 on the first instruction of the kernel's entry
+    /// of a fault of `thread` (a `MOV SS` before a faulting instruction),
+    /// then the fault, in one event; BS there is a bug of the kernel. Says
+    /// whether the fault was taken.
+    pub fn fault_with_debug(
+        &mut self,
+        thread: ObjId,
+        causes: u64,
+        kind: FaultKind,
+        exception: [u64; 3],
+    ) -> bool {
+        let taken = self.debug_entry(thread, causes, false);
+        if taken {
+            self.fault_once(thread, kind, exception);
+        }
+        taken
+    }
+
+    /// The #DB handler at CPL0: it reads DR6 once and loads its reset
+    /// value; each cause it names is judged alone: an enabled breakpoint of
+    /// the thread is a fault of kind 9, kept in the thread and raised when
+    /// it would next return to user mode; BS at the first instruction of
+    /// the system-call entry (`at_entry`) is ignored; BS elsewhere, BD, BT,
+    /// or no cause at all is a bug of the kernel, which accuses itself in
+    /// its own event. Says whether the entry goes on.
+    fn debug_entry(&mut self, thread: ObjId, causes: u64, at_entry: bool) -> bool {
         assert_eq!(self.machine.arch, crate::Arch::X86_64);
         assert!(self.runnable().contains(&thread), "{thread:?} does not run");
         assert_eq!(causes & !DR6_CAUSES, 0, "not a cause of DR6");
-        *self.last_event = None;
         let core = self.core_of(thread);
-        let entry = self.begin_on(core);
         self.cores[core].dr6 |= causes;
         let read = self.read_dr6(core);
         let control = self.threads[&thread].regs[REG_DR7];
@@ -65,15 +95,40 @@ impl Model {
             .filter(|i| control >> (2 * i) & 3 != 0)
             .fold(0, |bits, i| bits | 1 << i);
         let hit = read & 0xF & enabled;
-        let bug = read & (DR6_BD | DR6_BT) != 0 || read & DR6_BS != 0 && !at_entry;
+        let step = read & DR6_BS != 0;
+        let bug = read & (DR6_BD | DR6_BT) != 0 || step && !at_entry || hit == 0 && !step;
         if bug {
+            *self.last_event = None;
+            let entry = self.begin_on(core);
             self.accuse_self(dodos_abi::CrashReason::KernelException as u32);
-        } else if hit != 0 {
-            live(&mut self.threads, thread).outcome = None;
+            self.end(entry);
+            self.auto_deliver();
+            return false;
+        }
+        if hit != 0 {
+            live(&mut self.threads, thread).debug_kept = Some((hit, read));
+        }
+        true
+    }
+
+    /// Kind 9 kept from a #DB at CPL0, raised as the fault *no context* is:
+    /// at the end of the event in which its thread is runnable, words 0 and
+    /// 1 where it would resume and its stack pointer; a fault of the entry
+    /// itself goes first, and a thread that waits or is suspended keeps it
+    /// (D-146).
+    pub(crate) fn raise_kept_debug(&mut self) {
+        let kept: Vec<ObjId> = self
+            .threads
+            .iter()
+            .filter(|(_, t)| t.debug_kept.is_some() && Self::runnable_thread(t))
+            .map(|(&id, _)| id)
+            .collect();
+        for thread in kept {
+            let Some((hit, read)) = live(&mut self.threads, thread).debug_kept.take() else {
+                continue;
+            };
             self.raise(thread, FaultKind::HardwareBreakpoint, [1, hit, read]);
         }
-        self.end(entry);
-        self.auto_deliver();
     }
 
     /// The #DB handler reads DR6 once and loads it with its reset value

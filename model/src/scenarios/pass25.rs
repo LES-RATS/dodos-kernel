@@ -296,6 +296,8 @@ fn an_observation_of_a_generation_that_ended_never_accuses_the_next() {
         t.beacons[1].observations.push(Observation {
             node: 2,
             generation: old,
+            state: MemberState::Live,
+            resume: false,
             watched: Watched::Heartbeat { core: 2, heartbeat },
             at: now - stale,
         });

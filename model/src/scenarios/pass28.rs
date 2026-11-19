@@ -426,6 +426,224 @@ fn a_state_that_keeps_the_context_by_its_parameter_is_no_lossy_sleep() {
     assert_eq!(m.sys.hardware(2), Hardware::Running);
 }
 
+// D-146, item 5: the take-over of a failed unit's role. Node 1 holds the
+// IOMMU role and grants node 2, its successor, a frame that node 2 maps in
+// an iospace behind the unit; the unit fails and node 2's removal of the
+// frame leaves its use entry counting a leaf (D-142). Node 1 then dies:
+// node 2 takes the failed role over, writing held with bit 63 before it
+// maps the unit, and its R1 for node 1 is done at once (node 1 had no
+// device behind it). R1 writes no `acked`: R5 alone does, after R2 to R4,
+// and node 2's R2 for node 1 stays undone under the counted leaf, so node 1
+// is never acknowledged and stays fenced, its frame never reused.
+#[test]
+fn a_take_over_of_a_failed_unit_under_a_pin_leaves_the_old_holder_unacknowledged() {
+    use super::pass24::{GOT, THIRD, Y, granted_by, io_map, kept_without_root, until_done};
+    use super::units::IOMMU_ROLE;
+    let mut g = granted_by(THIRD, false);
+    let map = io_map(&g.m, GOT);
+    g.m.ok(Y, map);
+    g.m.sys.break_unit(IOMMU_ROLE);
+    until_done(&mut g.m, Y, Syscall::CapDelete(s(GOT)));
+    g.m.settle();
+    kept_without_root(&g);
+    let generation = g.m.sys.member(THIRD).generation();
+    g.m.ok(0, kill(THIRD));
+    g.m.run(500 * MS);
+    let word = g.m.sys.role(IOMMU_ROLE);
+    assert!(
+        word.failed() && word.holder() == Y,
+        "node 2 took the failed role over"
+    );
+    assert_eq!(g.m.state(THIRD), MemberState::Fenced);
+    let acked = |m: &S, z: u16| m.sys.canonical().beacons[z as usize].acked[THIRD as usize];
+    assert_ne!(
+        acked(&g.m, Y),
+        generation,
+        "acknowledged under a counted leaf"
+    );
+    let reclaim = &g.m.sys.node(Y).reclaims[&THIRD];
+    assert!(!reclaim.devices.contains(&IOMMU_ROLE), "R1 is done at once");
+}
+
+// D-146, item 5: an unfenced old holder of a failed unit is not
+// acknowledged: its successor's R1 is done at once, but R5 is only for a
+// fenced node (an unfenced one keeps its memory frozen).
+#[test]
+fn a_take_over_of_a_failed_unit_does_not_acknowledge_an_unfenced_old_holder() {
+    use super::units::IOMMU_ROLE;
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
+    let iospace = m.retype(0, ObjectKind::IoSpace, 0, super::units::IOSPACE);
+    m.ok(0, iospace);
+    m.sys.break_unit(IOMMU_ROLE);
+    let call = super::units::attach(&m, 0, super::units::IOSPACE, 0x11);
+    assert_eq!(m.call(0, call), WAITS);
+    m.run(30 * MS);
+    assert!(m.sys.role(IOMMU_ROLE).failed());
+    // Core 1 hangs in VMX root operation, where INIT is blocked: the fence
+    // cannot stop it.
+    m.sys.set_vmx(1, true);
+    m.sys.hang(1, false);
+    let generation = m.sys.member(1).generation();
+    m.ok(0, kill(1));
+    m.run(dodos_abi::FENCE_NS + 100 * MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    let word = m.sys.role(IOMMU_ROLE);
+    assert!(
+        word.failed() && word.holder() != 1,
+        "the failed role was taken over"
+    );
+    for z in [0, 2] {
+        assert_ne!(
+            m.sys.canonical().beacons[z].acked[1],
+            generation,
+            "node {z} acknowledged an unfenced node"
+        );
+    }
+}
+
+// D-146, item 6: `node_stop` is `busy` when the caller's node is not live
+// or sealing. Node 3 starts afresh, its first wake lost so that its start
+// lasts; its first thread runs before node 3 is live, and its kill of node
+// 0 accuses no one.
+#[test]
+fn node_stop_from_a_node_still_starting_is_busy() {
+    let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.ok(0, kill(3));
+    m.run(100 * MS);
+    assert_eq!(m.state(3), MemberState::Dead);
+    let old = m.sys.member(3).generation();
+    m.sys.set_window(4);
+    m.ok(0, fresh(3, 1 << 3 | 1 << 4));
+    let built = |m: &S| m.sys.has(3) && m.sys.node(3).generation_built() == old + 1;
+    assert!(m.step_until(built));
+    m.restarted(3);
+    assert_eq!(m.state(3), MemberState::Starting);
+    for mode in [kill(0), seal(1), kill(2)] {
+        assert_eq!(m.call(3, mode), Err(Error::Busy));
+    }
+    assert!((0..3).all(|n| m.state(n) == MemberState::Live));
+}
+
+// D-146, item 8: an observation is stamped with the member word read and
+// holds only while it reads the same state, generation and resume bit;
+// none is taken of a sealed node. Node 1 seals, and node 0 takes no
+// observation of it. An observation of node 1's first core stamped while
+// node 1 was sealing, old enough to be evidence against a starting node,
+// is in node 0's beacon, the heartbeat it names still the core's (a sealed
+// core does not beat). Node 1 resumes, starting with the resume bit: the
+// stamp no longer reads the same, so node 0 does not accuse node 1 before
+// its cores beat, and node 1 is live again.
+#[test]
+fn an_observation_stamped_before_a_seal_does_not_accuse_the_node_after_its_resume() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.run(1_200 * MS);
+    let g = m.sys.member(1).generation();
+    m.ok(2, seal(1));
+    m.run(20 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    m.run(20 * MS);
+    let observed = |m: &S| {
+        m.sys.canonical().beacons[0]
+            .observations
+            .iter()
+            .any(|o| o.node == 1)
+    };
+    assert!(!observed(&m), "an observation of a sealed node");
+    let heartbeat = m.sys.canonical().core_beacons[1].heartbeat.0;
+    let watched = crate::table::Watched::Heartbeat { core: 1, heartbeat };
+    let at = m.sys.node(0).membership_now() - dodos_abi::START_NS;
+    m.sys.edit_table(|t| {
+        t.beacons[0].observations.push(crate::table::Observation {
+            node: 1,
+            generation: g,
+            state: MemberState::Sealing,
+            resume: false,
+            watched,
+            at,
+        });
+    });
+    m.ok(2, resume(1));
+    let settled = |m: &S| m.state(1) != MemberState::Starting;
+    assert!(m.step_until(settled));
+    assert_eq!(
+        m.state(1),
+        MemberState::Live,
+        "node 1 accused after its resume"
+    );
+}
+
+// D-146, item 9: messages held for a node that starts fresh are work of
+// the holder's recovery reserve, which reads the member word at each step
+// and sends once it reads live. Node 3 starts afresh, its first wake lost so
+// that its start lasts; its first thread grants node 0 a frame, which node
+// 0 receives and then deletes: its `Release` toward a node starting with
+// the resume bit clear is held (D-144). Nothing else happens; once node 3
+// is live, node 0's reserve sends the `Release`, and node 3 frees its
+// grant.
+#[test]
+fn a_release_held_for_a_node_starting_afresh_is_sent_once_it_is_live() {
+    use crate::{Range, Transfer};
+    let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.ok(0, kill(3));
+    m.run(100 * MS);
+    assert_eq!(m.state(3), MemberState::Dead);
+    let old = m.sys.member(3).generation();
+    m.sys.set_window(4);
+    m.ok(0, fresh(3, 1 << 3 | 1 << 4));
+    let built = |m: &S| m.sys.has(3) && m.sys.node(3).generation_built() == old + 1;
+    assert!(m.step_until(built));
+    m.restarted(3);
+    assert_eq!(m.state(3), MemberState::Starting);
+    let reply = m.retype(0, ObjectKind::Reply, 0, 100);
+    m.ok(0, reply);
+    let recv = Syscall::Recv {
+        endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+        reply: s(100),
+        range: Range {
+            first: s(110),
+            count: 4,
+        },
+        wait: 0,
+    };
+    assert_eq!(m.call(0, recv), WAITS);
+    let frame = m.retype(3, ObjectKind::Frame, 1, 101);
+    m.ok(3, frame);
+    let rights = Rights::READ.union(Rights::WRITE);
+    let send = Syscall::NodeSend {
+        node: node_cap(0),
+        message: crate::Message {
+            label: 7,
+            flags: 0,
+            words: vec![],
+            caps: vec![Transfer::Derive(s(101), rights.bits())],
+            marks: 0,
+        },
+        doorbell: SlotAddr::NONE,
+    };
+    assert_eq!(m.call(3, send), WAITS);
+    let received = |m: &S| m.woken(0).is_some();
+    assert!(m.step_until(received));
+    assert_eq!(m.state(3), MemberState::Starting, "node 3 was live first");
+    assert!(m.woken(0).is_some_and(|o| o.is_ok()));
+    assert_eq!(m.sys.canonical().grants[3].len(), 1);
+    assert_eq!(m.call(0, Syscall::CapDelete(s(110))), DONE);
+    let held = |m: &S| {
+        m.sys.canonical().uses[0]
+            .values()
+            .any(|u| u.release_pending)
+    };
+    assert!(held(&m), "the release is held while node 3 starts");
+    let live = |m: &S| m.state(3) == MemberState::Live;
+    assert!(m.step_until(live));
+    m.run(2 * RECOVERY_PERIOD);
+    assert!(!held(&m), "the release still held");
+    assert!(
+        m.sys.canonical().grants[3].is_empty(),
+        "node 3 kept its grant"
+    );
+}
+
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 
@@ -457,13 +675,14 @@ fn breakpoint(k: &N) -> Option<(u64, u64)> {
 
 // A single step that ends on the system-call entry is ignored, and the
 // handler loads DR6's reset value: the next #DB, a breakpoint of the thread
-// hit elsewhere, reads only its own cause and is the thread's fault, word 4
-// the value read. Without the reset BS would still read set, and the
-// second #DB would be a bug of the kernel (D-143, SDM §20.2.3).
+// hit by a `MOV SS` before a faulting instruction, reads only its own
+// cause and is the thread's, word 4 the value read. Without the reset BS
+// would still read set, and the second #DB would be a bug of the kernel
+// (D-143, SDM §20.2.3).
 #[test]
 fn the_reset_of_dr6_keeps_a_single_step_ignored_at_the_entry_from_making_the_next_db_a_bug() {
     let mut k = debugged();
-    k.m.kernel_debug(k.t, BS, true);
+    assert_eq!(k.m.call_with_debug(k.t, BS, Syscall::Yield), Some(DONE));
     assert_eq!(k.m.check(), Ok(()));
     assert!(!accused(&k));
     assert_eq!(
@@ -471,40 +690,117 @@ fn the_reset_of_dr6_keeps_a_single_step_ignored_at_the_entry_from_making_the_nex
         None,
         "a single step at the entry is ignored"
     );
-    k.m.kernel_debug(k.t, B0, false);
+    let thread = k.t;
+    assert!(k.m.call_with_debug(thread, B0, Syscall::Yield).is_some());
     assert_eq!(k.m.check(), Ok(()));
     assert!(!accused(&k), "the second #DB read a single step left over");
     assert_eq!(breakpoint(&k), Some((B0, RESET | B0)));
 }
 
 // Each cause judged alone: BS at the entry and an enabled breakpoint
-// together are the thread's, the fault of kind 9 delivered and the single
-// step ignored (rule (1) of D-142 as written called it a bug).
+// together are the thread's, the fault of kind 9 kept and the single step
+// ignored (rule (1) of D-142 as written called it a bug).
 #[test]
 fn a_single_step_at_the_entry_with_a_breakpoint_of_the_thread_is_the_threads_fault() {
     let mut k = debugged();
-    k.m.kernel_debug(k.t, BS | B0, true);
+    assert!(k.m.call_with_debug(k.t, BS | B0, Syscall::Yield).is_some());
     assert_eq!(k.m.check(), Ok(()));
     assert!(!accused(&k));
     assert_eq!(breakpoint(&k), Some((B0, RESET | BS | B0)));
 }
 
 // BS anywhere but the entry, BD or BT at CPL0 is a bug of the kernel, a
-// breakpoint of the thread with it or not; a breakpoint the thread does not
-// enable names no cause of the thread's.
+// breakpoint of the thread with it or not; so is a #DB that names no cause,
+// a breakpoint the thread does not enable naming none (D-146).
 #[test]
-fn a_single_step_elsewhere_a_register_access_or_a_task_switch_at_cpl0_is_a_bug_of_the_kernel() {
-    for causes in [BS, BS | B0, BD, BT | B0, BD | BS] {
+fn a_single_step_elsewhere_a_register_access_a_task_switch_or_no_cause_at_cpl0_is_a_bug() {
+    for causes in [BS, BS | B0, BD, BT | B0, BD | BS, 1 << 1, 0] {
         let mut k = debugged();
-        k.m.kernel_debug(k.t, causes, false);
-        assert!(accused(&k), "{causes:#x}");
+        let thread = k.t;
+        let taken =
+            k.m.fault_with_debug(thread, causes, dodos_abi::FaultKind::Page, [14, 0, 0x1000]);
+        assert!(!taken && accused(&k), "{causes:#x}");
         assert_eq!(breakpoint(&k), None);
         assert_eq!(k.m.cores[0].dr6, 0, "{causes:#x}");
     }
+    // At the entry, BD is a bug and no cause is one too.
+    for causes in [BD, 0] {
+        let mut k = debugged();
+        assert_eq!(k.m.call_with_debug(k.t, causes, Syscall::Yield), None);
+        assert!(accused(&k), "{causes:#x}");
+    }
+}
+
+// D-146: kind 9 is kept in the thread and raised when it would next return
+// to user mode. The entry the #DB landed on is a call that waits: the
+// thread keeps the fault while it waits, and raises it at the end of the
+// event that makes it runnable again, after the signal that wakes it.
+#[test]
+fn a_kept_breakpoint_fault_waits_with_its_thread_and_is_raised_when_it_runs_again() {
     let mut k = debugged();
-    k.m.kernel_debug(k.t, 1 << 1, false);
-    assert!(!accused(&k));
-    assert_eq!(breakpoint(&k), None, "breakpoint 1 is not enabled");
+    k.ok(k.retype(ObjectKind::Notify, 0, 211));
+    k.place_first(0);
+    let other = k.thread_on(300, 0);
+    let thread = k.t;
+    let wait = Syscall::Wait(s(211), 0);
+    assert_eq!(k.m.call_with_debug(thread, B0, wait), Some(WAITS));
+    assert_eq!(k.m.check(), Ok(()));
+    assert_eq!(breakpoint(&k), None, "raised while the thread waits");
+    assert!(k.m.threads[&thread].debug_kept.is_some());
+    // Another thread of the node signals the notify.
+    assert_eq!(k.m.apply(other, Syscall::Signal(s(211))), DONE);
+    assert_eq!(k.m.check(), Ok(()));
+    assert_eq!(breakpoint(&k), Some((B0, RESET | B0)));
+}
+
+// D-146: the entry's own fault goes first. A #DB that hits breakpoint 0 on
+// the kernel's entry of an undefined instruction's fault: that fault is
+// delivered (here recorded, the thread having no fault endpoint) and the
+// thread suspended; kind 9 stays kept behind it.
+#[test]
+fn the_entrys_own_fault_goes_first_and_a_kept_breakpoint_fault_waits_behind_it() {
+    let mut k = debugged();
+    let thread = k.t;
+    let undefined = dodos_abi::FaultKind::Undefined;
+    assert!(k.m.fault_with_debug(thread, B0, undefined, [6, 0, 0]));
+    assert_eq!(k.m.check(), Ok(()));
+    let recorded = k.m.threads[&thread].recorded.map(|(kind, _)| kind);
+    assert_eq!(recorded, Some(undefined as u32));
+    assert!(
+        k.m.threads[&thread].debug_kept.is_some(),
+        "kept behind the page fault"
+    );
+}
+
+// CONTRACT-GAP 23 (D-146, kind 9 kept): the thread keeps one word, the DR6
+// value read, and word 3 is "the bits of the breakpoints and watchpoints
+// that hit". B0 to B3 of DR6 "may or may not be set if the breakpoint is
+// not enabled", so word 3 needs the control word; but a thread suspended
+// behind its entry's own fault can have its control word rewritten by
+// `thread_write_regs` before kind 9 is raised. Here breakpoint 0 hits, the
+// entry's undefined-instruction fault suspends the thread, another thread
+// clears its control word and resumes it: judged with the control word at
+// the raise, word 3 would name no breakpoint, in a fault that says one hit.
+// The model takes the careful reading, the breakpoints judged at the #DB.
+#[test]
+fn gap_23_word_3_of_a_kept_breakpoint_fault_is_judged_at_the_db() {
+    let mut k = debugged();
+    k.place_first(0);
+    let other = k.thread_on(300, 0);
+    let thread = k.t;
+    let undefined = dodos_abi::FaultKind::Undefined;
+    assert!(k.m.fault_with_debug(thread, B0, undefined, [6, 0, 0]));
+    let mut block = k.m.threads[&thread].regs.clone();
+    block[dodos_abi::x86_64::REG_DR7] = 0;
+    let write = Syscall::ThreadWriteRegs {
+        thread: SlotAddr::own(dodos_abi::START_SLOT_THREAD),
+        block,
+    };
+    assert_eq!(k.m.apply(other, write), DONE);
+    let resume = Syscall::ThreadResume(SlotAddr::own(dodos_abi::START_SLOT_THREAD));
+    assert_eq!(k.m.apply(other, resume), DONE);
+    assert_eq!(k.m.check(), Ok(()));
+    assert_eq!(breakpoint(&k), Some((B0, RESET | B0)));
 }
 
 // At CPL3 too the handler loads DR6's reset value: a hardware breakpoint of
@@ -523,6 +819,9 @@ fn the_handler_resets_dr6_at_cpl3_as_well() {
 // nodes of one core each.
 
 const GSI: u32 = 5;
+
+/// The period of the recovery reserve.
+const RECOVERY_PERIOD: u64 = 10 * MS;
 
 fn claimed_on(nodes: usize, n: u16, level: bool) -> S {
     let groups: Vec<Vec<usize>> = (0..nodes).map(|c| vec![c]).collect();

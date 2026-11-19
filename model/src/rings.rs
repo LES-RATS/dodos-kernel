@@ -851,6 +851,29 @@ impl Model {
         }
     }
 
+    /// Whether, with no more than `PENDING_STEP` messages held, one is held
+    /// toward a current granter that can be written to and has room: what
+    /// `send_pending` sends (D-146).
+    pub(crate) fn held_sendable(&self) -> bool {
+        let me = self.node as usize;
+        let pending: Vec<_> = self.table.uses[me]
+            .values()
+            .filter(|u| u.release_pending || u.signal_pending)
+            .collect();
+        pending.len() <= PENDING_STEP
+            && pending.into_iter().any(|used| {
+                let member = self.table.member(used.granter);
+                let writable = member.generation() == used.generation
+                    && (matches!(member.state(), MemberState::Live | MemberState::Sealing)
+                        || member.state() == MemberState::Starting && member.resuming());
+                let kind = match used.release_pending {
+                    true => NodeMessage::Release,
+                    false => NodeMessage::Signal,
+                };
+                writable && self.ring_room(used.granter, kind, 1)
+            })
+    }
+
     /// The observation of a ring from this node to `to` that is not empty,
     /// for stuck evidence.
     pub(crate) fn ring_watch(&self, to: u16) -> Option<Watched> {

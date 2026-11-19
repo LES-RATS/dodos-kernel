@@ -732,6 +732,11 @@ struct Thread {
     /// Faults: a fault that was not delivered, recorded in the thread: its
     /// kind and its five words, until the thread is resumed.
     recorded: Option<(u32, [u64; 5])>,
+    /// x86-64: a fault of kind 9 from a #DB at CPL0, kept until the thread
+    /// would next return to user mode: the breakpoints of the thread that
+    /// hit, judged at the #DB, and the DR6 value read (D-146; the contract
+    /// keeps one word, the DR6 value: CONTRACT-GAP 23).
+    debug_kept: Option<(u64, u64)>,
     /// Scheduling contexts: its own context, if it is that context's home.
     home: Option<ObjId>,
     /// The budget follows the call: marked as having lost its context.
@@ -1022,6 +1027,12 @@ struct EventLog {
     /// RISC-V: the APLIC sources whose `setipnum`, `setienum` or `clrienum`
     /// the event wrote (G9, D-146).
     aplic: Vec<u32>,
+    /// The state of this node's member word at each accusation the event
+    /// wrote (D-146: only a live or sealing node writes fencing).
+    accusers: Vec<dodos_abi::MemberState>,
+    /// A step of the recovery reserve in the event left a held message it
+    /// could have sent (judged at the step: the granter's word and room).
+    held_after_step: bool,
 }
 
 /// The whole state of the kernel of one node: its shared state, and the

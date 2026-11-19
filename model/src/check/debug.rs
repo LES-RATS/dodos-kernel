@@ -64,6 +64,14 @@ impl Model {
                 "DR6: a core's DR6 is not at its reset value after an event",
             )?;
         }
+        // D-146: kind 9 from a #DB at CPL0 is raised at the end of the event
+        // in which its thread is runnable: none keeps it after an event.
+        ensure(
+            self.threads
+                .values()
+                .all(|t| t.debug_kept.is_none() || !Self::runnable_thread(t)),
+            "KIND 9: a runnable thread keeps a breakpoint fault after an event",
+        )?;
         self.check_records()
     }
 

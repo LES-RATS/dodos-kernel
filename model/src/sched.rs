@@ -376,6 +376,7 @@ impl Model {
         let at = *self.at;
         for _ in 0..=self.threads.len() {
             self.no_context();
+            self.raise_kept_debug();
             entered += self.requeue();
             // A resuming node runs no thread until its resume ends (The
             // node's life, `node_start` mode resume: "no thread runs before

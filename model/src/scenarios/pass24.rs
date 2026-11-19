@@ -16,14 +16,14 @@ use dodos_abi::START_SLOT_MAILBOX;
 const REPLY: u32 = 100;
 const OBJ: u32 = 101;
 const OTHER: u32 = 102;
-const GOT: u32 = 110;
+pub(super) const GOT: u32 = 110;
 const GOT_OTHER: u32 = 120;
 const BLOCK: u32 = 160;
 /// The granting node, the holder, and the third node, which holds the
 /// IOMMU unit's role.
 const X: u16 = 0;
-const Y: u16 = 2;
-const THIRD: u16 = 1;
+pub(super) const Y: u16 = 2;
+pub(super) const THIRD: u16 = 1;
 
 fn recv(first: u32) -> Syscall {
     Syscall::Recv {
@@ -52,7 +52,7 @@ fn send(slot: u32) -> Syscall {
     }
 }
 
-fn io_map(m: &S, frame: u32) -> Syscall {
+pub(super) fn io_map(m: &S, frame: u32) -> Syscall {
     Syscall::IoSpaceMap(Map {
         space: s(IOSPACE),
         frame: s(frame),
@@ -66,15 +66,20 @@ fn io_map(m: &S, frame: u32) -> Syscall {
 
 /// Node `X` grants node `Y` a frame of a chunk it took (slot `BLOCK`),
 /// received in slot `slot`; `Y` has an iospace with a device attached.
-struct Granted {
-    m: S,
-    chunk: u64,
-    frame: ObjId,
-    grant: u16,
-    use_index: u16,
+pub(super) struct Granted {
+    pub(super) m: S,
+    pub(super) chunk: u64,
+    pub(super) frame: ObjId,
+    pub(super) grant: u16,
+    pub(super) use_index: u16,
 }
 
 fn granted(caching: bool) -> Granted {
+    granted_by(X, caching)
+}
+
+/// As `granted`, the frame granted by node `x`.
+pub(super) fn granted_by(x: u16, caching: bool) -> Granted {
     let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
     machine.caching_mode = caching;
     let mut m = S::on(&machine);
@@ -89,17 +94,21 @@ fn granted(caching: bool) -> Granted {
         .iter()
         .position(|&w| w == free)
         .expect("a free chunk") as u64;
-    m.ok(X, take(0, chunk << shift, u64::from(shift), BLOCK));
-    m.ok(X, retype_from(BLOCK, ObjectKind::Frame, 1, OBJ));
-    let frame = m.sys.node(X).object_at(m.t[0], s(OBJ)).expect("the frame");
-    for node in [X, Y] {
+    m.ok(x, take(0, chunk << shift, u64::from(shift), BLOCK));
+    m.ok(x, retype_from(BLOCK, ObjectKind::Frame, 1, OBJ));
+    let frame = m
+        .sys
+        .node(x)
+        .object_at(m.t[x as usize], s(OBJ))
+        .expect("the frame");
+    for node in [x, Y] {
         let reply = m.retype(node, ObjectKind::Reply, 0, REPLY);
         m.ok(node, reply);
     }
     assert_eq!(m.call(Y, recv(GOT)), WAITS);
-    assert_eq!(m.call(X, send(OBJ)), WAITS);
+    assert_eq!(m.call(x, send(OBJ)), WAITS);
     m.settle();
-    let (&grant, entry) = m.sys.canonical().grants[X as usize]
+    let (&grant, entry) = m.sys.canonical().grants[x as usize]
         .iter()
         .next()
         .expect("the grant");
@@ -115,7 +124,7 @@ fn granted(caching: bool) -> Granted {
 
 /// A call repeated, time passing between, until it is done.
 #[track_caller]
-fn until_done(m: &mut S, node: u16, call: Syscall) {
+pub(super) fn until_done(m: &mut S, node: u16, call: Syscall) {
     for _ in 0..20 {
         match m.call(node, call.clone()) {
             DONE => return,
@@ -128,7 +137,7 @@ fn until_done(m: &mut S, node: u16, call: Syscall) {
 
 /// The holder's use entry: kept with no root, its count above 0.
 #[track_caller]
-fn kept_without_root(g: &Granted) {
+pub(super) fn kept_without_root(g: &Granted) {
     let used = g.m.sys.canonical().uses[Y as usize]
         .get(&g.use_index)
         .copied();

@@ -1044,3 +1044,85 @@ fn an_idle_state_whose_flag_disagrees_with_its_parameter_is_reported() {
         "IDLE: a suspend state whose flag disagrees with its parameter",
     );
 }
+
+// D-146: `acked` written for a node that is not fenced (R5 alone writes
+// it, and only for a fenced node).
+#[test]
+fn an_acknowledgement_of_a_node_that_is_not_fenced_is_reported() {
+    let mut m = S::two();
+    let g = m.sys.member(1).generation();
+    m.sys.edit_table(|t| t.beacons[0].acked[1] = g);
+    let report = m.sys.check().expect_err("the spoiled machine");
+    assert!(
+        report.ends_with("ACKED: an acknowledgement of a node that is not fenced"),
+        "{report}"
+    );
+}
+
+// D-146: an accusation written while the accuser's own node is starting.
+#[test]
+fn an_accusation_by_a_node_that_is_not_live_is_reported() {
+    let mut k = node2();
+    k.m.event.accusers.push(dodos_abi::MemberState::Starting);
+    reported(&k, "ACCUSE: a node that is not live or sealing accused");
+}
+
+// D-146: a unit role held by a node whose member word reads starting.
+#[test]
+fn a_unit_role_held_by_a_starting_node_is_reported() {
+    let mut m = S::two();
+    let holder = m.sys.role(super::units::IOMMU_ROLE).holder();
+    let g = m.sys.member(holder).generation();
+    m.sys.edit_table(|t| {
+        let member = t.member(holder);
+        let starting =
+            dodos_abi::Member::new(MemberState::Starting, member.evidence(), member.driver(), g);
+        t.members[holder as usize] = starting;
+    });
+    machine_reported(&m, "UNIT ROLE: a starting node holds a unit role");
+}
+
+// D-146: a thread that can run and still keeps the kind 9 of a #DB at CPL0
+// after an event.
+#[test]
+fn a_runnable_thread_that_keeps_a_breakpoint_fault_is_reported() {
+    let mut k = node2();
+    let thread = k.t;
+    k.m.threads.get_mut(&thread).unwrap().debug_kept = Some((1, 0xFFFF_0FF1));
+    reported(
+        &k,
+        "KIND 9: a runnable thread keeps a breakpoint fault after an event",
+    );
+}
+
+// D-146: an observation stamped with a sealed member word.
+#[test]
+fn an_observation_of_a_sealed_node_is_reported() {
+    let mut m = S::two();
+    let g = m.sys.member(1).generation();
+    m.sys.edit_table(|t| {
+        t.beacons[0].observations.push(crate::table::Observation {
+            node: 1,
+            generation: g,
+            state: MemberState::Sealed,
+            resume: false,
+            watched: crate::table::Watched::Heartbeat {
+                core: 1,
+                heartbeat: 0,
+            },
+            at: 0,
+        });
+    });
+    machine_reported(&m, "OBSERVATION: an observation taken of a sealed node");
+}
+
+// D-146: a step of the reserve that left a `Release` it could have sent.
+#[test]
+fn a_message_held_after_a_step_that_could_send_it_is_reported() {
+    let mut k = node2();
+    k.m.event.held_after_step = true;
+    reported(
+        &k,
+        "HELD: a message held after a step of the reserve that could send it",
+    );
+}

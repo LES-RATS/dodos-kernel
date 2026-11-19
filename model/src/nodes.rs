@@ -304,6 +304,15 @@ impl Model {
             _ if core != 0 => return Err(Error::Invalid),
             _ => {}
         }
+        // First, for every mode: the caller's node live or sealing; a
+        // starting node accuses no one and asks no seal, since only a live
+        // or sealing node writes fencing (D-146).
+        if !matches!(
+            self.table.member(self.node).state(),
+            MemberState::Live | MemberState::Sealing
+        ) {
+            return Err(Error::Busy);
+        }
         let state = member.state();
         match mode {
             NODE_STOP_SEAL if state != MemberState::Live => return Err(Error::Busy),
@@ -484,6 +493,8 @@ impl Model {
     /// The gate accuses a node with evidence, this node its driver. Its
     /// fence begins at the next step of this node's recovery reserve.
     pub(crate) fn accuse(&mut self, node: u16, evidence: Evidence) {
+        let accuser = self.table.member(self.node).state();
+        self.event.accusers.push(accuser);
         let member = self.table.member(node);
         let fencing = Member::new(
             MemberState::Fencing,
@@ -646,7 +657,7 @@ impl Model {
         for observation in self.table.beacons[me]
             .observations
             .iter()
-            .filter(|o| o.node == node && o.generation == g)
+            .filter(|o| o.node == node && o.holds(member))
         {
             match observation.watched {
                 Watched::Heartbeat { core, heartbeat } => {
@@ -760,12 +771,15 @@ impl Model {
         let starting: Vec<u16> = (0..self.table.nodes)
             .filter(|&z| self.table.member(z).state() == MemberState::Starting)
             .collect();
+        // An observation closed by a change of the observed node's state,
+        // generation or resume bit is dropped, to be taken again (D-146).
+        let members = self.table.members.clone();
         self.table.beacons[me].observations.retain(|o| {
             let life = match starting.contains(&o.node) {
                 true => life.max(START_NS + self.table.stale_ns),
                 false => life,
             };
-            now < o.at + life
+            now < o.at + life && o.holds(members[o.node as usize])
         });
         let mut changed = before != self.table.beacons[me].observations.len();
         let swept = self.now >= self.next_sweep;
@@ -773,7 +787,8 @@ impl Model {
             if !self.table.writes(node) || !self.real(node) {
                 continue;
             }
-            let g = self.table.generation(node);
+            let member = self.table.member(node);
+            let g = member.generation();
             let mut wanted: Vec<Watched> = self
                 .table
                 .cores_of(node, g)
@@ -788,7 +803,7 @@ impl Model {
                 let observations = &mut self.table.beacons[me].observations;
                 if observations
                     .iter()
-                    .any(|o| o.node == node && o.generation == g && o.watched == watched)
+                    .any(|o| o.node == node && o.holds(member) && o.watched == watched)
                 {
                     continue;
                 }
@@ -810,6 +825,8 @@ impl Model {
                     observations.push(Observation {
                         node,
                         generation: g,
+                        state: member.state(),
+                        resume: member.resuming(),
                         watched,
                         at: now,
                     });
@@ -2071,7 +2088,7 @@ impl Model {
     }
 
     /// Whether some work of the reserve could progress now.
-    fn reserve_work(&self) -> bool {
+    pub(crate) fn reserve_work(&self) -> bool {
         let words_changed = self.seen != (self.table.members.clone(), self.table.roles.clone());
         let recovering = (0..self.table.nodes).any(|z| {
             z != self.node
@@ -2139,6 +2156,7 @@ impl Model {
             progressed |= self.serve_kernel_rings(&mut units);
             progressed |= self.roles_step(&mut units);
             self.send_pending();
+            self.event.held_after_step = self.held_sendable();
             progressed |= self.observe_needed();
             progressed |= self.accuse_with_evidence();
         }
