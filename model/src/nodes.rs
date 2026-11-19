@@ -1049,7 +1049,6 @@ impl Model {
     /// handler calls `sbi_hart_stop`, sent again once per round of 11.2 ms
     /// to every hart not yet confirmed (The fence, RISC-V, D-146).
     fn cooperative(&self, node: u16, generation: u32) -> bool {
-        let list = self.machine.core_list();
         self.machine.arch == crate::Arch::Riscv64
             && self
                 .table
