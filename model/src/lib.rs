@@ -35,6 +35,8 @@ mod check;
 mod cores;
 mod debug;
 mod faults;
+#[cfg(test)]
+mod gate;
 mod grants;
 mod ipc;
 mod irq;
