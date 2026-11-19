@@ -69,7 +69,7 @@ impl Model {
         ensure(
             self.threads
                 .values()
-                .all(|t| t.debug_kept.is_none() || !Self::runnable_thread(t)),
+                .all(|t| t.debug_kept.is_none() || t.lost || !Self::runnable_thread(t)),
             "KIND 9: a runnable thread keeps a breakpoint fault after an event",
         )?;
         self.check_records()

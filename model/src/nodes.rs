@@ -848,8 +848,12 @@ impl Model {
     /// Accusations, with evidence the gate checks: at least one other node
     /// live or sealing, except for evidence self.
     fn accuse_with_evidence(&mut self) -> bool {
-        // No accusation while the release word of the stub is raised.
-        if self.table.release {
+        // No accusation while the release word of the stub is raised, and
+        // none by a node that is not live or sealing: only such a node
+        // writes fencing (D-146; seed 1434 of pass 28: a node starting
+        // afresh accused another with evidence self).
+        let me = self.table.member(self.node).state();
+        if self.table.release || !matches!(me, MemberState::Live | MemberState::Sealing) {
             return false;
         }
         for node in (0..self.table.nodes).filter(|&z| z != self.node) {
@@ -2135,9 +2139,13 @@ impl Model {
         let mut progressed = false;
         self.observe_watched();
         let me = self.node;
-        let writes = self.table.member(me).writes();
         progressed |= self.seal_step(&mut units);
         progressed |= self.resume_step(&mut units);
+        // Read after the seal's step: the write of sealed is the node's last
+        // gate call, after which it fences, reclaims and accuses nothing
+        // (`node_stop` mode 1; seed 867 of pass 28: a node that had just
+        // written sealed accused another in the same step).
+        let writes = self.table.member(me).writes();
         if writes {
             progressed |= self.start_step();
             progressed |= self.fence_step();
@@ -2198,7 +2206,7 @@ pub(crate) fn loses_context(method: u64, machine: &crate::boot::Machine) -> bool
     let parameter = method >> 32;
     match method & 0xFFFF_FFFF {
         IDLE_METHOD_PSCI => {
-            let bit = if machine.psci_extended { 30 } else { 16 };
+            let bit = if machine.psci_extended() { 30 } else { 16 };
             parameter >> bit & 1 != 0
         }
         IDLE_METHOD_SBI => parameter >> 31 & 1 != 0,

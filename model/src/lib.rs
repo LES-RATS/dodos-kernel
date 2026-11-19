@@ -733,10 +733,10 @@ struct Thread {
     /// kind and its five words, until the thread is resumed.
     recorded: Option<(u32, [u64; 5])>,
     /// x86-64: a fault of kind 9 from a #DB at CPL0, kept until the thread
-    /// would next return to user mode: the breakpoints of the thread that
-    /// hit, judged at the #DB, and the DR6 value read (D-146; the contract
-    /// keeps one word, the DR6 value: CONTRACT-GAP 23).
-    debug_kept: Option<(u64, u64)>,
+    /// would next return to user mode, in one word: bits 0-31 the DR6 value
+    /// read, bits 32-35 the enabled breakpoints that hit, judged against
+    /// the control word at the #DB (D-146, D-147).
+    debug_kept: Option<u64>,
     /// Scheduling contexts: its own context, if it is that context's home.
     home: Option<ObjId>,
     /// The budget follows the call: marked as having lost its context.

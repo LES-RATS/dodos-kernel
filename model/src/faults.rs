@@ -106,27 +106,31 @@ impl Model {
             return false;
         }
         if hit != 0 {
-            live(&mut self.threads, thread).debug_kept = Some((hit, read));
+            live(&mut self.threads, thread).debug_kept = Some(hit << 32 | read);
         }
         true
     }
 
     /// Kind 9 kept from a #DB at CPL0, raised as the fault *no context* is:
-    /// at the end of the event in which its thread is runnable, words 0 and
-    /// 1 where it would resume and its stack pointer; a fault of the entry
-    /// itself goes first, and a thread that waits or is suspended keeps it
-    /// (D-146).
+    /// at the end of the event in which its thread is runnable with a
+    /// context, before it runs any user instruction, words 0 and 1 where it
+    /// would resume and its stack pointer, word 3 the hits of bits 32-35,
+    /// word 4 the DR6 value of bits 0-31; a fault of the entry itself goes
+    /// first, a thread also marked *no context* raises kind 8 first and
+    /// keeps kind 9, and a thread that waits or is suspended keeps it;
+    /// raising it, delivered or recorded, clears the word (D-146, D-147).
     pub(crate) fn raise_kept_debug(&mut self) {
         let kept: Vec<ObjId> = self
             .threads
             .iter()
-            .filter(|(_, t)| t.debug_kept.is_some() && Self::runnable_thread(t))
+            .filter(|(_, t)| t.debug_kept.is_some() && !t.lost && Self::runnable_thread(t))
             .map(|(&id, _)| id)
             .collect();
         for thread in kept {
-            let Some((hit, read)) = live(&mut self.threads, thread).debug_kept.take() else {
+            let Some(word) = live(&mut self.threads, thread).debug_kept.take() else {
                 continue;
             };
+            let (hit, read) = (word >> 32 & 0xF, word & 0xFFFF_FFFF);
             self.raise(thread, FaultKind::HardwareBreakpoint, [1, hit, read]);
         }
     }

@@ -114,7 +114,17 @@ const ATTACHED: usize = 22;
 const DETACHED: usize = 23;
 const MID_ATTACH: usize = 24;
 const LINE: usize = 25;
-const EVENTS: usize = 26;
+/// A core waking from a sleep that lost its context (pass 28).
+const WAKE: usize = 26;
+/// A node starting afresh whose first thread runs before it is live
+/// (pass 28).
+const PRE_LIVE: usize = 27;
+const EVENTS: usize = 28;
+/// The node of two cores, whose start can leave its second core out for a
+/// while: the window before live.
+const WIDE: u16 = 4;
+/// The architectures, one per round of the 286 triples of drivers.
+const ARCHES: [Arch; 3] = [Arch::X86_64, Arch::Aarch64, Arch::Riscv64];
 
 const NAMES: [&str; EVENTS] = [
     "accused kill",
@@ -143,6 +153,8 @@ const NAMES: [&str; EVENTS] = [
     "device detached",
     "mid-attach",
     "line moving",
+    "wake from sleep",
+    "first thread before live",
 ];
 
 /// The accusations: a node fencing, fenced or unfenced.
@@ -209,6 +221,14 @@ fn probe(m: &S, splittable: usize) -> u32 {
         if state == MemberState::Starting {
             set(RESUME, member.resuming());
             set(FRESH, !member.resuming());
+            // Its first thread runs before it is live (pass 28).
+            set(
+                PRE_LIVE,
+                !member.resuming()
+                    && m.sys.has(n)
+                    && m.sys.node(n).generation_built() == member.generation()
+                    && m.sys.node(n).is_ready(),
+            );
         }
         if m.sys.has(n) {
             let node = m.sys.node(n);
@@ -223,6 +243,16 @@ fn probe(m: &S, splittable: usize) -> u32 {
             );
         }
     }
+    // A core on its way out of a sleep that lost its context.
+    set(
+        WAKE,
+        (0..m.sys.core_count()).any(|core| {
+            matches!(
+                m.sys.hardware(core),
+                Hardware::Asleep { wake: Some(_), .. } | Hardware::Suspending { roused: true, .. }
+            )
+        }),
+    );
     let word = m.sys.role(IOMMU_ROLE);
     set(FAILED_UNIT, word.failed());
     if word.state() == RoleState::Handing {
@@ -440,18 +470,29 @@ struct Run {
     handed_failed: bool,
     /// A node whose events are held back, and for how many more churns.
     deferred: Option<(u16, u32)>,
+    /// ARM64 and RISC-V: the start of the wide node's second core held
+    /// back for so many churns, so that its first thread runs before it is
+    /// live.
+    late_start: u32,
 }
 
 impl Run {
     fn new(seed: u64) -> Self {
-        let cores: Vec<Vec<usize>> = (0..NODES as usize).map(|c| vec![c]).collect();
+        // Five nodes, the last of two cores; the architecture by round.
+        let cores: Vec<Vec<usize>> = (0..NODES as usize)
+            .map(|c| match c as u16 == WIDE {
+                true => vec![c, c + 1],
+                false => vec![c],
+            })
+            .collect();
         let layout: Vec<&[usize]> = cores.iter().map(Vec::as_slice).collect();
+        let arch = ARCHES[(seed / 286) as usize % ARCHES.len()];
         // The times of membership at the low end of their ranges, so that a
         // seal outlives `SEAL_NS` and a silent core is found stale within
         // the steps of a seed (Numbers: `SWEEP_NS` from 100 ms, `SEAL_NS`
         // and `STALE_NS` from 10 ms; `STUCK_NS` above the reserve's period
         // and `CORE_ANSWER_NS`).
-        let mut machine = machine(Arch::X86_64, NODES as usize, &layout);
+        let mut machine = machine(arch, NODES as usize + 1, &layout);
         machine.membership.sweep_ms = 100;
         machine.membership.seal_ms = 30;
         machine.membership.stale_ms = 40;
@@ -478,6 +519,7 @@ impl Run {
             gap_21: false,
             handed_failed: false,
             deferred: None,
+            late_start: 0,
         };
         say(format_args!("drivers {:?}", run.drivers));
         run.set_up();
@@ -527,6 +569,32 @@ impl Run {
 
     fn set_up(&mut self) {
         let m = &mut self.m;
+        // ARM64 and RISC-V: every core idles in a state that loses its
+        // context (`node_idle`, D-143, D-146).
+        let lossy = match m.sys.arch() {
+            Arch::Aarch64 => Some(dodos_abi::IDLE_METHOD_PSCI | 1 << 16 << 32),
+            Arch::Riscv64 => Some(dodos_abi::IDLE_METHOD_SBI | 0x8000_0000 << 32),
+            Arch::X86_64 => None,
+        };
+        for node in 0..NODES {
+            let cores: Vec<u64> = match node == WIDE {
+                true => vec![u64::from(node), u64::from(node) + 1],
+                false => vec![u64::from(node)],
+            };
+            for core in cores.into_iter().filter(|_| lossy.is_some()) {
+                let idle = Syscall::NodeIdle {
+                    node: node_cap(node),
+                    core,
+                    words: vec![
+                        200_000,
+                        100_000,
+                        lossy.expect("a lossy state"),
+                        dodos_abi::IDLE_FLAG_LOSES_CONTEXT,
+                    ],
+                };
+                m.ok(node, idle);
+            }
+        }
         for (node, device) in DEVICES {
             let iospace = m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
             m.ok(node, iospace);
@@ -688,6 +756,9 @@ impl Run {
         if let Some((node, steps)) = self.deferred {
             self.deferred = (steps > 1).then_some((node, steps - 1));
         }
+        let late = self.late_start > 0;
+        self.late_start = self.late_start.saturating_sub(1);
+        let second = WIDE as usize + 1;
         for _ in 0..self.rng.below(12) {
             let events: Vec<_> = self
                 .m
@@ -697,6 +768,14 @@ impl Run {
                 .filter(|e| {
                     !matches!(e, crate::system::Event::Ipi { node, .. }
                         | crate::system::Event::Timer { node, .. } if Some(*node) == deferred)
+                })
+                .filter(|e| {
+                    let crate::system::Event::Action(i) = *e else {
+                        return true;
+                    };
+                    !late
+                        || self.m.sys.actions()[i].1
+                            != crate::nodes::HwAction::Start { core: second }
                 })
                 .collect();
             if events.is_empty() || self.m.sys.stopped {
@@ -882,18 +961,68 @@ impl Run {
             }
             _ => {
                 // The wake of the start lost once, so that the start lasts
-                // a retry (`START_RETRY_NS`).
-                if matches!(self.m.sys.hardware(target as usize), Hardware::Stub { .. }) {
-                    self.m.sys.set_window(target as usize);
+                // a retry (`START_RETRY_NS`); for the wide node, the wake of
+                // its second core, so that its first thread runs before it
+                // is live (on ARM64 and RISC-V, `CPU_ON` and
+                // `sbi_hart_start` held back a few steps).
+                let wide = target == WIDE;
+                let late = target as usize + usize::from(wide);
+                if matches!(self.m.sys.hardware(late), Hardware::Stub { .. }) {
+                    self.m.sys.set_window(late);
+                } else if wide {
+                    self.late_start = 3 + self.rng.below(6) as u32;
                 }
-                if self.call(actor, fresh(target, 1 << target)) == Some(DONE) {
+                let mask = match wide {
+                    true => 0b11 << target,
+                    false => 1 << target,
+                };
+                if self.call(actor, fresh(target, mask)) == Some(DONE) {
                     self.receivers[target as usize] = None;
                     // A grant between two other nodes during the start.
                     let pair = PAIRS[self.rng.below(PAIRS.len())];
                     self.regrant(pair, 0);
+                    if wide {
+                        self.before_live(target);
+                    }
                 }
             }
         }
+    }
+
+    /// The wide node's first thread, once its node is built and before
+    /// it is live, sends to a live node and waits for the answer (pass 28:
+    /// the window before live, interleaved with the rest).
+    fn before_live(&mut self, node: u16) {
+        let built = |run: &Self| {
+            let member = run.m.sys.member(node);
+            member.state() == MemberState::Starting
+                && run.m.sys.has(node)
+                && run.m.sys.node(node).generation_built() == member.generation()
+                && run.m.sys.node(node).is_ready()
+        };
+        for _ in 0..8 {
+            if built(self) || self.m.state(node) != MemberState::Starting {
+                break;
+            }
+            self.churn();
+        }
+        if !built(self) {
+            return;
+        }
+        self.m.restarted(node);
+        let Some(peer) = self.live_other(node) else {
+            return;
+        };
+        let send = Syscall::NodeSend {
+            node: node_cap(peer),
+            message: Message::default(),
+            doorbell: SlotAddr::NONE,
+        };
+        say(format_args!(
+            "{} node {node}: send before live",
+            self.m.sys.now()
+        ));
+        let _ = self.call(node, send);
     }
 
     fn drive(&mut self, driver: Driver) {
@@ -1404,8 +1533,9 @@ fn combined_recovery_states_between_nodes() {
     if !super::explore::once() {
         return;
     }
-    let triples = 286;
-    let reach = explore((0..26).map(|i| i * triples / 26).collect());
+    // Over the three rounds of the triples, one per architecture.
+    let seeds = 3 * 286;
+    let reach = explore((0..26).map(|i| i * seeds / 26).collect());
     let _ = report(&reach);
     if replayed().is_none() {
         for e in 0..EVENTS {
@@ -1435,6 +1565,31 @@ fn every_combination_of_recovery_states_is_reached() {
     if replayed().is_none() {
         assert!(missing.is_empty(), "never reached: {missing:#?}");
     }
+}
+
+// Seed 867 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
+// node 3's last seal step wrote sealed, its last gate call, and went on in
+// the same step to accuse node 0, which had just failed. A node fences,
+// reclaims and accuses nothing once it has written sealed.
+#[test]
+fn seed_867_of_pass_28_a_node_that_wrote_sealed_accuses_no_one() {
+    if !super::explore::once() {
+        return;
+    }
+    let reach = explore(vec![867]);
+    assert!(reach.events[SEALED] > 0);
+}
+
+// Seed 1434 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
+// node 4, starting afresh, accused node 3 with evidence self from its
+// reserve. Only a live or sealing node writes fencing.
+#[test]
+fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
+    if !super::explore::once() {
+        return;
+    }
+    let reach = explore(vec![1434]);
+    assert!(reach.events[FRESH] > 0);
 }
 
 // Seed 1109 of the long run of pass 26: a rebuild's `ReportAsk` to a node

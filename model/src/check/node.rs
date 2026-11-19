@@ -44,8 +44,9 @@ impl Model {
     /// Reclaim, R5 (D-146): `acked[X]` is written by R5 alone, after R2 to
     /// R4, only for a fenced node, and not before R1 is done on every unit
     /// this node holds; on a failed unit R1 is never done for a node that
-    /// had a device behind it. So an acknowledgement of X's generation
-    /// names a fenced or dead X, with R1 done here.
+    /// had a device behind it, unless the unit confirmed it before it
+    /// failed. So an acknowledgement of X's generation names a fenced or
+    /// dead X, with R1 done here while X is fenced.
     fn check_acked(&self) -> Check {
         use dodos_abi::{MemberState, RoleState};
         let me = self.node as usize;
@@ -59,6 +60,12 @@ impl Model {
                 matches!(member.state(), MemberState::Fenced | MemberState::Dead),
                 "ACKED: an acknowledgement of a node that is not fenced",
             )?;
+            // Once X is dead its barrier held: a later change of holder has
+            // no acknowledgement to withdraw (Roles, R1 at every change of
+            // holder), so R1 is judged while X is fenced.
+            if member.state() != MemberState::Fenced {
+                continue;
+            }
             let reclaim = self.reclaims.get(&x).filter(|r| r.generation == g);
             for (role, word) in self.table.roles.iter().enumerate() {
                 if word.state() != RoleState::Held
@@ -67,11 +74,12 @@ impl Model {
                 {
                     continue;
                 }
+                // Done: confirmed by the unit, or at once on a failed unit
+                // for a node that had no device behind it (R1, D-140); a
+                // confirmation before the unit failed stays.
                 let done = reclaim.is_none_or(|r| r.r1.get(&role).is_none_or(Option::is_none));
-                let blocked =
-                    reclaim.is_some_and(|r| r.devices.contains(&role)) && self.unit_failed(role);
                 ensure(
-                    done && !blocked,
+                    done,
                     "ACKED: an acknowledgement before R1 is done on a unit this node holds",
                 )?;
             }

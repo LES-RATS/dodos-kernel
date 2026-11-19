@@ -1190,6 +1190,16 @@ impl System {
         true
     }
 
+    /// The number of physical cores.
+    pub fn core_count(&self) -> usize {
+        self.hardware.len()
+    }
+
+    /// The architecture of the machine.
+    pub fn arch(&self) -> Arch {
+        self.machine.arch
+    }
+
     /// The hardware state of `core`, set by a checker test.
     #[cfg(test)]
     pub(crate) fn set_hardware(&mut self, core: usize, state: Hardware) {

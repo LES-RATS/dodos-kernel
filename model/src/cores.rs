@@ -763,6 +763,13 @@ impl Model {
         (part.running.is_some() || part.thread.is_some()) && part.ipis.is_empty()
     }
 
+    /// Whether the node is ready: its state built, its first thread able to
+    /// run (before it is live on a fresh start).
+    #[cfg(test)]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready
+    }
+
     /// The physical core number of the core at `position`.
     pub(crate) fn core_number(&self, position: usize) -> usize {
         self.cores[position].number as usize

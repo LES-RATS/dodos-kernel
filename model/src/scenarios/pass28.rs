@@ -399,10 +399,17 @@ fn node_idle_refuses_a_suspend_state_whose_flag_disagrees_with_its_parameter() {
     // Bit 30 says nothing in the original format.
     k.no(idle(psci(1 << 30), lose), Error::Invalid);
     let mut machine = one_node(Arch::Aarch64, 1);
-    machine.psci_extended = true;
+    machine.psci_features = 2;
     let mut k = N::on(&machine);
     k.ok(idle(psci(1 << 30), lose));
     k.no(idle(psci(1 << 16), lose), Error::Invalid);
+    // D-147: a negative `PSCI_FEATURES` (`NOT_SUPPORTED`, -1, every bit
+    // set) is the original format, not the extended one its bit 1 reads.
+    let mut machine = one_node(Arch::Aarch64, 1);
+    machine.psci_features = -1;
+    let mut k = N::on(&machine);
+    k.ok(idle(psci(1 << 16), lose));
+    k.no(idle(psci(1 << 30), lose), Error::Invalid);
     let mut k = N::on(&one_node(Arch::Riscv64, 1));
     k.ok(idle(sbi(0x8000_0000), lose));
     k.ok(idle(sbi(0), 0));
@@ -498,6 +505,36 @@ fn a_take_over_of_a_failed_unit_does_not_acknowledge_an_unfenced_old_holder() {
             m.sys.canonical().beacons[z].acked[1],
             generation,
             "node {z} acknowledged an unfenced node"
+        );
+    }
+}
+
+// D-147, item 1: a take-over, of a healthy unit too, never writes `acked`
+// itself: its R1 for the old holder only stops holding back R5, which is
+// only for a fenced node. Node 1 holds the IOMMU role and hangs in VMX root
+// operation, where INIT is blocked: it is unfenced, its successor rebuilds
+// the unit, and no node acknowledges node 1.
+#[test]
+fn a_take_over_of_a_healthy_unit_does_not_acknowledge_an_unfenced_old_holder() {
+    use super::units::IOMMU_ROLE;
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
+    m.sys.set_vmx(1, true);
+    m.sys.hang(1, false);
+    let generation = m.sys.member(1).generation();
+    m.ok(0, kill(1));
+    m.run(dodos_abi::FENCE_NS + 100 * MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    let word = m.sys.role(IOMMU_ROLE);
+    assert!(
+        !word.failed() && word.holder() != 1,
+        "the role was taken over"
+    );
+    for z in [0, 2] {
+        assert_ne!(
+            m.sys.canonical().beacons[z].acked[1],
+            generation,
+            "node {z}"
         );
     }
 }
@@ -772,18 +809,13 @@ fn the_entrys_own_fault_goes_first_and_a_kept_breakpoint_fault_waits_behind_it()
     );
 }
 
-// CONTRACT-GAP 23 (D-146, kind 9 kept): the thread keeps one word, the DR6
-// value read, and word 3 is "the bits of the breakpoints and watchpoints
-// that hit". B0 to B3 of DR6 "may or may not be set if the breakpoint is
-// not enabled", so word 3 needs the control word; but a thread suspended
-// behind its entry's own fault can have its control word rewritten by
-// `thread_write_regs` before kind 9 is raised. Here breakpoint 0 hits, the
-// entry's undefined-instruction fault suspends the thread, another thread
-// clears its control word and resumes it: judged with the control word at
-// the raise, word 3 would name no breakpoint, in a fault that says one hit.
-// The model takes the careful reading, the breakpoints judged at the #DB.
+// D-147 (gap 23 of pass 28, settled): the kept word holds the enabled
+// breakpoints that hit, judged against the control word at the #DB, in
+// bits 32-35, beside the DR6 value. Breakpoint 0 hits, the entry's
+// undefined-instruction fault suspends the thread, another thread clears
+// its control word and resumes it: word 3 still names breakpoint 0.
 #[test]
-fn gap_23_word_3_of_a_kept_breakpoint_fault_is_judged_at_the_db() {
+fn word_3_of_a_kept_breakpoint_fault_is_judged_at_the_db() {
     let mut k = debugged();
     k.place_first(0);
     let other = k.thread_on(300, 0);
@@ -801,6 +833,28 @@ fn gap_23_word_3_of_a_kept_breakpoint_fault_is_judged_at_the_db() {
     assert_eq!(k.m.apply(other, resume), DONE);
     assert_eq!(k.m.check(), Ok(()));
     assert_eq!(breakpoint(&k), Some((B0, RESET | B0)));
+}
+
+// D-147: a thread also marked *no context* raises kind 8 first and keeps
+// its kind 9 until it is runnable with a context. A thread with no context
+// of its own, resumed, is marked as the release of a lend marks it, with a
+// kind 9 kept from a #DB at its last entry; at the end of the next event it
+// raises kind 8 (recorded: it has no fault endpoint) and keeps kind 9.
+#[test]
+fn a_thread_marked_no_context_raises_kind_8_first_and_keeps_kind_9() {
+    let mut k = debugged();
+    let passive = super::checker::idle_thread(&mut k);
+    k.ok(Syscall::ThreadResume(s(300)));
+    let thread = k.m.threads.get_mut(&passive).unwrap();
+    thread.lost = true;
+    thread.debug_kept = Some(1 << 32 | (RESET | B0));
+    k.ok(Syscall::Yield);
+    let recorded = k.m.threads[&passive].recorded.map(|(kind, _)| kind);
+    assert_eq!(recorded, Some(dodos_abi::FaultKind::NoContext as u32));
+    assert!(
+        k.m.threads[&passive].debug_kept.is_some(),
+        "kind 9 raised first"
+    );
 }
 
 // At CPL3 too the handler loads DR6's reset value: a hardware breakpoint of

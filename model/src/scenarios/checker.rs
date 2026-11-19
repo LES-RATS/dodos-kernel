@@ -30,7 +30,7 @@ fn machine_reported(m: &S, message: &str) {
 
 /// A thread of the node with no context, configured and resumed: it can be
 /// said to wait without its context leaving a queue.
-fn idle_thread(k: &mut N) -> crate::ObjId {
+pub(super) fn idle_thread(k: &mut N) -> crate::ObjId {
     k.ok(k.retype(ObjectKind::Thread, 0, 300));
     k.ok(Syscall::ThreadConfigure {
         thread: s(300),
@@ -1088,7 +1088,7 @@ fn a_unit_role_held_by_a_starting_node_is_reported() {
 fn a_runnable_thread_that_keeps_a_breakpoint_fault_is_reported() {
     let mut k = node2();
     let thread = k.t;
-    k.m.threads.get_mut(&thread).unwrap().debug_kept = Some((1, 0xFFFF_0FF1));
+    k.m.threads.get_mut(&thread).unwrap().debug_kept = Some(1 << 32 | 0xFFFF_0FF1);
     reported(
         &k,
         "KIND 9: a runnable thread keeps a breakpoint fault after an event",

@@ -83,8 +83,13 @@ impl Model {
                     // context), so its replenishment never runs (found by
                     // seed 329 of pass 23's long run).
                     let silent = self.cores.get(sched.core).is_some_and(|c| c.silent);
+                    // A replenishment on a sleeping core is taken at its
+                    // wake, up to the state's exit latency late (Idle).
+                    let late = self.cores.get(sched.core).map_or(0, |c| c.asleep);
+                    let due =
+                        |at: u64| at > self.now || late > 0 && at.saturating_add(late) >= self.now;
                     let throttled =
-                        silent || dying || sched.throttled.is_some_and(|(at, _)| at > self.now);
+                        silent || dying || sched.throttled.is_some_and(|(at, _)| due(at));
                     valid((sched.budget, sched.period))
                         && sched.pending.is_none_or(valid)
                         && sched.class <= 2
