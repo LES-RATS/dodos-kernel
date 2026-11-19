@@ -21,6 +21,8 @@ pub(crate) const DEVICES: u16 = 3;
 pub(crate) const VECTORS: usize = 2;
 /// The largest *k* of an `its_table` (2^*k* pages).
 pub(crate) const ITS_K_MAX: u8 = 4;
+/// Event identifiers an ITS table page holds in the small machine.
+pub(crate) const ITS_EVENTS_PER_PAGE: u64 = 2;
 
 /// A remapping handle: (physical core, vector).
 pub(crate) type Handle = (usize, usize);
@@ -428,13 +430,29 @@ impl Machine {
     /// `its_table`: the identifier word names the node; every page of the
     /// object *ITS table* with bits 6-7 0, written 1; the ITS word 0 →
     /// *pinned*; the ITS mapping asked of the holder.
-    pub(crate) fn its_claim(&mut self, n: u16, device: u16, first: Page, entry: usize) -> Gated {
+    ///
+    /// A later claim of an LPI of the device writes nothing: it is
+    /// `invalid` if it names another object than the one pinned, or an
+    /// event identifier beyond the object's 2^*k* pages.
+    pub(crate) fn its_claim(
+        &mut self,
+        n: u16,
+        device: u16,
+        first: Page,
+        event: u32,
+        entry: usize,
+    ) -> Gated {
         self.unit_writes(n)?;
         require(device < DEVICES && !self.unit.failed)?;
         require(self.dev.ids[usize::from(device)] == Some((n, self.generation(n))))?;
-        require(self.dev.its[usize::from(device)].0 == Bound::Zero)?;
+        let fits = |k: u8| u64::from(event) < (1u64 << k) * ITS_EVENTS_PER_PAGE;
+        let (state, table, k) = self.dev.its[usize::from(device)];
+        if state != Bound::Zero {
+            return require(table == first && fits(k));
+        }
         require(!self.device_request_open(n, device, true))?;
         let k = *self.dev.its_objects.get(&first).ok_or(Refused::Condition)?;
+        require(fits(k))?;
         for page in run(first, k) {
             require(self.holds(n, page))?;
             require(self.gate.classes[page as usize] == Class::ItsTable { pinned: false })?;

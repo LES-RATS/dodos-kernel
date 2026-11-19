@@ -28,6 +28,7 @@ pub(crate) mod events;
 pub(crate) mod faulty;
 pub(crate) mod grants;
 pub(crate) mod parks;
+pub(crate) mod ports;
 pub(crate) mod suspend;
 pub(crate) mod unit;
 
@@ -365,6 +366,8 @@ pub(crate) struct Machine {
     pub(crate) grants: grants::GrantGate,
     /// The device side's words and the unit's other caches.
     pub(crate) dev: devices::DeviceGate,
+    /// Device and port entries (x86-64 ports).
+    pub(crate) ports: ports::PortGate,
     /// Memory reused since a translation could reach it: a page given
     /// away or turned into a table (for the checker).
     pub(crate) chunks: u64,
@@ -452,6 +455,7 @@ impl Machine {
             parks: parks::ParkGate::new(nodes, cores),
             grants: grants::GrantGate::new(nodes),
             dev: devices::DeviceGate::new(nodes),
+            ports: ports::PortGate::new(),
             chunks,
         }
     }

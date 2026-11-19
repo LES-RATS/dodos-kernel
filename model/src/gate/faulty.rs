@@ -166,6 +166,7 @@ pub(crate) enum Op {
         n: u16,
         device: u16,
         first: Page,
+        event: u32,
         entry: usize,
     },
     ItsUnmap {
@@ -187,6 +188,29 @@ pub(crate) enum Op {
         core: usize,
         v: usize,
         entry: usize,
+    },
+    TakeEntry {
+        n: u16,
+        entry: usize,
+    },
+    GiveEntry {
+        n: u16,
+        entry: usize,
+    },
+    SplitEntry {
+        n: u16,
+        entry: usize,
+    },
+    DeviceLookup {
+        n: u16,
+        entry: usize,
+    },
+    PortIo {
+        n: u16,
+        port: u16,
+    },
+    Spurious {
+        intid: u32,
     },
     /// Death's steps, by the fence's driver and the unit's holder.
     Fence {
@@ -354,12 +378,19 @@ impl Machine {
                 n,
                 device,
                 first,
+                event,
                 entry,
-            } => self.its_claim(n, device, first, entry),
+            } => self.its_claim(n, device, first, event, entry),
             Op::ItsUnmap { n, device, entry } => self.its_unmap(n, device, entry),
             Op::ItsDestroy { n, first } => self.its_destroy(n, first),
             Op::ClaimMsi { n, core, v } => self.claim_msi(n, core, v),
             Op::RemoveMsi { n, core, v, entry } => self.remove_msi(n, core, v, entry),
+            Op::TakeEntry { n, entry } => self.take_entry(n, entry),
+            Op::GiveEntry { n, entry } => self.give_entry(n, entry),
+            Op::SplitEntry { n, entry } => self.split_entry(n, entry),
+            Op::DeviceLookup { n, entry } => self.device_lookup(n, entry),
+            Op::PortIo { n, port } => self.port_io(n, port),
+            Op::Spurious { intid } => self.arrival_spurious(intid),
             Op::Fence { n } => self.fence(n),
             Op::TakeOver { s } => self.take_over(s),
             Op::R1Start { h, x } => self.r1_start(h, x),
@@ -661,6 +692,20 @@ impl Machine {
                         n: dead[rng.below(dead.len() as u64) as usize],
                     };
                 }
+                if rng.below(4) == 0 {
+                    let entry = rng.below(self.ports.entries.len() as u64 + 1) as usize;
+                    let port = ports::PORTS[rng.below(ports::PORTS.len() as u64) as usize];
+                    return match rng.below(6) {
+                        0 => Op::TakeEntry { n, entry },
+                        1 => Op::GiveEntry { n, entry },
+                        2 => Op::SplitEntry { n, entry },
+                        3 => Op::DeviceLookup { n, entry },
+                        4 => Op::PortIo { n, port },
+                        _ => Op::Spurious {
+                            intid: 1018 + rng.below(8) as u32,
+                        },
+                    };
+                }
                 match rng.below(12) {
                     0 => Op::ItsRetype {
                         n,
@@ -671,6 +716,7 @@ impl Machine {
                         n,
                         device,
                         first,
+                        event: rng.below(6) as u32,
                         entry,
                     },
                     2 => Op::ItsUnmap { n, device, entry },

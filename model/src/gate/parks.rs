@@ -85,6 +85,12 @@ impl Machine {
         Ok(())
     }
 
+    /// The arrival call reading an INTID of 1020 to 1023 (spurious, or a
+    /// special INTID): the call ends with nothing written.
+    pub(crate) fn arrival_spurious(&mut self, intid: u32) -> Gated {
+        require((1020..=1023).contains(&intid))
+    }
+
     /// The drop bit 1 → 0: `irq_ack` or an arming bind, which writes
     /// `ICC_DIR_EL1` for that SPI; the line word names the node with its
     /// generation.

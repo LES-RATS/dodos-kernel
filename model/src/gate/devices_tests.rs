@@ -146,6 +146,7 @@ fn its_mapped(old: OldRules) -> Machine {
                 n: 1,
                 device: 1,
                 first: 12,
+                event: 0,
                 entry: 1,
             },
         ],
@@ -210,6 +211,7 @@ fn the_holder_serves_an_its_unmapping_only_after_the_mapping() {
                     n: 1,
                     device: 1,
                     first: 12,
+                    event: 0,
                     entry: 1,
                 },
                 Op::ItsUnmap {
@@ -502,5 +504,58 @@ fn a_stale_free_list_link_is_never_followed() {
         }),
         Err(Refused::Cas),
         "a data page hooked through the link"
+    );
+}
+
+// D-152 item 7, the ports: an `in` or `out` only on a port whose entry the
+// caller's node holds (bit 7 set, the port in it), a port of no entry only
+// for the holder of `platform`; a port entry never split, never matched by
+// the mapping lookup. A dead generation's entry is taken again by rule 3.
+#[test]
+fn ports_are_executed_only_for_the_holder_of_their_entry() {
+    let mut m = Machine::new(2, 2, 8);
+    steps(&mut m, &[Op::TakeEntry { n: 1, entry: 1 }]).expect("taken");
+    assert_eq!(
+        m.step(&Op::PortIo { n: 0, port: 0x60 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.step(&Op::PortIo { n: 1, port: 0x64 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.step(&Op::PortIo { n: 1, port: 0x80 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.step(&Op::SplitEntry { n: 1, entry: 1 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.step(&Op::DeviceLookup { n: 1, entry: 1 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.step(&Op::TakeEntry { n: 0, entry: 1 }),
+        Err(Refused::Condition)
+    );
+    steps(
+        &mut m,
+        &[
+            Op::PortIo { n: 1, port: 0x63 },
+            Op::PortIo { n: 0, port: 0x80 },
+            Op::TakeEntry { n: 0, entry: 0 },
+            Op::SplitEntry { n: 0, entry: 0 },
+            Op::DeviceLookup { n: 0, entry: 4 },
+            Op::Death { n: 1 },
+            Op::TakeEntry { n: 0, entry: 1 },
+            Op::PortIo { n: 0, port: 0x61 },
+            Op::Spurious { intid: 1023 },
+        ],
+    )
+    .expect("the tables");
+    assert_eq!(
+        m.step(&Op::Spurious { intid: 1019 }),
+        Err(Refused::Condition)
     );
 }

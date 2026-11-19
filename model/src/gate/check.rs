@@ -23,6 +23,7 @@ impl Machine {
         self.check_reach()?;
         self.check_device_reach()?;
         self.check_devices()?;
+        self.check_ports()?;
         self.check_parks()
     }
 
