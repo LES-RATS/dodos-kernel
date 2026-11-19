@@ -32,7 +32,12 @@ impl System {
         )?;
         // A node that is accused runs nothing, and its memory is being
         // reclaimed: its kernel's state is not judged against the table.
-        for (slot, model) in self.models().filter(|(slot, _)| self.running_node(*slot)) {
+        // A faulty kernel's own state is not judged: only what it does to
+        // the others (the rules below).
+        for (slot, model) in self
+            .models()
+            .filter(|(slot, _)| self.running_node(*slot) && !self.faulty.contains(slot))
+        {
             model.check().map_err(|e| format!("node {slot}: {e}"))?;
         }
         if self.models().next().is_none() {
@@ -60,7 +65,8 @@ impl System {
         self.check_counts()?;
         self.check_grants()?;
         self.check_rings()?;
-        self.check_units()
+        self.check_units()?;
+        self.check_r6_proof()
     }
 
     /// Node slots and core words: "a core executes node N only while its
@@ -419,6 +425,38 @@ impl System {
     /// the event, a core marked was raised before, and a core both marked
     /// and stopped was marked before it was stopped. The state after the
     /// event cannot tell the orders apart (the eighth model review).
+    /// G15, R6's proof (D-149): a dead generation's grant entries and
+    /// attach words were freed only once no grantee's use entry counted a
+    /// leaf under them and no attach word beside its identifiers read
+    /// *attached*, whatever `acked` and `maps_of` said.
+    fn check_r6_proof(&self) -> Check {
+        let table = self.canonical();
+        for x in 0..table.nodes {
+            let member = table.member(x);
+            if member.state() != MemberState::Dead {
+                continue;
+            }
+            let g = member.generation();
+            let counted = table
+                .uses
+                .iter()
+                .flat_map(|u| u.values())
+                .any(|u| u.granter == x && u.generation == g && u.leaves > 0);
+            ensure(
+                !counted,
+                "R6: a dead generation's grant still counted by its grantee",
+            )?;
+            let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(x), g).raw();
+            let attached = table.attach.iter().any(|(key, &raw)| {
+                table.identifiers.get(key) == Some(&taken)
+                    && dodos_abi::AttachWord::from_raw(raw).and_then(dodos_abi::AttachWord::state)
+                        == Some(dodos_abi::AttachState::Attached)
+            });
+            ensure(!attached, "R6: a dead generation's device still attached")?;
+        }
+        Ok(())
+    }
+
     /// The fence sends its stop again once per round to every core not
     /// yet confirmed (ARM64, D-143; the RISC-V cooperative fence, D-146):
     /// while a live driver whose first core runs fences a node, no

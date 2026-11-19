@@ -126,6 +126,12 @@ pub struct System {
     pub(crate) park_went_back: bool,
     /// The cores whose firmware refuses a park (a test's input).
     refusing: std::collections::BTreeSet<usize>,
+    /// The nodes whose kernel is faulty (a test's input): arbitrary code at
+    /// kernel privilege, writing any word its kernel view maps writable and
+    /// skipping any step of its own kernel. The checker holds no invariant
+    /// of that kernel's own state against it, only the machine's: what it
+    /// can do to the others.
+    pub(crate) faulty: std::collections::BTreeSet<u16>,
     /// ARM64: `parked` written for a core whose word carried no fence mark
     /// (D-147: only at a fence).
     pub(crate) parked_unfenced: bool,
@@ -181,6 +187,7 @@ impl System {
             sent: Vec::new(),
             park_went_back: false,
             refusing: Default::default(),
+            faulty: Default::default(),
             parked_unfenced: false,
             in_service: vec![false; machine.cores.len()],
             now: 0,
@@ -1013,6 +1020,11 @@ impl System {
             Arch::Riscv64 if self.refusing.contains(&core) => self.refused(core),
             Arch::Riscv64 => self.off_unanswered(core),
         }
+    }
+
+    /// Node `node`'s kernel becomes faulty (a test's input).
+    pub fn make_faulty(&mut self, node: u16) {
+        self.faulty.insert(node);
     }
 
     /// The firmware refuses a park (a test's input): ARM64 `CPU_OFF`

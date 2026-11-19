@@ -21,7 +21,7 @@ const GOT_OTHER: u32 = 120;
 const BLOCK: u32 = 160;
 /// The granting node, the holder, and the third node, which holds the
 /// IOMMU unit's role.
-const X: u16 = 0;
+pub(super) const X: u16 = 0;
 pub(super) const Y: u16 = 2;
 pub(super) const THIRD: u16 = 1;
 
@@ -331,7 +331,7 @@ fn the_gate_refuses_a_leaf_under_a_use_entry_with_no_root() {
 
 /// The granting node killed by the third node once the holder's unit failed (or
 /// not): time for the fence, the reclaim and the barrier.
-fn granter_killed(fail: bool) -> Granted {
+pub(super) fn granter_killed(fail: bool) -> Granted {
     let mut g = granted(false);
     let map = io_map(&g.m, GOT);
     g.m.ok(Y, map);

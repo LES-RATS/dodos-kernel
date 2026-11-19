@@ -1176,6 +1176,70 @@ fn a_core_resumed_without_an_init_clears_its_in_service_bits_first() {
     assert!(!m.sys.in_service[1]);
 }
 
+// D-149, item 1, driven by a faulty node: the reclaim barrier is the
+// signal, R6 the proof. Node 0 grants node 2 a frame that node 2 maps in
+// an iospace behind the IOMMU unit; the unit fails and node 2's removal of
+// the frame leaves its use entry counting a leaf (D-142); node 0 is killed.
+// Node 2, faulty, writes `acked` of node 0 and clears `maps_of` though its
+// R2 is undone: the barrier holds, but R6 finds node 2's use entry still
+// counting a leaf under node 0's grant and stops: node 0 never dies and its
+// chunk is never reused while the unit may still translate to it.
+#[test]
+fn a_faulty_nodes_early_acknowledgement_lets_no_memory_it_translates_be_reused() {
+    use super::pass24::{X, Y, granter_killed};
+    let mut g = granter_killed(true);
+    assert_eq!(g.m.state(X), MemberState::Fenced);
+    let generation = g.m.sys.member(X).generation();
+    // The faulty node's own beacon, a word its kernel writes.
+    g.m.sys.make_faulty(Y);
+    let beacon = &mut g.m.sys.node_mut(Y).table.beacons[Y as usize];
+    beacon.acked[X as usize] = generation;
+    beacon.maps_of[X as usize] = false;
+    let _ = g.m.call(Y, Syscall::Yield);
+    g.m.run(500 * MS);
+    assert_eq!(
+        g.m.state(X),
+        MemberState::Fenced,
+        "the early acknowledgement let node 0 die"
+    );
+    let word =
+        dodos_abi::Ownership::from_raw(g.m.sys.canonical().owners[g.chunk as usize]).unwrap();
+    assert_eq!(word.generation(), generation, "the chunk was reused");
+}
+
+// D-149, item 2, driven by a faulty holder: R1's gate writes an attach
+// word *detached* only at the unit's confirmation, and R6 clears an attach
+// word only if it does not read *attached*. Node `n` has a device attached
+// behind the IOMMU unit, which stops confirming; `n` is killed. The holder,
+// faulty, acknowledges `n` before its R1 is confirmed: the attach word still
+// reads attached, R6 stops, and `n` never dies, so its memory is not reused
+// while the device may still reach it.
+#[test]
+fn a_faulty_holders_early_acknowledgement_lets_no_device_reach_reused_memory() {
+    use super::units::{IOMMU_ROLE, attached, three};
+    let mut m = three();
+    let holder = m.sys.role(IOMMU_ROLE).holder();
+    let n = (1..3).find(|&n| n != holder).unwrap();
+    let killer = (0..3).find(|&k| k != holder && k != n).unwrap_or(holder);
+    attached(&mut m, n);
+    m.sys
+        .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
+    let generation = m.sys.member(n).generation();
+    m.ok(killer, kill(n));
+    m.run(30 * MS);
+    m.sys.make_faulty(holder);
+    let beacon = &mut m.sys.node_mut(holder).table.beacons[holder as usize];
+    beacon.acked[n as usize] = generation;
+    beacon.maps_of[n as usize] = false;
+    let _ = m.call(holder, Syscall::Yield);
+    m.run(300 * MS);
+    assert_ne!(
+        m.state(n),
+        MemberState::Dead,
+        "the early acknowledgement let the node die"
+    );
+}
+
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 

@@ -70,6 +70,10 @@ pub(crate) struct Reclaim {
     /// context entry R1 cleared, or an attach word left *attached*. On a
     /// failed unit R1 stays undone for these alone (Reclaim, R1, D-140).
     pub(crate) devices: std::collections::BTreeSet<usize>,
+    /// The attach words R1 found *attached* behind each unit, by role:
+    /// their keys and roots, written *detached* by the holder's gate at
+    /// the unit's confirmation (D-149).
+    pub(crate) detach: std::collections::BTreeMap<usize, Vec<(u32, u64)>>,
     pub(crate) r3: bool,
     /// R4: the blocks still to audit, once begun.
     pub(crate) audit: Option<Vec<ObjId>>,
@@ -1155,6 +1159,7 @@ impl Model {
                 continue;
             }
             let device = self.had_device(role, node, generation);
+            let detach = self.attached_behind(role, node, generation);
             let unit = self.table.units.entry(role).or_default();
             unit.entries
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
@@ -1165,6 +1170,7 @@ impl Model {
             let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
             if let Some(reclaim) = self.reclaims.get_mut(&node) {
                 reclaim.r1.insert(role, Some(serial));
+                reclaim.detach.insert(role, detach);
                 if device {
                     reclaim.devices.insert(role);
                 }
@@ -1203,11 +1209,21 @@ impl Model {
             match serial {
                 None => {}
                 Some(serial) if !self.unit_failed(role) && self.confirmed(role, serial) => {
-                    self.reclaims
-                        .get_mut(&node)
-                        .expect("a reclaim")
-                        .r1
-                        .insert(role, None);
+                    let reclaim = self.reclaims.get_mut(&node).expect("a reclaim");
+                    reclaim.r1.insert(role, None);
+                    // At the unit's confirmation the holder's gate writes
+                    // *detached*, with its root, the attach word of each
+                    // device whose context entry R1 cleared (D-149).
+                    let detach = reclaim.detach.remove(&role).unwrap_or_default();
+                    for (key, root) in detach {
+                        let attached =
+                            dodos_abi::AttachWord::new(dodos_abi::AttachState::Attached, root);
+                        let detached =
+                            dodos_abi::AttachWord::new(dodos_abi::AttachState::Detached, root);
+                        if let (Some(attached), Some(detached)) = (attached, detached) {
+                            self.table.swap_attach(key, attached, detached);
+                        }
+                    }
                 }
                 // On a failed unit, R1 is done at once for a node that had
                 // no device behind it (Reclaim, R1, D-140).
@@ -1224,6 +1240,67 @@ impl Model {
             }
         }
         done
+    }
+
+    /// Whether a grant entry of `node` that is live, revoking or pinned is
+    /// still counted by its grantee: the use entry at the recorded index
+    /// names that grant and counts a leaf (D-149).
+    fn grant_still_counted(&self, node: u16, grant: u16) -> bool {
+        let Some(entry) = self.table.grants[node as usize].get(&grant) else {
+            return false;
+        };
+        let held = matches!(
+            entry.state,
+            crate::table::GrantState::Live
+                | crate::table::GrantState::Revoking
+                | crate::table::GrantState::Pinned
+        );
+        let Some(index) = entry.use_index.filter(|_| held) else {
+            return false;
+        };
+        self.table.uses[entry.grantee as usize]
+            .get(&index)
+            .is_some_and(|u| {
+                u.granter == node && u.grant == grant && u.serial == entry.serial && u.leaves > 0
+            })
+    }
+
+    /// What holds R6 back for `node`'s generation `g` (D-149).
+    pub(crate) fn r6_held_back(&self, node: u16, g: u32) -> bool {
+        let counted = self.table.grants[node as usize]
+            .keys()
+            .any(|&grant| self.grant_still_counted(node, grant));
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), g).raw();
+        let attached = self.table.attach.iter().any(|(key, &raw)| {
+            self.table.identifiers.get(key) == Some(&taken)
+                && dodos_abi::AttachWord::from_raw(raw).and_then(dodos_abi::AttachWord::state)
+                    == Some(dodos_abi::AttachState::Attached)
+        });
+        counted || attached
+    }
+
+    /// The attach words beside identifier words `node`'s generation took,
+    /// in the segment the unit of `role` serves, that read *attached*:
+    /// their keys and roots.
+    fn attached_behind(&self, role: usize, node: u16, generation: u32) -> Vec<(u32, u64)> {
+        let record = self.table.role_records[role];
+        if record.governs != dodos_abi::Governs::IommuUnit {
+            return Vec::new();
+        }
+        let segment = u32::from(self.machine.iommus[usize::from(record.object)].segment);
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation).raw();
+        self.table
+            .attach
+            .iter()
+            .filter(|&(&key, _)| {
+                key >> 16 == segment && self.table.identifiers.get(&key) == Some(&taken)
+            })
+            .filter_map(|(&key, &raw)| {
+                let word = dodos_abi::AttachWord::from_raw(raw)?;
+                (word.state() == Some(dodos_abi::AttachState::Attached))
+                    .then_some((key, word.root()))
+            })
+            .collect()
     }
 
     /// Whether `node`'s generation had a device behind the unit of `role`:
@@ -1496,6 +1573,13 @@ impl Model {
             .unwrap_or_default();
         let mut any = false;
         let shift = self.table.geometry.chunk_shift();
+        // R6's proof, before the walk clears anything (D-149): no grant
+        // entry of the dead generation that a grantee's use entry still
+        // counts a leaf under, and no attach word beside an identifier word
+        // it took that reads *attached*; either one stops the walk.
+        if cursor.phase <= 3 && self.r6_held_back(node, g) {
+            return false;
+        }
         while *units > 0 {
             let before = any;
             *units -= 1;
@@ -1557,6 +1641,17 @@ impl Model {
                 // Its grant entries: free, the serial grows.
                 2 => {
                     let next = self.table.grants[node as usize].keys().next().copied();
+                    // R6's proof (D-149): an entry is freed only once the
+                    // grantee's use entry at the recorded index counts no
+                    // leaf or no longer names the grant; otherwise the walk
+                    // stops (a failed unit's kept count stops it for good).
+                    // `acked` and `maps_of` only started the walk.
+                    if let Some(grant) = next
+                        && self.grant_still_counted(node, grant)
+                    {
+                        self.reclaims.get_mut(&node).expect("a reclaim").clear = Some(cursor);
+                        return any;
+                    }
                     match next {
                         Some(grant) => {
                             let entry = self.table.grants[node as usize]
@@ -1600,6 +1695,18 @@ impl Model {
                                 .iter()
                                 .find(|(_, e)| e.node == node && e.generation == g)
                                 .map(|(&h, e)| (h, e.units.clone()));
+                            // An attach word that reads *attached* stops the
+                            // walk: R1's gate has not written it detached
+                            // (D-149).
+                            let still = attached.is_some_and(|key| {
+                                self.table.attach_word(key).state()
+                                    == Some(dodos_abi::AttachState::Attached)
+                            });
+                            if still {
+                                self.reclaims.get_mut(&node).expect("a reclaim").clear =
+                                    Some(cursor);
+                                return any;
+                            }
                             match (attached, entry) {
                                 (Some(key), _) => {
                                     self.table.attach.remove(&key);

@@ -1197,3 +1197,26 @@ fn a_core_running_with_an_in_service_bit_of_its_last_node_is_reported() {
         "ISR: a core runs a node with an in-service bit from its last one",
     );
 }
+
+// D-149: a dead generation whose device's attach word still reads
+// attached (R6 cleared it before R1's gate wrote it detached). The nodes'
+// own states are not judged here (the spoiled words are no kernel's).
+#[test]
+fn a_dead_generations_device_still_attached_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let g = m.sys.member(1).generation();
+    m.ok(0, super::pass17::kill(1));
+    m.run(100 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    for n in 0..3 {
+        m.sys.make_faulty(n);
+    }
+    let key = 0x10;
+    m.sys.edit_table(|t| {
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(1), g).raw();
+        t.identifiers.insert(key, taken);
+        let word = dodos_abi::AttachWord::new(dodos_abi::AttachState::Attached, 0x1000).unwrap();
+        t.attach.insert(key, word.raw());
+    });
+    machine_reported(&m, "R6: a dead generation's device still attached");
+}
