@@ -458,8 +458,8 @@ impl Machine {
     /// or accepts an unfenced core, or keeps its cores of class 0 out of
     /// every node (The fence: D-116, D-117, D-149): a `BootNodes` layout
     /// that names one runs one node; the default layout leaves them out.
-    /// CONTRACT-GAP 24: the start-up's own passage still says a core of
-    /// class 0 makes the machine run one node; the model follows The fence.
+    /// (Gap 24 of pass 28, the start-up's passage that still said a core of
+    /// class 0 makes the machine run one node: settled by D-151.)
     fn single(&self) -> bool {
         let count = self.cores.len();
         let zero: Vec<usize> = (0..count).filter(|&c| self.class(c) == 0).collect();

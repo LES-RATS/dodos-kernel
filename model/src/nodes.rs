@@ -999,9 +999,9 @@ impl Model {
                 self.table.write_member(self.node, node, unfenced);
                 // ARM64: a core the fence leaves unconfirmed (a `DENIED`
                 // `CPU_OFF` among them) is marked unusable, as `node_stop`
-                // mode retire does (D-149). CONTRACT-GAP 25: the text names
-                // a DENIED core, which the driver cannot tell from another
-                // unconfirmed one; the model marks every one.
+                // mode retire does (D-149; gap 25 of pass 28, which cores:
+                // every unconfirmed one, D-151, on every architecture from
+                // pass 29).
                 if self.machine.arch == crate::Arch::Aarch64 {
                     for &core in &cores {
                         let raw = self.table.core_words[core];

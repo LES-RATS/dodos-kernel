@@ -194,11 +194,53 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
 - The checker: each of its 225 rules that go through `ensure`, switched
   off alone (its condition read as true), makes at least one test fail
   (pass 26's sweep of 224: 210 by a test of the checker, 14 by another
-  test of the library; pass 27's rule HANDED by its checker test); a check that cannot fail is deleted or says which
+  test of the library; pass 27's rule HANDED by its checker test; pass
+  28's new rules, 257 `ensure` calls in all, each by its own checker test,
+  the whole sweep not run again); a check that cannot fail is deleted or says which
   earlier rule shadows it, and the checker names an invariant for a value
   of the state it would index, never panics.
 - `verify` runs the tests that depend on the page on three geometries (4,
   16 and 32 KB pages); the explorations run once.
+
+## Pass 28 (D-143, D-146 to D-149)
+
+- Sleep that loses the context: `Suspending` and `Asleep`, the events
+  `Sleep`, `PowerDown`, `ShallowReturn` and `Wake`; the gate's reads of
+  the fence mark before a suspend, at a shallow return and at a wake
+  (ARM64), at every return (RISC-V); a timer of a sleeping core taken at
+  its wake, at most an exit latency late; the ARM64 fence and the RISC-V
+  cooperative fence in rounds of 11.2 ms; `node_idle` reading context loss
+  from the parameter, the PSCI format from `PSCI_FEATURES`.
+- The first thread runs before live; the combined exploration rotates
+  x86-64, ARM64 and RISC-V by round of the 286 triples, with a node of two
+  cores whose second start is held back, and probes a wake from sleep and
+  a first thread before live.
+- Interrupts: the APLIC as machine state (input, pending, enable,
+  `sourcecfg`, MSIs on their way), `clrienum` at an arrival, `setipnum`
+  then `setienum` at `irq_ack` and an arming bind, a rebuild that enables a
+  reported level source; no mask at arrival with a directed end of
+  interrupt, on ARM64 and RISC-V; a level line without one needs one node.
+- x86-64: a #DB at CPL0 is the start of its entry; each DR6 cause judged
+  alone; DR6 reset at CPL0 and CPL3; kind 9 kept in one word, raised before
+  any user instruction, after kind 8.
+- Membership and reclaim: observations stamped with the member word;
+  messages held for a fresh start sent once it no longer reads starting
+  fresh; `node_stop` only from a live or sealing node; acknowledgements by
+  R5 alone; R6's proof (no counted leaf, no attached device) and R1's
+  attach words written detached at the unit's confirmation.
+- The fence: INIT on x86-64 every round, the NMI confirming nothing,
+  `parked` and the firmware's answers read-only to node kernels; the
+  bootstrap core's class from `BootMembership`'s flags; parks through the
+  park routine on ARM64, `sbi_hart_stop` on RISC-V, a refused park never
+  confirmed; in-service bits cleared before a core runs a node it entered
+  without an INIT.
+- The grant count of D-148 in the gate word, held by G5 against a faulty
+  kernel's give and retype (`gate_give_chunk`, `gate_retype_page`);
+  `System::make_faulty` judges no faulty kernel's own state, only the
+  machine's rules.
+- Two model faults found by the long run: a node that had just written
+  sealed accused another in the same step (seed 867); a node starting
+  afresh accused another (seed 1434).
 
 ## Mutations shown equivalent
 
@@ -231,7 +273,11 @@ the reading implemented and the text proposed. The sixteen of pass 15
 since pass 16 (D-133), and each branch that applies one names the
 contract's sentence and "gap *n*". The four found in pass 25 (17 to 20)
 are settled by D-144, and gap 21, found in pass 26 (the seal of the
-holder of a failed unit's role never ended), by D-145. None is open. Two were settled otherwise than the
+holder of a failed unit's role never ended), by D-145. Pass 28 found
+three: gap 23 (word 3 of a kind 9 kept while a debugger rewrites the
+control word), settled by D-147; gap 24 (the start-up's passage on a core
+of class 0 against The fence) and gap 25 (which unconfirmed cores the
+fence marks unusable), both settled by D-151. None is open. Two were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the claim
 of an MSI asks every IOMMU unit of the source's segment, one after another
