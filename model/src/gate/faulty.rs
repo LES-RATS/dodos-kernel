@@ -447,6 +447,46 @@ impl Machine {
     }
 }
 
+impl Machine {
+    /// The next step a healthy holder and requester take on the first
+    /// record that is open or answered and not yet released.
+    fn healthy_holder_step(&self) -> Option<Op> {
+        let h = self.unit.holder;
+        for slot in 0..self.layout.len() as u16 {
+            for entry in 0..unit::UNIT_ENTRIES {
+                let record = self.unit.records[usize::from(slot)][entry];
+                let gate = &self.unit.gate_records[usize::from(slot)][entry];
+                if record.state != unit::RecordState::Open {
+                    if gate.is_some() && record.state != unit::RecordState::Void {
+                        return Some(Op::Release { n: slot, entry });
+                    }
+                    continue;
+                }
+                let service =
+                    self.unit.services.iter().position(|s| {
+                        s.slot == slot && s.entry == entry && s.serial == record.serial
+                    });
+                return Some(match service {
+                    None => Op::Accept { h, slot, entry },
+                    Some(i) => match self.unit.services[i].submission {
+                        None => Op::Submit { h },
+                        Some(id) if !self.unit.submissions[id].complete => Op::UnitCompletes {
+                            id: self
+                                .unit
+                                .submissions
+                                .iter()
+                                .position(|s| !s.complete)
+                                .unwrap_or(id),
+                        },
+                        Some(_) => Op::Answer { h, service: i },
+                    },
+                });
+            }
+        }
+        None
+    }
+}
+
 /// A small generator (xorshift).
 #[derive(Clone, Debug)]
 pub(crate) struct Rng(pub(crate) u64);
@@ -684,6 +724,19 @@ impl Machine {
                         _ => Op::R1Start { h, x },
                     };
                 }
+                // A quarter of the time, a healthy holder's next step on the
+                // first open or answered record, or a sealed node resumed.
+                if rng.below(4) == 0 {
+                    if let Some(sealed) = (0..nodes as u16)
+                        .find(|&x| self.gate.members[usize::from(x)].state == NodeState::Sealed)
+                        && rng.below(3) == 0
+                    {
+                        return Op::Resume { n: sealed };
+                    }
+                    if let Some(op) = self.healthy_holder_step() {
+                        return op;
+                    }
+                }
                 let dead: Vec<u16> = (0..nodes as u16)
                     .filter(|&x| self.gate.members[usize::from(x)].state == NodeState::Dead)
                     .collect();
@@ -719,7 +772,21 @@ impl Machine {
                         event: rng.below(6) as u32,
                         entry,
                     },
-                    2 => Op::ItsUnmap { n, device, entry },
+                    // Mostly a device whose ITS word is set, with a free
+                    // entry of the node.
+                    2 => {
+                        let set: Vec<u16> = (0..devices::DEVICES)
+                            .filter(|&d| self.dev.its[usize::from(d)].0 != devices::Bound::Zero)
+                            .collect();
+                        let device = match set.is_empty() || rng.below(4) == 0 {
+                            true => device,
+                            false => set[rng.below(set.len() as u64) as usize],
+                        };
+                        let entry = (0..unit::UNIT_ENTRIES)
+                            .find(|&e| self.unit.gate_records[usize::from(n)][e].is_none())
+                            .unwrap_or(entry);
+                        Op::ItsUnmap { n, device, entry }
+                    }
                     3 => Op::ItsDestroy { n, first },
                     4 => Op::ClaimMsi { n, core, v },
                     5 => Op::RemoveMsi { n, core, v, entry },
@@ -835,7 +902,13 @@ impl Machine {
                 0 => Op::Death { n },
                 1 => Op::Fresh { n },
                 2 => Op::Seal { n },
-                3 => Op::Resume { n },
+                // Mostly a sealed node, the one a resume can concern.
+                3 => Op::Resume {
+                    n: (0..nodes as u16)
+                        .find(|&x| self.gate.members[usize::from(x)].state == NodeState::Sealed)
+                        .filter(|_| rng.below(4) != 0)
+                        .unwrap_or(n),
+                },
                 _ => Op::Barrier { n, p },
             },
             14 if rng.below(2) == 0 => {
