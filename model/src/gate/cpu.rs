@@ -41,7 +41,8 @@ impl Machine {
     /// the node maps writable becomes one of its own tables (pass 29's seed
     /// 8, kept as a test).
     pub(super) fn unmapped(&self, page: Page) -> bool {
-        self.gate.map_counts[Self::chunk_of(page) as usize] == 0 && !self.giving(page)
+        let count = self.gate.map_counts[Self::chunk_of(page) as usize];
+        (count == 0 || self.old.class_change_ignores_map_count) && !self.giving(page)
     }
 
     /// While a request names a give or a destruction of a chunk, every
@@ -50,6 +51,9 @@ impl Machine {
     /// the completion gives a chunk that holds a root (pass 29's seeds 75
     /// and 151, kept as tests).
     pub(super) fn giving(&self, page: Page) -> bool {
+        if self.old.counts_free_during_give {
+            return false;
+        }
         let chunk = Self::chunk_of(page);
         self.gate.nodes.iter().flat_map(|n| &n.requests).any(|r| {
             matches!(r, Request::InUse { what: Invalidates::KernelRun { chunk: c, .. }, .. } if *c == chunk)
@@ -248,6 +252,9 @@ impl Machine {
     /// The caller's own invalidation in a clearing call (Gate words, a
     /// core's invalidation request, row *free* → *in use*; D-153, gap 26).
     fn invalidate_here(&mut self, n: u16, p: usize, what: &Flush) {
+        if self.old.no_own_invalidation {
+            return;
+        }
         let core = self.core(n, p);
         self.invalidate(core, what.clone());
     }
@@ -574,6 +581,10 @@ impl Machine {
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
         let core = self.core(n, p);
         let mut asked: BTreeSet<usize> = self.gate.nodes[usize::from(n)].tags[tag].set.clone();
+        if self.old.unbind_skips_idle {
+            let idle = &self.gate.nodes[usize::from(n)].idle;
+            asked.retain(|&q| !idle[q].idle);
+        }
         if asked.remove(&p) {
             self.invalidate(core, Flush::Tag(tag));
             if self.gate.nodes[usize::from(n)].loaded[p].1 != tag {

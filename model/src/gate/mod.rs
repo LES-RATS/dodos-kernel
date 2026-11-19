@@ -326,6 +326,18 @@ pub(crate) struct OldRules {
     /// (`acked`, which a faulty node may write early), not on the use
     /// counts (D-149).
     pub(crate) r6_frees_on_acked: bool,
+    /// The clearing call leaving its own core's caches alone (the reading
+    /// before D-153, gap 26).
+    pub(crate) no_own_invalidation: bool,
+    /// An unbind asking only the cores of the tag's set that are not idle
+    /// (the reading before D-153, gap 27).
+    pub(crate) unbind_skips_idle: bool,
+    /// A page leaving *data* with its chunk's map count unread (the reading
+    /// before D-153, gap 28).
+    pub(crate) class_change_ignores_map_count: bool,
+    /// A chunk's counts left free between a give's call and its completion
+    /// (the reading before D-153, gap 30).
+    pub(crate) counts_free_during_give: bool,
     /// R1's invalidation of the interrupt entry cache covering only the
     /// handles the walk found present (the reading before D-153, gap 32).
     pub(crate) r1_present_handles_only: bool,
@@ -594,6 +606,8 @@ pub(crate) enum Flush {
 
 #[cfg(test)]
 mod devices_tests;
+#[cfg(test)]
+mod settled_tests;
 #[cfg(test)]
 mod suspend_tests;
 #[cfg(test)]
