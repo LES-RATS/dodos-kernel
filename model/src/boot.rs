@@ -1681,17 +1681,11 @@ impl Model {
         // table-floor untyped pays for them, and its watermark stands after
         // them; a table floor that does not hold them is a refusal (D-154).
         //
-        // CONTRACT-GAP 48 (Start-up state, rule 7, and Address spaces and
-        // their tables, the start-up aspace: "created from no untyped", yet
-        // "the first table-floor untyped pays for the start-up aspace's
-        // root, tables and reserve of free tables; its watermark stands
-        // after them"): the contract does not say whether these pages are
-        // live pieces of that untyped, nor what its watermark does when the
-        // start-up aspace is destroyed. The reading here: they are live
-        // pieces for the life of the node, never given back, so the
-        // watermark of the first table-floor untyped never returns to its
-        // start, and a first service that wants its table memory back
-        // takes table blocks (`memory_take` kind 2) instead.
+        // Start-up state, rule 7 (D-154, D-157, settling gap 48): those
+        // pages stay permanent live pieces of the first table-floor untyped
+        // for the life of the node, never returned to it even if the
+        // start-up aspace is destroyed, so its watermark never returns to
+        // its start.
         let hooked = hooked(&self.aspaces[&aspace], geometry.levels, geometry);
         let tables = hooked + machine.reserve_tables;
         let first_tables = *table_floor.first().ok_or(Refusal::Floors)?;

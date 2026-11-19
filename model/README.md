@@ -454,13 +454,14 @@ the gate word's table), 38 (a second request of a device while its first
 is open), 39 (`its_table`'s kind number). Pass 30's model of gap 29's
 split and merge found seven open points in the new cells (40 to 46, in
 `823e473`); D-154 closes them all by removing the split and the merge:
-tables live in dedicated table chunks (see Pass 31). Pass 31 found two:
-gap 47 (`abi/src/machine.rs`: what the tag table holds on RISC-V with
-`ASIDLEN = 0`, where the gate reserves no ASID; read as its one tag) and
-gap 48 (`model/src/boot.rs`: whether the start-up aspace's root and
-tables, which the first table-floor untyped "pays for", are live pieces
-of it, and what its watermark does if that aspace is destroyed; read as
-live pieces for the life of the node, so that watermark never returns). Two earlier gaps were settled otherwise than the
+tables live in dedicated table chunks (see Pass 31). Pass 31 found two,
+both settled by D-157 (no `CONTRACT-GAP` marker left):
+gap 47 (`abi/src/machine.rs`: on RISC-V with `ASIDLEN = 0`, where the
+gate reserves no ASID, the tag table holds its one tag, entry 0) and
+gap 48 (`model/src/boot.rs`: the start-up aspace's root and tables drawn
+from the first table-floor untyped stay permanent live pieces for the
+life of the node, so its watermark never returns); D-157 also records
+that D-156's two-pass sweep defers pinned roots per dying `cspace`. Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

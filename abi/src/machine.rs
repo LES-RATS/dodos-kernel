@@ -766,10 +766,9 @@ impl GateWord {
 /// one tag is reserved for the gate and bound to no root, and the table
 /// holds at most `TAGS_USABLE_MAX` (G7, D-152, D-155).
 ///
-/// CONTRACT-GAP 47 (G7, D-155): with `ASIDLEN = 0` on RISC-V the gate
-/// reserves no ASID ("a full `SFENCE.VMA` on every gate entry and exit"),
-/// and the contract does not say what the table then holds. The reading
-/// here: its one tag, 0, shared by every root.
+/// With `ASIDLEN = 0` on RISC-V the gate reserves no ASID (a full
+/// `SFENCE.VMA` on every gate entry and exit), and the table holds its one
+/// tag, 0, shared by every root (D-157, settling gap 47).
 pub const fn usable_tags(width: u32) -> u32 {
     if width == 0 {
         return 1;
