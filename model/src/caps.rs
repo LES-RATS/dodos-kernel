@@ -916,6 +916,8 @@ impl Model {
                         });
                         Sweep {
                             next: 1,
+                            first_deferred: None,
+                            pass2: false,
                             held: held.collect(),
                         }
                     });
@@ -945,9 +947,19 @@ impl Model {
     /// The first capability left in the capability space that `cap` is the
     /// root capability of, if `cap` is one.
     ///
-    /// The derivation tree: the dying space keeps the index where the sweep
-    /// stands, and a slot examined once is not examined again. A space may
-    /// hold its own root capability, which is removed last.
+    /// The derivation tree: a bounded sweep in two passes, at most twice the
+    /// slots of the space examined (D-156). The dying space keeps the index
+    /// where the sweep stands and the first slot it deferred. Pass 1 defers
+    /// a slot that holds the root capability of a table untyped which spaces
+    /// still name, and moves past it, so the spaces in the higher slots of
+    /// the same dying space are removed first; at the end of the space,
+    /// pass 2 resumes from the first deferred slot and defers nothing: a
+    /// table untyped that a space outside still names is `again` there. A
+    /// space may hold its own root capability, which is removed last.
+    ///
+    /// The root capability of an `its_table` whose ITS word is not 0 is
+    /// deferred the same way by the contract; this model keeps no ITS word
+    /// (the gate model does), so no `its_table` waits here.
     fn swept(&mut self, cap: CapId, slots: &mut usize) -> Swept {
         let space = self
             .rooted(cap)
@@ -959,19 +971,43 @@ impl Model {
         // The derivation tree: a slot counts as examined when the sweep
         // moves past it, so a full slot is not counted while its capability
         // is being removed. A step may end on the slot budget alone.
-        while let Some(&slot) = space.slots.get(sweep.next) {
-            match slot {
-                Slot::Full(held) if held != cap => return Swept::Holds(held),
-                Slot::Full(_) | Slot::Empty | Slot::Dead => {
-                    let Some(left) = slots.checked_sub(1) else {
-                        return Swept::OutOfBudget;
-                    };
-                    *slots = left;
-                    sweep.next += 1;
+        loop {
+            let Some(&slot) = space.slots.get(sweep.next) else {
+                match sweep.first_deferred.take() {
+                    Some(first) if !sweep.pass2 => {
+                        (sweep.pass2, sweep.next) = (true, first);
+                        continue;
+                    }
+                    _ => return Swept::Empty,
                 }
+            };
+            let deferred = match slot {
+                Slot::Full(held) if held != cap => {
+                    // A table untyped counts a child table untyped among
+                    // its live pieces, so a space that names a descendant
+                    // defers it too.
+                    let object = self.caps[&held].object;
+                    let pinned = self.objects[&object].root == held
+                        && self
+                            .untypeds
+                            .get(&object)
+                            .is_some_and(|untyped| untyped.table && untyped.live > untyped.lost);
+                    if sweep.pass2 || !pinned {
+                        return Swept::Holds(held);
+                    }
+                    true
+                }
+                Slot::Full(_) | Slot::Empty | Slot::Dead => false,
+            };
+            let Some(left) = slots.checked_sub(1) else {
+                return Swept::OutOfBudget;
+            };
+            *slots = left;
+            if deferred {
+                sweep.first_deferred.get_or_insert(sweep.next);
             }
+            sweep.next += 1;
         }
-        Swept::Empty
     }
 
     /// The object that `cap` is the root capability of, if it is one.
@@ -1213,11 +1249,15 @@ impl Model {
             self.frames.remove(&id);
             return self.remote_destroyed(id);
         }
+        // Whether a table untyped is destroyed with pieces lost behind a
+        // failed unit.
+        let mut held = false;
         match object.kind {
             // Destruction of a block: its words become free (D-114).
             ObjectKind::Untyped => {
                 self.free_block(id, crate::blocks::Freed::Destroyed);
-                self.untypeds.remove(&id);
+                let untyped = self.untypeds.remove(&id);
+                held = untyped.is_some_and(|untyped| untyped.lost > 0);
             }
             ObjectKind::CSpace => {
                 // Slots and addresses: its segments die with it. The one
@@ -1320,8 +1360,16 @@ impl Model {
             }
             _ => {}
         }
-        if let Some(untyped) = object.from {
-            self.release(untyped);
+        match object.from {
+            // The permanent hold of the pages a failed unit keeps is on the
+            // watermark of their table untyped and of its ancestors: a
+            // child destroyed with lost pieces stays a live piece of its
+            // parent, lost in its turn, so the parent waits for no one and
+            // no watermark above returns over those pages (Destruction of
+            // an address space, D-137, D-156).
+            Some(parent) if held => live(&mut self.untypeds, parent).lost += 1,
+            Some(untyped) => self.release(untyped),
+            None => {}
         }
     }
 }

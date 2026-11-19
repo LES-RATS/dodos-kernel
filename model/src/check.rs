@@ -212,7 +212,10 @@ impl Model {
     ///    all its slots;
     /// 27. a capability space keeps a sweep if and only if it is dying; the
     ///     sweep stands at slot 1 or after, within the table, and no slot
-    ///     before it is full, but for the root capability of the space.
+    ///     before it is full, but for the root capability of the space and,
+    ///     in pass 1, for the root capability of a table untyped in a slot
+    ///     from the first deferred one on; the first deferred slot is
+    ///     before the sweep in pass 1, and none is kept in pass 2 (D-156).
     ///
     /// Objects:
     /// 8. every capability names a live object;
@@ -567,7 +570,18 @@ impl Model {
                 };
                 ensure(deep_enough, "28: depth of what a space holds")?;
                 let swept = sweep.is_some_and(|sweep| index < sweep.next);
-                ensure(!swept || cap == root, "27: full slot behind the sweep")?;
+                // Pass 1 moves past the root capability of a table untyped
+                // that spaces still name; the spaces may be gone since.
+                let table_root = of.is_some_and(|of| of.root == cap)
+                    && self.untypeds.get(&held.object).is_some_and(|u| u.table);
+                let deferred = table_root
+                    && sweep.is_some_and(|sweep| {
+                        !sweep.pass2 && sweep.first_deferred.is_some_and(|first| first <= index)
+                    });
+                ensure(
+                    !swept || cap == root || deferred,
+                    "27: full slot behind the sweep",
+                )?;
                 let kept = sweep.is_none_or(|sweep| sweep.held.contains(&cap));
                 ensure(kept, "23: new capability in a dying space")?;
             }
@@ -578,6 +592,14 @@ impl Model {
             let slots = space.slots.len();
             let within = |sweep: &crate::Sweep| (1..=slots.max(1)).contains(&sweep.next);
             ensure(sweep.is_none_or(within), "27: index of the sweep")?;
+            let first = |sweep: &crate::Sweep| match sweep.first_deferred {
+                Some(first) => !sweep.pass2 && (1..sweep.next).contains(&first),
+                None => true,
+            };
+            ensure(
+                sweep.is_none_or(first),
+                "27: first deferred slot of the sweep",
+            )?;
             let whole = slots.is_multiple_of(CSPACE_SEGMENT_SLOTS as usize);
             ensure(whole && slots <= space.max as usize, "7: segments")?;
             let max = space.max != 0 && space.max.is_multiple_of(CSPACE_SEGMENT_SLOTS);

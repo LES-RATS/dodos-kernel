@@ -419,6 +419,11 @@ impl Model {
             let table_page =
                 (start / page..end.div_ceil(page)).any(|p| table.classes.contains_key(&p));
             ensure(!table_page, "58: translation to a table page")?;
+            // G3 (3): no leaf of a user space or of an iospace targets a
+            // table chunk, whatever the class of the page and whatever the
+            // chunk's map count says (D-156).
+            let table_chunk = chunks.clone().any(|c| table.table_chunk(c));
+            ensure(!table_chunk, "58: translation to a table chunk")?;
         }
         // Alone, the node's leaves are every leaf; on a machine of several
         // models, the others' count too, and `System::check` sums them. A

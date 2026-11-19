@@ -587,3 +587,218 @@ fn r6_retires_every_handle_of_a_dead_nodes_cores_once_a_unit_failed() {
     assert_eq!(handles(&m, 0) + handles(&m, 2), 0);
     assert_eq!(m.sys.check(), Ok(()));
 }
+
+// D-156, the review of pass 31.
+
+const INNER: u32 = 230;
+
+/// A slot of the capability space in `INNER`.
+fn via(index: u32) -> SlotAddr {
+    SlotAddr::through(INNER, index)
+}
+
+fn retype_at(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAddr) -> Syscall {
+    Syscall::UntypedRetype {
+        untyped,
+        kind,
+        size,
+        page: PageSize::Page as u64,
+        memory: 0,
+        destination,
+    }
+}
+
+/// `with_blocks`, and a capability space of 128 slots in `INNER` whose
+/// slot 5 holds the root capability of a child of the table block; the
+/// space.
+fn with_inner_tables() -> (N, u64, ObjId) {
+    let (mut k, tables, _) = with_blocks();
+    let page = k.m.geometry().page();
+    k.ok(retype_from(BLOCK, ObjectKind::CSpace, 128, INNER));
+    let grow = Syscall::CSpaceGrow {
+        cspace: s(INNER),
+        untyped: s(BLOCK),
+    };
+    assert_eq!(k.call(k.t, grow), Ok(Output::Slots(128)));
+    let child = retype_at(s(TABLES), ObjectKind::Untyped, 4 * page, via(5));
+    k.ok(child);
+    let inner = k.m.object_at(k.t, s(INNER)).expect("a cspace");
+    (k, tables, inner)
+}
+
+/// Deletes the capability in `slot` in at most 16 calls.
+fn deleted(k: &mut N, slot: u32) -> Outcome {
+    let mut outcome = Err(Error::Again);
+    for _ in 0..16 {
+        outcome = k.call(k.t, Syscall::CapDelete(s(slot)));
+        if outcome != Err(Error::Again) {
+            break;
+        }
+        k.interrupts();
+    }
+    outcome
+}
+
+// The bounded sweep in two passes: a dying `cspace` holds the root
+// capability of a table untyped in a slot below the `aspace` that names it.
+// Pass 1 defers the slot and removes the higher ones, the `aspace` among
+// them; pass 2 removes the table untyped (The derivation tree, D-156).
+#[test]
+fn a_dying_cspace_removes_a_space_above_the_table_untyped_it_names() {
+    let (mut k, tables, inner) = with_inner_tables();
+    k.ok(retype_at(
+        s(BLOCK),
+        ObjectKind::ASpace,
+        via(5).raw(),
+        via(9),
+    ));
+    // More capabilities than one call removes, above the deferred slot.
+    for index in 10..50 {
+        k.ok(retype_at(s(BLOCK), ObjectKind::Endpoint, 0, via(index)));
+    }
+    k.no(Syscall::CapDelete(s(INNER)), Error::Again);
+    // The call ended in pass 1, past the deferred slot, which is still
+    // full: the checker accepts it there (invariant 27).
+    let space = &k.m.cspaces[&inner];
+    let sweep = space.sweep.as_ref().expect("a dying space");
+    assert_eq!((sweep.first_deferred, sweep.pass2), (Some(5), false));
+    assert!(sweep.next > 9 && matches!(space.slots[5], crate::Slot::Full(_)));
+    assert_eq!(deleted(&mut k, INNER), DONE);
+    // Everything went back: the table block's watermark returned.
+    k.interrupts();
+    k.ok(aspace(TABLES, SPACE));
+    let shift = k.m.geometry().chunk_shift();
+    assert_eq!(k.m.root_table(k.t, s(SPACE)), Some(tables << shift));
+}
+
+// A space outside the dying `cspace` names the table untyped: pass 1 defers
+// its slot and removes the higher ones; pass 2 defers nothing and is
+// `again` on that slot until the space outside is destroyed.
+#[test]
+fn a_dying_cspace_waits_in_pass_2_for_a_space_outside_it() {
+    let (mut k, _, inner) = with_inner_tables();
+    k.ok(retype_at(
+        s(BLOCK),
+        ObjectKind::ASpace,
+        via(5).raw(),
+        s(SPACE),
+    ));
+    for index in [9, 10] {
+        k.ok(retype_at(s(BLOCK), ObjectKind::Endpoint, 0, via(index)));
+    }
+    for _ in 0..3 {
+        k.no(Syscall::CapDelete(s(INNER)), Error::Again);
+        let space = &k.m.cspaces[&inner];
+        let sweep = space.sweep.as_ref().expect("a dying space");
+        assert_eq!(
+            (sweep.next, sweep.first_deferred, sweep.pass2),
+            (5, None, true)
+        );
+        let full = |index: usize| matches!(space.slots[index], crate::Slot::Full(_));
+        assert!(full(5) && !full(9) && !full(10));
+    }
+    k.ok(Syscall::CapDelete(s(SPACE)));
+    k.interrupts();
+    assert_eq!(deleted(&mut k, INNER), DONE);
+}
+
+// A child table untyped destroyed with pieces lost behind a failed unit
+// stays a lost piece of its parent: each ancestor is deletable, and no
+// ancestor's watermark returns over the pages the unit keeps (Destruction
+// of an address space, D-137, D-156).
+#[test]
+fn a_table_untyped_destroyed_with_lost_pages_holds_the_watermarks_above_it() {
+    use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach, three};
+    let mut m = three();
+    let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    let floor = super::table_slot(m.sys.node(0), m.t[0]);
+    let page = m.sys.node(0).geometry().page();
+    // The table floor, then 160, 161 and 162, each a child of the last.
+    for (from, slot, pages) in [(floor, 160, 16), (160, 161, 8), (161, 162, 4)] {
+        m.ok(
+            0,
+            retype_from(from, ObjectKind::Untyped, pages * page, slot),
+        );
+    }
+    m.ok(
+        0,
+        retype_from(ut, ObjectKind::IoSpace, s(162).raw(), IOSPACE),
+    );
+    let call = attach(&m, 0, IOSPACE, DEVICE);
+    assert_eq!(m.call(0, call), WAITS);
+    m.run(30 * MS);
+    assert_eq!(m.woken(0), Some(&DONE));
+    let root = m
+        .sys
+        .node(0)
+        .root_table(m.t[0], s(IOSPACE))
+        .expect("a root");
+    m.sys.break_unit(IOMMU_ROLE);
+    let deleted = |m: &mut S, slot: u32| {
+        let mut outcome = Err(Error::Again);
+        for _ in 0..8 {
+            outcome = m.call(0, Syscall::CapDelete(s(slot)));
+            if outcome != Err(Error::Again) {
+                break;
+            }
+            m.run(10 * MS);
+        }
+        outcome
+    };
+    let mark = |m: &S, slot: u32| {
+        let node = m.sys.node(0);
+        node.untyped_marks(m.t[0], s(slot)).expect("an untyped").0
+    };
+    let lost = |m: &S, slot: u32| {
+        let node = m.sys.node(0);
+        node.untypeds[&node.object_at(m.t[0], s(slot)).expect("an untyped")].lost
+    };
+    // After a barrier, a retype from the untyped in `slot` lands above its
+    // watermark, which did not return: not over the root the unit keeps.
+    let held = |m: &mut S, slot: u32| {
+        m.run(30 * MS);
+        let before = mark(m, slot);
+        assert!(before > 0);
+        m.ok(0, retype_from(slot, ObjectKind::Untyped, page, 170));
+        assert_eq!(mark(m, slot), before + page, "slot {slot}");
+        m.ok(0, Syscall::CapDelete(s(170)));
+        m.run(30 * MS);
+        assert_eq!(mark(m, slot), before + page, "slot {slot}");
+    };
+    // The iospace is destroyed with its root attached: lost to 162.
+    assert_eq!(deleted(&mut m, IOSPACE), DONE);
+    assert_eq!(lost(&m, 162), 1);
+    assert_ne!(m.sys.node(0).page_class(root), PageClass::DATA);
+    let floor_lost = lost(&m, floor);
+    for (slot, parent) in [(162, 161), (161, 160), (160, floor)] {
+        // Deletable: its lost pieces are waited for by no one.
+        assert_eq!(deleted(&mut m, slot), DONE, "slot {slot}");
+        held(&mut m, parent);
+    }
+    assert_eq!(lost(&m, floor), floor_lost + 1);
+    assert_ne!(m.sys.node(0).page_class(root), PageClass::DATA);
+    assert_eq!(m.sys.check(), Ok(()));
+}
+
+// G6 in the kernel's own reading before a grant: a frame over a table
+// chunk the node holds, here a *data* page of its table floor that no
+// healthy retype makes a frame of, is `busy` at `node_send` (D-156).
+#[test]
+fn node_send_of_a_frame_over_a_table_chunk_is_busy() {
+    let (mut k, _, _) = with_blocks();
+    k.ok(retype_from(BLOCK, ObjectKind::Frame, 1, 211));
+    let send = Syscall::NodeSend {
+        node: node_cap(1),
+        message: crate::Message {
+            caps: vec![crate::Transfer::Derive(s(211), Rights::READ.bits())],
+            ..crate::Message::default()
+        },
+        doorbell: SlotAddr::NONE,
+    };
+    // Over its ordinary block, the gate's reading refuses nothing.
+    assert_ne!(k.m.clone().apply(k.t, send.clone()), Err(Error::Busy));
+    let frame = k.m.object_at(k.t, s(211)).expect("a frame");
+    let (_, end) = k.m.table_floor(0)[0];
+    crate::live(&mut k.m.frames, frame).base = end - k.m.geometry().page();
+    assert_eq!(k.m.apply(k.t, send), Err(Error::Busy));
+}

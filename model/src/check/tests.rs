@@ -635,7 +635,95 @@ fn dying_space(m: &mut Model, at: At, next: usize) {
     let root = m.objects[&at.space].root;
     live(&mut m.caps, root).dying = true;
     let held = m.caps.keys().copied().collect();
-    live(&mut m.cspaces, at.space).sweep = Some(Sweep { next, held });
+    live(&mut m.cspaces, at.space).sweep = Some(Sweep {
+        next,
+        first_deferred: None,
+        pass2: false,
+        held,
+    });
+}
+
+/// A dying capability space of 128 slots whose slot 5 holds the root
+/// capability of a child table untyped, with its sweep past it at slot 6.
+fn deferring_space(m: &mut Model, at: At, first_deferred: Option<usize>, pass2: bool) {
+    let inner = inner_space(m, at, 60);
+    let (&tables, _) = m.untypeds.iter().find(|(_, u)| u.table).expect("a floor");
+    let parent = m.objects[&tables].root;
+    let (rights, page) = (m.caps[&parent].rights, m.machine.geometry.page());
+    let place = Place {
+        space: inner,
+        index: 5,
+    };
+    let child = m.create(ObjectKind::Untyped, page, Some(parent), rights, place);
+    let child = m.caps[&child].object;
+    let parent = live(&mut m.untypeds, tables);
+    let base = parent.base + parent.watermark;
+    parent.watermark += page;
+    parent.live += 1;
+    live(&mut m.untypeds, child).base = base;
+    let root = m.objects[&inner].root;
+    live(&mut m.caps, root).dying = true;
+    let held = m.caps.keys().copied().collect();
+    live(&mut m.cspaces, inner).sweep = Some(Sweep {
+        next: 6,
+        first_deferred,
+        pass2,
+        held,
+    });
+}
+
+// The bounded sweep in two passes (D-156): pass 1 leaves behind it the root
+// capability of a table untyped, from the first deferred slot on; pass 2
+// leaves nothing.
+#[test]
+fn table_untyped_that_pass_1_deferred_stays_behind_the_sweep() {
+    let mut model = state();
+    let at = places(&model);
+    deferring_space(&mut model, at, Some(5), false);
+    assert_eq!(model.check(), Ok(()));
+}
+
+#[test]
+fn table_untyped_behind_the_sweep_that_no_pass_deferred_is_reported() {
+    let broken = spoiled(|m, at| deferring_space(m, at, None, false));
+    assert_eq!(broken, "27: full slot behind the sweep");
+    // Pass 2 defers nothing.
+    let broken = spoiled(|m, at| deferring_space(m, at, None, true));
+    assert_eq!(broken, "27: full slot behind the sweep");
+}
+
+#[test]
+fn deferred_slot_that_holds_no_table_untyped_is_reported() {
+    let broken = spoiled(|m, at| {
+        dying_space(m, at, EP as usize + 1);
+        let sweep = live(&mut m.cspaces, at.space).sweep.as_mut().unwrap();
+        sweep.first_deferred = Some(1);
+    });
+    assert_eq!(broken, "27: full slot behind the sweep");
+}
+
+#[test]
+fn first_deferred_slot_that_the_sweep_did_not_pass_is_reported() {
+    // Slot 0 is no slot of a sweep.
+    let broken = spoiled(|m, at| deferring_space(m, at, Some(0), false));
+    assert_eq!(broken, "27: first deferred slot of the sweep");
+    // An empty dying space whose sweep stands at slot 6: a first deferred
+    // slot at the sweep or after it, and one kept in pass 2.
+    let emptied = |first: usize, pass2: bool| {
+        spoiled(|m, at| {
+            let inner = inner_space(m, at, 60);
+            let root = m.objects[&inner].root;
+            live(&mut m.caps, root).dying = true;
+            live(&mut m.cspaces, inner).sweep = Some(Sweep {
+                next: 6,
+                first_deferred: Some(first),
+                pass2,
+                held: Vec::new(),
+            });
+        })
+    };
+    assert_eq!(emptied(6, false), "27: first deferred slot of the sweep");
+    assert_eq!(emptied(5, true), "27: first deferred slot of the sweep");
 }
 
 #[test]
@@ -694,6 +782,8 @@ fn sweep_that_stands_beyond_the_table_is_reported() {
         live(&mut m.caps, root).dying = true;
         let sweep = Sweep {
             next: 129,
+            first_deferred: None,
+            pass2: false,
             held: Vec::new(),
         };
         live(&mut m.cspaces, inner).sweep = Some(sweep);
@@ -2144,6 +2234,20 @@ fn translation_to_a_table_page_is_reported() {
         m.table.set_class(page, dodos_abi::PageClass::table(1));
     });
     assert_eq!(broken, "58: translation to a table page");
+}
+
+// G3 (3): a leaf toward a *data* page of a table chunk is reported by the
+// rule on targets itself, before any count is read (D-156).
+#[test]
+fn translation_to_a_data_page_of_a_table_chunk_is_reported() {
+    let broken = spoiled(|m, _| {
+        let page = m.machine.geometry.page();
+        let (_, end) = m.table.table_floors[m.node as usize][0];
+        assert!(!m.table.classes.contains_key(&(end / page - 1)));
+        let start = object(m, dodos_abi::START_SLOT_MESSAGE_PAGE);
+        live(&mut m.frames, start).base = end - page;
+    });
+    assert_eq!(broken, "58: translation to a table chunk");
 }
 
 #[test]

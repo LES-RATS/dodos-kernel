@@ -636,8 +636,14 @@ struct CSpace {
 #[derive(Clone, Debug, PartialEq)]
 struct Sweep {
     /// The index where the sweep stands: the slots before it were examined
-    /// and are not examined again.
+    /// and, within the pass, are not examined again.
     next: usize,
+    /// The first slot pass 1 deferred, the contract's 0 as `None`: it holds
+    /// the root capability of a table untyped that spaces still name, and
+    /// the higher slots are removed before it (D-156).
+    first_deferred: Option<usize>,
+    /// Whether the sweep is in its second pass, which defers nothing.
+    pass2: bool,
     /// The capabilities the space held when it began to die. Removal ends:
     /// a dying space only shrinks, so invariant 23 refuses any other.
     held: Vec<CapId>,

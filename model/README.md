@@ -392,6 +392,16 @@ order.
   vector (G10); a register write with `DR7.GD` is `invalid`.
 - The combined exploration's faulty node also asks its gate for a table in
   an ordinary chunk and for a leaf and an anchor toward its table floor.
+- The review of pass 31 against D-156 (four findings, each with its test
+  in `scenarios/pass31.rs` or `check/tests.rs`): the sweep of a dying
+  `cspace` runs in two bounded passes (`Sweep::first_deferred`, `pass2`;
+  pass 1 defers the root capability of a table untyped that spaces still
+  name, invariant 27 follows); a child table untyped destroyed with pieces
+  lost behind a failed unit stays a lost live piece of its parent, so no
+  ancestor's watermark returns over them; `holds_frame` refuses a table
+  chunk (G6, `busy` at `node_send`); invariant 58 names a translation to a
+  table chunk itself (G3 (3)). The ITS word of an `its_table` is in the
+  gate model only, so the sweep defers no `its_table` here.
 
 ## Mutations shown equivalent
 

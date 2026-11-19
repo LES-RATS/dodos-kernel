@@ -359,8 +359,8 @@ impl Model {
     /// Whether this node holds every chunk of a frame, as the gate reads it
     /// before it writes an anchor (G3 (2)): a chunk taken by this node with
     /// its generation (with its own code, or a reserve's whose role it
-    /// holds), its floor, a device entry it owns, or the global read-only
-    /// set (a kept frame).
+    /// holds), its ordinary floor, a device entry it owns, or the global
+    /// read-only set (a kept frame); and no chunk of it is a table chunk.
     pub(crate) fn holds_frame(&self, frame: Frame) -> bool {
         let me = self.node;
         let generation = self.table.generation(me);
@@ -383,13 +383,16 @@ impl Model {
             crate::memory::Target::Chunks => {
                 let chunk = self.machine.geometry.chunk();
                 let end = frame.base + frame.pages * self.bytes(frame.page);
+                // A table chunk, of the table floor or taken as kind 2, is
+                // never granted (G6, D-156).
                 (frame.base / chunk..end.div_ceil(chunk)).all(|c| {
-                    self.table.holds_page(c * chunk, me, generation)
-                        || self
-                            .table
-                            .owners
-                            .get(c as usize)
-                            .is_some_and(|&raw| taken_here(raw))
+                    !self.table.table_chunk(c)
+                        && (self.table.holds_page(c * chunk, me, generation)
+                            || self
+                                .table
+                                .owners
+                                .get(c as usize)
+                                .is_some_and(|&raw| taken_here(raw)))
                 })
             }
         }
