@@ -279,6 +279,51 @@ order.
 - The suspend draft (`suspend.rs`, experimental, outside the conformance
   set): every interleaving under each variant of the open rules.
 
+## Pass 30 (D-153)
+
+- Gaps 26 to 28 and 30 to 39 settled in the tables of Gate words: every
+  `CONTRACT-GAP` marker in `model/src/gate/` and `abi/src/lib.rs` points
+  to its D-153 cell, R6 (`Death`) clears a chunk's kept counts while
+  keeping the per-generation check (gap 37), and `settled_tests.rs` adds
+  explicit regression scenarios with `OldRules` switches for gaps 26,
+  27, 28 and 30 alongside the scenarios of gaps 31 to 39.
+- Gap 29 (`823e473`, in its own commit while under review): the kernel's
+  own writable view of a chunk splits its large leaf into a kept level-1
+  table drawn from another `data` page of the chunk (`from_data`,
+  `complete_kernel`), returns a page back to `data` to writable in the
+  split table (`kernel_view_writable`), and merges the split table back
+  into the large leaf (`merge`) when the chunk's count of pages not
+  `data` falls to 1, with the faulty-kernel actor exercising `Merge`,
+  `KernelAccess` and the split (`cpu.rs`, `faulty.rs`,
+  `kernel_view_tests.rs`). Seven behaviours the new text leaves open or
+  breaks are marked `CONTRACT-GAP` 40 to 46.
+- The suspend draft (`suspend.rs`, `suspend_tests.rs`, outside the
+  conformance set): `SUSPEND_PARK_NS`, Q4 (`alarm_on_watchdog_only`: one
+  watchdog core that parks keeping a wake at `SUSPEND_PARK_NS`, the
+  others off, is enough to abandon for a hung *S* without a wedge), and
+  the second half of Q5 (`pm1_late_sleep`, `wake_accepts_resuming`: a
+  PM1 write that gives up to *resuming* and then enters the sleep late
+  wedges at the waking vector unless the waking vector accepts *resuming*
+  as well as *asleep*).
+- Two cores racing inside gate calls under the gate lock (`gate/race.rs`):
+  the calls whose words another node reads (an attach of a device and the
+  release of the answer, on one shared request entry), split into their
+  word accesses across two cores of node *X*, with the holder *H*, the
+  fence (stopping a core at any word access with its call half done and
+  its gate lock held), R1 and R6; every interleaving holds the invariants
+  and never wedges under the lock, and without the lock two cores tear
+  the open record.
+- A faulty node in the combined exploration (`scenarios/combinations.rs`,
+  `check/machine.rs`): each seed designates `seed % 5` as a faulty node
+  that attempts forbidden gate calls (`gate_give_chunk` on a chunk with
+  `grant_count > 0` or `map_count > 0`, `gate_park_self` while not
+  sealing) and injects forged ring messages (wrong sender slot, a
+  `Release` while `uses` still counts leaves, forged `RevokeStep`,
+  `UnitRequest`, `UnitAnswer`, `Send` and `Report` credits, an unreadable
+  raw header) and early `acked`/`maps_of` beacon words during a peer's
+  `Fenced` state while the healthy nodes run all 28 combination events
+  and recoveries.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a
@@ -327,11 +372,22 @@ invalidation covers), 33 (handles a failed unit never confirmed), 34 (an
 identifier freed under its ITS word), 35 (an ITS unmapping served before
 its mapping), 36 (a fencing requester's record served), 37 (two cells of
 the gate word's table), 38 (a second request of a device while its first
-is open), 39 (`its_table`'s kind number). Two were settled otherwise than the
+is open), 39 (`its_table`'s kind number). Pass 30's model of gap 29's
+split and merge found seven open points in the new cells (40 to 46, in
+`823e473`): 40 (no count of a chunk rises while a kernel-space request
+makes its pages leave `data`), 41 (no page leaves `data` while a split or
+a merge of its chunk is in flight), 42 (no give of a chunk whose split is
+in flight), 43 (a clearing call's walk stops at a shared entry and never
+crosses into a split table), 44 (the split table is another `data` page
+of the chunk, unmapped and under no anchor, turned into the split table
+at the completion), 45 (the split row writes the pages leaving `data`
+read-only at the hook so one kernel-space request suffices), and 46 (the
+merge is a gate call of its own when the chunk's count of pages not
+`data` falls to 1). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
-window of 64 core numbers (gap 7, checked after every step), and the claim
-of an MSI asks every IOMMU unit of the source's segment, one after another
-(gap 12).
+window of 64 core numbers (gap 7, checked after every step), and the
+claim of an MSI asks every IOMMU unit of the source's segment, one after
+another (gap 12).
 
 ## What it does not model
 
