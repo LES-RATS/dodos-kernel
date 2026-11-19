@@ -31,6 +31,8 @@ pub(crate) mod faulty;
 pub(crate) mod grants;
 pub(crate) mod parks;
 pub(crate) mod ports;
+#[cfg(test)]
+pub(crate) mod race;
 pub(crate) mod suspend;
 pub(crate) mod unit;
 
