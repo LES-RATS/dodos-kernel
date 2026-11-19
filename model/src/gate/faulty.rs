@@ -152,6 +152,33 @@ pub(crate) enum Op {
         entry: usize,
     },
     UnitFails,
+    Grant {
+        n: u16,
+        slot: usize,
+        page: Page,
+        to: u16,
+    },
+    Deliver {
+        to: u16,
+        index: usize,
+        granter: u16,
+        slot: usize,
+    },
+    MapRemote {
+        n: u16,
+        root: Page,
+        tag: usize,
+        va: (usize, usize),
+        index: usize,
+    },
+    Revoke {
+        n: u16,
+        slot: usize,
+    },
+    FreeGrant {
+        n: u16,
+        slot: usize,
+    },
     Refuse {
         h: u16,
         slot: u16,
@@ -239,6 +266,22 @@ impl Machine {
             Op::Answer { h, service } => self.answer(h, service),
             Op::Release { n, entry } => self.release(n, entry),
             Op::UnitFails => self.unit_fails(),
+            Op::Grant { n, slot, page, to } => self.grant(n, slot, page, to),
+            Op::Deliver {
+                to,
+                index,
+                granter,
+                slot,
+            } => self.deliver(to, index, granter, slot),
+            Op::MapRemote {
+                n,
+                root,
+                tag,
+                va,
+                index,
+            } => self.map_remote(n, root, tag, va, index),
+            Op::Revoke { n, slot } => self.revoke(n, slot),
+            Op::FreeGrant { n, slot } => self.free_grant(n, slot),
             Op::Refuse { h, slot, entry } => self.refuse(h, slot, entry),
             Op::Death { n } => self.death(n),
             Op::Fresh { n } => self.fresh(n),
@@ -357,8 +400,9 @@ impl Machine {
                 }
             }
         }
-        let category = match rng.below(3) {
+        let category = match rng.below(4) {
             0 => 15,
+            1 => 16,
             _ => rng.below(15),
         };
         match category {
@@ -397,6 +441,33 @@ impl Machine {
                 0 => Op::Destroy { n, p, root },
                 _ => Op::Teardown { n, root },
             },
+            16 => {
+                let slot = rng.below(grants::GRANTS as u64) as usize;
+                let other = rng.below(nodes) as u16;
+                match rng.below(5) {
+                    0 => Op::Grant {
+                        n,
+                        slot,
+                        page,
+                        to: other,
+                    },
+                    1 => Op::Deliver {
+                        to: n,
+                        index: slot,
+                        granter: other,
+                        slot: rng.below(grants::GRANTS as u64) as usize,
+                    },
+                    2 => Op::MapRemote {
+                        n,
+                        root,
+                        tag,
+                        va: (e0, e1),
+                        index: slot,
+                    },
+                    3 => Op::Revoke { n, slot },
+                    _ => Op::FreeGrant { n, slot },
+                }
+            }
             15 => {
                 let mut entry = rng.below(unit::UNIT_ENTRIES as u64) as usize;
                 let mut slot = rng.below(nodes) as u16;

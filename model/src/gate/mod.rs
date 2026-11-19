@@ -25,6 +25,7 @@ pub(crate) mod check;
 pub(crate) mod cpu;
 pub(crate) mod events;
 pub(crate) mod faulty;
+pub(crate) mod grants;
 pub(crate) mod parks;
 pub(crate) mod suspend;
 pub(crate) mod unit;
@@ -298,6 +299,10 @@ pub(crate) struct OldRules {
     /// A seal whose park requests a later call raises, which a faulty
     /// kernel may skip.
     pub(crate) park_requests_by_later_call: bool,
+    /// R6 freeing a dead granter's grant entries on the barrier alone
+    /// (`acked`, which a faulty node may write early), not on the use
+    /// counts (D-149).
+    pub(crate) r6_frees_on_acked: bool,
 }
 
 /// The small machine.
@@ -318,6 +323,8 @@ pub(crate) struct Machine {
     pub(crate) iotlb: BTreeMap<(u16, usize), Page>,
     /// The interrupt and park side's words.
     pub(crate) parks: parks::ParkGate,
+    /// Grant and use entries.
+    pub(crate) grants: grants::GrantGate,
     /// Memory reused since a translation could reach it: a page given
     /// away or turned into a table (for the checker).
     pub(crate) chunks: u64,
@@ -402,6 +409,7 @@ impl Machine {
             unit: unit::UnitGate::new(nodes),
             iotlb: BTreeMap::new(),
             parks: parks::ParkGate::new(nodes, cores),
+            grants: grants::GrantGate::new(nodes),
             chunks,
         }
     }
@@ -426,6 +434,16 @@ impl Machine {
             Some(Owner::Taken { node, generation }) if *node == n && *generation == g
         );
         taken || (start <= page && page < end)
+    }
+
+    /// Whether a live, revoking or pinned grant to node `n` covers `page`.
+    pub(crate) fn granted_to(&self, n: u16, page: Page) -> bool {
+        self.grants
+            .grants
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|g| g.grantee == n && g.page == page)
     }
 
     /// The physical core at position `p` of node `n`.

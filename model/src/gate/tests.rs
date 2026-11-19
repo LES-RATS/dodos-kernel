@@ -641,3 +641,75 @@ fn faulty_kernels_keep_g_long_run() {
         }
     }
 }
+
+// The audit table's first row (D-149, R6's proof), driven by a faulty
+// node: the gate model's barrier holds the moment a node dies, the worst a
+// faulty node's early `acked` can do. Node 0 takes chunk 4 and grants node
+// 1 its page 16, which node 1 maps; node 0 dies. On the barrier alone R6
+// freed node 0's grant and memory while node 1 still translated the page;
+// under the table node 0 stays fenced while node 1's use entry counts the
+// leaf.
+#[test]
+fn a_dead_granters_memory_is_not_reused_while_a_grantee_translates_it() {
+    let ops = [
+        Op::Take { n: 0, chunk: 4 },
+        Op::Grant {
+            n: 0,
+            slot: 0,
+            page: 16,
+            to: 1,
+        },
+        Op::Deliver {
+            to: 1,
+            index: 0,
+            granter: 0,
+            slot: 0,
+        },
+        Op::RetypeRoot { n: 1, page: 10 },
+        Op::Bind {
+            n: 1,
+            tag: 1,
+            root: 10,
+        },
+        Op::TakeTable { n: 1, page: 11 },
+        Op::Hook {
+            n: 1,
+            root: 10,
+            e0: 0,
+            child: 11,
+        },
+        Op::MapRemote {
+            n: 1,
+            root: 10,
+            tag: 1,
+            va: (0, 0),
+            index: 0,
+        },
+        Op::Load {
+            n: 1,
+            p: 0,
+            root: 10,
+            tag: 1,
+        },
+        Op::Death { n: 0 },
+    ];
+    let mut m = Machine::new(2, 2, 8);
+    m.old = OldRules {
+        r6_frees_on_acked: true,
+        ..OldRules::default()
+    };
+    let broken = steps(&mut m, &ops).expect_err("the old rule broke nothing");
+    // The count of node 0's chunk below the leaf node 1 still has, or the
+    // leaf itself toward memory node 0 no longer holds.
+    assert!(
+        broken.1.starts_with("G:") || broken.1.starts_with("COUNT:"),
+        "{broken:?}"
+    );
+    let mut m = Machine::new(2, 2, 8);
+    steps(&mut m, &ops).expect("the table");
+    assert_eq!(
+        m.gate.members[0].state,
+        NodeState::Fenced,
+        "node 0 dead under a counted leaf"
+    );
+}

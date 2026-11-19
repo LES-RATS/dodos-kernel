@@ -16,6 +16,7 @@ fn ensure(cond: bool, rule: &str) -> Check {
 impl Machine {
     /// Every invariant.
     pub(crate) fn check(&self) -> Check {
+        self.check_grants()?;
         self.check_classes()?;
         self.check_tags()?;
         self.check_counts()?;
@@ -70,6 +71,40 @@ impl Machine {
             ensure(
                 present || counted,
                 "G: a device's stale translation whose count the gate lowered",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Grants: a chunk's grant count is the grant entries over it; a use
+    /// count holds every present leaf under its grant; a grant entry's page
+    /// stays its granter's.
+    fn check_grants(&self) -> Check {
+        let mut counts = vec![0u64; self.chunks as usize];
+        for (granter, grants) in self.grants.grants.iter().enumerate() {
+            for grant in grants.iter().flatten() {
+                counts[Self::chunk_of(grant.page) as usize] += 1;
+                let live = self.gate.members[granter].state.writes()
+                    || self.gate.members[granter].state == NodeState::Sealed;
+                ensure(
+                    !live || self.holds(granter as u16, grant.page),
+                    "GRANT: a granted page no longer its granter's",
+                )?;
+            }
+        }
+        ensure(
+            counts == self.gate.grant_counts,
+            "GATE WORD: a grant count not the grants over its chunk",
+        )?;
+        let mut present: BTreeMap<(u16, usize), u64> = BTreeMap::new();
+        for (&(holder, _, _), &(_, _, index)) in &self.grants.remote {
+            *present.entry((holder, index)).or_default() += 1;
+        }
+        for ((holder, index), leaves) in present {
+            let count = self.grants.uses[usize::from(holder)][index].map_or(0, |u| u.count);
+            ensure(
+                count >= leaves,
+                "USE: a use count below the leaves under its grant",
             )?;
         }
         Ok(())
@@ -246,7 +281,7 @@ impl Machine {
                     continue;
                 }
                 ensure(
-                    self.holds(n, page),
+                    self.holds(n, page) || (self.granted_to(n, page) && !write),
                     "G: a translation reaches memory its node does not hold",
                 )?;
                 ensure(

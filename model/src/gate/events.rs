@@ -44,6 +44,40 @@ impl Machine {
         // The holder drops its services of the node's records at its own
         // R0, later: a late answer may still come, judged by the record's
         // compare-and-swap.
+        // R3 by every granter: its grants to the dead generation pinned.
+        for granter in 0..self.layout.len() {
+            for grant in self.grants.grants[granter].iter_mut().flatten() {
+                if grant.grantee == n && grant.state == grants::GrantState::Live {
+                    grant.state = grants::GrantState::Pinned;
+                }
+            }
+        }
+        // The dead node's use entries freed (its tables gone with R6 below),
+        // then the granters free their pinned grants on them.
+        self.grants.uses[usize::from(n)] = [None; grants::GRANTS];
+        self.grants.remote.retain(|&(holder, _, _), _| holder != n);
+        for granter in 0..self.layout.len() as u16 {
+            for slot in 0..grants::GRANTS {
+                if self.grants.grants[usize::from(granter)][slot].is_some_and(|g| g.grantee == n) {
+                    let _ = self.free_grant(granter, slot);
+                }
+            }
+        }
+        // R6's proof: each grant entry of the dead node freed only on its
+        // use count; one still counted stops the walk (the node stays
+        // fenced, its memory not reused).
+        for slot in 0..grants::GRANTS {
+            let Some(grant) = self.grants.grants[usize::from(n)][slot] else {
+                continue;
+            };
+            if self.old.r6_frees_on_acked {
+                self.grants.grants[usize::from(n)][slot] = None;
+                let chunk = Self::chunk_of(grant.page) as usize;
+                self.gate.grant_counts[chunk] = self.gate.grant_counts[chunk].saturating_sub(1);
+            } else if self.free_grant(n, slot).is_err() {
+                return Ok(());
+            }
+        }
         // R6, the barrier holding.
         let (start, end) = self.layout[usize::from(n)].floor;
         let layout = self.layout[usize::from(n)].clone();
@@ -132,6 +166,8 @@ impl Machine {
             self.invalidate(core, Flush::All);
         }
         self.fresh_unit(n);
+        // G13: its use table emptied; its serials never reset.
+        self.grants.uses[usize::from(n)] = [None; grants::GRANTS];
         self.parks.drop[usize::from(n)] = [false; parks::SPIS];
         for p in 0..layout.cores.len() {
             let core = self.core(n, p);

@@ -496,6 +496,9 @@ impl Machine {
         for page in record.leaves {
             let chunk = Self::chunk_of(page) as usize;
             self.gate.map_counts[chunk] = self.gate.map_counts[chunk].saturating_sub(1);
+            if !self.holds(n, page) {
+                self.lower_use(n, page);
+            }
         }
         let level = LEVELS - 1;
         for table in record.unhooked {
@@ -640,6 +643,14 @@ impl Machine {
                 if let Entry::Leaf { page, .. } = leaf {
                     let chunk = Self::chunk_of(page) as usize;
                     self.gate.map_counts[chunk] = self.gate.map_counts[chunk].saturating_sub(1);
+                }
+            }
+            self.gate.tables.insert(child, [Entry::Absent; ENTRIES]);
+            for leaf in leaves {
+                if let Entry::Leaf { page, .. } = leaf
+                    && !self.holds(n, page)
+                {
+                    self.lower_use(n, page);
                 }
             }
             self.gate.tables.insert(child, [Entry::Absent; ENTRIES]);
