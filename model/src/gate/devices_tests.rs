@@ -1,6 +1,6 @@
-//! The scenarios of the device side's gaps (CONTRACT-GAP 31 to 38): each
-//! breaks the checker under the reading the gap names (an `OldRules`
-//! switch) and holds under the careful one the model takes.
+//! The scenarios of pass 29's gaps 31 to 38, settled by D-153: each breaks
+//! the checker under the reading before D-153 (an `OldRules` switch) and
+//! holds under the rule; kept as regression tests.
 
 use super::faulty::Op;
 use super::*;
@@ -48,7 +48,7 @@ fn with(old: OldRules) -> Machine {
     m
 }
 
-// CONTRACT-GAP 32: node 1 empties one of its handles itself; its
+// D-153, gap 32: node 1 empties one of its handles itself; its
 // invalidation of the interrupt entry cache is asked and never served
 // before it dies. A walk that invalidates only the handles it found present
 // leaves the dead generation's entry cached.
@@ -87,7 +87,7 @@ fn r1_invalidates_every_handle_of_the_dead_nodes_cores() {
     run(OldRules::default()).expect("the tables");
 }
 
-// CONTRACT-GAP 33: R1 clears node 1's entry while the unit is healthy; the
+// D-153, gap 33: R1 clears node 1's entry while the unit is healthy; the
 // unit fails before the walk's invalidation is confirmed; R6 on the failed
 // unit finds no present entry to retire.
 #[test]
@@ -157,7 +157,7 @@ fn its_mapped(old: OldRules) -> Machine {
     m
 }
 
-// CONTRACT-GAP 34: device 1 detached while the ITS maps it; the identifier
+// D-153, gap 34: device 1 detached while the ITS maps it; the identifier
 // word freed with the attach word alone; R1 and R6, which find the node's
 // words through its identifier words, skip the ITS word; the ITS writes
 // into a page R6 turned back into data.
@@ -189,7 +189,7 @@ fn an_identifier_word_stays_taken_while_its_its_word_is_not_0() {
     run(OldRules::default()).expect("the tables");
 }
 
-// CONTRACT-GAP 35: the unmapping asked before the mapping is served (with
+// D-153, gap 35: the unmapping asked before the mapping is served (with
 // gap 38's check off, so the request is made); the holder issues the
 // unmapping first, the mapping after, and writes the word *detached*.
 #[test]
@@ -284,7 +284,7 @@ fn the_holder_serves_an_its_unmapping_only_after_the_mapping() {
     .expect("the mapping refused");
 }
 
-// CONTRACT-GAP 36: node 1 asks an attach and is fenced; R1's walk passes
+// D-153, gap 36: node 1 asks an attach and is fenced; R1's walk passes
 // its identifier word (still *pinned*); the holder then serves the attach
 // and R1 reads done while the unit translates for the device.
 #[test]
@@ -330,7 +330,7 @@ fn the_holder_serves_no_record_of_a_fenced_requester() {
     assert_eq!(run(OldRules::default()), Ok(false), "accepted");
 }
 
-// CONTRACT-GAP 37: the two cells of the gate word's table agree on safety.
+// D-153, gap 37: the two cells of the gate word's table agree on safety.
 // On a failed unit R6 stops while a device of the node is attached; once
 // none is, R6 writes the counts 0 and no device translates for the node.
 #[test]
@@ -388,10 +388,12 @@ fn r6_on_a_failed_unit_waits_for_no_attached_device() {
     )
     .expect("the kept count of the dead generation holds nothing");
     assert_eq!(m.gate.members[1].state, NodeState::Live);
+    // R6 cleared the dead generation's kept counts (the cell Death).
+    assert!(m.unit.kept.iter().all(|&(n, _, _)| n != 1));
     assert!(m.dev.context_cache.keys().all(|&d| d != 1));
 }
 
-// CONTRACT-GAP 38: a detach asked while the attach is in flight (the word
+// D-153, gap 38: a detach asked while the attach is in flight (the word
 // already *attached*); after a take-over the new holder serves the detach,
 // then the kept attach again, which writes the context entry anew.
 #[test]
@@ -464,7 +466,7 @@ fn no_detach_while_the_attach_of_the_device_is_open() {
     );
 }
 
-// CONTRACT-GAP 31: a free-list link may name a table freed or hooked since;
+// D-153, gap 31: a free-list link may name a table freed or hooked since;
 // the hook reads the hook state, never the link, so nothing follows it.
 #[test]
 fn a_stale_free_list_link_is_never_followed() {

@@ -36,26 +36,19 @@ impl Machine {
         Ok(())
     }
 
-    /// CONTRACT-GAP 28 (Gate words, the page class byte, rows *data* →
-    /// table *k*, *data* → root and *data* → *ITS table*): the rows name
-    /// the ownership word and the anchors, not the chunk's map count, which
-    /// G5 requires to be 0 for any change of class. Executed as written, a
-    /// page the node maps writable becomes one of its own tables, and its
-    /// kernel writes translations into it (the exploration's seed 8). The
-    /// model adds G5's condition.
+    /// G5's map count 0 for a page leaving *data* (Gate words, the page
+    /// class byte, every row from *data*; D-153, gap 28). Without it a page
+    /// the node maps writable becomes one of its own tables (pass 29's seed
+    /// 8, kept as a test).
     pub(super) fn unmapped(&self, page: Page) -> bool {
         self.gate.map_counts[Self::chunk_of(page) as usize] == 0 && !self.giving(page)
     }
 
-    /// CONTRACT-GAP 30 (Gate words, the ownership words, row *taken* →
-    /// *free* "after G5's counts", and the request's completion, which
-    /// "writes a give's or a destruction's words"): between a give's call,
-    /// which checks the counts, and its completion, which writes the words,
-    /// nothing keeps the chunk's counts at 0; the node can make a page of
-    /// it a table or map it, and the completion gives a chunk that holds a
-    /// root (the exploration's seed 151). The model refuses every write
-    /// that would raise a count of a chunk whose give or destruction the
-    /// gate's record names.
+    /// While a request names a give or a destruction of a chunk, every
+    /// write that would raise one of its counts is refused (Gate words, the
+    /// ownership words and the page class byte; D-153, gap 30). Without it
+    /// the completion gives a chunk that holds a root (pass 29's seeds 75
+    /// and 151, kept as tests).
     pub(super) fn giving(&self, page: Page) -> bool {
         let chunk = Self::chunk_of(page);
         self.gate.nodes.iter().flat_map(|n| &n.requests).any(|r| {
@@ -252,11 +245,8 @@ impl Machine {
         Ok(())
     }
 
-    /// The caller's own invalidation in a clearing call. CONTRACT-GAP 26:
-    /// the request table's row names the asked set "less the caller" and
-    /// no row says that the calling core invalidates its own caches; the
-    /// model reads the most careful one, the clearing call invalidates on
-    /// its own core.
+    /// The caller's own invalidation in a clearing call (Gate words, a
+    /// core's invalidation request, row *free* → *in use*; D-153, gap 26).
     fn invalidate_here(&mut self, n: u16, p: usize, what: &Flush) {
         let core = self.core(n, p);
         self.invalidate(core, what.clone());
@@ -571,12 +561,9 @@ impl Machine {
         }
     }
 
-    /// `unbind(tag)`: a whole-tag request. CONTRACT-GAP 27: the request
-    /// table gives the asked set of a range, a kernel run, a barrier and a
-    /// dying root, not of an unbind; the model asks the whole set, idle
-    /// cores included (an idle core left in the set would never leave it:
-    /// only an asked core's whole-tag invalidation removes a core, so the
-    /// unbind could never complete).
+    /// `unbind(tag)`: a whole-tag request asking the tag's whole set, idle
+    /// cores included (Gate words, the tag table; D-153, gap 27): an idle
+    /// core left out would never leave the set.
     pub(crate) fn unbind(&mut self, n: u16, p: usize, tag: usize) -> Gated {
         self.writes(n)?;
         require(tag != 0 && tag < TAGS)?;
@@ -619,7 +606,7 @@ impl Machine {
         let node = &self.gate.nodes[usize::from(n)];
         let mut asked: BTreeSet<usize> = node.tags[tag].set.clone();
         asked.extend((0..node.loaded.len()).filter(|&q| node.loaded[q].0 == root));
-        // The caller's own part (CONTRACT-GAP 26): it loads the kernel's
+        // The caller's own part (D-153, gap 26): it loads the kernel's
         // root if it had this one loaded, and invalidates the tag.
         if asked.remove(&p) {
             let kernel = self.layout[usize::from(n)].kernel_root;

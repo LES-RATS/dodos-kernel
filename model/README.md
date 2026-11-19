@@ -314,8 +314,11 @@ holder of a failed unit's role never ended), by D-145. Pass 28 found
 three: gap 23 (word 3 of a kind 9 kept while a debugger rewrites the
 control word), settled by D-147; gap 24 (the start-up's passage on a core
 of class 0 against The fence) and gap 25 (which unconfirmed cores the
-fence marks unusable), both settled by D-151. Pass 29 found fourteen, open,
-each modelled on its most careful reading and marked in `model/src/gate/`:
+fence marks unusable), both settled by D-151. Pass 29 found fourteen, all
+settled by D-153 in cells of Gate words (26 to 28 and 30 to 39 as the model
+read them; 29 by a new design, the split and merge of a chunk's large leaf,
+see Pass 30); each scenario stays as a regression test with the earlier
+reading as an `OldRules` switch:
 26 and 27 (a core's request: the caller's own invalidation, an unbind's
 asked set), 28 and 29 (the class byte's rows from *data*: G5's map count,
 the kernel's own writable view), 30 (counts between a give's call and its

@@ -167,7 +167,7 @@ impl Machine {
             None => true,
             Some((owner, g)) => {
                 let m = self.gate.members[usize::from(owner)];
-                // Its own word (kept for the ITS word, CONTRACT-GAP 34).
+                // Its own word (kept for the ITS word, D-153, gap 34).
                 m.generation != g || m.state == NodeState::Dead || owner == by
             }
         }
@@ -195,20 +195,10 @@ impl Machine {
 
     // The attach word, the identifier word and the domain word.
 
-    /// CONTRACT-GAP 38 (the attach word, "one request at a time per device:
-    /// the attach word and the *detaching* mark of the device's entry in
-    /// the iospace header refuse a second"): once the holder has moved the
-    /// word to *attached*, only the header, which the kernel writes, tells
-    /// that the attach is still in flight. A faulty kernel asks a detach
-    /// then; a take-over drops the old holder's service, the new holder
-    /// serves the detach and then the kept attach again, which writes the
-    /// context entry anew, and the detach's answer frees the identifier and
-    /// the root under it (the exploration's seed 4473). The model reads the
-    /// careful one: the gate refuses an attach or a detach of a device while
-    /// its node's request table holds an open record naming that device;
-    /// and the same for the ITS word's map and unmap (the exploration's
-    /// seed 18395: an unmapping asked while the mapping was open, the kept
-    /// mapping served again after it by the next holder).
+    /// The gate refuses an attach, a detach, an ITS mapping or an ITS
+    /// unmapping of a device while another record of the node naming it is
+    /// *open* (Gate words, the attach word and the ITS word; D-153, gap 38;
+    /// pass 29's seeds 4473 and 18395, kept as tests).
     fn device_request_open(&self, n: u16, device: u16, its: bool) -> bool {
         !self.old.concurrent_device_requests
             && self.unit.records[usize::from(n)].iter().any(|r| {
@@ -279,16 +269,10 @@ impl Machine {
         self.open_record(n, entry, words, Vec::new())
     }
 
-    /// CONTRACT-GAP 34 (the ownership words, row *taken* → *free*: "an
-    /// identifier word with its attach word → 0"): the row reads the
-    /// attach word only, not the ITS word beside the same identifier. A
-    /// detach answered while the device's ITS mapping is in place frees the
-    /// identifier; R1 and R6, which find a node's words through its
-    /// identifier words, then skip the ITS word, and the ITS writes into
-    /// the dead node's memory once R6 has turned its table back into data
-    /// (the exploration's seed 2845). The model reads the careful one: the
-    /// identifier word is freed only when its attach word and its ITS word
-    /// both read 0, by whichever answer brings the second to 0.
+    /// An identifier word is freed only when its attach word and its ITS
+    /// word both read 0, by whichever answer brings the second to 0 (Gate
+    /// words, the ownership words, row *taken* → *free*; D-153, gap 34;
+    /// pass 29's seed 2845, kept as a test).
     fn free_identifier(&mut self, n: u16, device: u16, by_attach: bool) {
         let d = usize::from(device);
         let both = self.dev.attach[d].0 == Bound::Zero && self.dev.its[d].0 == Bound::Zero;
@@ -406,8 +390,8 @@ impl Machine {
 
     /// `untyped_retype` of kind 17: 2^*k* pages of *data* → *ITS table*,
     /// unpinned, cleared in the call; *k* above 4 `invalid`. As for a
-    /// table: held, no anchor, G5's map count (CONTRACT-GAP 28) and the
-    /// kernel's view (CONTRACT-GAP 29).
+    /// table: held, no anchor, G5's map count and no give in flight (D-153,
+    /// gaps 28 and 30), and the kernel's view first (D-153, gap 29).
     pub(crate) fn retype_its(&mut self, n: u16, first: Page, k: u8) -> Gated {
         self.unit_writes(n)?;
         require(k <= ITS_K_MAX)?;
@@ -689,16 +673,9 @@ impl Machine {
                     self.parks.active[l] = false;
                 }
             }
-            // CONTRACT-GAP 32 (the R1 word, row walking → done: "at the
-            // completion of an invalidation submitted after the walk's last
-            // unit"): the row does not say what the invalidation covers. Read
-            // as the handles the walk found present and cleared, it misses a
-            // handle X emptied itself whose invalidation X's own request
-            // asked and no holder served (the record voided at X's fresh
-            // start): the interrupt entry cache keeps the dead generation's
-            // entry across the fresh start (the exploration's seed 101). The
-            // model reads the careful one: the walk invalidates every handle
-            // of each core it visits, present or not.
+            // R1's closing invalidation covers every handle of each core it
+            // visits, present or not (Gate words, the R1 word, row walking →
+            // done; D-153, gap 32; pass 29's seed 101, kept as a test).
             R1Unit::Core(core) => {
                 for v in 0..VECTORS {
                     let present = self.dev.remap.get(&(core, v)).is_some_and(|&(o, _)| o == x);
@@ -821,18 +798,15 @@ impl Machine {
             }
         }
         self.unit.domains[usize::from(n)] = None;
+        // The kept counts of the node's records end at R6, which reaches
+        // here only once no attach word of the generation reads *attached*
+        // (Gate words, the gate word, cell Death; D-153, gap 37).
+        self.unit.kept.retain(|&(m, _, _)| m != n);
         self.dev.id_bits[usize::from(n)].clear();
         self.dev.line_bits[usize::from(n)].clear();
-        // CONTRACT-GAP 33 (the retired word, row 0 → 1): its writers are
-        // the node at a *failed* invalidation, the holder clearing a present
-        // entry in R1 on a failed unit, and R6 for a present entry in a
-        // failed unit's table. None covers an entry R1 cleared while the
-        // unit was healthy and whose invalidation the unit never confirmed
-        // before it failed, nor one the node emptied itself whose request
-        // its death voided: the cache keeps the dead generation's entry
-        // across its fresh start (the exploration's seed 1233). The model
-        // reads the careful one: on a failed unit, R6 retires every handle
-        // of the node's cores.
+        // On a failed unit serving the node's cores, R6 retires every handle
+        // of those cores, present or not (Gate words, the retired word, row 0
+        // → 1; D-153, gap 33; pass 29's seed 1233, kept as a test).
         if self.unit.failed {
             let handles: Vec<Handle> = self
                 .dev

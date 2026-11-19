@@ -139,7 +139,7 @@ fn object_kinds_and_page_sizes_have_their_numbers() {
         ItsTable,
     ];
     assert_eq!(kinds, ObjectKind::ALL);
-    // CONTRACT-GAP 39: `its_table` takes the next free kind, the others'
+    // D-153, gap 39: `its_table` takes the next free kind, the others'
     // numbers pinned.
     assert_eq!(ItsTable as u32, 21);
     assert_eq!(IrqControl as u32, 17);

@@ -356,9 +356,8 @@ pub enum ObjectKind {
     Role = 20,
     /// The interrupt translation table of one device behind a GIC ITS:
     /// 2^*k* pages (*k* ≤ 4) of class *ITS table* (D-152 complement).
-    /// CONTRACT-GAP 39: the complement names it kind 17, which `IrqControl`
-    /// holds, and the contract pins every kind's number (Changes for `abi/`,
-    /// object kinds); the next free number, 21, keeps them.
+    /// D-153, gap 39: kind 21, the next free number (the complement had
+    /// named 17, which `IrqControl` holds).
     ItsTable = 21,
 }
 

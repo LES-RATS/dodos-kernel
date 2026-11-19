@@ -167,7 +167,8 @@ impl Machine {
     pub(crate) fn retype_ioroot(&mut self, n: u16, page: Page) -> Gated {
         self.unit_writes(n)?;
         // The row *data* → iospace root, as for any table (with G5's map
-        // count, CONTRACT-GAP 28, and the kernel's view, CONTRACT-GAP 29).
+        // count and no give in flight, D-153 gaps 28 and 30, and the
+        // kernel's view first, gap 29).
         require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
         self.cas_class(
             page,
@@ -239,7 +240,7 @@ impl Machine {
     pub(crate) fn io_map(&mut self, n: u16, root: Page, e: usize, page: Page) -> Gated {
         self.unit_writes(n)?;
         require(self.ioroot_of(n, root, false))?;
-        // CONTRACT-GAP 30: not into a chunk whose give is in flight.
+        // Not into a chunk whose give is in flight (D-153, gap 30).
         require(e < ENTRIES && self.holds(n, page) && !self.giving(page))?;
         require(self.gate.classes[page as usize] == Class::Data)?;
         require(self.gate.tables[&root][e] == Entry::Absent)?;
@@ -337,16 +338,9 @@ impl Machine {
                         (Bound::Pinned | Bound::Attached, t, kk) if t == table && kk == k
                     )
             }
-            // CONTRACT-GAP 35 (the ITS word, row *attached* → *detached*,
-            // "once the ITS has consumed the unmapping MAPD"): nothing ties
-            // the unmapping to a mapping already issued. A requester that
-            // asks it before its mapping is served has the holder issue the
-            // unmapping first and the mapping after, then write the word
-            // *detached* and the requester 0 while the ITS maps the device
-            // (the exploration's seed 3442). The model reads the careful
-            // one: the holder serves an unmapping only while the ITS word
-            // reads *attached* (its mapping issued before) or *detached* (an
-            // unmapping served again), and refuses it otherwise.
+            // An ITS unmapping is served only while the ITS word reads
+            // *attached* or *detached* (Gate words, the ITS word; D-153, gap
+            // 35; pass 29's seed 3442, kept as a test).
             Words::ItsUnmap { device } => {
                 names(device)
                     && (self.old.its_unmap_unordered
@@ -378,16 +372,10 @@ impl Machine {
             .iter()
             .any(|s| s.slot == slot && s.entry == entry && s.serial == record.serial);
         require(!taken && self.checks(slot, words))?;
-        // CONTRACT-GAP 36 (the request record, row (*s*, *open*) → (*s*,
-        // *done*)): the holder's condition reads the requester's identifier
-        // word "with its generation", not its member word, so a fencing or
-        // fenced requester's record is still served: an attach accepted
-        // after R1's walk passed its identifier word writes a context entry
-        // for a generation whose R1 reads done (the exploration's seed 265).
-        // The model reads the careful one: the holder accepts a record only
-        // while its requester's member word reads starting, live, sealing or
-        // sealed; a fencing requester's records wait for its fresh start,
-        // which voids them.
+        // The holder answers a record only from a requester starting, live,
+        // sealing or sealed (Gate words, the request record, row (*s*,
+        // *open*) → (*s*, *done*); D-153, gap 36; pass 29's seed 265, kept as
+        // a test).
         let requester = self.gate.members[usize::from(slot)].state;
         require(
             self.old.serve_fenced_requesters

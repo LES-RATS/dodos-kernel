@@ -117,13 +117,9 @@ impl Machine {
     }
 
     /// The class byte and the non-data count; a free-list link is held
-    /// only by a *loose* table. CONTRACT-GAP 31 (the page class byte: "a
-    /// *loose* table ... whose first word holds 0 or the address of a
-    /// *loose* table"): `table_free` and the hook of a table that another
-    /// table's link names leave that link naming a data page or a hooked
-    /// table, so the statement is no invariant of the table's own
-    /// transitions; harmless, the gate reading the hook state, never the
-    /// link, at a hook. The model holds the link's source only.
+    /// only by a *loose* table: its target may be anything since, and a
+    /// hook never reads a link (Gate words, the page class byte; D-153,
+    /// gap 31).
     fn check_classes(&self) -> Check {
         let loose = Class::Table {
             level: LEVELS - 1,
@@ -230,15 +226,8 @@ impl Machine {
                 }
             }
         }
-        // CONTRACT-GAP 37 (the gate word, the cells "Unit failed": "the
-        // counts of a record answered *failed* are never lowered before the
-        // machine restarts", and "Death": "R6 writes the whole word 0"): the
-        // two cells of one table disagree for a dead node's kept counts. They
-        // agree on safety: R6 stops while an attach word of the generation
-        // reads *attached*, and a failed unit attaches nothing new, so once
-        // R6 passes no device uses a translation a kept count holds (the
-        // exploration's seed 3309 reached the cells). The model holds the
-        // kept counts of the generation that kept them only.
+        // Kept counts are held per generation and end at R6 (Gate words,
+        // the gate word, cells Unit failed and Death; D-153, gap 37).
         for &(n, g, page) in &self.unit.kept {
             let m = self.gate.members[usize::from(n)];
             if m.state.writes() && m.generation == g {

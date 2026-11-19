@@ -19,7 +19,9 @@
 //! invariants of (G) after every step.
 //!
 //! A cell of a table that cannot be executed, or that the checker breaks,
-//! is marked `CONTRACT-GAP` and numbered (from 26).
+//! is marked `CONTRACT-GAP` and numbered (26 to 39 settled by D-153; new
+//! ones from 40). The earlier readings stay as `OldRules` switches, so that
+//! each scenario shows its attack failing.
 
 pub(crate) mod check;
 pub(crate) mod cpu;
@@ -325,22 +327,22 @@ pub(crate) struct OldRules {
     /// counts (D-149).
     pub(crate) r6_frees_on_acked: bool,
     /// R1's invalidation of the interrupt entry cache covering only the
-    /// handles the walk found present (CONTRACT-GAP 32).
+    /// handles the walk found present (the reading before D-153, gap 32).
     pub(crate) r1_present_handles_only: bool,
     /// R6 on a failed unit retiring only the present entries toward the
-    /// node's cores (CONTRACT-GAP 33).
+    /// node's cores (the reading before D-153, gap 33).
     pub(crate) r6_retires_present_only: bool,
     /// The identifier word freed with the attach word alone, its ITS word
-    /// unread (CONTRACT-GAP 34).
+    /// unread (the reading before D-153, gap 34).
     pub(crate) identifier_freed_by_attach_word: bool,
     /// The holder serving an ITS unmapping whatever its ITS word reads
-    /// (CONTRACT-GAP 35).
+    /// (the reading before D-153, gap 35).
     pub(crate) its_unmap_unordered: bool,
     /// The holder serving a fencing or fenced requester's records
-    /// (CONTRACT-GAP 36).
+    /// (the reading before D-153, gap 36).
     pub(crate) serve_fenced_requesters: bool,
     /// An attach or a detach asked while the node's own record of the
-    /// device is open (CONTRACT-GAP 38).
+    /// device is open (the reading before D-153, gap 38).
     pub(crate) concurrent_device_requests: bool,
 }
 
