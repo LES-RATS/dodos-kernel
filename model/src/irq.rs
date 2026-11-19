@@ -85,6 +85,12 @@ impl Model {
             if !held_here && !held_away {
                 return Err(Error::Unsupported);
             }
+            // x86-64 without a directed end of interrupt: mask then unmask
+            // by the holder, so a level line is claimable only on a machine
+            // where one node runs, one slot or the others phantom (D-148).
+            if self.masks_at_arrival() && !self.one_node_runs() {
+                return Err(Error::Unsupported);
+            }
         }
         // A line beyond the last line word (Interrupts, D-135).
         if source.is_line() && source.id() as usize >= dodos_abi::IRQ_LINES_MAX {
@@ -334,6 +340,12 @@ impl Model {
         {
             unit.masked.remove(&source.id());
         }
+    }
+
+    /// Whether one node runs on the machine: one node slot, or every other
+    /// a phantom node (D-148, D-149).
+    pub(crate) fn one_node_runs(&self) -> bool {
+        (0..self.table.nodes).all(|z| z == self.node || !self.real(z))
     }
 
     /// Whether this node holds role `role`.

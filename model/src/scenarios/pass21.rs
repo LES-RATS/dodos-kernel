@@ -297,8 +297,9 @@ fn a_lines_vector_whose_invalidation_a_failed_unit_did_not_confirm_is_retired() 
 fn deepseek12_1_a_line_whose_entry_a_rebuild_wrote_masked_raises_nothing_until_it_is_armed() {
     // D-147: a claimed level line is left masked by a rebuild only on
     // x86-64 without a directed end of interrupt, where the holder of the
-    // IOAPIC's role alone claims it and unmasks it when it arms it.
-    let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    // IOAPIC's role alone claims it and unmasks it when it arms it; D-148:
+    // only where one node runs.
+    let mut machine = machine(Arch::X86_64, 1, &[&[0]]);
     machine.directed_eoi = false;
     let mut m = S::on(&machine);
     let role = m.sys.node(0).ioapic_role(5).unwrap();

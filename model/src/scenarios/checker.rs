@@ -1262,3 +1262,21 @@ fn granted_memory_owned_by_another_node_is_reported() {
     });
     machine_reported(&m, "G5: granted memory owned by another than its granter");
 }
+
+// D-148: a level line claimed beside other nodes on x86-64 without a
+// directed end of interrupt (the claim made where it was directed, the
+// machine then read without it).
+#[test]
+fn a_level_line_without_a_directed_end_of_interrupt_beside_other_nodes_is_reported() {
+    let (mut m, n, _) = super::pass28::line_bound_on(|holder, _, _| holder);
+    for z in 0..3 {
+        m.sys.node_mut(z).machine.directed_eoi = false;
+    }
+    let report = m.sys.check().expect_err("the spoiled machine");
+    assert_eq!(
+        report,
+        format!(
+            "node {n}: LEVEL: a level line with no directed end of interrupt beside other nodes"
+        )
+    );
+}

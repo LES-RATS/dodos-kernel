@@ -116,6 +116,15 @@ impl Model {
                     || line.active,
                 "SOURCECFG: a claimed line's APLIC source inactive",
             )?;
+            // D-148: on x86-64 without a directed end of interrupt a level
+            // line is claimed only where one node runs.
+            ensure(
+                !self.masks_at_arrival()
+                    || !irq.source.is_line()
+                    || !irq.source.level()
+                    || self.one_node_runs(),
+                "LEVEL: a level line with no directed end of interrupt beside other nodes",
+            )?;
             // D-147: but on x86-64 without a directed end of interrupt, no
             // node masks a level line at its arrival, and a rebuild never
             // leaves a claimed, live one masked that only its claimer could

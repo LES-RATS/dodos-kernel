@@ -1276,6 +1276,34 @@ fn a_faulty_kernel_cannot_give_or_retype_granted_memory() {
     assert_eq!(g.m.sys.check(), Ok(()));
 }
 
+// D-148, item 4: on x86-64 without a directed end of interrupt a level
+// line is claimable only on a machine where one node runs: on three nodes
+// even the IOAPIC's holder gets `unsupported`; on one node it claims it.
+#[test]
+fn a_level_line_without_a_directed_end_of_interrupt_needs_one_node() {
+    let claim = dodos_abi::IrqSource::line(5, true, false).raw();
+    let call = |core: u64| Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: claim,
+        core,
+        vector: 48,
+        destination: s(210),
+    };
+    let mut three = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    three.directed_eoi = false;
+    let mut m = S::on(&three);
+    let role = m.sys.node(0).ioapic_role(5).unwrap();
+    let holder = m.sys.role(role).holder();
+    assert_eq!(
+        m.call(holder, call(u64::from(holder))),
+        Err(Error::Unsupported)
+    );
+    let mut one = machine(Arch::X86_64, 1, &[&[0]]);
+    one.directed_eoi = false;
+    let mut m = S::on(&one);
+    super::pass17::succeeds(&mut m, 0, call(0), 30 * MS);
+}
+
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 
