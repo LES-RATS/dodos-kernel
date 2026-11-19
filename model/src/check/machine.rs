@@ -377,6 +377,9 @@ impl System {
         let n = table.nodes;
         for from in 0..n {
             for to in (0..n).filter(|&t| t != from) {
+                if self.faulty.contains(&from) || self.faulty.contains(&to) {
+                    continue;
+                }
                 let pair = &table.rings[from as usize][to as usize];
                 let consumed = table.beacons[to as usize].consumed[from as usize];
                 ensure(
@@ -598,10 +601,15 @@ impl System {
             .flatten()
             .filter(|c| c.kind == dodos_abi::NodeMessage::ReportAsk)
             .count();
-        ensure(
-            asks <= 1,
-            "RESERVE: more than one ReportAsk in flight to a peer",
-        )?;
+        if !self.faulty.contains(&x) {
+            ensure(
+                asks <= 1,
+                "RESERVE: more than one ReportAsk in flight to a peer",
+            )?;
+        }
+        if self.faulty.contains(&y) {
+            return Ok(());
+        }
         let still_owed: u64 = peer
             .iter()
             .enumerate()

@@ -474,6 +474,12 @@ struct Run {
     /// back for so many churns, so that its first thread runs before it is
     /// live.
     late_start: u32,
+    /// A node whose kernel also acts as a faulty kernel in this seed: it
+    /// attempts gate writes that the gate must refuse and writes forged
+    /// messages, sender slots, credits and beacon words that other nodes'
+    /// gates and recovery reserves must refuse or withstand.
+    faulty_node: u16,
+    faulty_acts: usize,
 }
 
 impl Run {
@@ -505,6 +511,7 @@ impl Run {
             .iter()
             .filter(|e| e.is_used())
             .count();
+        let faulty_node = (seed % u64::from(NODES)) as u16;
         let mut run = Self {
             m,
             rng: Rng(seed + 701),
@@ -520,8 +527,13 @@ impl Run {
             handed_failed: false,
             deferred: None,
             late_start: 0,
+            faulty_node,
+            faulty_acts: 0,
         };
-        say(format_args!("drivers {:?}", run.drivers));
+        say(format_args!(
+            "drivers {:?}, faulty node {}",
+            run.drivers, run.faulty_node
+        ));
         run.set_up();
         run
     }
@@ -1356,8 +1368,244 @@ impl Run {
         }
     }
 
+    /// A faulty node's action alongside the normal exploration: it attempts
+    /// gate writes that its own gate must refuse when counts or state forbid
+    /// them, and writes forged messages, sender slots, credits and early
+    /// `acked`/`maps_of` beacon words that the other nodes' gates and
+    /// recovery reserves must refuse or withstand without breaking machine
+    /// invariants or liveness.
+    fn faulty(&mut self) {
+        use crate::rings::Message;
+        use dodos_abi::{NodeMessage, RingHeader};
+        let f = self.faulty_node;
+        if !self.m.sys.has(f) || !self.m.sys.canonical().writes(f) {
+            return;
+        }
+        let Some(to) = (1..NODES)
+            .map(|step| (f + step) % NODES)
+            .find(|&n| self.healthy(n))
+        else {
+            return;
+        };
+        let fg = self.m.sys.member(f).generation();
+        let tg = self.m.sys.member(to).generation();
+        let can_send = |m: &S, from: u16, dest: u16, user: bool, entries: u64| {
+            let table = m.sys.canonical();
+            let pair = &table.rings[from as usize][dest as usize];
+            let consumed = table.beacons[dest as usize].consumed[from as usize];
+            match user {
+                true => {
+                    pair.user.produced.wrapping_sub(consumed.1) + entries
+                        <= dodos_abi::RING_USER_ENTRIES
+                }
+                false => {
+                    pair.kernel.produced.wrapping_sub(consumed.0)
+                        + entries
+                        + dodos_abi::RING_ANSWER_RESERVE
+                        <= dodos_abi::RING_KERNEL_ENTRIES
+                }
+            }
+        };
+        self.faulty_acts += 1;
+        if self.faulty_acts.is_multiple_of(10) {
+            let table = self.m.sys.canonical();
+            let busy_chunk = (0..table.owners.len() as u64).find(|&c| {
+                Ownership::from_raw(table.owners[c as usize]).is_some_and(|w| {
+                    w.state() == OwnState::Taken
+                        && w.owner() == Owner::Node(f)
+                        && w.generation() == fg
+                }) && (table.grant_count(c) > 0 || table.map_count(c) > 0)
+            });
+            if let Some(chunk) = busy_chunk {
+                assert!(!self.m.sys.node_mut(f).gate_give_chunk(chunk, to));
+            }
+            if self.m.state(f) != MemberState::Sealing {
+                assert!(!self.m.sys.gate_park_self(f, f as usize));
+            }
+        }
+        let table = self.m.sys.canonical();
+        match self.faulty_acts % 10 {
+            0 => {}
+            // 1: forged sender slot in header (speaking in a third node's
+            // name): refused by `to` (`header.sender != from`, D-141).
+            1 if can_send(&self.m, f, to, false, 1) => {
+                let third = (0..NODES).find(|&z| z != f && z != to).unwrap_or(0);
+                let header = RingHeader::new(
+                    NodeMessage::Release,
+                    1,
+                    (third, self.m.sys.member(third).generation()),
+                    tg,
+                    None,
+                );
+                let body = Body::Release {
+                    grant: 0,
+                    serial: 1,
+                };
+                self.m.sys.inject(f, to, Message { header, body });
+            }
+            // 2: forged `Release` for a live grant `f` holds while `uses[f]`
+            // still counts leaves > 0: refused by the granter (D-141).
+            2 => {
+                let held = (0..NODES).find_map(|g| {
+                    table.grants[g as usize]
+                        .iter()
+                        .find(|(_, e)| {
+                            e.grantee == f
+                                && e.generation == fg
+                                && e.state == GrantState::Live
+                                && e.use_index.is_some_and(|i| {
+                                    table.uses[f as usize].get(&i).is_some_and(|u| u.leaves > 0)
+                                })
+                        })
+                        .map(|(&id, e)| (g, id, e.serial))
+                });
+                if let Some((granter, grant, serial)) = held
+                    && can_send(&self.m, f, granter, false, 1)
+                {
+                    let gg = self.m.sys.member(granter).generation();
+                    let header = RingHeader::new(NodeMessage::Release, 1, (f, fg), gg, None);
+                    let body = Body::Release { grant, serial };
+                    self.m.sys.inject(f, granter, Message { header, body });
+                }
+            }
+            // 3: forged `RevokeStep` naming a credit `to` does not have in
+            // use toward `f`: refused by `credit_in_use` (D-141).
+            3 if can_send(&self.m, f, to, false, 1) => {
+                let header = RingHeader::new(
+                    NodeMessage::RevokeStep,
+                    1,
+                    (f, fg),
+                    tg,
+                    Some((15, 0x7ff_ffff)),
+                );
+                let body = Body::RevokeStep { removed: true };
+                self.m.sys.inject(f, to, Message { header, body });
+            }
+            // 4: forged `UnitRequest` to the IOMMU role holder with a send
+            // credit (index 20, outside 0..16): refused by the holder's
+            // receive check without occupying `unit_service`.
+            4 => {
+                let holder = self.m.sys.role(IOMMU_ROLE).holder();
+                if holder != f
+                    && holder < NODES
+                    && self.m.sys.canonical().writes(holder)
+                    && can_send(&self.m, f, holder, false, 1)
+                {
+                    let hg = self.m.sys.member(holder).generation();
+                    let epoch = self.m.sys.role(IOMMU_ROLE).epoch();
+                    let header =
+                        RingHeader::new(NodeMessage::UnitRequest, 1, (f, fg), hg, Some((20, 1)));
+                    let body = Body::UnitRequest {
+                        role: IOMMU_ROLE as u16,
+                        epoch,
+                        op: crate::rings::UnitOp::Invalidate { domain: Some(1) },
+                    };
+                    self.m.sys.inject(f, holder, Message { header, body });
+                }
+            }
+            // 5: forged `UnitAnswer` to the IOMMU role holder naming a
+            // request credit the holder does not have in use toward `f`:
+            // refused by `credit_in_use` (D-141).
+            5 => {
+                let holder = self.m.sys.role(IOMMU_ROLE).holder();
+                if holder != f
+                    && holder < NODES
+                    && self.m.sys.canonical().writes(holder)
+                    && can_send(&self.m, f, holder, false, 1)
+                {
+                    let hg = self.m.sys.member(holder).generation();
+                    let header = RingHeader::new(
+                        NodeMessage::UnitAnswer,
+                        1,
+                        (f, fg),
+                        hg,
+                        Some((15, 0x7ff_fffe)),
+                    );
+                    let body = Body::UnitAnswer {
+                        result: dodos_abi::UnitResult::Done,
+                    };
+                    self.m.sys.inject(f, holder, Message { header, body });
+                }
+            }
+            // 6: forged `Send` on the user ring with no credit (`None`,
+            // outside the send credit range 16..24) and a stamp naming
+            // another node: refused by `to`'s receive check.
+            6 if can_send(&self.m, f, to, true, 1) => {
+                let body = Body::Send {
+                    header: dodos_abi::Header::new(0, 1, 0, 0).expect("valid"),
+                    stamp: (u64::from(to) << 48 | 1, 0b100),
+                    grants: Vec::new(),
+                    words: vec![0; 1],
+                };
+                let header =
+                    RingHeader::new(NodeMessage::Send, body.entries() as u8, (f, fg), tg, None);
+                self.m.sys.inject(f, to, Message { header, body });
+            }
+            // 7: forged `Report` to `to` with an unused credit: refused by
+            // `to` (`credit_in_use`), leaving any active rebuild untouched.
+            7 if can_send(&self.m, f, to, false, 1) => {
+                let header =
+                    RingHeader::new(NodeMessage::Report, 1, (f, fg), tg, Some((14, 0x7ff_fffc)));
+                let body = Body::Report {
+                    next: dodos_abi::REPORT_END,
+                    items: vec![crate::rings::Item::Device(0, 0)],
+                };
+                self.m.sys.inject(f, to, Message { header, body });
+            }
+            // 8: unreadable raw header on the user ring (length 0 or
+            // reserved kind 9): `to` consumes 1 entry, traces `Refused` and
+            // continues.
+            8 if can_send(&self.m, f, to, true, 1) => {
+                let mut bad = RingHeader::new(NodeMessage::Release, 0, (f, fg), tg, None);
+                bad.kind = 9;
+                self.m.sys.inject_raw(f, to, true, bad, 1);
+            }
+            // 9: early `beacons[f].acked[x] = g` and `maps_of[x] = false`
+            // written by `f` (when `f` holds no unit role, has run R0 for
+            // `x`, and has no active grant or remote capability of `x`)
+            // while `x` is `Fenced`: R6's proof (`r6_held_back`, D-149)
+            // still holds R6 back until every grantee's use entry counts no
+            // leaf under `x`'s grants and no attach word of `x` reads
+            // `Attached`.
+            9 => {
+                let holds_unit = table.role_records.iter().zip(&table.roles).any(|(r, w)| {
+                    r.kind == dodos_abi::RoleKind::Unit
+                        && w.state() != RoleState::Vacant
+                        && (w.holder() == f || w.target() == f)
+                });
+                let fenced = (0..NODES).filter(|_| !holds_unit).find(|&x| {
+                    let xg = self.m.sys.member(x).generation();
+                    x != f
+                        && self.m.state(x) == MemberState::Fenced
+                        && self
+                            .m
+                            .sys
+                            .node(f)
+                            .reclaims
+                            .get(&x)
+                            .is_some_and(|r| r.generation == xg && r.isolated)
+                        && !table.grants[x as usize].values().any(|e| e.grantee == f)
+                        && !table.grants[f as usize].values().any(|e| e.grantee == x)
+                });
+                if let Some(x) = fenced {
+                    let xg = self.m.sys.member(x).generation();
+                    self.m.sys.edit_table(|t| {
+                        t.beacons[f as usize].acked[x as usize] = xg;
+                        t.beacons[f as usize].maps_of[x as usize] = false;
+                    });
+                }
+            }
+            _ => {}
+        }
+        self.m
+            .sys
+            .check()
+            .expect("invariants hold after faulty action");
+        self.note();
+    }
+
     /// One step: a driver one time in three, an action of the machine's
-    /// other parts, then events and time.
+    /// other parts, then events and time, and a faulty node's action.
     fn step(&mut self) {
         // A node started afresh has a new first thread once it runs.
         refresh(&mut self.m);
@@ -1384,6 +1632,7 @@ impl Run {
             _ => self.recover(MemberState::Dead),
         }
         self.churn();
+        self.faulty();
     }
 
     /// The machine runs until it is quiet; then no node is accused that was
