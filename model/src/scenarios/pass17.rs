@@ -207,7 +207,10 @@ fn a_fence_nmi_that_lands_in_the_entry_stub_gives_no_false_confirmation() {
     // Node 0 is accused while its core is in the entry stub, before the
     // stub installed the kernel's handler: the fence raises the park
     // request, marks the word and sends the NMI, which the stub's handler
-    // only returns from.
+    // only returns from. The core is in VMX root operation, so INIT, which
+    // would stop it and let the park stub confirm it, is blocked: the NMI
+    // alone acts, and confirms nothing (D-149).
+    m.sys.set_vmx(0, true);
     m.ok(1, kill(0));
     let request = loop {
         let stop = m

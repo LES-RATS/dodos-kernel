@@ -178,6 +178,8 @@ impl Model {
                             .table
                             .core_word(*c)
                             .is_some_and(|w| w.state() == CoreState::Free && !w.is_unusable())
+                        // A core of class 0 kept out of every node (D-149).
+                        && !self.machine.kept_out(*c)
                 };
                 let alike = cores.iter().all(|&c| {
                     c < count && self.table.state_kinds[c] == self.table.state_kinds[cores[0]]
@@ -1053,7 +1055,7 @@ impl Model {
                 .table
                 .cores_of(node, generation)
                 .iter()
-                .any(|&core| list[core].fence == 0)
+                .any(|&core| self.machine.class(core) == 0)
     }
 
     // Reclaim.

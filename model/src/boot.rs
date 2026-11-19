@@ -403,7 +403,7 @@ impl Machine {
                 sweep_ms: 1000,
                 seal_ms: 1000,
                 core_answer_ms: 10,
-                reserved: 0,
+                flags: dodos_abi::BOOT_MEMBERSHIP_BSP_CLEARED,
             },
             console: false,
             boot_nodes: None,
@@ -425,12 +425,54 @@ impl Machine {
         self.psci_features >= 0 && self.psci_features & 2 != 0
     }
 
+    /// The fence class of the core of number `core`: 2 under the hardening
+    /// monitor; on x86-64 the bootstrap core, whose BSP flag the start-up
+    /// clears, of class 2 where the image declares the cleared flag
+    /// honoured and of class 0 otherwise (D-149); the machine's class for
+    /// any other core.
+    pub fn class(&self, core: usize) -> u8 {
+        let entry = self.core_list()[core];
+        let declared = self.membership.flags & dodos_abi::BOOT_MEMBERSHIP_BSP_CLEARED != 0;
+        match (self.monitor, self.arch, entry.booted) {
+            (true, ..) => 2,
+            // Declared: stopped by INIT and confirmed by the park stub. The
+            // machine record's class is kept when it is not 0: the
+            // scenarios give the bootstrap core class 1 to steer the
+            // successors, which on x86-64 changes nothing else.
+            (false, Arch::X86_64, true) if declared => entry.fence.max(1),
+            (false, Arch::X86_64, true) => 0,
+            _ => entry.fence,
+        }
+    }
+
+    /// Whether a core of class 0 is kept out of every node: on a machine
+    /// that runs several nodes without the hardening monitor or the
+    /// acceptance of an unfenced core (D-149). Such a core is not usable
+    /// for `node_start`.
+    pub fn kept_out(&self, core: usize) -> bool {
+        self.class(core) == 0 && !self.monitor && !self.accept_unfenced && !self.single()
+    }
+
     /// A machine with a core of fence class 0, which no other core can
     /// stop, runs one node unless the image declares the hardening monitor
-    /// or accepts an unfenced core (The fence: D-116, D-117).
+    /// or accepts an unfenced core, or keeps its cores of class 0 out of
+    /// every node (The fence: D-116, D-117, D-149): a `BootNodes` layout
+    /// that names one runs one node; the default layout leaves them out.
+    /// CONTRACT-GAP 24: the start-up's own passage still says a core of
+    /// class 0 makes the machine run one node; the model follows The fence.
     fn single(&self) -> bool {
-        let unstoppable = self.cores.iter().any(|core| core.fence == 0);
-        unstoppable && !self.monitor && !self.accept_unfenced
+        let count = self.cores.len();
+        let zero: Vec<usize> = (0..count).filter(|&c| self.class(c) == 0).collect();
+        if zero.is_empty() || self.monitor || self.accept_unfenced {
+            return false;
+        }
+        match &self.boot_nodes {
+            Some((_, nodes)) => nodes.iter().any(|&(window, mask)| {
+                zero.iter()
+                    .any(|&c| c as u64 / 64 == window && mask >> (c % 64) & 1 == 1)
+            }),
+            None => count - zero.len() == 0,
+        }
     }
 
     /// The node slots: `BootNodes`'s number, by default one per usable
@@ -439,7 +481,9 @@ impl Machine {
         match (&self.boot_nodes, self.single()) {
             (_, true) => 1,
             (Some((slots, _)), false) => *slots as usize,
-            (None, false) => self.cores.len(),
+            (None, false) => (0..self.cores.len())
+                .filter(|&c| self.class(c) != 0 || self.monitor || self.accept_unfenced)
+                .count(),
         }
     }
 
@@ -473,7 +517,10 @@ impl Machine {
                         .collect()
                 })
                 .collect(),
-            None => (0..count).map(|core| vec![core]).collect(),
+            None => (0..count)
+                .filter(|&c| self.class(c) != 0 || self.monitor || self.accept_unfenced)
+                .map(|core| vec![core])
+                .collect(),
         }
     }
 
@@ -791,6 +838,8 @@ impl Machine {
             .cores
             .iter()
             .all(|c| usize::from(c.kind) < self.kinds.len());
+        // `BootMembership`'s flags: none but those defined (D-149).
+        let kinds = kinds && self.membership.flags & !dodos_abi::BOOT_MEMBERSHIP_FLAGS == 0;
         let windows = self.boot_nodes.as_ref().is_none_or(|(_, nodes)| {
             nodes
                 .iter()
@@ -864,7 +913,9 @@ impl Machine {
         // The layout leaves no core firmware booted in no node (Start-up
         // state: the kernel refuses to start if `BootNodes` "leaves the core
         // firmware booted in no node").
-        let boot_core_placed = named.contains(&booted[0]);
+        // A bootstrap core of class 0 kept out of every node of a machine
+        // of several nodes stays in the park stub (D-149).
+        let boot_core_placed = named.contains(&booted[0]) || self.kept_out(booted[0]);
         if !slots_ok || !domains_ok || nodes.len() > n as usize || !fits || !boot_core_placed {
             return Err(Refusal::Nodes);
         }
@@ -1094,7 +1145,8 @@ impl Machine {
         let fence: Vec<u8> = self
             .core_list()
             .iter()
-            .map(|core| if self.monitor { 2 } else { core.fence })
+            .enumerate()
+            .map(|(number, _)| self.class(number))
             .collect();
         let booted: Vec<bool> = self.core_list().iter().map(|core| core.booted).collect();
         let class = |node: &Vec<usize>| node.iter().map(|&c| fence[c]).min().unwrap_or(0);

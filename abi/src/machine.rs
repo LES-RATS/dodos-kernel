@@ -1226,7 +1226,7 @@ pub struct BootFloors {
 
 /// The record `BootMembership` of the boot image (24 bytes): the times of
 /// Detection in milliseconds, then `SEAL_NS` and `CORE_ANSWER_NS` in
-/// milliseconds (D-129).
+/// milliseconds (D-129), then its flags (D-149).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BootMembership {
@@ -1235,8 +1235,17 @@ pub struct BootMembership {
     pub sweep_ms: u32,
     pub seal_ms: u32,
     pub core_answer_ms: u32,
-    pub reserved: u32,
+    /// `BOOT_MEMBERSHIP_*`.
+    pub flags: u32,
 }
+
+/// `BootMembership` flags bit 0: the image declares that the processor
+/// honours the bootstrap core's cleared BSP flag (`IA32_APIC_BASE` bit 8),
+/// so that a later INIT sends that core to wait for a SIPI: x86-64's
+/// bootstrap core is then of fence class 2, of class 0 otherwise (D-149).
+pub const BOOT_MEMBERSHIP_BSP_CLEARED: u32 = 1 << 0;
+/// The flags `BootMembership` defines.
+pub const BOOT_MEMBERSHIP_FLAGS: u32 = BOOT_MEMBERSHIP_BSP_CLEARED;
 
 /// The record `BootNodes` of the boot image (8 bytes), followed by one
 /// `BootNode` per node the machine start-up starts: the number of node

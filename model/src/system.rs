@@ -266,7 +266,16 @@ impl System {
     fn after(&mut self, node: u16) {
         let model = self.model(node);
         let actions = model.take_hw();
-        let table = model.table.clone();
+        let mut table = model.table.clone();
+        // G15 (D-149): `parked` lies in a kept page no node kernel maps
+        // writable, and the firmware's answers (`AFFINITY_INFO`, STOPPED)
+        // are no word of a node: a node kernel's write to them, a faulty
+        // kernel's, lands nowhere.
+        let canonical = self.table();
+        for (core, beacon) in table.core_beacons.iter_mut().enumerate() {
+            beacon.parked = canonical.core_beacons[core].parked;
+        }
+        table.stopped = canonical.stopped.clone();
         self.actions.extend(actions.into_iter().map(|a| (node, a)));
         self.share(table);
         for slot in 0..self.nodes.len() as u16 {
@@ -855,7 +864,6 @@ impl System {
 
     /// The fence's stop of a core, by the means of its architecture.
     fn stop(&mut self, core: usize) {
-        let booted = self.table().booted[core];
         match (self.machine.arch, self.hardware[core]) {
             // x86-64: the NMI. The node kernel's handler parks its core only
             // if the core's word carries the fence mark, and otherwise
@@ -869,40 +877,33 @@ impl System {
                 | Hardware::Entering
                 | Hardware::EntryStub { installed: true },
             ) if !self.marked(core) => {}
-            // A kernel that can run its handler writes the park request it
-            // reads into `parked` and returns by IRET into the park stub;
-            // the stub's own NMI handler does the same from its loop.
-            (
-                Arch::X86_64,
-                Hardware::Running
-                | Hardware::Hung { nmi: true }
-                | Hardware::Stub { .. }
-                | Hardware::Entering
-                | Hardware::EntryStub { installed: true },
-            ) => {
-                // The handler leaves VMX root operation if it is in it.
-                self.fence_record(core);
-                self.set_vmx(core, false);
-                self.write_parked(core, false);
-                self.hardware[core] = Hardware::Stub { window: false };
+            (Arch::X86_64, _) if !self.marked(core) => {}
+            // The NMI: a kernel that can run its handler writes what it can
+            // of the crash record, leaves VMX root operation if it is in it,
+            // and returns by IRET into the park stub, writing no `parked`:
+            // the NMI confirms nothing (D-149, G15). Then, every round and
+            // whatever the NMI did, INIT and the two SIPIs to a core of
+            // class 2 (INIT blocked in VMX root operation): the park stub
+            // started by a SIPI, paging off, writes `parked` in its kept
+            // page, which no node kernel maps writable, and that confirms.
+            (Arch::X86_64, hw) => {
+                if matches!(
+                    hw,
+                    Hardware::Running
+                        | Hardware::Hung { nmi: true }
+                        | Hardware::Entering
+                        | Hardware::EntryStub { installed: true }
+                ) {
+                    self.fence_record(core);
+                    self.set_vmx(core, false);
+                    self.silence(core);
+                    self.hardware[core] = Hardware::Stub { window: false };
+                }
+                if self.machine.class(core) >= 1 && !self.table().core_beacons[core].vmx {
+                    self.write_parked(core, false);
+                    self.hardware[core] = Hardware::Stub { window: false };
+                }
             }
-            // INIT (not to the bootstrap core, and blocked in VMX root
-            // operation), then the SIPIs to the park stub, which writes
-            // `parked`.
-            // The entry stub before it installed the kernel's handler: the
-            // stub's handler only returns (it writes `parked` only from its
-            // own loop, D-134), so only INIT stops it; the entry stub then
-            // reads its word, which the fence marked before its NMI.
-            (
-                Arch::X86_64,
-                Hardware::Hung { nmi: false }
-                | Hardware::WaitSipi
-                | Hardware::EntryStub { installed: false },
-            ) if !booted && !self.table().core_beacons[core].vmx => {
-                self.write_parked(core, false);
-                self.hardware[core] = Hardware::Stub { window: false };
-            }
-            (Arch::X86_64, _) => {}
             // ARM64: SDEI event 0 to a core whose kernel registered its
             // handler; the handler writes `parked` and completes the event
             // to the park routine, which calls `CPU_OFF` (a later event).
@@ -944,7 +945,7 @@ impl System {
             // way into a non-retentive suspend, where nothing keeps it; it
             // wakes a hart asleep, and the read at the return stops it; a
             // hart already stopped reads STOPPED (D-146).
-            (Arch::Riscv64, hw) if self.machine.core_list()[core].fence == 0 => match hw {
+            (Arch::Riscv64, hw) if self.machine.class(core) == 0 => match hw {
                 Hardware::Running | Hardware::Hung { nmi: true } | Hardware::Entering => {
                     self.fence_record(core);
                     self.off_unanswered(core);
@@ -1009,13 +1010,11 @@ impl System {
         }
         let request = self.table().start_requests[core];
         let Some((node, generation)) = crate::table::Table::started_node(request) else {
-            // The stub's handler interrupted its loop: it writes the park
-            // request it reads into `parked`, finds no start request, and
-            // the stub halts again.
-            // ARM64 and RISC-V: the entry stub finds no request and the
-            // core parks again, off.
+            // The stub's handler interrupted its loop, finds no start
+            // request, and the stub halts again; it writes no `parked`
+            // (D-149). ARM64 and RISC-V: the entry stub finds no request and
+            // the core parks again, off.
             if self.machine.arch == Arch::X86_64 {
-                self.write_parked(core, false);
                 self.hardware[core] = Hardware::Stub { window: true };
             }
             return;
@@ -1198,6 +1197,20 @@ impl System {
     /// The architecture of the machine.
     pub fn arch(&self) -> Arch {
         self.machine.arch
+    }
+
+    /// A faulty node kernel's gate call that asks the gate to park its
+    /// own core and write `parked` (D-149): the gate writes it only for a
+    /// sealing node's own park, the word read first; otherwise it refuses.
+    /// Says whether it parked.
+    pub fn gate_park_self(&mut self, node: u16, core: usize) -> bool {
+        let own = CoreWord::from_raw(self.table().core_words[core])
+            .is_some_and(|w| w.names(node, self.table().generation(node)));
+        if !own || self.table().member(node).state() != MemberState::Sealing {
+            return false;
+        }
+        self.park(core);
+        true
     }
 
     /// The hardware state of `core`, set by a checker test.

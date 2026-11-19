@@ -1048,8 +1048,13 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(BootMembership, sweep_ms),
         offset_of!(BootMembership, seal_ms),
         offset_of!(BootMembership, core_answer_ms),
+        offset_of!(BootMembership, flags),
     ];
-    assert_eq!(membership, [8, 12, 16]);
+    assert_eq!(membership, [8, 12, 16, 20]);
+    // D-149: bit 0 the bootstrap core's cleared BSP flag declared honoured,
+    // the only flag.
+    assert_eq!(BOOT_MEMBERSHIP_BSP_CLEARED, 1);
+    assert_eq!(BOOT_MEMBERSHIP_FLAGS, 1);
     let ring = [
         offset_of!(RingHeader, kind),
         offset_of!(RingHeader, length),

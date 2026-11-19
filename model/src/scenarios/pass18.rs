@@ -118,18 +118,19 @@ fn an_x86_64_core_in_vmx_root_that_waits_in_its_node_is_stopped_by_its_nmi() {
 }
 
 #[test]
-fn a_stale_wake_of_a_halted_park_stub_writes_the_current_park_request() {
+fn a_stale_wake_of_a_halted_park_stub_writes_no_parked() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.sys.hardware(1), Hardware::Stub { window: false });
     // A park request is raised while the stub is halted, then a stale wake
-    // reaches it: the stub's handler writes the request it reads.
+    // reaches it: the stub's NMI handler writes no `parked` (D-149: only
+    // the stub started by a SIPI writes it).
     m.sys.edit_table(|t| t.park_requests[1] += 1);
     assert_eq!(m.sys.check(), Ok(()));
     m.sys.late_wake(1);
     assert_eq!(m.sys.check(), Ok(()));
-    assert_eq!(
+    assert_ne!(
         m.sys.canonical().core_beacons[1].parked,
         m.sys.park_request(1)
     );
@@ -147,7 +148,9 @@ fn the_start_up_refuses_a_layout_that_leaves_the_core_firmware_booted_in_no_node
 #[test]
 fn one_node_of_class_0_on_more_cores_than_one_window_runs_on_the_booted_core() {
     let mut machine = machine(Arch::X86_64, 65, &[&[0]]);
-    machine.cores[0].fence = 0;
+    // The bootstrap core of class 0: its cleared BSP flag not declared
+    // honoured (D-149).
+    machine.membership.flags = 0;
     machine.cores_supported = 128;
     assert_eq!(machine.initial_nodes(), vec![vec![0]]);
     machine.cores.truncate(64);

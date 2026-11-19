@@ -1151,3 +1151,18 @@ fn a_claimed_live_level_line_masked_with_a_directed_end_of_interrupt_is_reported
         "LINE MASK: a claimed, live level line masked at its controller",
     );
 }
+
+// G15, D-149: an x86-64 core whose `parked` answers its park request under
+// a marked word while it still runs: a confirmation its own kernel made.
+#[test]
+fn an_x86_core_confirmed_while_it_runs_is_reported() {
+    let mut m = S::two();
+    let g = m.sys.member(1).generation();
+    m.sys.edit_table(|t| {
+        t.park_requests[1] += 1;
+        t.core_words[1] = CoreWord::owned(1, g).marked().raw();
+        t.core_beacons[1].parked = t.park_requests[1];
+    });
+    m.sys.push_action(0, HwAction::Stop { core: 1 });
+    machine_reported(&m, "G15: an x86-64 core confirmed while it runs");
+}

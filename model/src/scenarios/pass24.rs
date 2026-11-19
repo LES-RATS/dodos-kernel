@@ -390,6 +390,8 @@ fn resumed_over_a_dead_granter(fail: bool, unfenced: bool) -> Granted {
     g.m.run(50 * MS);
     assert_eq!(g.m.state(Y), MemberState::Sealed);
     if unfenced {
+        // In VMX root operation, where INIT is blocked (D-149).
+        g.m.sys.set_vmx(0, true);
         g.m.sys.hang(0, false);
     }
     g.m.ok(THIRD, super::pass17::kill(X));

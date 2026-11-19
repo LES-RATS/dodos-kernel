@@ -116,6 +116,16 @@ impl System {
             // fence's stop or its node's park in flight; a woken core with
             // it raised was parked by the read at its wake (`node_idle`).
             let raised = word.is_marked();
+            // G15 (D-149): an x86-64 core counted confirmed under a marked
+            // word is in the park stub, which only a SIPI started; no word
+            // its own kernel wrote confirmed it.
+            ensure(
+                self.machine.arch != crate::Arch::X86_64
+                    || !raised
+                    || table.core_beacons[core].parked != table.park_requests[core]
+                    || matches!(self.hardware(core), Hardware::Stub { .. }),
+                "G15: an x86-64 core confirmed while it runs",
+            )?;
             let in_flight = self.actions().iter().any(|&(_, a)| {
                 a == crate::nodes::HwAction::Stop { core }
                     || a == crate::nodes::HwAction::Park { core }

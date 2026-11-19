@@ -426,7 +426,11 @@ fn nodes_that_beat_are_never_accused() {
 
 #[test]
 fn a_hung_bootstrap_core_that_cannot_run_its_handler_is_unfenced() {
+    // D-149: INIT reaches the bootstrap core whose cleared BSP flag the
+    // image declares honoured; one hung in VMX root operation, where INIT
+    // is blocked, cannot be confirmed while it is.
     let mut m = S::two();
+    m.sys.set_vmx(0, true);
     m.sys.hang(0, false);
     m.ok(1, stop(0, NODE_STOP_KILL));
     m.run(FENCE_NS + MS);

@@ -1051,8 +1051,11 @@ impl Run {
                     }
                 }
             }
+            // In VMX root operation, where INIT is blocked (D-149: the
+            // bootstrap core is stopped by INIT like the others).
             Driver::Unfence => {
                 if self.healthy(0) && self.may_harm() && first(self) {
+                    self.m.sys.set_vmx(0, true);
                     self.hang(0, false);
                 }
             }

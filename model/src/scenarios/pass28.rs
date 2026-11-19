@@ -991,6 +991,80 @@ fn an_aplic_rebuild_leaves_a_level_line_acknowledged_after_its_report_working() 
     assert_eq!(state_on(&m, n), crate::IrqState::Fired);
 }
 
+// D-149, item 3, driven by a faulty kernel: on x86-64 `parked` lies in a
+// kept page no node kernel maps writable, written by the park stub started
+// by a SIPI, and the NMI confirms nothing. Node 1's core is in VMX root
+// operation, where INIT is blocked. Node 0 kills node 1; before the fence's
+// stop lands, node 1's faulty kernel writes `parked` with the park request
+// it reads, and asks its gate to park its core: the write lands nowhere and
+// the gate refuses (node 1 is not sealing). Its core then hangs, still in
+// VMX root: node 1 ends unfenced and its core is never freed. Had its write
+// confirmed it, node 1 would be fenced while it runs, and its core reused.
+#[test]
+fn a_faulty_kernel_cannot_get_its_fence_confirmed_while_it_runs() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let g = m.sys.member(1).generation();
+    m.sys.set_vmx(1, true);
+    m.ok(0, kill(1));
+    let stop_in_flight = |m: &S| {
+        m.sys
+            .actions()
+            .iter()
+            .any(|&(_, a)| a == crate::nodes::HwAction::Stop { core: 1 })
+    };
+    for _ in 0..10_000 {
+        if stop_in_flight(&m) {
+            break;
+        }
+        let event = *m.sys.events().first().expect("an event");
+        m.sys.fire(event);
+    }
+    assert!(stop_in_flight(&m));
+    let request = m.sys.park_request(1);
+    // The faulty kernel's write and its gate call.
+    m.sys.node_mut(1).table.core_beacons[1].parked = request;
+    let _ = m.call(1, Syscall::Yield);
+    assert_ne!(
+        m.sys.canonical().core_beacons[1].parked,
+        request,
+        "the write landed"
+    );
+    assert!(
+        !m.sys.gate_park_self(1, 1),
+        "the gate parked a fencing node's core"
+    );
+    m.sys.hang(1, false);
+    m.run(dodos_abi::FENCE_NS + 50 * MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    let word = dodos_abi::CoreWord::from_raw(m.sys.canonical().core_words[1]);
+    assert!(word.is_some_and(|w| w.names(1, g)), "core 1 freed");
+}
+
+// D-149, item 4: the bootstrap core whose cleared BSP flag the image does
+// not declare honoured is of class 0; on a machine of several nodes it is
+// left out of every node, stays in the park stub, and `node_start` cannot
+// use it. An undefined flag of `BootMembership` is refused.
+#[test]
+fn an_undeclared_bootstrap_core_is_kept_out_of_every_node() {
+    let mut machine = machine(Arch::X86_64, 3, &[&[1], &[2]]);
+    machine.membership.flags = 0;
+    assert_eq!(machine.class(0), 0);
+    let mut m = S::on(&machine);
+    assert_eq!(m.state(0), MemberState::Live);
+    assert_eq!(m.state(1), MemberState::Live);
+    assert!(matches!(m.sys.hardware(0), Hardware::Stub { .. }));
+    m.ok(0, kill(1));
+    m.run(100 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    assert_eq!(m.call(0, fresh(1, 1 << 0)), Err(Error::Busy), "core 0 used");
+    // Declared, the same core is stoppable by INIT; an undefined flag is
+    // refused.
+    let mut declared = super::machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    assert!(declared.class(0) > 0);
+    declared.membership.flags = 1 << 1;
+    assert!(declared.layout().is_err());
+}
+
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 
