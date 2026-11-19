@@ -23,6 +23,7 @@
 
 pub(crate) mod check;
 pub(crate) mod cpu;
+pub(crate) mod devices;
 pub(crate) mod events;
 pub(crate) mod faulty;
 pub(crate) mod grants;
@@ -138,9 +139,25 @@ pub(crate) enum Class {
     /// byte in the contract, its class following from where it lies; one
     /// state, *fixed*: never hooked to, never loose, never data.
     Kernel,
-    /// An iospace root, *live* (the small machine's iospaces have one
-    /// level: its entries are leaves).
-    IoRoot,
+    /// An iospace root 40 + `devices` (0 to 16), *live* or *dying* (the
+    /// small machine's iospaces have one level: its entries are leaves).
+    IoRoot {
+        devices: u8,
+        dying: bool,
+    },
+    /// A page of an `its_table` object (class 8), unpinned or pinned (bits
+    /// 6-7 0 or 1); no entries the gate reads.
+    ItsTable {
+        pinned: bool,
+    },
+}
+
+impl Class {
+    /// Whether the page holds entries the gate (or a walk) reads: every
+    /// class but *data* and *ITS table*.
+    pub(crate) fn has_entries(self) -> bool {
+        !matches!(self, Class::Data | Class::ItsTable { .. })
+    }
 }
 
 /// An entry of a table (gate-written: a table page is mapped writable by
@@ -306,6 +323,24 @@ pub(crate) struct OldRules {
     /// (`acked`, which a faulty node may write early), not on the use
     /// counts (D-149).
     pub(crate) r6_frees_on_acked: bool,
+    /// R1's invalidation of the interrupt entry cache covering only the
+    /// handles the walk found present (CONTRACT-GAP 32).
+    pub(crate) r1_present_handles_only: bool,
+    /// R6 on a failed unit retiring only the present entries toward the
+    /// node's cores (CONTRACT-GAP 33).
+    pub(crate) r6_retires_present_only: bool,
+    /// The identifier word freed with the attach word alone, its ITS word
+    /// unread (CONTRACT-GAP 34).
+    pub(crate) identifier_freed_by_attach_word: bool,
+    /// The holder serving an ITS unmapping whatever its ITS word reads
+    /// (CONTRACT-GAP 35).
+    pub(crate) its_unmap_unordered: bool,
+    /// The holder serving a fencing or fenced requester's records
+    /// (CONTRACT-GAP 36).
+    pub(crate) serve_fenced_requesters: bool,
+    /// An attach or a detach asked while the node's own record of the
+    /// device is open (CONTRACT-GAP 38).
+    pub(crate) concurrent_device_requests: bool,
 }
 
 /// The small machine.
@@ -328,6 +363,8 @@ pub(crate) struct Machine {
     pub(crate) parks: parks::ParkGate,
     /// Grant and use entries.
     pub(crate) grants: grants::GrantGate,
+    /// The device side's words and the unit's other caches.
+    pub(crate) dev: devices::DeviceGate,
     /// Memory reused since a translation could reach it: a page given
     /// away or turned into a table (for the checker).
     pub(crate) chunks: u64,
@@ -414,6 +451,7 @@ impl Machine {
             iotlb: BTreeMap::new(),
             parks: parks::ParkGate::new(nodes, cores),
             grants: grants::GrantGate::new(nodes),
+            dev: devices::DeviceGate::new(nodes),
             chunks,
         }
     }
@@ -548,6 +586,8 @@ pub(crate) enum Flush {
     KernelSpace,
 }
 
+#[cfg(test)]
+mod devices_tests;
 #[cfg(test)]
 mod suspend_tests;
 #[cfg(test)]

@@ -59,6 +59,12 @@ impl Machine {
         require(takeable)?;
         let g = self.gate.members[usize::from(n)].generation;
         self.parks.lines[spi] = Some((n, g));
+        // The line bitmap's bit set in the same call; the bits of lines the
+        // node no longer holds cleared lazily by its own gate, here.
+        let lines = self.parks.lines;
+        let bits = &mut self.dev.line_bits[usize::from(n)];
+        bits.retain(|&l| lines[l] == Some((n, g)));
+        bits.insert(spi);
         if !self.old.drop_bit_per_intid {
             self.parks.drop[usize::from(n)][spi] = false;
         }

@@ -5,53 +5,35 @@
 use super::*;
 
 impl Machine {
-    /// **Death**, by R-step: the member word fencing (the node's gate
-    /// refuses every write from now), its cores stopped (a stopped core
-    /// uses nothing it cached; it invalidates its whole TLB when it next
-    /// enters a node), then, after the barrier, R6: the class bytes of
-    /// every chunk taken by the generation and of its floor 0, its gate
+    /// **Death**, by R-step: the fence (`devices.rs`), R1 by the unit's
+    /// holder (a take-over first if the node held the role), then R6. A
+    /// node whose R6 is refused stays fenced (its memory not reused).
+    pub(crate) fn death(&mut self, n: u16) -> Gated {
+        self.fence(n)?;
+        self.recover(n);
+        let _ = self.r6(n);
+        Ok(())
+    }
+
+    /// **R6**, after the barrier: refused while the device side holds the
+    /// generation (`r6_devices`); the dead node's use entries freed (R3
+    /// pinned the grants to it at fenced), R6's proof on its grant entries; then the class bytes
+    /// of every chunk taken by the generation and of its floor 0, its gate
     /// words whole 0 (the kept kernel tables unchanged: "no core of X
     /// runs, and the next fresh start writes them"); the member word dead.
-    pub(crate) fn death(&mut self, n: u16) -> Gated {
+    pub(crate) fn r6(&mut self, n: u16) -> Gated {
         let member = self.gate.members[usize::from(n)];
-        require(member.state.writes() || member.state == NodeState::Sealed)?;
-        self.gate.members[usize::from(n)].state = NodeState::Fencing;
-        for p in 0..self.layout[usize::from(n)].cores.len() {
-            let core = self.core(n, p);
-            self.invalidate(core, Flush::All);
-        }
-        self.gate.members[usize::from(n)].state = NodeState::Fenced;
-        // R1 by the unit's holder: the node's devices detached, their
-        // domain invalidated at the unit's confirmation; on a failed unit a
-        // device stays attached and the node stays fenced (the barrier
-        // never holds).
-        let devices: Vec<u16> = self
-            .unit
-            .devices
-            .iter()
-            .filter(|&(_, &owner)| owner == n)
-            .map(|(&d, _)| d)
-            .collect();
-        if !devices.is_empty() && self.unit.failed {
-            return Ok(());
-        }
-        for device in devices {
-            self.unit.contexts.remove(&device);
-            self.unit.devices.remove(&device);
-        }
-        self.iotlb.retain(|&(domain, _), _| domain != n);
-        self.unit.domains[usize::from(n)] = None;
-        // The holder drops its services of the node's records at its own
-        // R0, later: a late answer may still come, judged by the record's
-        // compare-and-swap.
-        // R3 by every granter: its grants to the dead generation pinned.
-        for granter in 0..self.layout.len() {
-            for grant in self.grants.grants[granter].iter_mut().flatten() {
-                if grant.grantee == n && grant.state == grants::GrantState::Live {
-                    grant.state = grants::GrantState::Pinned;
-                }
+        require(member.state == NodeState::Fenced)?;
+        // Every refusal judged before any write: the device side, and R6's
+        // proof on each grant entry of the node (its use count; the node's
+        // own use entries, freed below, count nothing of its grants).
+        self.r6_devices_hold(n)?;
+        for slot in 0..grants::GRANTS {
+            if let Some(grant) = self.grants.grants[usize::from(n)][slot] {
+                require(self.old.r6_frees_on_acked || self.use_released(n, slot, grant))?;
             }
         }
+        self.r6_devices(n);
         // The dead node's use entries freed (its tables gone with R6 below),
         // then the granters free their pinned grants on them.
         self.grants.uses[usize::from(n)] = [None; grants::GRANTS];
@@ -75,7 +57,7 @@ impl Machine {
                 let chunk = Self::chunk_of(grant.page) as usize;
                 self.gate.grant_counts[chunk] = self.gate.grant_counts[chunk].saturating_sub(1);
             } else if self.free_grant(n, slot).is_err() {
-                return Ok(());
+                return Err(Refused::Condition);
             }
         }
         // R6, the barrier holding.
@@ -107,6 +89,7 @@ impl Machine {
                 .filter(|&q| self.gate.classes[q as usize] != Class::Data)
                 .count() as u64;
         }
+        self.forget_its_objects();
         self.gate.members[usize::from(n)].state = NodeState::Dead;
         Ok(())
     }
@@ -168,6 +151,7 @@ impl Machine {
             self.invalidate(core, Flush::All);
         }
         self.fresh_unit(n);
+        self.forget_its_objects();
         // G13: its use table emptied; its serials never reset.
         self.grants.uses[usize::from(n)] = [None; grants::GRANTS];
         self.parks.drop[usize::from(n)] = [false; parks::SPIS];
@@ -186,6 +170,16 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state == NodeState::Live)?;
         let node = &self.gate.nodes[usize::from(n)];
         require(node.requests.iter().all(|r| *r == Request::Free))?;
+        // Unit roles handed over (a target that runs; none, no seal): the
+        // role word held by the target, its service records handed with the
+        // unit.
+        if self.unit.holder == n {
+            let target = (0..self.layout.len() as u16)
+                .find(|&s| s != n && self.gate.members[usize::from(s)].state == NodeState::Live)
+                .ok_or(Refused::Condition)?;
+            self.unit.holder = target;
+            self.unit.epoch += 1;
+        }
         self.sealing(n)?;
         let kernel = self.layout[usize::from(n)].kernel_root;
         let cores = self.layout[usize::from(n)].cores.len();

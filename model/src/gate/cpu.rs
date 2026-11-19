@@ -11,7 +11,7 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state.writes())
     }
 
-    fn class(&self, page: Page) -> Gated<Class> {
+    pub(super) fn class(&self, page: Page) -> Gated<Class> {
         self.gate
             .classes
             .get(page as usize)
@@ -21,7 +21,7 @@ impl Machine {
 
     /// The compare-and-swap of a class byte: written only if it reads
     /// `before`.
-    fn cas_class(&mut self, page: Page, before: Class, after: Class) -> Gated {
+    pub(super) fn cas_class(&mut self, page: Page, before: Class, after: Class) -> Gated {
         let slot = &mut self.gate.classes[page as usize];
         if *slot != before {
             return Err(Refused::Cas);
@@ -388,7 +388,7 @@ impl Machine {
 
     /// A page back to *data*: its kernel-space leaf writable again (a
     /// change that widens rights needs no invalidation).
-    fn kernel_view_writable(&mut self, n: u16, page: Page) {
+    pub(super) fn kernel_view_writable(&mut self, n: u16, page: Page) {
         let kernel = self.layout[usize::from(n)].kernel_table;
         let slot = (Self::chunk_of(page) % ENTRIES as u64) as usize;
         let entries = self.gate.tables.get_mut(&kernel).expect("the kernel table");

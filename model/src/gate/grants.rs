@@ -169,7 +169,7 @@ impl Machine {
 
     /// Whether the use entry a grant records counts no leaf under it, or no
     /// longer names it.
-    fn use_released(&self, granter: u16, slot: usize, grant: Grant) -> bool {
+    pub(super) fn use_released(&self, granter: u16, slot: usize, grant: Grant) -> bool {
         let Some(index) = grant.use_index else {
             return true;
         };

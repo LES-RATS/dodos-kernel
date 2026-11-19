@@ -128,13 +128,87 @@ pub(crate) enum Op {
     },
     IoMap {
         n: u16,
+        root: Page,
         e: usize,
         page: Page,
     },
     IoUnmap {
         n: u16,
+        root: Page,
         entry: usize,
         e: usize,
+    },
+    IoAttach {
+        n: u16,
+        device: u16,
+        root: Page,
+        entry: usize,
+    },
+    IoDetach {
+        n: u16,
+        device: u16,
+        entry: usize,
+    },
+    IoDestroy {
+        n: u16,
+        root: Page,
+    },
+    IoTeardown {
+        n: u16,
+        root: Page,
+    },
+    ItsRetype {
+        n: u16,
+        first: Page,
+        k: u8,
+    },
+    ItsClaim {
+        n: u16,
+        device: u16,
+        first: Page,
+        entry: usize,
+    },
+    ItsUnmap {
+        n: u16,
+        device: u16,
+        entry: usize,
+    },
+    ItsDestroy {
+        n: u16,
+        first: Page,
+    },
+    ClaimMsi {
+        n: u16,
+        core: usize,
+        v: usize,
+    },
+    RemoveMsi {
+        n: u16,
+        core: usize,
+        v: usize,
+        entry: usize,
+    },
+    /// Death's steps, by the fence's driver and the unit's holder.
+    Fence {
+        n: u16,
+    },
+    TakeOver {
+        s: u16,
+    },
+    R1Start {
+        h: u16,
+        x: u16,
+    },
+    R1Unit {
+        h: u16,
+        x: u16,
+    },
+    R1Done {
+        h: u16,
+        x: u16,
+    },
+    R6 {
+        n: u16,
     },
     Accept {
         h: u16,
@@ -264,8 +338,34 @@ impl Machine {
             Op::Sealing { n } => self.sealing(n),
             Op::ParkCall { n, p } => self.park_call(n, p),
             Op::SealedCall { n, p } => self.sealed_call(n, p),
-            Op::IoMap { n, e, page } => self.io_map(n, e, page),
-            Op::IoUnmap { n, entry, e } => self.io_unmap(n, entry, e),
+            Op::IoMap { n, root, e, page } => self.io_map(n, root, e, page),
+            Op::IoUnmap { n, root, entry, e } => self.io_unmap(n, root, entry, e),
+            Op::IoAttach {
+                n,
+                device,
+                root,
+                entry,
+            } => self.iospace_attach(n, device, root, entry),
+            Op::IoDetach { n, device, entry } => self.iospace_detach(n, device, entry),
+            Op::IoDestroy { n, root } => self.io_destroy(n, root),
+            Op::IoTeardown { n, root } => self.io_teardown(n, root),
+            Op::ItsRetype { n, first, k } => self.retype_its(n, first, k),
+            Op::ItsClaim {
+                n,
+                device,
+                first,
+                entry,
+            } => self.its_claim(n, device, first, entry),
+            Op::ItsUnmap { n, device, entry } => self.its_unmap(n, device, entry),
+            Op::ItsDestroy { n, first } => self.its_destroy(n, first),
+            Op::ClaimMsi { n, core, v } => self.claim_msi(n, core, v),
+            Op::RemoveMsi { n, core, v, entry } => self.remove_msi(n, core, v, entry),
+            Op::Fence { n } => self.fence(n),
+            Op::TakeOver { s } => self.take_over(s),
+            Op::R1Start { h, x } => self.r1_start(h, x),
+            Op::R1Unit { h, x } => self.r1_unit(h, x),
+            Op::R1Done { h, x } => self.r1_done(h, x),
+            Op::R6 { n } => self.r6(n),
             Op::Accept { h, slot, entry } => self.accept(h, slot, entry),
             Op::Submit { h } => self.submit(h),
             Op::UnitCompletes { id } => self.unit_completes(id),
@@ -406,9 +506,10 @@ impl Machine {
                 }
             }
         }
-        let category = match rng.below(4) {
+        let category = match rng.below(5) {
             0 => 15,
             1 => 16,
+            2 => 17,
             _ => rng.below(15),
         };
         match category {
@@ -498,16 +599,117 @@ impl Machine {
                     _ => Op::FreeGrant { n, slot },
                 }
             }
+            17 => {
+                let device = rng.below(u64::from(devices::DEVICES)) as u16;
+                let entry = rng.below(unit::UNIT_ENTRIES as u64) as usize;
+                // Death's steps mostly by the holder, for a fenced node.
+                let fenced: Vec<u16> = (0..nodes as u16)
+                    .filter(|&x| self.gate.members[usize::from(x)].state == NodeState::Fenced)
+                    .collect();
+                let x = match fenced.is_empty() || rng.below(4) == 0 {
+                    true => rng.below(nodes) as u16,
+                    false => fenced[rng.below(fenced.len() as u64) as usize],
+                };
+                let h = match rng.below(4) {
+                    0 => n,
+                    _ => self.unit.holder,
+                };
+                let objects: Vec<Page> = self.dev.its_objects.keys().copied().collect();
+                let first = pick(rng, objects);
+                let core = match rng.below(4) {
+                    0 => rng.below(self.tlb.len() as u64) as usize,
+                    _ => self.core(n, p),
+                };
+                let v = rng.below(devices::VECTORS as u64) as usize;
+                // Half the time, the next step a healthy holder takes for a
+                // fenced node (the walk, its submission and completion,
+                // done, R6), then its fresh start once dead.
+                if !fenced.is_empty() && rng.below(2) == 0 {
+                    let word = self.dev.r1[usize::from(x)];
+                    let g = self.gate.members[usize::from(x)].generation;
+                    let end = self.r1_units(x).len();
+                    let h = self.unit.holder;
+                    let pending = self.unit.submissions.iter().position(|s| !s.complete);
+                    let confirmed = self
+                        .unit
+                        .submissions
+                        .iter()
+                        .any(|s| s.complete && s.r1.contains(&(x, g)));
+                    return match word.state {
+                        _ if !self.gate.members[usize::from(h)].state.writes() => {
+                            Op::TakeOver { s: n }
+                        }
+                        devices::R1State::Done if word.generation == g => Op::R6 { n: x },
+                        devices::R1State::Walking(c) if word.generation == g && c < end => {
+                            Op::R1Unit { h, x }
+                        }
+                        devices::R1State::Walking(_) if word.generation == g => {
+                            match (confirmed || self.unit.failed, pending) {
+                                (true, _) => Op::R1Done { h, x },
+                                (false, Some(id)) => Op::UnitCompletes { id },
+                                (false, None) => Op::Submit { h },
+                            }
+                        }
+                        _ => Op::R1Start { h, x },
+                    };
+                }
+                let dead: Vec<u16> = (0..nodes as u16)
+                    .filter(|&x| self.gate.members[usize::from(x)].state == NodeState::Dead)
+                    .collect();
+                if !dead.is_empty() && rng.below(3) == 0 {
+                    return Op::Fresh {
+                        n: dead[rng.below(dead.len() as u64) as usize],
+                    };
+                }
+                match rng.below(12) {
+                    0 => Op::ItsRetype {
+                        n,
+                        first: page,
+                        k: rng.below(3) as u8,
+                    },
+                    1 => Op::ItsClaim {
+                        n,
+                        device,
+                        first,
+                        entry,
+                    },
+                    2 => Op::ItsUnmap { n, device, entry },
+                    3 => Op::ItsDestroy { n, first },
+                    4 => Op::ClaimMsi { n, core, v },
+                    5 => Op::RemoveMsi { n, core, v, entry },
+                    6 if rng.below(40) == 0 => Op::Fence { n: x },
+                    6 => Op::TakeOver { s: n },
+                    7 => Op::R1Start { h, x },
+                    8 | 9 => Op::R1Unit { h, x },
+                    10 => match rng.below(3) {
+                        0 => Op::Submit { h },
+                        1 => Op::UnitCompletes {
+                            id: self
+                                .unit
+                                .submissions
+                                .iter()
+                                .position(|s| !s.complete)
+                                .unwrap_or(0),
+                        },
+                        _ => Op::R1Done { h, x },
+                    },
+                    _ => Op::R6 { n: x },
+                }
+            }
             15 => {
                 let mut entry = rng.below(unit::UNIT_ENTRIES as u64) as usize;
                 let mut slot = rng.below(nodes) as u16;
                 let mut e1 = e1;
                 // Mostly the unit's actual state: a present leaf, an open
                 // record, a submitted service, a gate record.
+                let ioroots: Vec<Page> = held
+                    .iter()
+                    .copied()
+                    .filter(|&q| matches!(self.gate.classes[q as usize], Class::IoRoot { .. }))
+                    .collect();
+                let ioroot = pick(rng, ioroots);
                 if rng.below(4) != 0 {
-                    if let Some(entries) = self.unit.domains[usize::from(n)]
-                        .and_then(|root| self.gate.tables.get(&root))
-                    {
+                    if let Some(entries) = self.gate.tables.get(&ioroot) {
                         let present: Vec<usize> = (0..ENTRIES)
                             .filter(|&i| matches!(entries[i], Entry::Leaf { .. }))
                             .collect();
@@ -531,15 +733,36 @@ impl Machine {
                         entry = mine[rng.below(mine.len() as u64) as usize];
                     }
                 }
+                let device = rng.below(u64::from(devices::DEVICES)) as u16;
                 match rng.below(7) {
-                    0 => Op::IoMap { n, e: e1, page },
-                    1 => Op::IoUnmap { n, entry, e: e1 },
+                    0 => Op::IoMap {
+                        n,
+                        root: ioroot,
+                        e: e1,
+                        page,
+                    },
+                    1 => Op::IoUnmap {
+                        n,
+                        root: ioroot,
+                        entry,
+                        e: e1,
+                    },
                     2 => Op::Accept { h: n, slot, entry },
-                    3 if rng.below(20) == 0 => Op::UnitFails,
+                    3 if rng.below(80) == 0 => Op::UnitFails,
                     3 if rng.below(4) == 0 => Op::Refuse { h: n, slot, entry },
                     3 if rng.below(4) == 0 => Op::IoRoot { n, page },
                     3 => Op::Submit { h: n },
-                    4 if rng.below(2) == 0 => Op::IoMap { n, e: e1, page },
+                    4 if rng.below(2) == 0 => match rng.below(4) {
+                        0 => Op::IoAttach {
+                            n,
+                            device,
+                            root: ioroot,
+                            entry,
+                        },
+                        1 => Op::IoDetach { n, device, entry },
+                        2 => Op::IoDestroy { n, root: ioroot },
+                        _ => Op::IoTeardown { n, root: ioroot },
+                    },
                     4 => Op::UnitCompletes {
                         id: rng.below(self.unit.submissions.len() as u64 + 1) as usize,
                     },

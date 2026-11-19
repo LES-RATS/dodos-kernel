@@ -34,9 +34,13 @@ fn replay_a_gate_seed() {
     else {
         return;
     };
+    let steps = std::env::var("DODOS_GATE_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
     let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
     let mut rng = Rng(seed + 1);
-    for step in 0..400 {
+    for step in 0..steps {
         let op = m.random_op(&mut rng);
         let outcome = m.step(&op);
         if outcome.is_ok() {
@@ -334,9 +338,7 @@ fn a_give_invalidates_the_kernel_space_on_idle_cores() {
 /// Node 1's iospace root again, its device attached, as its new
 /// generation's start-up does (scaffolding of the scenarios).
 fn reattach(m: &mut Machine, n: u16) {
-    let root = m.layout[usize::from(n)].floor.1 - 1;
-    m.retype_ioroot(n, root).expect("an iospace root");
-    m.attach_at_start(n, n, root);
+    m.attach_through_unit(n, n);
 }
 
 /// Steps one by one, the checker after each; the first rule broken.
@@ -361,11 +363,13 @@ fn late_answer(old: OldRules) -> Machine {
         &[
             Op::IoMap {
                 n: 1,
+                root: 15,
                 e: 0,
                 page: 12,
             },
             Op::IoUnmap {
                 n: 1,
+                root: 15,
                 entry: 0,
                 e: 0,
             },
@@ -375,7 +379,7 @@ fn late_answer(old: OldRules) -> Machine {
                 entry: 0,
             },
             Op::Submit { h: 0 },
-            Op::UnitCompletes { id: 0 },
+            Op::UnitCompletes { id: 2 },
             Op::Death { n: 1 },
             Op::Fresh { n: 1 },
         ],
@@ -387,11 +391,13 @@ fn late_answer(old: OldRules) -> Machine {
         &[
             Op::IoMap {
                 n: 1,
+                root: 15,
                 e: 0,
                 page: 12,
             },
             Op::IoUnmap {
                 n: 1,
+                root: 15,
                 entry: 0,
                 e: 0,
             },
@@ -445,16 +451,19 @@ fn a_requester_cannot_rewrite_an_open_record() {
         &[
             Op::IoMap {
                 n: 1,
+                root: 15,
                 e: 0,
                 page: 12,
             },
             Op::IoMap {
                 n: 1,
+                root: 15,
                 e: 1,
                 page: 13,
             },
             Op::IoUnmap {
                 n: 1,
+                root: 15,
                 entry: 0,
                 e: 0,
             },
@@ -464,6 +473,7 @@ fn a_requester_cannot_rewrite_an_open_record() {
     assert!(
         m.step(&Op::IoUnmap {
             n: 1,
+            root: 15,
             entry: 0,
             e: 1
         })
@@ -480,21 +490,25 @@ fn a_requester_cannot_rewrite_an_open_record() {
         &[
             Op::IoMap {
                 n: 1,
+                root: 15,
                 e: 0,
                 page: 12,
             },
             Op::IoMap {
                 n: 1,
+                root: 15,
                 e: 1,
                 page: 13,
             },
             Op::IoUnmap {
                 n: 1,
+                root: 15,
                 entry: 0,
                 e: 0,
             },
             Op::IoUnmap {
                 n: 1,
+                root: 15,
                 entry: 0,
                 e: 1,
             },
@@ -516,11 +530,13 @@ fn a_healthy_request_completes() {
             &[
                 Op::IoMap {
                     n: 1,
+                    root: 15,
                     e: 0,
                     page: 12,
                 },
                 Op::IoUnmap {
                     n: 1,
+                    root: 15,
                     entry: 0,
                     e: 0,
                 },
@@ -530,7 +546,7 @@ fn a_healthy_request_completes() {
                     entry: 0,
                 },
                 Op::Submit { h: 0 },
-                Op::UnitCompletes { id: 0 },
+                Op::UnitCompletes { id: 2 },
             ],
         )
         .expect("the steps");

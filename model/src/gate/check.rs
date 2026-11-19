@@ -9,7 +9,7 @@ use super::*;
 
 pub(crate) type Check = Result<(), String>;
 
-fn ensure(cond: bool, rule: &str) -> Check {
+pub(crate) fn ensure(cond: bool, rule: &str) -> Check {
     if cond { Ok(()) } else { Err(rule.to_string()) }
 }
 
@@ -22,6 +22,7 @@ impl Machine {
         self.check_counts()?;
         self.check_reach()?;
         self.check_device_reach()?;
+        self.check_devices()?;
         self.check_parks()
     }
 
@@ -67,7 +68,11 @@ impl Machine {
                 .iter()
                 .flatten()
                 .any(|g| g.leaves.contains(&page))
-                || self.unit.kept.contains(&(domain, page));
+                || self
+                    .unit
+                    .kept
+                    .iter()
+                    .any(|&(n, _, p)| n == domain && p == page);
             ensure(
                 present || counted,
                 "G: a device's stale translation whose count the gate lowered",
@@ -146,7 +151,7 @@ impl Machine {
         for (page, class) in self.gate.classes.iter().enumerate() {
             let has_entries = self.gate.tables.contains_key(&(page as u64));
             ensure(
-                has_entries == (*class != Class::Data),
+                has_entries == class.has_entries(),
                 "CLASS: a table's entries and its class byte disagree",
             )?;
         }
@@ -203,7 +208,7 @@ impl Machine {
         for (page, entries) in &self.gate.tables {
             if matches!(
                 self.gate.classes[*page as usize],
-                Class::Table { .. } | Class::IoRoot
+                Class::Table { .. } | Class::IoRoot { .. }
             ) {
                 for entry in entries {
                     if let Entry::Leaf { page, .. } = entry {
@@ -224,8 +229,18 @@ impl Machine {
                 }
             }
         }
-        for &(n, page) in &self.unit.kept {
-            if self.gate.members[usize::from(n)].state.writes() {
+        // CONTRACT-GAP 37 (the gate word, the cells "Unit failed": "the
+        // counts of a record answered *failed* are never lowered before the
+        // machine restarts", and "Death": "R6 writes the whole word 0"): the
+        // two cells of one table disagree for a dead node's kept counts. They
+        // agree on safety: R6 stops while an attach word of the generation
+        // reads *attached*, and a failed unit attaches nothing new, so once
+        // R6 passes no device uses a translation a kept count holds (the
+        // exploration's seed 3309 reached the cells). The model holds the
+        // kept counts of the generation that kept them only.
+        for &(n, g, page) in &self.unit.kept {
+            let m = self.gate.members[usize::from(n)];
+            if m.state.writes() && m.generation == g {
                 needed[Self::chunk_of(page) as usize] += 1;
             }
         }
