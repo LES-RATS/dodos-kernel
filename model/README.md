@@ -242,6 +242,43 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   sealed accused another in the same step (seed 867); a node starting
   afresh accused another (seed 1434).
 
+## Pass 29 (D-152): the gate from the tables of "Gate words"
+
+`model/src/gate/` (compiled for tests only) is a small machine whose state
+is the gate-written words, each a type with exactly the states of its
+table, and whose operations are the rows: one function per transition,
+with its writer, its condition and its compare-and-swap; the event columns
+are functions too (`events.rs`, death split into fence, R1 and R6 in
+`devices.rs`). The hardware caches everything it may after every step
+(TLBs and paging-structure caches, the unit's contexts and IOTLB, the ITS's
+mappings, the interrupt entry cache), and the unit's queue completes in
+order.
+
+- CPU side (`cpu.rs`): the page class byte with its hook states and the
+  free-list link, kept kernel tables, the gate word's counts, loaded roots
+  and tags, the tag table, requests, pending sets and idle words, take and
+  give.
+- Unit side (`unit.rs`, `devices.rs`): request records with operations 1
+  to 3, ITS commands and IEC invalidations; identifier, attach and domain
+  words; an iospace root's device count and *dying*; the ITS word and the
+  `its_table` object; the R1 word and both bitmaps, one unit per call;
+  remapping entries and the retired word; take-over with its rebuild and
+  the hand-over at a seal.
+- Interrupts and seals (`parks.rs`): line words and drop bits, the park
+  requests raised by the sealing call, `seal_parked`.
+- Grants (`grants.rs`), ports (`ports.rs`).
+- Faulty kernels (`faulty.rs`): every node calls any operation with any
+  arguments in any order, and writes any data page it holds; the checker
+  (`check.rs`, `check_devices`, `check_ports`: 47 rules) holds (G) and the
+  tables after every step. 200 seeds of 400 steps in `verify`; 30,000 seeds
+  of 800 steps clean (`faulty_kernels_keep_g_long_run`, ignored).
+- The nine seeds of D-150 and D-151 and the scenario of each gap below
+  fail under the old reading (`OldRules`) and hold under the tables.
+- `abi/`: the D-152 class byte, `ItsWord`, `RequestWord`, `R1Word`,
+  `SuspendWord`, `StartMachine` of 128 bytes (layout 6), `ObjectKind::ItsTable`.
+- The suspend draft (`suspend.rs`, experimental, outside the conformance
+  set): every interleaving under each variant of the open rules.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a
@@ -277,7 +314,17 @@ holder of a failed unit's role never ended), by D-145. Pass 28 found
 three: gap 23 (word 3 of a kind 9 kept while a debugger rewrites the
 control word), settled by D-147; gap 24 (the start-up's passage on a core
 of class 0 against The fence) and gap 25 (which unconfirmed cores the
-fence marks unusable), both settled by D-151. None is open. Two were settled otherwise than the
+fence marks unusable), both settled by D-151. Pass 29 found fourteen, open,
+each modelled on its most careful reading and marked in `model/src/gate/`:
+26 and 27 (a core's request: the caller's own invalidation, an unbind's
+asked set), 28 and 29 (the class byte's rows from *data*: G5's map count,
+the kernel's own writable view), 30 (counts between a give's call and its
+completion), 31 (a free-list link naming a freed table), 32 (what R1's
+invalidation covers), 33 (handles a failed unit never confirmed), 34 (an
+identifier freed under its ITS word), 35 (an ITS unmapping served before
+its mapping), 36 (a fencing requester's record served), 37 (two cells of
+the gate word's table), 38 (a second request of a device while its first
+is open), 39 (`its_table`'s kind number). Two were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the claim
 of an MSI asks every IOMMU unit of the source's segment, one after another
