@@ -46,6 +46,11 @@ pub(crate) enum Op {
         tag: usize,
         e0: usize,
     },
+    TableLink {
+        n: u16,
+        table: Page,
+        next: Option<Page>,
+    },
     TableFree {
         n: u16,
         page: Page,
@@ -241,6 +246,7 @@ impl Machine {
                 e0,
             } => self.unhook(n, p, root, tag, e0),
             Op::TableFree { n, page } => self.table_free(n, page),
+            Op::TableLink { n, table, next } => self.table_link(n, table, next),
             Op::Bind { n, tag, root } => self.bind(n, tag, root),
             Op::Load { n, p, root, tag } => self.load(n, p, root, tag),
             Op::Idle { n, p } => self.idle(n, p),
@@ -430,6 +436,11 @@ impl Machine {
                 root,
                 tag,
                 e0,
+            },
+            7 if rng.below(2) == 0 => Op::TableLink {
+                n,
+                table: child,
+                next: (rng.below(3) != 0).then_some(page),
             },
             7 => Op::TableFree { n, page },
             8 => Op::Bind { n, tag, root },

@@ -170,6 +170,7 @@ impl Machine {
                 hook: Hook::Hooked,
             },
         )?;
+        self.gate.links.remove(&child);
         self.gate.tables.get_mut(&root).expect("a root")[e0] = Entry::Table(child);
         Ok(())
     }
@@ -348,6 +349,24 @@ impl Machine {
         self.start_request(n, p, Invalidates::Range { tag, root, va }, asked, record)
     }
 
+    /// *loose* → *loose*, first word changed: `table_link(table, next)`,
+    /// both *loose*, of one kind, of the node (`next` 0 for none).
+    pub(crate) fn table_link(&mut self, n: u16, table: Page, next: Option<Page>) -> Gated {
+        self.writes(n)?;
+        let loose = Class::Table {
+            level: LEVELS - 1,
+            hook: Hook::Loose,
+        };
+        require(self.holds(n, table) && self.class(table)? == loose)?;
+        if let Some(next) = next {
+            require(next != table && self.holds(n, next) && self.class(next)? == loose)?;
+            self.gate.links.insert(table, next);
+        } else {
+            self.gate.links.remove(&table);
+        }
+        Ok(())
+    }
+
     /// *loose* → *data*: `table_free`; first word written 0; non-data − 1.
     pub(crate) fn table_free(&mut self, n: u16, page: Page) -> Gated {
         self.writes(n)?;
@@ -361,6 +380,7 @@ impl Machine {
             },
             Class::Data,
         )?;
+        self.gate.links.remove(&page);
         self.gate.tables.remove(&page);
         self.kernel_view_writable(n, page);
         Ok(())

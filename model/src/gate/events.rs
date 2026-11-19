@@ -98,6 +98,7 @@ impl Machine {
                 if self.gate.classes[page as usize] != Class::Data {
                     self.gate.classes[page as usize] = Class::Data;
                     self.gate.tables.remove(&page);
+                    self.gate.links.remove(&page);
                 }
             }
             self.gate.map_counts[chunk as usize] = 0;
@@ -129,6 +130,7 @@ impl Machine {
             if self.gate.classes[page as usize] != Class::Data {
                 self.gate.classes[page as usize] = Class::Data;
                 self.gate.tables.remove(&page);
+                self.gate.links.remove(&page);
             }
         }
         for chunk in Self::chunk_of(start)..Self::chunk_of(end) {

@@ -110,8 +110,29 @@ impl Machine {
         Ok(())
     }
 
-    /// The class byte and the non-data count.
+    /// The class byte and the non-data count; a free-list link is held
+    /// only by a *loose* table. CONTRACT-GAP 31 (the page class byte: "a
+    /// *loose* table ... whose first word holds 0 or the address of a
+    /// *loose* table"): `table_free` and the hook of a table that another
+    /// table's link names leave that link naming a data page or a hooked
+    /// table, so the statement is no invariant of the table's own
+    /// transitions; harmless, the gate reading the hook state, never the
+    /// link, at a hook. The model holds the link's source only.
     fn check_classes(&self) -> Check {
+        let loose = Class::Table {
+            level: LEVELS - 1,
+            hook: Hook::Loose,
+        };
+        for (&table, &next) in &self.gate.links {
+            let owner_runs = self.gate.members.iter().enumerate().any(|(n, m)| {
+                (m.state.writes() || m.state == NodeState::Sealed) && self.holds(n as u16, table)
+            });
+            let _ = next;
+            ensure(
+                !owner_runs || self.gate.classes[table as usize] == loose,
+                "LINK: a free-list link held by a table that is not loose",
+            )?;
+        }
         for chunk in 0..self.chunks {
             let first = chunk * PAGES_PER_CHUNK;
             let counted = (first..first + PAGES_PER_CHUNK)

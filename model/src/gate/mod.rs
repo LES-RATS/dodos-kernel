@@ -261,6 +261,9 @@ pub(crate) struct Gate {
     /// The entries of every table page, by page (a table's contents are
     /// written only by the gate).
     pub(crate) tables: BTreeMap<Page, [Entry; ENTRIES]>,
+    /// The first word of each *loose* table: 0 or the next *loose* table of
+    /// the node's free list (written only by the gate, `table_link`).
+    pub(crate) links: BTreeMap<Page, Page>,
     pub(crate) nodes: Vec<NodeGate>,
 }
 
@@ -401,6 +404,7 @@ impl Machine {
                 not_data,
                 grant_counts: vec![0; chunks as usize],
                 tables,
+                links: BTreeMap::new(),
                 nodes: nodes_gate,
             },
             kernel: Kernel::default(),
