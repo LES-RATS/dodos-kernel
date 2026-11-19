@@ -26,6 +26,7 @@ pub(crate) mod cpu;
 pub(crate) mod events;
 pub(crate) mod faulty;
 pub(crate) mod parks;
+pub(crate) mod suspend;
 pub(crate) mod unit;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -525,5 +526,7 @@ pub(crate) enum Flush {
     KernelSpace,
 }
 
+#[cfg(test)]
+mod suspend_tests;
 #[cfg(test)]
 mod tests;

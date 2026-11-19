@@ -1,0 +1,399 @@
+//! EXPERIMENTAL, not in the conformance set: the draft of whole-machine
+//! suspend and resume (Gate words; "Whole-machine suspend and resume
+//! (draft, not normative until D-153)"), executed so that its questions
+//! can be answered from what the model shows. `node_stop` mode 3 is
+//! `unsupported` in the normative text; nothing here is reached from the
+//! gate model's normative operations.
+//!
+//! A small machine: nodes of cores, IOMMU units each held by a node, the
+//! unit request records open between them, the suspend word, and the
+//! cores' states. Every interleaving of the actors' steps is enumerated
+//! (depth-first, with the states seen), under each variant of the open
+//! rules; a node may hang at any step. Two findings are recorded per
+//! variant: an isolation break (a core of a node runs while a unit that
+//! has not failed is not yet enabled again) and a wedge (a reachable state
+//! in which nobody can move, the word neither 0 nor *asleep*).
+
+use std::collections::BTreeSet;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Word {
+    Zero,
+    Suspending,
+    Asleep,
+    Resuming,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum CoreState {
+    Running,
+    Parked,
+    Hung,
+    /// Started again at the resume, not yet through its entry stub.
+    Starting,
+}
+
+/// The variants of the draft's open rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Variant {
+    /// Q3: a holder parks only once no open record names a unit it holds,
+    /// and every node only once its own records are answered (the draft's
+    /// text); `false`: a core parks at once.
+    pub(crate) serve_before_park: bool,
+    /// Q4: who may abandon at the park bound: only *S*'s gate, or any core
+    /// still running.
+    pub(crate) abandon_by_any_running: bool,
+    /// Q4: a watchdog: the first core of the lowest other live node stays
+    /// awake until *S*'s last call, which it then makes for *S* if *S* is
+    /// hung (its gate writes *resuming*).
+    pub(crate) watchdog: bool,
+    /// Q5: the firmware may refuse or return from the sleep call.
+    pub(crate) firmware_may_return: bool,
+    /// Fixed point 1 removed: the resume starts the cores before it enables
+    /// the units (D-151's text).
+    pub(crate) start_before_units: bool,
+    /// Q4: a parked core is woken at the park bound (an alarm armed by its
+    /// park), and may then abandon.
+    pub(crate) alarm_wakes_parked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct State {
+    pub(crate) word: Word,
+    /// Per core: its node and state.
+    pub(crate) cores: Vec<(usize, CoreState)>,
+    /// Per unit: its holder, whether it failed, whether enabled.
+    pub(crate) units: Vec<(usize, bool, bool)>,
+    /// Open records: (requester node, unit).
+    pub(crate) open: BTreeSet<(usize, usize)>,
+    /// The park bound passed (time, the one input the model abstracts).
+    pub(crate) bound: bool,
+    /// The core firmware resumes on.
+    pub(crate) resume_core: Option<usize>,
+}
+
+pub(crate) const S: usize = 0;
+
+impl State {
+    /// `nodes` nodes of `cores` cores; `units` units, unit *u* held by node
+    /// *u* mod *nodes*; `open` records.
+    pub(crate) fn new(nodes: usize, cores: usize, units: usize, open: &[(usize, usize)]) -> Self {
+        Self {
+            word: Word::Zero,
+            cores: (0..nodes * cores)
+                .map(|c| (c / cores, CoreState::Running))
+                .collect(),
+            units: (0..units).map(|u| (u % nodes, false, true)).collect(),
+            open: open.iter().copied().collect(),
+            bound: false,
+            resume_core: None,
+        }
+    }
+
+    fn running(&self, n: usize) -> bool {
+        self.cores
+            .iter()
+            .any(|&(m, s)| m == n && s == CoreState::Running)
+    }
+
+    fn node_hung(&self, n: usize) -> bool {
+        self.cores
+            .iter()
+            .any(|&(m, s)| m == n && s == CoreState::Hung)
+    }
+
+    fn nodes(&self) -> usize {
+        self.cores
+            .iter()
+            .map(|&(n, _)| n)
+            .max()
+            .map_or(0, |n| n + 1)
+    }
+
+    /// The first core of the watchdog node: the lowest node after *S*.
+    fn watchdog_core(&self) -> Option<usize> {
+        let node = (1..self.nodes()).next()?;
+        self.cores.iter().position(|&(n, _)| n == node)
+    }
+}
+
+/// One step of an actor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// *S*'s gate, `node_stop` mode 3: 0 → *suspending*; every *owned*
+    /// core's park request raised (fixed point 2).
+    Mode3,
+    /// A holder answers an open record of a unit it holds (or a failed
+    /// unit's records answered *failed* at once).
+    Serve { requester: usize, unit: usize },
+    /// A core parks.
+    Park { core: usize },
+    /// A core hangs (the input).
+    Hang { core: usize },
+    /// The park bound passes (time).
+    Bound,
+    /// *suspending* → *resuming*, by `core`'s gate.
+    Abandon { core: usize },
+    /// *S*'s last core: *suspending* → *asleep*, every other owned core
+    /// confirmed.
+    Sleep { core: usize },
+    /// The firmware returns from the sleep call: → *resuming*.
+    FirmwareReturns,
+    /// The wake: *asleep* → *resuming* on `core`, translation off.
+    Wake { core: usize },
+    /// The resume path enables unit `unit` (fixed point 1).
+    Enable { unit: usize },
+    /// The resume path starts core `core`.
+    Start { core: usize },
+    /// A started core passes its entry stub.
+    Enter { core: usize },
+    /// *resuming* → 0: every started core entered (fixed point 5).
+    End,
+    /// A parked core woken by its alarm at the park bound.
+    Alarm { core: usize },
+}
+
+impl State {
+    /// The steps that can be taken now under `v`.
+    pub(crate) fn steps(&self, v: Variant) -> Vec<Step> {
+        let mut out = Vec::new();
+        let s_runs = self.running(S);
+        match self.word {
+            Word::Zero => {
+                if s_runs {
+                    out.push(Step::Mode3);
+                }
+            }
+            Word::Suspending => {
+                for &(r, u) in &self.open {
+                    let (holder, failed, _) = self.units[u];
+                    if failed || self.running(holder) {
+                        out.push(Step::Serve {
+                            requester: r,
+                            unit: u,
+                        });
+                    }
+                }
+                for (core, &(n, state)) in self.cores.iter().enumerate() {
+                    if state != CoreState::Running {
+                        continue;
+                    }
+                    let holds_open = self.open.iter().any(|&(_, u)| self.units[u].0 == n);
+                    let own_open = self.open.iter().any(|&(r, _)| r == n);
+                    let may_park = !v.serve_before_park || !(holds_open || own_open);
+                    let last_of_s =
+                        n == S
+                            && self.cores.iter().enumerate().all(|(c, &(m, st))| {
+                                c == core || m != S || st == CoreState::Parked
+                            });
+                    let watchdog = v.watchdog && Some(core) == self.watchdog_core();
+                    if may_park && !last_of_s && !watchdog {
+                        out.push(Step::Park { core });
+                    }
+                    if self.bound && (n == S || v.abandon_by_any_running) {
+                        out.push(Step::Abandon { core });
+                    }
+                    let others_parked = self
+                        .cores
+                        .iter()
+                        .enumerate()
+                        .all(|(c, &(_, st))| c == core || st == CoreState::Parked);
+                    if last_of_s && others_parked && !holds_open && !own_open {
+                        out.push(Step::Sleep { core });
+                    }
+                    // The watchdog parks last, just before S's last call;
+                    // at the bound with S hung it abandons for S.
+                    if watchdog {
+                        let rest_parked = self.cores.iter().enumerate().all(|(c, &(m, st))| {
+                            c == core
+                                || st == CoreState::Parked
+                                || (m == S && st == CoreState::Running)
+                        });
+                        if rest_parked && may_park && s_runs {
+                            out.push(Step::Park { core });
+                        }
+                        if self.bound && self.node_hung(S) {
+                            out.push(Step::Abandon { core });
+                        }
+                    }
+                }
+                if !self.bound {
+                    out.push(Step::Bound);
+                }
+                if self.bound && v.alarm_wakes_parked {
+                    for (core, &(_, state)) in self.cores.iter().enumerate() {
+                        if state == CoreState::Parked {
+                            out.push(Step::Alarm { core });
+                        }
+                    }
+                }
+            }
+            Word::Asleep => {
+                if v.firmware_may_return && self.resume_core.is_none() {
+                    out.push(Step::FirmwareReturns);
+                }
+                for core in 0..self.cores.len() {
+                    out.push(Step::Wake { core });
+                }
+            }
+            Word::Resuming => {
+                let units_on = self.units.iter().all(|&(_, failed, on)| failed || on);
+                for (u, &(_, failed, on)) in self.units.iter().enumerate() {
+                    if !failed && !on {
+                        out.push(Step::Enable { unit: u });
+                    }
+                }
+                for (core, &(_, state)) in self.cores.iter().enumerate() {
+                    if state == CoreState::Parked && (units_on || v.start_before_units) {
+                        out.push(Step::Start { core });
+                    }
+                    if state == CoreState::Starting {
+                        out.push(Step::Enter { core });
+                    }
+                }
+                let back = self
+                    .cores
+                    .iter()
+                    .all(|&(_, st)| st != CoreState::Parked && st != CoreState::Starting);
+                if back {
+                    out.push(Step::End);
+                }
+            }
+        }
+        // A core may hang at any step (one hang per run: the inputs of a
+        // fault).
+        if !self.cores.iter().any(|&(_, st)| st == CoreState::Hung) {
+            for (core, &(_, state)) in self.cores.iter().enumerate() {
+                if state == CoreState::Running {
+                    out.push(Step::Hang { core });
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn take(&mut self, step: Step) {
+        match step {
+            Step::Mode3 => self.word = Word::Suspending,
+            Step::Serve { requester, unit } => {
+                self.open.remove(&(requester, unit));
+            }
+            Step::Park { core } => self.cores[core].1 = CoreState::Parked,
+            Step::Hang { core } => self.cores[core].1 = CoreState::Hung,
+            Step::Bound => self.bound = true,
+            Step::Abandon { .. } | Step::FirmwareReturns => {
+                self.word = Word::Resuming;
+                self.resume_core = None;
+            }
+            Step::Sleep { core } => {
+                self.cores[core].1 = CoreState::Parked;
+                self.word = Word::Asleep;
+                // Across the sleep the units lose their state.
+                for unit in &mut self.units {
+                    unit.2 = false;
+                }
+            }
+            Step::Wake { core } => {
+                self.word = Word::Resuming;
+                self.resume_core = Some(core);
+            }
+            Step::Enable { unit } => self.units[unit].2 = true,
+            Step::Start { core } => self.cores[core].1 = CoreState::Starting,
+            Step::Enter { core } | Step::Alarm { core } => self.cores[core].1 = CoreState::Running,
+            Step::End => {
+                self.word = Word::Zero;
+                self.bound = false;
+                self.resume_core = None;
+            }
+        }
+    }
+
+    /// Isolation (fixed point 1): no core of a node runs while a unit that
+    /// has not failed is disabled.
+    pub(crate) fn isolated(&self) -> bool {
+        let units_off = self.units.iter().any(|&(_, failed, on)| !failed && !on);
+        !(units_off && self.cores.iter().any(|&(_, st)| st == CoreState::Running))
+    }
+}
+
+/// What an exploration of a variant found.
+#[derive(Debug, Default)]
+pub(crate) struct Findings {
+    pub(crate) states: usize,
+    pub(crate) isolation: Option<Vec<Step>>,
+    pub(crate) wedge: Option<(Vec<Step>, State)>,
+    /// A wedge reached with no hang (a healthy machine wedged).
+    pub(crate) healthy_wedge: Option<Vec<Step>>,
+    /// Healthy *suspending* states (no hang) from which no healthy path
+    /// reaches the sleep: a suspend that can only be abandoned.
+    pub(crate) healthy_no_sleep: usize,
+    pub(crate) slept: bool,
+}
+
+/// Whether a path without a hang and without the bound reaches the sleep.
+fn can_sleep(start: &State, v: Variant) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![start.clone()];
+    while let Some(state) = stack.pop() {
+        if state.word == Word::Asleep {
+            return true;
+        }
+        if !seen.insert(state.clone()) || state.word != Word::Suspending {
+            continue;
+        }
+        for step in state.steps(v) {
+            if matches!(step, Step::Hang { .. } | Step::Bound | Step::Abandon { .. }) {
+                continue;
+            }
+            let mut next = state.clone();
+            next.take(step);
+            stack.push(next);
+        }
+    }
+    false
+}
+
+/// Every interleaving from `start` under `v`.
+pub(crate) fn explore(start: &State, v: Variant) -> Findings {
+    let mut seen = BTreeSet::new();
+    let mut findings = Findings::default();
+    let mut stack = vec![(start.clone(), Vec::new())];
+    while let Some((state, path)) = stack.pop() {
+        if !seen.insert(state.clone()) {
+            continue;
+        }
+        findings.states += 1;
+        if !state.isolated() && findings.isolation.is_none() {
+            findings.isolation = Some(path.clone());
+        }
+        findings.slept |= state.word == Word::Asleep;
+        let healthy = !state.cores.iter().any(|&(_, st)| st == CoreState::Hung);
+        if healthy && state.word == Word::Suspending && !can_sleep(&state, v) {
+            findings.healthy_no_sleep += 1;
+        }
+        let steps = state.steps(v);
+        let moving: Vec<Step> = steps
+            .iter()
+            .copied()
+            .filter(|s| !matches!(s, Step::Hang { .. }))
+            .collect();
+        let stuck = moving.is_empty() && !matches!(state.word, Word::Zero | Word::Asleep);
+        if stuck {
+            let hung = state.cores.iter().any(|&(_, st)| st == CoreState::Hung);
+            if !hung && findings.healthy_wedge.is_none() {
+                findings.healthy_wedge = Some(path.clone());
+            }
+            if findings.wedge.is_none() {
+                findings.wedge = Some((path.clone(), state.clone()));
+            }
+        }
+        for step in steps {
+            let mut next = state.clone();
+            next.take(step);
+            let mut p = path.clone();
+            p.push(step);
+            stack.push((next, p));
+        }
+    }
+    findings
+}
