@@ -1166,3 +1166,34 @@ fn an_x86_core_confirmed_while_it_runs_is_reported() {
     m.sys.push_action(0, HwAction::Stop { core: 1 });
     machine_reported(&m, "G15: an x86-64 core confirmed while it runs");
 }
+
+// D-147: `parked` written on ARM64 with no fence mark.
+#[test]
+fn an_arm64_parked_written_with_no_fence_mark_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::Aarch64, 2, &[&[0], &[1]]));
+    m.sys.parked_unfenced = true;
+    machine_reported(&m, "PARKED: an ARM64 parked written with no fence mark");
+}
+
+// D-149: a core whose park its firmware refused, counted confirmed.
+#[test]
+fn a_refused_core_counted_confirmed_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::Aarch64, 2, &[&[0], &[1]]));
+    m.sys.set_hardware(1, crate::system::Hardware::Refused);
+    m.sys.edit_table(|t| t.stopped[1] = t.park_requests[1]);
+    machine_reported(
+        &m,
+        "REFUSED: a core whose park was refused counted confirmed",
+    );
+}
+
+// D-149: a core running a node with an in-service bit left from its last.
+#[test]
+fn a_core_running_with_an_in_service_bit_of_its_last_node_is_reported() {
+    let mut m = S::two();
+    m.sys.in_service[1] = true;
+    machine_reported(
+        &m,
+        "ISR: a core runs a node with an in-service bit from its last one",
+    );
+}

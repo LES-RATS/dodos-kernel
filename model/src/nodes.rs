@@ -993,6 +993,22 @@ impl Model {
                     Member::new(MemberState::Unfenced, member.evidence(), member.driver(), g)
                         .with_class(member.class());
                 self.table.write_member(self.node, node, unfenced);
+                // ARM64: a core the fence leaves unconfirmed (a `DENIED`
+                // `CPU_OFF` among them) is marked unusable, as `node_stop`
+                // mode retire does (D-149). CONTRACT-GAP 25: the text names
+                // a DENIED core, which the driver cannot tell from another
+                // unconfirmed one; the model marks every one.
+                if self.machine.arch == crate::Arch::Aarch64 {
+                    for &core in &cores {
+                        let raw = self.table.core_words[core];
+                        if let Some(word) = self.table.core_word(core)
+                            && !self.park_confirmed(core)
+                            && !word.is_unusable()
+                        {
+                            self.table.write_core(core, raw, word.unusable());
+                        }
+                    }
+                }
                 return true;
             }
             return false;

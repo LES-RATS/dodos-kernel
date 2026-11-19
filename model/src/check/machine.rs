@@ -25,6 +25,11 @@ impl System {
         // that a confirmation of an earlier request is never taken for one
         // of a later stop.
         ensure(!self.park_went_back, "fence: a park request went back")?;
+        // D-147: on ARM64 `parked` is written only at a fence.
+        ensure(
+            !self.parked_unfenced,
+            "PARKED: an ARM64 parked written with no fence mark",
+        )?;
         // A node that is accused runs nothing, and its memory is being
         // reclaimed: its kernel's state is not judged against the table.
         for (slot, model) in self.models().filter(|(slot, _)| self.running_node(*slot)) {
@@ -116,6 +121,12 @@ impl System {
             // fence's stop or its node's park in flight; a woken core with
             // it raised was parked by the read at its wake (`node_idle`).
             let raised = word.is_marked();
+            // D-149: a park its firmware refused is never confirmed by it.
+            ensure(
+                self.hardware(core) != Hardware::Refused
+                    || table.stopped[core] != table.park_requests[core],
+                "REFUSED: a core whose park was refused counted confirmed",
+            )?;
             // G15 (D-149): an x86-64 core counted confirmed under a marked
             // word is in the park stub, which only a SIPI started; no word
             // its own kernel wrote confirmed it.
@@ -152,6 +163,12 @@ impl System {
             if self.hardware(core) != Hardware::Running {
                 continue;
             }
+            // D-149: no node runs on an x86-64 core whose local APIC may keep
+            // an in-service bit from its last node.
+            ensure(
+                !self.in_service.get(core).copied().unwrap_or(false),
+                "ISR: a core runs a node with an in-service bit from its last one",
+            )?;
             let (slot, generation) = (word.slot(), word.generation());
             let named = matches!(word.state(), CoreState::Owned | CoreState::Joining);
             // Every node whose kernel runs on the core is the one its word

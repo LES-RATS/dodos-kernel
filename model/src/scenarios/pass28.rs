@@ -1065,6 +1065,117 @@ fn an_undeclared_bootstrap_core_is_kept_out_of_every_node() {
     assert!(declared.layout().is_err());
 }
 
+// D-147, item 7, and D-149, item 5: the parks.
+
+/// The state of node 1 once time has passed after `act`, at most 100 ms.
+fn settle_node(m: &mut S, until: impl Fn(&S) -> bool) {
+    let start = m.sys.now();
+    while !until(m) && m.sys.now() < start + 100 * MS {
+        m.run(MS);
+    }
+}
+
+// Every ARM64 park runs the park routine through the gate, a seal's own
+// included, and writes `parked` only at a fence: node 1 seals, its cores
+// run the routine and go off, `parked` unwritten. (A seal that wrote it
+// is what the checker's rule PARKED reports.)
+#[test]
+fn an_arm64_seal_parks_through_the_park_routine_and_writes_no_parked() {
+    let mut m = S::on(&machine(Arch::Aarch64, 3, &[&[0], &[1, 2]]));
+    let parked = m.sys.canonical().core_beacons[2].parked;
+    m.ok(0, seal(1));
+    settle_node(&mut m, |m| m.state(1) == MemberState::Sealed);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    assert_eq!(m.sys.hardware(2), Hardware::Off);
+    assert_eq!(m.sys.canonical().core_beacons[2].parked, parked);
+    assert!(
+        m.sys
+            .sent
+            .iter()
+            .all(|&(_, _, a)| a != crate::nodes::HwAction::Stop { core: 2 })
+    );
+}
+
+// A `CPU_OFF` that returns `DENIED` at a seal's park, outside a fence: the
+// core writes `panic` and loops; node 1 is accused with evidence self and
+// fenced, but a `DENIED` is never confirmed: node 1 ends unfenced and the
+// core is marked unusable.
+#[test]
+fn a_denied_cpu_off_outside_a_fence_writes_panic_and_is_never_confirmed() {
+    let mut m = S::on(&machine(Arch::Aarch64, 3, &[&[0], &[1, 2]]));
+    m.sys.refuse_parks(2);
+    m.ok(0, seal(1));
+    settle_node(&mut m, |m| m.sys.hardware(2) == Hardware::Refused);
+    assert_eq!(m.sys.hardware(2), Hardware::Refused);
+    let g = m.sys.member(1).generation();
+    assert!(
+        m.sys.canonical().beacons[1]
+            .panic
+            .is_some_and(|(_, pg, _)| pg == g)
+    );
+    m.run(dodos_abi::FENCE_NS + 50 * MS);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    let word = dodos_abi::CoreWord::from_raw(m.sys.canonical().core_words[2]).unwrap();
+    assert!(word.is_unusable(), "the refusing core not marked unusable");
+}
+
+// A `DENIED` at a fence: the handler completes to the park routine, whose
+// `CPU_OFF` is refused; the loop writes `parked` through the gate, which
+// confirms nothing; the node ends unfenced.
+#[test]
+fn a_denied_cpu_off_at_a_fence_is_never_confirmed() {
+    let mut m = S::on(&machine(Arch::Aarch64, 2, &[&[0], &[1]]));
+    m.sys.refuse_parks(1);
+    m.ok(0, kill(1));
+    m.run(dodos_abi::FENCE_NS + 50 * MS);
+    assert_eq!(m.sys.hardware(1), Hardware::Refused);
+    assert_eq!(m.state(1), MemberState::Unfenced);
+    assert_eq!(
+        m.sys.canonical().core_beacons[1].parked,
+        m.sys.park_request(1)
+    );
+}
+
+// RISC-V: every park is `sbi_hart_stop`; one that returns at a seal's park
+// writes `panic` and loops; the fence confirms such a hart by `fence_hart`
+// on a hart of class 2, and leaves it unconfirmed on one of class 0.
+#[test]
+fn a_refused_hart_stop_at_a_seal_is_confirmed_by_fence_hart_only() {
+    for class in [2, 0] {
+        let mut machine = machine(Arch::Riscv64, 3, &[&[0], &[1, 2]]);
+        machine.cores[2].fence = class;
+        machine.accept_unfenced = true;
+        let mut m = S::on(&machine);
+        m.sys.refuse_parks(2);
+        m.ok(0, seal(1));
+        settle_node(&mut m, |m| m.sys.hardware(2) == Hardware::Refused);
+        assert_eq!(m.sys.hardware(2), Hardware::Refused, "class {class}");
+        m.run(dodos_abi::FENCE_NS + 50 * MS);
+        let expected = match class {
+            2 => [MemberState::Fenced, MemberState::Dead].contains(&m.state(1)),
+            _ => m.state(1) == MemberState::Unfenced,
+        };
+        assert!(expected, "class {class}: {:?}", m.state(1));
+    }
+}
+
+// D-149, item 6: an x86-64 core that enters a node without an INIT since
+// its last node writes the local APIC's EOI until no in-service bit is set,
+// before the node runs. Node 1 seals (its own park, no INIT) and resumes on
+// the same core. (Without the loop, the checker's rule ISR reports the core
+// running node 1 with an in-service bit of its sealed generation.)
+#[test]
+fn a_core_resumed_without_an_init_clears_its_in_service_bits_first() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.ok(0, seal(1));
+    settle_node(&mut m, |m| m.state(1) == MemberState::Sealed);
+    assert!(m.sys.in_service[1], "parked by its own kernel, no INIT");
+    m.ok(0, resume(1));
+    settle_node(&mut m, |m| m.state(1) == MemberState::Live);
+    assert_eq!(m.state(1), MemberState::Live);
+    assert!(!m.sys.in_service[1]);
+}
+
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 

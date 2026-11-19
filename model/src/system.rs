@@ -31,9 +31,14 @@ pub enum Hardware {
     WaitSipi,
     /// Off: ARM64 `CPU_OFF`, RISC-V STOPPED.
     Off,
-    /// ARM64: the fence's handler completed the event and its core calls
-    /// `CPU_OFF`; firmware answers OFF once the call is done.
+    /// ARM64: the park routine (`SDEI_PE_MASK`, `SDEI_EVENT_DISABLE`,
+    /// `CPU_OFF`) runs; firmware answers OFF once the call is done. Every
+    /// park runs it, through the gate (D-147).
     Parking,
+    /// A park its firmware refused: ARM64 `CPU_OFF` answered `DENIED`, or
+    /// RISC-V `sbi_hart_stop` returned; the core loops with every
+    /// exception masked, reading its core word (D-147, D-149).
+    Refused,
     /// Started for a node whose first core has not built its state yet.
     Entering,
     /// x86-64: in the kept image's entry stub, left by the park stub with a
@@ -119,6 +124,14 @@ pub struct System {
     pub sent: Vec<(u64, u16, HwAction)>,
     /// Whether a park request was ever written lower than it was.
     pub(crate) park_went_back: bool,
+    /// The cores whose firmware refuses a park (a test's input).
+    refusing: std::collections::BTreeSet<usize>,
+    /// ARM64: `parked` written for a core whose word carried no fence mark
+    /// (D-147: only at a fence).
+    pub(crate) parked_unfenced: bool,
+    /// x86-64: the cores that left a node with no INIT since, whose local
+    /// APIC may keep an in-service bit (D-149).
+    pub(crate) in_service: Vec<bool>,
     /// The common clock.
     now: u64,
 }
@@ -167,6 +180,9 @@ impl System {
             stopped: false,
             sent: Vec::new(),
             park_went_back: false,
+            refusing: Default::default(),
+            parked_unfenced: false,
+            in_service: vec![false; machine.cores.len()],
             now: 0,
         };
         system.share(table);
@@ -533,6 +549,7 @@ impl System {
                 self.act(node, action);
             }
             Event::StubHalt { core } => self.hardware[core] = Hardware::Stub { window: false },
+            Event::CpuOff { core } if self.refusing.contains(&core) => self.refused(core),
             Event::CpuOff { core } => {
                 let mut table = self.table().clone();
                 table.stopped[core] = table.park_requests[core];
@@ -810,6 +827,7 @@ impl System {
     /// the handler reads, and, on ARM64 and RISC-V once the core is off,
     /// the machine's answer to that request.
     fn write_parked(&mut self, core: usize, off: bool) {
+        self.parked_unfenced |= self.machine.arch == Arch::Aarch64 && !self.marked(core);
         let mut table = self.table().clone();
         let request = table.park_requests[core];
         table.core_beacons[core].parked = request;
@@ -902,6 +920,10 @@ impl System {
                 if self.machine.class(core) >= 1 && !self.table().core_beacons[core].vmx {
                     self.write_parked(core, false);
                     self.hardware[core] = Hardware::Stub { window: false };
+                    self.in_service[core] = false;
+                } else if matches!(self.hardware[core], Hardware::Stub { .. }) {
+                    // Into the park stub by the NMI's IRET, no INIT.
+                    self.in_service[core] = true;
                 }
             }
             // ARM64: SDEI event 0 to a core whose kernel registered its
@@ -931,6 +953,10 @@ impl System {
             (Arch::Aarch64, Hardware::Asleep { .. }) if self.marked(core) => self.rouse_one(core),
             // A core already off answers OFF to the new request at once (no
             // `CPU_ON` was sent since).
+            // A core looping after a refused `CPU_OFF`: its loop, once the
+            // word is marked, writes `parked` through the gate, which
+            // confirms nothing (D-149).
+            (Arch::Aarch64, Hardware::Refused) => self.write_parked(core, false),
             (Arch::Aarch64, Hardware::Off) => {
                 let mut table = self.table().clone();
                 table.stopped[core] = table.park_requests[core];
@@ -969,12 +995,58 @@ impl System {
         // ARM64 and RISC-V: a seal's own park (`CPU_OFF`, `sbi_hart_stop`)
         // writes no `parked`, confirmed by `AFFINITY_INFO` or STOPPED; on
         // x86-64 the park stub writes it (The fence, `node_idle`, D-146).
-        if self.machine.arch == Arch::X86_64 {
-            self.write_parked(core, false);
-            self.hardware[core] = Hardware::Stub { window: false };
-        } else {
-            self.off_unanswered(core);
+        match self.machine.arch {
+            // Into the park stub by its own kernel: no INIT.
+            Arch::X86_64 => {
+                self.write_parked(core, false);
+                self.hardware[core] = Hardware::Stub { window: false };
+                self.in_service[core] = true;
+            }
+            // Every ARM64 park runs the park routine through the gate; its
+            // `CPU_OFF` is a later event (D-147).
+            Arch::Aarch64 => {
+                self.unstarted(core);
+                self.hardware[core] = Hardware::Parking;
+            }
+            // `sbi_hart_stop` of its own hart, interrupts disabled; one that
+            // returns writes `panic` and loops (D-147).
+            Arch::Riscv64 if self.refusing.contains(&core) => self.refused(core),
+            Arch::Riscv64 => self.off_unanswered(core),
         }
+    }
+
+    /// The firmware refuses a park (a test's input): ARM64 `CPU_OFF`
+    /// answers `DENIED`, RISC-V `sbi_hart_stop` returns.
+    pub fn refuse_parks(&mut self, core: usize) {
+        self.refusing.insert(core);
+    }
+
+    /// A refused park: outside a fence the core writes `panic` for its
+    /// node, then loops with every exception masked, reading its word;
+    /// under a fence mark the ARM64 loop writes `parked` through the gate,
+    /// which confirms nothing. Never confirmed by the firmware (D-147,
+    /// D-149).
+    fn refused(&mut self, core: usize) {
+        if !self.marked(core)
+            && let Some(word) = CoreWord::from_raw(self.table().core_words[core])
+        {
+            let mut table = self.table().clone();
+            let (node, g) = (word.slot(), word.generation());
+            if (node as usize) < table.beacons.len()
+                && table.beacons[node as usize]
+                    .panic
+                    .is_none_or(|(_, pg, _)| pg != g)
+            {
+                let reason = u64::from(dodos_abi::CrashReason::Assertion as u32);
+                table.beacons[node as usize].panic = Some((reason, g, core as u32));
+                self.share(table);
+            }
+        }
+        if self.machine.arch == Arch::Aarch64 && self.marked(core) {
+            self.write_parked(core, false);
+        }
+        self.silence(core);
+        self.hardware[core] = Hardware::Refused;
     }
 
     /// A core off with no write of `parked`: `AFFINITY_INFO` or the SBI
@@ -1090,6 +1162,11 @@ impl System {
     /// builds the node's state; each core invalidates its whole TLB, clears
     /// its interrupt table and writes its word owned.
     fn enter(&mut self, core: usize, node: u16, generation: u32) {
+        // x86-64: a core that enters a node without an INIT since its last
+        // node writes the local APIC's EOI until no in-service bit is set,
+        // before the node runs (an INIT resets the local APIC, its ISR to
+        // 0: SDM §13.4.7.1, §13.4.7.3; D-149).
+        self.in_service[core] = false;
         let joining = self.table().cores_of(node, generation);
         let fresh = self.nodes[node as usize]
             .as_ref()
