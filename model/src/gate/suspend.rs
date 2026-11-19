@@ -24,6 +24,19 @@ pub(crate) enum Word {
     Resuming,
 }
 
+/// The member word of a node, as far as the draft reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Member {
+    Live,
+    /// Accused (by its own evidence, the one accusation the draft keeps
+    /// while the word is not 0): fencing.
+    Fencing,
+}
+
+/// The node of a core that belongs to no node (x86-64: a class-0 core left
+/// out of every node, parked since the start, Q10).
+pub(crate) const FREE: usize = usize::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum CoreState {
     Running,
@@ -55,6 +68,15 @@ pub(crate) struct Variant {
     /// Q4: a parked core is woken at the park bound (an alarm armed by its
     /// park), and may then abandon.
     pub(crate) alarm_wakes_parked: bool,
+    /// Q7: the entry stub returns a started core to its node only if the
+    /// member word reads live with the generation its start request names;
+    /// `false`: on the resume bit of the request alone.
+    pub(crate) stub_checks_member: bool,
+    /// Q10: the resume path starts a core of no node as it starts a node's.
+    pub(crate) start_free_cores: bool,
+    /// A node other than *S* may accuse itself at any step while the word
+    /// is not 0 (evidence self).
+    pub(crate) self_accusation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -70,6 +92,11 @@ pub(crate) struct State {
     pub(crate) bound: bool,
     /// The core firmware resumes on.
     pub(crate) resume_core: Option<usize>,
+    /// Per node: its member word and generation.
+    pub(crate) members: Vec<(Member, u32)>,
+    /// Per core: the start request the resume path wrote (node,
+    /// generation, the resume bit implied).
+    pub(crate) requests: Vec<Option<(usize, u32)>>,
 }
 
 pub(crate) const S: usize = 0;
@@ -87,7 +114,20 @@ impl State {
             open: open.iter().copied().collect(),
             bound: false,
             resume_core: None,
+            members: vec![(Member::Live, 1); nodes],
+            requests: vec![None; nodes * cores],
         }
+    }
+
+    /// The same machine with one more core, of no node, parked (Q10).
+    pub(crate) fn with_free_core(mut self) -> Self {
+        self.cores.push((FREE, CoreState::Parked));
+        self.requests.push(None);
+        self
+    }
+
+    pub(crate) fn live(&self, n: usize) -> bool {
+        n != FREE && self.members[n].0 == Member::Live
     }
 
     fn running(&self, n: usize) -> bool {
@@ -103,11 +143,7 @@ impl State {
     }
 
     fn nodes(&self) -> usize {
-        self.cores
-            .iter()
-            .map(|&(n, _)| n)
-            .max()
-            .map_or(0, |n| n + 1)
+        self.members.len()
     }
 
     /// The first core of the watchdog node: the lowest node after *S*.
@@ -151,6 +187,9 @@ pub(crate) enum Step {
     End,
     /// A parked core woken by its alarm at the park bound.
     Alarm { core: usize },
+    /// A node accuses itself (evidence self): fencing, its running cores
+    /// stopped.
+    SelfAccuse { node: usize },
 }
 
 impl State {
@@ -160,7 +199,9 @@ impl State {
         let s_runs = self.running(S);
         match self.word {
             Word::Zero => {
-                if s_runs {
+                // Every member word dead or live (a fencing node makes mode
+                // 3 `busy`).
+                if s_runs && self.members.iter().all(|m| m.0 == Member::Live) {
                     out.push(Step::Mode3);
                 }
             }
@@ -243,20 +284,36 @@ impl State {
                         out.push(Step::Enable { unit: u });
                     }
                 }
-                for (core, &(_, state)) in self.cores.iter().enumerate() {
-                    if state == CoreState::Parked && (units_on || v.start_before_units) {
+                for (core, &(n, state)) in self.cores.iter().enumerate() {
+                    let startable = self.live(n) || n == FREE && v.start_free_cores;
+                    if state == CoreState::Parked
+                        && (units_on || v.start_before_units)
+                        && startable
+                        && self.requests[core].is_none()
+                    {
                         out.push(Step::Start { core });
                     }
-                    if state == CoreState::Starting {
-                        out.push(Step::Enter { core });
-                    }
                 }
-                let back = self
-                    .cores
-                    .iter()
-                    .all(|&(_, st)| st != CoreState::Parked && st != CoreState::Starting);
+                // Back: every core of a live node entered (a node accused
+                // meanwhile is not waited for: fixed point 5).
+                let back = self.cores.iter().all(|&(n, st)| {
+                    !self.live(n) || st != CoreState::Parked && st != CoreState::Starting
+                });
                 if back {
                     out.push(Step::End);
+                }
+            }
+        }
+        // A started core runs its entry stub whatever the word reads.
+        for (core, &(_, state)) in self.cores.iter().enumerate() {
+            if state == CoreState::Starting {
+                out.push(Step::Enter { core });
+            }
+        }
+        if v.self_accusation && self.word != Word::Zero {
+            for (node, member) in self.members.iter().enumerate().skip(1) {
+                if member.0 == Member::Live {
+                    out.push(Step::SelfAccuse { node });
                 }
             }
         }
@@ -272,7 +329,7 @@ impl State {
         out
     }
 
-    pub(crate) fn take(&mut self, step: Step) {
+    pub(crate) fn take(&mut self, step: Step, v: Variant) {
         match step {
             Step::Mode3 => self.word = Word::Suspending,
             Step::Serve { requester, unit } => {
@@ -298,12 +355,43 @@ impl State {
                 self.resume_core = Some(core);
             }
             Step::Enable { unit } => self.units[unit].2 = true,
-            Step::Start { core } => self.cores[core].1 = CoreState::Starting,
-            Step::Enter { core } | Step::Alarm { core } => self.cores[core].1 = CoreState::Running,
+            Step::Start { core } => {
+                let node = self.cores[core].0;
+                self.cores[core].1 = CoreState::Starting;
+                let generation = self.members.get(node).map_or(0, |m| m.1);
+                self.requests[core] = Some((node, generation));
+            }
+            Step::Enter { core } => {
+                // The entry stub: back to its node only on a member word
+                // that reads live with the generation the request names;
+                // otherwise it parks again.
+                let node = self.cores[core].0;
+                let returns = match (node, self.requests[core]) {
+                    (FREE, _) => true,
+                    (_, Some((n, g))) => {
+                        !v.stub_checks_member || self.members[n] == (Member::Live, g)
+                    }
+                    (_, None) => false,
+                };
+                self.cores[core].1 = match returns {
+                    true => CoreState::Running,
+                    false => CoreState::Parked,
+                };
+            }
+            Step::Alarm { core } => self.cores[core].1 = CoreState::Running,
+            Step::SelfAccuse { node } => {
+                self.members[node].0 = Member::Fencing;
+                for core in self.cores.iter_mut() {
+                    if core.0 == node && core.1 == CoreState::Running {
+                        core.1 = CoreState::Parked;
+                    }
+                }
+            }
             Step::End => {
                 self.word = Word::Zero;
                 self.bound = false;
                 self.resume_core = None;
+                self.requests.iter_mut().for_each(|r| *r = None);
             }
         }
     }
@@ -328,6 +416,16 @@ pub(crate) struct Findings {
     /// reaches the sleep: a suspend that can only be abandoned.
     pub(crate) healthy_no_sleep: usize,
     pub(crate) slept: bool,
+    /// The first of those states, and the path to it.
+    pub(crate) no_sleep_example: Option<(Vec<Step>, State)>,
+    /// Q6: a core runs while the word reads *asleep*.
+    pub(crate) asleep_runner: Option<Vec<Step>>,
+    /// Q10: a core of no node runs.
+    pub(crate) free_runs: Option<Vec<Step>>,
+    /// Q10: a resume on a core of no node reached the end (0).
+    pub(crate) ended_after_free_wake: bool,
+    /// Q7: a started core returned into a node that is not live.
+    pub(crate) entered_not_live: Option<Vec<Step>>,
 }
 
 /// Whether a path without a hang and without the bound reaches the sleep.
@@ -346,7 +444,7 @@ fn can_sleep(start: &State, v: Variant) -> bool {
                 continue;
             }
             let mut next = state.clone();
-            next.take(step);
+            next.take(step, v);
             stack.push(next);
         }
     }
@@ -367,9 +465,39 @@ pub(crate) fn explore(start: &State, v: Variant) -> Findings {
             findings.isolation = Some(path.clone());
         }
         findings.slept |= state.word == Word::Asleep;
+        // Q6: while the word reads *asleep* no core runs, so nothing but
+        // the firmware's resume vector can reach the resume path.
+        let runs = |st: CoreState| matches!(st, CoreState::Running | CoreState::Hung);
+        if state.word == Word::Asleep
+            && state.cores.iter().any(|&(_, st)| runs(st))
+            && findings.asleep_runner.is_none()
+        {
+            findings.asleep_runner = Some(path.clone());
+        }
+        // Q10: a core of no node never runs a node's code.
+        if state
+            .cores
+            .iter()
+            .any(|&(n, st)| n == FREE && st == CoreState::Running)
+            && findings.free_runs.is_none()
+        {
+            findings.free_runs = Some(path.clone());
+        }
+        // Q7: no started core returns into a node that is not live.
+        if state
+            .cores
+            .iter()
+            .any(|&(n, st)| n != FREE && st == CoreState::Running && !state.live(n))
+            && findings.entered_not_live.is_none()
+        {
+            findings.entered_not_live = Some(path.clone());
+        }
         let healthy = !state.cores.iter().any(|&(_, st)| st == CoreState::Hung);
         if healthy && state.word == Word::Suspending && !can_sleep(&state, v) {
             findings.healthy_no_sleep += 1;
+            findings
+                .no_sleep_example
+                .get_or_insert_with(|| (path.clone(), state.clone()));
         }
         let steps = state.steps(v);
         let moving: Vec<Step> = steps
@@ -389,9 +517,12 @@ pub(crate) fn explore(start: &State, v: Variant) -> Findings {
         }
         for step in steps {
             let mut next = state.clone();
-            next.take(step);
+            next.take(step, v);
             let mut p = path.clone();
             p.push(step);
+            if step == Step::End && state.resume_core.is_some_and(|c| state.cores[c].0 == FREE) {
+                findings.ended_after_free_wake = true;
+            }
             stack.push((next, p));
         }
     }
