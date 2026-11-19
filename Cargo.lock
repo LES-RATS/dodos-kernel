@@ -7,8 +7,19 @@ name = "dodos-abi"
 version = "0.0.0"
 
 [[package]]
+name = "dodos-classifier"
+version = "0.0.0"
+
+[[package]]
 name = "dodos-model"
 version = "0.0.0"
 dependencies = [
  "dodos-abi",
+]
+
+[[package]]
+name = "dodos-regs"
+version = "0.0.0"
+dependencies = [
+ "dodos-classifier",
 ]

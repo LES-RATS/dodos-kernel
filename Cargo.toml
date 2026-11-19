@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["abi", "model"]
+members = ["abi", "classifier", "model", "regs"]
 
 [workspace.package]
 edition = "2024"
@@ -28,3 +28,6 @@ opt-level = 2
 # and the tests build in less time.
 [profile.dev]
 debug = "line-tables-only"
+# The classifier reads 214 MB of Arm's JSON in its tests and in `verify`.
+[profile.dev.package.dodos-classifier]
+opt-level = 2

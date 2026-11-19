@@ -1,0 +1,597 @@
+# Classification of RISC-V (RV64), from the RISC-V unified database (D-125).
+# One line per encoding: KIND NAME CLASS [REASON]. `classify items riscv64`
+# lists the encodings and the domain (see src/riscv64.rs). The class of a
+# CSR governs every CSR instruction that may write it; its pure reads are
+# allowed wherever it is `kernel` or `gate`.
+
+why UNUSED kernel-interface.md#architectures "*unused* (refused)" -- not used by the kernel
+why RV32 kernel-interface.md#architectures "*unreachable* (traps or is undefined at the kernel's level; refused anyway)" -- an RV32-only CSR; the kernel is RV64
+why MACHINE kernel-interface.md#what-it-costs-and-what-it-does-not-cover "Not covered: ... firmware (SMM, EL3, machine mode)" and kernel-interface.md#architectures "*unreachable* (traps or is undefined at the kernel's level; refused anyway)" -- machine mode
+why DEBUG-MODE kernel.md#the-write-gate-mechanisms "The trigger registers of the debug specification (`tselect`, `tdata1` to `tdata3`) are reachable only from machine mode and debug mode under Sdtrig" -- debug mode only
+why SATP kernel.md#the-write-gate-mechanisms "Forbidden outside the gate (scanned at every 2-byte offset): writes to `satp`"
+why STVEC kernel.md#the-write-gate-mechanisms "Forbidden outside the gate ...: writes to ... `stvec`"
+why SSP kernel.md#the-write-gate-mechanisms "Forbidden outside the gate ...: writes to ... `ssp`"
+why SENVCFG kernel.md#the-write-gate-mechanisms "Forbidden outside the gate ...: writes to ... `senvcfg`"
+why HYPERVISOR kernel.md#the-write-gate-mechanisms "Forbidden outside the gate ...: writes to ... the hypervisor CSRs"
+why ECALL kernel.md#the-write-gate-mechanisms "`ECALL`" and kernel-interface.md#the-rules "Firmware calls are made only by the gate"
+why SHADOW kernel.md#the-write-gate-mechanisms "the shadow-stack stores"
+why CBO-INVAL kernel.md#the-write-gate-mechanisms "`CBO.INVAL`"
+why HYPERVISOR-INSN kernel.md#the-write-gate-mechanisms "the hypervisor fences and loads"
+
+# The CSRs of the ratified table that the database lacks, all of the AIA
+# (Smaia, Ssaia): riscv/riscv-isa-manual at 5f1104a0613af80219232b1e4bc108f9ec2bd6b2,
+# src/priv/csrs.adoc. A test checks the table against the database and this
+# list when the manual is available.
+extra csr sieh 0x114 csrs.adoc:208 RV32 only
+extra csr siph 0x154 csrs.adoc:225 RV32 only
+extra csr stopei 0x15C csrs.adoc:226
+extra csr stopi 0xDB0 csrs.adoc:228
+extra csr vsieh 0x214 csrs.adoc:342 RV32 only
+extra csr vsiph 0x254 csrs.adoc:348 RV32 only
+extra csr vstopei 0x25C csrs.adoc:349
+extra csr vstopi 0xEB0 csrs.adoc:351
+extra csr hvien 0x608 csrs.adoc:289
+extra csr hvictl 0x609 csrs.adoc:290
+extra csr hidelegh 0x613 csrs.adoc:292 RV32 only
+extra csr hvienh 0x618 csrs.adoc:293 RV32 only
+extra csr hviprio1 0x646 csrs.adoc:294
+extra csr hviprio2 0x647 csrs.adoc:295
+extra csr hviph 0x655 csrs.adoc:305 RV32 only
+extra csr hviprio1h 0x656 csrs.adoc:296 RV32 only
+extra csr hviprio2h 0x657 csrs.adoc:297 RV32 only
+extra csr mvien 0x308 csrs.adoc:400
+extra csr mvip 0x309 csrs.adoc:401
+extra csr midelegh 0x313 csrs.adoc:404 RV32 only
+extra csr mieh 0x314 csrs.adoc:405 RV32 only
+extra csr mvienh 0x318 csrs.adoc:406 RV32 only
+extra csr mviph 0x319 csrs.adoc:407 RV32 only
+extra csr miph 0x354 csrs.adoc:418 RV32 only
+extra csr mtopei 0x35C csrs.adoc:419
+extra csr mtopi 0xFB0 csrs.adoc:420
+
+csr sieh unreachable RV32
+csr siph unreachable RV32
+csr stopei kernel   # claims this hart's top external interrupt
+csr stopi kernel
+csr vsieh unreachable RV32
+csr vsiph unreachable RV32
+csr vstopei gate HYPERVISOR
+csr vstopi gate HYPERVISOR
+csr hvien gate HYPERVISOR
+csr hvictl gate HYPERVISOR
+csr hidelegh unreachable RV32
+csr hvienh unreachable RV32
+csr hviprio1 gate HYPERVISOR
+csr hviprio2 gate HYPERVISOR
+csr hviph unreachable RV32
+csr hviprio1h unreachable RV32
+csr hviprio2h unreachable RV32
+csr mvien unreachable MACHINE
+csr mvip unreachable MACHINE
+csr midelegh unreachable RV32
+csr mieh unreachable RV32
+csr mvienh unreachable RV32
+csr mviph unreachable RV32
+csr miph unreachable RV32
+csr mtopei unreachable MACHINE
+csr mtopi unreachable MACHINE
+
+# The database.
+csr cycle kernel
+csr cycleh unreachable RV32
+csr dcsr unreachable DEBUG-MODE
+csr dpc unreachable DEBUG-MODE
+csr dscratch0 unreachable DEBUG-MODE
+csr dscratch1 unreachable DEBUG-MODE
+csr fcsr kernel
+csr fflags kernel
+csr frm kernel
+csr hcontext gate HYPERVISOR
+csr hcounteren gate HYPERVISOR
+csr hedeleg gate HYPERVISOR
+csr hedelegh unreachable RV32
+csr henvcfg gate HYPERVISOR
+csr henvcfgh unreachable RV32
+csr hgatp gate HYPERVISOR
+csr hgeie gate HYPERVISOR
+csr hgeip gate HYPERVISOR
+csr hideleg gate HYPERVISOR
+csr hie gate HYPERVISOR
+csr hip gate HYPERVISOR
+csr hpmcounter10 unused UNUSED   # performance counter
+csr hpmcounter10h unreachable RV32
+csr hpmcounter11 unused UNUSED   # performance counter
+csr hpmcounter11h unreachable RV32
+csr hpmcounter12 unused UNUSED   # performance counter
+csr hpmcounter12h unreachable RV32
+csr hpmcounter13 unused UNUSED   # performance counter
+csr hpmcounter13h unreachable RV32
+csr hpmcounter14 unused UNUSED   # performance counter
+csr hpmcounter14h unreachable RV32
+csr hpmcounter15 unused UNUSED   # performance counter
+csr hpmcounter15h unreachable RV32
+csr hpmcounter16 unused UNUSED   # performance counter
+csr hpmcounter16h unreachable RV32
+csr hpmcounter17 unused UNUSED   # performance counter
+csr hpmcounter17h unreachable RV32
+csr hpmcounter18 unused UNUSED   # performance counter
+csr hpmcounter18h unreachable RV32
+csr hpmcounter19 unused UNUSED   # performance counter
+csr hpmcounter19h unreachable RV32
+csr hpmcounter20 unused UNUSED   # performance counter
+csr hpmcounter20h unreachable RV32
+csr hpmcounter21 unused UNUSED   # performance counter
+csr hpmcounter21h unreachable RV32
+csr hpmcounter22 unused UNUSED   # performance counter
+csr hpmcounter22h unreachable RV32
+csr hpmcounter23 unused UNUSED   # performance counter
+csr hpmcounter23h unreachable RV32
+csr hpmcounter24 unused UNUSED   # performance counter
+csr hpmcounter24h unreachable RV32
+csr hpmcounter25 unused UNUSED   # performance counter
+csr hpmcounter25h unreachable RV32
+csr hpmcounter26 unused UNUSED   # performance counter
+csr hpmcounter26h unreachable RV32
+csr hpmcounter27 unused UNUSED   # performance counter
+csr hpmcounter27h unreachable RV32
+csr hpmcounter28 unused UNUSED   # performance counter
+csr hpmcounter28h unreachable RV32
+csr hpmcounter29 unused UNUSED   # performance counter
+csr hpmcounter29h unreachable RV32
+csr hpmcounter3 unused UNUSED   # performance counter
+csr hpmcounter30 unused UNUSED   # performance counter
+csr hpmcounter30h unreachable RV32
+csr hpmcounter31 unused UNUSED   # performance counter
+csr hpmcounter31h unreachable RV32
+csr hpmcounter3h unreachable RV32
+csr hpmcounter4 unused UNUSED   # performance counter
+csr hpmcounter4h unreachable RV32
+csr hpmcounter5 unused UNUSED   # performance counter
+csr hpmcounter5h unreachable RV32
+csr hpmcounter6 unused UNUSED   # performance counter
+csr hpmcounter6h unreachable RV32
+csr hpmcounter7 unused UNUSED   # performance counter
+csr hpmcounter7h unreachable RV32
+csr hpmcounter8 unused UNUSED   # performance counter
+csr hpmcounter8h unreachable RV32
+csr hpmcounter9 unused UNUSED   # performance counter
+csr hpmcounter9h unreachable RV32
+csr hstateen0 gate HYPERVISOR
+csr hstateen0h unreachable RV32
+csr hstateen1 gate HYPERVISOR
+csr hstateen1h unreachable RV32
+csr hstateen2 gate HYPERVISOR
+csr hstateen2h unreachable RV32
+csr hstateen3 gate HYPERVISOR
+csr hstateen3h unreachable RV32
+csr hstatus gate HYPERVISOR
+csr htimedelta gate HYPERVISOR
+csr htimedeltah unreachable RV32
+csr htinst gate HYPERVISOR
+csr htval gate HYPERVISOR
+csr hvip gate HYPERVISOR
+csr instret kernel
+csr instreth unreachable RV32
+csr jvt unused UNUSED   # table jumps (Zcmt) are not a feature of abi/
+csr marchid unreachable MACHINE
+csr mcause unreachable MACHINE
+csr mconfigptr unreachable MACHINE
+csr mcontext unreachable MACHINE   # trigger register
+csr mcounteren unreachable MACHINE
+csr mcountinhibit unreachable MACHINE
+csr mctrctl unreachable MACHINE
+csr mcycle unreachable MACHINE
+csr mcyclecfg unreachable MACHINE
+csr mcyclecfgh unreachable MACHINE
+csr mcycleh unreachable RV32
+csr medeleg unreachable MACHINE
+csr medelegh unreachable RV32
+csr menvcfg unreachable MACHINE
+csr menvcfgh unreachable RV32
+csr mepc unreachable MACHINE
+csr mhartid unreachable MACHINE
+csr mhpmcounter10 unreachable MACHINE
+csr mhpmcounter10h unreachable RV32
+csr mhpmcounter11 unreachable MACHINE
+csr mhpmcounter11h unreachable RV32
+csr mhpmcounter12 unreachable MACHINE
+csr mhpmcounter12h unreachable RV32
+csr mhpmcounter13 unreachable MACHINE
+csr mhpmcounter13h unreachable RV32
+csr mhpmcounter14 unreachable MACHINE
+csr mhpmcounter14h unreachable RV32
+csr mhpmcounter15 unreachable MACHINE
+csr mhpmcounter15h unreachable RV32
+csr mhpmcounter16 unreachable MACHINE
+csr mhpmcounter16h unreachable RV32
+csr mhpmcounter17 unreachable MACHINE
+csr mhpmcounter17h unreachable RV32
+csr mhpmcounter18 unreachable MACHINE
+csr mhpmcounter18h unreachable RV32
+csr mhpmcounter19 unreachable MACHINE
+csr mhpmcounter19h unreachable RV32
+csr mhpmcounter20 unreachable MACHINE
+csr mhpmcounter20h unreachable RV32
+csr mhpmcounter21 unreachable MACHINE
+csr mhpmcounter21h unreachable RV32
+csr mhpmcounter22 unreachable MACHINE
+csr mhpmcounter22h unreachable RV32
+csr mhpmcounter23 unreachable MACHINE
+csr mhpmcounter23h unreachable RV32
+csr mhpmcounter24 unreachable MACHINE
+csr mhpmcounter24h unreachable RV32
+csr mhpmcounter25 unreachable MACHINE
+csr mhpmcounter25h unreachable RV32
+csr mhpmcounter26 unreachable MACHINE
+csr mhpmcounter26h unreachable RV32
+csr mhpmcounter27 unreachable MACHINE
+csr mhpmcounter27h unreachable RV32
+csr mhpmcounter28 unreachable MACHINE
+csr mhpmcounter28h unreachable RV32
+csr mhpmcounter29 unreachable MACHINE
+csr mhpmcounter29h unreachable RV32
+csr mhpmcounter3 unreachable MACHINE
+csr mhpmcounter30 unreachable MACHINE
+csr mhpmcounter30h unreachable RV32
+csr mhpmcounter31 unreachable MACHINE
+csr mhpmcounter31h unreachable RV32
+csr mhpmcounter3h unreachable RV32
+csr mhpmcounter4 unreachable MACHINE
+csr mhpmcounter4h unreachable RV32
+csr mhpmcounter5 unreachable MACHINE
+csr mhpmcounter5h unreachable RV32
+csr mhpmcounter6 unreachable MACHINE
+csr mhpmcounter6h unreachable RV32
+csr mhpmcounter7 unreachable MACHINE
+csr mhpmcounter7h unreachable RV32
+csr mhpmcounter8 unreachable MACHINE
+csr mhpmcounter8h unreachable RV32
+csr mhpmcounter9 unreachable MACHINE
+csr mhpmcounter9h unreachable RV32
+csr mhpmevent10 unreachable MACHINE
+csr mhpmevent10h unreachable RV32
+csr mhpmevent11 unreachable MACHINE
+csr mhpmevent11h unreachable RV32
+csr mhpmevent12 unreachable MACHINE
+csr mhpmevent12h unreachable RV32
+csr mhpmevent13 unreachable MACHINE
+csr mhpmevent13h unreachable RV32
+csr mhpmevent14 unreachable MACHINE
+csr mhpmevent14h unreachable RV32
+csr mhpmevent15 unreachable MACHINE
+csr mhpmevent15h unreachable RV32
+csr mhpmevent16 unreachable MACHINE
+csr mhpmevent16h unreachable RV32
+csr mhpmevent17 unreachable MACHINE
+csr mhpmevent17h unreachable RV32
+csr mhpmevent18 unreachable MACHINE
+csr mhpmevent18h unreachable RV32
+csr mhpmevent19 unreachable MACHINE
+csr mhpmevent19h unreachable RV32
+csr mhpmevent20 unreachable MACHINE
+csr mhpmevent20h unreachable RV32
+csr mhpmevent21 unreachable MACHINE
+csr mhpmevent21h unreachable RV32
+csr mhpmevent22 unreachable MACHINE
+csr mhpmevent22h unreachable RV32
+csr mhpmevent23 unreachable MACHINE
+csr mhpmevent23h unreachable RV32
+csr mhpmevent24 unreachable MACHINE
+csr mhpmevent24h unreachable RV32
+csr mhpmevent25 unreachable MACHINE
+csr mhpmevent25h unreachable RV32
+csr mhpmevent26 unreachable MACHINE
+csr mhpmevent26h unreachable RV32
+csr mhpmevent27 unreachable MACHINE
+csr mhpmevent27h unreachable RV32
+csr mhpmevent28 unreachable MACHINE
+csr mhpmevent28h unreachable RV32
+csr mhpmevent29 unreachable MACHINE
+csr mhpmevent29h unreachable RV32
+csr mhpmevent3 unreachable MACHINE
+csr mhpmevent30 unreachable MACHINE
+csr mhpmevent30h unreachable RV32
+csr mhpmevent31 unreachable MACHINE
+csr mhpmevent31h unreachable RV32
+csr mhpmevent3h unreachable RV32
+csr mhpmevent4 unreachable MACHINE
+csr mhpmevent4h unreachable RV32
+csr mhpmevent5 unreachable MACHINE
+csr mhpmevent5h unreachable RV32
+csr mhpmevent6 unreachable MACHINE
+csr mhpmevent6h unreachable RV32
+csr mhpmevent7 unreachable MACHINE
+csr mhpmevent7h unreachable RV32
+csr mhpmevent8 unreachable MACHINE
+csr mhpmevent8h unreachable RV32
+csr mhpmevent9 unreachable MACHINE
+csr mhpmevent9h unreachable RV32
+csr mideleg unreachable MACHINE
+csr mie unreachable MACHINE
+csr mimpid unreachable MACHINE
+csr minstret unreachable MACHINE
+csr minstretcfg unreachable MACHINE
+csr minstretcfgh unreachable MACHINE
+csr minstreth unreachable RV32
+csr mip unreachable MACHINE
+csr mireg unreachable MACHINE
+csr mireg2 unreachable MACHINE
+csr mireg3 unreachable MACHINE
+csr mireg4 unreachable MACHINE
+csr mireg5 unreachable MACHINE
+csr mireg6 unreachable MACHINE
+csr misa unreachable MACHINE
+csr miselect unreachable MACHINE
+csr mncause unreachable MACHINE
+csr mnepc unreachable MACHINE
+csr mnrmcfg unreachable MACHINE
+csr mnscratch unreachable MACHINE
+csr mnstatus unreachable MACHINE
+csr mrmcfg unreachable MACHINE
+csr mscontext unused UNUSED   # context for debug triggers
+csr mscratch unreachable MACHINE
+csr mseccfg unreachable MACHINE
+csr mseccfgh unreachable RV32
+csr mstateen0 unreachable MACHINE
+csr mstateen0h unreachable RV32
+csr mstateen1 unreachable MACHINE
+csr mstateen1h unreachable RV32
+csr mstateen2 unreachable MACHINE
+csr mstateen2h unreachable RV32
+csr mstateen3 unreachable MACHINE
+csr mstateen3h unreachable RV32
+csr mstatus unreachable MACHINE
+csr mstatush unreachable RV32
+csr mtinst unreachable MACHINE
+csr mtval unreachable MACHINE
+csr mtval2 unreachable MACHINE
+csr mtvec unreachable MACHINE
+csr mvendorid unreachable MACHINE
+csr pmpaddr0 unreachable MACHINE
+csr pmpaddr1 unreachable MACHINE
+csr pmpaddr10 unreachable MACHINE
+csr pmpaddr11 unreachable MACHINE
+csr pmpaddr12 unreachable MACHINE
+csr pmpaddr13 unreachable MACHINE
+csr pmpaddr14 unreachable MACHINE
+csr pmpaddr15 unreachable MACHINE
+csr pmpaddr16 unreachable MACHINE
+csr pmpaddr17 unreachable MACHINE
+csr pmpaddr18 unreachable MACHINE
+csr pmpaddr19 unreachable MACHINE
+csr pmpaddr2 unreachable MACHINE
+csr pmpaddr20 unreachable MACHINE
+csr pmpaddr21 unreachable MACHINE
+csr pmpaddr22 unreachable MACHINE
+csr pmpaddr23 unreachable MACHINE
+csr pmpaddr24 unreachable MACHINE
+csr pmpaddr25 unreachable MACHINE
+csr pmpaddr26 unreachable MACHINE
+csr pmpaddr27 unreachable MACHINE
+csr pmpaddr28 unreachable MACHINE
+csr pmpaddr29 unreachable MACHINE
+csr pmpaddr3 unreachable MACHINE
+csr pmpaddr30 unreachable MACHINE
+csr pmpaddr31 unreachable MACHINE
+csr pmpaddr32 unreachable MACHINE
+csr pmpaddr33 unreachable MACHINE
+csr pmpaddr34 unreachable MACHINE
+csr pmpaddr35 unreachable MACHINE
+csr pmpaddr36 unreachable MACHINE
+csr pmpaddr37 unreachable MACHINE
+csr pmpaddr38 unreachable MACHINE
+csr pmpaddr39 unreachable MACHINE
+csr pmpaddr4 unreachable MACHINE
+csr pmpaddr40 unreachable MACHINE
+csr pmpaddr41 unreachable MACHINE
+csr pmpaddr42 unreachable MACHINE
+csr pmpaddr43 unreachable MACHINE
+csr pmpaddr44 unreachable MACHINE
+csr pmpaddr45 unreachable MACHINE
+csr pmpaddr46 unreachable MACHINE
+csr pmpaddr47 unreachable MACHINE
+csr pmpaddr48 unreachable MACHINE
+csr pmpaddr49 unreachable MACHINE
+csr pmpaddr5 unreachable MACHINE
+csr pmpaddr50 unreachable MACHINE
+csr pmpaddr51 unreachable MACHINE
+csr pmpaddr52 unreachable MACHINE
+csr pmpaddr53 unreachable MACHINE
+csr pmpaddr54 unreachable MACHINE
+csr pmpaddr55 unreachable MACHINE
+csr pmpaddr56 unreachable MACHINE
+csr pmpaddr57 unreachable MACHINE
+csr pmpaddr58 unreachable MACHINE
+csr pmpaddr59 unreachable MACHINE
+csr pmpaddr6 unreachable MACHINE
+csr pmpaddr60 unreachable MACHINE
+csr pmpaddr61 unreachable MACHINE
+csr pmpaddr62 unreachable MACHINE
+csr pmpaddr63 unreachable MACHINE
+csr pmpaddr7 unreachable MACHINE
+csr pmpaddr8 unreachable MACHINE
+csr pmpaddr9 unreachable MACHINE
+csr pmpcfg0 unreachable MACHINE
+csr pmpcfg1 unreachable MACHINE
+csr pmpcfg10 unreachable MACHINE
+csr pmpcfg11 unreachable MACHINE
+csr pmpcfg12 unreachable MACHINE
+csr pmpcfg13 unreachable MACHINE
+csr pmpcfg14 unreachable MACHINE
+csr pmpcfg15 unreachable MACHINE
+csr pmpcfg2 unreachable MACHINE
+csr pmpcfg3 unreachable MACHINE
+csr pmpcfg4 unreachable MACHINE
+csr pmpcfg5 unreachable MACHINE
+csr pmpcfg6 unreachable MACHINE
+csr pmpcfg7 unreachable MACHINE
+csr pmpcfg8 unreachable MACHINE
+csr pmpcfg9 unreachable MACHINE
+csr satp gate SATP
+csr scause kernel
+csr scontext unused UNUSED   # context for debug triggers
+csr scounteren kernel
+csr scountinhibit unused UNUSED   # counter delegation
+csr scountovf unused UNUSED   # counter delegation
+csr sctrctl unused UNUSED   # control transfer records
+csr sctrdepth unused UNUSED   # control transfer records
+csr sctrstatus unused UNUSED   # control transfer records
+csr seed kernel
+csr senvcfg gate SENVCFG
+csr sepc kernel
+csr sie kernel
+csr sip kernel
+csr sireg kernel
+csr sireg2 kernel
+csr sireg3 kernel
+csr sireg4 kernel
+csr sireg5 kernel
+csr sireg6 kernel
+csr siselect kernel
+csr srmcfg unused UNUSED   # resource partitioning (Ssqosid)
+csr sscratch kernel
+csr ssp gate SSP
+csr sstateen0 kernel
+csr sstateen1 kernel
+csr sstateen2 kernel
+csr sstateen3 kernel
+csr sstatus kernel
+csr stimecmp kernel
+csr stimecmph unreachable RV32
+csr stval kernel
+csr stvec gate STVEC
+csr tcontrol unreachable MACHINE   # trigger register
+csr tdata1 unreachable MACHINE   # trigger register
+csr tdata2 unreachable MACHINE   # trigger register
+csr tdata3 unreachable MACHINE   # trigger register
+csr time kernel
+csr timeh unreachable RV32
+csr tinfo unreachable MACHINE   # trigger register
+csr tselect unreachable MACHINE   # trigger register
+csr vcsr kernel
+csr vl kernel
+csr vlenb kernel
+csr vsatp gate HYPERVISOR
+csr vscause gate HYPERVISOR
+csr vsctrctl gate HYPERVISOR
+csr vsepc gate HYPERVISOR
+csr vsie gate HYPERVISOR
+csr vsip gate HYPERVISOR
+csr vsireg gate HYPERVISOR
+csr vsireg2 gate HYPERVISOR
+csr vsireg3 gate HYPERVISOR
+csr vsireg4 gate HYPERVISOR
+csr vsireg5 gate HYPERVISOR
+csr vsireg6 gate HYPERVISOR
+csr vsiselect gate HYPERVISOR
+csr vsscratch gate HYPERVISOR
+csr vsstatus gate HYPERVISOR
+csr vstart kernel
+csr vstimecmp gate HYPERVISOR
+csr vstimecmph unreachable RV32
+csr vstval gate HYPERVISOR
+csr vstvec gate HYPERVISOR
+csr vtype kernel
+csr vxrm kernel
+csr vxsat kernel
+insn c.ebreak kernel
+insn c.mop.1 gate SHADOW   # the same encoding as c.sspush
+insn c.mop.11 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.mop.13 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.mop.15 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.mop.3 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.mop.5 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.mop.7 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.mop.9 kernel   # writes 0 to its destination unless an extension redefines it
+insn c.sspopchk kernel
+insn c.sspush gate SHADOW
+insn cbo.clean kernel
+insn cbo.flush kernel
+insn cbo.inval gate CBO-INVAL
+insn cbo.zero kernel
+insn csrrc unused UNUSED   # a CSR outside the database: custom or unallocated
+insn csrrci unused UNUSED   # a CSR outside the database: custom or unallocated
+insn csrrs unused UNUSED   # a CSR outside the database: custom or unallocated
+insn csrrsi unused UNUSED   # a CSR outside the database: custom or unallocated
+insn csrrw unused UNUSED   # a CSR outside the database: custom or unallocated
+insn csrrwi unused UNUSED   # a CSR outside the database: custom or unallocated
+insn dret unreachable DEBUG-MODE
+insn ebreak kernel
+insn ecall gate ECALL
+insn fence kernel
+insn fence.i kernel
+insn fence.tso kernel
+insn hfence.gvma gate HYPERVISOR-INSN
+insn hfence.vvma gate HYPERVISOR-INSN
+insn hinval.gvma gate HYPERVISOR-INSN
+insn hinval.vvma gate HYPERVISOR-INSN
+insn hlv.b gate HYPERVISOR-INSN
+insn hlv.bu gate HYPERVISOR-INSN
+insn hlv.d gate HYPERVISOR-INSN
+insn hlv.h gate HYPERVISOR-INSN
+insn hlv.hu gate HYPERVISOR-INSN
+insn hlv.w gate HYPERVISOR-INSN
+insn hlv.wu gate HYPERVISOR-INSN
+insn hlvx.hu gate HYPERVISOR-INSN
+insn hlvx.wu gate HYPERVISOR-INSN
+insn hsv.b gate HYPERVISOR-INSN
+insn hsv.d gate HYPERVISOR-INSN
+insn hsv.h gate HYPERVISOR-INSN
+insn hsv.w gate HYPERVISOR-INSN
+insn mnret unreachable MACHINE
+insn mop.r.0 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.1 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.10 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.11 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.12 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.13 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.14 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.15 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.16 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.17 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.18 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.19 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.2 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.20 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.21 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.22 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.23 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.24 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.25 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.26 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.27 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.28 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.29 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.3 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.30 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.31 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.4 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.5 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.6 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.7 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.8 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.r.9 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.0 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.1 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.2 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.3 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.4 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.5 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.6 kernel   # writes 0 to its destination unless an extension redefines it
+insn mop.rr.7 kernel   # writes 0 to its destination unless an extension redefines it
+insn mret unreachable MACHINE
+insn pause kernel
+insn sctrclr unused UNUSED   # control transfer records
+insn sfence.inval.ir kernel
+insn sfence.vma kernel   # a local invalidation, like INVLPG on x86-64
+insn sfence.w.inval kernel
+insn sinval.vma kernel
+insn sret kernel
+insn ssamoswap.d gate SHADOW
+insn ssamoswap.w gate SHADOW
+insn sspopchk kernel
+insn sspush gate SHADOW
+insn ssrdp kernel
+insn wfi kernel
+insn wrs.nto kernel
+insn wrs.sto kernel

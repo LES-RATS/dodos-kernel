@@ -4,15 +4,21 @@ set -eu
 cd "$(dirname "$0")"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+# Every test binary is built once, here; the runs below only execute them.
+cargo test --workspace --no-run
+# Rule G11 (D-125): every encoding of the pinned specifications classified
+# once; prints the counts per class and the undecided encodings. The tests
+# already fail on an unclassified encoding; this is the report.
+cargo run -q -p dodos-classifier --bin classify -- check
 # The page size is a value of the machine (D-121): the tests whose rules
 # involve the page run again on two more geometries, 16 KB pages (three
 # levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). Debugging is among
 # them: its breakpoint words are judged against the user range end. The
 # tests of membership, roles, scheduling, interrupts and tasks do not
-# depend on the page and run once, above.
-# The two runs share the binaries the first run built (the page is read at
-# run time), so they run side by side; each must pass.
+# depend on the page and run once, with the default geometry.
+# The three runs share the binaries built above (the page is read at run
+# time), so they run side by side: the 32 KB run is the longest, and the
+# other two fit beside it. Each must pass.
 geometry() {
 	DODOS_PAGE=$1 cargo test -p dodos-model --lib \
 		--test blocks --test boot --test calls \
@@ -20,9 +26,10 @@ geometry() {
 		--test gate_words --test generations --test memory \
 		--test property --test verify7_deepseek
 }
-geometry 16k &
-sixteen=$!
 geometry 32k &
 thirty_two=$!
+geometry 16k &
+sixteen=$!
+cargo test --workspace
 wait "$sixteen"
 wait "$thirty_two"
