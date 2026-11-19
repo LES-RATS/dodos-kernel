@@ -2052,8 +2052,17 @@ fn the_gate_word_holds_a_32_bit_map_count_and_the_pages_not_of_class_data() {
     assert_eq!(word.raw(), 0xFFFF_FFFF | 4096 << 32);
     assert_eq!(GateWord::from_raw(word.raw()), Some(word));
     assert_eq!(GateWord::new(0, 4097), None);
-    assert_eq!(GateWord::from_raw(1 << 45), None);
+    // D-148: bits 45-57 the grant count; a bit above 57 is refused.
+    assert_eq!(GateWord::from_raw(1 << 58), None);
+    assert_eq!(GateWord::from_raw(1 << 45).map(GateWord::grants), Some(1));
     assert_eq!(GateWord::from_raw(4097 << 32), None);
+    let granted = word.with_grants(crate::GRANT_COUNT_MAX).unwrap();
+    assert_eq!(
+        (granted.map_count(), granted.not_data(), granted.grants()),
+        (u32::MAX, 4096, crate::GRANT_COUNT_MAX)
+    );
+    assert_eq!(word.with_grants(crate::GRANT_COUNT_MAX + 1), None);
+    assert_eq!(crate::device_leaf_word(3, 2), 3 | 2 << 32);
 }
 
 /// DeepSeek F9: the MSI formats of the result of `irq_claim`.
@@ -2191,8 +2200,8 @@ fn r7_abi_survivors() {
         exec: false,
         device_type: true,
     }));
-    // #027: GateWord::from_raw rejects bit 45 set
-    assert_eq!(GateWord::from_raw((1u64 << 45) | (1u64 << 32)), None);
+    // #027, revised by D-148: GateWord::from_raw rejects a bit above 57.
+    assert_eq!(GateWord::from_raw((1u64 << 58) | (1u64 << 32)), None);
     // #030 (restated for D-128, which removed the co-hosting row): a
     // sealed word is reached only from sealing, keeping evidence and driver.
     let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);

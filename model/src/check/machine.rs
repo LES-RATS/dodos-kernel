@@ -66,7 +66,63 @@ impl System {
         self.check_grants()?;
         self.check_rings()?;
         self.check_units()?;
-        self.check_r6_proof()
+        self.check_r6_proof()?;
+        self.check_granted()
+    }
+
+    /// G4, G5 (D-148): every chunk's grant count is the live, revoking or
+    /// pinned grant entries whose anchor touches it, and so is every device
+    /// entry's; the memory under such an anchor stays its granter's, taken
+    /// by that generation, and of class data, whatever the granter's kernel
+    /// does.
+    fn check_granted(&self) -> Check {
+        let table = self.canonical();
+        let mut counts = vec![0u16; table.gate_words.len()];
+        let mut devices = vec![0u16; table.devices.len()];
+        for (granter, grants) in table.grants.iter().enumerate() {
+            for entry in grants.values() {
+                if !matches!(
+                    entry.state,
+                    GrantState::Live | GrantState::Revoking | GrantState::Pinned
+                ) {
+                    continue;
+                }
+                let (chunks, device) = table.frame_touches(&entry.anchor.frame);
+                for &chunk in &chunks {
+                    counts[chunk as usize] += 1;
+                    let g = table.generation(granter as u16);
+                    let at = chunk << table.geometry.chunk_shift();
+                    let reserve = dodos_abi::Ownership::from_raw(table.owners[chunk as usize])
+                        .is_some_and(|w| {
+                            matches!(w.owner(), dodos_abi::Owner::Reserve(j)
+                                if table.holds_reserve(granter as u16, j))
+                        });
+                    let kept = table.holds_page(at.max(entry.anchor.frame.base), granter as u16, g)
+                        || reserve
+                        || table.member(granter as u16).state() != MemberState::Live;
+                    ensure(kept, "G5: granted memory owned by another than its granter")?;
+                }
+                if let Some(index) = device {
+                    devices[index] += 1;
+                }
+                let frame = entry.anchor.frame;
+                let page = table.geometry.page();
+                let bytes = frame.pages << table.geometry.page_shift[frame.page as usize];
+                let classed = (frame.base / page..(frame.base + bytes) / page)
+                    .any(|p| table.classes.contains_key(&p));
+                ensure(
+                    !classed,
+                    "G5: a page under a grant's anchor not of class data",
+                )?;
+            }
+        }
+        let gate: Vec<u16> = (0..table.gate_words.len() as u64)
+            .map(|c| table.grant_count(c))
+            .collect();
+        ensure(
+            gate == counts && *table.device_grants == devices,
+            "G4: a grant count that is not the grants over its chunk",
+        )
     }
 
     /// Node slots and core words: "a core executes node N only while its

@@ -1240,6 +1240,42 @@ fn a_faulty_holders_early_acknowledgement_lets_no_device_reach_reused_memory() {
     );
 }
 
+// D-148, items 1 and 2, driven by a faulty kernel (the reason for the
+// decision): node 0 grants node 2 a frame of a chunk it took; node 2 holds
+// it and has not mapped it, so the chunk's map count is 0. Node 0's
+// kernel, faulty, ignores its own derivation list and asks its gate to give
+// the chunk to node 1, then to turn the granted page into a page table. The
+// gate refuses both, on the chunk's grant count and on the anchor that
+// covers the page; then node 2 maps the frame, and its mapping reaches only
+// memory node 0 still owns. (With the map count alone the give passed, and
+// node 2's mapping reached node 1's memory.)
+#[test]
+fn a_faulty_kernel_cannot_give_or_retype_granted_memory() {
+    use super::pass24::{GOT, X, Y, granted, io_map};
+    let mut g = granted(false);
+    assert_eq!(g.m.sys.canonical().map_count(g.chunk), 0, "mapped already");
+    assert_eq!(g.m.sys.canonical().grant_count(g.chunk), 1);
+    g.m.sys.make_faulty(X);
+    assert!(
+        !g.m.sys.node_mut(X).gate_give_chunk(g.chunk, 1),
+        "a granted chunk given"
+    );
+    let base = g.m.sys.node(X).frame_base(g.frame);
+    let page = base / g.m.sys.canonical().geometry.page();
+    let table = dodos_abi::PageClass::table(1).expect("a class");
+    assert!(
+        !g.m.sys.node_mut(X).gate_retype_page(page, table),
+        "a granted page retyped"
+    );
+    assert_eq!(g.m.sys.check(), Ok(()));
+    let map = io_map(&g.m, GOT);
+    g.m.ok(Y, map);
+    let word =
+        dodos_abi::Ownership::from_raw(g.m.sys.canonical().owners[g.chunk as usize]).unwrap();
+    assert_eq!(word.owner(), dodos_abi::Owner::Node(X));
+    assert_eq!(g.m.sys.check(), Ok(()));
+}
+
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 

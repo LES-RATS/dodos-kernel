@@ -366,11 +366,16 @@ fn f12_at_most_32_pending_signals_are_sent_in_one_event() {
     let g = m.sys.member(0).generation();
     let grantee_generation = m.sys.member(1).generation();
     m.sys.edit_table(|t| {
+        // The anchors on a page of node 0's floor, counted in its gate word
+        // as the owner's gate counts a grant entry it writes (D-148).
+        let mut anchor = crate::table::Anchor::test();
+        anchor.frame.base = t.floors[0][0].0;
         for grant in 0..33u16 {
+            t.add_grants(&anchor.frame, 1);
             t.grants[0].insert(
                 grant,
                 crate::table::GrantEntry {
-                    anchor: crate::table::Anchor::test(),
+                    anchor,
                     state: GrantState::Live,
                     serial: 1,
                     grantee: 1,

@@ -415,6 +415,9 @@ pub(crate) struct Table {
     /// The leaf count of each entry of the device table (G4): the leaves of
     /// its owner's tables, CPU and IOMMU, that target its pages.
     pub(crate) device_leaves: Arc<Vec<u64>>,
+    /// The grant count of each entry of the device table, bits 32-44 of
+    /// its leaf-count word in the living part, kept apart here (D-148).
+    pub(crate) device_grants: Arc<Vec<u16>>,
     /// The identifier words of the devices, by segment << 16 | identifier,
     /// as raw ownership words; one not listed is free and unclaimed.
     pub(crate) identifiers: BTreeMap<u32, u64>,
@@ -616,15 +619,83 @@ impl Table {
             .checked_add_signed(delta)
             .expect("a map count never goes below 0");
         let count = u32::try_from(count).expect("a map count fits 32 bits");
-        let word = GateWord::new(count, word.not_data()).expect("a gate word");
+        let word = GateWord::new(count, word.not_data())
+            .and_then(|w| w.with_grants(word.grants()))
+            .expect("a gate word");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
         self.gated.0 = true;
+    }
+
+    /// The chunks a frame touches, and the device entry it lies in.
+    pub(crate) fn frame_touches(&self, frame: &crate::Frame) -> (Vec<u64>, Option<usize>) {
+        let bytes = frame.pages << self.geometry.page_shift[frame.page as usize];
+        let end = frame.base + bytes.max(1) - 1;
+        let device = self.devices.iter().position(|e| {
+            e.is_used() && e.base() <= frame.base && frame.base < e.base() + (1 << e.log2())
+        });
+        match device {
+            Some(index) => (Vec::new(), Some(index)),
+            None => {
+                let shift = self.geometry.chunk_shift();
+                let chunks = (frame.base >> shift..=end >> shift)
+                    .filter(|&c| (c as usize) < self.gate_words.len())
+                    .collect();
+                (chunks, None)
+            }
+        }
+    }
+
+    /// The owner's gate raises (`delta` 1) or lowers (-1) the grant count
+    /// of every chunk, or of the device entry, a grant entry's anchor
+    /// touches, at its write and at its freeing (D-148).
+    pub(crate) fn add_grants(&mut self, frame: &crate::Frame, delta: i32) {
+        let (chunks, device) = self.frame_touches(frame);
+        for chunk in chunks {
+            let word = self.gate_word(chunk);
+            let count = (i32::from(word.grants()) + delta).max(0) as u16;
+            let word = word.with_grants(count).expect("a grant count");
+            Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
+        }
+        if let Some(index) = device {
+            let counts = Arc::make_mut(&mut self.device_grants);
+            counts[index] = (i32::from(counts[index]) + delta).max(0) as u16;
+        }
+        self.gated.0 = true;
+    }
+
+    /// The grant count of a chunk.
+    pub(crate) fn grant_count(&self, chunk: u64) -> u16 {
+        self.gate_words
+            .get(chunk as usize)
+            .and_then(|&raw| GateWord::from_raw(raw))
+            .map_or(0, GateWord::grants)
+    }
+
+    /// Whether a live, revoking or pinned grant's anchor covers page
+    /// `page`: the chunk's count when 0, else a walk of the grant tables
+    /// (G5, D-148).
+    pub(crate) fn page_granted(&self, page: u64) -> bool {
+        let at = page * self.geometry.page();
+        if self.grant_count(at >> self.geometry.chunk_shift()) == 0 {
+            return false;
+        }
+        self.grants.iter().flat_map(|g| g.values()).any(|entry| {
+            let frame = entry.anchor.frame;
+            let bytes = frame.pages << self.geometry.page_shift[frame.page as usize];
+            matches!(
+                entry.state,
+                GrantState::Live | GrantState::Revoking | GrantState::Pinned
+            ) && frame.base <= at
+                && at < frame.base + bytes
+        })
     }
 
     /// The gate writes the map count of a chunk (G13: 0 at a take; R6: 0).
     pub(crate) fn set_map_count(&mut self, chunk: u64, count: u32) {
         let word = self.gate_word(chunk);
-        let word = GateWord::new(count, word.not_data()).expect("a gate word");
+        let word = GateWord::new(count, word.not_data())
+            .and_then(|w| w.with_grants(word.grants()))
+            .expect("a gate word");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
         self.gated.0 = true;
     }
@@ -644,7 +715,9 @@ impl Table {
         }
         let word = self.gate_word(chunk);
         let not_data = u16::try_from(i32::from(word.not_data()) + delta).expect("pages of a chunk");
-        let word = GateWord::new(word.map_count(), not_data).expect("at most E pages");
+        let word = GateWord::new(word.map_count(), not_data)
+            .and_then(|w| w.with_grants(word.grants()))
+            .expect("at most E pages");
         Arc::make_mut(&mut self.gate_words)[chunk as usize] = word.raw();
         self.gated.0 = true;
     }

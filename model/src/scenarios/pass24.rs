@@ -74,7 +74,7 @@ pub(super) struct Granted {
     pub(super) use_index: u16,
 }
 
-fn granted(caching: bool) -> Granted {
+pub(super) fn granted(caching: bool) -> Granted {
     granted_by(X, caching)
 }
 

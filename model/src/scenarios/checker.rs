@@ -1220,3 +1220,45 @@ fn a_dead_generations_device_still_attached_is_reported() {
     });
     machine_reported(&m, "R6: a dead generation's device still attached");
 }
+
+// D-148: a gate word whose grant count is not the grants over its chunk.
+#[test]
+fn a_grant_count_that_is_not_the_grants_over_its_chunk_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    m.sys.edit_table(|t| {
+        let word = t.gate_word(g.chunk).with_grants(0).unwrap();
+        std::sync::Arc::make_mut(&mut t.gate_words)[g.chunk as usize] = word.raw();
+    });
+    machine_reported(
+        &m,
+        "G4: a grant count that is not the grants over its chunk",
+    );
+}
+
+// D-148: a page under a live grant's anchor of a class other than data.
+#[test]
+fn a_page_under_a_grants_anchor_not_of_class_data_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    m.sys.make_faulty(super::pass24::X);
+    let base = m.sys.node(super::pass24::X).frame_base(g.frame);
+    m.sys.edit_table(|t| {
+        let page = base / t.geometry.page();
+        t.set_class(page, Some(dodos_abi::PageClass::table(1).unwrap()));
+    });
+    machine_reported(&m, "G5: a page under a grant's anchor not of class data");
+}
+
+// D-148: granted memory given to another node while its granter is live.
+#[test]
+fn granted_memory_owned_by_another_node_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    m.sys.make_faulty(super::pass24::X);
+    m.sys.edit_table(|t| {
+        let free = dodos_abi::Ownership::free(dodos_abi::Owner::Node(1)).raw();
+        std::sync::Arc::make_mut(&mut t.owners)[g.chunk as usize] = free;
+    });
+    machine_reported(&m, "G5: granted memory owned by another than its granter");
+}

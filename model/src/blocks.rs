@@ -195,6 +195,57 @@ impl Model {
         Ok(())
     }
 
+    /// The physical address of frame object `frame` (the tests' input).
+    #[cfg(test)]
+    pub(crate) fn frame_base(&self, frame: ObjId) -> u64 {
+        self.frames[&frame].base
+    }
+
+    /// A faulty kernel's call of its gate, its derivation list ignored:
+    /// give chunk `chunk` to node `to` (D-148). The gate checks what it
+    /// owns: the chunk's owner word taken by this node's generation, its
+    /// map count and its grant count 0 (G5). Says whether it gave.
+    pub fn gate_give_chunk(&mut self, chunk: u64, to: u16) -> bool {
+        let Some(&raw) = self.table.owners.get(chunk as usize) else {
+            return false;
+        };
+        let generation = self.table.generation(self.node);
+        let owned = Ownership::from_raw(raw).is_some_and(|w| {
+            w.state() == dodos_abi::OwnState::Taken
+                && w.owner() == Owner::Node(self.node)
+                && w.generation() == generation
+        });
+        if !owned || self.table.map_count(chunk) != 0 || self.table.grant_count(chunk) != 0 {
+            return false;
+        }
+        self.table
+            .write_owner(self.node, chunk, raw, Ownership::free(Owner::Node(to)))
+    }
+
+    /// A faulty kernel's call of its gate: change page `page`, of its own
+    /// memory and of class data, to `class` (a table, say), its derivation
+    /// list ignored. The gate refuses a change away from data while a live,
+    /// revoking or pinned grant's anchor covers the page (G5, D-148). Says
+    /// whether it changed it.
+    pub fn gate_retype_page(&mut self, page: u64, class: dodos_abi::PageClass) -> bool {
+        let geometry = self.table.geometry;
+        let chunk = (page * geometry.page()) >> geometry.chunk_shift();
+        let generation = self.table.generation(self.node);
+        let owned = self.table.owners.get(chunk as usize).is_some_and(|&raw| {
+            Ownership::from_raw(raw).is_some_and(|w| {
+                w.state() == dodos_abi::OwnState::Taken
+                    && w.owner() == Owner::Node(self.node)
+                    && w.generation() == generation
+            })
+        });
+        let data = !self.table.classes.contains_key(&page);
+        if !owned || !data || self.table.page_granted(page) {
+            return false;
+        }
+        self.table.set_class(page, Some(class));
+        true
+    }
+
     /// `memory_give`: destroys the block and gives its chunks, or its
     /// device entry, to the node.
     pub(crate) fn memory_give(
@@ -329,17 +380,23 @@ impl Model {
         Ok(Output::Index(spare as u64))
     }
 
-    /// Whether a map count of the run of a block, or the leaf count of its
-    /// device entry, is not 0 (G5).
+    /// Whether a map count or a grant count of the run of a block, or the
+    /// leaf or grant count of its device entry, is not 0 (G5; D-148: the
+    /// grant count, so that a kernel that ignores its own derivation list
+    /// cannot give, split or destroy granted memory).
     pub(crate) fn mapped_block(&self, object: ObjId) -> bool {
         let untyped = &self.untypeds[&object];
         match untyped.block {
             Some(Block::Run) => {
                 let shift = self.table.geometry.chunk_shift();
                 let chunks = untyped.base >> shift..(untyped.base + untyped.bytes) >> shift;
-                chunks.into_iter().any(|c| self.table.map_count(c) != 0)
+                chunks
+                    .into_iter()
+                    .any(|c| self.table.map_count(c) != 0 || self.table.grant_count(c) != 0)
             }
-            Some(Block::Entry(index)) => self.table.device_leaves[index] != 0,
+            Some(Block::Entry(index)) => {
+                self.table.device_leaves[index] != 0 || self.table.device_grants[index] != 0
+            }
             None => false,
         }
     }

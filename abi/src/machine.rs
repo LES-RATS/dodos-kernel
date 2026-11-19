@@ -300,10 +300,16 @@ impl AttachWord {
 }
 
 /// The gate word of a chunk (G4): the map count in bits 0-31, the number of
-/// pages of the chunk not of class data in bits 32-44, the other bits 0.
+/// pages of the chunk not of class data in bits 32-44, the grant count in
+/// bits 45-57 (the live, revoking or pinned grant entries whose anchor
+/// touches the chunk, D-148), the other bits 0.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GateWord(u64);
+
+/// The largest grant count of a gate word, and of a device entry's
+/// leaf-count word (13 bits).
+pub const GRANT_COUNT_MAX: u16 = (1 << 13) - 1;
 
 impl GateWord {
     pub const fn new(map_count: u32, not_data: u16) -> Option<Self> {
@@ -313,10 +319,21 @@ impl GateWord {
         Some(Self(map_count as u64 | (not_data as u64) << 32))
     }
 
-    /// `None` for a word with a bit above 44 set, or more pages not of
+    /// The same word with grant count `grants` (D-148); `None` above
+    /// `GRANT_COUNT_MAX`.
+    pub const fn with_grants(self, grants: u16) -> Option<Self> {
+        if grants > GRANT_COUNT_MAX {
+            return None;
+        }
+        Some(Self(
+            self.0 & !((GRANT_COUNT_MAX as u64) << 45) | (grants as u64) << 45,
+        ))
+    }
+
+    /// `None` for a word with a bit above 57 set, or more pages not of
     /// class data than a chunk can have (*E* ≤ 4,096).
     pub const fn from_raw(raw: u64) -> Option<Self> {
-        if raw >> 45 != 0 || (raw >> 32) as u16 > 1 << 12 {
+        if raw >> 58 != 0 || (raw >> 32) & 0x1FFF > 1 << 12 {
             return None;
         }
         Some(Self(raw))
@@ -331,8 +348,19 @@ impl GateWord {
     }
 
     pub const fn not_data(self) -> u16 {
-        (self.0 >> 32) as u16
+        ((self.0 >> 32) & 0x1FFF) as u16
     }
+
+    /// The grant count (D-148).
+    pub const fn grants(self) -> u16 {
+        ((self.0 >> 45) & GRANT_COUNT_MAX as u64) as u16
+    }
+}
+
+/// A device entry's leaf-count word: the leaf count in bits 0-31, the
+/// grant count in bits 32-44 (D-148).
+pub const fn device_leaf_word(leaves: u32, grants: u16) -> u64 {
+    leaves as u64 | ((grants & GRANT_COUNT_MAX) as u64) << 32
 }
 pub const GRANT_ENTRY_BYTES: usize = 128;
 pub const USE_ENTRY_BYTES: usize = 32;

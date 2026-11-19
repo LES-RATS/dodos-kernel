@@ -1657,6 +1657,7 @@ impl Model {
                             let entry = self.table.grants[node as usize]
                                 .remove(&grant)
                                 .expect("listed");
+                            self.table.add_grants(&entry.anchor.frame, -1);
                             self.table.serials[node as usize]
                                 .insert(grant, crate::grants::next_serial(entry.serial));
                         }

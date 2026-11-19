@@ -115,6 +115,7 @@ impl Model {
     pub(crate) fn free_grant(&mut self, grant: u16) {
         let node = self.node as usize;
         if let Some(entry) = self.table.grants[node].remove(&grant) {
+            self.table.add_grants(&entry.anchor.frame, -1);
             self.table.serials[node].insert(grant, next_serial(entry.serial));
             if let Some((notify, _)) = entry.doorbell
                 && let Some(notify) = self.notifies.get_mut(&notify)
@@ -331,6 +332,7 @@ impl Model {
             rights,
             depth: self.depth(anchor),
         };
+        self.table.add_grants(&anchor_says.frame, 1);
         self.table.grants[node].insert(
             grant,
             GrantEntry {

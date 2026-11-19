@@ -515,7 +515,7 @@ impl Model {
         for (chunk, &raw) in table.gate_words.iter().enumerate() {
             let counted = stored.get(&(chunk as u64)).copied().unwrap_or(0);
             ensure(
-                raw >> 32 == counted,
+                raw >> 32 & 0x1FFF == counted,
                 "59: pages not of class data in a gate word",
             )?;
         }
