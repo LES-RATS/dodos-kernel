@@ -10,7 +10,7 @@ use super::*;
 fn faulty_kernels_keep_g_on_the_cpu_side() {
     let mut done = 0;
     for seed in 0..200u64 {
-        let mut m = Machine::new(2, 2, 8).with_units();
+        let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
         let mut rng = Rng(seed + 1);
         for step in 0..400 {
             let op = m.random_op(&mut rng);
@@ -34,7 +34,7 @@ fn replay_a_gate_seed() {
     else {
         return;
     };
-    let mut m = Machine::new(2, 2, 8).with_units();
+    let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
     let mut rng = Rng(seed + 1);
     for step in 0..400 {
         let op = m.random_op(&mut rng);
@@ -58,7 +58,7 @@ fn gate_exploration_coverage() {
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let mut asked = 0;
     for seed in 0..200u64 {
-        let mut m = Machine::new(2, 2, 8).with_units();
+        let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
         let mut rng = Rng(seed + 1);
         for _ in 0..400 {
             let op = m.random_op(&mut rng);
@@ -630,7 +630,7 @@ fn faulty_kernels_keep_g_long_run() {
         number("DODOS_GATE_STEPS", 800),
     );
     for seed in 0..seeds {
-        let mut m = Machine::new(2, 2, 8).with_units();
+        let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
         let mut rng = Rng(seed + 1);
         for step in 0..length {
             let op = m.random_op(&mut rng);

@@ -146,6 +146,19 @@ impl Machine {
         self
     }
 
+    /// Each node's user space at start: a root at its floor's third page,
+    /// bound to tag 1, a table at the fourth hooked at entry 0.
+    pub(crate) fn with_spaces(mut self) -> Self {
+        for n in 0..self.layout.len() as u16 {
+            let first = self.layout[usize::from(n)].floor.0;
+            self.retype_root(n, first + 2).expect("a root");
+            self.bind(n, 1, first + 2).expect("bound");
+            self.take_table(n, first + 3, LEVELS - 1).expect("a table");
+            self.hook(n, first + 2, 0, first + 3).expect("hooked");
+        }
+        self
+    }
+
     /// A leaf of the iospace written by its owner's gate: map count + 1.
     pub(crate) fn io_map(&mut self, n: u16, e: usize, page: Page) -> Gated {
         self.unit_writes(n)?;

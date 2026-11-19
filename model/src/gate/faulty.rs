@@ -457,13 +457,32 @@ impl Machine {
                         granter: other,
                         slot: rng.below(grants::GRANTS as u64) as usize,
                     },
-                    2 => Op::MapRemote {
-                        n,
-                        root,
-                        tag,
-                        va: (e0, e1),
-                        index: slot,
-                    },
+                    2 => {
+                        // A delivered use entry, and an absent leaf of a
+                        // hooked table of the root its tag holds.
+                        let used: Vec<usize> = (0..grants::GRANTS)
+                            .filter(|&i| self.grants.uses[usize::from(n)][i].is_some())
+                            .collect();
+                        let index = match used.is_empty() {
+                            true => slot,
+                            false => used[rng.below(used.len() as u64) as usize],
+                        };
+                        let mut va = (e0, e1);
+                        if let Some(entries) = self.gate.tables.get(&root)
+                            && let Entry::Table(table) = entries[e0.min(ENTRIES - 1)]
+                            && let Some(leaves) = self.gate.tables.get(&table)
+                            && let Some(free) = (0..ENTRIES).find(|&i| leaves[i] == Entry::Absent)
+                        {
+                            va = (e0, free);
+                        }
+                        Op::MapRemote {
+                            n,
+                            root,
+                            tag,
+                            va,
+                            index,
+                        }
+                    }
                     3 => Op::Revoke { n, slot },
                     _ => Op::FreeGrant { n, slot },
                 }
