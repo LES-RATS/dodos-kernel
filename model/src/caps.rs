@@ -145,6 +145,12 @@ fn footprint(
         ObjectKind::Notify => fixed(NOTIFY_BYTES),
         ObjectKind::Timer => fixed(TIMER_BYTES),
         ObjectKind::Task => fixed(TASK_BYTES),
+        // D-152 complement: an `its_table` is 2^k pages, k at most 4 (above,
+        // `invalid`), aligned on its size (D-151).
+        ObjectKind::ItsTable => (
+            page << size.min(4),
+            size <= u64::from(dodos_abi::ITS_TABLE_K_MAX),
+        ),
         // Order of checks, step 3: a kind never made from an untyped is
         // `invalid` (D-110); the reserved `vcpu` is `unsupported`.
         ObjectKind::Irq
@@ -160,7 +166,7 @@ fn footprint(
     // Rules of `untyped_retype`: aligned on the size of a child untyped, and
     // for the other objects on their size, or on a page if they are larger.
     let align = match kind {
-        ObjectKind::Untyped => bytes,
+        ObjectKind::Untyped | ObjectKind::ItsTable => bytes,
         _ => bytes.min(page),
     };
     valid.then_some((bytes, align, None)).ok_or(Error::Invalid)

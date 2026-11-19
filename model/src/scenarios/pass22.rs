@@ -1169,11 +1169,15 @@ fn the_start_up_page_counts_its_records_at_the_sizes_of_the_abi() {
     // final review's verification of lot C, H1 = O2.
     // Pass 25: the example lists one more memory range (a descriptor of 48
     // bytes) and keeps the tables of its IOMMU unit (16 bytes in `Kept`).
+    // D-152: `StartMachine` is 128 bytes (layout 6, eight more offsets).
     let machine = Machine::example();
     let bytes = crate::boot::start_page_bytes_of(&machine);
-    assert_eq!(bytes, 2168 + (48 - 40) + (96 - 80) - 8 + 48 + 16);
+    assert_eq!(
+        bytes,
+        2168 + (48 - 40) + (96 - 80) - 8 + 48 + 16 + (128 - 96)
+    );
     assert_eq!(std::mem::size_of::<dodos_abi::StartBootTimes>(), 48);
-    assert_eq!(std::mem::size_of::<dodos_abi::StartMachine>(), 96);
+    assert_eq!(std::mem::size_of::<dodos_abi::StartMachine>(), 128);
 }
 
 #[test]

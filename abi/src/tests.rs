@@ -136,8 +136,13 @@ fn object_kinds_and_page_sizes_have_their_numbers() {
         Iommu,
         MemoryControl,
         Role,
+        ItsTable,
     ];
     assert_eq!(kinds, ObjectKind::ALL);
+    // CONTRACT-GAP 39: `its_table` takes the next free kind, the others'
+    // numbers pinned.
+    assert_eq!(ItsTable as u32, 21);
+    assert_eq!(IrqControl as u32, 17);
     for (number, kind) in kinds.into_iter().enumerate() {
         assert_eq!(kind as usize, number, "{kind:?}");
     }
@@ -1028,12 +1033,25 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
         offset_of!(StartMachine, line_count),
         offset_of!(StartMachine, attach_words),
         offset_of!(StartMachine, retired_words),
+        offset_of!(StartMachine, domain_words),
+        offset_of!(StartMachine, its_words),
+        offset_of!(StartMachine, request_records),
+        offset_of!(StartMachine, r1_words),
+        offset_of!(StartMachine, identifier_bitmaps),
+        offset_of!(StartMachine, line_bitmaps),
+        offset_of!(StartMachine, seal_parked),
+        offset_of!(StartMachine, suspend_word),
     ];
     assert_eq!(
         machine,
-        [28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92]
+        [
+            28, 32, 40, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116,
+            120, 124
+        ]
     );
-    assert_eq!(START_MACHINE_LAYOUT, 5);
+    // D-152: 128 bytes, layout 6.
+    assert_eq!(size_of::<StartMachine>(), 128);
+    assert_eq!(START_MACHINE_LAYOUT, 6);
     assert_eq!(RETIRED_WORD_BYTES, 24);
     let node = [
         offset_of!(StartNode, slot),
@@ -1171,7 +1189,7 @@ fn layouts_are_fixed() {
     assert_eq!(ranges, [0, 1, 2, 3, 4]);
     assert_eq!(size_of::<StartMemory>(), 56);
     assert_eq!(size_of::<StartIommu>(), 16);
-    assert_eq!(size_of::<StartMachine>(), 96);
+    assert_eq!(size_of::<StartMachine>(), 128);
     assert_eq!(size_of::<StartRole>(), 8);
     assert_eq!(size_of::<StartImage>(), 48);
     assert_eq!(size_of::<StartKindRecord>(), 56);
@@ -1953,14 +1971,25 @@ fn page_classes_have_their_bytes_and_the_rules_of_g3() {
     ]
     .map(PageClass::raw);
     assert_eq!(raw, [0, 1, 2, 3]);
-    // D-137: an iospace table of level k is 32 + k, an iospace root with n
-    // devices attached 48 + n, n up to 16; the former 4 names no class.
+    // D-152: bits 0-5 the class, bits 6-7 the hook state. An iospace table
+    // of level k is 32 + k (k up to 7), an iospace root with n devices 40 +
+    // n, n up to 16, *live* (1) or, with none, *dying* (3); the former 4
+    // names no class (D-137's 48 + n does not fit six bits).
     assert_eq!(PageClass::iospace_table(1).map(PageClass::raw), Some(33));
     assert_eq!(PageClass::iospace_table(0), None);
-    assert_eq!(PageClass::iospace_table(9), None);
-    assert_eq!(PageClass::iospace_root(0).map(PageClass::raw), Some(48));
-    assert_eq!(PageClass::iospace_root(16).map(PageClass::raw), Some(64));
+    assert_eq!(PageClass::iospace_table(8), None);
+    assert_eq!(
+        PageClass::iospace_root(0).map(PageClass::raw),
+        Some(40 | 1 << 6)
+    );
+    assert_eq!(
+        PageClass::iospace_root(16).map(PageClass::raw),
+        Some(56 | 1 << 6)
+    );
     assert_eq!(PageClass::iospace_root(17), None);
+    assert_eq!(PageClass::IOSPACE_ROOT_DYING.raw(), 40 | 3 << 6);
+    assert_eq!(PageClass::its_table(false).raw(), 8);
+    assert_eq!(PageClass::its_table(true).raw(), 8 | 1 << 6);
     assert_eq!(PageClass::from_raw(4), None);
     let root = PageClass::iospace_root(3).unwrap();
     assert_eq!((root.root_devices(), root.iospace_level()), (Some(3), None));
@@ -1972,20 +2001,38 @@ fn page_classes_have_their_bytes_and_the_rules_of_g3() {
     assert_eq!(PageClass::table(1).map(PageClass::raw), Some(17));
     assert_eq!(PageClass::table(0), None);
     assert_eq!(PageClass::table(9), None);
-    for byte in [5, 16, 25, 255] {
+    for byte in [5, 16, 25, 40, 48, 64, 255] {
         assert_eq!(PageClass::from_raw(byte), None, "{byte}");
     }
-    // DeepSeek F11 of the seventh review: the page classes hold 0, 16 + k,
-    // and since D-137 32 + k and 48 + n; gate, global read-only and device
-    // pages lie in no chunk.
+    // DeepSeek F11 of the seventh review, with D-152's hook states: for an
+    // aspace whose root is at level 4, the bytes the page classes hold are
+    // data (0); an ITS table unpinned or pinned; a table of level 1 to 3
+    // loose, hooked or unhooking; the root unbound, live or dying; an
+    // iospace table of level 1 to 7 loose, hooked or unhooking; an iospace
+    // root of 0 to 16 devices live, of none dying. Gate, global read-only
+    // and device pages lie in no chunk.
     let stored: Vec<u8> = (0..=255)
-        .filter(|&b| PageClass::stored(b).is_some())
+        .filter(|&b| PageClass::stored_at(b, 4).is_some())
         .collect();
-    let mut expected: Vec<u8> = Vec::from([0]);
-    expected.extend(17..=24);
-    expected.extend(33..=40);
-    expected.extend(48..=64);
+    let mut expected: Vec<u8> = Vec::from([0, 8, 8 | 64]);
+    for hook in 0..3u8 {
+        expected.extend((17..=19).map(|c| c | hook << 6));
+        expected.extend((33..=39).map(|c| c | hook << 6));
+    }
+    expected.extend([20, 20 | 64, 20 | 192]);
+    expected.extend((40..=56).map(|c| c | 64));
+    expected.push(40 | 192);
+    expected.sort_unstable();
     assert_eq!(stored, expected);
+    // A table of level 4 below a root at level 5 may be unhooking; a root
+    // at level 4 never.
+    let unhooking = PageClass::table_hooked(4, crate::Hook::Unhooking).unwrap();
+    assert!(PageClass::stored_at(unhooking.raw(), 5).is_some());
+    assert!(PageClass::stored_at(unhooking.raw(), 4).is_none());
+    let dying = PageClass::aspace_root(4, crate::RootState::Dying).unwrap();
+    assert!(PageClass::stored_at(dying.raw(), 4).is_some());
+    assert!(PageClass::stored_at(dying.raw(), 5).is_none());
+    assert!(PageClass::stored(dying.raw()).is_some());
     let leaf = |write, exec, device_type| Leaf {
         write,
         exec,
@@ -2009,9 +2056,94 @@ fn page_classes_have_their_bytes_and_the_rules_of_g3() {
         PageClass::iospace_root(1).unwrap(),
         PageClass::table(1).unwrap(),
         PageClass::table(4).unwrap(),
+        PageClass::its_table(false),
+        PageClass::its_table(true),
     ] {
         assert!(!class.permits(leaf(false, false, false)), "{class:?}");
     }
+}
+
+/// D-152: the ITS word, the request record's state word, the R1 word and
+/// the suspend word read back and refuse the words their checks refuse.
+#[test]
+fn the_words_of_d152_read_back_and_check() {
+    use crate::{
+        AttachState, ItsWord, R1State, R1Word, RequestState, RequestWord, SuspendState, SuspendWord,
+    };
+    let its = ItsWord::new(AttachState::Pinned, 0x4_0000, 2).unwrap();
+    assert_eq!(
+        (its.state(), its.table(), its.k()),
+        (Some(AttachState::Pinned), 0x4_0000, 2)
+    );
+    assert_eq!(ItsWord::from_raw(its.raw()), Some(its));
+    // A table not aligned on its 2^k pages, k above 4, a table of 0.
+    assert_eq!(ItsWord::new(AttachState::Pinned, 0x1000, 1), None);
+    assert_eq!(ItsWord::new(AttachState::Pinned, 0x10_0000, 5), None);
+    assert_eq!(ItsWord::new(AttachState::Pinned, 0, 0), None);
+    // State 0 with another bit; a bit between k and the address.
+    assert_eq!(ItsWord::from_raw(0x4_0000), None);
+    assert_eq!(ItsWord::from_raw(its.raw() | 1 << 5), None);
+    assert_eq!(ItsWord::from_raw(0), Some(ItsWord::NONE));
+
+    let opened = RequestWord::new(7, RequestState::Done)
+        .unwrap()
+        .opened()
+        .unwrap();
+    assert_eq!((opened.serial(), opened.state()), (8, RequestState::Open));
+    assert_eq!(opened.opened(), None, "an open record opened again");
+    assert_eq!(
+        opened.answered(7, RequestState::Done),
+        None,
+        "another serial"
+    );
+    assert_eq!(opened.answered(8, RequestState::Open), None);
+    let done = opened.answered(8, RequestState::Done).unwrap();
+    assert_eq!((done.serial(), done.state()), (8, RequestState::Done));
+    assert_eq!(done.answered(8, RequestState::Done), None, "answered twice");
+    let void = opened.voided();
+    assert_eq!((void.serial(), void.state()), (8, RequestState::Void));
+    assert_eq!(done.voided(), done);
+    assert_eq!(RequestWord::from_raw(5), None);
+    assert_eq!(RequestWord::new(1 << 61, RequestState::Void), None);
+
+    assert_eq!(size_of::<R1Word>(), 16);
+    assert_eq!(R1Word::START.checked(), Some(R1State::Done));
+    let walking = R1Word {
+        generation: 3,
+        state: 1,
+        cursor: 9,
+    };
+    assert_eq!(walking.checked(), Some(R1State::Walking));
+    assert_eq!(
+        R1Word {
+            state: 2,
+            ..walking
+        }
+        .checked(),
+        None,
+        "done with a cursor"
+    );
+    assert_eq!(
+        R1Word {
+            state: 3,
+            ..walking
+        }
+        .checked(),
+        None
+    );
+
+    let word = SuspendWord::new(SuspendState::Asleep, 5, 9);
+    assert_eq!(
+        (word.state(), word.node(), word.generation()),
+        (SuspendState::Asleep, 5, 9)
+    );
+    assert_eq!(SuspendWord::from_raw(word.raw()), Some(word));
+    assert_eq!(
+        SuspendWord::new(SuspendState::None, 5, 9),
+        SuspendWord::NONE
+    );
+    assert_eq!(SuspendWord::from_raw(1 << 16), None, "state 0 with a node");
+    assert_eq!(SuspendWord::from_raw(word.raw() | 1 << 4), None);
 }
 
 /// D-137: the attach word of a device identifier, 0 or a state and the

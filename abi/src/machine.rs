@@ -130,11 +130,18 @@ pub const SLOT_RECORD_PARTIAL: u64 = 1 << 5;
 /// otherwise 0.
 pub const SLOT_FRAME_ASKED_MASK: u64 = 0xfff;
 
-/// The class of a page (The gate over page tables, G2), one byte per page
-/// of ordinary memory: 0 data, 1 gate, 2 global read-only, 3 device, 16 + k
-/// a page table of level k, 32 + k an iospace table of level k, 48 + n an
-/// iospace root with n devices attached (D-137; 4, *iospace table*, is no
-/// longer a class).
+/// The page class byte (Gate words, D-152), one byte per page of ordinary
+/// memory: bits 0-5 the class, 0 *data*, 8 *ITS table*, 16 + *k* an aspace
+/// table of level *k* (1 to *L*, the root at *L*), 32 + *k* an iospace table
+/// of level *k* (1 to *L_io* − 1, so at most 7), 40 + *n* an iospace root
+/// with *n* devices (0 to 16); bits 6-7 the hook state, whose valid values
+/// depend on the class: *data* 0; *ITS table* 0 unpinned or 1 pinned; a
+/// table below a root 0 *loose*, 1 *hooked*, 2 *unhooking*; an aspace root 0
+/// *unbound*, 1 *live*, 3 *dying*; an iospace root 1 *live*, 3 *dying*. Any
+/// other byte fails the check. 1 *gate*, 2 *global read-only* and 3
+/// *device* are no stored byte: such a page lies in no chunk and its class
+/// follows from where it lies (D-137 numbered the iospace roots 48 + *n*,
+/// which the six bits of the class do not hold).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageClass(u8);
@@ -148,42 +155,107 @@ pub struct Leaf {
     pub device_type: bool,
 }
 
+/// The hook state of a table below a root (bits 6-7 of its class byte).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hook {
+    Loose = 0,
+    Hooked = 1,
+    Unhooking = 2,
+}
+
+/// The state of a root (bits 6-7 of its class byte): an aspace root is
+/// *unbound*, *live* or *dying*; an iospace root *live* or *dying*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootState {
+    Unbound = 0,
+    Live = 1,
+    Dying = 3,
+}
+
+/// The class of an ITS table page (bits 0-5).
+pub const PAGE_CLASS_ITS_TABLE: u8 = 8;
+/// The deepest level of an iospace table below its root (32 + 7 = 39; 40
+/// is the first iospace root).
+pub const IOSPACE_TABLE_LEVEL_MAX: u8 = 7;
+
 impl PageClass {
     pub const DATA: Self = Self(0);
     pub const GATE: Self = Self(1);
     pub const GLOBAL_READ_ONLY: Self = Self(2);
     pub const DEVICE: Self = Self(3);
 
-    /// A page table of level `level`, 1 (its entries are pages) to 8.
+    const fn with(class: u8, state: u8) -> Self {
+        Self(class | state << 6)
+    }
+
+    /// A page table of level `level`, 1 (its entries are pages) to 8,
+    /// *loose*.
     pub const fn table(level: u8) -> Option<Self> {
+        Self::table_hooked(level, Hook::Loose)
+    }
+
+    /// A page table of level `level` below a root, with its hook state.
+    pub const fn table_hooked(level: u8, hook: Hook) -> Option<Self> {
         match level {
-            1..=8 => Some(Self(16 + level)),
+            1..=8 => Some(Self::with(16 + level, hook as u8)),
             _ => None,
         }
     }
 
-    /// An iospace table of level `level`, 1 (its entries are pages) to 8,
-    /// below its root (D-137).
+    /// The root of an aspace whose tables have `levels` levels (the root's
+    /// level), with its state.
+    pub const fn aspace_root(levels: u8, state: RootState) -> Option<Self> {
+        match levels {
+            1..=8 => Some(Self::with(16 + levels, state as u8)),
+            _ => None,
+        }
+    }
+
+    /// An iospace table of level `level`, 1 (its entries are pages) to 7,
+    /// below its root (D-137), *loose*.
     pub const fn iospace_table(level: u8) -> Option<Self> {
+        Self::iospace_table_hooked(level, Hook::Loose)
+    }
+
+    /// An iospace table of level `level` with its hook state.
+    pub const fn iospace_table_hooked(level: u8, hook: Hook) -> Option<Self> {
         match level {
-            1..=8 => Some(Self(32 + level)),
+            1..=IOSPACE_TABLE_LEVEL_MAX => Some(Self::with(32 + level, hook as u8)),
             _ => None,
         }
     }
 
     /// The root of an iospace with `devices` devices pinned or attached to
-    /// it, 0 to 16 (D-137).
+    /// it, 0 to 16 (D-137), *live*.
     pub const fn iospace_root(devices: u8) -> Option<Self> {
         match devices {
-            0..=16 => Some(Self(48 + devices)),
+            0..=16 => Some(Self::with(40 + devices, RootState::Live as u8)),
             _ => None,
         }
     }
 
+    /// An iospace root with no device, *dying* (its destruction).
+    pub const IOSPACE_ROOT_DYING: Self = Self::with(40, RootState::Dying as u8);
+
+    /// A page of an `its_table`, unpinned or pinned (D-152 complement).
+    pub const fn its_table(pinned: bool) -> Self {
+        Self::with(PAGE_CLASS_ITS_TABLE, pinned as u8)
+    }
+
+    /// Bits 0-5: the class.
+    pub const fn class(self) -> u8 {
+        self.0 & 0x3f
+    }
+
+    /// Bits 6-7: the hook state.
+    pub const fn hook_bits(self) -> u8 {
+        self.0 >> 6
+    }
+
     /// The level of an iospace table, `None` for any other class.
     pub const fn iospace_level(self) -> Option<u8> {
-        match self.0 {
-            33..=40 => Some(self.0 - 32),
+        match self.class() {
+            33..=39 => Some(self.class() - 32),
             _ => None,
         }
     }
@@ -191,29 +263,48 @@ impl PageClass {
     /// The devices pinned or attached to an iospace root, `None` for any
     /// other class.
     pub const fn root_devices(self) -> Option<u8> {
-        match self.0 {
-            48..=64 => Some(self.0 - 48),
+        match self.class() {
+            40..=56 => Some(self.class() - 40),
             _ => None,
         }
     }
 
-    /// `None` for a byte the page classes may not hold (G2): the stored
-    /// classes are *data*, *page table of level k*, *iospace table of level
-    /// k* and *iospace root with n devices attached*; a *gate*, *global
-    /// read-only* or *device* page lies in no chunk, and its class follows
-    /// from where it lies.
+    /// `None` for a byte the page classes may not hold (G2), for an aspace
+    /// whose root is at level `levels`: the class and the hook state its
+    /// class allows.
+    pub const fn stored_at(raw: u8, levels: u8) -> Option<Self> {
+        let (class, hook) = (raw & 0x3f, raw >> 6);
+        let valid = match class {
+            0 => hook == 0,
+            PAGE_CLASS_ITS_TABLE => hook <= 1,
+            17..=24 if class - 16 == levels => hook != 2,
+            17..=24 => class - 16 < levels && hook <= 2,
+            33..=39 => hook <= 2,
+            40 => hook == 1 || hook == 3,
+            41..=56 => hook == 1,
+            _ => false,
+        };
+        if valid { Some(Self(raw)) } else { None }
+    }
+
+    /// `None` for a byte no aspace geometry allows: an aspace class of any
+    /// level with the states of a table or of a root.
     pub const fn stored(raw: u8) -> Option<Self> {
-        match raw {
-            0 | 17..=24 | 33..=40 | 48..=64 => Some(Self(raw)),
-            _ => None,
+        let mut levels = 1;
+        while levels <= 8 {
+            if Self::stored_at(raw, levels).is_some() {
+                return Some(Self(raw));
+            }
+            levels += 1;
         }
+        None
     }
 
     /// `None` for a byte that names no class.
     pub const fn from_raw(raw: u8) -> Option<Self> {
         match raw {
-            0..=3 | 17..=24 | 33..=40 | 48..=64 => Some(Self(raw)),
-            _ => None,
+            1..=3 => Some(Self(raw)),
+            _ => Self::stored(raw),
         }
     }
 
@@ -225,8 +316,8 @@ impl PageClass {
     /// device and global read-only pages only; a data page never with a
     /// device memory type nor both writable and executable; a global
     /// read-only page never writable; a device page never executable and
-    /// always with a device memory type. A table or gate page is never the
-    /// target of a leaf (outside the gate's own view).
+    /// always with a device memory type. A table, an ITS table or a gate
+    /// page is never the target of a leaf (outside the gate's own view).
     pub const fn permits(self, leaf: Leaf) -> bool {
         match self.0 {
             0 => !leaf.device_type && !(leaf.write && leaf.exec),
@@ -296,6 +387,273 @@ impl AttachWord {
 
     pub const fn root(self) -> u64 {
         self.0 & !Self::LOW
+    }
+}
+
+/// The largest *k* of an `its_table` (2^*k* pages, D-152 complement).
+pub const ITS_TABLE_K_MAX: u8 = 4;
+
+/// The ITS word of a device identifier on a machine with an ITS, beside its
+/// identifier word in the living part (Gate words, D-152): 0, or the state
+/// in bits 0-1 as an attach word's, *k* in bits 2-4 (0 to 4) and the
+/// address of the device's table, a run of 2^*k* pages of class *ITS table*
+/// aligned on its size, in the other bits.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItsWord(u64);
+
+impl ItsWord {
+    pub const NONE: Self = Self(0);
+    const LOW: u64 = 0xfff;
+
+    /// `None` for *k* above 4, or a table of 0 or not aligned on 2^*k*
+    /// pages of the smallest size.
+    pub const fn new(state: AttachState, table: u64, k: u8) -> Option<Self> {
+        if k > ITS_TABLE_K_MAX || table == 0 || table & (((Self::LOW + 1) << k) - 1) != 0 {
+            return None;
+        }
+        Some(Self(table | (k as u64) << 2 | state as u64))
+    }
+
+    /// `None` for a word that fails its check: a state 0 with any other
+    /// bit, a state with no table, *k* above 4, a table not aligned on its
+    /// size, or a bit set between *k* and the address.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw & 0b11 == 0 {
+            return if raw == 0 { Some(Self::NONE) } else { None };
+        }
+        let k = (raw >> 2 & 0b111) as u8;
+        if raw & Self::LOW & !0b1_1111 != 0 {
+            return None;
+        }
+        let table = raw & !Self::LOW;
+        match Self::new(Self::decode(raw), table, k) {
+            Some(word) => Some(word),
+            None => None,
+        }
+    }
+
+    const fn decode(raw: u64) -> AttachState {
+        match raw & 0b11 {
+            1 => AttachState::Pinned,
+            2 => AttachState::Attached,
+            _ => AttachState::Detached,
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn state(self) -> Option<AttachState> {
+        match self.0 & 0b11 {
+            0 => None,
+            _ => Some(Self::decode(self.0)),
+        }
+    }
+
+    pub const fn k(self) -> u8 {
+        (self.0 >> 2 & 0b111) as u8
+    }
+
+    pub const fn table(self) -> u64 {
+        self.0 & !Self::LOW
+    }
+}
+
+/// The state of a request record (bits 0-2 of its state word, Gate words,
+/// D-152).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestState {
+    Void = 0,
+    Open = 1,
+    Done = 2,
+    Failed = 3,
+    Refused = 4,
+}
+
+/// Word 3 of a request record, its state word: the serial in bits 3-63,
+/// never reset, and the state in bits 0-2 (Gate words, D-152).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestWord(u64);
+
+/// A request record: words 0 to 2, the operation and its operands, and
+/// word 3, the state word (32 bytes, per node slot and entry of the unit
+/// request table, in the living part).
+pub const REQUEST_RECORD_BYTES: usize = 32;
+/// The largest serial of a state word (61 bits).
+pub const REQUEST_SERIAL_MAX: u64 = (1 << 61) - 1;
+
+impl RequestWord {
+    /// `None` for a serial above 61 bits.
+    pub const fn new(serial: u64, state: RequestState) -> Option<Self> {
+        if serial > REQUEST_SERIAL_MAX {
+            return None;
+        }
+        Some(Self(serial << 3 | state as u64))
+    }
+
+    /// `None` for a state of 5 to 7.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw & 0b111 {
+            0..=4 => Some(Self(raw)),
+            _ => None,
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn serial(self) -> u64 {
+        self.0 >> 3
+    }
+
+    pub const fn state(self) -> RequestState {
+        match self.0 & 0b111 {
+            0 => RequestState::Void,
+            1 => RequestState::Open,
+            2 => RequestState::Done,
+            3 => RequestState::Failed,
+            _ => RequestState::Refused,
+        }
+    }
+
+    /// The requester's opening: (*s*, not *open*) → (*s* + 1, *open*);
+    /// `None` from an *open* word or at the last serial.
+    pub const fn opened(self) -> Option<Self> {
+        match self.state() {
+            RequestState::Open => None,
+            _ => Self::new(self.serial() + 1, RequestState::Open),
+        }
+    }
+
+    /// The holder's answer: (*s*, *open*) → (*s*, `to`); `None` from any
+    /// other word, or for an answer that is not *done*, *failed* or
+    /// *refused*.
+    pub const fn answered(self, serial: u64, to: RequestState) -> Option<Self> {
+        let open = matches!(self.state(), RequestState::Open) && self.serial() == serial;
+        match to {
+            RequestState::Done | RequestState::Failed | RequestState::Refused if open => {
+                Self::new(serial, to)
+            }
+            _ => None,
+        }
+    }
+
+    /// A fresh start's void: (*s*, *open*) → (*s*, *void*); any other word
+    /// unchanged.
+    pub const fn voided(self) -> Self {
+        match self.state() {
+            RequestState::Open => Self(self.0 & !0b111),
+            _ => self,
+        }
+    }
+}
+
+/// The state of an R1 word (Gate words, D-152).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum R1State {
+    None = 0,
+    Walking = 1,
+    Done = 2,
+}
+
+/// An R1 word, per unit role and node slot in the living part (Gate words,
+/// D-152): the generation it concerns, a state and a cursor (16 bytes; the
+/// contract names the three fields, the assistant settles their order: the
+/// generation in bytes 0-3, the state in bytes 4-7, the cursor in bytes
+/// 8-15). Start-up writes (0, done, 0).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct R1Word {
+    pub generation: u32,
+    pub state: u32,
+    pub cursor: u64,
+}
+
+/// R1's units per step of the recovery reserve (Gate words, D-152).
+pub const R1_UNITS_PER_STEP: u32 = 32;
+/// The identifier bitmap of a node slot, per PCI segment (65,536 bits), and
+/// its line bitmap (`IRQ_LINES_MAX` bits), in the living part (D-152).
+pub const IDENTIFIER_BITMAP_BYTES: usize = IDENTIFIERS_PER_SEGMENT / 8;
+pub const LINE_BITMAP_BYTES: usize = IRQ_LINES_MAX / 8;
+
+impl R1Word {
+    /// The start-up word: (0, done, 0).
+    pub const START: Self = Self {
+        generation: 0,
+        state: R1State::Done as u32,
+        cursor: 0,
+    };
+
+    /// `None` for a state above 2, or a cursor other than 0 on a word that
+    /// is not walking.
+    pub const fn checked(self) -> Option<R1State> {
+        match (self.state, self.cursor) {
+            (0, 0) => Some(R1State::None),
+            (1, _) => Some(R1State::Walking),
+            (2, 0) => Some(R1State::Done),
+            _ => None,
+        }
+    }
+}
+
+/// The state of the suspend word (Gate words, D-152).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuspendState {
+    None = 0,
+    Suspending = 1,
+    Asleep = 2,
+    Resuming = 3,
+}
+
+/// The suspend word, in the living part (Gate words, D-152): bits 0-1 the
+/// state, bits 16-31 the suspending node, bits 32-63 its generation; 0 for
+/// *none*. Since D-152 no call writes it: `node_stop` mode 3 is
+/// `unsupported`, and the word reads 0.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuspendWord(u64);
+
+impl SuspendWord {
+    pub const NONE: Self = Self(0);
+
+    pub const fn new(state: SuspendState, node: u16, generation: u32) -> Self {
+        match state {
+            SuspendState::None => Self::NONE,
+            _ => Self(state as u64 | (node as u64) << 16 | (generation as u64) << 32),
+        }
+    }
+
+    /// `None` for a bit set in 2-15, or a state 0 with any other bit.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw & 0xfffc != 0 || raw & 0b11 == 0 && raw != 0 {
+            return None;
+        }
+        Some(Self(raw))
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn state(self) -> SuspendState {
+        match self.0 & 0b11 {
+            0 => SuspendState::None,
+            1 => SuspendState::Suspending,
+            2 => SuspendState::Asleep,
+            _ => SuspendState::Resuming,
+        }
+    }
+
+    pub const fn node(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
     }
 }
 
@@ -1577,6 +1935,36 @@ mod member_proofs {
 mod page_class_proofs {
     use super::{Leaf, PageClass};
 
+    /// D-152: a stored byte holds a hook state its class allows, and only
+    /// data among the stored classes is ever the target of a leaf.
+    #[kani::proof]
+    fn a_stored_class_byte_has_a_hook_its_class_allows() {
+        let raw: u8 = kani::any();
+        let levels: u8 = kani::any();
+        kani::assume((1..=8).contains(&levels));
+        let Some(class) = PageClass::stored_at(raw, levels) else {
+            return;
+        };
+        assert!(PageClass::stored(raw) == Some(class));
+        assert!(PageClass::from_raw(raw) == Some(class));
+        let (bits, hook) = (raw & 0x3f, raw >> 6);
+        match bits {
+            0 => assert!(hook == 0),
+            8 => assert!(hook <= 1),
+            40 => assert!(hook == 1 || hook == 3),
+            41..=56 => assert!(hook == 1),
+            17..=24 => assert!(bits - 16 <= levels && (bits - 16 == levels || hook <= 2)),
+            33..=39 => assert!(hook <= 2),
+            _ => panic!("a byte of no class stored"),
+        }
+        let leaf = Leaf {
+            write: kani::any(),
+            exec: kani::any(),
+            device_type: kani::any(),
+        };
+        assert!(!class.permits(leaf) || raw == 0);
+    }
+
     /// G3 (4), for every class byte and every leaf: a table or gate page is
     /// never the target of a leaf; no leaf of an accepted class is both
     /// writable and executable; a global read-only page is never writable;
@@ -1678,6 +2066,66 @@ mod proofs {
             Owner::Reserve(_) => holds,
         };
         assert!(accepted == expected);
+    }
+
+    /// D-152: an ITS word that passes its check reads back from its fields.
+    #[kani::proof]
+    fn its_word_reads_back() {
+        let raw: u64 = kani::any();
+        let Some(word) = ItsWord::from_raw(raw) else {
+            return;
+        };
+        assert!(word.raw() == raw);
+        match word.state() {
+            None => assert!(raw == 0),
+            Some(state) => {
+                assert!(word.k() <= ITS_TABLE_K_MAX && word.table() != 0);
+                assert!(ItsWord::new(state, word.table(), word.k()) == Some(word));
+            }
+        }
+    }
+
+    /// D-152: a request record's serial never goes back; only the requester
+    /// opens, from a word not open, to the next serial; only an open word at
+    /// its serial is answered, keeping the serial; a fresh start keeps it.
+    #[kani::proof]
+    fn a_request_serial_never_goes_back() {
+        let Some(word) = RequestWord::from_raw(kani::any()) else {
+            return;
+        };
+        if let Some(opened) = word.opened() {
+            assert!(!matches!(word.state(), RequestState::Open));
+            assert!(opened.serial() == word.serial() + 1);
+            assert!(matches!(opened.state(), RequestState::Open));
+        }
+        let to = match kani::any::<u8>() % 5 {
+            0 => RequestState::Void,
+            1 => RequestState::Open,
+            2 => RequestState::Done,
+            3 => RequestState::Failed,
+            _ => RequestState::Refused,
+        };
+        let serial: u64 = kani::any();
+        if let Some(answered) = word.answered(serial, to) {
+            assert!(matches!(word.state(), RequestState::Open) && word.serial() == serial);
+            assert!(answered.serial() == serial);
+            assert!(!matches!(
+                answered.state(),
+                RequestState::Open | RequestState::Void
+            ));
+        }
+        assert!(word.voided().serial() == word.serial());
+        assert!(!matches!(word.voided().state(), RequestState::Open));
+    }
+
+    /// D-152: a suspend word that passes its check reads back.
+    #[kani::proof]
+    fn suspend_word_reads_back() {
+        let raw: u64 = kani::any();
+        let Some(word) = SuspendWord::from_raw(raw) else {
+            return;
+        };
+        assert!(SuspendWord::new(word.state(), word.node(), word.generation()) == word);
     }
 
     #[kani::proof]

@@ -336,8 +336,8 @@ pub struct StartIommu {
     pub role: u32,
 }
 
-/// Where the living part lies in the frame of slot 13, and its sizes (96
-/// bytes since D-137, 88 since D-135, 80 since D-129).
+/// Where the living part lies in the frame of slot 13, and its sizes (128
+/// bytes since D-152, 96 since D-137, 88 since D-135, 80 since D-129).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartMachine {
@@ -379,12 +379,29 @@ pub struct StartMachine {
     /// unit may still hold the vector's remapping entry, cleared only at
     /// machine start-up (Interrupts, the irq, D-140; layout 5).
     pub retired_words: u32,
+    /// The offsets of the words D-152 defines (Gate words; layout 6): the
+    /// domain words (one u64 per unit and domain number), the ITS words
+    /// (one `ItsWord` beside each identifier word), the request records
+    /// (`REQUEST_RECORD_BYTES` per node slot and entry of the unit request
+    /// table), the R1 words (one `R1Word` per unit role and node slot), the
+    /// identifier bitmaps (`IDENTIFIER_BITMAP_BYTES` per node slot and
+    /// segment), the line bitmaps (`LINE_BITMAP_BYTES` per node slot),
+    /// `seal_parked` (one u64 per physical core) and the suspend word.
+    pub domain_words: u32,
+    pub its_words: u32,
+    pub request_records: u32,
+    pub r1_words: u32,
+    pub identifier_bitmaps: u32,
+    pub line_bitmaps: u32,
+    pub seal_parked: u32,
+    pub suspend_word: u32,
 }
 
 /// The layout version of the living part that `StartMachine` describes.
-/// 5 since the retired words (D-140), 4 since the attach words (D-137), 3 since the line words (D-135), 2
-/// since the fence records (pass 16), 1 since D-129.
-pub const START_MACHINE_LAYOUT: u32 = 5;
+/// 6 since the words of D-152, 5 since the retired words (D-140), 4 since
+/// the attach words (D-137), 3 since the line words (D-135), 2 since the
+/// fence records (pass 16), 1 since D-129.
+pub const START_MACHINE_LAYOUT: u32 = 6;
 
 /// The retired word of a physical core: one bit per entry of its interrupt
 /// table (Interrupts, the irq, D-140).
