@@ -157,7 +157,9 @@ impl Model {
     /// unhooks wait for the invalidation of that record before they join
     /// the free list (D-137).
     fn rehook_by(&mut self, space: ObjId, by: Option<CapId>) {
-        if self.objects[&space].from.is_none() {
+        // The start-up aspace follows its translations once the start-up
+        // has placed its root and its tables in the table floor (D-154).
+        if self.aspaces[&space].root.is_none() {
             return;
         }
         let levels = self.levels(space);
@@ -394,15 +396,16 @@ impl Model {
         let space = self.object(thread, map.space, kind, Rights::WRITE)?;
         // 2. The frame: slot, kind; the rights it needs depend on the rights
         // argument. Then the untyped, unless it is 0: slot, kind, `write`,
-        // then that it is the space's own untyped (`invalid`; any untyped
-        // is `invalid` for the start-up aspace, made from none).
+        // then that it is the space's own table untyped, the one named
+        // when the space was created (`invalid`; any untyped is `invalid`
+        // for the start-up aspace, made from none; D-154).
         // Memory under a grant: the gate maps a frame of another node only
         // while the grant is live (an invalid remote capability is `gone`,
         // judged with its slot).
         let cap = self.cap(thread, map.frame, Rights::READ)?;
         self.is(cap, ObjectKind::Frame, Rights::NONE)?;
         let untyped = self.optional(thread, map.untyped, ObjectKind::Untyped, Rights::WRITE)?;
-        if untyped.is_some() && untyped != self.objects[&space].from {
+        if untyped.is_some() && untyped != self.aspaces[&space].table_untyped {
             return Err(Error::Invalid);
         }
         // 3. The plain arguments.
@@ -485,6 +488,7 @@ impl Model {
             step += 1;
         }
         let first = map.first + done;
+        let remote_frame = self.remotes.contains_key(&self.caps[&cap].object);
         // G3 (3) and (4): the class of every page the step's leaves target.
         let leaf = dodos_abi::Leaf {
             write: rights.contains(Rights::WRITE),
@@ -492,6 +496,16 @@ impl Model {
             device_type: device,
         };
         if (first..first + step).any(|page| !self.class_of(frame, page).permits(leaf)) {
+            return Err(Error::Denied);
+        }
+        // G3 (3) (D-154): a leaf never points into a chunk whose gate word
+        // has the table bit set, whatever the class of its page.
+        let in_tables = target == Target::Chunks
+            && self
+                .leaf_chunks(frame, first, step)
+                .iter()
+                .any(|&chunk| self.table.table_chunk(chunk));
+        if in_tables && !remote_frame {
             return Err(Error::Denied);
         }
         // The gate over page tables, G4: a map count, or the leaf count of

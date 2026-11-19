@@ -118,6 +118,10 @@ pub struct Machine {
     pub kinds: Vec<Kind>,
     pub iommus: Vec<IommuUnit>,
     pub ioapics: Vec<IoApic>,
+    /// Interrupt remapping is on with compatibility-format messages
+    /// blocked: bit 0 of the flags of the entry `Interrupts` (D-155).
+    /// Remapping on while such messages pass reads `false` here: the
+    /// machine then carries the faulty-kernel promise only.
     pub remapping: bool,
     pub x2apic: bool,
     /// x86-64: the end of interrupt can be directed (every local APIC can
@@ -285,8 +289,9 @@ impl Machine {
     /// holds no chunk, and a 2 MB device range at `DEVICES`, the
     /// chipset's (IOAPIC, HPET and the unit's registers); and a first
     /// service of two segments from the first large page with one other
-    /// file. Its floors are three chunks, cut into blocks of two chunks and
-    /// one; its two reserves are one chunk each.
+    /// file. Its ordinary floors are three chunks, cut into blocks of two
+    /// chunks and one, its table floors one chunk (D-154); its two reserves
+    /// are one chunk each.
     /// The base of the example's device range: the chipset's on a PC, where
     /// the IOAPIC (0xFEC0_0000), the HPET and the VT-d unit's registers lie.
     pub const DEVICES: u64 = 0xFEC0_0000;
@@ -392,6 +397,7 @@ impl Machine {
             framebuffer: false,
             floors: BootFloors {
                 floor_node: 3 * chunk,
+                floor_tables: chunk,
                 reserve_bytes: chunk,
                 reserve_per_gib: 0,
                 reserves: 2,
@@ -641,7 +647,10 @@ pub(crate) struct Layout {
     crash_len: u64,
     /// The tables of the IOMMU units, one range per unit (IOMMU).
     unit_tables: Ranges,
+    /// The floor of each node slot, its ordinary floor's ranges first,
+    /// then its table floor's, and the table floor alone (D-154).
     floors: Vec<Ranges>,
+    table_floors: Vec<Ranges>,
     reserves: Vec<Ranges>,
     owners: Vec<u64>,
     none: Vec<u64>,
@@ -657,10 +666,7 @@ pub(crate) struct Layout {
 #[cfg(test)]
 pub(crate) fn start_page_bytes_of(machine: &Machine) -> u64 {
     let layout = machine.layout().expect("a layout");
-    let untypeds = layout.floors[0]
-        .iter()
-        .flat_map(|&range| blocks(range))
-        .count();
+    let untypeds = layout.untypeds(0).len();
     start_page_bytes(
         machine,
         &layout,
@@ -691,7 +697,8 @@ fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u6
     // 80 stood for 48 and 96, and a table no machine lists for 8 bytes).
     let size = |bytes: usize| bytes as u64;
     let mut contents = vec![
-        21 * 8,
+        // `ObjectSizes`: one word per kind, 0 to 21 (D-154, F12).
+        size(dodos_abi::OBJECT_SIZES_ENTRIES * 8),
         16 * untypeds,
         32 * machine.cores.len() as u64,
         0,
@@ -728,6 +735,44 @@ fn start_page_bytes(machine: &Machine, layout: &Layout, untypeds: u64, cores: u6
     let entries = contents.len() as u64;
     let body: u64 = contents.iter().map(|bytes| bytes.next_multiple_of(8)).sum();
     16 + 24 * entries + body
+}
+
+impl Layout {
+    /// Untypeds of a node (Start-up state, rule 7): each range of its
+    /// ordinary floor and of its table floor, in ascending order, cut into
+    /// blocks: base, bytes, and whether it is a table untyped (D-154).
+    pub(crate) fn untypeds(&self, node: usize) -> Vec<(u64, u64, Floor)> {
+        let tables = &self.table_floors[node];
+        let mut found = Vec::new();
+        for &range in &self.floors[node] {
+            let floor = match tables.contains(&range) {
+                true => Floor::Tables,
+                false => Floor::Ordinary,
+            };
+            found.extend(blocks(range).into_iter().map(|(b, l)| (b, l, floor)));
+        }
+        found
+    }
+
+    /// The gate words of machine start-up: 0, but the table bit set with
+    /// counts 0 for the chunks of every table floor (G4, D-154).
+    fn gate_words(&self, geometry: Geometry) -> Vec<u64> {
+        let mut words = vec![dodos_abi::GateWord::ORDINARY.raw(); self.owners.len()];
+        let chunk = geometry.chunk();
+        for &(start, end) in self.table_floors.iter().flatten() {
+            for at in (start..end).step_by(chunk as usize) {
+                words[(at / chunk) as usize] = dodos_abi::GateWord::TABLE.raw();
+            }
+        }
+        words
+    }
+}
+
+/// Which floor a start-up untyped is cut from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Floor {
+    Ordinary,
+    Tables,
 }
 
 impl Machine {
@@ -1051,7 +1096,17 @@ impl Machine {
             }
             ranges
         };
-        let floors: Vec<Ranges> = (0..n).map(|_| take(sizes.floor)).collect();
+        // Start-up state, rule 4 (D-154): each slot's ordinary floor, then
+        // its table floor.
+        let mut floors: Vec<Ranges> = Vec::new();
+        let mut table_floors: Vec<Ranges> = Vec::new();
+        for _ in 0..n {
+            let mut floor = take(sizes.floor);
+            let tables = take(sizes.tables);
+            floor.extend(tables.iter().copied());
+            floors.push(floor);
+            table_floors.push(tables);
+        }
         let reserves: Vec<Ranges> = (0..k).map(|_| take(sizes.reserve)).collect();
         // The ownership words: none, but for the chunks of ordinary memory
         // in no floor, free and unclaimed; a reserve's chunks name it.
@@ -1123,6 +1178,7 @@ impl Machine {
             crash_len,
             unit_tables,
             floors,
+            table_floors,
             reserves,
             owners,
             none,
@@ -1201,6 +1257,7 @@ impl Machine {
             geometry: self.geometry,
             nodes: n as u16,
             floors: layout.floors.clone(),
+            table_floors: layout.table_floors.clone(),
             reserves: layout.reserves.clone(),
             role_records: layout.roles.clone(),
             kept: self.kept_ranges(layout.image, layout.crash_len, &layout.unit_tables),
@@ -1261,7 +1318,7 @@ impl Machine {
             gated: Default::default(),
             role_writes: Default::default(),
             owners: std::sync::Arc::new(layout.owners.clone()),
-            gate_words: std::sync::Arc::new(vec![0; layout.owners.len()]),
+            gate_words: std::sync::Arc::new(layout.gate_words(self.geometry)),
             classes: Default::default(),
             devices: std::sync::Arc::new(layout.devices.clone()),
             device_leaves: std::sync::Arc::new(vec![0; layout.devices.len()]),
@@ -1327,10 +1384,7 @@ impl Model {
         cores: &[usize],
     ) -> Result<(Self, ObjId), Refusal> {
         let page = machine.geometry.page();
-        let untypeds: Vec<(u64, u64)> = layout.floors[node as usize]
-            .iter()
-            .flat_map(|&range| blocks(range))
-            .collect();
+        let untypeds = layout.untypeds(node as usize);
         let start_bytes =
             start_page_bytes(machine, layout, untypeds.len() as u64, cores.len() as u64);
         let start_pages = start_bytes.div_ceil(page);
@@ -1372,7 +1426,7 @@ impl Model {
     fn build(
         &mut self,
         layout: &Layout,
-        untypeds: &[(u64, u64)],
+        untypeds: &[(u64, u64, Floor)],
         start_pages: u64,
     ) -> Result<ObjId, Refusal> {
         let machine = self.machine.clone();
@@ -1389,9 +1443,11 @@ impl Model {
         let frames_of = |phys, virt, len| module_frames(phys, virt, len, geometry).count();
         // A floor that holds no block of a page has no start-up untyped
         // (refusal 5; the final review's verification of lot C, H3).
-        let Some(&(start_at, _)) = untypeds.first() else {
+        let ordinary = untypeds.iter().find(|u| u.2 == Floor::Ordinary);
+        let Some(&(start_at, _, _)) = ordinary else {
             return Err(Refusal::Floors);
         };
+        self.reset_floor();
         // The copied frames counted where they are placed: each segment
         // from the start-up untyped's watermark as the frames before it
         // left it, each frame at its own alignment (H2).
@@ -1500,11 +1556,22 @@ impl Model {
         }
         // The untypeds of the floor, by ascending address, with every
         // right, `exec` included; the clean mark of each is at its start.
+        // A table-floor untyped is a table untyped: every right except
+        // `exec`, and no clean mark (rules 7 and 8, D-154).
         let mut floor = Vec::new();
-        for &(base, bytes) in untypeds {
-            let untyped = add(self, ObjectKind::Untyped, bytes, next(), Rights::ALL);
-            live(&mut self.untypeds, untyped).base = base;
-            floor.push(untyped);
+        let mut table_floor = Vec::new();
+        for &(base, bytes, from) in untypeds {
+            let rights = match from {
+                Floor::Ordinary => Rights::ALL,
+                Floor::Tables => all,
+            };
+            let untyped = add(self, ObjectKind::Untyped, bytes, next(), rights);
+            let state = live(&mut self.untypeds, untyped);
+            (state.base, state.table) = (base, from == Floor::Tables);
+            match from {
+                Floor::Ordinary => floor.push(untyped),
+                Floor::Tables => table_floor.push(untyped),
+            }
         }
         let start_untyped = floor[0];
         let start_cap = self.objects[&start_untyped].root;
@@ -1610,8 +1677,47 @@ impl Model {
         }
         // The address space was built with the tables these mappings need
         // and the reserve of free tables the boot image states.
+        // Its root and its tables lie in the node's table floor: the first
+        // table-floor untyped pays for them, and its watermark stands after
+        // them; a table floor that does not hold them is a refusal (D-154).
+        //
+        // CONTRACT-GAP 48 (Start-up state, rule 7, and Address spaces and
+        // their tables, the start-up aspace: "created from no untyped", yet
+        // "the first table-floor untyped pays for the start-up aspace's
+        // root, tables and reserve of free tables; its watermark stands
+        // after them"): the contract does not say whether these pages are
+        // live pieces of that untyped, nor what its watermark does when the
+        // start-up aspace is destroyed. The reading here: they are live
+        // pieces for the life of the node, never given back, so the
+        // watermark of the first table-floor untyped never returns to its
+        // start, and a first service that wants its table memory back
+        // takes table blocks (`memory_take` kind 2) instead.
         let hooked = hooked(&self.aspaces[&aspace], geometry.levels, geometry);
-        live(&mut self.aspaces, aspace).tables = hooked + machine.reserve_tables;
+        let tables = hooked + machine.reserve_tables;
+        let first_tables = *table_floor.first().ok_or(Refusal::Floors)?;
+        let mut pages = Vec::new();
+        for _ in 0..=tables {
+            let taken = self
+                .take(first_tables, page, page, Clearing::None)
+                .map_err(|_| Refusal::Floors)?;
+            pages.push(self.untypeds[&first_tables].base + taken.at);
+        }
+        // Made from no untyped: its pages never go back to one.
+        live(&mut self.untypeds, first_tables).lost += tables as u32 + 1;
+        let root = pages.remove(0);
+        let start = live(&mut self.aspaces, aspace);
+        start.tables = tables;
+        start.root = Some(root);
+        start.free = pages.into_iter().rev().collect();
+        // A table of the free list is a *loose* table of the last level
+        // until it is hooked (the page class byte, D-152).
+        let loose = dodos_abi::PageClass::table(1).expect("a level");
+        for at in self.aspaces[&aspace].free.clone() {
+            self.table.set_class(at / page, Some(loose));
+        }
+        let class = self.root_class(aspace);
+        self.table.set_class(root / page, Some(class));
+        self.rehook(aspace);
         // The first thread: bound to the space in slot 1, the address space
         // in slot 2 and the message page in slot 10; not suspended.
         self.bind_space(thread, Some(space));
@@ -1647,6 +1753,33 @@ impl Model {
         let text = u64::from_le_bytes(*b"start\0\0\0");
         self.trace(dodos_abi::TraceCode::Text, None, [text, 0, 0]);
         Ok(thread)
+    }
+
+    /// G13 (D-154): a node started fresh resets the whole gate word of its
+    /// floor's chunks, 0 for its ordinary floor and the table bit with
+    /// counts 0 for its table floor, and their page classes; its table
+    /// floor is mapped read-only in its kernel's own space.
+    fn reset_floor(&mut self) {
+        let geometry = self.table.geometry;
+        let (chunk, pages) = (geometry.chunk(), geometry.chunk() / geometry.page());
+        let node = self.node as usize;
+        let tables = self.table.table_floors[node].clone();
+        for (start, end) in self.table.floors[node].clone() {
+            let word = match tables.contains(&(start, end)) {
+                true => dodos_abi::GateWord::TABLE,
+                false => dodos_abi::GateWord::ORDINARY,
+            };
+            for at in (start..end).step_by(chunk as usize) {
+                let index = at / chunk;
+                for page in index * pages..(index + 1) * pages {
+                    self.table.set_class(page, None);
+                }
+                self.table.write_gate_word(index, word);
+                if word.is_table() {
+                    self.kernel_read_only.insert(index);
+                }
+            }
+        }
     }
 
     /// A kept frame: ordinary memory, write-back, never cleared, made from

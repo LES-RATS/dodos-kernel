@@ -750,3 +750,8 @@ impl Model {
 pub(crate) fn remap_handle(core: u64, vector: u8) -> u16 {
     (core * IRQ_TABLE_ENTRIES as u64 + u64::from(vector.saturating_sub(IRQ_VECTOR_FIRST))) as u16
 }
+
+/// Every handle of one core: one per claimable vector (Interrupts).
+pub(crate) fn handles_of_core(core: u64) -> impl Iterator<Item = u16> {
+    (0..IRQ_TABLE_ENTRIES as u64).map(move |entry| (core * IRQ_TABLE_ENTRIES as u64 + entry) as u16)
+}

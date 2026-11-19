@@ -143,7 +143,7 @@ fn a_resume_under_a_rebuild_reports_and_both_end() {
     };
     assert_eq!(m.call(0, send), WAITS);
     m.settle();
-    let ut = untyped_slot(m.sys.node(2), m.t[2]);
+    let ut = super::table_slot(m.sys.node(2), m.t[2]);
     let map = Syscall::IoSpaceMap(crate::Map {
         space: s(IOSPACE),
         frame: s(110),

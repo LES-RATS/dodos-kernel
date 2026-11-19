@@ -576,6 +576,11 @@ struct Untyped {
     block: Option<Block>,
     bytes: u64,
     device: bool,
+    /// A **table untyped** (D-154): made by `memory_take` kind 2, cut from
+    /// a table floor, or a child of one. It has no clean mark and no
+    /// `exec`, and makes only a child table untyped or an `its_table`; the
+    /// root table and the lower tables of a space come from it.
+    table: bool,
     watermark: u64,
     /// Rules of `untyped_retype`: the memory from the watermark to the
     /// clean mark is known to be zero. Device memory has none: it stays 0.
@@ -660,6 +665,10 @@ struct ASpace {
     /// and the free list, most recently freed last, whose pages keep the
     /// class they had.
     root: Option<u64>,
+    /// The table untyped named when the space was created, which its root
+    /// table and its lower tables are live pieces of (D-154); `None` for
+    /// the start-up aspace, whose tables lie in the table floor.
+    table_untyped: Option<ObjId>,
     hooked: BTreeMap<(u32, u64), u64>,
     free: Vec<u64>,
     /// The tables unhooked by the clearing of a record, by its capability,
@@ -1070,6 +1079,13 @@ pub struct Model {
     table: table::Table,
     /// The write gate: the chunks the node maps in its kernel space.
     kernel_runs: std::collections::BTreeSet<u64>,
+    /// Of the chunks the kernel's own space maps, its table floor included:
+    /// those the gate mapped read-only, as one large leaf never rewritten
+    /// between take and give (kept kernel tables, D-154).
+    kernel_read_only: std::collections::BTreeSet<u64>,
+    /// The `its_table` objects: the first page and the number of pages of
+    /// each, of class *ITS table* (D-152 complement, D-154).
+    its_tables: BTreeMap<ObjId, (u64, u64)>,
     /// IOMMU: the devices each `iospace` serves, the most recently attached
     /// last, each by its `iommu` and its identifier: the node's own list of
     /// its devices on each unit (D-131).
@@ -1332,6 +1348,33 @@ impl Model {
         let object = self.object_at(thread, slot)?;
         let untyped = self.untypeds.get(&object)?;
         Some((untyped.watermark, untyped.clean, untyped.device))
+    }
+
+    /// Whether the untyped in `slot` is a table untyped (D-154: bit 51 of
+    /// word 0 of its slot, bit 1 of its `StartUntyped` flags).
+    pub fn untyped_is_table(&self, thread: ObjId, slot: SlotAddr) -> Option<bool> {
+        let object = self.object_at(thread, slot)?;
+        Some(self.untypeds.get(&object)?.table)
+    }
+
+    /// Whether a chunk is a table chunk: bit 58 of its gate word (D-154).
+    pub fn table_chunk(&self, chunk: u64) -> bool {
+        self.table.table_chunk(chunk)
+    }
+
+    /// Whether the kernel's own space maps a chunk read-only (D-154).
+    pub fn kernel_maps_read_only(&self, chunk: u64) -> bool {
+        self.kernel_read_only.contains(&chunk)
+    }
+
+    /// The table floor of a node slot, as ranges of chunks (D-154).
+    pub fn table_floor(&self, node: u16) -> Vec<(u64, u64)> {
+        self.table.table_floors[node as usize].clone()
+    }
+
+    /// The physical address of the root table of the space in `slot`.
+    pub fn root_table(&self, thread: ObjId, slot: SlotAddr) -> Option<u64> {
+        self.aspaces.get(&self.object_at(thread, slot)?)?.root
     }
 
     /// The map count of a chunk (G4): bits 0-31 of its gate word.

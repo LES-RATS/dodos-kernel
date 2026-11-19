@@ -110,16 +110,20 @@ fn start_up_space_holds_the_slots_of_the_table_in_their_order() {
     assert_eq!(kind(&mut m, t, 0), Err(Error::Invalid));
     // From 16: the two cores, the IOMMU unit, the five roles (the IOMMU
     // unit, the IOAPIC, two reserves, `platform`), the two untypeds of the
-    // floor, the copied writable segment, the kept frames of the three
-    // modules, the two crash areas; then empty slots.
+    // ordinary floor and the table untyped of the table floor (D-154), the
+    // copied writable segment, the kept frames of the three modules, the
+    // two crash areas; then empty slots.
     let machine = [
-        Node, Node, Iommu, Role, Role, Role, Role, Role, Untyped, Untyped, Frame, Frame, Frame,
-        Frame, Frame, Frame,
+        Node, Node, Iommu, Role, Role, Role, Role, Role, Untyped, Untyped, Untyped, Frame, Frame,
+        Frame, Frame, Frame, Frame,
     ];
     for (slot, wanted) in (16..).zip(machine) {
         assert_eq!(kind(&mut m, t, slot), Ok(wanted), "slot {slot}");
     }
-    assert_eq!(kind(&mut m, t, 32), Err(Error::Invalid));
+    assert_eq!(kind(&mut m, t, 33), Err(Error::Invalid));
+    // Only the untyped of the table floor is a table untyped.
+    let tables = [24, 25, 26].map(|slot| m.untyped_is_table(t, own(slot)));
+    assert_eq!(tables, [Some(false), Some(false), Some(true)]);
     assert_eq!(m.object_at(t, own(START_SLOT_THREAD)), Some(t));
 }
 
@@ -158,11 +162,14 @@ fn start_up_capabilities_have_the_rights_of_their_kind_and_row() {
     }
     // The kept frames of the kept image: `read`, `exec` and `derive`; of the
     // machine table and the crash areas: `read` and `derive`.
-    for slot in 27..30 {
+    // The table-floor untyped has every right except `exec` (rule 8,
+    // D-154).
+    assert_eq!(inspect(&mut m, t, 26).unwrap().1, NOT_EXEC, "slot 26");
+    for slot in 28..31 {
         let rights = READ_DERIVE.union(Rights::EXEC);
         assert_eq!(inspect(&mut m, t, slot).unwrap().1, rights, "slot {slot}");
     }
-    for slot in [13, 14, 30, 31] {
+    for slot in [13, 14, 31, 32] {
         assert_eq!(
             inspect(&mut m, t, slot).unwrap().1,
             READ_DERIVE,
@@ -190,9 +197,9 @@ fn start_up_capabilities_are_at_depth_1_the_frames_at_2_and_the_copy_at_3() {
     let depths = [
         (24, 1),
         (START_SLOT_TASK, 1),
-        (27, 1),
+        (28, 1),
         (13, 1),
-        (26, 2),
+        (27, 2),
         (10, 2),
         (11, 3),
     ];
@@ -224,10 +231,10 @@ fn start_up_untyped_is_taken_after_the_message_page() {
     // The copied segment, the start-up page and the message page are its
     // children, in that order, from its start.
     let base = |m: &Model, slot| m.frame_at(t, own(slot)).unwrap().2;
-    let (copied, start, message) = (base(&m, 26), base(&m, 9), base(&m, 10));
+    let (copied, start, message) = (base(&m, 27), base(&m, 9), base(&m, 10));
     let page = m.geometry().page();
     let start_pages = m.frame_at(t, own(9)).unwrap().1;
-    let copied_pages = m.frame_at(t, own(26)).unwrap().1;
+    let copied_pages = m.frame_at(t, own(27)).unwrap().1;
     assert_eq!(start, copied + copied_pages * page);
     assert_eq!(message, start + start_pages * page);
     assert_eq!(copied, Machine::example().memory[5].base);
@@ -285,14 +292,14 @@ fn address_space_maps_the_segments_the_message_page_and_the_start_up_page() {
 #[test]
 fn segments_that_are_not_writable_are_mapped_from_the_kept_image() {
     let (m, t) = boot(&Machine::example());
-    // The executable segment is the first module: its kept frame in slot 27
+    // The executable segment is the first module: its kept frame in slot 28
     // holds the mapping; the writable one is mapped from its copy.
     let image = Machine::example().image_base;
-    assert_eq!(m.frame_at(t, own(27)).unwrap().2, image);
-    let copied = m.frame_at(t, own(26)).unwrap().2;
+    assert_eq!(m.frame_at(t, own(28)).unwrap().2, image);
+    let copied = m.frame_at(t, own(27)).unwrap().2;
     assert!(copied >= Machine::example().memory[5].base);
     let (mut m, t) = (m, t);
-    let unmap = Syscall::ASpaceUnmap(own(27));
+    let unmap = Syscall::ASpaceUnmap(own(28));
     assert_eq!(m.apply(t, unmap), Ok(Output::Done));
     assert_eq!(m.translated(t, m.geometry().chunk()), None);
 }
@@ -312,13 +319,13 @@ fn kept_frames_cover_each_module_in_consecutive_slots_by_the_largest_sizes() {
     };
     let (m, t) = boot(&machine);
     // The two segments, then the file: one large page, then three pages.
-    assert_eq!(m.frame_at(t, own(29)).unwrap().0, PageSize::Large1);
-    assert_eq!(m.frame_at(t, own(29)).unwrap().1, 1);
-    let (size, pages, base) = m.frame_at(t, own(30)).unwrap();
+    assert_eq!(m.frame_at(t, own(30)).unwrap().0, PageSize::Large1);
+    assert_eq!(m.frame_at(t, own(30)).unwrap().1, 1);
+    let (size, pages, base) = m.frame_at(t, own(31)).unwrap();
     assert_eq!((size, pages), (PageSize::Page, 3));
-    assert_eq!(base, m.frame_at(t, own(29)).unwrap().2 + chunk);
+    assert_eq!(base, m.frame_at(t, own(30)).unwrap().2 + chunk);
     // Then the crash areas.
-    assert_eq!(m.frame_at(t, own(31)).unwrap().0, PageSize::Large1);
+    assert_eq!(m.frame_at(t, own(32)).unwrap().0, PageSize::Large1);
 }
 
 #[test]
@@ -431,21 +438,32 @@ fn ownership_words_are_none_in_floors_reserves_name_their_reserve() {
     let geometry = m.geometry();
     let chunk = geometry.chunk_shift();
     let ram = Machine::example().memory[5].base >> chunk;
-    // Floors of three chunks for nodes 0 and 1: none.
-    for c in ram..ram + 6 {
+    // Floors of four chunks for nodes 0 and 1, three of ordinary floor then
+    // one of table floor (D-154): none, and only the table floor's gate
+    // word carries the table bit.
+    for c in ram..ram + 8 {
         assert_eq!(m.ownership(c), 0, "chunk {c}");
+        assert_eq!(m.table_chunk(c), (c - ram) % 4 == 3, "chunk {c}");
     }
+    assert_eq!(
+        m.table_floor(0),
+        vec![((ram + 3) << chunk, (ram + 4) << chunk)]
+    );
+    assert_eq!(
+        m.table_floor(1),
+        vec![((ram + 7) << chunk, (ram + 8) << chunk)]
+    );
     // Then the two reserves of one chunk each, then free and unclaimed.
     assert_eq!(
-        m.ownership(ram + 6),
+        m.ownership(ram + 8),
         Ownership::free(Owner::Reserve(0)).raw()
     );
     assert_eq!(
-        m.ownership(ram + 7),
+        m.ownership(ram + 9),
         Ownership::free(Owner::Reserve(1)).raw()
     );
     assert_eq!(
-        m.ownership(ram + 8),
+        m.ownership(ram + 10),
         Ownership::free(Owner::Unclaimed).raw()
     );
     // The crash areas at the top are kept: none.

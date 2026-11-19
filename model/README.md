@@ -182,7 +182,12 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
 - `tests/`: the calls on one node, judged argument by argument, and the
   random walk of `property.rs` with its coverage floors: three quarters
   of the counts measured on 17 November 2026 (pass 23), rounded up, the
-  smallest of the three page sizes. The directed cases of each seed count
+  smallest of the three page sizes; since pass 31 the walk runs 48 seeds
+  (24 before: D-154 moved the start-up slots and the chunks, and 24 seeds
+  no longer reached the rarest events on every page size), and three
+  floors were measured again on 19 November 2026 (a sched dying, a copy
+  under `cap_delete`, a thread that lost its context), a fourth added
+  (an `its_table` dying). The directed cases of each seed count
   in no floor, so every floor is above what they give alone
   (`DODOS_PROPERTY_STEPS=0` runs them alone); the kinds seen dying are
   every kind made from an untyped, the irq, the role and the
@@ -324,6 +329,70 @@ order.
   `Fenced` state while the healthy nodes run all 28 combination events
   and recoveries.
 
+## Pass 31 (D-154, D-155)
+
+- D-154, dedicated table chunks, replaces pass 30's split and merge of the
+  kernel's large leaf (`823e473`), and the gaps 40 to 46 leave with it.
+  Bit 58 of the gate word is the table bit (`abi/`: `GateWord::TABLE`,
+  `is_table`, `consistent`; `MEMORY_TAKE_TABLES`, `SLOT_UNTYPED_TABLE`,
+  `START_UNTYPED_TABLE`, `BootFloors.floor_tables`, `OBJECT_SIZES_ENTRIES`
+  = 22).
+- The node model (`Model`): every node slot has a table floor after its
+  ordinary floor (`floors`, at least one chunk, refused otherwise), whose
+  chunks carry the table bit from machine start-up and whose untypeds are
+  table untypeds; the start-up aspace's root, tables and reserve of free
+  tables lie there. `memory_take` kind 2 makes a table untyped (no clean
+  mark, no `exec`, the whole gate word written with the table bit, the run
+  mapped read-only). `untyped_retype` of an `aspace` or an `iospace` takes
+  one page of header from the ordinary untyped and one page of root from
+  the table untyped its size argument names (judged as a capability
+  argument); `aspace_map` and `iospace_map` take that table untyped; an
+  `its_table` comes from a table untyped only, and a table untyped makes
+  nothing else but a child table untyped. A table untyped waits for the
+  spaces whose tables it holds (`again` at its removal, `busy` at a give).
+  R6 clears the table bit with the counts, a fresh start writes its floors'
+  words anew (G13). New checker rules, each with its test in
+  `scenarios/pass31.rs`: `TABLES:` a gate word no gate writes (a table
+  chunk counts no leaf and no grant, an ordinary chunk no page not *data*),
+  the kernel's view of a table chunk, `exec` on a table untyped, a table of
+  a space outside its table untyped, a kind a table untyped does not make.
+  G5's rule on a page under an anchor is now shadowed by the first.
+- The gate model (`model/src/gate/`): `Take::Tables`, the table bit per
+  chunk, a read-only large leaf never rewritten, the rows from *data*
+  asking for the table bit alone (no map count, no grant walk, no request
+  of a core), G3 and G6 refusing a leaf and an anchor toward a table chunk,
+  each node's floor one table chunk then one ordinary chunk, the kept
+  kernel root and table out of the chunks. `table_chunk_tests.rs` shows
+  each attack breaking the checker under its earlier reading
+  (`tables_in_ordinary_chunks`, `leaves_into_table_chunks`,
+  `anchors_over_table_chunks`, `table_chunks_mapped_writable`) and refused
+  under the tables, R6 and G13, a seal and a resume; the faulty actor takes
+  chunks of both kinds and tries all of it (200 seeds of 400 steps in
+  `verify`; 30,000 seeds of 800 steps clean on 19 November 2026).
+- The corrections of D-153's review that D-154 carries: F9 (an identifier
+  word freed only when its attach word and its ITS word read 0: as pass
+  30 had it), F10 (the ITS word *pinned* → 0 at a *failed* or *refused*
+  mapping answer: `a_failed_its_mapping_unpins_its_table`), F11 (the
+  clearing call of an `unbind` takes its own core out of the set: as pass
+  30 had it), F12 (22 object sizes: the start-up page's bytes), F13 (kept
+  counts end at R6 once no attach word reads *attached*: as pass 30 had
+  it), F14 (R6 retires every handle of a dead node's cores once any IOMMU
+  unit has failed, in the node model too:
+  `r6_retires_every_handle_of_a_dead_nodes_cores_once_a_unit_failed`), F15
+  and S1 (one segment and one unit in the small machine: nothing to
+  change), M3 (RISC-V: a change that unhooks a table invalidates the whole
+  ASID, an invalidation by address dropping leaf entries only:
+  `riscv_unhooks_a_table_with_a_whole_asid_fence`).
+- D-155: `abi/` gains `IKV_FIRST` and `IKV_LAST` (240 to 243, one vector
+  for each of the kernel's four interrupts to other cores: the contract
+  fixes only "inside 240 to 255"), `ikv_valid`, `line_vector_valid`,
+  `GATE_PCID`, `usable_tags` and `gate_tag`, and `dr7_valid` refuses
+  `DR7.GD` by name. The gate model reserves the gate's tag (G7: bound to
+  no root, loaded for none) and composes an ICR only for an inter-kernel
+  vector (G10); a register write with `DR7.GD` is `invalid`.
+- The combined exploration's faulty node also asks its gate for a table in
+  an ordinary chunk and for a leaf and an anchor toward its table floor.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a
@@ -374,16 +443,14 @@ its mapping), 36 (a fencing requester's record served), 37 (two cells of
 the gate word's table), 38 (a second request of a device while its first
 is open), 39 (`its_table`'s kind number). Pass 30's model of gap 29's
 split and merge found seven open points in the new cells (40 to 46, in
-`823e473`): 40 (no count of a chunk rises while a kernel-space request
-makes its pages leave `data`), 41 (no page leaves `data` while a split or
-a merge of its chunk is in flight), 42 (no give of a chunk whose split is
-in flight), 43 (a clearing call's walk stops at a shared entry and never
-crosses into a split table), 44 (the split table is another `data` page
-of the chunk, unmapped and under no anchor, turned into the split table
-at the completion), 45 (the split row writes the pages leaving `data`
-read-only at the hook so one kernel-space request suffices), and 46 (the
-merge is a gate call of its own when the chunk's count of pages not
-`data` falls to 1). Two earlier gaps were settled otherwise than the
+`823e473`); D-154 closes them all by removing the split and the merge:
+tables live in dedicated table chunks (see Pass 31). Pass 31 found two:
+gap 47 (`abi/src/machine.rs`: what the tag table holds on RISC-V with
+`ASIDLEN = 0`, where the gate reserves no ASID; read as its one tag) and
+gap 48 (`model/src/boot.rs`: whether the start-up aspace's root and
+tables, which the first table-floor untyped "pays for", are live pieces
+of it, and what its watermark does if that aspace is destroyed; read as
+live pieces for the life of the node, so that watermark never returns). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

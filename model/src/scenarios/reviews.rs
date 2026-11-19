@@ -294,7 +294,7 @@ fn hydrogen_n5_a_revoke_step_that_needs_a_units_invalidation_completes_its_recor
         device: 0x10,
     };
     super::pass17::succeeds(&mut m, 1, attach, 20 * MS);
-    let untyped = untyped_slot(m.sys.node(1), m.t[1]);
+    let untyped = super::table_slot(m.sys.node(1), m.t[1]);
     m.ok(
         1,
         Syscall::IoSpaceMap(crate::Map {

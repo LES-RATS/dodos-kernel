@@ -61,7 +61,7 @@ fn gate_exploration_coverage() {
     }
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let mut asked = 0;
-    let mut splits = 0;
+    let mut table_chunks = 0;
     for seed in 0..200u64 {
         let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
         let mut rng = Rng(seed + 1);
@@ -73,11 +73,11 @@ fn gate_exploration_coverage() {
                     .entry(name.split(' ').next().unwrap().to_string())
                     .or_default() += 1;
             }
-            splits += m
+            table_chunks += m
                 .layout
                 .iter()
                 .flat_map(|l| m.gate.tables[&l.kernel_table])
-                .filter(|e| matches!(e, Entry::Table(_)))
+                .filter(|e| matches!(e, Entry::Large { write: false, .. }))
                 .count();
             asked += m
                 .gate
@@ -89,7 +89,7 @@ fn gate_exploration_coverage() {
         }
     }
     eprintln!(
-        "{done:#?}\nsteps with a request asking a core: {asked}\nsteps times split chunks: {splits}"
+        "{done:#?}\nsteps with a request asking a core: {asked}\nsteps times table chunks taken: {table_chunks}"
     );
 }
 
@@ -111,24 +111,18 @@ fn run(old: OldRules, steps: &[Op]) -> Result<Machine, (usize, String)> {
 /// 0 took); core 1 has loaded it and cached the leaf.
 fn space() -> Vec<Op> {
     vec![
-        Op::Take { n: 0, chunk: 4 },
-        Op::RetypeRoot {
+        Op::Take {
             n: 0,
-            p: 0,
-            page: 2,
-            split: None,
+            chunk: 4,
+            kind: Take::Ordinary,
         },
+        Op::RetypeRoot { n: 0, page: 2 },
         Op::Bind {
             n: 0,
             tag: 1,
             root: 2,
         },
-        Op::TakeTable {
-            n: 0,
-            p: 0,
-            page: 3,
-            split: None,
-        },
+        Op::TakeTable { n: 0, page: 3 },
         Op::Hook {
             n: 0,
             root: 2,
@@ -163,16 +157,11 @@ fn space() -> Vec<Op> {
 fn a_dying_root_loaded_on_another_core_leaves_no_stale_translation() {
     let mut steps = space();
     steps.extend([
-        Op::RetypeRoot {
-            n: 0,
-            p: 0,
-            page: 4,
-            split: None,
-        },
+        Op::RetypeRoot { n: 0, page: 0 },
         Op::Bind {
             n: 0,
             tag: 2,
-            root: 4,
+            root: 0,
         },
         Op::Destroy {
             n: 0,
@@ -183,7 +172,7 @@ fn a_dying_root_loaded_on_another_core_leaves_no_stale_translation() {
         Op::Load {
             n: 0,
             p: 1,
-            root: 4,
+            root: 0,
             tag: 2,
         },
         Op::Teardown { n: 0, root: 2 },
@@ -194,21 +183,16 @@ fn a_dying_root_loaded_on_another_core_leaves_no_stale_translation() {
             to: 1,
         },
         Op::Ack { n: 0, p: 1 },
-        Op::RetypeRoot {
-            n: 0,
-            p: 0,
-            page: 5,
-            split: None,
-        },
+        Op::RetypeRoot { n: 0, page: 1 },
         Op::Bind {
             n: 0,
             tag: 1,
-            root: 5,
+            root: 1,
         },
         Op::Load {
             n: 0,
             p: 1,
-            root: 5,
+            root: 1,
             tag: 1,
         },
     ]);
@@ -286,24 +270,18 @@ fn a_fresh_start_leaves_no_request_of_the_dead_generation() {
         },
         Op::Death { n: 0 },
         Op::Fresh { n: 0 },
-        Op::Take { n: 0, chunk: 4 },
-        Op::RetypeRoot {
+        Op::Take {
             n: 0,
-            p: 0,
-            page: 2,
-            split: None,
+            chunk: 4,
+            kind: Take::Ordinary,
         },
+        Op::RetypeRoot { n: 0, page: 2 },
         Op::Bind {
             n: 0,
             tag: 1,
             root: 2,
         },
-        Op::TakeTable {
-            n: 0,
-            p: 0,
-            page: 3,
-            split: None,
-        },
+        Op::TakeTable { n: 0, page: 3 },
         Op::Hook {
             n: 0,
             root: 2,
@@ -349,7 +327,11 @@ fn a_fresh_start_leaves_no_request_of_the_dead_generation() {
 #[test]
 fn a_give_invalidates_the_kernel_space_on_idle_cores() {
     let steps = vec![
-        Op::Take { n: 0, chunk: 4 },
+        Op::Take {
+            n: 0,
+            chunk: 4,
+            kind: Take::Ordinary,
+        },
         Op::Idle { n: 0, p: 1 },
         Op::Give {
             n: 0,
@@ -402,13 +384,13 @@ fn late_answer(old: OldRules) -> Machine {
         &[
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 0,
                 page: 12,
             },
             Op::IoUnmap {
                 n: 1,
-                root: 15,
+                root: 9,
                 entry: 0,
                 e: 0,
             },
@@ -430,13 +412,13 @@ fn late_answer(old: OldRules) -> Machine {
         &[
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 0,
                 page: 12,
             },
             Op::IoUnmap {
                 n: 1,
-                root: 15,
+                root: 9,
                 entry: 0,
                 e: 0,
             },
@@ -490,19 +472,19 @@ fn a_requester_cannot_rewrite_an_open_record() {
         &[
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 0,
                 page: 12,
             },
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 1,
                 page: 13,
             },
             Op::IoUnmap {
                 n: 1,
-                root: 15,
+                root: 9,
                 entry: 0,
                 e: 0,
             },
@@ -512,7 +494,7 @@ fn a_requester_cannot_rewrite_an_open_record() {
     assert!(
         m.step(&Op::IoUnmap {
             n: 1,
-            root: 15,
+            root: 9,
             entry: 0,
             e: 1
         })
@@ -529,25 +511,25 @@ fn a_requester_cannot_rewrite_an_open_record() {
         &[
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 0,
                 page: 12,
             },
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 1,
                 page: 13,
             },
             Op::IoUnmap {
                 n: 1,
-                root: 15,
+                root: 9,
                 entry: 0,
                 e: 0,
             },
             Op::IoUnmap {
                 n: 1,
-                root: 15,
+                root: 9,
                 entry: 0,
                 e: 1,
             },
@@ -569,13 +551,13 @@ fn a_healthy_request_completes() {
             &[
                 Op::IoMap {
                     n: 1,
-                    root: 15,
+                    root: 9,
                     e: 0,
                     page: 12,
                 },
                 Op::IoUnmap {
                     n: 1,
-                    root: 15,
+                    root: 9,
                     entry: 0,
                     e: 0,
                 },
@@ -707,7 +689,11 @@ fn faulty_kernels_keep_g_long_run() {
 #[test]
 fn a_dead_granters_memory_is_not_reused_while_a_grantee_translates_it() {
     let ops = [
-        Op::Take { n: 0, chunk: 4 },
+        Op::Take {
+            n: 0,
+            chunk: 4,
+            kind: Take::Ordinary,
+        },
         Op::Grant {
             n: 0,
             slot: 0,
@@ -720,23 +706,13 @@ fn a_dead_granters_memory_is_not_reused_while_a_grantee_translates_it() {
             granter: 0,
             slot: 0,
         },
-        Op::RetypeRoot {
-            n: 1,
-            p: 0,
-            page: 10,
-            split: None,
-        },
+        Op::RetypeRoot { n: 1, page: 10 },
         Op::Bind {
             n: 1,
             tag: 1,
             root: 10,
         },
-        Op::TakeTable {
-            n: 1,
-            p: 0,
-            page: 11,
-            split: None,
-        },
+        Op::TakeTable { n: 1, page: 11 },
         Op::Hook {
             n: 1,
             root: 10,

@@ -51,6 +51,32 @@ pub const FEATURES: FeatureList = FeatureList {
 /// The vectors that `irq_claim` accepts; the others are the kernel's.
 pub const IRQ_VECTOR_FIRST: u8 = 48;
 pub const IRQ_VECTOR_LAST: u8 = 239;
+/// The ordinary inter-kernel vectors (G10, D-155): the kernel's own
+/// interrupts to the cores of its node (reschedule, leave, invalidation)
+/// and the interrupt of a ring, one vector each. The gate composes the ICR
+/// only for a vector in this range (fixed delivery, physical destination,
+/// edge, no shorthand), the target named by core number. Inside 240 to 255:
+/// outside the exceptions and outside the claimable vectors.
+pub const IKV_FIRST: u8 = 240;
+pub const IKV_LAST: u8 = 243;
+
+/// Whether the gate sends `vector` to another core as an ordinary
+/// inter-kernel interrupt (G10, D-155).
+pub const fn ikv_valid(vector: u8) -> bool {
+    IKV_FIRST <= vector && vector <= IKV_LAST
+}
+
+/// Whether `vector` may be written for a line without remapping (G10,
+/// operation 5, D-155): a claimable vector, 48 to 239.
+pub const fn line_vector_valid(vector: u8) -> bool {
+    IRQ_VECTOR_FIRST <= vector && vector <= IRQ_VECTOR_LAST
+}
+
+/// The PCID the gate keeps for its own translation context, bound to no
+/// kernel or user root (G7, D-155): the tag table holds PCIDs 0 to 4,094.
+pub const PCID_BITS: u32 = 12;
+pub const GATE_PCID: u16 = 4095;
+
 /// Entries of the interrupt table of one physical core: one per claimable
 /// vector (D-129).
 pub const IRQ_TABLE_ENTRIES: usize = 192;
@@ -92,10 +118,17 @@ pub const HW_BREAKPOINTS: usize = 4;
 pub const DR7_USER_MASK: u64 = 0xFFFF_0055;
 /// The condition 0b10 of a R/W field is the I/O condition (with CR4.DE).
 pub const DR7_CONDITION_IO: u64 = 0b10;
+/// DR7.GD, general detect (bit 13, Intel SDM vol. 3B §20.2.4): refused in
+/// production and in development builds (Debugging a component, D-155).
+pub const DR7_GD: u64 = 1 << 13;
 
-/// Whether a breakpoint control word is one a user thread may set: no bit
-/// outside the user mask, and no condition field naming I/O.
+/// Whether a breakpoint control word is one a user thread may set: `GD`
+/// clear, no bit outside the user mask, and no condition field naming I/O.
 pub const fn dr7_valid(word: u64) -> bool {
+    // D-155: general detect is refused by name, whatever the user mask is.
+    if word & DR7_GD != 0 {
+        return false;
+    }
     if word & !DR7_USER_MASK != 0 {
         return false;
     }

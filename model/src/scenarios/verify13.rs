@@ -472,8 +472,13 @@ fn a_pinned_iospace_loses_its_root_and_its_tables() {
     use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach, three};
     let mut m = three();
     let ut = untyped_slot(m.sys.node(0), m.t[0]);
-    m.ok(0, retype_from(ut, ObjectKind::Untyped, 1 << 20, 160));
-    m.ok(0, retype_from(160, ObjectKind::IoSpace, 0, IOSPACE));
+    // Its root and its tables are pieces of a child table untyped (D-154).
+    let tables = super::table_slot(m.sys.node(0), m.t[0]);
+    m.ok(0, retype_from(tables, ObjectKind::Untyped, 1 << 20, 160));
+    m.ok(
+        0,
+        retype_from(ut, ObjectKind::IoSpace, s(160).raw(), IOSPACE),
+    );
     m.ok(0, retype_from(ut, ObjectKind::Frame, 1, 161));
     let call = attach(&m, 0, IOSPACE, DEVICE);
     assert_eq!(m.call(0, call), WAITS);
@@ -540,13 +545,14 @@ fn a_device_count_frozen_by_a_killed_owner_is_judged_at_least() {
 // The table is filled by calls: 64 threads, each waiting on such a map.
 #[test]
 fn an_iospace_map_that_must_ask_a_full_unit_request_table_is_again_with_nothing_changed() {
-    let (mut m, ut, iospace) = super::pass22::caching_iospace();
+    let (mut m, tables, iospace) = super::pass22::caching_iospace();
+    let ut = untyped_slot(m.sys.node(0), m.t[0]);
     m.ok(0, place_first(0, 0));
     let map = |frame: u32, address: u64| {
         Syscall::IoSpaceMap(Map {
             space: s(iospace),
             frame: s(frame),
-            untyped: s(ut),
+            untyped: s(tables),
             address,
             first: 0,
             count: 1,

@@ -1247,7 +1247,10 @@ fn a_page_under_a_grants_anchor_not_of_class_data_is_reported() {
         let page = base / t.geometry.page();
         t.set_class(page, Some(dodos_abi::PageClass::table(1).unwrap()));
     });
-    machine_reported(&m, "G5: a page under a grant's anchor not of class data");
+    // D-154: a page that is not *data* in an ordinary chunk is refused
+    // first by the gate word's own rule, on every node that reads the
+    // word; G5's rule stays behind it.
+    machine_reported(&m, "TABLES: a gate word no gate writes");
 }
 
 // D-148: granted memory given to another node while its granter is live.

@@ -1607,8 +1607,10 @@ impl Model {
                             && (w.owner() == dodos_abi::Owner::Node(node)
                                 || matches!(w.owner(), dodos_abi::Owner::Reserve(j) if self.table.holds_reserve(node, j)))
                     });
+                    // R6 (D-154): the whole gate word, its counts and its
+                    // table bit, floor chunks included, ordinary and table.
                     if taken || floor {
-                        self.table.set_map_count(chunk, 0);
+                        self.table.clear_gate_word(chunk);
                         let pages = self.table.geometry.chunk() / self.table.geometry.page();
                         let first = at / self.table.geometry.page();
                         for page in first..first + pages {
@@ -1712,13 +1714,29 @@ impl Model {
                                 (Some(key), _) => {
                                     self.table.attach.remove(&key);
                                 }
-                                (None, Some((handle, units))) => {
-                                    if units.iter().any(|&role| self.unit_failed(role)) {
+                                (None, Some((handle, _))) => {
+                                    if self.an_iommu_unit_failed() {
                                         self.table.retired.insert(handle);
                                     }
                                     self.table.irq_tables.remove(&handle);
                                 }
-                                (None, None) => cursor = Clear { phase: 4, index: 0 },
+                                // R6 (D-153, gap 33; D-154, F14): if the
+                                // role word of any IOMMU unit reads
+                                // *failed*, the retired bit of every handle
+                                // of every core of the dead node, present
+                                // or not: an entry cleared before the
+                                // failure, or emptied by the node itself,
+                                // may stay in that unit's cache.
+                                (None, None) => {
+                                    if self.an_iommu_unit_failed() {
+                                        for core in self.table.cores_of(node, g) {
+                                            self.table
+                                                .retired
+                                                .extend(crate::irq::handles_of_core(core as u64));
+                                        }
+                                    }
+                                    cursor = Clear { phase: 4, index: 0 }
+                                }
                             }
                         }
                     }

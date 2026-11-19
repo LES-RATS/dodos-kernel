@@ -40,32 +40,33 @@ pub use machine::{
     CORE_ANSWER_RANGE_NS, CORE_EVENT_FEEDBACK, CORE_MARK, CORE_NO_SLOT, CORE_UNUSABLE,
     CORES_PER_KERNEL_MAX, CoreState, CoreWord, DEVICE_TABLE_SPARE, DRIVER_NONE, DeviceEntry,
     Evidence, FENCE_CLASS_COOPERATIVE, FENCE_CLASS_FORCED, FENCE_CLASS_SIGNALLED, FENCE_NS,
-    FENCE_RANGE_NS, FENCE_RECORD_BYTES, FENCE_RECORD_CORES, FenceRecord, Floors, GRANT_COUNT_MAX,
-    GRANT_ENTRY_BYTES, GRANTS, GateWord, Governs, Hook, IDENTIFIER_BITMAP_BYTES,
+    FENCE_RANGE_NS, FENCE_RECORD_BYTES, FENCE_RECORD_CORES, FenceRecord, Floors, GATE_WORD_TABLE,
+    GRANT_COUNT_MAX, GRANT_ENTRY_BYTES, GRANTS, GateWord, Governs, Hook, IDENTIFIER_BITMAP_BYTES,
     IDENTIFIERS_PER_SEGMENT, IDLE_ENTRY_WORDS, IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_HALT,
     IDLE_METHOD_MWAIT, IDLE_METHOD_PSCI, IDLE_METHOD_SBI, IDLE_STATES_MAX, IOSPACE_TABLE_LEVEL_MAX,
     IRQ_LINES_MAX, ITS_TABLE_K_MAX, IoPortRange, ItsWord, LINE_BITMAP_BYTES, Leaf, MAP_COUNT_MAX,
-    MEMBER_RESUME, Member, MemberState, ModuleFrame, ModuleFrames, NMI_GRACE_NS, NODE_IMAGE_BOOT,
-    NODE_IMAGE_REPLACEMENT, NODE_START_FRESH, NODE_START_RESUME, NODE_STATUS_CLASS_SHIFT,
-    NODE_STATUS_CORES_MASK, NODE_STATUS_UNUSABLE, NODE_STATUS_WORDS, NODE_STOP_KILL,
-    NODE_STOP_RETIRE, NODE_STOP_SEAL, NODE_WATCH_SLOTS, NODES_MAX, OBSERVATION_LIFE,
-    OBSERVATIONS_MAX, OWNER_RESERVE_BASE, OWNER_UNCLAIMED, OwnState, Owner, Ownership,
-    PAGE_CLASS_ITS_TABLE, PageClass, R1_UNITS_PER_STEP, R1State, R1Word, RECOVERY_BANDWIDTH,
-    RECOVERY_PERIOD_NS, REQUEST_RECORD_BYTES, REQUEST_SERIAL_MAX, RESERVES_MAX, RESERVES_MIN,
-    ROLE_EPOCH_MASK, ROLE_FAILED, ROLE_NOBODY, ROLE_PLAIN_PLATFORM, ROLES_PLAIN_MAX, RemoteRef,
-    RequestState, RequestWord, RoleKind, RoleState, RoleWord, RootState, SEAL_NS, SEAL_RANGE_NS,
-    SETTLE_NS, SLOT_BY_KIND_SHIFT, SLOT_DEAD, SLOT_DEPTH_SHIFT, SLOT_DYING, SLOT_EMPTY,
-    SLOT_FRAME_ASKED_MASK, SLOT_FRAME_DEVICE, SLOT_FRAME_FIRST_SHIFT, SLOT_FRAME_MEMORY_SHIFT,
-    SLOT_FRAME_PAGE_SHIFT, SLOT_FRAME_PAGES_SHIFT, SLOT_FULL, SLOT_IRQ_CORE_SHIFT, SLOT_KIND_SHIFT,
-    SLOT_RECORD_BINDING, SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_PARTIAL,
-    SLOT_RECORD_RIGHTS_SHIFT, SLOT_RECORD_UNMAPPING, SLOT_REMOTE, SLOT_REMOTE_GRANT_SHIFT,
-    SLOT_REMOTE_SERIAL_SHIFT, SLOT_REMOTE_USE_SHIFT, SLOT_RIGHTS_SHIFT, SLOT_ROOT, SLOT_STATE_MASK,
-    SLOT_UNTYPED_BLOCK, SLOT_UNTYPED_CLEAN, SLOT_UNTYPED_DEVICE, SLOT_UNTYPED_ENTRY,
-    SLOT_UNTYPED_ENTRY_SHIFT, SLOT_UNTYPED_LOG2_SHIFT, SLOT_UNTYPED_READY_WORD, STALE_NS,
-    STALE_RANGE_NS, START_NS, START_RETRY_NS, STUCK_NS, SWEEP_NS, SWEEP_RANGE_NS, SuspendState,
-    SuspendWord, Transition, USE_ENTRY_BYTES, barrier, best_class, clear_step, clear_steps,
-    device_leaf_word, floors, ioport_check, member_transition, module_frames, ports_meet,
-    successor,
+    MEMBER_RESUME, MEMORY_TAKE_ENTRY, MEMORY_TAKE_RUN, MEMORY_TAKE_TABLES, Member, MemberState,
+    ModuleFrame, ModuleFrames, NMI_GRACE_NS, NODE_IMAGE_BOOT, NODE_IMAGE_REPLACEMENT,
+    NODE_START_FRESH, NODE_START_RESUME, NODE_STATUS_CLASS_SHIFT, NODE_STATUS_CORES_MASK,
+    NODE_STATUS_UNUSABLE, NODE_STATUS_WORDS, NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL,
+    NODE_WATCH_SLOTS, NODES_MAX, OBSERVATION_LIFE, OBSERVATIONS_MAX, OWNER_RESERVE_BASE,
+    OWNER_UNCLAIMED, OwnState, Owner, Ownership, PAGE_CLASS_ITS_TABLE, PageClass,
+    R1_UNITS_PER_STEP, R1State, R1Word, RECOVERY_BANDWIDTH, RECOVERY_PERIOD_NS,
+    REQUEST_RECORD_BYTES, REQUEST_SERIAL_MAX, RESERVES_MAX, RESERVES_MIN, ROLE_EPOCH_MASK,
+    ROLE_FAILED, ROLE_NOBODY, ROLE_PLAIN_PLATFORM, ROLES_PLAIN_MAX, RemoteRef, RequestState,
+    RequestWord, RoleKind, RoleState, RoleWord, RootState, SEAL_NS, SEAL_RANGE_NS, SETTLE_NS,
+    SLOT_BY_KIND_SHIFT, SLOT_DEAD, SLOT_DEPTH_SHIFT, SLOT_DYING, SLOT_EMPTY, SLOT_FRAME_ASKED_MASK,
+    SLOT_FRAME_DEVICE, SLOT_FRAME_FIRST_SHIFT, SLOT_FRAME_MEMORY_SHIFT, SLOT_FRAME_PAGE_SHIFT,
+    SLOT_FRAME_PAGES_SHIFT, SLOT_FULL, SLOT_IRQ_CORE_SHIFT, SLOT_KIND_SHIFT, SLOT_RECORD_BINDING,
+    SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_PARTIAL, SLOT_RECORD_RIGHTS_SHIFT,
+    SLOT_RECORD_UNMAPPING, SLOT_REMOTE, SLOT_REMOTE_GRANT_SHIFT, SLOT_REMOTE_SERIAL_SHIFT,
+    SLOT_REMOTE_USE_SHIFT, SLOT_RIGHTS_SHIFT, SLOT_ROOT, SLOT_STATE_MASK, SLOT_UNTYPED_BLOCK,
+    SLOT_UNTYPED_CLEAN, SLOT_UNTYPED_DEVICE, SLOT_UNTYPED_ENTRY, SLOT_UNTYPED_ENTRY_SHIFT,
+    SLOT_UNTYPED_LOG2_SHIFT, SLOT_UNTYPED_READY_WORD, SLOT_UNTYPED_TABLE, STALE_NS, STALE_RANGE_NS,
+    START_NS, START_RETRY_NS, STUCK_NS, SWEEP_NS, SWEEP_RANGE_NS, SuspendState, SuspendWord,
+    TAGS_USABLE_MAX, Transition, USE_ENTRY_BYTES, barrier, best_class, clear_step, clear_steps,
+    device_leaf_word, floors, gate_tag, ioport_check, member_transition, module_frames, ports_meet,
+    successor, usable_tags,
 };
 pub use ring::{
     CREDIT_NONE, CREDIT_SERIAL_MASK, NodeMessage, PENDING_STEP, REPORT_END, REPORT_KIND_DEVICE,
@@ -90,10 +91,11 @@ pub use start::{
     START_SLOT_TASK, START_SLOT_THREAD, START_STAGE_DEVICE_TREE, START_STAGE_LIMINE,
     START_STAGE_OTHER, START_STAGE_UBIOS, START_STAGE_UEFI, START_TABLE_ACPI_ROOT,
     START_TABLE_DEVICE_TREE, START_TABLE_SMBIOS, START_TABLE_UBIOS, START_UNTYPED_DEVICE,
-    START_VERSION, StartBootTimes, StartCore, StartCrash, StartDebug, StartEntry, StartFeedback,
-    StartFirmwareTable, StartFramebuffer, StartHeader, StartImage, StartInterrupts, StartIoApic,
-    StartIommu, StartKept, StartKind, StartKindRecord, StartMachine, StartMemory, StartMemoryRange,
-    StartModule, StartNode, StartProcess, StartRole, StartShare, StartUntyped,
+    START_UNTYPED_TABLE, START_VERSION, StartBootTimes, StartCore, StartCrash, StartDebug,
+    StartEntry, StartFeedback, StartFirmwareTable, StartFramebuffer, StartHeader, StartImage,
+    StartInterrupts, StartIoApic, StartIommu, StartKept, StartKind, StartKindRecord, StartMachine,
+    StartMemory, StartMemoryRange, StartModule, StartNode, StartProcess, StartRole, StartShare,
+    StartUntyped,
 };
 
 /// Message words carried in registers on x86-64. A message that fits here,
@@ -155,10 +157,18 @@ pub const SCHED_BYTES: usize = 256;
 /// Bytes of the fixed part of a `thread`; the vector state area is added
 /// and the sum rounded up to a power of two (Object sizes, Unlike cores).
 pub const THREAD_FIXED_BYTES: u64 = 1024;
-/// Pages of an `aspace` and of an `iospace`: the root table and a header
-/// (Address spaces and their tables).
+/// Pages of an `aspace` and of an `iospace`, in all: a header and the
+/// root table (Address spaces and their tables).
 pub const ASPACE_PAGES: u64 = 2;
 pub const IOSPACE_PAGES: u64 = 2;
+/// Of those, the pages `untyped_retype` takes from the ordinary untyped
+/// (the header) and from the table untyped its size argument names (the
+/// root table) (D-154).
+pub const SPACE_HEADER_PAGES: u64 = 1;
+pub const SPACE_ROOT_PAGES: u64 = 1;
+/// Entries of the start-up entry `ObjectSizes`: one per object kind, 0 to
+/// 21 (D-154, F12).
+pub const OBJECT_SIZES_ENTRIES: usize = ObjectKind::ALL.len();
 /// Entries of one table page, at most: the number of pages of a frame and
 /// the fields of a mapping record have 12 bits (Values of the machine).
 pub const TABLE_ENTRIES_MAX: u32 = 4096;
@@ -1377,6 +1387,8 @@ mod proofs {
     fn dr7_valid_refuses_what_the_contract_refuses() {
         let word: u64 = kani::any();
         if x86_64::dr7_valid(word) {
+            // D-155: general detect, bit 13, is never accepted.
+            assert!(word & x86_64::DR7_GD == 0 && word >> 13 & 1 == 0);
             assert!(word & !x86_64::DR7_USER_MASK == 0);
             let n: u64 = kani::any::<u64>() % 4;
             let condition = word >> (16 + 4 * n) & 0b11;
@@ -1384,6 +1396,19 @@ mod proofs {
             assert!(condition != 0b10 && length != 0b10);
             assert!(condition != 0 || length == 0);
         }
+    }
+
+    /// G10 (D-155): an ordinary inter-kernel vector lies inside 240 to
+    /// 255, a vector of a line without remapping in 48 to 239, and no
+    /// vector is both; neither is an exception's.
+    #[kani::proof]
+    fn inter_kernel_vectors_and_line_vectors_are_disjoint() {
+        let vector: u8 = kani::any();
+        let (ikv, line) = (x86_64::ikv_valid(vector), x86_64::line_vector_valid(vector));
+        assert!(!(ikv && line));
+        assert!(!ikv || vector >= 240);
+        assert!(!line || (48 <= vector && vector <= 239));
+        assert!(ikv == (x86_64::IKV_FIRST <= vector && vector <= x86_64::IKV_LAST));
     }
 
     /// `dbgbcr_valid` accepts 0 or a word within the user mask that

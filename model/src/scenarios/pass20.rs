@@ -755,7 +755,7 @@ fn a_table_unhooked_by_a_record_whose_invalidation_is_in_flight_stays_off_the_fr
         k.ok(Syscall::ASpaceMap(crate::Map {
             space: s(360),
             frame: s(slot),
-            untyped: s(k.ut),
+            untyped: s(k.tables()),
             address: at,
             first: 0,
             count: 1,

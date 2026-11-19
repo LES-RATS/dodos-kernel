@@ -16,7 +16,11 @@ use dodos_model::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::OnceLock;
 
-const SEEDS: u64 = 24;
+/// 48 since pass 31 (24 before): D-154 moved the start-up slots and the
+/// chunks, which changed every run, and 24 seeds no longer reached the
+/// rarest events on every geometry (a `send` refused by the depth rule at
+/// random read 0 on two of the three).
+const SEEDS: u64 = 48;
 const STEPS: usize = 5000;
 
 /// The steps of a run: more where a page is larger than 16 KB, since each
@@ -89,6 +93,11 @@ const UNTYPED_SLOT: u32 = 25;
 /// and the device range, at depth 2.
 const MEMORY_SLOT: u32 = 107;
 const DEVICE_SLOT: u32 = 108;
+/// A table block of 8 chunks (`memory_take` kind 2, D-154), at depth 2:
+/// the root tables and the lower tables of the spaces the walk makes come
+/// from it. The table floor's own untyped holds the start-up aspace's
+/// tables for the life of the node, so its watermark never returns.
+const TABLES_SLOT: u32 = 109;
 /// The `core` capabilities of `Machine::example`: the boot core's, then
 /// the other's.
 const CORE_SLOT: u32 = 16;
@@ -136,8 +145,12 @@ fn root_span() -> u64 {
 
 const HERE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
 const MEMORY: SlotAddr = SlotAddr::own(MEMORY_SLOT);
+/// The table block: the size argument of an `aspace` and of an `iospace`,
+/// and the untyped of their maps (D-154).
+const TABLES: SlotAddr = SlotAddr::own(TABLES_SLOT);
 
-const KINDS: [(ObjectKind, u32, u64); 12] = [
+const KINDS: [(ObjectKind, u32, u64); 13] = [
+    (ObjectKind::ItsTable, OTHER, 1),
     (ObjectKind::Untyped, UNTYPED, 0),
     (ObjectKind::CSpace, CSPACE, 256),
     (ObjectKind::Thread, THREAD, 0),
@@ -145,11 +158,11 @@ const KINDS: [(ObjectKind, u32, u64); 12] = [
     (ObjectKind::Reply, REPLY, 0),
     (ObjectKind::Notify, NOTIFY, 0),
     (ObjectKind::Frame, OTHER, 3),
-    (ObjectKind::ASpace, SPACE, 0),
+    (ObjectKind::ASpace, SPACE, TABLES.raw()),
     (ObjectKind::Sched, OTHER, 0),
     (ObjectKind::Timer, OTHER, 0),
     (ObjectKind::Task, OTHER, 0),
-    (ObjectKind::IoSpace, SPACE, 0),
+    (ObjectKind::IoSpace, SPACE, TABLES.raw()),
 ];
 /// The kinds that this version does not make, and those never made from an
 /// untyped.
@@ -178,7 +191,7 @@ const PAGES: [PageSize; 5] = [
 /// task; the role and the memory_control were never measured). A `node`,
 /// an `iommu`, `irq_control`, `ioports` and the debug capability are of the
 /// start-up and never die in a run of one node.
-const MADE: [ObjectKind; 15] = [
+const MADE: [ObjectKind; 16] = [
     ObjectKind::Untyped,
     ObjectKind::CSpace,
     ObjectKind::ASpace,
@@ -194,6 +207,7 @@ const MADE: [ObjectKind; 15] = [
     ObjectKind::Task,
     ObjectKind::MemoryControl,
     ObjectKind::Role,
+    ObjectKind::ItsTable,
 ];
 
 /// The calls, numbered as `name_of` numbers them.
@@ -356,7 +370,10 @@ fn retype(kind: ObjectKind, size: u64, destination: SlotAddr) -> Syscall {
     Syscall::UntypedRetype {
         untyped: MEMORY,
         kind,
-        size,
+        size: match kind {
+            ObjectKind::ASpace | ObjectKind::IoSpace if size == 0 => TABLES.raw(),
+            _ => size,
+        },
         page: PageSize::Page as u64,
         memory: 0,
         destination,
@@ -505,12 +522,14 @@ impl Generator<'_> {
     }
 
     /// The untyped to take memory from: mostly the one in slot 107, so that a
-    /// capability space is often grown from the untyped it was created from.
+    /// capability space is often grown from the untyped it was created from;
+    /// now and then the table block, which makes only child table untypeds
+    /// and `its_table`s (D-154).
     fn memory(&mut self) -> SlotAddr {
-        if self.rng.chance(60) {
-            MEMORY
-        } else {
-            self.held(UNTYPED)
+        match self.rng.below(100) {
+            0..60 => MEMORY,
+            60..66 => TABLES,
+            _ => self.held(UNTYPED),
         }
     }
 
@@ -790,16 +809,17 @@ impl Generator<'_> {
     }
 
     /// The arguments of a mapping: a space and a frame of their classes,
-    /// mostly the untyped in slot 107, and a range near the bottom of the
-    /// user range, so that mappings meet.
+    /// mostly the table-floor untyped the spaces name (D-154), and a range
+    /// near the bottom of the user range, so that mappings meet.
     fn map(&mut self) -> Map {
         let size = if self.rng.chance(90) { page() } else { large() };
         Map {
             space: self.held(SPACE),
             frame: self.held(OTHER),
             untyped: match self.rng.below(10) {
-                0..7 => MEMORY,
+                0..7 => TABLES,
                 7 => SlotAddr::NONE,
+                8 => MEMORY,
                 _ => self.held(UNTYPED),
             },
             address: (1 << 30) + size * self.rng.below(16) + (self.rng.chance(2) as u64) * page(),
@@ -1557,7 +1577,7 @@ impl Generator<'_> {
             calls.push(Syscall::ASpaceMap(Map {
                 space: own(*aspace),
                 frame: own(frame),
-                untyped: MEMORY,
+                untyped: TABLES,
                 address: base + far + 2 * page() * n as u64,
                 first: 0,
                 count: 1 + self.rng.below(2),
@@ -1577,7 +1597,7 @@ impl Generator<'_> {
                 calls.push(Syscall::ASpaceMap(Map {
                     space: own(*aspace),
                     frame: own(copy),
-                    untyped: MEMORY,
+                    untyped: TABLES,
                     address: (1 << 31) + page() * n as u64,
                     first: 0,
                     count: 1,
@@ -1600,7 +1620,7 @@ impl Generator<'_> {
         calls.push(Syscall::IoSpaceMap(Map {
             space: own(*iospace),
             frame: own(copy),
-            untyped: MEMORY,
+            untyped: TABLES,
             address: 0x1_0000,
             first: 0,
             count: 2,
@@ -1647,8 +1667,21 @@ impl Generator<'_> {
                 if !self.whole(MEMORY) {
                     return Vec::new();
                 }
-                let kinds = [ObjectKind::Timer, ObjectKind::Task, ObjectKind::IoSpace];
-                calls.push(retype(self.rng.pick(&kinds), 0, own(*first)));
+                // An `its_table` comes from a table untyped only (D-154).
+                let kinds = [
+                    ObjectKind::Timer,
+                    ObjectKind::Task,
+                    ObjectKind::IoSpace,
+                    ObjectKind::ItsTable,
+                ];
+                let kind = self.rng.pick(&kinds);
+                let mut made = retype(kind, 0, own(*first));
+                if let (ObjectKind::ItsTable, Syscall::UntypedRetype { untyped, .. }) =
+                    (kind, &mut made)
+                {
+                    *untyped = TABLES;
+                }
+                calls.push(made);
                 own(*first)
             }
         };
@@ -1961,6 +1994,16 @@ fn start() -> (Model, ObjId) {
     assert_eq!(model.apply(first, half), Ok(Output::Done));
     let chunk = model.geometry().chunk_shift();
     common::take_run(&mut model, first, chunk + 5, MEMORY_SLOT);
+    // The table block lies after the run of 32 chunks.
+    let run = 32 * model.geometry().chunk();
+    let tables = Syscall::MemoryTake {
+        control: own(START_SLOT_MEMORY_CONTROL),
+        kind: MEMORY_TAKE_TABLES,
+        place: (ram() + 10 * model.geometry().chunk()).next_multiple_of(run) + run,
+        size: u64::from(chunk + 3),
+        destination: own(TABLES_SLOT),
+    };
+    assert_eq!(model.apply(first, tables), Ok(Output::Done));
     common::take_device(&mut model, first);
     let to_place = Syscall::CapMove {
         source: own(common::DEVICE),
@@ -2647,10 +2690,15 @@ fn objects_of_every_kind_are_seen_dying() {
     at_least(
         dying,
         [
-            2147, 8037, 18, 6411, 15, 15, 12, 15, 31, 15, 3, 8237, 15, 732, 4,
+            // Pass 31 (19 November 2026, 48 seeds, the smallest of the
+            // three page sizes): a sched measured 8, floor 6 (15 before);
+            // an `its_table`, made from a table untyped (D-154), measured
+            // 6, floor 5. The other floors are those of pass 23.
+            2147, 8037, 18, 6411, 15, 6, 12, 15, 31, 15, 3, 8237, 15, 732, 4, 5,
         ],
     );
-    at_least([reached.dying_copies], [270]);
+    // Pass 31: measured 243, floor 183 (270 before).
+    at_least([reached.dying_copies], [183]);
 }
 
 #[test]
@@ -2767,7 +2815,11 @@ fn scheduling_states_are_reached() {
         reached.no_aspace,
         reached.no_context,
     ];
-    at_least(states, [64948, 1467, 207, 6789, 9751, 52611, 5749, 108]);
+    // Pass 31 (19 November 2026, 48 seeds): a thread marked as having
+    // lost its context measured 3,468 on the smallest of the three page
+    // sizes, floor 2,601 (6,789 before); the other floors are those of
+    // pass 23.
+    at_least(states, [64948, 1467, 207, 2601, 9751, 52611, 5749, 108]);
     // Measured: the clock moved 4,730 times, and a timer fired in 11.
     at_least([reached.advanced, reached.fired], [3548, 9]);
 }

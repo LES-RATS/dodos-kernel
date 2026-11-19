@@ -110,6 +110,10 @@ impl System {
                 let bytes = frame.pages << table.geometry.page_shift[frame.page as usize];
                 let classed = (frame.base / page..(frame.base + bytes) / page)
                     .any(|p| table.classes.contains_key(&p));
+                // Shadowed since D-154 by the gate word's rule (TABLES, in
+                // each node's check): a page not *data* lies in a table
+                // chunk, whose grant count is 0, so G4's count below would
+                // not be the grants over it.
                 ensure(
                     !classed,
                     "G5: a page under a grant's anchor not of class data",

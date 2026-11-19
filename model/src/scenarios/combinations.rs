@@ -1422,6 +1422,18 @@ impl Run {
             if self.m.state(f) != MemberState::Sealing {
                 assert!(!self.m.sys.gate_park_self(f, f as usize));
             }
+            // D-154: its gate puts no table in an ordinary chunk it holds
+            // (its ordinary floor's first page here), and writes no leaf
+            // and no grant's anchor toward its table floor.
+            let table = self.m.sys.canonical();
+            let geometry = table.geometry;
+            let class = dodos_abi::PageClass::table(1).expect("a class");
+            let ordinary = table.floors[f as usize][0].0 / geometry.page();
+            let tables = table.table_floors[f as usize][0].0 / geometry.page();
+            let last = tables + geometry.chunk() / geometry.page() - 1;
+            let node = self.m.sys.node_mut(f);
+            assert!(!node.gate_retype_page(ordinary, class));
+            assert!(!node.gate_leaf_allowed(last) && !node.gate_anchor_allowed(last));
         }
         let table = self.m.sys.canonical();
         match self.faulty_acts % 10 {
@@ -1680,7 +1692,9 @@ fn map_call(m: &S, pair: Pair) -> Syscall {
     };
     match pair.io {
         true => {
-            let ut = untyped_slot(m.sys.node(pair.holder), m.t[pair.holder as usize]);
+            // The iospace's table untyped: the holder's table floor's
+            // (D-154).
+            let ut = super::table_slot(m.sys.node(pair.holder), m.t[pair.holder as usize]);
             Syscall::IoSpaceMap(map(s(IOSPACE), s(ut)))
         }
         false => Syscall::ASpaceMap(map(s(dodos_abi::START_SLOT_ASPACE), SlotAddr::NONE)),

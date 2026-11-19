@@ -142,6 +142,18 @@ impl Model {
         self.table.roles[role].failed()
     }
 
+    /// Whether the role word of any IOMMU unit reads *failed* (Reclaim,
+    /// R6; D-154, F14).
+    pub(crate) fn an_iommu_unit_failed(&self) -> bool {
+        self.table
+            .role_records
+            .iter()
+            .enumerate()
+            .any(|(role, record)| {
+                record.governs == dodos_abi::Governs::IommuUnit && self.unit_failed(role)
+            })
+    }
+
     /// Makes an entry of the unit request table for a call or a step. A
     /// call that finds no free entry returns `again` with nothing changed;
     /// a step returns `again` in the same way.

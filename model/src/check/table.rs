@@ -3,7 +3,7 @@
 
 use super::{Check, ensure};
 use crate::{Block, Model, ObjId};
-use dodos_abi::{Ownership, Rights};
+use dodos_abi::{ObjectKind, Ownership, Rights};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// An ownership word as the invariants read it: (state, owner code,
@@ -493,7 +493,48 @@ impl Model {
             let taken = space.hooked.len() + space.free.len() + space.unhooked.len();
             let followed = space.root.is_none() || space.tables == taken as u64;
             ensure(followed, "59: tables of a space")?;
+            // The root table and the lower tables of a space lie in the
+            // table untyped named at its creation (Address spaces and their
+            // tables, D-154); the start-up aspace's in its table floor.
+            let inside = |at: u64| match space.table_untyped {
+                Some(tables) => self
+                    .untypeds
+                    .get(&tables)
+                    .is_some_and(|u| u.table && u.base <= at && at + page <= u.base + u.bytes),
+                None => table.table_floors[node as usize]
+                    .iter()
+                    .any(|&(s, e)| s <= at && at < e),
+            };
+            ensure(
+                space.table_pages().all(inside),
+                "TABLES: a table of a space outside its table untyped",
+            )?;
         }
+        // An `its_table`'s pages are of class *ITS table* (D-152
+        // complement), and only a table untyped makes one; a table untyped
+        // makes nothing else but a child table untyped (D-154).
+        for (id, &(first, pages)) in &self.its_tables {
+            for at in first..first + pages {
+                tables.insert(at, Some(dodos_abi::PageClass::its_table(false)));
+            }
+            ensure(
+                self.objects.contains_key(id),
+                "59: an its_table of no object",
+            )?;
+        }
+        let from_tables = |object: &crate::Object| {
+            object
+                .from
+                .is_some_and(|from| self.untypeds.get(&from).is_some_and(|u| u.table))
+        };
+        let kinds = self.objects.values().all(|object| {
+            let table_kind = matches!(object.kind, ObjectKind::Untyped | ObjectKind::ItsTable);
+            match object.kind {
+                ObjectKind::ItsTable => from_tables(object),
+                _ => !from_tables(object) || table_kind,
+            }
+        });
+        ensure(kinds, "TABLES: a kind a table untyped does not make")?;
         let classes_right = tables.iter().all(|(page, class)| {
             let stored = table.classes.get(page);
             match class {
@@ -528,6 +569,34 @@ impl Model {
             true => tables.is_subset(&classes),
         };
         ensure(held, "59: page classes")?;
+        // The gate word of a chunk (G4, D-154): a table chunk counts no
+        // leaf and no grant (G3 and G6 refuse a leaf and an anchor over
+        // it), and only a table chunk holds a page that is not *data*. With
+        // rule 58's map counts and G4's grant counts, this is also "no
+        // translation and no anchor targets a table chunk".
+        let words = table.gate_words.iter().all(|&raw| {
+            dodos_abi::GateWord::from_raw(raw).is_some_and(dodos_abi::GateWord::consistent)
+        });
+        ensure(words, "TABLES: a gate word no gate writes")?;
+        // Kept kernel tables (D-154): the kernel's own space maps
+        // read-only, as one large leaf, exactly its table floor and the
+        // table chunks it took; every other chunk it maps is writable.
+        let chunk = table.geometry.chunk();
+        let floor = table.table_floors[node as usize]
+            .iter()
+            .flat_map(|&(s, e)| (s..e).step_by(chunk as usize))
+            .map(|at| at / chunk);
+        let read_only: BTreeSet<u64> = self
+            .kernel_runs
+            .iter()
+            .copied()
+            .chain(floor)
+            .filter(|&c| table.table_chunk(c))
+            .collect();
+        ensure(
+            read_only == self.kernel_read_only,
+            "TABLES: the kernel's view of a table chunk",
+        )?;
         Ok(())
     }
 }

@@ -331,6 +331,31 @@ impl Machine {
                     }
                 }
             }
+            // The ITS word *pinned* → 0 at a *failed* or *refused* answer to
+            // an ITS mapping: the run's bits 6-7 written 0, the object
+            // unpinned, the identifier word free if the attach word also
+            // reads 0 (Gate words, the ITS word; D-154, F10: the row named
+            // the unmapping's answer alone, and a mapping that failed left
+            // the word pinned, its `its_table` never destroyed).
+            Words::ItsMap { device, table, k }
+                if matches!(
+                    state,
+                    unit::RecordState::Failed | unit::RecordState::Refused
+                ) =>
+            {
+                let d = usize::from(device);
+                if self.dev.its[d] == (Bound::Pinned, table, k) && self.dev.ids[d] == Some((n, g)) {
+                    self.dev.its[d] = (Bound::Zero, 0, 0);
+                    self.free_identifier(n, device, false);
+                    for page in run(table, k) {
+                        if let Some(c) = self.gate.classes.get_mut(page as usize)
+                            && *c == (Class::ItsTable { pinned: true })
+                        {
+                            *c = Class::ItsTable { pinned: false };
+                        }
+                    }
+                }
+            }
             // The retired bit at the state word *failed* of an invalidation
             // of the interrupt entry cache.
             Words::Iec { handle } if state == unit::RecordState::Failed => {
@@ -382,24 +407,16 @@ impl Machine {
             Class::Data,
         )?;
         self.gate.tables.remove(&root);
-        self.kernel_view_writable(n, root);
         Ok(())
     }
 
     // The ITS word and the `its_table` object.
 
-    /// `untyped_retype` of kind 17: 2^*k* pages of *data* → *ITS table*,
+    /// `untyped_retype` of kind 21: 2^*k* pages of *data* → *ITS table*,
     /// unpinned, cleared in the call; *k* above 4 `invalid`. As for a
-    /// table: held, no anchor, G5's map count and no give in flight (D-153,
-    /// gaps 28 and 30), and the kernel's view first (D-153, gap 29).
-    pub(crate) fn retype_its(
-        &mut self,
-        n: u16,
-        p: usize,
-        first: Page,
-        k: u8,
-        split: Option<Page>,
-    ) -> Gated {
+    /// table: held, in a table chunk (an `its_table` comes from a table
+    /// untyped only, D-154), no give in flight (D-153, gap 30).
+    pub(crate) fn retype_its(&mut self, n: u16, first: Page, k: u8) -> Gated {
         self.unit_writes(n)?;
         require(k <= ITS_K_MAX)?;
         let pages = run(first, k);
@@ -409,10 +426,12 @@ impl Machine {
         require(first.is_multiple_of(1 << k) && pages.end <= self.chunks * PAGES_PER_CHUNK)?;
         require(Machine::chunk_of(first) == Machine::chunk_of(pages.end - 1))?;
         for page in pages.clone() {
-            require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
+            require(self.leaves_data(n, page))?;
             require(self.gate.classes[page as usize] == Class::Data)?;
         }
-        self.leave_data(n, p, pages.collect(), split, Target::Its { first, k })
+        let pages: Vec<Page> = pages.collect();
+        self.apply_target(n, &pages, Target::Its { first, k });
+        Ok(())
     }
 
     /// The first `irq_claim` of an LPI of the device, naming an
@@ -480,7 +499,6 @@ impl Machine {
         }
         for page in run(first, k) {
             self.cas_class(page, Class::ItsTable { pinned: false }, Class::Data)?;
-            self.kernel_view_writable(n, page);
         }
         self.dev.its_objects.remove(&first);
         Ok(())

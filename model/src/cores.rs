@@ -36,6 +36,21 @@ pub enum Ipi {
     Ring,
 }
 
+impl Ipi {
+    /// x86-64: the vector of the interrupt, one of the ordinary
+    /// inter-kernel vectors `IKV_FIRST..=IKV_LAST`, which are the only
+    /// ones the gate composes an ICR for (G10, D-155).
+    pub fn vector(self) -> u8 {
+        let index = match self {
+            Ipi::Reschedule => 0,
+            Ipi::Leave => 1,
+            Ipi::Invalidate => 2,
+            Ipi::Ring => 3,
+        };
+        dodos_abi::x86_64::IKV_FIRST + index
+    }
+}
+
 /// The idle word of a core: the idle mark and the owes bit, changed only by
 /// compare-and-swap (D-131).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

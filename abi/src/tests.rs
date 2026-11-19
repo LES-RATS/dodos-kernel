@@ -1129,11 +1129,14 @@ fn fields_of_the_shared_layouts_have_their_offsets() {
     ];
     assert_eq!(crash, [12, 16, 24, 32, 36, 48]);
     let floors = [
+        offset_of!(BootFloors, floor_tables),
+        offset_of!(BootFloors, reserve_bytes),
         offset_of!(BootFloors, reserve_per_gib),
         offset_of!(BootFloors, reserves),
         offset_of!(BootFloors, plain_roles),
     ];
-    assert_eq!(floors, [16, 24, 28]);
+    // D-154: `floor_tables` after `floor_node`, as the contract lists them.
+    assert_eq!(floors, [8, 16, 24, 32, 36]);
     let clock = [
         offset_of!(ClockPage, seq),
         offset_of!(ClockPage, flags),
@@ -1195,7 +1198,7 @@ fn layouts_are_fixed() {
     assert_eq!(size_of::<StartKindRecord>(), 56);
     assert_eq!(size_of::<StartFeedback>(), 16);
     assert_eq!(size_of::<StartDebug>(), 56);
-    assert_eq!(size_of::<BootFloors>(), 32);
+    assert_eq!(size_of::<BootFloors>(), 40);
     assert_eq!(size_of::<BootMembership>(), 24);
     assert_eq!(size_of::<BootNodes>(), 8);
     assert_eq!(size_of::<BootNode>(), 16);
@@ -1698,6 +1701,7 @@ fn the_size_of_a_thread_follows_its_mask() {
 fn floors_are_whole_chunks_of_the_boot_numbers() {
     let boot = BootFloors {
         floor_node: (64 << 20) + 1,
+        floor_tables: 1,
         reserve_bytes: 128 << 20,
         reserve_per_gib: 1 << 20,
         reserves: 2,
@@ -1706,8 +1710,10 @@ fn floors_are_whole_chunks_of_the_boot_numbers() {
     let chunk = 2 << 20;
     let f = floors(8 << 30, 4, boot, chunk).unwrap();
     assert_eq!(f.floor, 66 << 20);
+    // D-154: the table floor, rounded up to a chunk, once per node slot.
+    assert_eq!(f.tables, 2 << 20);
     assert_eq!(f.reserve, 136 << 20);
-    assert_eq!(f.total, 4 * (66 << 20) + 2 * (136 << 20));
+    assert_eq!(f.total, 4 * (68 << 20) + 2 * (136 << 20));
     assert_eq!(floors(256 << 20, 4, boot, chunk), None);
     let huge = BootFloors {
         floor_node: u64::MAX,
@@ -2184,8 +2190,10 @@ fn the_gate_word_holds_a_32_bit_map_count_and_the_pages_not_of_class_data() {
     assert_eq!(word.raw(), 0xFFFF_FFFF | 4096 << 32);
     assert_eq!(GateWord::from_raw(word.raw()), Some(word));
     assert_eq!(GateWord::new(0, 4097), None);
-    // D-148: bits 45-57 the grant count; a bit above 57 is refused.
-    assert_eq!(GateWord::from_raw(1 << 58), None);
+    // D-148: bits 45-57 the grant count; D-154: bit 58 the table bit, a
+    // bit above 58 refused.
+    assert_eq!(GateWord::from_raw(1 << 58), Some(GateWord::TABLE));
+    assert_eq!(GateWord::from_raw(1 << 59), None);
     assert_eq!(GateWord::from_raw(1 << 45).map(GateWord::grants), Some(1));
     assert_eq!(GateWord::from_raw(4097 << 32), None);
     let granted = word.with_grants(crate::GRANT_COUNT_MAX).unwrap();
@@ -2332,8 +2340,10 @@ fn r7_abi_survivors() {
         exec: false,
         device_type: true,
     }));
-    // #027, revised by D-148: GateWord::from_raw rejects a bit above 57.
-    assert_eq!(GateWord::from_raw((1u64 << 58) | (1u64 << 32)), None);
+    // #027, revised by D-148 and D-154: GateWord::from_raw rejects a bit
+    // above 58 (bit 58 is the table bit).
+    assert_eq!(GateWord::from_raw((1u64 << 59) | (1u64 << 32)), None);
+    assert!(GateWord::from_raw((1u64 << 58) | (1u64 << 32)).is_some_and(GateWord::is_table));
     // #030 (restated for D-128, which removed the co-hosting row): a
     // sealed word is reached only from sealing, keeping evidence and driver.
     let live = Member::new(MemberState::Live, Evidence::None, DRIVER_NONE, 1);
@@ -2980,4 +2990,156 @@ fn every_abort_status_code_of_arm64_has_its_kind() {
     for fsc in 0..=0x3F {
         assert_eq!(crate::aarch64::abort_use(fsc), wanted(fsc), "{fsc:#x}");
     }
+}
+
+/// D-154: bit 58 of the gate word is the table bit, kept by every write of
+/// a count; a table chunk counts no leaf and no grant, an ordinary chunk no
+/// page that is not data.
+#[test]
+fn the_gate_word_carries_the_table_bit_through_its_counts() {
+    use crate::{GATE_WORD_TABLE, GRANT_COUNT_MAX, GateWord};
+    assert_eq!(GATE_WORD_TABLE, 1 << 58);
+    assert_eq!(
+        (GateWord::TABLE.raw(), GateWord::ORDINARY.raw()),
+        (1 << 58, 0)
+    );
+    assert!(GateWord::TABLE.is_table() && !GateWord::ORDINARY.is_table());
+    let table = GateWord::TABLE.with_not_data(3).unwrap();
+    assert!(table.is_table() && table.consistent());
+    assert_eq!(
+        (table.map_count(), table.not_data(), table.grants()),
+        (0, 3, 0)
+    );
+    assert_eq!(GateWord::TABLE.with_not_data(4097), None);
+    // A table chunk that counts a leaf or a grant, and an ordinary chunk
+    // that holds a table, are words no gate writes.
+    assert!(!table.with_map_count(1).consistent());
+    assert!(!table.with_grants(1).unwrap().consistent());
+    assert!(table.with_map_count(1).is_table());
+    assert!(table.with_grants(GRANT_COUNT_MAX).unwrap().is_table());
+    let ordinary = GateWord::new(7, 0).unwrap().with_grants(2).unwrap();
+    assert!(ordinary.consistent() && !ordinary.is_table());
+    assert!(!ordinary.with_not_data(1).unwrap().consistent());
+    assert_eq!(ordinary.with_map_count(9).grants(), 2);
+    // Bits 59-63 are zero.
+    for bit in 59..64 {
+        assert_eq!(GateWord::from_raw(1 << bit), None, "bit {bit}");
+    }
+}
+
+/// D-154: `memory_take` kind 2, bit 51 of an untyped's slot word 0, bit 1
+/// of `StartUntyped.flags`, and the 22 entries of `ObjectSizes` (F12).
+#[test]
+fn a_table_untyped_has_its_kind_its_slot_bit_and_its_start_flag() {
+    use crate::{
+        MEMORY_TAKE_ENTRY, MEMORY_TAKE_RUN, MEMORY_TAKE_TABLES, OBJECT_SIZES_ENTRIES, ObjectKind,
+        SLOT_UNTYPED_BLOCK, SLOT_UNTYPED_CLEAN, SLOT_UNTYPED_DEVICE, SLOT_UNTYPED_ENTRY,
+        SLOT_UNTYPED_TABLE, SPACE_HEADER_PAGES, SPACE_ROOT_PAGES, START_UNTYPED_DEVICE,
+        START_UNTYPED_TABLE,
+    };
+    assert_eq!(
+        [MEMORY_TAKE_RUN, MEMORY_TAKE_ENTRY, MEMORY_TAKE_TABLES],
+        [0, 1, 2]
+    );
+    assert_eq!(SLOT_UNTYPED_TABLE, 1 << 51);
+    let others = SLOT_UNTYPED_DEVICE | SLOT_UNTYPED_CLEAN | SLOT_UNTYPED_BLOCK | SLOT_UNTYPED_ENTRY;
+    // Bits 35-50 hold a device entry's index: bit 51 is the next free one.
+    assert_eq!(SLOT_UNTYPED_TABLE & (others | 0xFFFF << 35), 0);
+    assert_eq!((START_UNTYPED_DEVICE, START_UNTYPED_TABLE), (1, 2));
+    assert_eq!(OBJECT_SIZES_ENTRIES, 22);
+    assert_eq!(ObjectKind::ALL[21], ObjectKind::ItsTable);
+    assert_eq!(ObjectKind::ItsTable as u32, 21);
+    assert_eq!(SPACE_HEADER_PAGES + SPACE_ROOT_PAGES, crate::ASPACE_PAGES);
+    assert_eq!(SPACE_HEADER_PAGES + SPACE_ROOT_PAGES, crate::IOSPACE_PAGES);
+}
+
+/// D-154: a boot image whose `floor_tables` is 0 gives fewer than one
+/// table chunk per node slot, and has no floors.
+#[test]
+fn floors_need_a_table_floor_of_at_least_one_chunk() {
+    let boot = BootFloors {
+        floor_node: 2 << 20,
+        floor_tables: 0,
+        reserve_bytes: 2 << 20,
+        reserve_per_gib: 0,
+        reserves: 2,
+        plain_roles: 0,
+    };
+    let chunk = 2 << 20;
+    assert_eq!(floors(1 << 30, 2, boot, chunk), None);
+    let one = BootFloors {
+        floor_tables: 1,
+        ..boot
+    };
+    let f = floors(1 << 30, 2, one, chunk).unwrap();
+    assert_eq!((f.floor, f.tables), (chunk, chunk));
+    assert_eq!(f.total, 2 * 2 * chunk + 2 * chunk);
+    // Three chunks and a byte round up to four.
+    let more = BootFloors {
+        floor_tables: 3 * chunk + 1,
+        ..boot
+    };
+    assert_eq!(floors(1 << 30, 2, more, chunk).unwrap().tables, 4 * chunk);
+    let huge = BootFloors {
+        floor_tables: u64::MAX,
+        ..boot
+    };
+    assert_eq!(floors(u64::MAX, 1, huge, chunk), None);
+}
+
+/// D-155, G7: one tag is the gate's on each architecture, and the tag
+/// table holds the others, at most 4,095.
+#[test]
+fn the_tag_table_leaves_the_gate_its_tag() {
+    use crate::{TAGS_USABLE_MAX, gate_tag, usable_tags};
+    assert_eq!(TAGS_USABLE_MAX, 4095);
+    // x86-64: 12-bit PCIDs less `GATE_PCID`.
+    assert_eq!(usable_tags(x86_64::PCID_BITS), 4095);
+    assert_eq!(
+        gate_tag(x86_64::PCID_BITS),
+        Some(u32::from(x86_64::GATE_PCID))
+    );
+    // ARM64: 8 or 16-bit ASIDs less the gate's.
+    assert_eq!((usable_tags(8), gate_tag(8)), (255, Some(255)));
+    assert_eq!((usable_tags(16), gate_tag(16)), (4095, Some(4095)));
+    // RISC-V: the ASID bits `satp` accepts; none, and no tag is reserved.
+    assert_eq!((usable_tags(4), gate_tag(4)), (15, Some(15)));
+    assert_eq!((usable_tags(1), gate_tag(1)), (1, Some(1)));
+    assert_eq!((usable_tags(0), gate_tag(0)), (1, None));
+    for width in 0..=64 {
+        let usable = usable_tags(width);
+        assert!((1..=TAGS_USABLE_MAX).contains(&usable), "width {width}");
+        assert!(gate_tag(width).is_none_or(|tag| tag >= usable));
+    }
+}
+
+/// D-155, G10: the ordinary inter-kernel vectors lie inside 240 to 255,
+/// and a line without remapping takes a vector of 48 to 239.
+#[test]
+fn inter_kernel_vectors_lie_above_the_claimable_ones() {
+    use x86_64::{IKV_FIRST, IKV_LAST, IRQ_VECTOR_LAST, ikv_valid, line_vector_valid};
+    const { assert!(IRQ_VECTOR_LAST < IKV_FIRST && IKV_FIRST <= IKV_LAST) };
+    const { assert!(IKV_FIRST >= 240) };
+    assert_eq!((IKV_FIRST, IKV_LAST), (240, 243));
+    for vector in 0..=u8::MAX {
+        assert_eq!(ikv_valid(vector), (IKV_FIRST..=IKV_LAST).contains(&vector));
+        assert_eq!(line_vector_valid(vector), (48..=239).contains(&vector));
+        assert!(!(ikv_valid(vector) && line_vector_valid(vector)));
+    }
+    // An exception's vector, the NMI's and a claimable one are refused.
+    assert!(!ikv_valid(2) && !ikv_valid(31) && !ikv_valid(48) && !ikv_valid(239));
+    assert!(!line_vector_valid(47) && !line_vector_valid(240));
+}
+
+/// D-155: `DR7.GD = 1` (bit 13, general detect) is refused, alone or with
+/// an otherwise valid word, as an I/O condition is.
+#[test]
+fn dr7_refuses_general_detect() {
+    use x86_64::{DR7_GD, DR7_USER_MASK, dr7_valid};
+    assert_eq!(DR7_GD, 1 << 13);
+    assert_eq!(DR7_USER_MASK & DR7_GD, 0);
+    let good = 1 | 0b01 << 16 | 0b11 << 18;
+    assert!(dr7_valid(good));
+    assert!(!dr7_valid(DR7_GD) && !dr7_valid(good | DR7_GD));
+    assert!(!dr7_valid(good | 0b10 << 20));
 }

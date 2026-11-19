@@ -518,7 +518,7 @@ fn a_table_unhooked_by_an_unmap_joins_the_free_list_only_at_the_completion_of_it
     attached(&mut m, 0);
     let frame = m.retype(0, ObjectKind::Frame, 1, 160);
     m.ok(0, frame);
-    let untyped = super::untyped_slot(m.sys.node(0), m.t[0]);
+    let untyped = super::table_slot(m.sys.node(0), m.t[0]);
     m.ok(
         0,
         Syscall::IoSpaceMap(crate::Map {

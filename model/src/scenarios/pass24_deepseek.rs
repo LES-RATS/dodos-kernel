@@ -53,7 +53,7 @@ fn io_map(m: &S, frame: u32) -> Syscall {
     Syscall::IoSpaceMap(crate::Map {
         space: s(IOSPACE),
         frame: s(frame),
-        untyped: s(untyped_slot(m.sys.node(Y), m.t[Y as usize])),
+        untyped: s(super::table_slot(m.sys.node(Y), m.t[Y as usize])),
         address: 0x1000_0000 + u64::from(frame) * 0x10_0000,
         first: 0,
         count: 1,

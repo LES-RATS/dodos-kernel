@@ -6,10 +6,10 @@ use crate::{
 };
 use dodos_abi::x86_64::{REG_RFLAGS, REGS_WORDS, RFLAGS_FIXED};
 use dodos_abi::{
-    ASPACE_PAGES, CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
-    ENDPOINT_BYTES, Error, FeatureMask, Geometry, IOSPACE_PAGES, LONGEST_WALK, MemoryType,
-    NOTIFY_BYTES, ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP, REPLY_BYTES, Rights,
-    SCHED_BYTES, SLOT_BYTES, SlotAddr, TASK_BYTES, TIMER_BYTES, TREE_DEPTH, thread_bytes,
+    CLEAR_STEP_BYTES, CSPACE_DIRECTORY_BYTES, CSPACE_MAX_SLOTS, CSPACE_SEGMENT_SLOTS,
+    ENDPOINT_BYTES, Error, FeatureMask, Geometry, LONGEST_WALK, MemoryType, NOTIFY_BYTES,
+    ObjectKind, PageSize, REMOVAL_SLOTS, REMOVAL_STEP, REPLY_BYTES, Rights, SCHED_BYTES,
+    SLOT_BYTES, SlotAddr, TASK_BYTES, TIMER_BYTES, TREE_DEPTH, thread_bytes,
 };
 
 /// Slots and addresses: one segment of a capability space, 8 KB.
@@ -41,6 +41,14 @@ pub(crate) enum Clearing {
     InSteps,
     WithinCall,
     None,
+}
+
+/// What an untyped is, for the kinds it makes (`untyped_retype`, D-154).
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    Ordinary,
+    Device,
+    Tables,
 }
 
 /// How a capability comes to a slot, for `Model::fits`.
@@ -85,21 +93,34 @@ enum Removal {
 /// Capabilities and objects, with the table of Object sizes: the bytes and
 /// the alignment of a new object, from its size argument. The kind is judged
 /// before the size: device memory first (`invalid` but for a frame or a
-/// child untyped), then a kind that this version does not make
-/// (`unsupported`) or that is never made from an untyped (`invalid`, D-110).
+/// child untyped), then a table untyped (`invalid` but for a child table
+/// untyped or an `its_table`, which is `invalid` from any other untyped,
+/// D-154), then a kind that this version does not make (`unsupported`) or
+/// that is never made from an untyped (`invalid`, D-110). An `aspace` and
+/// an `iospace` take here the one page of their header; their size
+/// argument, the slot of a table untyped, is judged by the caller.
 /// For a frame the size argument is judged in this order: the page size
 /// value, whether the processor supports it, the memory type, the number of
 /// pages.
 fn footprint(
     kind: ObjectKind,
     arg: SizeArgument,
-    device: bool,
+    source: Source,
     geometry: Geometry,
     thread: Result<u64, Error>,
 ) -> Result<(u64, u64, Option<Frame>), Error> {
     let page = geometry.page();
     let size = arg.size;
-    if device && kind != ObjectKind::Frame && kind != ObjectKind::Untyped {
+    let device = source == Source::Device;
+    // Order of checks, step 3; `untyped_retype`: device memory makes only a
+    // frame or a child untyped; a table untyped only a child table untyped
+    // or an `its_table`, which no other untyped makes (D-154).
+    let made = match source {
+        Source::Device => matches!(kind, ObjectKind::Frame | ObjectKind::Untyped),
+        Source::Tables => matches!(kind, ObjectKind::Untyped | ObjectKind::ItsTable),
+        Source::Ordinary => kind != ObjectKind::ItsTable,
+    };
+    if !made {
         return Err(Error::Invalid);
     }
     let segments = size / u64::from(CSPACE_SEGMENT_SLOTS);
@@ -133,9 +154,10 @@ fn footprint(
                 && size.is_multiple_of(CSPACE_SEGMENT_SLOTS.into())
                 && size <= CSPACE_MAX_SLOTS.into(),
         ),
-        // Address spaces and their tables: two pages.
-        ObjectKind::ASpace => (ASPACE_PAGES * page, size == 0),
-        ObjectKind::IoSpace => (IOSPACE_PAGES * page, size == 0),
+        // Address spaces and their tables: the header, one page of the
+        // ordinary untyped; the root table is one page of the table untyped
+        // the size argument names (D-154).
+        ObjectKind::ASpace | ObjectKind::IoSpace => (dodos_abi::SPACE_HEADER_PAGES * page, true),
         // Object sizes: a thread is its fixed part and its save area,
         // rounded up to a power of two.
         ObjectKind::Thread => (thread?, true),
@@ -285,20 +307,52 @@ impl Model {
         size: SizeArgument,
         destination: SlotAddr,
     ) -> Outcome {
+        let thread_of = thread;
         let parent = self.cap(thread, untyped, Rights::READ)?;
         let &Cap { object, rights, .. } = self.is(parent, ObjectKind::Untyped, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
         // Order of checks, step 3: the kind is judged before the size
         // argument.
-        let device = self.untypeds[&object].device;
+        let source = match &self.untypeds[&object] {
+            untyped if untyped.device => Source::Device,
+            untyped if untyped.table => Source::Tables,
+            _ => Source::Ordinary,
+        };
         let thread = match kind {
             ObjectKind::Thread => self.thread_size(size.size),
             _ => Ok(0),
         };
         let geometry = self.machine.geometry;
-        let (bytes, align, frame) = footprint(kind, size, device, geometry, thread)?;
+        let (bytes, align, frame) = footprint(kind, size, source, geometry, thread)?;
+        // Order of checks, step 3 (D-154): for an `aspace` or an `iospace`
+        // the size argument is the slot address of a table untyped with
+        // `write`, checked here as a capability argument: slot, kind, the
+        // table bit (`invalid`), `write`; a dying one is `gone`.
+        let space = matches!(kind, ObjectKind::ASpace | ObjectKind::IoSpace);
+        let tables = match space {
+            true => Some(self.table_untyped(thread_of, size.size)?),
+            false => None,
+        };
         self.fits(place.space, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
+        // Rules of `untyped_retype` (D-154): a state check after `no_slot`:
+        // `again` with nothing changed while the watermark of either
+        // untyped is ready to return, then `no_memory` if the root table
+        // would end beyond the end of the table untyped, before any
+        // clearing.
+        let page = geometry.page();
+        if let Some(tables) = tables {
+            self.return_watermark(object)?;
+            self.return_watermark(tables)?;
+            let untyped = &self.untypeds[&tables];
+            let end = untyped
+                .watermark
+                .checked_next_multiple_of(page)
+                .and_then(|start| start.checked_add(page));
+            if end.is_none_or(|end| end > untyped.bytes) {
+                return Err(Error::NoMemory);
+            }
+        }
         // Rules of `untyped_retype`: the kernel clears every object it
         // creates, but a child untyped (D-110). A call that has not reached
         // the end of the new object returns `again` and makes nothing.
@@ -330,13 +384,28 @@ impl Model {
                 child.zero.push((0, child.clean));
             }
         }
-        // The gate over page tables, G2: the root table of a space is a
-        // table page.
-        if self.aspaces.contains_key(&id) {
+        // The gate over page tables, G2 (D-154): the root table of a space
+        // is one page of the table untyped, a page of a table chunk that
+        // the gate clears and turns into a table page as it leaves *data*.
+        if let Some(tables) = tables {
+            let taken = self
+                .take(tables, page, page, Clearing::WithinCall)
+                .expect("judged to fit");
+            let root = self.untypeds[&tables].base + taken.at;
             let class = self.root_class(id);
-            live(&mut self.aspaces, id).root = Some(base);
-            let page = base / self.machine.geometry.page();
-            self.table.set_class(page, Some(class));
+            let space = live(&mut self.aspaces, id);
+            (space.root, space.table_untyped) = (Some(root), Some(tables));
+            self.table.set_class(root / page, Some(class));
+        }
+        // An `its_table`: its 2^k pages turn into *ITS table*, cleared by
+        // the gate in the retype's call (Gate words, the ITS word; D-154).
+        if kind == ObjectKind::ItsTable {
+            let pages = bytes / page;
+            self.its_tables.insert(id, (base / page, pages));
+            for at in base / page..base / page + pages {
+                let class = dodos_abi::PageClass::its_table(false);
+                self.table.set_class(at, Some(class));
+            }
         }
         Ok(Output::Done)
     }
@@ -368,6 +437,19 @@ impl Model {
         let slots = space.slots.len() + CSPACE_SEGMENT_SLOTS as usize;
         space.slots.resize(slots, Slot::Empty);
         Ok(Output::Slots(slots as u32))
+    }
+
+    /// The size argument of an `aspace` or an `iospace` (D-154): the slot
+    /// address of a table untyped, judged as a capability argument: its
+    /// slot, its kind, that it is a table untyped (`invalid`), `write`.
+    fn table_untyped(&self, thread: ObjId, slot: u64) -> Result<ObjId, Error> {
+        let cap = self.cap(thread, SlotAddr::from_raw(slot), Rights::READ)?;
+        let kind = self.objects[&self.caps[&cap].object].kind;
+        let object = self.caps[&cap].object;
+        if kind != ObjectKind::Untyped || !self.untypeds[&object].table {
+            return Err(Error::Invalid);
+        }
+        Ok(self.is(cap, ObjectKind::Untyped, Rights::WRITE)?.object)
     }
 
     /// Unlike cores: the size argument of a thread is its feature mask,
@@ -451,7 +533,11 @@ impl Model {
             _ => return Err(Error::NoMemory),
         };
         let clean = untyped.clean;
-        if !untyped.device && clearing != Clearing::None && untyped.clean < end {
+        // Device memory and a table untyped have no clean mark: the gate
+        // clears each page of a table untyped as it leaves *data*, within
+        // the call (`memory_take`, D-154).
+        let marked = !untyped.device && !untyped.table;
+        if marked && clearing != Clearing::None && untyped.clean < end {
             // A step clears from the clean mark, padding included, at most
             // 64 KB, and stops at the end of the new object.
             let reached = match clearing {
@@ -472,7 +558,7 @@ impl Model {
         }
         // When the watermark moves past the clean mark, the clean mark moves
         // with it.
-        if !untyped.device {
+        if marked {
             untyped.clean = untyped.clean.max(end);
         }
         untyped.live += 1;
@@ -565,6 +651,10 @@ impl Model {
                     device: from
                         .and_then(|from| self.untypeds.get(&from))
                         .is_some_and(|from| from.device),
+                    // A child of a table untyped is a table untyped (D-154).
+                    table: from
+                        .and_then(|from| self.untypeds.get(&from))
+                        .is_some_and(|from| from.table),
                     watermark: 0,
                     clean: 0,
                     live: 0,
@@ -964,6 +1054,17 @@ impl Model {
                 return Undone::Wait;
             }
             ObjectKind::Thread if self.threads[&object].leaving => return Undone::Wait,
+            // A table untyped whose live pieces still belong to a surviving
+            // space (its root table, its lower tables) waits for their
+            // destruction: the step returns `again` (`memory_control` and
+            // its calls, destruction of a block; D-154). The pieces lost
+            // behind a failed unit are waited for by no one.
+            ObjectKind::Untyped
+                if self.untypeds[&object].table
+                    && self.untypeds[&object].live > self.untypeds[&object].lost =>
+            {
+                return Undone::Wait;
+            }
             // A block of a run: its map counts must be 0 (the step returns
             // `again` while translations are removed), then the run is
             // unmapped from the kernel's own space and that invalidated on
@@ -1159,22 +1260,34 @@ impl Model {
                 for at in space.table_pages().filter(|_| !pinned) {
                     self.table.set_class(at / page, None);
                 }
-                // A pinned space's pages stay live pieces of their untyped,
-                // lost, so its watermark never returns over a root a context
-                // entry of a failed unit may still name (D-141; the final
-                // review's verification of lot B, finding 3).
-                if pinned {
-                    if let Some(from) = object.from {
-                        live(&mut self.untypeds, from).lost += 1 + space.tables as u32;
+                // A pinned space's root and tables stay live pieces of their
+                // table untyped, lost, so its watermark never returns over a
+                // root a context entry of a failed unit may still name
+                // (D-141; the final review's verification of lot B, finding
+                // 3; D-154). The header goes back to its ordinary untyped.
+                let pieces = 1 + space.tables as usize;
+                match (space.table_untyped, pinned) {
+                    (Some(tables), true) => {
+                        live(&mut self.untypeds, tables).lost += pieces as u32;
                     }
-                    return;
+                    // The root and the lower tables, hooked or free, stop
+                    // counting as live pieces of the table untyped in the
+                    // same step (D-154).
+                    (Some(tables), false) => {
+                        for _ in 0..pieces {
+                            self.release(tables);
+                        }
+                    }
+                    // The start-up aspace, made from no untyped.
+                    (None, _) => {}
                 }
-                for untyped in object
-                    .from
-                    .iter()
-                    .flat_map(|from| [*from].repeat(space.tables as usize))
-                {
-                    self.release(untyped);
+            }
+            // An `its_table`: its pages turn back into *data* (D-154).
+            ObjectKind::ItsTable => {
+                if let Some((first, pages)) = self.its_tables.remove(&id) {
+                    for page in first..first + pages {
+                        self.table.set_class(page, None);
+                    }
                 }
             }
             // A machine object is destroyed by no removal: removing its root

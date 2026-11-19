@@ -43,7 +43,7 @@ fn retype(untyped: u32, kind: ObjectKind, page: PageSize, count: u64, at: u32) -
     Syscall::UntypedRetype {
         untyped: s(untyped),
         kind,
-        size: count,
+        size: common::sized(kind, count),
         page: page as u64,
         memory: memory as u64,
         destination: s(at),
@@ -66,15 +66,22 @@ fn map(kind: ObjectKind, frame: SlotAddr, untyped: u32, address: u64, count: u64
     }
 }
 
-/// A node with a block of one chunk in `BLOCK`, and a space of `kind` made
-/// from it in `SPACE`: its root table is the block's first page.
+/// A node with a table block of one chunk in `BLOCK` (`memory_take` kind
+/// 2), and a space of `kind` in `SPACE` whose header comes from the
+/// ordinary untyped and whose root table is the block's first page (D-154).
 fn with_space(kind: ObjectKind) -> (Model, ObjId, u64) {
     let (mut m, t) = Model::boot(&Machine::example()).unwrap();
     let log2 = m.geometry().chunk_shift();
-    common::take_run(&mut m, t, log2, BLOCK);
+    common::take_tables(&mut m, t, log2, BLOCK);
     let base = m.frame_at(t, s(BLOCK)).map(|f| f.2);
     assert_eq!(base, None, "a block is no frame");
-    ok(&mut m, t, retype(BLOCK, kind, PageSize::Page, 0, SPACE));
+    let tables = s(BLOCK).raw();
+    ok(
+        &mut m,
+        t,
+        retype(common::UNTYPED, kind, PageSize::Page, tables, SPACE),
+    );
+    assert!(m.table_chunk(block_base(&m) >> m.geometry().chunk_shift()));
     let block = block_base(&m);
     (m, t, block)
 }
@@ -83,7 +90,7 @@ fn with_space(kind: ObjectKind) -> (Model, ObjId, u64) {
 fn block_base(m: &Model) -> u64 {
     let geometry = m.geometry();
     let ram = Machine::example_on(geometry).memory[5].base;
-    (ram + 8 * geometry.chunk()).next_multiple_of(geometry.chunk())
+    (ram + 10 * geometry.chunk()).next_multiple_of(geometry.chunk())
 }
 
 #[test]
@@ -99,7 +106,7 @@ fn table_pages_have_the_class_of_their_level_and_count_in_the_gate_word() {
         1
     );
     // A page of a frame mapped in it needs a table of each level below the
-    // root, taken from the block after the space's two pages.
+    // root, taken from the table block after the space's root.
     ok(
         &mut m,
         t,
@@ -107,7 +114,7 @@ fn table_pages_have_the_class_of_their_level_and_count_in_the_gate_word() {
     );
     ok(&mut m, t, map(ASpace, s(160), BLOCK, AT, 1));
     let tables: Vec<PageClass> = (0..levels as u64 - 1)
-        .map(|n| m.page_class(base + (2 + n) * page))
+        .map(|n| m.page_class(base + (1 + n) * page))
         .collect();
     let mut wanted: Vec<PageClass> = (1..levels as u8)
         .map(|level| PageClass::table(level).unwrap())
@@ -121,14 +128,16 @@ fn table_pages_have_the_class_of_their_level_and_count_in_the_gate_word() {
     // Unmapped, the tables go to the free list and keep their class.
     ok(&mut m, t, Syscall::ASpaceUnmap(s(160)));
     let again: Vec<PageClass> = (0..levels as u64 - 1)
-        .map(|n| m.page_class(base + (2 + n) * page))
+        .map(|n| m.page_class(base + (1 + n) * page))
         .collect();
     assert_eq!(again, tables);
     // Destroyed, the space gives every table page back as data.
     ok(&mut m, t, Syscall::CapDelete(s(SPACE)));
-    for n in 0..levels as u64 + 1 {
+    for n in 0..levels as u64 {
         assert_eq!(m.page_class(base + n * page), PageClass::DATA);
     }
+    // The chunk stays a table chunk, mapped read-only, while it is held.
+    assert!(m.table_chunk(chunk) && m.kernel_maps_read_only(chunk));
     assert_eq!(
         GateWord::from_raw(m.gate_word(chunk)).unwrap().not_data(),
         0
@@ -151,7 +160,7 @@ fn a_table_taken_again_from_the_free_list_takes_the_class_of_its_new_level() {
     ok(&mut m, t, Syscall::ASpaceUnmap(s(160)));
     let class_of = |m: &Model| -> Vec<u8> {
         (0..levels as u64 - 1)
-            .map(|n| m.page_class(base + (2 + n) * page).raw())
+            .map(|n| m.page_class(base + (1 + n) * page).raw())
             .collect()
     };
     let before = class_of(&m);
@@ -196,7 +205,7 @@ fn an_iospace_root_is_of_class_root_with_0_devices_and_its_tables_of_their_level
         retype(common::UNTYPED, Frame, PageSize::Page, 1, 160),
     );
     ok(&mut m, t, map(IoSpace, s(160), BLOCK, AT, 1));
-    let level = m.page_class(base + 2 * page).iospace_level();
+    let level = m.page_class(base + page).iospace_level();
     assert!(level.is_some_and(|l| l >= 1), "{level:?}");
     let chunk = base >> m.geometry().chunk_shift();
     assert!(GateWord::from_raw(m.gate_word(chunk)).unwrap().not_data() >= 2);
@@ -274,7 +283,7 @@ fn one_nodes_kept_leaves_never_make_another_nodes_mapping_busy() {
         };
         assert_eq!(sys.apply(node, t[node as usize], derive), DONE);
         let page = sys.node(node).geometry().page();
-        let call = map(ASpace, s(at), 25, AT + n * page, 1);
+        let call = map(ASpace, s(at), common::TABLES, AT + n * page, 1);
         assert_eq!(sys.apply(node, t[node as usize], call), DONE);
         assert_eq!(sys.check(), Ok(()));
     }

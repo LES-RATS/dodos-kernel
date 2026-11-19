@@ -139,15 +139,13 @@ fn its_mapped(old: OldRules) -> Machine {
         &[
             Op::ItsRetype {
                 n: 1,
-                p: 0,
-                first: 12,
+                first: 8,
                 k: 0,
-                split: None,
             },
             Op::ItsClaim {
                 n: 1,
                 device: 1,
-                first: 12,
+                first: 8,
                 event: 0,
                 entry: 1,
             },
@@ -206,15 +204,13 @@ fn the_holder_serves_an_its_unmapping_only_after_the_mapping() {
             &[
                 Op::ItsRetype {
                     n: 1,
-                    p: 0,
-                    first: 12,
+                    first: 8,
                     k: 0,
-                    split: None,
                 },
                 Op::ItsClaim {
                     n: 1,
                     device: 1,
-                    first: 12,
+                    first: 8,
                     event: 0,
                     entry: 1,
                 },
@@ -301,7 +297,7 @@ fn the_holder_serves_no_record_of_a_fenced_requester() {
                 Op::IoAttach {
                     n: 1,
                     device: 2,
-                    root: 15,
+                    root: 9,
                     entry: 1,
                 },
                 Op::Fence { n: 1 },
@@ -345,7 +341,7 @@ fn r6_on_a_failed_unit_waits_for_no_attached_device() {
         &[
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 0,
                 page: 12,
             },
@@ -362,7 +358,7 @@ fn r6_on_a_failed_unit_waits_for_no_attached_device() {
         &[
             Op::IoMap {
                 n: 1,
-                root: 15,
+                root: 9,
                 e: 0,
                 page: 12,
             },
@@ -380,7 +376,7 @@ fn r6_on_a_failed_unit_waits_for_no_attached_device() {
         &[
             Op::IoUnmap {
                 n: 1,
-                root: 15,
+                root: 9,
                 entry: 1,
                 e: 0,
             },
@@ -410,7 +406,7 @@ fn no_detach_while_the_attach_of_the_device_is_open() {
                 Op::IoAttach {
                     n: 1,
                     device: 2,
-                    root: 15,
+                    root: 9,
                     entry: 1,
                 },
                 Op::Accept {
@@ -478,34 +474,24 @@ fn a_stale_free_list_link_is_never_followed() {
     steps(
         &mut m,
         &[
-            Op::TakeTable {
-                n: 0,
-                p: 0,
-                page: 4,
-                split: None,
-            },
-            Op::TakeTable {
-                n: 0,
-                p: 0,
-                page: 5,
-                split: None,
-            },
+            Op::TakeTable { n: 0, page: 0 },
+            Op::TakeTable { n: 0, page: 1 },
             Op::TableLink {
                 n: 0,
-                table: 4,
-                next: Some(5),
+                table: 0,
+                next: Some(1),
             },
-            Op::TableFree { n: 0, page: 5 },
+            Op::TableFree { n: 0, page: 1 },
             Op::Write {
                 n: 0,
-                page: 5,
+                page: 1,
                 value: 0xdead,
             },
             Op::Hook {
                 n: 0,
                 root: 2,
                 e0: 1,
-                child: 4,
+                child: 0,
             },
         ],
     )

@@ -164,23 +164,18 @@ impl Machine {
     }
 
     /// *data* → iospace root 40 + 0, *live*.
-    pub(crate) fn retype_ioroot(
-        &mut self,
-        n: u16,
-        p: usize,
-        page: Page,
-        split: Option<Page>,
-    ) -> Gated {
+    pub(crate) fn retype_ioroot(&mut self, n: u16, page: Page) -> Gated {
         self.unit_writes(n)?;
-        // The row *data* → iospace root, as for any table (G5's map count
-        // and no give in flight, D-153 gaps 28 and 30; the kernel's view
-        // first, gap 29).
-        require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
+        // The row *data* → iospace root, as for any table: the root is a
+        // page of the table untyped the retype names, in a table chunk, no
+        // give of it in flight (D-153, gap 30; D-154).
+        require(self.leaves_data(n, page))?;
         require(self.gate.classes.get(page as usize) == Some(&Class::Data))?;
-        self.leave_data(n, p, vec![page], split, Target::IoRoot)
+        self.apply_target(n, &[page], Target::IoRoot);
+        Ok(())
     }
 
-    /// Each node's iospace root at the last page of its floor, its device
+    /// Each node's iospace root at the second page of its table floor, its device
     /// (numbered as the node) attached to it through the unit (the attach
     /// asked, accepted, submitted, completed, answered and released); node
     /// 0 holds the unit's role.
@@ -191,13 +186,17 @@ impl Machine {
         self
     }
 
-    /// Node `n`'s iospace root at the last page of its floor (made if it
-    /// is data), and device `device` attached to it by the whole request.
+    /// Node `n`'s iospace root: the second page of its table floor.
+    pub(crate) fn ioroot_page(&self, n: u16) -> Page {
+        self.layout[usize::from(n)].table_floor.0 + 1
+    }
+
+    /// Node `n`'s iospace root in its table floor (made if it is data),
+    /// and device `device` attached to it by the whole request.
     pub(crate) fn attach_through_unit(&mut self, n: u16, device: u16) {
-        let root = self.layout[usize::from(n)].floor.1 - 1;
+        let root = self.ioroot_page(n);
         if self.gate.classes[root as usize] == Class::Data {
-            self.retype_ioroot(n, 0, root, None)
-                .expect("an iospace root");
+            self.retype_ioroot(n, root).expect("an iospace root");
         }
         let entry = (0..UNIT_ENTRIES)
             .find(|&e| self.unit.gate_records[usize::from(n)][e].is_none())
@@ -219,15 +218,14 @@ impl Machine {
         self.release(n, entry).expect("released");
     }
 
-    /// Each node's user space at start: a root at its floor's third page,
-    /// bound to tag 1, a table at the fourth hooked at entry 0.
+    /// Each node's user space at start: a root at its table floor's third
+    /// page, bound to tag 1, a table at the fourth hooked at entry 0.
     pub(crate) fn with_spaces(mut self) -> Self {
         for n in 0..self.layout.len() as u16 {
             let first = self.layout[usize::from(n)].floor.0;
-            self.retype_root(n, 0, first + 2, None).expect("a root");
+            self.retype_root(n, first + 2).expect("a root");
             self.bind(n, 1, first + 2).expect("bound");
-            self.take_table(n, 0, first + 3, LEVELS - 1, None)
-                .expect("a table");
+            self.take_table(n, first + 3, LEVELS - 1).expect("a table");
             self.hook(n, first + 2, 0, first + 3).expect("hooked");
         }
         self
@@ -241,6 +239,8 @@ impl Machine {
         // Not into a chunk whose give is in flight (D-153, gap 30).
         require(e < ENTRIES && self.holds(n, page) && !self.giving(page))?;
         require(self.gate.classes[page as usize] == Class::Data)?;
+        // G3 (3) (D-154): no device leaf into a table chunk.
+        require(!self.table_chunk(page) || self.old.leaves_into_table_chunks)?;
         require(self.gate.tables[&root][e] == Entry::Absent)?;
         self.gate.tables.get_mut(&root).expect("a root")[e] = Entry::Leaf { page, write: true };
         self.gate.map_counts[Self::chunk_of(page) as usize] += 1;

@@ -36,13 +36,27 @@ impl Machine {
         Ok(())
     }
 
-    /// G5's map count 0 for a page leaving *data* (Gate words, the page
-    /// class byte, every row from *data*; D-153, gap 28). Without it a page
-    /// the node maps writable becomes one of its own tables (pass 29's seed
-    /// 8, kept as a test).
-    pub(super) fn unmapped(&self, page: Page) -> bool {
-        let count = self.gate.map_counts[Self::chunk_of(page) as usize];
-        (count == 0 || self.old.class_change_ignores_map_count) && !self.giving(page)
+    /// Whether `page` lies in a table chunk: bit 58 of its chunk's gate
+    /// word (G4, D-154).
+    pub(crate) fn table_chunk(&self, page: Page) -> bool {
+        self.gate
+            .table_bits
+            .get(Self::chunk_of(page) as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The conditions of every row of the page class byte from *data*
+    /// (Gate words, the page class byte; G5; D-154): the ownership word
+    /// taken by the node with its generation, or the page in its floor;
+    /// the chunk's gate word with the table bit set; no give or destruction
+    /// of the chunk in flight (D-153, gap 30). No leaf and no anchor ever
+    /// targets a table chunk (G3, G6), so no map count is read, no grant
+    /// table walked, no core asked, and the kernel's large leaf, already
+    /// read-only, is not touched.
+    pub(super) fn leaves_data(&self, n: u16, page: Page) -> bool {
+        let tables = self.table_chunk(page) || self.old.tables_in_ordinary_chunks;
+        self.holds(n, page) && tables && !self.giving(page)
     }
 
     /// While a request names a give or a destruction of a chunk, every
@@ -55,35 +69,11 @@ impl Machine {
             return false;
         }
         let chunk = Self::chunk_of(page);
-        let pages = !self.old.kernel_pages_unguarded;
         self.gate
             .nodes
             .iter()
             .flat_map(|n| &n.requests)
-            .any(|r| match r {
-                Request::InUse {
-                    what: Invalidates::KernelRun { chunk: c, .. },
-                    ..
-                } => *c == chunk,
-                // CONTRACT-GAP 40 (the page class byte, every row from *data*,
-                // and kept kernel tables, the split): the conditions are read in
-                // the call, the byte written at the request's completion, and
-                // nothing keeps them meanwhile. The rule the model reads: while
-                // a request makes pages of a chunk leave *data*, every write
-                // that would raise one of its counts is refused, as for a give.
-                Request::InUse {
-                    what: Invalidates::KernelPages { chunk: c, .. },
-                    ..
-                } => pages && *c == chunk,
-                _ => false,
-            })
-    }
-
-    /// Whether a live, revoking or pinned grant's anchor covers `page`:
-    /// the grant count when 0 (the small machine has no grant entries on
-    /// its CPU side yet, so the count is the whole answer).
-    pub(super) fn anchored(&self, page: Page) -> bool {
-        self.gate.grant_counts[Self::chunk_of(page) as usize] != 0
+            .any(|r| matches!(r, Request::InUse { what: Invalidates::KernelRun { chunk: c, .. }, .. } if *c == chunk))
     }
 
     /// The tag whose entry holds `root`, if any.
@@ -97,149 +87,48 @@ impl Machine {
     // The page class byte.
 
     /// *data* → table *k*, *loose*: the call that takes a page for a
-    /// space's table. The ownership word taken by the node with its
-    /// generation, or the page in its floor; no anchor covers it; the gate
-    /// clears the page; non-data count + 1.
-    pub(crate) fn take_table(
-        &mut self,
-        n: u16,
-        p: usize,
-        page: Page,
-        level: u8,
-        split: Option<Page>,
-    ) -> Gated {
+    /// space's table, from the space's table untyped. The gate clears the
+    /// page; non-data count + 1.
+    pub(crate) fn take_table(&mut self, n: u16, page: Page, level: u8) -> Gated {
         self.writes(n)?;
-        require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
+        require(self.leaves_data(n, page))?;
         require((1..LEVELS).contains(&level))?;
         require(self.class(page)? == Class::Data)?;
-        self.leave_data(n, p, vec![page], split, Target::Table)
+        self.apply_target(n, &[page], Target::Table);
+        Ok(())
     }
 
-    /// *data* → aspace root *unbound*: `untyped_retype` of the space; the
-    /// gate clears the page and writes the node's shared entries.
-    pub(crate) fn retype_root(
-        &mut self,
-        n: u16,
-        p: usize,
-        page: Page,
-        split: Option<Page>,
-    ) -> Gated {
+    /// *data* → aspace root *unbound*: `untyped_retype` of the space, the
+    /// root a page of the table untyped the call names (D-154); the gate
+    /// clears the page and writes the node's shared entries.
+    pub(crate) fn retype_root(&mut self, n: u16, page: Page) -> Gated {
         self.writes(n)?;
-        require(self.holds(n, page) && !self.anchored(page) && self.unmapped(page))?;
+        require(self.leaves_data(n, page))?;
         require(self.class(page)? == Class::Data)?;
-        self.leave_data(n, p, vec![page], split, Target::Root)
+        self.apply_target(n, &[page], Target::Root);
+        Ok(())
     }
 
-    // The kernel's own space (Gate words, kept kernel tables; D-153, gap
-    // 29): a chunk taken is mapped by one large leaf; the first page that
-    // leaves *data* splits it into a level-1 table drawn from a *data* page
-    // of the chunk (break-before-make, under the kernel-space request); a
-    // page leaving *data* has its leaf made read-only first, on every core;
-    // a page back to *data* has it writable again; the split is merged when
-    // the chunk's count of pages not *data* falls to its split table alone.
+    // The kernel's own space (Gate words, kept kernel tables; D-154): a
+    // chunk taken is mapped by one large leaf, writable for kind 0 and
+    // read-only for kind 2, never rewritten between take and give; a
+    // node's table floor is mapped read-only and its ordinary floor
+    // writable, by leaves the kernel table of the small machine does not
+    // hold (kept memory).
 
     /// The kernel-table entry of `chunk` in node `n`'s kernel table, if it
-    /// maps that chunk: the large leaf or the split table.
+    /// maps that chunk.
     pub(super) fn kernel_entry(&self, n: u16, chunk: u64) -> (usize, Entry) {
         let kernel = self.layout[usize::from(n)].kernel_table;
         let slot = (chunk % ENTRIES as u64) as usize;
         let entry = self.gate.tables[&kernel][slot];
-        let ours = match entry {
-            Entry::Large { chunk: c } => c == chunk,
-            Entry::Table(split) => Self::chunk_of(split) == chunk,
-            _ => false,
-        };
+        let ours = matches!(entry, Entry::Large { chunk: c, .. } if c == chunk);
         (slot, if ours { entry } else { Entry::Absent })
-    }
-
-    fn set_kernel_entry(&mut self, n: u16, slot: usize, entry: Entry) {
-        let kernel = self.layout[usize::from(n)].kernel_table;
-        self.gate.tables.get_mut(&kernel).expect("the kernel table")[slot] = entry;
-    }
-
-    /// Whether a request of any node names a split, a merge or pages
-    /// leaving *data* of `chunk`.
-    pub(super) fn chunk_in_flight(&self, chunk: u64) -> bool {
-        self.gate.nodes.iter().flat_map(|n| &n.requests).any(|r| {
-            matches!(r, Request::InUse { what: Invalidates::KernelPages { chunk: c, .. }
-                | Invalidates::KernelMerge { chunk: c, .. }, .. } if *c == chunk)
-        })
-    }
-
-    /// Every other core of the node, idle ones included: a kernel-space
-    /// request's asked set.
-    fn kernel_space_asked(&self, n: u16, p: usize) -> BTreeSet<usize> {
-        (0..self.layout[usize::from(n)].cores.len())
-            .filter(|&q| q != p)
-            .collect()
-    }
-
-    /// Pages of one chunk leave *data*. A chunk out of the kernel's view
-    /// (a floor's) changes at once. A chunk mapped by its large leaf is
-    /// split: `split`, a *data* page of the chunk other than the pages, is
-    /// the table; the large leaf is written invalid and invalidated on this
-    /// core, the other cores asked (break), and the completion hooks the
-    /// table with one leaf per page, writable for *data* pages, read-only
-    /// for the others and for the pages leaving, before their bytes change.
-    /// A split chunk has the pages' leaves made read-only, every core
-    /// asked, the bytes changed at the completion. One request per chunk at
-    /// a time.
-    pub(super) fn leave_data(
-        &mut self,
-        n: u16,
-        p: usize,
-        pages: Vec<Page>,
-        split: Option<Page>,
-        target: Target,
-    ) -> Gated {
-        let chunk = Self::chunk_of(pages[0]);
-        require(pages.iter().all(|&q| Self::chunk_of(q) == chunk))?;
-        require(self.old.chunk_requests_unserialized || !self.chunk_in_flight(chunk))?;
-        require(p < self.layout[usize::from(n)].cores.len())?;
-        let (slot, entry) = self.kernel_entry(n, chunk);
-        let what = |split| Invalidates::KernelPages {
-            chunk,
-            pages: pages.clone(),
-            split,
-            target,
-        };
-        match entry {
-            Entry::Large { .. } => {
-                let s = split.ok_or(Refused::Condition)?;
-                // The split table's page: a *data* page of the chunk that
-                // the kernel names, none of the pages leaving, held, mapped
-                // by no leaf (G5's count, the chunk's), under no anchor
-                // (CONTRACT-GAP 44: the row names none of these).
-                require(Self::chunk_of(s) == chunk && !pages.contains(&s))?;
-                require(self.holds(n, s) && !self.anchored(s) && self.unmapped(s))?;
-                require(self.class(s)? == Class::Data)?;
-                require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
-                self.set_kernel_entry(n, slot, Entry::Absent);
-                self.invalidate_here(n, p, &Flush::KernelSpace);
-                let asked = self.kernel_space_asked(n, p);
-                self.start_request(n, p, what(Some(s)), asked, Clearing::default())
-            }
-            Entry::Table(s) => {
-                require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
-                let first = chunk * PAGES_PER_CHUNK;
-                let table = self.gate.tables.get_mut(&s).expect("the split table");
-                for &page in &pages {
-                    table[(page - first) as usize] = Entry::Leaf { page, write: false };
-                }
-                self.invalidate_here(n, p, &Flush::KernelSpace);
-                let asked = self.kernel_space_asked(n, p);
-                self.start_request(n, p, what(None), asked, Clearing::default())
-            }
-            _ => {
-                self.apply_target(n, &pages, target);
-                Ok(())
-            }
-        }
     }
 
     /// The bytes of pages that leave *data*, and what the gate writes into
     /// them (cleared; an aspace root's shared entries).
-    fn apply_target(&mut self, n: u16, pages: &[Page], target: Target) {
+    pub(super) fn apply_target(&mut self, n: u16, pages: &[Page], target: Target) {
         for &page in pages {
             let after = match target {
                 Target::Table => Class::Table {
@@ -274,136 +163,29 @@ impl Machine {
         }
     }
 
-    /// The completion of a kernel-space request of a split, of pages
-    /// leaving *data*, or of a merge.
-    fn complete_kernel(&mut self, n: u16, what: Invalidates) {
-        match what {
-            Invalidates::KernelPages {
-                chunk,
-                pages,
-                split,
-                target,
-            } => {
-                if let Some(s) = split {
-                    let hooked = Class::Table {
-                        level: 1,
-                        hook: Hook::Hooked,
-                    };
-                    let _ = self.cas_class(s, Class::Data, hooked);
-                    self.kernel.data.remove(&s);
-                    let first = chunk * PAGES_PER_CHUNK;
-                    let mut entries = [Entry::Absent; ENTRIES];
-                    // CONTRACT-GAP 45 (kept kernel tables, the split row:
-                    // "writable for *data* pages and read-only for every
-                    // other"): the pages the call turns from *data* are still
-                    // *data* at the hook, so the row writes them writable and
-                    // a second kernel-space request must make them read-only
-                    // before their bytes change (the row from *data*). The
-                    // model writes them read-only at the hook: the split's
-                    // request has already made every core drop the large
-                    // leaf, so no writable entry of them is left, and one
-                    // request does both.
-                    for (i, entry) in entries.iter_mut().enumerate() {
-                        let page = first + i as u64;
-                        let write = self.gate.classes[page as usize] == Class::Data
-                            && !pages.contains(&page);
-                        *entry = Entry::Leaf { page, write };
-                    }
-                    self.gate.tables.insert(s, entries);
-                    let slot = (chunk % ENTRIES as u64) as usize;
-                    self.set_kernel_entry(n, slot, Entry::Table(s));
-                }
-                self.apply_target(n, &pages, target);
-            }
-            Invalidates::KernelMerge { chunk, split } => {
-                let level = 1;
-                let _ = self.cas_class(
-                    split,
-                    Class::Table {
-                        level,
-                        hook: Hook::Unhooking,
-                    },
-                    Class::Table {
-                        level,
-                        hook: Hook::Loose,
-                    },
-                );
-                let _ = self.cas_class(
-                    split,
-                    Class::Table {
-                        level,
-                        hook: Hook::Loose,
-                    },
-                    Class::Data,
-                );
-                self.gate.tables.remove(&split);
-                let slot = (chunk % ENTRIES as u64) as usize;
-                self.set_kernel_entry(n, slot, Entry::Large { chunk });
-            }
-            _ => {}
+    /// How node `n`'s kernel reaches `page` through its own space now, on
+    /// core `p`: the large leaf its TLB holds for the page's chunk, or the
+    /// kept leaf of its floor (the table floor read-only, the ordinary
+    /// floor writable); `None`, a fault.
+    fn kernel_view(&self, n: u16, p: usize, page: Page) -> Option<bool> {
+        let layout = &self.layout[usize::from(n)];
+        let (start, end) = layout.floor;
+        if start <= page && page < end {
+            let (first, last) = layout.table_floor;
+            return Some(!(first <= page && page < last));
         }
-    }
-
-    /// The merge: when the chunk's count of pages not *data* falls to 1,
-    /// its split table's own, the table unhooked under the kernel-space
-    /// request (*unhooking*), *loose* then *data* at its completion, the
-    /// large leaf written. CONTRACT-GAP 46 (kept kernel tables, the merge
-    /// row: "the node's gate, when the chunk's count ... falls to 1"): no
-    /// call is named, and the calls that lower the count (`table_free`, a
-    /// teardown, an `its_table`'s destruction) name no core whose request
-    /// the merge could use, or are made on a core whose request is in use.
-    /// The model makes the merge a gate call of its own, which any core of
-    /// the node makes while the condition holds; until then the chunk stays
-    /// split, which is safe (only a give waits for it).
-    pub(crate) fn merge(&mut self, n: u16, p: usize, chunk: u64) -> Gated {
-        self.writes(n)?;
-        require(p < self.layout[usize::from(n)].cores.len() && chunk < self.chunks)?;
-        let (slot, entry) = self.kernel_entry(n, chunk);
-        let Entry::Table(s) = entry else {
-            return Err(Refused::Condition);
-        };
-        require(self.gate.not_data[chunk as usize] == 1 && !self.chunk_in_flight(chunk))?;
-        require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
-        self.cas_class(
-            s,
-            Class::Table {
-                level: 1,
-                hook: Hook::Hooked,
-            },
-            Class::Table {
-                level: 1,
-                hook: Hook::Unhooking,
-            },
-        )?;
-        self.set_kernel_entry(n, slot, Entry::Absent);
-        self.invalidate_here(n, p, &Flush::KernelSpace);
-        let asked = self.kernel_space_asked(n, p);
-        self.start_request(
-            n,
-            p,
-            Invalidates::KernelMerge { chunk, split: s },
-            asked,
-            Clearing::default(),
-        )
-    }
-
-    /// A page back to *data* in a split chunk: its leaf writable again (a
-    /// change that widens rights; another core's stale read-only entry
-    /// takes a spurious fault).
-    pub(super) fn kernel_view_writable(&mut self, n: u16, page: Page) {
         let chunk = Self::chunk_of(page);
-        if let (_, Entry::Table(s)) = self.kernel_entry(n, chunk) {
-            let first = chunk * PAGES_PER_CHUNK;
-            let table = self.gate.tables.get_mut(&s).expect("the split table");
-            table[(page - first) as usize] = Entry::Leaf { page, write: true };
+        let slot = (chunk % ENTRIES as u64) as usize;
+        match self.tlb[self.core(n, p)].large.get(&slot) {
+            Some(&(c, write)) if c == chunk => Some(write),
+            _ => None,
         }
     }
 
     /// A kernel access, by core `p`, to `page` through its own view: the
-    /// translation the core holds now (cached, or read through the tables).
-    /// None: a fault, which the kernel resolves by waiting and retrying
-    /// (as for a spurious fault, during a break-before-make). A store
-    /// through a writable translation writes the page.
+    /// translation the core holds now. None: a fault. A store goes through
+    /// a writable translation only, so never into a table chunk, mapped
+    /// read-only from take to give (D-154).
     pub(crate) fn kernel_access(
         &mut self,
         n: u16,
@@ -413,20 +195,8 @@ impl Machine {
     ) -> Gated {
         self.writes(n)?;
         require(p < self.layout[usize::from(n)].cores.len())?;
-        let core = self.core(n, p);
-        let chunk = Self::chunk_of(page);
-        let slot = (chunk % ENTRIES as u64) as usize;
-        let index = (page - chunk * PAGES_PER_CHUNK) as usize;
-        let tlb = &self.tlb[core];
-        let write = if tlb.large.get(&slot) == Some(&chunk) {
-            Some(true)
-        } else {
-            match tlb.kernel.get(&(slot, index)) {
-                Some(&(q, w)) if q == page => Some(w),
-                _ => None,
-            }
-        };
-        let write = write.ok_or(Refused::Condition)?;
+        require(page < self.chunks * PAGES_PER_CHUNK)?;
+        let write = self.kernel_view(n, p, page).ok_or(Refused::Condition)?;
         if let Some(value) = value {
             require(write)?;
             self.kernel.data.insert(page, value);
@@ -435,64 +205,6 @@ impl Machine {
             }
         }
         Ok(())
-    }
-
-    /// A clearing call whose walk crosses the root's shared entry into the
-    /// kernel half and reaches a split table (a hooked table of class 16 +
-    /// 1, as G3 (3) reads it): the leaf cleared, its count lowered at the
-    /// completion. CONTRACT-GAP 43 (G3 (3), and the kept kernel tables'
-    /// split): G3 forbids writing an entry toward a kernel table, not a
-    /// walk through one; with D-153 a split table is an ordinary hooked
-    /// table below a kernel table, so a call's walk reaches it, and the
-    /// leaf it clears was never counted. The rule the model reads: a walk
-    /// named by a call stops at a shared entry.
-    pub(crate) fn unmap_kernel_half(
-        &mut self,
-        n: u16,
-        p: usize,
-        root: Page,
-        tag: usize,
-        (slot, index): (usize, usize),
-    ) -> Gated {
-        self.writes(n)?;
-        require(self.old.walks_through_shared)?;
-        require(slot < ENTRIES && index < ENTRIES && tag < TAGS)?;
-        require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
-        require(self.class(root)? == Class::Root(RootState::Live))?;
-        let kernel = self.layout[usize::from(n)].kernel_table;
-        require(self.gate.tables[&root][ENTRIES - 1] == Entry::Shared(kernel))?;
-        let Entry::Table(s) = self.gate.tables[&kernel][slot] else {
-            return Err(Refused::Condition);
-        };
-        require(matches!(
-            self.class(s)?,
-            Class::Table {
-                hook: Hook::Hooked,
-                ..
-            }
-        ))?;
-        let Entry::Leaf { page, .. } = self.gate.tables[&s][index] else {
-            return Err(Refused::Condition);
-        };
-        require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
-        self.gate.tables.get_mut(&s).expect("the split table")[index] = Entry::Absent;
-        self.invalidate_here(n, p, &Flush::KernelSpace);
-        let asked = self.asked_for_tag(n, p, tag);
-        let record = Clearing {
-            leaves: vec![page],
-            ..Clearing::default()
-        };
-        self.start_request(
-            n,
-            p,
-            Invalidates::Range {
-                tag,
-                root,
-                va: Vec::new(),
-            },
-            asked,
-            record,
-        )
     }
 
     /// *loose* → *hooked* at level *k*: the call that writes the entry
@@ -538,6 +250,9 @@ impl Machine {
         require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
         require(self.holds(n, page) && !self.giving(page))?;
         require(!write || self.class(page)? == Class::Data)?;
+        // G3 (3) (D-154): a leaf never points into a chunk whose gate word
+        // has the table bit set; so its map count is always 0.
+        require(!self.table_chunk(page) || self.old.leaves_into_table_chunks)?;
         let Entry::Table(table) = self.gate.tables[&root][e0] else {
             return Err(Refused::Condition);
         };
@@ -679,20 +394,29 @@ impl Machine {
         )?;
         self.gate.tables.get_mut(&root).expect("a root")[e0] = Entry::Absent;
         let va: Vec<(usize, usize)> = (0..ENTRIES).map(|e1| (e0, e1)).collect();
-        self.invalidate_here(
-            n,
-            p,
-            &Flush::Range {
-                tag,
-                va: va.clone(),
-            },
-        );
+        let flush = self.unhook_flush(tag, &va);
+        self.invalidate_here(n, p, &flush);
         let asked = self.asked_for_tag(n, p, tag);
         let record = Clearing {
             unhooked: vec![child],
             ..Clearing::default()
         };
         self.start_request(n, p, Invalidates::Range { tag, root, va }, asked, record)
+    }
+
+    /// What a core invalidates for a change that unhooked a non-leaf
+    /// entry: the addresses it covered, and on RISC-V the space's whole
+    /// ASID (`SFENCE.VMA` with `rs1 = x0`), since an invalidation by
+    /// address leaves the cached non-leaf entry there (TLB, the request of
+    /// a core; D-154, M3).
+    fn unhook_flush(&self, tag: usize, va: &[(usize, usize)]) -> Flush {
+        match self.riscv && !self.old.riscv_unhook_by_address {
+            true => Flush::Tag(tag),
+            false => Flush::Range {
+                tag,
+                va: va.to_vec(),
+            },
+        }
     }
 
     /// *loose* → *loose*, first word changed: `table_link(table, next)`,
@@ -728,7 +452,20 @@ impl Machine {
         )?;
         self.gate.links.remove(&page);
         self.gate.tables.remove(&page);
-        self.kernel_view_writable(n, page);
+        Ok(())
+    }
+
+    /// An interrupt to another core with an ordinary vector (G10, D-155):
+    /// on x86-64 the vector lies in `IKV_FIRST..=IKV_LAST`, the caller
+    /// names the target by core number, any core of the machine, and the
+    /// gate composes the ICR (fixed delivery, physical destination, edge,
+    /// no shorthand). An NMI's vector, an exception's or a claimable one
+    /// is refused: a faulty kernel forges none toward another node.
+    pub(crate) fn send_ipi(&mut self, n: u16, target: usize, vector: u8) -> Gated {
+        self.writes(n)?;
+        require(target < self.tlb.len())?;
+        require(dodos_abi::x86_64::ikv_valid(vector) || self.old.any_vector_in_icr)?;
+        self.icr.push((n, target, vector));
         Ok(())
     }
 
@@ -738,7 +475,10 @@ impl Machine {
     /// → (root, ∅). Tag 0 is the kernel's.
     pub(crate) fn bind(&mut self, n: u16, tag: usize, root: Page) -> Gated {
         self.writes(n)?;
-        require(tag != 0 && tag < TAGS && self.holds(n, root))?;
+        // G7 (D-155): one tag is the gate's own, bound to no kernel or user
+        // root; the tag table holds the others.
+        let usable = tag < TAGS || (self.old.gate_tag_bound && tag == GATE_TAG);
+        require(tag != 0 && usable && self.holds(n, root))?;
         let entry = &self.gate.nodes[usize::from(n)].tags[tag];
         require(entry.root.is_none() && entry.set.is_empty())?;
         let second = self.old.root_under_two_tags
@@ -759,7 +499,8 @@ impl Machine {
     /// owes bit invalidates every tag first; the core joins the tag's set.
     pub(crate) fn load(&mut self, n: u16, p: usize, root: Page, tag: usize) -> Gated {
         self.writes(n)?;
-        require(tag < TAGS)?;
+        // G7 (D-155): the gate never loads its own tag for a root.
+        require(tag < TAGS || (self.old.gate_tag_bound && tag == GATE_TAG))?;
         require(self.class(root)? == Class::Root(RootState::Live))?;
         require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
         let owes = self.gate.nodes[usize::from(n)].idle[p].owes;
@@ -796,15 +537,23 @@ impl Machine {
             .copied()
             .collect();
         for q in pending {
-            let Request::InUse { what, .. } = self.gate.nodes[usize::from(n)].requests[q].clone()
+            let Request::InUse { what, record, .. } =
+                self.gate.nodes[usize::from(n)].requests[q].clone()
             else {
                 continue;
             };
             let core = self.core(n, p);
             let kernel = self.layout[usize::from(n)].kernel_root;
             match what {
+                // An asked core does on its own what the caller did: for a
+                // change that unhooked a table, RISC-V's whole-ASID fence
+                // (D-154, M3).
                 Invalidates::Range { tag, va, .. } => {
-                    self.invalidate(core, Flush::Range { tag, va })
+                    let flush = match record.unhooked.is_empty() {
+                        true => Flush::Range { tag, va },
+                        false => self.unhook_flush(tag, &va),
+                    };
+                    self.invalidate(core, flush)
                 }
                 Invalidates::Tag { tag, root } => {
                     if !self.old.dying_without_kernel_load
@@ -820,9 +569,7 @@ impl Machine {
                         self.gate.nodes[usize::from(n)].tags[tag].set.remove(&p);
                     }
                 }
-                Invalidates::KernelRun { .. }
-                | Invalidates::KernelPages { .. }
-                | Invalidates::KernelMerge { .. } => self.invalidate(core, Flush::KernelSpace),
+                Invalidates::KernelRun { .. } => self.invalidate(core, Flush::KernelSpace),
                 Invalidates::Barrier => {}
             }
             let node = &mut self.gate.nodes[usize::from(n)];
@@ -850,13 +597,6 @@ impl Machine {
         ) else {
             return;
         };
-        if matches!(
-            what,
-            Invalidates::KernelPages { .. } | Invalidates::KernelMerge { .. }
-        ) {
-            self.complete_kernel(n, what);
-            return;
-        }
         for page in record.leaves {
             let chunk = Self::chunk_of(page) as usize;
             self.gate.map_counts[chunk] = self.gate.map_counts[chunk].saturating_sub(1);
@@ -1039,22 +779,22 @@ impl Machine {
                 Class::Data,
             )?;
             self.gate.tables.remove(&child);
-            self.kernel_view_writable(n, child);
         }
         self.gate.tables.remove(&root);
         self.gate.nodes[usize::from(n)].tags[tag] = TagEntry::default();
         self.cas_class(root, Class::Root(RootState::Dying), Class::Data)?;
-        self.kernel_view_writable(n, root);
         Ok(())
     }
 
     // Ownership words and the kernel's own space.
 
     /// `memory_take` of a chunk: *free* → *taken* (the rules of taking:
-    /// a free chunk, or one taken by a generation that is over); the whole
-    /// gate word 0, the class bytes of the run 0; the run mapped in the
-    /// kernel's own table (one leaf per chunk, entry chunk mod E).
-    pub(crate) fn take(&mut self, n: u16, chunk: u64) -> Gated {
+    /// a free chunk, or one taken by a generation that is over); the class
+    /// bytes of the run 0; the whole gate word written, 0 for kind 0 and
+    /// the table bit with its three counts 0 for kind 2; the run mapped in
+    /// the kernel's own table by one large leaf (entry chunk mod E),
+    /// writable for kind 0 and read-only for kind 2 (D-154).
+    pub(crate) fn take(&mut self, n: u16, chunk: u64, kind: Take) -> Gated {
         self.writes(n)?;
         require(chunk < self.chunks)?;
         let takeable = match self.gate.owners[chunk as usize] {
@@ -1080,7 +820,10 @@ impl Machine {
         };
         self.gate.map_counts[chunk as usize] = 0;
         self.gate.grant_counts[chunk as usize] = 0;
-        self.gate.tables.get_mut(&kernel).expect("the kernel table")[slot] = Entry::Large { chunk };
+        self.gate.table_bits[chunk as usize] = kind == Take::Tables;
+        let write = kind == Take::Ordinary || self.old.table_chunks_mapped_writable;
+        let leaf = Entry::Large { chunk, write };
+        self.gate.tables.get_mut(&kernel).expect("the kernel table")[slot] = leaf;
         Ok(())
     }
 
@@ -1105,18 +848,11 @@ impl Machine {
                 && self.gate.grant_counts[chunk as usize] == 0,
         )?;
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
-        // CONTRACT-GAP 42 (the ownership words, row *taken* → *free*, and
-        // kept kernel tables, `memory_give`): the give reads the counts, not
-        // the kernel-table entry; while the chunk's split is in flight its
-        // counts read 0 (the split table is counted at the completion), and
-        // the completion hooks a table of a chunk given away. The rule the
-        // model reads: a give needs the chunk's large leaf, no split, merge
-        // or pages leaving *data* in flight.
+        // The large leaf, writable or read-only, leaves the kernel's own
+        // space; a table chunk is given as an ordinary one is, once it
+        // holds no table (its count of pages not *data* 0).
         let (slot, entry) = self.kernel_entry(n, chunk);
-        if !self.old.give_during_split {
-            require(entry == Entry::Large { chunk } && !self.chunk_in_flight(chunk))?;
-        }
-        if entry == (Entry::Large { chunk }) {
+        if entry != Entry::Absent {
             let kernel = self.layout[usize::from(n)].kernel_table;
             self.gate.tables.get_mut(&kernel).expect("the kernel table")[slot] = Entry::Absent;
         }

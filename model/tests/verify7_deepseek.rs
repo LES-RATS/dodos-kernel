@@ -27,6 +27,8 @@ use dodos_abi::*;
 use dodos_model::*;
 
 const UNTYPED: SlotAddr = SlotAddr::own(common::UNTYPED);
+/// The node's table-floor untyped (D-154).
+const TABLES: SlotAddr = SlotAddr::own(common::TABLES);
 const CONTROL: SlotAddr = SlotAddr::own(START_SLOT_MEMORY_CONTROL);
 const LIVING: SlotAddr = SlotAddr::own(START_SLOT_MACHINE_LIVING);
 const IOMMU: SlotAddr = SlotAddr::own(18);
@@ -47,7 +49,7 @@ fn retype_with(
     Syscall::UntypedRetype {
         untyped,
         kind,
-        size,
+        size: common::sized(kind, size),
         page: page as u64,
         memory: memory as u64,
         destination: slot(dst),
@@ -143,10 +145,12 @@ impl NodeHarness {
     }
 
     fn make_aspace(&mut self, aspace_idx: u32, thread_idx: u32, table_ut: SlotAddr) -> ObjId {
+        // Its header from the ordinary untyped, its root table from the
+        // table untyped the size argument names (D-154).
         self.ok(retype_with(
-            table_ut,
+            UNTYPED,
             ASpace,
-            0,
+            table_ut.raw(),
             PageSize::Page,
             MemoryType::WriteBack,
             aspace_idx,
@@ -274,11 +278,11 @@ fn f2_partial_aspace_map_rejects_different_page_count() {
     let mut machine = Machine::example();
     machine.gate_chunks = 1;
     let mut k = NodeHarness::on(&machine);
-    let viewer = k.make_aspace(30, 31, UNTYPED);
+    let viewer = k.make_aspace(30, 31, TABLES);
     k.ok(retype_small(Frame, 4, 32));
 
     k.err(
-        aspace_map(slot(30), slot(32), UNTYPED, VADDR, 4, Rights::READ),
+        aspace_map(slot(30), slot(32), TABLES, VADDR, 4, Rights::READ),
         Error::Again,
     );
     let page = k.m.geometry().page();
@@ -293,7 +297,7 @@ fn f2_partial_aspace_map_rejects_different_page_count() {
         retry_short = k.call(aspace_map(
             slot(30),
             slot(32),
-            UNTYPED,
+            TABLES,
             VADDR,
             3,
             Rights::READ,
@@ -372,12 +376,13 @@ fn f5_gate_word_bits_32_to_44_count_non_data_pages() {
     let chunk_shift = k.m.geometry().chunk_shift();
     let chunk_size = k.m.geometry().chunk();
     let machine = Machine::example_on(k.m.geometry());
-    let base = (machine.memory[5].base + 8 * chunk_size).next_multiple_of(1 << chunk_shift);
+    let base = (machine.memory[5].base + 10 * chunk_size).next_multiple_of(1 << chunk_shift);
     let chunk = base >> chunk_shift;
 
-    common::take_run(&mut k.m, k.t, chunk_shift, common::slot(40));
-    // Creating an ASpace from slot(40) turns at least 2 pages in `chunk` into
-    // table pages (non-data per G2).
+    common::take_tables(&mut k.m, k.t, chunk_shift, common::slot(40));
+    // An ASpace whose table untyped is slot(40), a table block (D-154),
+    // turns pages of `chunk` into table pages (non-data per G2): its root
+    // and the tables of its mapping.
     k.make_aspace(30, 31, slot(40));
     k.ok(retype_small(Frame, 1, 32));
     k.ok(aspace_map(
@@ -409,7 +414,7 @@ fn f6_device_and_kept_leaves_do_not_increment_chunk_gate_words() {
     let mut k = NodeHarness::new();
     common::take_device(&mut k.m, k.t);
     let chunk_shift = k.m.geometry().chunk_shift();
-    let _viewer = k.make_aspace(30, 31, UNTYPED);
+    let _viewer = k.make_aspace(30, 31, TABLES);
 
     // 1. Device leaf:
     k.ok(Syscall::UntypedRetype {
@@ -426,7 +431,7 @@ fn f6_device_and_kept_leaves_do_not_increment_chunk_gate_words() {
     k.ok(aspace_map(
         slot(30),
         slot(32),
-        UNTYPED,
+        TABLES,
         VADDR,
         1,
         Rights::READ,
@@ -441,7 +446,7 @@ fn f6_device_and_kept_leaves_do_not_increment_chunk_gate_words() {
     k.ok(aspace_map(
         slot(30),
         LIVING,
-        UNTYPED,
+        TABLES,
         VADDR + page,
         1,
         Rights::READ,
@@ -465,16 +470,16 @@ fn f9_completed_stepped_mapping_is_not_partial_and_hits_protect_fifth_clause() {
     let mut machine = Machine::example();
     machine.gate_chunks = 1;
     let mut k = NodeHarness::on(&machine);
-    k.make_aspace(30, 31, UNTYPED);
+    k.make_aspace(30, 31, TABLES);
     k.ok(retype_small(Frame, 2, 32));
     k.err(
-        aspace_map(slot(30), slot(32), UNTYPED, VADDR, 2, Rights::READ),
+        aspace_map(slot(30), slot(32), TABLES, VADDR, 2, Rights::READ),
         Error::Again,
     );
     k.ok(aspace_map(
         slot(30),
         slot(32),
-        UNTYPED,
+        TABLES,
         VADDR,
         2,
         Rights::READ,
@@ -510,7 +515,7 @@ fn f9_completed_stepped_mapping_is_not_partial_and_hits_protect_fifth_clause() {
         let mut k = NodeHarness::on(&default_m);
         let chunk = k.m.geometry().chunk();
         let ram = default_m.memory[5].base;
-        let place = (ram + 8 * chunk).next_multiple_of(2 * large2);
+        let place = (ram + 10 * chunk).next_multiple_of(2 * large2);
         k.err(
             Syscall::MemoryTake {
                 control: CONTROL,
@@ -576,7 +581,7 @@ fn n2_partial_iospace_map_rejects_different_page_count() {
     k.ok(retype_small(Frame, 4, 31));
 
     k.err(
-        iospace_map(slot(30), slot(31), UNTYPED, VADDR, 4, Rights::READ),
+        iospace_map(slot(30), slot(31), TABLES, VADDR, 4, Rights::READ),
         Error::Again,
     );
     let mut retry_short = Err(Error::Again);
@@ -584,7 +589,7 @@ fn n2_partial_iospace_map_rejects_different_page_count() {
         retry_short = k.call(iospace_map(
             slot(30),
             slot(31),
-            UNTYPED,
+            TABLES,
             VADDR,
             3,
             Rights::READ,
@@ -724,7 +729,7 @@ fn n4_iospace_device_leaf_and_two_node_kept_mappings_write_none_chunk_gate_word(
         let before = sys.sys.node(0).map_count(dev_chunk);
         sys.ok(
             0,
-            iospace_map(slot(31), slot(32), UNTYPED, VADDR, 1, Rights::READ),
+            iospace_map(slot(31), slot(32), TABLES, VADDR, 1, Rights::READ),
         );
         (before, sys.sys.node(0).map_count(dev_chunk))
     };
@@ -747,7 +752,7 @@ fn n4_iospace_device_leaf_and_two_node_kept_mappings_write_none_chunk_gate_word(
         sys.ok(node, retype_small(ASpace, 0, 40));
         sys.ok(
             node,
-            aspace_map(slot(40), LIVING, UNTYPED, VADDR + 2 * page, 1, Rights::READ),
+            aspace_map(slot(40), LIVING, TABLES, VADDR + 2 * page, 1, Rights::READ),
         );
         kept_deltas.push((node, before, sys.sys.node(node).map_count(kept_chunk)));
     }

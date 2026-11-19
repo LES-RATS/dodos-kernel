@@ -54,6 +54,9 @@ pub const SLOT_UNTYPED_CLEAN: u64 = 1 << 32;
 pub const SLOT_UNTYPED_BLOCK: u64 = 1 << 33;
 pub const SLOT_UNTYPED_ENTRY: u64 = 1 << 34;
 pub const SLOT_UNTYPED_ENTRY_SHIFT: u32 = 35;
+/// Bit 51 of word 0: a **table untyped**, made by `memory_take` kind 2 or
+/// from `floor_tables`: no clean mark, no `exec` (D-154).
+pub const SLOT_UNTYPED_TABLE: u64 = 1 << 51;
 /// An untyped's root slot, word 6: 0, or the kernel epoch at which its
 /// watermark became ready to return, raised by the destruction of its last
 /// object; it returns once a barrier covers that epoch (A node of several
@@ -660,7 +663,10 @@ impl SuspendWord {
 /// The gate word of a chunk (G4): the map count in bits 0-31, the number of
 /// pages of the chunk not of class data in bits 32-44, the grant count in
 /// bits 45-57 (the live, revoking or pinned grant entries whose anchor
-/// touches the chunk, D-148), the other bits 0.
+/// touches the chunk, D-148), the **table bit** in bit 58 (0 an ordinary
+/// chunk, 1 a table chunk, fixed for the chunk's ownership: written whole
+/// at `memory_take` or node start-up, cleared whole at R6, D-154), bits
+/// 59-63 zero.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GateWord(u64);
@@ -668,8 +674,17 @@ pub struct GateWord(u64);
 /// The largest grant count of a gate word, and of a device entry's
 /// leaf-count word (13 bits).
 pub const GRANT_COUNT_MAX: u16 = (1 << 13) - 1;
+/// Bit 58 of a gate word: the chunk is a table chunk (D-154).
+pub const GATE_WORD_TABLE: u64 = 1 << 58;
 
 impl GateWord {
+    /// The word `memory_take` kind 2 and a node start-up write for a table
+    /// chunk: the table bit set, its three counts 0 (G4, G13, D-154).
+    pub const TABLE: Self = Self(GATE_WORD_TABLE);
+    /// The word of an ordinary chunk just taken: every bit 0.
+    pub const ORDINARY: Self = Self(0);
+
+    /// The word of an ordinary chunk with these counts and no grant.
     pub const fn new(map_count: u32, not_data: u16) -> Option<Self> {
         if not_data > 1 << 12 {
             return None;
@@ -688,10 +703,25 @@ impl GateWord {
         ))
     }
 
-    /// `None` for a word with a bit above 57 set, or more pages not of
+    /// The same word with map count `map_count`, its other fields kept,
+    /// the table bit among them.
+    pub const fn with_map_count(self, map_count: u32) -> Self {
+        Self(self.0 & !0xFFFF_FFFF | map_count as u64)
+    }
+
+    /// The same word with `not_data` pages not of class data, its other
+    /// fields kept; `None` above the pages a chunk can have (*E* ≤ 4,096).
+    pub const fn with_not_data(self, not_data: u16) -> Option<Self> {
+        if not_data > 1 << 12 {
+            return None;
+        }
+        Some(Self(self.0 & !(0x1FFF << 32) | (not_data as u64) << 32))
+    }
+
+    /// `None` for a word with a bit above 58 set, or more pages not of
     /// class data than a chunk can have (*E* ≤ 4,096).
     pub const fn from_raw(raw: u64) -> Option<Self> {
-        if raw >> 58 != 0 || (raw >> 32) & 0x1FFF > 1 << 12 {
+        if raw >> 59 != 0 || (raw >> 32) & 0x1FFF > 1 << 12 {
             return None;
         }
         Some(Self(raw))
@@ -713,7 +743,62 @@ impl GateWord {
     pub const fn grants(self) -> u16 {
         ((self.0 >> 45) & GRANT_COUNT_MAX as u64) as u16
     }
+
+    /// Whether the chunk is a table chunk (bit 58, D-154).
+    pub const fn is_table(self) -> bool {
+        self.0 & GATE_WORD_TABLE != 0
+    }
+
+    /// Whether the word is one a chunk may hold (G2, G3, G6, D-154): a
+    /// table chunk has map count 0 and grant count 0, and only a table
+    /// chunk holds a page not of class data.
+    pub const fn consistent(self) -> bool {
+        match self.is_table() {
+            true => self.map_count() == 0 && self.grants() == 0,
+            false => self.not_data() == 0,
+        }
+    }
 }
+
+/// The number of tags the gate's tag table holds on a machine whose
+/// architecture gives `width` tag bits (12-bit PCIDs on x86-64, 8 or 16-bit
+/// ASIDs on ARM64, the ASID bits `satp` accepts on RISC-V), read at start:
+/// one tag is reserved for the gate and bound to no root, and the table
+/// holds at most `TAGS_USABLE_MAX` (G7, D-152, D-155).
+///
+/// CONTRACT-GAP 47 (G7, D-155): with `ASIDLEN = 0` on RISC-V the gate
+/// reserves no ASID ("a full `SFENCE.VMA` on every gate entry and exit"),
+/// and the contract does not say what the table then holds. The reading
+/// here: its one tag, 0, shared by every root.
+pub const fn usable_tags(width: u32) -> u32 {
+    if width == 0 {
+        return 1;
+    }
+    if width >= 12 {
+        return TAGS_USABLE_MAX;
+    }
+    (1 << width) - 1
+}
+
+/// The tag the gate keeps for its own translation context: the one after
+/// the usable tags (`GATE_PCID` = 4,095 on x86-64); `None` where the
+/// architecture gives no tag bit (G7, D-155).
+pub const fn gate_tag(width: u32) -> Option<u32> {
+    if width == 0 {
+        return None;
+    }
+    Some(usable_tags(width))
+}
+
+/// The most tags a tag table holds: 4,096 less the gate's (G7, D-155).
+pub const TAGS_USABLE_MAX: u32 = 4095;
+
+/// The kinds of `memory_take`: a run of ordinary memory, an entry of the
+/// device table, a run of ordinary memory for tables (a **table untyped**,
+/// D-154).
+pub const MEMORY_TAKE_RUN: u64 = 0;
+pub const MEMORY_TAKE_ENTRY: u64 = 1;
+pub const MEMORY_TAKE_TABLES: u64 = 2;
 
 /// A device entry's leaf-count word: the leaf count in bits 0-31, the
 /// grant count in bits 32-44 (D-148).
@@ -1598,12 +1683,14 @@ impl RoleWord {
 
 // Start-up: floors and the kept frames of a module.
 
-/// The record `BootFloors` of the boot image (32 bytes); the names of the
-/// plain roles follow it.
+/// The record `BootFloors` of the boot image (40 bytes); the names of the
+/// plain roles follow it. `floor_tables` (D-154) is the table floor of a
+/// node slot, after `floor_node` as the contract lists them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BootFloors {
     pub floor_node: u64,
+    pub floor_tables: u64,
     pub reserve_bytes: u64,
     pub reserve_per_gib: u64,
     pub reserves: u32,
@@ -1655,8 +1742,10 @@ pub struct BootNode {
 /// The sizes of the floors and the reserves (Start-up state, rule 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Floors {
-    /// The floor of every node, a whole number of chunks.
+    /// The ordinary floor of every node, a whole number of chunks.
     pub floor: u64,
+    /// The table floor of every node, at least one chunk (D-154).
+    pub tables: u64,
     /// Each reserve, a whole number of chunks.
     pub reserve: u64,
     /// n floors and k reserves.
@@ -1664,13 +1753,18 @@ pub struct Floors {
 }
 
 /// The floors and reserves of a machine of `ordinary` bytes of ordinary
-/// memory and `n` nodes: `floor_node` rounded up to a chunk, and
-/// `reserve_bytes + reserve_per_gib × O` rounded up to a chunk, with O the
-/// ordinary memory in whole GiB. `None` when a sum overflows or the total
-/// does not fit in the ordinary memory. `chunk` is a power of two.
+/// memory and `n` nodes: `floor_node` and `floor_tables` each rounded up to
+/// a chunk, and `reserve_bytes + reserve_per_gib × O` rounded up to a chunk,
+/// with O the ordinary memory in whole GiB. `None` when a sum overflows,
+/// the total does not fit in the ordinary memory, or `floor_tables` is 0
+/// (fewer than one chunk per node slot, D-154). `chunk` is a power of two.
 pub const fn floors(ordinary: u64, n: u64, boot: BootFloors, chunk: u64) -> Option<Floors> {
     let Some(floor) = round_up(boot.floor_node, chunk) else {
         return None;
+    };
+    let tables = match round_up(boot.floor_tables, chunk) {
+        Some(tables) if tables != 0 => tables,
+        _ => return None,
     };
     let Some(per) = boot.reserve_per_gib.checked_mul(ordinary >> 30) else {
         return None;
@@ -1681,7 +1775,10 @@ pub const fn floors(ordinary: u64, n: u64, boot: BootFloors, chunk: u64) -> Opti
     let Some(reserve) = round_up(bytes, chunk) else {
         return None;
     };
-    let Some(floors) = floor.checked_mul(n) else {
+    let Some(per_node) = floor.checked_add(tables) else {
+        return None;
+    };
+    let Some(floors) = per_node.checked_mul(n) else {
         return None;
     };
     let Some(reserves) = reserve.checked_mul(boot.reserves as u64) else {
@@ -1690,6 +1787,7 @@ pub const fn floors(ordinary: u64, n: u64, boot: BootFloors, chunk: u64) -> Opti
     match floors.checked_add(reserves) {
         Some(total) if total <= ordinary => Some(Floors {
             floor,
+            tables,
             reserve,
             total,
         }),
@@ -2397,6 +2495,70 @@ mod proofs {
         }
     }
 
+    /// The gate word (G4, D-148, D-154): `from_raw` accepts exactly the
+    /// words with bits 59-63 zero and at most 4,096 pages not data; each
+    /// `with_` writes its field and keeps the others, the table bit among
+    /// them; a consistent word of a table chunk counts no leaf and no
+    /// grant, and one of an ordinary chunk no page not data.
+    #[kani::proof]
+    fn a_gate_word_keeps_its_table_bit_and_reads_back() {
+        let raw: u64 = kani::any();
+        let Some(word) = GateWord::from_raw(raw) else {
+            assert!(raw >> 59 != 0 || (raw >> 32) & 0x1FFF > 4096);
+            return;
+        };
+        assert!(word.raw() == raw && raw >> 59 == 0 && word.not_data() <= 4096);
+        assert!(word.is_table() == (raw >> 58 & 1 == 1));
+        let (map, not_data, grants): (u32, u16, u16) = (kani::any(), kani::any(), kani::any());
+        let mapped = word.with_map_count(map);
+        assert!(mapped.map_count() == map && mapped.is_table() == word.is_table());
+        assert!(mapped.not_data() == word.not_data() && mapped.grants() == word.grants());
+        match word.with_not_data(not_data) {
+            Some(w) => {
+                assert!(not_data <= 4096 && w.not_data() == not_data);
+                assert!(w.map_count() == word.map_count() && w.grants() == word.grants());
+                assert!(w.is_table() == word.is_table());
+            }
+            None => assert!(not_data > 4096),
+        }
+        match word.with_grants(grants) {
+            Some(w) => {
+                assert!(grants <= GRANT_COUNT_MAX && w.grants() == grants);
+                assert!(w.map_count() == word.map_count() && w.not_data() == word.not_data());
+                assert!(w.is_table() == word.is_table());
+            }
+            None => assert!(grants > GRANT_COUNT_MAX),
+        }
+        if word.consistent() {
+            assert!(!word.is_table() || (word.map_count() == 0 && word.grants() == 0));
+            assert!(word.is_table() || word.not_data() == 0);
+        }
+        if let Some(ordinary) = GateWord::new(map, not_data) {
+            assert!(!ordinary.is_table() && ordinary.grants() == 0);
+            assert!(ordinary.map_count() == map && ordinary.not_data() == not_data);
+        }
+        assert!(GateWord::TABLE.is_table() && GateWord::TABLE.consistent());
+        assert!(!GateWord::ORDINARY.is_table() && GateWord::ORDINARY.consistent());
+    }
+
+    /// G7 (D-155): the tag table holds every tag of the width but the
+    /// gate's, at most 4,095, and the gate's tag is none of them.
+    #[kani::proof]
+    fn the_gate_tag_is_outside_the_usable_tags() {
+        let width: u32 = kani::any();
+        kani::assume(width <= 64);
+        let usable = usable_tags(width);
+        assert!(usable >= 1 && usable <= TAGS_USABLE_MAX);
+        match gate_tag(width) {
+            Some(tag) => {
+                assert!(width != 0 && tag == usable);
+                assert!(width >= 12 || u64::from(tag) == (1u64 << width) - 1);
+                assert!(tag <= 4095);
+            }
+            None => assert!(width == 0 && usable == 1),
+        }
+    }
+
     #[kani::proof]
     fn floors_are_whole_chunks_without_overflow() {
         let boot = BootFloors {
@@ -2405,13 +2567,18 @@ mod proofs {
             reserve_per_gib: kani::any(),
             reserves: kani::any(),
             plain_roles: 0,
+            floor_tables: kani::any(),
         };
         let (ordinary, n): (u64, u64) = (kani::any(), kani::any());
         let chunk = if kani::any() { 1u64 << 21 } else { 1u64 << 25 };
         if let Some(f) = floors(ordinary, n, boot, chunk) {
             assert!(f.floor % chunk == 0 && f.reserve % chunk == 0);
             assert!(f.floor >= boot.floor_node && f.reserve >= boot.reserve_bytes);
-            let total = f.floor as u128 * n as u128 + f.reserve as u128 * boot.reserves as u128;
+            // D-154: a table floor of at least one chunk per node slot.
+            assert!(f.tables % chunk == 0 && f.tables >= chunk);
+            assert!(f.tables >= boot.floor_tables);
+            let total = (f.floor as u128 + f.tables as u128) * n as u128
+                + f.reserve as u128 * boot.reserves as u128;
             assert!(total == f.total as u128 && f.total <= ordinary);
         }
     }

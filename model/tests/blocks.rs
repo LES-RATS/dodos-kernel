@@ -54,7 +54,7 @@ impl K {
 
     /// The first chunk of ordinary memory past the floors and reserves.
     fn free(&self) -> u64 {
-        Machine::example().memory[5].base + 8 * self.chunk()
+        Machine::example().memory[5].base + 10 * self.chunk()
     }
 
     /// The index of the device entry of the 2 MB device range at 2 MB.
@@ -226,7 +226,8 @@ fn state_of_memory_take_is_judged_in_order() {
     k.no(take(0, next, shift, 41), Error::Busy);
     k.m.stray_write(chunk + 1, Ownership::free(Owner::Unclaimed).raw());
     // A reserve whose role this node does not hold.
-    let reserve = Machine::example().memory[5].base + 6 * k.chunk();
+    // Past the two node slots' floors of four chunks (D-154).
+    let reserve = Machine::example().memory[5].base + 8 * k.chunk();
     k.no(take(0, reserve, shift, 41), Error::Busy);
     // The state before the destination.
     k.no(take(0, reserve, shift, 40), Error::Busy);

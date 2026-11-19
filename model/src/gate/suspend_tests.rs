@@ -303,15 +303,13 @@ fn q9_an_its_with_its_tables_on_chip() {
     for op in [
         Op::ItsRetype {
             n: 1,
-            p: 0,
-            first: 12,
+            first: 8,
             k: 0,
-            split: None,
         },
         Op::ItsClaim {
             n: 1,
             device: 1,
-            first: 12,
+            first: 8,
             event: 0,
             entry: 1,
         },

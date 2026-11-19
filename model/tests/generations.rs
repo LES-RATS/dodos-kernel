@@ -9,6 +9,8 @@
 //! Every test runs on `System`, which delivers the messages of one ring in
 //! the order they were sent, and checks every invariant after every event.
 
+mod common;
+
 use dodos_abi::ObjectKind::IoSpace;
 use dodos_abi::*;
 use dodos_model::*;
@@ -30,7 +32,7 @@ fn iospace(destination: u32) -> Syscall {
     Syscall::UntypedRetype {
         untyped: UT,
         kind: IoSpace,
-        size: 0,
+        size: common::sized(IoSpace, 0),
         page: 0,
         memory: 0,
         destination: s(destination),

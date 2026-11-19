@@ -91,8 +91,10 @@ pub enum StartKind {
     Debug = 24,
 }
 
-/// Flags of `StartUntyped`: bit 0 device; other bits 0.
+/// Flags of `StartUntyped`: bit 0 device, bit 1 a table untyped (D-154);
+/// other bits 0.
 pub const START_UNTYPED_DEVICE: u8 = 1 << 0;
+pub const START_UNTYPED_TABLE: u8 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,7 +222,10 @@ pub struct StartIoApic {
     pub inputs: u32,
 }
 
-/// Flags of `StartInterrupts`.
+/// Flags of `StartInterrupts`. Bit 0: interrupt remapping is on **with
+/// compatibility-format messages blocked** (D-155): remapping on while
+/// such messages still pass leaves the bit clear, and the machine then
+/// carries the faulty-kernel promise only.
 pub const START_IRQ_REMAPPING: u32 = 1 << 0;
 pub const START_IRQ_X2APIC: u32 = 1 << 1;
 pub const START_IRQ_DIRECTED_EOI: u32 = 1 << 2;

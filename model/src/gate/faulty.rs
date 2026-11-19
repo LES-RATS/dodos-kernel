@@ -12,15 +12,11 @@ use super::*;
 pub(crate) enum Op {
     TakeTable {
         n: u16,
-        p: usize,
         page: Page,
-        split: Option<Page>,
     },
     RetypeRoot {
         n: u16,
-        p: usize,
         page: Page,
-        split: Option<Page>,
     },
     Hook {
         n: u16,
@@ -95,6 +91,7 @@ pub(crate) enum Op {
     Take {
         n: u16,
         chunk: u64,
+        kind: Take,
     },
     Barrier {
         n: u16,
@@ -102,9 +99,7 @@ pub(crate) enum Op {
     },
     IoRoot {
         n: u16,
-        p: usize,
         page: Page,
-        split: Option<Page>,
     },
     ClaimSpi {
         n: u16,
@@ -165,16 +160,8 @@ pub(crate) enum Op {
     },
     ItsRetype {
         n: u16,
-        p: usize,
         first: Page,
         k: u8,
-        split: Option<Page>,
-    },
-    /// The merge of a split chunk (D-153, gap 29).
-    Merge {
-        n: u16,
-        p: usize,
-        chunk: u64,
     },
     /// A kernel load (`None`) or store through core `p`'s own view.
     KernelAccess {
@@ -182,16 +169,6 @@ pub(crate) enum Op {
         p: usize,
         page: Page,
         value: Option<u64>,
-    },
-    /// A clearing call whose walk crosses the shared entry (CONTRACT-GAP
-    /// 43; refused under the rule).
-    UnmapKernelHalf {
-        n: u16,
-        p: usize,
-        root: Page,
-        tag: usize,
-        slot: usize,
-        index: usize,
     },
     ItsClaim {
         n: u16,
@@ -337,6 +314,12 @@ pub(crate) enum Op {
         chunk: u64,
         to: u16,
     },
+    /// An interrupt to core `target` with `vector` (G10).
+    Ipi {
+        n: u16,
+        target: usize,
+        vector: u8,
+    },
     /// A kernel's store into a page it maps writable (a data page).
     Write {
         n: u16,
@@ -349,18 +332,10 @@ impl Machine {
     /// Applies one operation; the gate refuses or performs it.
     pub(crate) fn apply(&mut self, op: &Op) -> Gated {
         match *op {
-            Op::TakeTable { n, p, page, split } => self.take_table(n, p, page, LEVELS - 1, split),
-            Op::RetypeRoot { n, p, page, split } => self.retype_root(n, p, page, split),
-            Op::Merge { n, p, chunk } => self.merge(n, p, chunk),
+            Op::TakeTable { n, page } => self.take_table(n, page, LEVELS - 1),
+            Op::RetypeRoot { n, page } => self.retype_root(n, page),
             Op::KernelAccess { n, p, page, value } => self.kernel_access(n, p, page, value),
-            Op::UnmapKernelHalf {
-                n,
-                p,
-                root,
-                tag,
-                slot,
-                index,
-            } => self.unmap_kernel_half(n, p, root, tag, (slot, index)),
+            Op::Ipi { n, target, vector } => self.send_ipi(n, target, vector),
             Op::Hook { n, root, e0, child } => self.hook(n, root, e0, child),
             Op::Map {
                 n,
@@ -393,9 +368,9 @@ impl Machine {
             Op::Unbind { n, p, tag } => self.unbind(n, p, tag),
             Op::Destroy { n, p, root } => self.destroy(n, p, root),
             Op::Teardown { n, root } => self.teardown(n, root),
-            Op::Take { n, chunk } => self.take(n, chunk),
+            Op::Take { n, chunk, kind } => self.take(n, chunk, kind),
             Op::Barrier { n, p } => self.barrier(n, p),
-            Op::IoRoot { n, p, page, split } => self.retype_ioroot(n, p, page, split),
+            Op::IoRoot { n, page } => self.retype_ioroot(n, page),
             Op::ClaimSpi { n, spi } => self.claim_spi(n, spi),
             Op::SpiArrives { spi } => self.spi_arrives(spi),
             Op::AckSpi { n, spi } => self.ack_spi(n, spi),
@@ -414,13 +389,7 @@ impl Machine {
             Op::IoDetach { n, device, entry } => self.iospace_detach(n, device, entry),
             Op::IoDestroy { n, root } => self.io_destroy(n, root),
             Op::IoTeardown { n, root } => self.io_teardown(n, root),
-            Op::ItsRetype {
-                n,
-                p,
-                first,
-                k,
-                split,
-            } => self.retype_its(n, p, first, k, split),
+            Op::ItsRetype { n, first, k } => self.retype_its(n, first, k),
             Op::ItsClaim {
                 n,
                 device,
@@ -582,17 +551,17 @@ impl Machine {
             .filter(|&q| matches!(self.gate.classes[q as usize], Class::Table { .. }))
             .collect();
         let page = pick(rng, held.clone());
-        // The split table a page leaving *data* names: mostly a *data* page
-        // of the same chunk, other than the page.
-        let chunk = Self::chunk_of(page);
-        let same: Vec<Page> = (chunk * PAGES_PER_CHUNK..(chunk + 1) * PAGES_PER_CHUNK)
-            .filter(|&q| q != page && self.gate.classes.get(q as usize) == Some(&Class::Data))
+        // The page a call turns from *data*: mostly a *data* page of a
+        // table chunk the node holds, sometimes any page, one of an
+        // ordinary chunk among them (D-154: refused).
+        let loose: Vec<Page> = held
+            .iter()
+            .copied()
+            .filter(|&q| self.table_chunk(q) && self.gate.classes[q as usize] == Class::Data)
             .collect();
-        let split = match rng.below(6) {
-            0 => None,
-            1 => Some(rng.below(pages)),
-            _ if same.is_empty() => None,
-            _ => Some(same[rng.below(same.len() as u64) as usize]),
+        let tpage = match rng.below(5) {
+            0 => page,
+            _ => pick(rng, loose),
         };
         let root = pick(rng, roots);
         let child = pick(rng, tables);
@@ -604,7 +573,7 @@ impl Machine {
             .map(|(i, _)| i as u64)
             .collect();
         let tag = match bound.is_empty() || rng.below(3) == 0 {
-            true => rng.below(TAGS as u64) as usize,
+            true => rng.below(ARCH_TAGS as u64) as usize,
             false => bound[rng.below(bound.len() as u64) as usize] as usize,
         };
         let mut e0 = rng.below(ENTRIES as u64) as usize;
@@ -643,35 +612,23 @@ impl Machine {
             _ => rng.below(15),
         };
         match category {
-            0 => Op::TakeTable { n, p, page, split },
-            1 if rng.below(2) == 0 => Op::RetypeRoot { n, p, page, split },
-            1 => match rng.below(4) {
-                0 => Op::Merge {
-                    n,
-                    p,
-                    // Mostly a chunk of the node that can be merged.
-                    chunk: (0..self.chunks)
-                        .find(|&c| {
-                            matches!(self.kernel_entry(n, c).1, Entry::Table(_))
-                                && self.gate.not_data[c as usize] == 1
-                        })
-                        .filter(|_| rng.below(4) != 0)
-                        .unwrap_or(chunk),
+            0 => Op::TakeTable { n, page: tpage },
+            1 if rng.below(2) == 0 => Op::RetypeRoot { n, page: tpage },
+            // An interrupt to any core, mostly with an inter-kernel vector,
+            // sometimes with any (an NMI's, a claimable one).
+            1 if rng.below(4) == 0 => Op::Ipi {
+                n,
+                target: rng.below(self.tlb.len() as u64 + 1) as usize,
+                vector: match rng.below(3) {
+                    0 => rng.below(256) as u8,
+                    _ => dodos_abi::x86_64::IKV_FIRST + rng.below(4) as u8,
                 },
-                1 => Op::UnmapKernelHalf {
-                    n,
-                    p,
-                    root,
-                    tag,
-                    slot: (chunk % ENTRIES as u64) as usize,
-                    index: (page % PAGES_PER_CHUNK) as usize,
-                },
-                _ => Op::KernelAccess {
-                    n,
-                    p,
-                    page,
-                    value: (rng.below(2) == 0).then(|| rng.next()),
-                },
+            },
+            1 => Op::KernelAccess {
+                n,
+                p,
+                page,
+                value: (rng.below(2) == 0).then(|| rng.next()),
             },
             2 => Op::Hook { n, root, e0, child },
             3 | 4 => Op::Map {
@@ -820,15 +777,6 @@ impl Machine {
                     {
                         return Op::Resume { n: sealed };
                     }
-                    // A chunk of the node whose count of pages not *data* fell
-                    // to its split table: merged.
-                    if let Some(chunk) = (0..self.chunks).find(|&c| {
-                        matches!(self.kernel_entry(n, c).1, Entry::Table(_))
-                            && self.gate.not_data[c as usize] == 1
-                    }) && rng.below(2) == 0
-                    {
-                        return Op::Merge { n, p, chunk };
-                    }
                     if let Some(op) = self.healthy_holder_step() {
                         return op;
                     }
@@ -858,10 +806,8 @@ impl Machine {
                 match rng.below(12) {
                     0 => Op::ItsRetype {
                         n,
-                        p,
-                        first: page,
+                        first: tpage,
                         k: rng.below(3) as u8,
-                        split,
                     },
                     1 => Op::ItsClaim {
                         n,
@@ -961,7 +907,7 @@ impl Machine {
                     2 => Op::Accept { h: n, slot, entry },
                     3 if rng.below(80) == 0 => Op::UnitFails,
                     3 if rng.below(4) == 0 => Op::Refuse { h: n, slot, entry },
-                    3 if rng.below(4) == 0 => Op::IoRoot { n, p, page, split },
+                    3 if rng.below(4) == 0 => Op::IoRoot { n, page: tpage },
                     3 => Op::Submit { h: n },
                     4 if rng.below(2) == 0 => match rng.below(4) {
                         0 => Op::IoAttach {
@@ -1012,7 +958,15 @@ impl Machine {
             14 if rng.below(2) == 0 => {
                 let chunk = rng.below(self.chunks);
                 match rng.below(2) {
-                    0 => Op::Take { n, chunk },
+                    // A third of the takes are of kind 2, a table chunk.
+                    0 => Op::Take {
+                        n,
+                        chunk,
+                        kind: match rng.below(3) {
+                            0 => Take::Tables,
+                            _ => Take::Ordinary,
+                        },
+                    },
                     _ => Op::Give {
                         n,
                         p,

@@ -58,7 +58,7 @@ fn retype(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAddr)
     Syscall::UntypedRetype {
         untyped,
         kind,
-        size,
+        size: common::sized(kind, size),
         page: PageSize::Page as u64,
         // Frames: write-back on ordinary memory, uncached on device memory.
         memory: (untyped == DEV) as u64,
@@ -854,7 +854,7 @@ fn cap_delete_removes_the_descendants_instead_of_handing_them_up() {
 fn object_lives_as_long_as_its_root_capability_wherever_it_is_moved() {
     let mut k = K::new();
     let page = k.m.geometry().page();
-    k.ok(retype(UT, Untyped, 2 * page, s(30)));
+    k.ok(retype(UT, Untyped, page, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.weak(31, 32, Rights::ALL);
     k.ok(mv(s(31), s(33)));
@@ -1710,8 +1710,10 @@ fn new_capability_is_a_child_of_the_untyped_capability() {
 fn untyped_retype_is_no_memory_when_the_untyped_is_exhausted() {
     let mut k = K::new();
     let page = k.m.geometry().page();
+    // Two headers of address spaces, one page each (D-154), fill it.
     k.ok(retype(UT, Untyped, 2 * page, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
+    k.ok(retype(s(30), ASpace, 0, s(33)));
     k.no(retype(s(30), Endpoint, 0, s(32)), Error::NoMemory);
 }
 
@@ -1721,11 +1723,12 @@ fn memory_is_aligned_on_the_size_of_the_object() {
     let page = k.m.geometry().page();
     k.ok(retype(UT, Untyped, 4 * page, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
-    // An address space of two pages is aligned on a page: at one page,
-    // which leaves room for a directory of a page at three, and nothing
-    // after it.
+    // The header of an address space, one page (D-154), is aligned on a
+    // page: at one page, which leaves room for a directory of a page at
+    // two and another header at three, and nothing after it.
     k.ok(retype(s(30), ASpace, 0, s(32)));
     k.ok(retype(s(30), CSpace, page / 16 * 128, s(34)));
+    k.ok(retype(s(30), ASpace, 0, s(35)));
     k.no(retype(s(30), Endpoint, 0, s(33)), Error::NoMemory);
 }
 
@@ -1740,19 +1743,20 @@ fn child_untyped_is_aligned_on_its_size() {
 }
 
 #[test]
-fn kernel_object_larger_than_a_page_is_aligned_on_a_page() {
+fn the_header_of_an_address_space_is_aligned_on_a_page() {
     let mut k = K::new();
     let page = k.m.geometry().page();
-    k.ok(retype(UT, Untyped, 8 * page, s(30)));
+    k.ok(retype(UT, Untyped, 4 * page, s(30)));
     k.ok(retype(s(30), Endpoint, 0, s(31)));
-    // An address space of two pages at one page, then another at three:
-    // three pages are left, which three more address spaces of two pages
-    // cannot use but for one.
+    // The header of an address space is one page since D-154 (its root
+    // table is a page of the table untyped): after an endpoint the first
+    // lies at one page, not after the endpoint's bytes, so three fill the
+    // untyped to its end and nothing fits after them, not even an endpoint.
     k.ok(retype(s(30), ASpace, 0, s(32)));
     k.ok(retype(s(30), ASpace, 0, s(33)));
     k.ok(retype(s(30), ASpace, 0, s(34)));
     k.no(retype(s(30), ASpace, 0, s(35)), Error::NoMemory);
-    k.ok(retype(s(30), Endpoint, 0, s(36)));
+    k.no(retype(s(30), Endpoint, 0, s(36)), Error::NoMemory);
 }
 
 #[test]
@@ -1783,7 +1787,7 @@ fn frame_is_aligned_on_its_page_size() {
 fn watermark_returns_to_zero_only_when_the_last_object_is_destroyed() {
     let mut k = K::new();
     let page = k.m.geometry().page();
-    k.ok(retype(UT, Untyped, 4 * page, s(30)));
+    k.ok(retype(UT, Untyped, 2 * page, s(30)));
     k.ok(retype(s(30), ASpace, 0, s(31)));
     k.ok(retype(s(30), ASpace, 0, s(32)));
     k.ok(Syscall::CapDelete(s(31)));

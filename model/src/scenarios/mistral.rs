@@ -224,7 +224,7 @@ fn f7_an_unmap_whose_unit_failed_empties_the_record_and_keeps_the_map_count() {
     assert_eq!(m.call(0, attach), WAITS);
     m.run(20 * MS);
     assert_eq!(m.woken(0), Some(&DONE));
-    let untyped = untyped_slot(m.sys.node(0), m.t[0]);
+    let untyped = super::table_slot(m.sys.node(0), m.t[0]);
     m.ok(
         0,
         Syscall::IoSpaceMap(crate::Map {

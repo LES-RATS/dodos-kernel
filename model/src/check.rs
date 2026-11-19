@@ -463,7 +463,11 @@ impl Model {
             )?;
             let exec = |cap: &CapId| self.caps[cap].rights.contains(Rights::EXEC);
             let made = cap.parent.filter(|_| !derived);
-            let device = self.untypeds.get(&cap.object).is_some_and(|u| u.device);
+            // Device memory and a table untyped never carry `exec` (D-154).
+            let device = self
+                .untypeds
+                .get(&cap.object)
+                .is_some_and(|u| u.device || u.table);
             // The frames of the start-up, children of the start-up untyped,
             // have no `exec`; an irq's root has every right; device memory
             // is judged by invariant 25.
@@ -481,6 +485,14 @@ impl Model {
             let on_device = device(&cap.object);
             let exec = cap.rights.contains(Rights::EXEC);
             ensure(!(on_device && exec), "25: exec on device memory")?;
+            // A table untyped, and what is made from one, has no `exec`
+            // (rules of `untyped_retype`, D-154).
+            let table = |id: &ObjId| self.untypeds.get(id).is_some_and(|untyped| untyped.table);
+            let from_tables = object.from.is_some_and(|from| table(&from));
+            ensure(
+                !((table(&cap.object) || from_tables) && exec),
+                "TABLES: exec on a table untyped or on what it made",
+            )?;
             ensure(id.0.max(cap.object.0) < self.next_id, "26: identity")?;
             let Place { space, index } = cap.place;
             let slots = self.cspaces.get(&space).map(|space| &space.slots);
@@ -847,13 +859,23 @@ impl Model {
             // capability space.
             let segments = |object: &ObjId| match self.cspaces.get(object) {
                 Some(space) => space.slots.len() / CSPACE_SEGMENT_SLOTS as usize,
-                None => self.aspaces.get(object).map_or(0, |a| a.tables as usize),
+                None => 0,
             };
             let taken = self
                 .objects
                 .iter()
                 .filter(|(_, object)| object.from == Some(id));
             let live: usize = taken.map(|(object, _)| 1 + segments(object)).sum();
+            // The root table and the lower tables of a space are live
+            // pieces of its table untyped; its header of its ordinary
+            // untyped (Address spaces and their tables, D-154).
+            let tables: usize = self
+                .aspaces
+                .values()
+                .filter(|space| space.table_untyped == Some(id))
+                .map(|space| 1 + space.tables as usize)
+                .sum();
+            let live = live + tables;
             ensure(
                 untyped.live as usize == live + untyped.lost as usize,
                 "19: live count",
@@ -870,7 +892,8 @@ impl Model {
                 untyped.ready.is_none() || untyped.live == 0,
                 "18: a watermark ready to return under a live object",
             )?;
-            let clean = match untyped.device {
+            // Device memory and a table untyped have no clean mark (D-154).
+            let clean = match untyped.device || untyped.table {
                 true => untyped.clean == 0,
                 false => (untyped.watermark..=untyped.bytes).contains(&untyped.clean),
             };

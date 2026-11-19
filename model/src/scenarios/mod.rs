@@ -24,6 +24,7 @@ mod pass25;
 mod pass26;
 mod pass27;
 mod pass28;
+mod pass31;
 mod reviews;
 mod units;
 mod verify13;
@@ -94,11 +95,30 @@ pub(crate) fn untyped_slot(model: &Model, thread: ObjId) -> u32 {
         .filter_map(|i| {
             let object = model.object_at(thread, s(i))?;
             let untyped = model.untypeds.get(&object)?;
-            (model.objects[&object].kind == ObjectKind::Untyped).then_some((untyped.bytes, i))
+            let ordinary = model.objects[&object].kind == ObjectKind::Untyped && !untyped.table;
+            ordinary.then_some((untyped.bytes, i))
         })
         .max()
         .map(|(_, i)| i)
         .expect("an untyped in the start-up space")
+}
+
+/// The slot of the first table untyped of a start-up space: the one cut
+/// from the node's table floor (D-154).
+pub(crate) fn table_slot(model: &Model, thread: ObjId) -> u32 {
+    (START_SLOT_FIRST..START_SLOT_FIRST + 256)
+        .find(|&i| model.untyped_is_table(thread, s(i)) == Some(true))
+        .expect("a table untyped in the start-up space")
+}
+
+/// The size argument of a retype in the tests: for an `aspace` or an
+/// `iospace` asked with 0, the slot of the node's table-floor untyped,
+/// which the contract asks for there (D-154).
+pub(crate) fn sized(model: &Model, thread: ObjId, kind: ObjectKind, size: u64) -> u64 {
+    match kind {
+        ObjectKind::ASpace | ObjectKind::IoSpace if size == 0 => s(table_slot(model, thread)).raw(),
+        _ => size,
+    }
 }
 
 /// The slots of a start-up space that hold objects of `kind`, in order.
@@ -164,7 +184,13 @@ impl N {
     }
 
     pub(crate) fn retype(&self, kind: ObjectKind, size: u64, destination: u32) -> Syscall {
+        let size = sized(&self.m, self.t, kind, size);
         retype_from(self.ut, kind, size, destination)
+    }
+
+    /// The slot of the node's table-floor untyped (D-154).
+    pub(crate) fn tables(&self) -> u32 {
+        table_slot(&self.m, self.t)
     }
 
     /// Every core takes its pending interrupts, in core order, until none
@@ -393,7 +419,9 @@ impl S {
 
     pub(crate) fn retype(&self, node: u16, kind: ObjectKind, size: u64, dest: u32) -> Syscall {
         let model = self.sys.node(node);
-        retype_from(untyped_slot(model, self.t[node as usize]), kind, size, dest)
+        let first = self.t[node as usize];
+        let size = sized(model, first, kind, size);
+        retype_from(untyped_slot(model, first), kind, size, dest)
     }
 
     #[track_caller]

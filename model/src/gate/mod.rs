@@ -19,9 +19,11 @@
 //! invariants of (G) after every step.
 //!
 //! A cell of a table that cannot be executed, or that the checker breaks,
-//! is marked `CONTRACT-GAP` and numbered (26 to 39 settled by D-153; new
-//! ones from 40). The earlier readings stay as `OldRules` switches, so that
-//! each scenario shows its attack failing.
+//! is marked `CONTRACT-GAP` and numbered (26 to 39 settled by D-153; 40 to
+//! 46, found in D-153's split and merge of the kernel's large leaf, closed
+//! by D-154, which replaces that design by dedicated table chunks). The
+//! earlier readings stay as `OldRules` switches, so that each scenario
+//! shows its attack failing.
 
 pub(crate) mod check;
 pub(crate) mod cpu;
@@ -43,8 +45,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const ENTRIES: usize = 4;
 pub(crate) const LEVELS: u8 = 2;
 pub(crate) const PAGES_PER_CHUNK: u64 = 4;
-/// Tags per node: entry 0 the kernel's own.
-pub(crate) const TAGS: usize = 4;
+/// The tags of the small machine's architecture; one, the last, is the
+/// gate's own, bound to no kernel or user root, and the tag table holds
+/// the others (G7, D-155: `GATE_PCID` on x86-64, a reserved ASID on ARM64
+/// and RISC-V). Entry 0 is the kernel's own.
+pub(crate) const ARCH_TAGS: usize = 5;
+pub(crate) const TAGS: usize = ARCH_TAGS - 1;
+pub(crate) const GATE_TAG: usize = TAGS;
 
 /// A page number.
 pub(crate) type Page = u64;
@@ -180,9 +187,12 @@ pub(crate) enum Entry {
     /// A shared entry toward the node's kept kernel table.
     Shared(Page),
     /// The kernel's large leaf of a chunk, in its kernel table: every page
-    /// of the chunk, writable (Gate words, kept kernel tables).
+    /// of the chunk, writable for an ordinary chunk and read-only for a
+    /// table chunk, never rewritten between take and give (Gate words, kept
+    /// kernel tables; D-154).
     Large {
         chunk: u64,
+        write: bool,
     },
 }
 
@@ -211,22 +221,17 @@ pub(crate) enum Invalidates {
     KernelRun { chunk: u64, to: Option<u16> },
     /// Nothing: a barrier.
     Barrier,
-    /// Pages of a chunk leaving *data* (D-153, gap 29): their kernel leaves
-    /// made read-only (or the chunk's large leaf broken, with `split` the
-    /// page that becomes its level-1 table), the class bytes written at
-    /// the completion.
-    KernelPages {
-        chunk: u64,
-        pages: Vec<Page>,
-        split: Option<Page>,
-        target: Target,
-    },
-    /// The merge of a split chunk: its split table unhooked, *loose* then
-    /// *data* at the completion, the large leaf written.
-    KernelMerge { chunk: u64, split: Page },
 }
 
-/// What pages leaving *data* become at the completion of their request.
+/// How a chunk is taken (`memory_take`): kind 0, an ordinary chunk, or
+/// kind 2, a table chunk (D-154).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Take {
+    Ordinary,
+    Tables,
+}
+
+/// What pages leaving *data* become, in the call that turns them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Table,
@@ -277,13 +282,16 @@ pub(crate) struct NodeGate {
 }
 
 /// One node of the small machine: its cores (physical numbers), its kept
-/// kernel root (tag 0) and kernel table, and its floor.
+/// kernel root (tag 0) and kernel table, kept memory outside the chunks,
+/// and its floor: one chunk of table floor (`floor_tables`, the table bit
+/// set), then one chunk of ordinary floor (`floor_node`) (D-154).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NodeLayout {
     pub(crate) cores: Vec<usize>,
     pub(crate) kernel_root: Page,
     pub(crate) kernel_table: Page,
     pub(crate) floor: (Page, Page),
+    pub(crate) table_floor: (Page, Page),
 }
 
 /// What a core's hardware caches under a tag: leaves and tables reached
@@ -295,12 +303,8 @@ pub(crate) struct Tlb {
     /// (tag, e0) → the level-1 table cached for it.
     pub(crate) tables: BTreeMap<(usize, usize), Page>,
     /// The kernel's own space (global, whatever the tag): the large leaves
-    /// cached (kernel-table slot → chunk), the split tables cached (slot →
-    /// table), and the page leaves read through them ((slot, index) →
-    /// (page, writable)).
-    pub(crate) large: BTreeMap<usize, u64>,
-    pub(crate) splits: BTreeMap<usize, Page>,
-    pub(crate) kernel: BTreeMap<(usize, usize), (Page, bool)>,
+    /// cached, kernel-table slot → (chunk, writable).
+    pub(crate) large: BTreeMap<usize, (u64, bool)>,
 }
 
 /// The gate-written state of the machine.
@@ -310,10 +314,12 @@ pub(crate) struct Gate {
     pub(crate) owners: Vec<Owner>,
     /// Per page of ordinary memory: its class byte.
     pub(crate) classes: Vec<Class>,
-    /// Per chunk: map count, pages not data, grant count (`GateWord`).
+    /// Per chunk: map count, pages not data, grant count and table bit
+    /// (`GateWord`; bit 58, D-154).
     pub(crate) map_counts: Vec<u64>,
     pub(crate) not_data: Vec<u64>,
     pub(crate) grant_counts: Vec<u64>,
+    pub(crate) table_bits: Vec<bool>,
     /// The entries of every table page, by page (a table's contents are
     /// written only by the gate).
     pub(crate) tables: BTreeMap<Page, [Entry; ENTRIES]>,
@@ -371,9 +377,28 @@ pub(crate) struct OldRules {
     /// An unbind asking only the cores of the tag's set that are not idle
     /// (the reading before D-153, gap 27).
     pub(crate) unbind_skips_idle: bool,
-    /// A page leaving *data* with its chunk's map count unread (the reading
-    /// before D-153, gap 28).
-    pub(crate) class_change_ignores_map_count: bool,
+    /// A page of any chunk the node holds leaving *data*, the table bit
+    /// and the chunk's map count unread (the reading before D-153's gap 28,
+    /// which D-154 settles by the table bit).
+    pub(crate) tables_in_ordinary_chunks: bool,
+    /// G3 without D-154: a leaf written toward a *data* page of a table
+    /// chunk.
+    pub(crate) leaves_into_table_chunks: bool,
+    /// G6 without D-154: a grant's anchor over a page of a table chunk.
+    pub(crate) anchors_over_table_chunks: bool,
+    /// `memory_take` kind 2 mapping the run writable in the kernel's own
+    /// space, as kind 0 does (without D-154's read-only large leaf).
+    pub(crate) table_chunks_mapped_writable: bool,
+    /// G7 without D-155: the tag table sized from the architecture's whole
+    /// tag width, the gate's own tag bound to a root like any other.
+    pub(crate) gate_tag_bound: bool,
+    /// G10 without D-155: the gate writing the ICR with any vector the
+    /// kernel names (an NMI's, an exception's, a claimable one).
+    pub(crate) any_vector_in_icr: bool,
+    /// RISC-V without D-154's M3: the unhooking of a table invalidated by
+    /// address (`SFENCE.VMA` with `rs1` not `x0`), which drops leaf entries
+    /// only and leaves the cached non-leaf entry.
+    pub(crate) riscv_unhook_by_address: bool,
     /// A chunk's counts left free between a give's call and its completion
     /// (the reading before D-153, gap 30).
     pub(crate) counts_free_during_give: bool,
@@ -395,19 +420,6 @@ pub(crate) struct OldRules {
     /// An attach or a detach asked while the node's own record of the
     /// device is open (the reading before D-153, gap 38).
     pub(crate) concurrent_device_requests: bool,
-    /// The letter of D-153's split (CONTRACT-GAP 40): while a request
-    /// makes a chunk's pages leave *data*, writes that raise the chunk's
-    /// counts are not refused.
-    pub(crate) kernel_pages_unguarded: bool,
-    /// The letter (CONTRACT-GAP 41): a page leaves *data* while a split or
-    /// a merge of its chunk is in flight, the large leaf absent.
-    pub(crate) chunk_requests_unserialized: bool,
-    /// The letter (CONTRACT-GAP 42): a give of a chunk whose split is in
-    /// flight, the large leaf not required.
-    pub(crate) give_during_split: bool,
-    /// The letter (CONTRACT-GAP 43): a walk named by a call crosses a
-    /// shared entry into the kernel half and reaches a split table.
-    pub(crate) walks_through_shared: bool,
 }
 
 /// The small machine.
@@ -434,6 +446,15 @@ pub(crate) struct Machine {
     pub(crate) dev: devices::DeviceGate,
     /// Device and port entries (x86-64 ports).
     pub(crate) ports: ports::PortGate,
+    /// The hardware is RISC-V: an invalidation by address drops only the
+    /// leaf entries cached for it, never a cached non-leaf entry ("the
+    /// fence also invalidates all address-translation cache entries that
+    /// contain leaf page table entries" for the address when `rs1` is not
+    /// `x0`; the Privileged Specification, `SFENCE.VMA`).
+    pub(crate) riscv: bool,
+    /// The ICRs the gates composed: the sending node, the target core's
+    /// number and the vector (x86-64, G10).
+    pub(crate) icr: Vec<(u16, usize, u8)>,
     /// Memory reused since a translation could reach it: a page given
     /// away or turned into a table (for the checker).
     pub(crate) chunks: u64,
@@ -441,23 +462,27 @@ pub(crate) struct Machine {
 
 impl Machine {
     /// `nodes` nodes of `cores` cores each; `chunks` chunks of ordinary
-    /// memory, the first two of each node its floor (kept root and kernel
-    /// table in the floor's first chunk, the rest of the floor data).
+    /// memory, the first two of each node its floor: a chunk of table
+    /// floor, whose gate word has the table bit set, then a chunk of
+    /// ordinary floor (D-154). Each node's kept kernel root and kernel
+    /// table are kept memory, in no chunk: two pages past the chunks.
     pub(crate) fn new(nodes: u16, cores: usize, chunks: u64) -> Self {
         let mut layout = Vec::new();
         let pages = chunks * PAGES_PER_CHUNK;
-        let mut classes = vec![Class::Data; pages as usize];
+        let mut classes = vec![Class::Data; (pages + 2 * u64::from(nodes)) as usize];
         let mut owners = vec![Owner::Free { node: None }; chunks as usize];
+        let mut table_bits = vec![false; chunks as usize];
         let mut tables = BTreeMap::new();
         for n in 0..nodes {
             let first = u64::from(n) * 2 * PAGES_PER_CHUNK;
             let floor = (first, first + 2 * PAGES_PER_CHUNK);
-            let kernel_root = first;
-            let kernel_table = first + 1;
+            let table_floor = (first, first + PAGES_PER_CHUNK);
+            table_bits[(u64::from(n) * 2) as usize] = true;
+            let kernel_root = pages + 2 * u64::from(n);
+            let kernel_table = kernel_root + 1;
             // The kept kernel root and table have no class byte in the
-            // contract (kept memory); the small machine keeps them in the
-            // floor's first page pair, of class Root(Live) and a hooked
-            // table, never on a free list and never torn down.
+            // contract (kept memory): their class follows from where they
+            // lie, never on a free list and never torn down.
             classes[kernel_root as usize] = Class::Kernel;
             classes[kernel_table as usize] = Class::Kernel;
             let mut root = [Entry::Absent; ENTRIES];
@@ -472,12 +497,13 @@ impl Machine {
                 kernel_root,
                 kernel_table,
                 floor,
+                table_floor,
             });
         }
         let nodes_gate = layout
             .iter()
             .map(|l| {
-                let mut tags = vec![TagEntry::default(); TAGS];
+                let mut tags = vec![TagEntry::default(); ARCH_TAGS];
                 tags[0].root = Some(l.kernel_root);
                 NodeGate {
                     loaded: vec![(l.kernel_root, 0); l.cores.len()],
@@ -489,7 +515,7 @@ impl Machine {
             })
             .collect();
         let mut not_data = vec![0; chunks as usize];
-        for (page, class) in classes.iter().enumerate() {
+        for (page, class) in classes.iter().enumerate().take(pages as usize) {
             if *class != Class::Data {
                 not_data[page / PAGES_PER_CHUNK as usize] += 1;
             }
@@ -509,6 +535,7 @@ impl Machine {
                 map_counts: vec![0; chunks as usize],
                 not_data,
                 grant_counts: vec![0; chunks as usize],
+                table_bits,
                 tables,
                 links: BTreeMap::new(),
                 nodes: nodes_gate,
@@ -522,6 +549,8 @@ impl Machine {
             grants: grants::GrantGate::new(nodes),
             dev: devices::DeviceGate::new(nodes),
             ports: ports::PortGate::new(),
+            riscv: false,
+            icr: Vec::new(),
             chunks,
         }
     }
@@ -611,34 +640,13 @@ impl Machine {
                     }
                 }
             }
-            // The kernel's own space, through the kernel table: a large
-            // leaf, or a split table and the leaves it reads now (a stale
-            // cached split table walked too).
+            // The kernel's own space, through the kernel table: the large
+            // leaf of each chunk it maps, with its permission.
             let kernel = self.layout[usize::from(n)].kernel_table;
             let entries = self.gate.tables[&kernel];
             for (slot, entry) in entries.iter().enumerate() {
-                match *entry {
-                    Entry::Large { chunk } => {
-                        self.tlb[core].large.insert(slot, chunk);
-                    }
-                    Entry::Table(split) => {
-                        self.tlb[core].splits.insert(slot, split);
-                    }
-                    _ => {}
-                }
-            }
-            let splits: Vec<(usize, Page)> = self.tlb[core]
-                .splits
-                .iter()
-                .map(|(&s, &t)| (s, t))
-                .collect();
-            for (slot, split) in splits {
-                if let Some(entries) = self.gate.tables.get(&split).copied() {
-                    for (i, entry) in entries.iter().enumerate() {
-                        if let Entry::Leaf { page, write } = *entry {
-                            self.tlb[core].kernel.insert((slot, i), (page, write));
-                        }
-                    }
+                if let Entry::Large { chunk, write } = *entry {
+                    self.tlb[core].large.insert(slot, (chunk, write));
                 }
             }
         }
@@ -647,6 +655,7 @@ impl Machine {
     /// The hardware invalidates on `core`: a range of a tag, or a whole
     /// tag, or every tag.
     pub(crate) fn invalidate(&mut self, core: usize, what: Flush) {
+        let riscv = self.riscv;
         let tlb = &mut self.tlb[core];
         match what {
             Flush::Range { tag, ref va } => {
@@ -654,9 +663,13 @@ impl Machine {
                     .retain(|&(t, v), _| !(t == tag && va.contains(&v)));
                 // A range invalidation drops the paging-structure caches of
                 // the tag too (x86-64 INVLPG, ARM64 TLBI VA): the tables
-                // cached for those addresses.
-                tlb.tables
-                    .retain(|&(t, e0), _| !(t == tag && va.iter().any(|v| v.0 == e0)));
+                // cached for those addresses. Not on RISC-V, where
+                // `SFENCE.VMA` by address drops leaf entries only (D-154,
+                // M3).
+                if !riscv {
+                    tlb.tables
+                        .retain(|&(t, e0), _| !(t == tag && va.iter().any(|v| v.0 == e0)));
+                }
             }
             Flush::Tag(tag) => {
                 tlb.leaves.retain(|&(t, _), _| t != tag);
@@ -666,8 +679,6 @@ impl Machine {
                 tlb.leaves.clear();
                 tlb.tables.clear();
                 tlb.large.clear();
-                tlb.splits.clear();
-                tlb.kernel.clear();
             }
             // The kernel's own space: what any tag cached through the
             // shared entry (global translations), nothing of the user half.
@@ -676,8 +687,6 @@ impl Machine {
                 tlb.leaves.retain(|&(_, (e0, _)), _| e0 != shared);
                 tlb.tables.retain(|&(_, e0), _| e0 != shared);
                 tlb.large.clear();
-                tlb.splits.clear();
-                tlb.kernel.clear();
             }
         }
     }
@@ -695,10 +704,10 @@ pub(crate) enum Flush {
 #[cfg(test)]
 mod devices_tests;
 #[cfg(test)]
-mod kernel_view_tests;
-#[cfg(test)]
 mod settled_tests;
 #[cfg(test)]
 mod suspend_tests;
+#[cfg(test)]
+mod table_chunk_tests;
 #[cfg(test)]
 mod tests;

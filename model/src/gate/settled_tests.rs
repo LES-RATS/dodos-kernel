@@ -23,24 +23,18 @@ fn run(old: OldRules, steps: &[Op]) -> Result<Machine, (usize, String)> {
 /// writable leaf at (0, 0) toward page 16.
 fn space(leaf: bool) -> Vec<Op> {
     let mut ops = vec![
-        Op::Take { n: 0, chunk: 4 },
-        Op::RetypeRoot {
+        Op::Take {
             n: 0,
-            p: 0,
-            page: 2,
-            split: None,
+            chunk: 4,
+            kind: Take::Ordinary,
         },
+        Op::RetypeRoot { n: 0, page: 2 },
         Op::Bind {
             n: 0,
             tag: 1,
             root: 2,
         },
-        Op::TakeTable {
-            n: 0,
-            p: 0,
-            page: 3,
-            split: None,
-        },
+        Op::TakeTable { n: 0, page: 3 },
         Op::Hook {
             n: 0,
             root: 2,
@@ -137,23 +131,17 @@ fn an_unbind_asks_the_idle_cores_of_its_set() {
     assert_eq!(m.gate.nodes[0].tags[1].root, None, "the tag freed");
 }
 
-// D-153, gap 28: every row from *data* requires the chunk's map count 0.
-// Page 16, mapped writable in node 0's space, becomes a table.
+// D-153, gap 28, settled anew by D-154: a page leaves *data* only in a
+// table chunk, which no leaf ever targets, so no map count is read. Page
+// 16 of an ordinary chunk, mapped writable in node 0's space, becomes a
+// table under the reading before both.
 #[test]
 fn a_mapped_page_never_becomes_a_table() {
     let mut steps = space(true);
-    steps.extend([
-        Op::TakeTable {
-            n: 0,
-            p: 0,
-            page: 16,
-            split: Some(17),
-        },
-        Op::Ack { n: 0, p: 1 },
-    ]);
+    steps.extend([Op::TakeTable { n: 0, page: 16 }, Op::Ack { n: 0, p: 1 }]);
     let broken = run(
         OldRules {
-            class_change_ignores_map_count: true,
+            tables_in_ordinary_chunks: true,
             ..OldRules::default()
         },
         &steps,
@@ -165,12 +153,7 @@ fn a_mapped_page_never_becomes_a_table() {
     );
     let mut m = run(OldRules::default(), &space(true)).expect("the space");
     assert_eq!(
-        m.step(&Op::TakeTable {
-            n: 0,
-            p: 0,
-            page: 16,
-            split: Some(17),
-        }),
+        m.step(&Op::TakeTable { n: 0, page: 16 }),
         Err(Refused::Condition)
     );
 }

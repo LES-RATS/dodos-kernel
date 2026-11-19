@@ -75,6 +75,9 @@ impl Machine {
         require(self.grants.grants[usize::from(n)][slot].is_none())?;
         require(self.holds(n, page) && !self.giving(page))?;
         require(self.gate.classes[page as usize] == Class::Data)?;
+        // G6 (D-154): an anchor only over memory whose chunks' gate words
+        // have the table bit clear; so a table chunk's grant count is 0.
+        require(!self.table_chunk(page) || self.old.anchors_over_table_chunks)?;
         let generation = self.gate.members[usize::from(to)].generation;
         let serial = self.grants.serials[usize::from(n)][slot];
         self.grants.grants[usize::from(n)][slot] = Some(Grant {

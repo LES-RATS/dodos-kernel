@@ -1,5 +1,7 @@
 //! The gate over page tables attacked from outside the gate.
 
+mod common;
+
 use dodos_abi::ObjectKind::{Frame, IoSpace, Reply};
 use dodos_abi::*;
 use dodos_model::*;
@@ -30,7 +32,7 @@ fn retype(kind: ObjectKind, size: u64, destination: u32) -> Syscall {
     Syscall::UntypedRetype {
         untyped: UT,
         kind,
-        size,
+        size: common::sized(kind, size),
         page: PageSize::Page as u64,
         memory: 0,
         destination: s(destination),
@@ -105,7 +107,7 @@ fn start(n: u32, mode: u64) -> Syscall {
 fn free_run(geometry: Geometry, log2: u32) -> u64 {
     let machine = Machine::example_on(geometry);
     let ram = machine.memory[5].base;
-    let free = ram + 8 * geometry.chunk();
+    let free = ram + 10 * geometry.chunk();
     free.next_multiple_of(1 << log2)
 }
 
@@ -550,7 +552,7 @@ fn a_partial_mapping_goes_on_only_with_the_page_count_it_started_with() {
         Syscall::IoSpaceMap(Map {
             space: s(210),
             frame: s(211),
-            untyped: UT,
+            untyped: s(common::TABLES),
             address: AT,
             first: 0,
             count,

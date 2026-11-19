@@ -498,7 +498,8 @@ fn a_reserve_chunk_taken_by_this_generation_is_busy() {
         Ok(Output::Epoch(_))
     ));
     m.ok(0, take(0, chunk << shift, u64::from(shift), 160));
-    m.ok(0, retype_from(160, ObjectKind::ASpace, 0, 162));
+    let tables = s(super::table_slot(m.sys.node(0), m.t[0])).raw();
+    m.ok(0, retype_from(160, ObjectKind::ASpace, tables, 162));
     m.no(
         0,
         take(0, chunk << shift, u64::from(shift), 161),
@@ -512,7 +513,7 @@ fn a_reserve_chunk_taken_by_this_generation_is_busy() {
 pub(super) fn frozen_device_leaf(index: u64) -> S {
     use super::units::{IOMMU_ROLE, IOSPACE, attached, three};
     let mut m = three();
-    let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    let ut = super::table_slot(m.sys.node(0), m.t[0]);
     attached(&mut m, 0);
     m.ok(0, take(1, index, 0, 160));
     let frame = Syscall::UntypedRetype {
@@ -565,8 +566,14 @@ fn the_pages_of_an_iospace_pinned_by_a_failed_unit_stay_out_of_their_untyped() {
     use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach, three};
     let mut m = three();
     let ut = untyped_slot(m.sys.node(0), m.t[0]);
-    m.ok(0, retype_from(ut, ObjectKind::Untyped, 1 << 20, 160));
-    m.ok(0, retype_from(160, ObjectKind::IoSpace, 0, IOSPACE));
+    // A child table untyped pays for the iospace's root and tables, and
+    // keeps them, lost (D-154).
+    let tables = super::table_slot(m.sys.node(0), m.t[0]);
+    m.ok(0, retype_from(tables, ObjectKind::Untyped, 1 << 20, 160));
+    m.ok(
+        0,
+        retype_from(ut, ObjectKind::IoSpace, s(160).raw(), IOSPACE),
+    );
     let iospace = m
         .sys
         .node(0)
@@ -587,7 +594,7 @@ fn the_pages_of_an_iospace_pinned_by_a_failed_unit_stay_out_of_their_untyped() {
         m.run(10 * MS);
     }
     assert_eq!(outcome, DONE);
-    m.ok(0, retype_from(160, ObjectKind::ASpace, 0, 162));
+    m.ok(0, retype_from(ut, ObjectKind::ASpace, s(160).raw(), 162));
     let aspace = m.sys.node(0).object_at(m.t[0], s(162)).expect("an aspace");
     assert_ne!(m.sys.node(0).aspaces[&aspace].root, Some(root));
 }
@@ -597,6 +604,7 @@ fn after_a_failed_detach_an_unmap_on_the_iospace_keeps_its_counts() {
     use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach, attached, three};
     let mut m = three();
     let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    let ut_tables = super::table_slot(m.sys.node(0), m.t[0]);
     attached(&mut m, 0);
     m.ok(0, retype_from(ut, ObjectKind::Frame, 1, 160));
     let frame = m.sys.node(0).object_at(m.t[0], s(160)).expect("a frame");
@@ -605,7 +613,7 @@ fn after_a_failed_detach_an_unmap_on_the_iospace_keeps_its_counts() {
     let map = Syscall::IoSpaceMap(Map {
         space: s(IOSPACE),
         frame: s(160),
-        untyped: s(ut),
+        untyped: s(ut_tables),
         address: 0x1000_0000,
         first: 0,
         count: 1,
@@ -960,14 +968,14 @@ fn an_aspace_map_while_tables_wait_for_their_invalidation_takes_new_tables_from_
     k.place_first(0);
     let other = k.thread_on(170, 1);
     assert_eq!(k.call(other, Syscall::Yield), DONE);
-    let ut = k.ut;
+    let ut_tables = k.tables();
     k.ok(k.retype(ObjectKind::ASpace, 0, 360));
     let space = k.m.object_at(k.t, s(360)).expect("an aspace");
     let map = |slot: u32, at: u64| {
         Syscall::ASpaceMap(Map {
             space: s(360),
             frame: s(slot),
-            untyped: s(ut),
+            untyped: s(ut_tables),
             address: at,
             first: 0,
             count: 1,
@@ -1172,9 +1180,12 @@ fn the_start_up_page_counts_its_records_at_the_sizes_of_the_abi() {
     // D-152: `StartMachine` is 128 bytes (layout 6, eight more offsets).
     let machine = Machine::example();
     let bytes = crate::boot::start_page_bytes_of(&machine);
+    // D-154: `ObjectSizes` has 22 words (F12, 8 bytes more), the node's
+    // table-floor untyped a `StartUntyped` (16), and each of the two node
+    // slots' table floors a record of the entry `Floors` (24 each).
     assert_eq!(
         bytes,
-        2168 + (48 - 40) + (96 - 80) - 8 + 48 + 16 + (128 - 96)
+        2168 + (48 - 40) + (96 - 80) - 8 + 48 + 16 + (128 - 96) + 8 + 16 + 2 * 24
     );
     assert_eq!(std::mem::size_of::<dodos_abi::StartBootTimes>(), 48);
     assert_eq!(std::mem::size_of::<dodos_abi::StartMachine>(), 128);
@@ -1385,8 +1396,10 @@ pub(super) fn caching_iospace() -> (S, u32, u32) {
     let mut m = S::on(&machine);
     attached(&mut m, 0);
     let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    // The iospace's table untyped, which its maps name (D-154).
+    let tables = super::table_slot(m.sys.node(0), m.t[0]);
     m.ok(0, retype_from(ut, ObjectKind::Frame, 1, 160));
-    (m, ut, IOSPACE)
+    (m, tables, IOSPACE)
 }
 
 pub(super) fn io_map(ut: u32, iospace: u32) -> Syscall {
@@ -1930,7 +1943,7 @@ fn a_take_journaled_in_the_old_owners_name_is_reported() {
 fn a_device_leaf_count_above_its_leaves_is_reported_while_its_owner_runs() {
     use super::units::{IOSPACE, attached, three};
     let mut m = three();
-    let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    let ut = super::table_slot(m.sys.node(0), m.t[0]);
     attached(&mut m, 0);
     m.ok(0, take(1, 0, 0, 160));
     let frame = Syscall::UntypedRetype {

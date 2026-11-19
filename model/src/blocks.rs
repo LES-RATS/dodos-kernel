@@ -4,7 +4,10 @@
 
 use crate::caps::Placing;
 use crate::{Block, Model, ObjId, Outcome, Output, live};
-use dodos_abi::{DeviceEntry, Error, ObjectKind, OwnState, Owner, Ownership, Rights, SlotAddr};
+use dodos_abi::{
+    DeviceEntry, Error, MEMORY_TAKE_ENTRY, MEMORY_TAKE_RUN, MEMORY_TAKE_TABLES, ObjectKind,
+    OwnState, Owner, Ownership, Rights, SlotAddr,
+};
 
 impl Model {
     /// The capability of a call on blocks: `manage` on the memory_control.
@@ -35,8 +38,11 @@ impl Model {
         let geometry = self.table.geometry;
         let chunk_shift = u64::from(geometry.chunk_shift());
         let entries_shift = u64::from(geometry.entries.trailing_zeros());
+        // The kind is 0, 1 or 2 (D-154): 2 a run of ordinary memory for
+        // tables, a table untyped, its place and size as for kind 0.
+        let run = kind == MEMORY_TAKE_RUN || kind == MEMORY_TAKE_TABLES;
         match kind {
-            0 => {
+            MEMORY_TAKE_RUN | MEMORY_TAKE_TABLES => {
                 if !(chunk_shift..=chunk_shift + entries_shift).contains(&size)
                     || !place.is_multiple_of(1 << size)
                 {
@@ -54,7 +60,7 @@ impl Model {
                     return Err(Error::Invalid);
                 }
             }
-            1 => {
+            MEMORY_TAKE_ENTRY => {
                 if size != 0 || place >= self.table.devices.len() as u64 {
                     return Err(Error::Invalid);
                 }
@@ -68,14 +74,14 @@ impl Model {
         // current generation of this node, or has an owner the rules of
         // taking refuse, is `busy`; an unused entry is `busy`; then the
         // destination.
-        let words: Vec<u64> = match kind {
-            0 => self.run(place, size).collect(),
-            _ => vec![place],
+        let words: Vec<u64> = match run {
+            true => self.run(place, size).collect(),
+            false => vec![place],
         };
         for &index in &words {
-            let raw = match kind {
-                0 => self.table.owners[index as usize],
-                _ => self.table.devices[index as usize].owner.raw(),
+            let raw = match run {
+                true => self.table.owners[index as usize],
+                false => self.table.devices[index as usize].owner.raw(),
             };
             let Some(word) = Ownership::from_raw(raw) else {
                 return Err(Error::Busy);
@@ -84,7 +90,7 @@ impl Model {
                 return Err(Error::Busy);
             }
         }
-        if kind == 1 && !self.table.devices[place as usize].is_used() {
+        if !run && !self.table.devices[place as usize].is_used() {
             return Err(Error::Busy);
         }
         self.vacant(at)?;
@@ -92,8 +98,8 @@ impl Model {
         // order, by this node and its generation, or by the reserve's code.
         let generation = self.table.generation(self.node);
         for &index in &words {
-            match kind {
-                0 => {
+            match run {
+                true => {
                     let before = self.table.owners[index as usize];
                     let owner = match Ownership::from_raw(before).map(|w| w.owner()) {
                         Some(Owner::Reserve(j)) => Owner::Reserve(j),
@@ -101,12 +107,19 @@ impl Model {
                     };
                     let after = Ownership::taken(owner, generation);
                     assert!(self.table.write_owner(self.node, index, before, after));
-                    // The gate maps the run into the kernel's own space,
-                    // with page classes data and map counts 0.
-                    // G13: its gate word and page classes are reset.
+                    // The gate maps the run into the kernel's own space
+                    // with large entries, writable for kind 0 and
+                    // read-only for kind 2, with page classes data, and
+                    // writes the whole gate word of each chunk: 0 for kind
+                    // 0, the table bit with its three counts 0 for kind 2
+                    // (`memory_take`, G13, D-151, D-154).
                     self.kernel_runs.insert(index);
                     self.added.0 += 1;
-                    self.table.set_map_count(index, 0);
+                    let tables = kind == MEMORY_TAKE_TABLES;
+                    match tables {
+                        true => self.kernel_read_only.insert(index),
+                        false => self.kernel_read_only.remove(&index),
+                    };
                     let pages = self.table.geometry.chunk() / self.table.geometry.page();
                     let stored: Vec<u64> = self
                         .table
@@ -117,8 +130,13 @@ impl Model {
                     for page in stored {
                         self.table.set_class(page, None);
                     }
+                    let word = match tables {
+                        true => dodos_abi::GateWord::TABLE,
+                        false => dodos_abi::GateWord::ORDINARY,
+                    };
+                    self.table.write_gate_word(index, word);
                 }
-                _ => {
+                false => {
                     let mut entry = self.table.devices[index as usize];
                     entry.owner = Ownership::taken(Owner::Node(self.node), generation);
                     assert!(self.table.write_entry(self.node, index as usize, entry));
@@ -131,9 +149,9 @@ impl Model {
         // watermark at the start; ordinary memory is dirty, so the clean
         // mark is at the start. `exec` only for ordinary memory taken
         // through a memory_control capability that has it.
-        let (base, bytes, device, block) = match kind {
-            0 => (place, 1 << size, false, Block::Run),
-            _ => {
+        let (base, bytes, device, block) = match run {
+            true => (place, 1 << size, false, Block::Run),
+            false => {
                 let entry = self.table.devices[place as usize];
                 (
                     entry.base(),
@@ -143,7 +161,11 @@ impl Model {
                 )
             }
         };
-        let exec = !device && self.caps[&parent].rights.contains(Rights::EXEC);
+        // `exec` only for kind 0 taken through a memory_control capability
+        // that has it, never for kind 1 or kind 2; device memory and table
+        // memory have no clean mark (D-154).
+        let tables = kind == MEMORY_TAKE_TABLES;
+        let exec = !device && !tables && self.caps[&parent].rights.contains(Rights::EXEC);
         let rights = match exec {
             true => Rights::ALL,
             false => Rights::ALL.without(Rights::EXEC),
@@ -153,6 +175,7 @@ impl Model {
         live(&mut self.objects, id).from = None;
         let untyped = live(&mut self.untypeds, id);
         (untyped.base, untyped.device, untyped.block) = (base, device, Some(block));
+        untyped.table = tables;
         Ok(Output::Done)
     }
 
@@ -215,7 +238,11 @@ impl Model {
                 && w.owner() == Owner::Node(self.node)
                 && w.generation() == generation
         });
-        if !owned || self.table.map_count(chunk) != 0 || self.table.grant_count(chunk) != 0 {
+        // G5 (D-148, D-150, D-154): map count 0, grant count 0 and count of
+        // pages not *data* 0, so a table chunk that holds a table, a root
+        // or an ITS table is never given.
+        let word = self.table.gate_word(chunk);
+        if !owned || word.map_count() != 0 || word.grants() != 0 || word.not_data() != 0 {
             return false;
         }
         self.table
@@ -224,9 +251,12 @@ impl Model {
 
     /// A faulty kernel's call of its gate: change page `page`, of its own
     /// memory and of class data, to `class` (a table, say), its derivation
-    /// list ignored. The gate refuses a change away from data while a live,
-    /// revoking or pinned grant's anchor covers the page (G5, D-148). Says
-    /// whether it changed it.
+    /// list ignored. The gate asks for the ownership word taken by the node
+    /// with its generation, or the page in its table floor, and for the
+    /// table bit of the chunk's gate word (G5, the page class byte's rows
+    /// from *data*, D-154): no leaf and no grant's anchor ever targets a
+    /// table chunk, so it reads no map count and walks no grant table.
+    /// Says whether it changed it.
     pub fn gate_retype_page(&mut self, page: u64, class: dodos_abi::PageClass) -> bool {
         let geometry = self.table.geometry;
         let chunk = (page * geometry.page()) >> geometry.chunk_shift();
@@ -238,12 +268,36 @@ impl Model {
                     && w.generation() == generation
             })
         });
+        let floor = self.table.table_floors[self.node as usize]
+            .iter()
+            .any(|&(s, e)| s <= page * geometry.page() && page * geometry.page() < e);
         let data = !self.table.classes.contains_key(&page);
-        if !owned || !data || self.table.page_granted(page) {
+        if !(owned || floor) || !data || !self.table.table_chunk(chunk) {
             return false;
         }
         self.table.set_class(page, Some(class));
         true
+    }
+
+    /// A faulty kernel's call of its gate: a leaf toward page `page` of its
+    /// own memory, whatever its frames say. G3 (3) refuses it into a chunk
+    /// whose gate word has the table bit set (D-154). Says whether the
+    /// gate would write it; nothing changes.
+    pub fn gate_leaf_allowed(&self, page: u64) -> bool {
+        let geometry = self.table.geometry;
+        let at = page * geometry.page();
+        let generation = self.table.generation(self.node);
+        self.table.holds_page(at, self.node, generation)
+            && !self.table.classes.contains_key(&page)
+            && !self.table.table_chunk(at >> geometry.chunk_shift())
+    }
+
+    /// A faulty kernel's call of its gate: a grant entry whose anchor
+    /// covers page `page`. G6 accepts an anchor only over ordinary memory
+    /// the node holds whose chunks' gate words have the table bit clear
+    /// (D-154). Says whether the gate would write it; nothing changes.
+    pub fn gate_anchor_allowed(&self, page: u64) -> bool {
+        self.gate_leaf_allowed(page)
     }
 
     /// `memory_give`: destroys the block and gives its chunks, or its
@@ -390,9 +444,13 @@ impl Model {
             Some(Block::Run) => {
                 let shift = self.table.geometry.chunk_shift();
                 let chunks = untyped.base >> shift..(untyped.base + untyped.bytes) >> shift;
-                chunks
-                    .into_iter()
-                    .any(|c| self.table.map_count(c) != 0 || self.table.grant_count(c) != 0)
+                // G5 (D-150, D-154): map count 0, grant count 0 and count
+                // of pages not *data* 0.
+                chunks.into_iter().any(|c| {
+                    self.table.map_count(c) != 0
+                        || self.table.grant_count(c) != 0
+                        || self.table.gate_word(c).not_data() != 0
+                })
             }
             Some(Block::Entry(index)) => {
                 self.table.device_leaves[index] != 0 || self.table.device_grants[index] != 0
@@ -428,6 +486,7 @@ impl Model {
         if block == Block::Run {
             for chunk in run.chunks(self.table.geometry.chunk_shift()) {
                 self.kernel_runs.remove(&chunk);
+                self.kernel_read_only.remove(&chunk);
             }
         }
         Some(run)

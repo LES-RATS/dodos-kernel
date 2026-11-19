@@ -21,8 +21,9 @@ impl Machine {
         self.check_tags()?;
         self.check_counts()?;
         self.check_reach()?;
-        self.check_kernel_view()?;
         self.check_device_reach()?;
+        self.check_table_chunks()?;
+        self.check_kernel_view()?;
         self.check_devices()?;
         self.check_ports()?;
         self.check_parks()
@@ -32,6 +33,14 @@ impl Machine {
     /// node (D-152: keyed on the line). Seals: a sealed node's cores are
     /// all parked (the sealing call raised their park requests).
     fn check_parks(&self) -> Check {
+        // G10 (D-155): the gate composes an ICR only with an ordinary
+        // inter-kernel vector.
+        ensure(
+            self.icr
+                .iter()
+                .all(|&(_, _, vector)| dodos_abi::x86_64::ikv_valid(vector)),
+            "G10: an ICR composed with a vector that is no inter-kernel vector",
+        )?;
         for &(n, _, line) in &self.parks.deactivated {
             ensure(
                 line.map(|(owner, _)| owner) == Some(n),
@@ -62,6 +71,11 @@ impl Machine {
             ensure(
                 self.holds(domain, page),
                 "G: a device's translation reaches memory its node does not hold",
+            )?;
+            // G3 (3) (D-154): no device leaf targets a table chunk.
+            ensure(
+                !self.table_chunk(page),
+                "G: a device's translation reaches a table chunk",
             )?;
             let present = self.unit.domains[usize::from(domain)]
                 .and_then(|root| self.gate.tables.get(&root))
@@ -182,6 +196,13 @@ impl Machine {
                     let _ = tag;
                 }
             }
+            // G7 (D-155): the gate's own tag is bound to no root and loaded
+            // for none.
+            ensure(
+                node.tags[GATE_TAG] == TagEntry::default()
+                    && node.loaded.iter().all(|&(_, tag)| tag != GATE_TAG),
+                "TAG: the gate's own tag bound to a root or loaded for one",
+            )?;
             for &(root, tag) in &node.loaded {
                 ensure(
                     node.tags[tag].root == Some(root),
@@ -203,13 +224,7 @@ impl Machine {
     /// leaf a request in use cleared and has not yet seen invalidated.
     fn check_counts(&self) -> Check {
         let mut needed = vec![0u64; self.chunks as usize];
-        let splits = self.split_tables();
         for (page, entries) in &self.gate.tables {
-            // A split table's leaves are the kernel's own view, which no map
-            // count holds.
-            if splits.contains(page) {
-                continue;
-            }
             if matches!(
                 self.gate.classes[*page as usize],
                 Class::Table { .. } | Class::IoRoot { .. }
@@ -321,6 +336,13 @@ impl Machine {
                     !write || self.gate.classes[page as usize] == Class::Data,
                     "G: a writable translation reaches a page that is not data",
                 )?;
+                // G3 (3) (D-154): no user leaf targets a table chunk, even
+                // a *data* page of one, which the next call may turn into a
+                // table with no count read and no core asked.
+                ensure(
+                    !self.table_chunk(page),
+                    "G: a translation reaches a table chunk",
+                )?;
                 let present = live.get(&va) == Some(&(page, write));
                 ensure(
                     present || counted.contains(&page),
@@ -331,38 +353,49 @@ impl Machine {
         Ok(())
     }
 
-    /// The split tables every node's kernel table names, and those a merge
-    /// in flight unhooks.
-    pub(super) fn split_tables(&self) -> BTreeSet<Page> {
-        let merging = self
-            .gate
-            .nodes
-            .iter()
-            .flat_map(|n| &n.requests)
-            .filter_map(|r| match r {
-                Request::InUse {
-                    what: Invalidates::KernelMerge { split, .. },
-                    ..
-                } => Some(*split),
-                _ => None,
-            });
-        self.layout
-            .iter()
-            .flat_map(|l| self.gate.tables[&l.kernel_table])
-            .filter_map(|e| match e {
-                Entry::Table(s) => Some(s),
-                _ => None,
-            })
-            .chain(merging)
-            .collect()
+    /// Table chunks (G2, G4, D-154): every page of a class other than
+    /// *data* lies in a chunk whose gate word has the table bit set; a
+    /// table chunk's map count and grant count are 0; while its node runs,
+    /// its table floor has the bit and its ordinary floor does not.
+    fn check_table_chunks(&self) -> Check {
+        for chunk in 0..self.chunks as usize {
+            let table = self.gate.table_bits[chunk];
+            ensure(
+                table || self.gate.not_data[chunk] == 0,
+                "TABLE: a page that is not data in an ordinary chunk",
+            )?;
+            ensure(
+                !table || self.gate.map_counts[chunk] == 0,
+                "TABLE: a table chunk counts a leaf",
+            )?;
+            ensure(
+                !table || self.gate.grant_counts[chunk] == 0,
+                "TABLE: a table chunk counts a grant's anchor",
+            )?;
+        }
+        for (n, layout) in self.layout.iter().enumerate() {
+            let state = self.gate.members[n].state;
+            if !state.writes() && state != NodeState::Sealed {
+                continue;
+            }
+            let (start, end) = layout.floor;
+            for chunk in Self::chunk_of(start)..Self::chunk_of(end) {
+                let tables = chunk == Self::chunk_of(layout.table_floor.0);
+                ensure(
+                    self.gate.table_bits[chunk as usize] == tables,
+                    "TABLE: a floor chunk's table bit is not its floor's",
+                )?;
+            }
+        }
+        Ok(())
     }
 
-    /// The kernel's own view (Gate words, kept kernel tables; D-153, gap
-    /// 29): what each running core holds of it writes only *data* pages of
-    /// memory its node holds (a run being given excepted until the give
-    /// completes), and walks only split tables of its node; a large leaf
-    /// covers a chunk all of whose pages are *data*; a split table's
-    /// writable leaves target *data* pages; the kernel never stored into a
+    /// The kernel's own view (Gate words, kept kernel tables; D-154): each
+    /// chunk a node took is mapped by one large leaf, read-only if its gate
+    /// word has the table bit set and writable otherwise; what a running
+    /// core holds of it reaches only memory its node holds (a run being
+    /// given excepted until the give completes), and is writable only over
+    /// a chunk whose pages are all *data*; the kernel never stored into a
     /// page that was not *data*.
     fn check_kernel_view(&self) -> Check {
         ensure(
@@ -376,35 +409,11 @@ impl Machine {
                 continue;
             }
             for entry in self.gate.tables[&layout.kernel_table] {
-                match entry {
-                    Entry::Large { chunk } => {
-                        let first = chunk * PAGES_PER_CHUNK;
-                        ensure(
-                            (first..first + PAGES_PER_CHUNK).all(data),
-                            "KERNEL: a large leaf over a chunk with a page that is not data",
-                        )?;
-                    }
-                    Entry::Table(s) => {
-                        ensure(
-                            matches!(
-                                self.gate.classes[s as usize],
-                                Class::Table {
-                                    level: 1,
-                                    hook: Hook::Hooked
-                                }
-                            ),
-                            "KERNEL: a kernel table's entry toward no hooked split table",
-                        )?;
-                        for leaf in self.gate.tables[&s] {
-                            if let Entry::Leaf { page, write: true } = leaf {
-                                ensure(
-                                    data(page),
-                                    "KERNEL: a split table's writable leaf toward a page that is not data",
-                                )?;
-                            }
-                        }
-                    }
-                    _ => {}
+                if let Entry::Large { chunk, write } = entry {
+                    ensure(
+                        write != self.gate.table_bits[chunk as usize],
+                        "KERNEL: a large leaf's permission is not its chunk's table bit",
+                    )?;
                 }
             }
             let giving: BTreeSet<u64> = self.gate.nodes[usize::from(n)]
@@ -420,8 +429,7 @@ impl Machine {
                 .collect();
             let reach = |page: Page| self.holds(n, page) || giving.contains(&Self::chunk_of(page));
             for &core in &layout.cores {
-                let tlb = &self.tlb[core];
-                for &chunk in tlb.large.values() {
+                for &(chunk, write) in self.tlb[core].large.values() {
                     let first = chunk * PAGES_PER_CHUNK;
                     for page in first..first + PAGES_PER_CHUNK {
                         ensure(
@@ -429,33 +437,10 @@ impl Machine {
                             "G: the kernel's own view reaches memory its node does not hold",
                         )?;
                         ensure(
-                            data(page),
+                            !write || data(page),
                             "G: the kernel's own view writes a page that is not data",
                         )?;
                     }
-                }
-                for &(page, write) in tlb.kernel.values() {
-                    ensure(
-                        reach(page),
-                        "G: the kernel's own view reaches memory its node does not hold",
-                    )?;
-                    ensure(
-                        !write || data(page),
-                        "G: the kernel's own view writes a page that is not data",
-                    )?;
-                }
-                for &s in tlb.splits.values() {
-                    ensure(
-                        self.holds(n, s)
-                            && matches!(
-                                self.gate.classes[s as usize],
-                                Class::Table {
-                                    level: 1,
-                                    hook: Hook::Hooked | Hook::Unhooking
-                                }
-                            ),
-                        "G: a core walks a cached kernel table that is no split table of its node",
-                    )?;
                 }
             }
         }

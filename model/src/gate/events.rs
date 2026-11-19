@@ -62,7 +62,6 @@ impl Machine {
         }
         // R6, the barrier holding.
         let (start, end) = self.layout[usize::from(n)].floor;
-        let layout = self.layout[usize::from(n)].clone();
         for chunk in 0..self.chunks {
             let first = chunk * PAGES_PER_CHUNK;
             let taken = matches!(
@@ -74,17 +73,18 @@ impl Machine {
                 continue;
             }
             for page in first..first + PAGES_PER_CHUNK {
-                if page == layout.kernel_root || page == layout.kernel_table {
-                    continue;
-                }
                 if self.gate.classes[page as usize] != Class::Data {
                     self.gate.classes[page as usize] = Class::Data;
                     self.gate.tables.remove(&page);
                     self.gate.links.remove(&page);
                 }
             }
+            // R6 (D-154): the whole gate word, its three counts and its
+            // table bit, of every chunk the generation took and of its
+            // floor, ordinary and table.
             self.gate.map_counts[chunk as usize] = 0;
             self.gate.grant_counts[chunk as usize] = 0;
+            self.gate.table_bits[chunk as usize] = false;
             self.gate.not_data[chunk as usize] = (first..first + PAGES_PER_CHUNK)
                 .filter(|&q| self.gate.classes[q as usize] != Class::Data)
                 .count() as u64;
@@ -107,19 +107,19 @@ impl Machine {
         let layout = self.layout[usize::from(n)].clone();
         let (start, end) = layout.floor;
         for page in start..end {
-            if page == layout.kernel_root || page == layout.kernel_table {
-                continue;
-            }
             if self.gate.classes[page as usize] != Class::Data {
                 self.gate.classes[page as usize] = Class::Data;
                 self.gate.tables.remove(&page);
                 self.gate.links.remove(&page);
             }
         }
+        // G13 (D-154): the whole gate word of its floor's chunks, 0 for its
+        // ordinary floor, the table bit with counts 0 for its table floor.
         for chunk in Self::chunk_of(start)..Self::chunk_of(end) {
             let first = chunk * PAGES_PER_CHUNK;
             self.gate.map_counts[chunk as usize] = 0;
             self.gate.grant_counts[chunk as usize] = 0;
+            self.gate.table_bits[chunk as usize] = first == layout.table_floor.0;
             self.gate.not_data[chunk as usize] = (first..first + PAGES_PER_CHUNK)
                 .filter(|&q| self.gate.classes[q as usize] != Class::Data)
                 .count() as u64;
@@ -136,7 +136,7 @@ impl Machine {
         };
         if !self.old.fresh_keeps_gate_part {
             let cores = layout.cores.len();
-            let mut tags = vec![TagEntry::default(); TAGS];
+            let mut tags = vec![TagEntry::default(); ARCH_TAGS];
             tags[0].root = Some(layout.kernel_root);
             self.gate.nodes[usize::from(n)] = NodeGate {
                 loaded: vec![(layout.kernel_root, 0); cores],

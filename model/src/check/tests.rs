@@ -19,6 +19,17 @@ const WAITER: u32 = 43;
 const COPY: u32 = 44;
 const CALLER: u32 = 46;
 
+/// The size argument of an `aspace` or an `iospace`: the slot address of
+/// the node's table-floor untyped (D-154).
+fn tables(model: &Model) -> u64 {
+    let thread = object(model, START_SLOT_THREAD);
+    (dodos_abi::START_SLOT_FIRST..dodos_abi::START_SLOT_FIRST + 64)
+        .map(SlotAddr::own)
+        .find(|&slot| model.untyped_is_table(thread, slot) == Some(true))
+        .expect("a table untyped")
+        .raw()
+}
+
 /// An endpoint, a reply object and a notify, a thread that waits on the
 /// notify, a thread in the queue of the endpoint, and two copies of the
 /// endpoint capability in `COPY` and after.
@@ -1285,9 +1296,10 @@ fn census_counts_what_the_state_holds() {
     let mut model = state();
     let boot = object(&model, START_SLOT_THREAD);
     let census = Census {
-        // Twenty at start-up, five objects, two copies; the node's kernel
-        // space holds no proxy since D-128.
-        capabilities: 40,
+        // Twenty-one at start-up (the table-floor untyped, D-154), five
+        // objects, two copies; the node's kernel space holds no proxy
+        // since D-128.
+        capabilities: 41,
         // The untyped, the endpoint, a copy of its capability.
         deepest: 3,
         callers: 1,
@@ -1595,6 +1607,11 @@ fn space_with_as_many_tables_as_its_translations_hook_is_accepted() {
     let space = start_aspace(&model, at);
     let geometry = model.machine.geometry;
     let hooked = crate::memory::hooked(&model.aspaces[&space], geometry.levels, geometry);
+    // Its reserve of free tables leaves it, back to *data*.
+    let page = geometry.page();
+    for at in std::mem::take(&mut live(&mut model.aspaces, space).free) {
+        model.table.set_class(at / page, None);
+    }
     live(&mut model.aspaces, space).tables = hooked;
     assert_eq!(model.check(), Ok(()));
 }
@@ -1624,7 +1641,7 @@ fn with_device(m: &mut Model) -> (ObjId, ObjId) {
     let retype = Syscall::UntypedRetype {
         untyped: own(UNTYPED),
         kind: ObjectKind::IoSpace,
-        size: 0,
+        size: tables(m),
         page: 0,
         memory: 0,
         destination: own(60),
@@ -1945,7 +1962,9 @@ fn irq_whose_root_capability_is_not_a_child_of_an_irq_control_is_reported() {
 fn with_block(m: &mut Model) -> (ObjId, u64) {
     let thread = object(m, START_SLOT_THREAD);
     let geometry = m.machine.geometry;
-    let place = m.machine.memory[5].base + 8 * geometry.chunk();
+    // Two node slots of four chunks (three of ordinary floor and one of
+    // table floor, D-154) and two reserves of one.
+    let place = m.machine.memory[5].base + 10 * geometry.chunk();
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
         kind: 0,
@@ -2102,7 +2121,7 @@ fn translation_to_memory_of_another_node_is_reported() {
 fn writable_translation_to_the_kept_image_is_reported() {
     let broken = spoiled(|m, _| {
         // The kept frame of the executable segment, mapped read and write.
-        let cap = cap(m, 27);
+        let cap = cap(m, 28);
         let rw = Rights::READ.union(Rights::WRITE);
         let Record::Mapping(mut mapping) = m.caps[&cap].record else {
             panic!("mapped");
@@ -2708,7 +2727,7 @@ fn spoiled_unit_wait(spoil: impl FnOnce(&mut Model, ObjId, usize)) -> &'static s
         let retype = Syscall::UntypedRetype {
             untyped: own(UNTYPED),
             kind: ObjectKind::IoSpace,
-            size: 0,
+            size: tables(m),
             page: 0,
             memory: 0,
             destination: own(60),
@@ -2858,7 +2877,7 @@ fn address_space_whose_count_of_tables_is_not_its_tables_is_reported() {
         let retype = Syscall::UntypedRetype {
             untyped: SlotAddr::own(UNTYPED),
             kind: ObjectKind::ASpace,
-            size: 0,
+            size: tables(m),
             page: 0,
             memory: 0,
             destination: SlotAddr::own(310),

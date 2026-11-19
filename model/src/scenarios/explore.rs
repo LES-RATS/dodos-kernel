@@ -361,7 +361,7 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
         };
         assert_eq!(m.call(0, send), WAITS);
         m.settle();
-        let ut = untyped_slot(m.sys.node(2), m.t[2]);
+        let ut = super::table_slot(m.sys.node(2), m.t[2]);
         let map = Syscall::IoSpaceMap(crate::Map {
             space: s(super::units::IOSPACE),
             frame: s(110),

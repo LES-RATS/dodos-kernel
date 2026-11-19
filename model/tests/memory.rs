@@ -10,6 +10,9 @@ use dodos_model::*;
 
 const IMAGE: u32 = 19;
 const UT: u32 = 20;
+/// The node's table-floor untyped, which the spaces' tables come from
+/// (D-154).
+const TB: u32 = common::TABLES_INDEX;
 const DEV: u32 = 21;
 const IOMMU: u32 = 18;
 const START: u32 = START_SLOT_ASPACE;
@@ -81,7 +84,7 @@ impl K {
         let call = Syscall::UntypedRetype {
             untyped: s(untyped),
             kind,
-            size,
+            size: common::sized(kind, size),
             page: 0,
             memory: 0,
             destination: s(slot),
@@ -170,7 +173,7 @@ fn iomap(space: u32, frame: u32, address: u64, count: u64, rights: Rights) -> Sy
     Syscall::IoSpaceMap(Map {
         space: s(space),
         frame: s(frame),
-        untyped: s(UT),
+        untyped: s(TB),
         address,
         first: 0,
         count,
@@ -221,7 +224,7 @@ fn seen(k: &K, viewer: ObjId, address: u64) -> Option<Rights> {
 fn aspace_map_maps_pages_first_to_first_plus_count_minus_1_from_the_address() {
     let (mut k, v) = with_aspace();
     k.small(4, 40);
-    k.ok(map(30, 40, UT, AT, 1, 2, rw()));
+    k.ok(map(30, 40, TB, AT, 1, 2, rw()));
     assert_eq!(seen(&k, v, AT - 1), None);
     assert_eq!(seen(&k, v, AT), Some(rw()));
     let page = k.page();
@@ -252,7 +255,7 @@ fn aspace_map_checks_the_frame_slot_and_kind_without_its_rights() {
     // A frame without rights passes its slot check; the rights asked for
     // are judged with the plain arguments, after the untyped.
     k.no(map(30, 41, IMAGE, AT, 0, 1, R), Error::Invalid);
-    k.no(map(30, 41, UT, AT, 0, 1, R), Error::Denied);
+    k.no(map(30, 41, TB, AT, 0, 1, R), Error::Denied);
 }
 
 #[test]
@@ -260,12 +263,15 @@ fn untyped_of_aspace_map_is_its_own_or_0() {
     let (mut k, _) = with_aspace();
     k.small(1, 40);
     k.small(1, 41);
-    // A copy of the untyped the aspace was made from is accepted.
-    k.derive(UT, 32, Rights::ALL);
+    // A copy of the table untyped named when the aspace was made is
+    // accepted (D-154).
+    k.derive(TB, 32, Rights::ALL.without(X));
     k.ok(map(30, 40, 32, AT, 0, 1, R));
-    k.derive(UT, 33, R);
+    k.derive(TB, 33, R);
     let page = k.page();
     k.no(map(30, 41, 33, AT + page, 0, 1, R), Error::Denied);
+    // The ordinary untyped its header came from is not its table untyped.
+    k.no(map(30, 41, UT, AT + page, 0, 1, R), Error::Invalid);
     k.no(map(30, 41, IMAGE, AT + page, 0, 1, R), Error::Invalid);
     // Refused with bad plain arguments as well (all `invalid`: no order
     // shows).
@@ -276,7 +282,7 @@ fn untyped_of_aspace_map_is_its_own_or_0() {
 fn start_up_aspace_takes_no_untyped_and_uses_its_reserve() {
     let mut k = K::new();
     k.small(1, 40);
-    k.no(map(START, 40, UT, AT, 0, 1, R), Error::Invalid);
+    k.no(map(START, 40, TB, AT, 0, 1, R), Error::Invalid);
     // The reserve of L tables: a new region of a root entry needs L - 1.
     let (root, levels) = (k.span(k.levels() - 1), k.levels());
     k.ok(map(START, 40, 0, root, 0, 1, R));
@@ -299,21 +305,21 @@ fn each_plain_argument_of_aspace_map_is_refused_and_the_range_before_the_rights(
     k.frame(35, PageSize::Large1, 2, MemoryType::WriteBack, 40);
     let page = k.large();
     // The address is a multiple of the frame's page size.
-    k.no(map(30, 40, UT, AT + k.page(), 0, 1, R), Error::Invalid);
+    k.no(map(30, 40, TB, AT + k.page(), 0, 1, R), Error::Invalid);
     // The first page is in the frame.
-    k.no(map(30, 40, UT, AT, 2, 1, R), Error::Invalid);
+    k.no(map(30, 40, TB, AT, 2, 1, R), Error::Invalid);
     // The page count is at least 1 and stays in the frame.
-    k.no(map(30, 40, UT, AT, 0, 0, R), Error::Invalid);
-    k.no(map(30, 40, UT, AT, 1, 2, R), Error::Invalid);
+    k.no(map(30, 40, TB, AT, 0, 0, R), Error::Invalid);
+    k.no(map(30, 40, TB, AT, 1, 2, R), Error::Invalid);
     // The range lies inside the user range.
     let end = k.m.geometry().user_end;
-    k.no(map(30, 40, UT, end - page, 0, 2, R), Error::Invalid);
-    k.ok(map(30, 40, UT, end - 2 * page, 0, 2, R));
+    k.no(map(30, 40, TB, end - page, 0, 2, R), Error::Invalid);
+    k.ok(map(30, 40, TB, end - 2 * page, 0, 2, R));
     // The range before the rights: a bad range with rights the frame has
     // not.
     k.ok(Syscall::ASpaceUnmap(s(40)));
     k.derive(40, 41, R);
-    k.no(map(30, 41, UT, AT + 1, 0, 1, rw()), Error::Invalid);
+    k.no(map(30, 41, TB, AT + 1, 0, 1, rw()), Error::Invalid);
 }
 
 #[test]
@@ -327,11 +333,11 @@ fn rights_of_a_mapping_are_read_and_write_or_execute_within_the_frame_s() {
         Rights::SEND,
         Rights::NONE,
     ] {
-        k.no(map(30, 40, UT, AT, 0, 1, word), Error::Invalid);
+        k.no(map(30, 40, TB, AT, 0, 1, word), Error::Invalid);
     }
     k.derive(40, 41, R.union(X));
-    k.no(map(30, 41, UT, AT, 0, 1, rw()), Error::Denied);
-    k.ok(map(30, 41, UT, AT, 0, 1, R.union(X)));
+    k.no(map(30, 41, TB, AT, 0, 1, rw()), Error::Denied);
+    k.ok(map(30, 41, TB, AT, 0, 1, R.union(X)));
     assert_eq!(k.m.translated(k.t, AT), None);
 }
 
@@ -339,21 +345,21 @@ fn rights_of_a_mapping_are_read_and_write_or_execute_within_the_frame_s() {
 fn plain_arguments_come_before_the_state() {
     let (mut k, _) = with_aspace();
     k.small(1, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
-    k.no(map(30, 40, UT, AT + 1, 0, 1, R), Error::Invalid);
-    k.no(map(30, 40, UT, AT, 0, 1, R), Error::Busy);
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
+    k.no(map(30, 40, TB, AT + 1, 0, 1, R), Error::Invalid);
+    k.no(map(30, 40, TB, AT, 0, 1, R), Error::Busy);
 }
 
 #[test]
 fn full_record_is_busy_even_for_this_aspace() {
     let (mut k, _) = with_aspace();
     k.small(1, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     let page = k.page();
-    k.no(map(30, 40, UT, AT + page, 0, 1, R), Error::Busy);
+    k.no(map(30, 40, TB, AT + page, 0, 1, R), Error::Busy);
     // The binding of a message page is a full record too.
     k.no(
-        map(30, START_SLOT_MESSAGE_PAGE, UT, AT + page, 0, 1, R),
+        map(30, START_SLOT_MESSAGE_PAGE, TB, AT + page, 0, 1, R),
         Error::Busy,
     );
 }
@@ -367,13 +373,13 @@ fn translated_address_of_any_page_size_is_busy() {
     k.frame(35, PageSize::Large1, 1, MemoryType::WriteBack, 42);
     k.frame(35, PageSize::Large1, 1, MemoryType::WriteBack, 43);
     let (page, large) = (k.page(), k.large());
-    k.ok(map(30, 40, UT, AT + 5 * page, 0, 1, R));
+    k.ok(map(30, 40, TB, AT + 5 * page, 0, 1, R));
     // A large page over a page.
-    k.no(map(30, 42, UT, AT, 0, 1, R), Error::Busy);
-    k.ok(map(30, 42, UT, AT + large, 0, 1, R));
+    k.no(map(30, 42, TB, AT, 0, 1, R), Error::Busy);
+    k.ok(map(30, 42, TB, AT + large, 0, 1, R));
     // A page inside a large page, and the same page twice.
-    k.no(map(30, 41, UT, AT + large + 3 * page, 0, 1, R), Error::Busy);
-    k.no(map(30, 43, UT, AT + large, 0, 1, R), Error::Busy);
+    k.no(map(30, 41, TB, AT + large + 3 * page, 0, 1, R), Error::Busy);
+    k.no(map(30, 43, TB, AT + large, 0, 1, R), Error::Busy);
 }
 
 /// Tables come from the aspace's untyped, then, unmapped, from its free
@@ -385,7 +391,7 @@ fn tables_come_from_the_untyped_then_from_the_free_list_then_from_the_untyped() 
     let (mut k, _) = with_aspace();
     k.small(1, 40);
     k.small(1, 41);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     // Unmapped: its L − 1 tables go to the free list.
     k.ok(Syscall::ASpaceUnmap(s(40)));
     // Untyped 0 supplies none, but the free list does.
@@ -393,43 +399,37 @@ fn tables_come_from_the_untyped_then_from_the_free_list_then_from_the_untyped() 
     k.ok(map(30, 41, 0, 3 * root, 0, 1, R));
     k.no(map(30, 40, 0, AT, 0, 1, R), Error::NoMemory);
     // The list is empty: the untyped supplies them again.
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
 }
 
 #[test]
 fn tables_beyond_what_the_untyped_holds_are_no_memory_and_nothing_is_taken() {
     let mut k = K::new();
-    // A child untyped of 8 pages: the aspace takes 2, frames of a page take
-    // all but L − 2: one table short.
+    // A child table untyped of 8 pages: the aspace's root takes 1, child
+    // untypeds of a page take all but L − 2: one table short (D-154).
     let (page, short) = (k.page(), u64::from(k.levels()) - 2);
-    k.retype(UT, Untyped, 8 * page, 32);
-    k.retype(32, ASpace, 0, 30);
-    for slot in 0..8 - 2 - short {
-        k.frame(
-            32,
-            PageSize::Page,
-            1,
-            MemoryType::WriteBack,
-            50 + slot as u32,
-        );
+    k.retype(TB, Untyped, 8 * page, 32);
+    k.retype(UT, ASpace, s(32).raw(), 30);
+    for slot in 0..8 - 1 - short {
+        k.retype(32, Untyped, page, 50 + slot as u32);
     }
     k.small(1, 40);
     k.no(map(30, 40, 32, AT, 0, 1, R), Error::NoMemory);
-    // Nothing was taken: a frame of the L − 2 pages left still fits.
-    k.frame(32, PageSize::Page, short, MemoryType::WriteBack, 33);
+    // Nothing was taken: a child of the L − 2 pages left still fits.
+    k.retype(32, Untyped, short * page, 33);
 }
 
 #[test]
 fn tables_count_as_live_pieces_until_the_aspace_is_destroyed() {
     let mut k = K::new();
     let page = k.page();
-    k.retype(UT, Untyped, 8 * page, 32);
-    k.retype(32, ASpace, 0, 30);
+    k.retype(TB, Untyped, 8 * page, 32);
+    k.retype(UT, ASpace, s(32).raw(), 30);
     k.small(1, 40);
     k.ok(map(30, 40, 32, AT, 0, 1, R));
     k.ok(Syscall::ASpaceUnmap(s(40)));
-    // Two pages of aspace and L − 1 tables on its free list: the rest is
-    // left, but not the whole untyped.
+    // The root and L − 1 tables on its free list, pieces of the table
+    // untyped (D-154): the rest is left, but not the whole untyped.
     k.retype(32, Untyped, page, 33);
     k.ok(Syscall::CapDelete(s(33)));
     k.no(
@@ -453,7 +453,7 @@ fn large_pages_map_with_the_frame_s_page_size() {
     let (mut k, v) = with_aspace();
     k.run(1, 35);
     k.frame(35, PageSize::Large1, 1, MemoryType::WriteBack, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     let large = k.large();
     assert_eq!(seen(&k, v, AT + large - 1), Some(R));
     assert_eq!(seen(&k, v, AT + large), None);
@@ -463,8 +463,8 @@ fn large_pages_map_with_the_frame_s_page_size() {
 fn device_frame_maps_into_an_aspace_without_exec() {
     let (mut k, v) = with_aspace();
     k.frame(DEV, PageSize::Page, 1, MemoryType::Uncached, 40);
-    k.no(map(30, 40, UT, AT, 0, 1, R.union(X)), Error::Denied);
-    k.ok(map(30, 40, UT, AT, 0, 1, rw()));
+    k.no(map(30, 40, TB, AT, 0, 1, R.union(X)), Error::Denied);
+    k.ok(map(30, 40, TB, AT, 0, 1, rw()));
     assert_eq!(seen(&k, v, AT), Some(rw()));
 }
 
@@ -474,7 +474,7 @@ fn device_frame_maps_into_an_aspace_without_exec() {
 fn aspace_unmap_needs_no_right_and_succeeds_on_an_empty_record() {
     let (mut k, v) = with_aspace();
     k.small(1, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     k.derive(40, 41, Rights::NONE);
     k.ok(Syscall::ASpaceUnmap(s(41)));
     assert_eq!(seen(&k, v, AT), Some(R));
@@ -519,13 +519,13 @@ fn record_that_names_a_dying_aspace_is_unmapped_as_usual() {
     // 33 frames mapped: destroying the aspace takes two calls.
     for n in 0..33 {
         k.small(1, 40 + n);
-        k.ok(map(30, 40 + n, UT, AT + k.page() * u64::from(n), 0, 1, R));
+        k.ok(map(30, 40 + n, TB, AT + k.page() * u64::from(n), 0, 1, R));
     }
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     // The most recently mapped records are emptied first: the first one is
     // still full, and is unmapped by the call.
     k.ok(Syscall::ASpaceUnmap(s(40)));
-    k.no(map(30, 40, UT, AT, 0, 1, R), Error::Gone);
+    k.no(map(30, 40, TB, AT, 0, 1, R), Error::Gone);
     k.ok(Syscall::CapDelete(s(30)));
 }
 
@@ -534,13 +534,13 @@ fn destroying_an_aspace_empties_its_records_most_recent_first_then_unbinds_its_t
     let (mut k, _) = with_aspace();
     for n in 0..32 {
         k.small(1, 40 + n);
-        k.ok(map(30, 40 + n, UT, AT + k.page() * u64::from(n), 0, 1, R));
+        k.ok(map(30, 40 + n, TB, AT + k.page() * u64::from(n), 0, 1, R));
     }
     // 32 records, one thread, the root: the first call empties the records
     // of slots 71 down to 40, the second unbinds the thread.
     k.no(Syscall::CapDelete(s(30)), Error::Again);
     k.retype(UT, ASpace, 0, 32);
-    k.ok(map(32, 40, UT, AT, 0, 1, R));
+    k.ok(map(32, 40, TB, AT, 0, 1, R));
     k.ok(Syscall::CapDelete(s(30)));
 }
 
@@ -548,7 +548,7 @@ fn destroying_an_aspace_empties_its_records_most_recent_first_then_unbinds_its_t
 fn aspace_protect_replaces_the_rights_of_the_whole_mapping() {
     let (mut k, v) = with_aspace();
     k.small(2, 40);
-    k.ok(map(30, 40, UT, AT, 0, 2, rw()));
+    k.ok(map(30, 40, TB, AT, 0, 2, rw()));
     k.ok(protect(30, 40, R));
     assert_eq!(seen(&k, v, AT + k.page()), Some(R));
     // It can also add rights, and the same rights change nothing.
@@ -563,7 +563,7 @@ fn aspace_protect_checks_the_aspace_the_frame_the_rights_then_the_record() {
     k.small(1, 40);
     k.small(1, 41);
     k.retype(UT, ASpace, 0, 32);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     k.derive(30, 33, R);
     k.no(protect(33, 40, R), Error::Denied);
     k.no(protect(30, 32, R), Error::Invalid);
@@ -583,9 +583,9 @@ fn aspace_protect_checks_the_aspace_the_frame_the_rights_then_the_record() {
 fn derived_frame_capability_has_an_empty_record_and_maps_the_same_pages_again() {
     let (mut k, v) = with_aspace();
     k.small(1, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, rw()));
+    k.ok(map(30, 40, TB, AT, 0, 1, rw()));
     k.derive(40, 41, R.union(X));
-    k.ok(map(30, 41, UT, AT + MB, 0, 1, R.union(X)));
+    k.ok(map(30, 41, TB, AT + MB, 0, 1, R.union(X)));
     assert_eq!(seen(&k, v, AT), Some(rw()));
     assert_eq!(seen(&k, v, AT + MB), Some(R.union(X)));
 }
@@ -594,9 +594,9 @@ fn derived_frame_capability_has_an_empty_record_and_maps_the_same_pages_again() 
 fn removing_a_frame_capability_undoes_its_mapping_and_revoke_keeps_its_own() {
     let (mut k, v) = with_aspace();
     k.small(1, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     k.derive(40, 41, Rights::ALL);
-    k.ok(map(30, 41, UT, AT + MB, 0, 1, R));
+    k.ok(map(30, 41, TB, AT + MB, 0, 1, R));
     k.ok(Syscall::CapRevoke(s(40)));
     assert_eq!(seen(&k, v, AT + MB), None);
     assert_eq!(seen(&k, v, AT), Some(R));
@@ -608,7 +608,7 @@ fn removing_a_frame_capability_undoes_its_mapping_and_revoke_keeps_its_own() {
 fn cap_inspect_says_nothing_of_the_record() {
     let (mut k, _) = with_aspace();
     k.small(1, 40);
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     let inspected = Output::Inspect {
         kind: Frame,
         rights: Rights::ALL,
@@ -646,9 +646,10 @@ fn iospace_of_39_bits_has_three_levels_of_tables() {
     let mut machine = Machine::example();
     machine.io_width = 39;
     let mut k = K::on(&machine);
-    // Four pages: the iospace takes two, and two tables suffice.
-    k.retype(UT, Untyped, 4 * k.page(), 32);
-    k.retype(32, IoSpace, 0, 30);
+    // Four pages of a table untyped: the root takes one, and two tables
+    // suffice.
+    k.retype(TB, Untyped, 4 * k.page(), 32);
+    k.retype(UT, IoSpace, s(32).raw(), 30);
     k.small(1, 40);
     k.ok(Syscall::IoSpaceMap(Map {
         space: s(30),
@@ -734,13 +735,13 @@ fn iospace_serves_devices_of_one_unit() {
     });
     let mut k = K::on(&machine);
     // The second unit's capability is in slot 19, then the roles (one more
-    // unit role), then the untypeds: the start-up one in slot 26 and the
-    // one of a chunk in 27; this test takes the first (the final review's
-    // F2 Opus 29).
+    // unit role), then the untypeds: the start-up one in slot 26, the one
+    // of a chunk in 27 and the table floor's in 28 (D-154); this test
+    // takes the first (the final review's F2 Opus 29).
     k.ok(Syscall::UntypedRetype {
         untyped: SlotAddr::own(26),
         kind: IoSpace,
-        size: 0,
+        size: SlotAddr::own(28).raw(),
         page: 0,
         memory: 0,
         destination: s(30),
@@ -848,6 +849,8 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
     let page = m.geometry().page();
     let chunk = m.geometry().chunk();
     let ut = SlotAddr::own(25);
+    // The table floor's untyped (D-154).
+    let tables = SlotAddr::own(common::TABLES);
     assert_eq!(
         checked(
             &mut m,
@@ -855,7 +858,7 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
             Syscall::UntypedRetype {
                 untyped: ut,
                 kind: ObjectKind::ASpace,
-                size: 0,
+                size: tables.raw(),
                 page: 0,
                 memory: 0,
                 destination: SlotAddr::own(100),
@@ -898,7 +901,7 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
             Syscall::ASpaceMap(Map {
                 space: SlotAddr::own(100),
                 frame: SlotAddr::own(101),
-                untyped: ut,
+                untyped: tables,
                 address: chunk,
                 first: 0,
                 count: 1,
@@ -941,7 +944,7 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
             &mut m,
             t,
             Syscall::UntypedRetype {
-                untyped: ut,
+                untyped: tables,
                 kind: ObjectKind::Untyped,
                 size: 4 * page,
                 page: 0,
@@ -956,9 +959,9 @@ fn tables_follow_the_page_and_e_of_the_sixteen_kb_geometry() {
             &mut m,
             t,
             Syscall::UntypedRetype {
-                untyped: SlotAddr::own(105),
+                untyped: ut,
                 kind: ObjectKind::IoSpace,
-                size: 0,
+                size: SlotAddr::own(105).raw(),
                 page: 0,
                 memory: 0,
                 destination: SlotAddr::own(106),
@@ -996,9 +999,9 @@ fn r7_aspace_map_partial_and_gate_chunks_boundaries() {
     k.retype(UT, ASpace, 0, 31);
     k.small(2, 40);
     // #072: mapping 1 page (cost 1 == gate_chunks 1) completes in 1 call (Done)
-    k.ok(map(30, 40, UT, AT, 0, 1, R));
+    k.ok(map(30, 40, TB, AT, 0, 1, R));
     // #066: completed mapping (partial == false, count == 1 < 2) cannot be continued as count: 2
-    k.no(map(30, 40, UT, AT, 0, 2, R), Error::Busy);
+    k.no(map(30, 40, TB, AT, 0, 2, R), Error::Busy);
     // #083: aspace_protect on 1 chunk (touched == 1 == gate_chunks) succeeds
     k.ok(protect(30, 40, rw()));
     k.ok(Syscall::ASpaceUnmap(s(40)));
@@ -1006,20 +1009,20 @@ fn r7_aspace_map_partial_and_gate_chunks_boundaries() {
     // A device frame of 3 pages, 2 of them mapped (cost = 1 per page, so
     // count: 2 takes 2 steps with gate_chunks = 1)
     k.frame(DEV, PageSize::Page, 3, MemoryType::Uncached, 41);
-    assert_eq!(k.go(map(30, 41, UT, AT, 0, 2, R)), Err(Error::Again));
+    assert_eq!(k.go(map(30, 41, TB, AT, 0, 2, R)), Err(Error::Again));
     // #067: continuing on another aspace (31) returns Busy
-    k.no(map(31, 41, UT, AT, 0, 2, R), Error::Busy);
+    k.no(map(31, 41, TB, AT, 0, 2, R), Error::Busy);
     // #069: continuing with another first page (1) returns Busy
-    k.no(map(30, 41, UT, AT, 1, 2, R), Error::Busy);
+    k.no(map(30, 41, TB, AT, 1, 2, R), Error::Busy);
     // #070: continuing with different rights (rw()) returns Busy
-    k.no(map(30, 41, UT, AT, 0, 2, rw()), Error::Busy);
+    k.no(map(30, 41, TB, AT, 0, 2, rw()), Error::Busy);
     // Matching continuation finishes with Done
-    k.ok(map(30, 41, UT, AT, 0, 2, R));
+    k.ok(map(30, 41, TB, AT, 0, 2, R));
     // #072: with gate_chunks = 2, mapping 2 device pages (spent + c == 2 == budget at step 1) finishes in 1 call (Done)!
     let mut m2 = Machine::example();
     m2.gate_chunks = 2;
     let mut k2 = K::on(&m2);
     k2.retype(UT, ASpace, 0, 30);
     k2.frame(DEV, PageSize::Page, 2, MemoryType::Uncached, 41);
-    k2.ok(map(30, 41, UT, AT, 0, 2, R));
+    k2.ok(map(30, 41, TB, AT, 0, 2, R));
 }
