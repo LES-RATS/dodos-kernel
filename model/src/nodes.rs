@@ -21,6 +21,10 @@ use dodos_abi::{
     SETTLE_NS, START_NS, START_RETRY_NS, SlotAddr,
 };
 
+/// Mode 3 of `node_stop`, the whole-machine suspend of the draft:
+/// `unsupported` since D-152.
+const NODE_STOP_SUSPEND: u64 = 3;
+
 /// What a node asks of the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HwAction {
@@ -293,6 +297,11 @@ impl Model {
         let target = self.node_of(thread, node, Rights::MANAGE)?;
         let member = self.table.member(target);
         let generation = member.generation();
+        // Mode 3 is `unsupported`, judged first among the plain arguments
+        // (D-152: no call writes the suspend word).
+        if mode == NODE_STOP_SUSPEND {
+            return Err(Error::Unsupported);
+        }
         if mode > NODE_STOP_RETIRE {
             return Err(Error::Invalid);
         }
@@ -317,6 +326,12 @@ impl Model {
             self.table.member(self.node).state(),
             MemberState::Live | MemberState::Sealing
         ) {
+            return Err(Error::Busy);
+        }
+        // Modes 0 and 2: the caller's node holds a reserve role. The
+        // evidence kill and retire need no proof, so the gate accepts them
+        // only from such a node (D-150: any node could kill any node).
+        if mode != NODE_STOP_SEAL && !self.table.holds_a_reserve(self.node) {
             return Err(Error::Busy);
         }
         let state = member.state();
@@ -997,20 +1012,19 @@ impl Model {
                     Member::new(MemberState::Unfenced, member.evidence(), member.driver(), g)
                         .with_class(member.class());
                 self.table.write_member(self.node, node, unfenced);
-                // ARM64: a core the fence leaves unconfirmed (a `DENIED`
+                // A core the fence leaves unconfirmed (on ARM64 a `DENIED`
                 // `CPU_OFF` among them) is marked unusable, as `node_stop`
                 // mode retire does (D-149; gap 25 of pass 28, which cores:
-                // every unconfirmed one, D-151, on every architecture from
-                // pass 29).
-                if self.machine.arch == crate::Arch::Aarch64 {
-                    for &core in &cores {
-                        let raw = self.table.core_words[core];
-                        if let Some(word) = self.table.core_word(core)
-                            && !self.park_confirmed(core)
-                            && !word.is_unusable()
-                        {
-                            self.table.write_core(core, raw, word.unusable());
-                        }
+                // every unconfirmed one, D-151, on every architecture: The
+                // fence, "the same gate call sets the flag unusable on
+                // every core of the node not confirmed").
+                for &core in &cores {
+                    let raw = self.table.core_words[core];
+                    if let Some(word) = self.table.core_word(core)
+                        && !self.park_confirmed(core)
+                        && !word.is_unusable()
+                    {
+                        self.table.write_core(core, raw, word.unusable());
                     }
                 }
                 return true;
@@ -1479,18 +1493,15 @@ impl Model {
     }
 
     /// R4 for one block: every ownership word it covers still reads taken
-    /// by this node with its generation.
+    /// by this node with its generation (a chunk of a reserve under the
+    /// reserve's code: `Table::taken_by`).
     fn audit_block(&self, block: ObjId) -> bool {
         let untyped = &self.untypeds[&block];
         let shift = self.table.geometry.chunk_shift();
-        let me = dodos_abi::Owner::Node(self.node);
         let generation = self.table.generation(self.node);
         (untyped.base >> shift..(untyped.base + untyped.bytes) >> shift).all(|c| {
-            dodos_abi::Ownership::from_raw(self.table.owners[c as usize]).is_some_and(|w| {
-                w.state() == dodos_abi::OwnState::Taken
-                    && w.owner() == me
-                    && w.generation() == generation
-            })
+            self.table
+                .taken_by(self.table.owners[c as usize], self.node, generation)
         })
     }
 

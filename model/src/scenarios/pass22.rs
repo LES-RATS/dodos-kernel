@@ -1585,6 +1585,7 @@ fn a_rebuild_keeps_the_entries_of_a_node_it_passed_over_sealed_even_once_it_resu
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(2, m.t[2]);
     m.sys.apply(2, m.t[2], kill).expect("the kill");
     let to = m.sys.now() + 300 * MS;
     let mut resumed = false;
@@ -1653,6 +1654,7 @@ fn a_rebuild_keeps_the_reported_remapping_handles_and_clears_the_others() {
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(0, m.t[0]);
     m.sys.apply(0, m.t[0], kill).expect("the kill");
     m.sys.settle(100_000);
     m.sys.advance(m.sys.now() + 300 * MS);

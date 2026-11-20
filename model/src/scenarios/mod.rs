@@ -25,6 +25,7 @@ mod pass26;
 mod pass27;
 mod pass28;
 mod pass31;
+mod pass32;
 mod reviews;
 mod units;
 mod verify13;
@@ -143,6 +144,28 @@ pub(crate) fn retype_from(untyped: u32, kind: ObjectKind, size: u64, destination
     }
 }
 
+/// Whether a call is a `node_stop` of mode kill or retire, which the gate
+/// accepts only from a node that holds a reserve role (D-150).
+fn stops_with_evidence(call: &Syscall) -> bool {
+    let stop = |mode| mode == dodos_abi::NODE_STOP_KILL || mode == dodos_abi::NODE_STOP_RETIRE;
+    matches!(call, Syscall::NodeStop { mode, .. } if stop(*mode))
+}
+
+/// The node of `model` claims a reserve role through `apply`, the first
+/// one a claim succeeds on, unless it holds one already.
+fn claim_a_reserve(model: &Model, thread: ObjId, mut apply: impl FnMut(Syscall) -> Outcome) {
+    if model.table.holds_a_reserve(model.node) {
+        return;
+    }
+    let slots = slots_of(model, thread, ObjectKind::Role);
+    let reserves = model.table.role_records.iter().zip(slots);
+    for (_, slot) in reserves.filter(|(r, _)| r.kind == dodos_abi::RoleKind::Reserve) {
+        if matches!(apply(Syscall::RoleClaim(s(slot))), Ok(Output::Epoch(_))) {
+            return;
+        }
+    }
+}
+
 /// A node alone: its model, its first thread, its largest untyped.
 pub(crate) struct N {
     pub(crate) m: Model,
@@ -164,6 +187,10 @@ impl N {
 
     #[track_caller]
     pub(crate) fn call(&mut self, thread: ObjId, call: Syscall) -> Outcome {
+        if stops_with_evidence(&call) {
+            let before = self.m.clone();
+            claim_a_reserve(&before, thread, |call| self.m.apply(thread, call));
+        }
         let outcome = self.m.apply(thread, call);
         assert_eq!(self.m.check(), Ok(()));
         outcome
@@ -352,6 +379,9 @@ impl S {
             _ => None,
         };
         let starter = (node, self.sys.member(node).generation());
+        if stops_with_evidence(&call) && self.sys.has(node) {
+            self.supervisor(node, thread);
+        }
         let outcome = self.sys.apply(node, thread, call);
         assert_eq!(self.sys.check(), Ok(()));
         if let (Some(target), DONE) = (started, outcome.clone()) {
@@ -366,6 +396,17 @@ impl S {
             };
         }
         outcome
+    }
+
+    /// Node `node` holds a reserve role from here on, if one can be
+    /// claimed by its thread `thread`: what a node that stops another with
+    /// mode kill or retire must hold (`node_stop`, D-150). `call` does it
+    /// before every such stop, as the supervisor that stops a node would;
+    /// a test that applies its stop to the system itself says it here.
+    pub(crate) fn supervisor(&mut self, node: u16, thread: ObjId) {
+        let model = self.sys.node(node).clone();
+        claim_a_reserve(&model, thread, |call| self.sys.apply(node, thread, call));
+        assert_eq!(self.sys.check(), Ok(()));
     }
 
     /// A core hangs (`System::hang`), a harm of the node it runs.

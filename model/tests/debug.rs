@@ -522,6 +522,9 @@ fn the_fence_handler_writes_a_record_of_reason_5() {
         mode: NODE_STOP_KILL,
         core: 0,
     };
+    // A kill comes from a node that holds a reserve role (D-150).
+    let claim = sys.apply(0, t[0], Syscall::RoleClaim(SlotAddr::own(21)));
+    assert!(matches!(claim, Ok(Output::Epoch(_))));
     assert_eq!(sys.apply(0, t[0], kill), DONE);
     sys.run(MS, MS / 10);
     assert_eq!(sys.node(0).crash_record(1), Some((1, 5)));
@@ -542,6 +545,9 @@ fn a_node_started_fresh_keeps_its_rings_and_goes_on_from_their_sequences() {
         mode: NODE_STOP_KILL,
         core: 0,
     };
+    // A kill comes from a node that holds a reserve role (D-150).
+    let claim = sys.apply(0, t[0], Syscall::RoleClaim(SlotAddr::own(21)));
+    assert!(matches!(claim, Ok(Output::Epoch(_))));
     assert_eq!(sys.apply(0, t[0], kill), DONE);
     sys.run(20 * MS, MS / 10);
     let start = Syscall::NodeStart {

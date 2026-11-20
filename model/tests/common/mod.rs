@@ -38,6 +38,14 @@ pub const DEVICE: u32 = 64;
 pub const ROLES: u32 = 19;
 pub const START_UNTYPED: u32 = 24;
 
+/// The claims of the two reserve roles (the role roots 21 and 22), in
+/// order: a node that stops another with mode kill or retire holds one
+/// (`node_stop`, D-150), so a test makes these calls first and goes on
+/// once one succeeded.
+pub fn reserve_claims() -> [Syscall; 2] {
+    [ROLES + 2, ROLES + 3].map(|role| Syscall::RoleClaim(SlotAddr::own(role)))
+}
+
 /// The slot a test names by a logical number: the fixed slots and the
 /// first three machine roots are themselves, 19 is the start-up untyped
 /// (an untyped that no test object comes from), 20 the untyped, 21 the

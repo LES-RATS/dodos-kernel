@@ -5,8 +5,8 @@
 use crate::caps::Placing;
 use crate::{Block, Model, ObjId, Outcome, Output, live};
 use dodos_abi::{
-    DeviceEntry, Error, MEMORY_TAKE_ENTRY, MEMORY_TAKE_RUN, MEMORY_TAKE_TABLES, ObjectKind,
-    OwnState, Owner, Ownership, Rights, SlotAddr,
+    DeviceEntry, Error, MEMORY_TAKE_ENTRY, MEMORY_TAKE_RUN, MEMORY_TAKE_TABLES, ObjectKind, Owner,
+    Ownership, Rights, SlotAddr,
 };
 
 impl Model {
@@ -185,15 +185,8 @@ impl Model {
     /// node the role word names, with the generation the word holds"; the
     /// final review's verification of lot B, finding 1).
     fn taken_here(&self, word: Ownership) -> bool {
-        if word.state() != OwnState::Taken {
-            return false;
-        }
-        let current = word.generation() == self.table.generation(self.node);
-        match word.owner() {
-            Owner::Node(owner) => owner == self.node && current,
-            Owner::Reserve(j) => current && self.table.holds_reserve(self.node, j),
-            Owner::Unclaimed => false,
-        }
+        let generation = self.table.generation(self.node);
+        self.table.taken_by(word.raw(), self.node, generation)
     }
 
     /// The block argument of `memory_give` and `memory_split`: `write` on
@@ -261,13 +254,8 @@ impl Model {
         let geometry = self.table.geometry;
         let chunk = (page * geometry.page()) >> geometry.chunk_shift();
         let generation = self.table.generation(self.node);
-        let owned = self.table.owners.get(chunk as usize).is_some_and(|&raw| {
-            Ownership::from_raw(raw).is_some_and(|w| {
-                w.state() == dodos_abi::OwnState::Taken
-                    && w.owner() == Owner::Node(self.node)
-                    && w.generation() == generation
-            })
-        });
+        let word = self.table.owners.get(chunk as usize);
+        let owned = word.is_some_and(|&raw| self.table.taken_by(raw, self.node, generation));
         let floor = self.table.table_floors[self.node as usize]
             .iter()
             .any(|&(s, e)| s <= page * geometry.page() && page * geometry.page() < e);

@@ -241,7 +241,10 @@ fn the_holder_of_a_grant_loses_its_mapping_when_the_granter_is_accused() {
         m.sys.node(1).translated(m.t[1], AT),
         Some(Rights::READ.union(Rights::WRITE))
     );
-    // Node 1 kills node 0; the machine runs to the end of the reclaim.
+    // Node 1, which holds a reserve role for it (D-150), kills node 0;
+    // the machine runs to the end of the reclaim.
+    let [claim, _] = common::reserve_claims();
+    assert!(matches!(m.on_node(1, claim), Ok(Output::Epoch(_))));
     m.ok(1, stop(0, NODE_STOP_KILL));
     m.run(5 * MS);
     assert_eq!(m.state(0), MemberState::Dead);

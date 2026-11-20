@@ -361,7 +361,7 @@ impl System {
                             | MemberState::Sealing
                             | MemberState::Sealed
                     );
-                let sending = model.peers_sending(entry.grantee, grant);
+                let sending = model.peers_sending(entry.grantee, (grant, entry.serial));
                 ensure(
                     over || sending,
                     "LEAK: a grant entry unanswered with nothing in flight",
@@ -685,8 +685,9 @@ impl Model {
         self.peers[peer as usize].credits.clone()
     }
 
-    /// Whether a send credit toward `peer` covers grant entry `grant`.
-    pub(crate) fn peers_sending(&self, peer: u16, grant: u16) -> bool {
+    /// Whether a send credit toward `peer` covers grant entry `grant`,
+    /// named with its serial.
+    pub(crate) fn peers_sending(&self, peer: u16, grant: (u16, u32)) -> bool {
         self.peers[peer as usize].credits.iter().flatten().any(
             |c| matches!(&c.completes, Completes::Send { grants, .. } if grants.contains(&grant)),
         )

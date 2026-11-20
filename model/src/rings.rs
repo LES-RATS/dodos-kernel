@@ -14,8 +14,8 @@ use crate::table::{RingEntry, Watched};
 use crate::{Model, ObjId};
 use dodos_abi::{
     Header, MemberState, NodeMessage, PENDING_STEP, REQUESTS_PER_PEER, RING_ANSWER_RESERVE,
-    RING_KERNEL_ENTRIES, RING_USER_ENTRIES, RING_USER_STEP, RingHeader, SENDS_PER_PEER, TraceCode,
-    UnitResult, message_entries, ring_fits, ring_resync,
+    RING_KERNEL_ENTRIES, RING_USER_ENTRIES, RING_USER_STEP, Ring, RingHeader, SENDS_PER_PEER,
+    TraceCode, UnitResult, message_entries, ring_fits, ring_resync,
 };
 
 /// The operation of a unit request, idempotent (Devices and shared
@@ -202,11 +202,11 @@ pub(crate) enum Completes {
     Unit { entry: usize },
     /// A `ReportAsk`: the unit role being rebuilt.
     Report { role: usize },
-    /// A `Send`: its grant entries, the thread that waits for the answer
-    /// (none once destroyed), and whether the call's `node` capability had
-    /// `manage`.
+    /// A `Send`: its grant entries, each with the serial the send wrote
+    /// it with, the thread that waits for the answer (none once
+    /// destroyed), and whether the call's `node` capability had `manage`.
     Send {
-        grants: Vec<u16>,
+        grants: Vec<(u16, u32)>,
         thread: Option<ObjId>,
         manage: bool,
     },
@@ -396,7 +396,7 @@ impl Model {
     /// one function and before anything changes, on a message read from the
     /// ring `from` → this node. `None` passes; `Some` names what it named,
     /// for the trace (code 11).
-    pub(crate) fn refused(&self, from: u16, message: &Message) -> Option<u64> {
+    pub(crate) fn refused(&self, from: u16, ring: Ring, message: &Message) -> Option<u64> {
         let header = &message.header;
         let sender = header.sender;
         // The sender the header names is the node whose ring the message
@@ -421,6 +421,13 @@ impl Model {
             return Some(0);
         }
         if message.body.kind() as u8 != header.kind {
+            return Some(0);
+        }
+        // The kind is one the ring carries: the kernel ring the kernels'
+        // own kinds, the user ring kinds 11 and 12 (Two rings per ordered
+        // pair of nodes). A kernel message read from the user ring is no
+        // kind that ring knows.
+        if message.body.kind().ring() != ring {
             return Some(0);
         }
         let generation = header.sender_generation;
@@ -604,6 +611,10 @@ impl Model {
         } else {
             RING_KERNEL_ENTRIES
         };
+        let ring = match user {
+            true => Ring::User,
+            false => Ring::Kernel,
+        };
         let me = self.node;
         let mut served = 0;
         while served < step {
@@ -650,7 +661,7 @@ impl Model {
             // messages (D-141).
             served += length;
             match message {
-                Some(message) => match self.refused(from, &message) {
+                Some(message) => match self.refused(from, ring, &message) {
                     None => self.receive_message(message),
                     Some(named) => {
                         self.refused.0 += 1;

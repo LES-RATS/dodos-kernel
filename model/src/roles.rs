@@ -202,6 +202,14 @@ impl Model {
                 continue;
             }
             done = false;
+            // A unit this node is rebuilding is not handed yet: the seal
+            // waits for the rebuild, which ends in bounded time, as
+            // `role_hand` is `busy` for it (a hand-over begun under a
+            // rebuild dropped the rebuild before its closing invalidation
+            // and left its `ReportAsk` credits in use for ever).
+            if self.rebuilds.contains_key(&role) {
+                continue;
+            }
             // A failed unit's role is handed too, without step 2 (D-145).
             if word.state() == RoleState::Held && !self.handing.contains_key(&role) {
                 let Some(successor) = dodos_abi::successor(&self.table.members, me as usize) else {
@@ -512,9 +520,16 @@ impl Model {
             return true;
         }
         if rebuild.asked {
-            // A node accused during the rebuild is skipped.
+            // A node accused during the rebuild is skipped; one that sealed
+            // before it answered is then treated as sealed, as one whose
+            // turn finds it sealed (Roles: "a node that seals during the
+            // rebuild [...] is then treated as sealed"): its entries are
+            // kept even if it resumes before the rebuild ends.
             if self.table.writes(rebuild.node) {
                 return false;
+            }
+            if self.table.member(rebuild.node).state() == MemberState::Sealed {
+                rebuild.sealed.insert(rebuild.node);
             }
             rebuild.asked = false;
             rebuild.node += 1;

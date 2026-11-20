@@ -379,6 +379,11 @@ fn the_only_running_node_cannot_stop_itself_beside_phantom_nodes() {
     for mode in [NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL] {
         let machine = Machine::example();
         let (mut m, t) = Model::boot(&machine).unwrap();
+        // The node holds a reserve role, which a kill and a retire ask of
+        // their caller (D-150): the stops below are judged on the nodes
+        // that would stay live.
+        let claim = Syscall::RoleClaim(SlotAddr::own(START_SLOT_FIRST + 5));
+        assert!(matches!(m.apply(t, claim), Ok(Output::Epoch(_))));
         let stop = Syscall::NodeStop {
             node: SlotAddr::own(START_SLOT_FIRST),
             mode,

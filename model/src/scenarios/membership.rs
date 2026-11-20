@@ -209,7 +209,8 @@ fn node_perf_is_judged_and_unsupported_without_the_register() {
 #[test]
 fn node_stop_is_judged_and_never_leaves_no_live_node() {
     let mut m = S::two();
-    m.no(0, stop(1, 3), Error::Invalid);
+    m.no(0, stop(1, 3), Error::Unsupported);
+    m.no(0, stop(1, 4), Error::Invalid);
     // Modes kill and seal take core 0; retire a core whose word names the
     // node.
     m.no(

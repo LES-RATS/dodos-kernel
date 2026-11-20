@@ -9,7 +9,7 @@ use crate::rings::Body;
 use crate::table::GrantState;
 use crate::{Message, Range, Transfer, Wait};
 use dodos_abi::{
-    NODE_START_FRESH, NODE_START_RESUME, NODE_STOP_KILL, NODE_STOP_SEAL, RingHeader,
+    NODE_START_FRESH, NODE_START_RESUME, NODE_STOP_KILL, NODE_STOP_SEAL, Ring, RingHeader,
     SENDS_PER_PEER, START_SLOT_MAILBOX,
 };
 
@@ -599,12 +599,12 @@ fn a_handed_that_does_not_name_the_current_epoch_the_holder_and_this_node_as_tar
             Body::Handed { role: 0, epoch },
         )
     };
-    assert_eq!(k.m.refused(1, &handed(1, 5)), None);
-    assert!(k.m.refused(1, &handed(1, 6)).is_some());
-    assert!(k.m.refused(2, &handed(2, 5)).is_some());
+    assert_eq!(k.m.refused(1, Ring::Kernel, &handed(1, 5)), None);
+    assert!(k.m.refused(1, Ring::Kernel, &handed(1, 6)).is_some());
+    assert!(k.m.refused(2, Ring::Kernel, &handed(2, 5)).is_some());
     // A word that does not name this node as target.
     k.m.table.roles[0] = dodos_abi::RoleWord::handing(1, 2, 5);
-    assert!(k.m.refused(1, &handed(1, 5)).is_some());
+    assert!(k.m.refused(1, Ring::Kernel, &handed(1, 5)).is_some());
 }
 
 #[test]

@@ -824,7 +824,7 @@ impl System {
     }
 
     /// An interrupt to the first core of a node that runs.
-    fn interrupt(&mut self, node: u16, ipi: crate::Ipi) {
+    pub(crate) fn interrupt(&mut self, node: u16, ipi: crate::Ipi) {
         if let Some(Some(model)) = self.nodes.get_mut(node as usize) {
             model.receive_interrupt(ipi);
         }

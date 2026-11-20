@@ -2484,11 +2484,16 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         .runnable()
         .into_iter()
         .find(|&t| model.object_at(t, own(CORE_SLOT + 1)).is_some());
-    if let Some(thread) = holder
-        && model.apply(thread, stop_call()).is_ok()
-    {
-        reached.ok.resize(NAMES.len(), 0);
-        reached.ok[name_of(&stop_call())] += 1;
+    if let Some(thread) = holder {
+        // The stop is a kill: its caller's node holds a reserve role
+        // (D-150), claimed here if the random calls left it without one.
+        for claim in common::reserve_claims() {
+            let _ = model.apply(thread, claim);
+        }
+        if model.apply(thread, stop_call()).is_ok() {
+            reached.ok.resize(NAMES.len(), 0);
+            reached.ok[name_of(&stop_call())] += 1;
+        }
     }
     assert_eq!(model.check(), Ok(()));
     reached.seeds_walked += walked as u32;

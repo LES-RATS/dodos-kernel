@@ -105,6 +105,9 @@ impl S {
             mode: NODE_STOP_KILL,
             core: 0,
         };
+        // A kill comes from a node that holds a reserve role (D-150).
+        let [claim, _] = common::reserve_claims();
+        assert!(matches!(self.call(0, claim), Ok(Output::Epoch(_))));
         assert_eq!(self.call(0, stop), DONE);
         self.run(10 * MS);
         let member = self.sys.member(1);

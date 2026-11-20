@@ -280,7 +280,7 @@ impl Model {
             words: message.words,
         };
         let completes = Completes::Send {
-            grants: grants.iter().map(|g| g.grant).collect(),
+            grants: grants.iter().map(|g| (g.grant, g.serial)).collect(),
             thread: Some(thread),
             manage,
         };
@@ -364,21 +364,11 @@ impl Model {
     pub(crate) fn holds_frame(&self, frame: Frame) -> bool {
         let me = self.node;
         let generation = self.table.generation(me);
-        let taken_here = |raw: u64| {
-            dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
-                w.state() == dodos_abi::OwnState::Taken
-                    && w.generation() == generation
-                    && match w.owner() {
-                        dodos_abi::Owner::Node(n) => n == me,
-                        dodos_abi::Owner::Reserve(j) => self.table.holds_reserve(me, j),
-                        dodos_abi::Owner::Unclaimed => false,
-                    }
-            })
-        };
         match self.leaf_target(frame) {
             crate::memory::Target::Nothing => frame.kept,
             crate::memory::Target::Entry(index) => {
-                taken_here(self.table.devices[index].owner.raw())
+                let word = self.table.devices[index].owner.raw();
+                self.table.taken_by(word, me, generation)
             }
             crate::memory::Target::Chunks => {
                 let chunk = self.machine.geometry.chunk();
@@ -386,13 +376,7 @@ impl Model {
                 // A table chunk, of the table floor or taken as kind 2, is
                 // never granted (G6, D-156).
                 (frame.base / chunk..end.div_ceil(chunk)).all(|c| {
-                    !self.table.table_chunk(c)
-                        && (self.table.holds_page(c * chunk, me, generation)
-                            || self
-                                .table
-                                .owners
-                                .get(c as usize)
-                                .is_some_and(|&raw| taken_here(raw)))
+                    !self.table.table_chunk(c) && self.table.holds_page(c * chunk, me, generation)
                 })
             }
         }
@@ -583,13 +567,21 @@ impl Model {
             return;
         };
         let me = self.node as usize;
-        for (i, grant) in grants.into_iter().enumerate() {
+        for (i, (grant, serial)) in grants.into_iter().enumerate() {
+            // The answer acts on the entry its send wrote and on no other:
+            // the gate writes the use index and *answered* once per serial,
+            // by a compare-and-swap from unanswered (G6). An entry released
+            // before its answer and written anew for another send has
+            // another serial, and may name another node: the answer then
+            // finds nothing of its own to write or to free.
+            let Some(entry) = self.table.grants[me].get_mut(&grant) else {
+                continue;
+            };
+            if entry.serial != serial || entry.grantee != from || entry.answered {
+                continue;
+            }
             match uses.get(i).copied().flatten() {
-                Some(use_index) => {
-                    if let Some(entry) = self.table.grants[me].get_mut(&grant) {
-                        (entry.use_index, entry.answered) = (Some(use_index), true);
-                    }
-                }
+                Some(use_index) => (entry.use_index, entry.answered) = (Some(use_index), true),
                 None => self.free_with_anchor(grant),
             }
         }

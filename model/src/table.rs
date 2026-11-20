@@ -527,17 +527,34 @@ impl Table {
         CoreWord::from_raw(*self.core_words.get(core)?)
     }
 
+    /// Whether an ownership word reads *taken* by a node with a
+    /// generation: with the node's own code, or with the code of a reserve
+    /// whose role the node holds, which a chunk of a reserve keeps when it
+    /// is taken (rule 4 of taking: "the word then keeps the owner code of
+    /// the reserve, with the state *taken* and X's generation"; R6 reads
+    /// it so too). A reserve role does not move while a word of its
+    /// reserve is taken by a node that is not dead (Roles), so the code
+    /// and the generation name one node. Every judgement of "taken by it
+    /// with its generation" reads the word here: G3 (2), R4's audit, the
+    /// checks of a unit request.
+    pub(crate) fn taken_by(&self, raw: u64, node: u16, generation: u32) -> bool {
+        dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
+            w.state() == dodos_abi::OwnState::Taken
+                && w.generation() == generation
+                && match w.owner() {
+                    dodos_abi::Owner::Node(owner) => owner == node,
+                    dodos_abi::Owner::Reserve(j) => self.holds_reserve(node, j),
+                    dodos_abi::Owner::Unclaimed => false,
+                }
+        })
+    }
+
     /// Whether a page of ordinary memory is held by a node with a
     /// generation: its chunk taken by it, or in its floor (G3 (2)).
     pub(crate) fn holds_page(&self, at: u64, node: u16, generation: u32) -> bool {
         let chunk = at / self.geometry.chunk();
-        let taken = self.owners.get(chunk as usize).is_some_and(|&raw| {
-            dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
-                w.state() == dodos_abi::OwnState::Taken
-                    && w.owner() == dodos_abi::Owner::Node(node)
-                    && w.generation() == generation
-            })
-        });
+        let word = self.owners.get(chunk as usize);
+        let taken = word.is_some_and(|&raw| self.taken_by(raw, node, generation));
         let floors = self.floors.get(node as usize).into_iter().flatten();
         taken || floors.clone().any(|&(start, end)| start <= at && at < end)
     }
@@ -634,8 +651,13 @@ impl Table {
         let device = self.devices.iter().position(|e| {
             e.is_used() && e.base() <= frame.base && frame.base < e.base() + (1 << e.log2())
         });
+        // A frame of the global read-only set is counted nowhere: an anchor
+        // over it raises no count, and no gate word of a chunk that no node
+        // owns is written after machine start-up (G4, D-151).
+        let kept = frame.kept || self.kept.iter().any(|&(s, e)| s <= frame.base && end < e);
         match device {
             Some(index) => (Vec::new(), Some(index)),
+            None if kept => (Vec::new(), None),
             None => {
                 let shift = self.geometry.chunk_shift();
                 let chunks = (frame.base >> shift..=end >> shift)
@@ -740,6 +762,13 @@ impl Table {
                     && word.state() == RoleState::Held
                     && word.holder() == node
             })
+    }
+
+    /// Whether a node holds a reserve role, any of them.
+    pub(crate) fn holds_a_reserve(&self, node: u16) -> bool {
+        self.role_records.iter().any(|record| {
+            record.kind == RoleKind::Reserve && self.holds_reserve(node, record.object)
+        })
     }
 
     /// Who may take a word (rules 1 to 4 of taking), for `node`.
