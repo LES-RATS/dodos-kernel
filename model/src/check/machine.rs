@@ -473,6 +473,11 @@ impl System {
                 dodos_abi::RoleState::Handing => Some(word.target()),
                 _ => None,
             };
+            // A value of the state used as an index is judged first.
+            ensure(
+                named.is_none_or(|n| usize::from(n) < table.members.len()),
+                "UNIT ROLE: a role word names a node past the table",
+            )?;
             ensure(
                 named.is_none_or(|n| table.member(n).state() != MemberState::Starting),
                 "UNIT ROLE: a starting node holds a unit role",

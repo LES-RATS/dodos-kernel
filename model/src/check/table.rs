@@ -522,9 +522,13 @@ impl Model {
         // An `its_table`'s pages are of class *ITS table* (D-152
         // complement), and only a table untyped makes one; a table untyped
         // makes nothing else but a child table untyped (D-154).
+        // Its pages are pinned or not all alike, as its first page reads
+        // (The ITS word, D-152; audit lot 7: the check took every page for
+        // unpinned).
         for (id, &(first, pages)) in &self.its_tables {
+            let class = dodos_abi::PageClass::its_table(self.its_pinned(*id));
             for at in first..first + pages {
-                tables.insert(at, Some(dodos_abi::PageClass::its_table(false)));
+                tables.insert(at, Some(class));
             }
             ensure(
                 self.objects.contains_key(id),
@@ -536,12 +540,14 @@ impl Model {
                 .from
                 .is_some_and(|from| self.untypeds.get(&from).is_some_and(|u| u.table))
         };
-        let kinds = self.objects.values().all(|object| {
-            let table_kind = matches!(object.kind, ObjectKind::Untyped | ObjectKind::ItsTable);
-            match object.kind {
-                ObjectKind::ItsTable => from_tables(object),
-                _ => !from_tables(object) || table_kind,
+        let kinds = self.objects.iter().all(|(id, object)| match object.kind {
+            ObjectKind::ItsTable => from_tables(object),
+            // A child of a table untyped is a table untyped (audit lot 7:
+            // an ordinary untyped cut from one passed).
+            ObjectKind::Untyped => {
+                !from_tables(object) || self.untypeds.get(id).is_some_and(|u| u.table)
             }
+            _ => !from_tables(object),
         });
         ensure(kinds, "TABLES: a kind a table untyped does not make")?;
         let classes_right = tables.iter().all(|(page, class)| {

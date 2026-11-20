@@ -88,6 +88,14 @@ impl Model {
 
     /// Whether the root capability of an object is marked dying, read from
     /// the capability itself and not through `Model::dying`.
+    /// Whether `object` is an `its_table` whose pages read pinned (The ITS
+    /// word: bits 6-7 of the class 1 from the first LPI's claim).
+    fn its_pinned(&self, object: ObjId) -> bool {
+        self.its_tables.get(&object).is_some_and(|&(first, _)| {
+            self.table.classes.get(&first) == Some(&dodos_abi::PageClass::its_table(true))
+        })
+    }
+
     fn marked(&self, object: ObjId) -> bool {
         let root = self.objects.get(&object).map(|object| object.root);
         let root = root.and_then(|root| self.caps.get(&root));
@@ -571,9 +579,13 @@ impl Model {
                 ensure(deep_enough, "28: depth of what a space holds")?;
                 let swept = sweep.is_some_and(|sweep| index < sweep.next);
                 // Pass 1 moves past the root capability of a table untyped
-                // that spaces still name; the spaces may be gone since.
+                // or of an `its_table` pinned when the sweep passed it
+                // (D-156, D-157 (3); audit lot 7: an `its_table` was not
+                // read); it may be unpinned since, the spaces or LPIs that
+                // pinned it gone.
                 let table_root = of.is_some_and(|of| of.root == cap)
-                    && self.untypeds.get(&held.object).is_some_and(|u| u.table);
+                    && (self.untypeds.get(&held.object).is_some_and(|u| u.table)
+                        || self.its_tables.contains_key(&held.object));
                 let deferred = table_root
                     && sweep.is_some_and(|sweep| {
                         !sweep.pass2 && sweep.first_deferred.is_some_and(|first| first <= index)
@@ -768,6 +780,25 @@ impl Model {
                 let named =
                     entry.is_some_and(|e| e.waiter == crate::units::Waiter::Thread(Some(id)));
                 ensure(named, "14: a wait on no unit request")?;
+            }
+        }
+        // The same for a hand-over's caller (Roles, `role_hand`, steps 1
+        // to 4; audit lot 7: `Wait::Hand` was judged by no invariant).
+        for (&id, thread) in &self.threads {
+            if let Wait::Hand(role) = thread.wait {
+                let named = self
+                    .handing
+                    .get(&role)
+                    .is_some_and(|h| h.caller == Some(id));
+                ensure(named, "14: a wait on no hand-over")?;
+            }
+        }
+        for (&role, hand) in &self.handing {
+            if let Some(thread) = hand.caller {
+                ensure(
+                    wait(&thread) == Some(&Wait::Hand(role)),
+                    "14: a hand-over names a thread that does not wait for it",
+                )?;
             }
         }
         for (index, entry) in self.unit_requests.iter().enumerate() {

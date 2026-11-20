@@ -66,10 +66,6 @@ impl Model {
                 ensure(fresh, "41: order of entry")?;
             }
             ensure(sched.core < self.width(), "42: core of a context")?;
-            if sched.configured && !dying {
-                let (budget, period) = sched.pending.unwrap_or((sched.budget, sched.period));
-                sums[sched.core] += bandwidth(budget, period);
-            }
             let valid = |(budget, period): (u64, u64)| {
                 SCHED_MIN_BUDGET_NS <= budget && budget <= period && period <= SCHED_MAX_PERIOD_NS
             };
@@ -99,6 +95,12 @@ impl Model {
                 false => sched.remaining == 0 && sched.deadline == 0 && sched.throttled.is_none(),
             };
             ensure(state, "43: parameters and state of a context")?;
+            // Summed only once 43 holds: `bandwidth` asserts its arguments
+            // (audit lot 7: the check panicked on the state it reports).
+            if sched.configured && !dying {
+                let (budget, period) = sched.pending.unwrap_or((sched.budget, sched.period));
+                sums[sched.core] += bandwidth(budget, period);
+            }
             let homed = sched
                 .home
                 .is_none_or(|home| self.threads.get(&home).is_some_and(|t| t.home == Some(id)));

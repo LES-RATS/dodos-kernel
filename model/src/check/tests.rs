@@ -683,6 +683,29 @@ fn table_untyped_that_pass_1_deferred_stays_behind_the_sweep() {
     assert_eq!(model.check(), Ok(()));
 }
 
+// Audit lot 7 (sonnet F4): a table untyped makes nothing else but a child
+// table untyped or an `its_table` (D-154): an untyped cut from one that is
+// not itself a table untyped is reported.
+#[test]
+fn ordinary_untyped_cut_from_a_table_untyped_is_reported() {
+    let broken = spoiled(|m, at| {
+        // The space of `deferring_space`, alive.
+        deferring_space(m, at, None, false);
+        let inner = m.caps[&cap(m, 60)].object;
+        let root = m.objects[&inner].root;
+        live(&mut m.caps, root).dying = false;
+        live(&mut m.cspaces, inner).sweep = None;
+        let child = m
+            .untypeds
+            .iter()
+            .find(|(id, u)| u.table && m.objects[id].from.is_some_and(|f| m.untypeds[&f].table))
+            .map(|(&id, _)| id)
+            .expect("a child table untyped");
+        live(&mut m.untypeds, child).table = false;
+    });
+    assert_eq!(broken, "TABLES: a kind a table untyped does not make");
+}
+
 #[test]
 fn table_untyped_behind_the_sweep_that_no_pass_deferred_is_reported() {
     let broken = spoiled(|m, at| deferring_space(m, at, None, false));
@@ -1867,6 +1890,19 @@ fn context_with_a_budget_below_10_microseconds_is_reported() {
     assert_eq!(broken, "43: parameters and state of a context");
 }
 
+// Audit lot 7 (sonnet F14 context, deepseek F-1): parameters a context
+// waits to use with a budget above their period are reported by 43; the
+// check sums no bandwidth of them first (`bandwidth` asserts budget <=
+// period), so it reports and never panics.
+#[test]
+fn pending_parameters_with_a_budget_above_their_period_are_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.scheds, context).pending = Some((2_000_000, 1_000_000));
+    });
+    assert_eq!(broken, "43: parameters and state of a context");
+}
+
 #[test]
 fn throttled_context_with_budget_left_is_reported() {
     let broken = spoiled(|m, at| {
@@ -2864,6 +2900,36 @@ fn a_unit_request_that_names_a_thread_that_does_not_wait_for_it_is_reported() {
     assert_eq!(
         broken,
         "14: a unit request names a thread that does not wait for it"
+    );
+}
+
+// Audit lot 7 (sonnet F3): a thread in *waiting for a unit* for a
+// hand-over (`role_hand`, steps 1 to 4) is the caller its hand-over
+// names, and the other way round, as for a unit request.
+#[test]
+fn a_wait_on_no_hand_over_is_reported() {
+    let broken = spoiled_unit_wait(|m, boot, index| {
+        let entry = m.unit_requests[index].as_mut().expect("the entry");
+        entry.waiter = crate::units::Waiter::Thread(None);
+        live(&mut m.threads, boot).wait = Wait::Hand(0);
+    });
+    assert_eq!(broken, "14: a wait on no hand-over");
+}
+
+#[test]
+fn a_hand_over_that_names_a_thread_that_does_not_wait_for_it_is_reported() {
+    let broken = spoiled_unit_wait(|m, boot, _| {
+        let hand = crate::roles::Handover {
+            target: 1,
+            started: 0,
+            caller: Some(boot),
+            failed: false,
+        };
+        m.handing.insert(0, hand);
+    });
+    assert_eq!(
+        broken,
+        "14: a hand-over names a thread that does not wait for it"
     );
 }
 

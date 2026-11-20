@@ -854,6 +854,22 @@ fn a_core_word_that_names_a_slot_past_the_table_is_reported() {
     machine_reported(&m, "core word: names a slot past the table");
 }
 
+// Audit lot 7 (deepseek F-2): a unit role word that names a node past the
+// table, as holder or as target, is reported, not an index out of bounds.
+#[test]
+fn a_unit_role_word_that_names_a_node_past_the_table_is_reported() {
+    use super::units::IOMMU_ROLE;
+    let words = [
+        dodos_abi::RoleWord::held(40, 5),
+        dodos_abi::RoleWord::handing(1, 40, 5),
+    ];
+    for word in words {
+        let mut m = S::two();
+        m.sys.edit_table(|t| t.roles[IOMMU_ROLE] = word);
+        machine_reported(&m, "UNIT ROLE: a role word names a node past the table");
+    }
+}
+
 #[test]
 fn a_use_entry_that_names_a_granter_past_the_table_is_reported() {
     let mut m = S::two();

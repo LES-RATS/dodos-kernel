@@ -805,3 +805,47 @@ fn node_send_of_a_frame_over_a_table_chunk_is_busy() {
     crate::live(&mut k.m.frames, frame).base = end - k.m.geometry().page();
     assert_eq!(k.m.apply(k.t, send), Err(Error::Busy));
 }
+
+/// A dying capability space whose slot 5 holds the root capability of an
+/// `its_table` of `TABLES`, its pages of class *ITS table* pinned or not,
+/// with pass 1 of its sweep at slot 6 and its first deferred slot 5
+/// (D-156, D-157 (3)).
+fn deferred_its_table(pinned: bool) -> N {
+    let (mut k, _, _) = with_blocks();
+    k.ok(retype_from(BLOCK, ObjectKind::CSpace, 128, INNER));
+    let grow = Syscall::CSpaceGrow {
+        cspace: s(INNER),
+        untyped: s(BLOCK),
+    };
+    assert_eq!(k.call(k.t, grow), Ok(Output::Slots(128)));
+    k.ok(retype_at(s(TABLES), ObjectKind::ItsTable, 0, via(5)));
+    let inner = k.m.object_at(k.t, s(INNER)).expect("a cspace");
+    let its = *k.m.its_tables.keys().next().expect("the its_table");
+    let (first, pages) = k.m.its_tables[&its];
+    for at in first..first + pages {
+        let class = PageClass::its_table(pinned);
+        k.m.table.set_class(at, Some(class));
+    }
+    let root = k.m.objects[&inner].root;
+    crate::live(&mut k.m.caps, root).dying = true;
+    let held = k.m.caps.keys().copied().collect();
+    crate::live(&mut k.m.cspaces, inner).sweep = Some(crate::Sweep {
+        next: 6,
+        first_deferred: Some(5),
+        pass2: false,
+        held,
+    });
+    k
+}
+
+// Audit lot 7 (deepseek F-3, F-5; D-157 (3): "pass-1 deferral of pinned
+// `table untyped` and `its_table` roots"). A pinned `its_table`'s pages
+// read *ITS table* with bits 6-7 1 (The ITS word), and pass 1 moves past
+// its root capability: the state is valid, pinned or unpinned since (as a
+// table untyped deferred stays deferred once the spaces that named it are
+// gone).
+#[test]
+fn an_its_table_root_that_pass_1_deferred_stays_behind_the_sweep() {
+    assert_eq!(deferred_its_table(true).m.check(), Ok(()));
+    assert_eq!(deferred_its_table(false).m.check(), Ok(()));
+}
