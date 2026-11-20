@@ -1811,6 +1811,9 @@ struct Reached {
     cancelled_at_once: [u32; 4],
     /// `untyped_retype` that returned `unsupported`: a kind not made.
     retype_unsupported: u32,
+    /// The `untyped_retype`s of a kind never made from an untyped, refused
+    /// `invalid`.
+    retype_never_made: u32,
     /// `cap_delete` and `cap_revoke` that returned `again`, and those of
     /// them that removed no capability: the step ended on the slot budget
     /// alone.
@@ -2101,8 +2104,16 @@ fn refused_send(model: &mut Model, first: ObjId) {
         assert_eq!(model.check(), Ok(()));
         outcome
     };
+    // Each call of the set-up is done, the growth with its 128 slots (the
+    // audit of lot 8b, D-8b F32: any success passed).
     for call in setup {
-        assert!(apply(model, first, call).is_ok());
+        let grows = matches!(call, Syscall::CSpaceGrow { .. });
+        let done = if grows {
+            Ok(Output::Slots(128))
+        } else {
+            Ok(Output::Done)
+        };
+        assert_eq!(apply(model, first, call), done);
     }
     let receiver = model.object_at(first, s(2)).expect("the receiver");
     let send = Syscall::Send {
@@ -2180,7 +2191,7 @@ fn destroyed_space(model: &mut Model, first: ObjId) {
         Syscall::ThreadResume(s(1)),
     ];
     for call in setup {
-        assert!(model.apply(first, call).is_ok());
+        assert_eq!(model.apply(first, call), Ok(Output::Done));
         assert_eq!(model.check(), Ok(()));
     }
     let orphan = model.object_at(first, s(1)).expect("the thread");
@@ -2395,6 +2406,8 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         let before = model.census();
         let capabilities = before.capabilities;
         let numbered = matches!(call, Syscall::ThreadCancel(_, number) if number != 0);
+        let never_made = matches!(&call, Syscall::UntypedRetype { kind, .. }
+            if NOT_MADE.contains(kind) && *kind != ObjectKind::Vcpu);
         let marks: Vec<(ObjId, Marks)> = known
             .iter()
             .filter_map(|&thread| Some((thread, model.marks(thread)?)))
@@ -2429,6 +2442,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             reached.cancelled_at_once[blocking.expect("a call that waits")] += 1;
         }
         reached.retype_unsupported += (name == 5 && outcome == Err(Error::Unsupported)) as u32;
+        reached.retype_never_made += (never_made && outcome == Err(Error::Invalid)) as u32;
         if name == 2 || name == 3 {
             let after = model.census();
             reached.unmapped_by_removal += (after.mappings < before.mappings) as u32;
@@ -2460,12 +2474,19 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             _ => {}
         }
         reached.destroyed += destroyed as u32;
-        match &outcome {
-            Ok(_) => {
-                reached.ok.resize(NAMES.len(), 0);
-                reached.ok[name] += 1;
-            }
-            Err(error) => reached.errors[*error as usize] += 1,
+        // A call that waits counts as a success unless the settling after
+        // it woke it with an error, as a unit request answered *failed* (the
+        // audit of lot 8b, D-8b F28: any wait counted; a `call` still waits
+        // for its answer here, and counts).
+        let succeeded = match &outcome {
+            Ok(Output::Waits) => model.woken(thread).is_none_or(Result::is_ok),
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        reached.ok.resize(NAMES.len(), 0);
+        reached.ok[name] += u32::from(succeeded);
+        if let Err(error) = &outcome {
+            reached.errors[*error as usize] += 1;
         }
         reached.outside += (space != Some(home)) as u32;
         reached.outside_ok += (space != Some(home) && outcome.is_ok()) as u32;
@@ -2551,6 +2572,7 @@ impl Reached {
         self.destroyed += other.destroyed;
         self.cancelled_by_number += other.cancelled_by_number;
         self.retype_unsupported += other.retype_unsupported;
+        self.retype_never_made += other.retype_never_made;
         self.again += other.again;
         self.swept_only += other.swept_only;
         self.seeds_walked += other.seeds_walked;
@@ -2653,10 +2675,11 @@ fn invariants_hold_after_every_call_of_random_sequences() {
     assert!(reached.several_threads as usize > STEPS);
 }
 
-// The coverage of the 24 seeds. Each floor is three quarters of the count
-// measured on 17 November 2026 (pass 23), rounded up: the smallest of the
-// three runs of `verify` (pages of 4, 16 and 32 KB), over the 24 seeds, in
-// the comments. A change of the generator that loses a quarter of a kind of
+// The coverage of the seeds (`SEEDS`: 24 until pass 31, 48 since). Each
+// floor is three quarters of the count measured when it was set (pass 23
+// on 24 seeds, later passes on 48), rounded up: the smallest of the three
+// runs of `verify` (pages of 4, 16 and 32 KB), in the comments (the audit
+// of lot 8b, F14: this said 24 seeds throughout). A change of the generator that loses a quarter of a kind of
 // state fails here, not only one that loses all of it (the eighth model
 // review found floors halved and floors of 1 that guarded only against 0).
 // The directed cases count in no floor (the final review's H6: three floors
@@ -2801,6 +2824,10 @@ fn untyped_retype_of_a_kind_not_made_is_reached() {
     // version does not make, the reserved `vcpu` (the other kinds never
     // made from an untyped are `invalid` since 16 November 2026).
     at_least([reached.retype_unsupported], [7]);
+    // The other kinds of `NOT_MADE`, refused `invalid` (the audit of lot
+    // 8b, D-8b F30: no count read them). Measured: 135 on 4 KB and 16 KB
+    // pages, 274 on 32 KB pages.
+    at_least([reached.retype_never_made], [101]);
 }
 
 #[test]
@@ -2916,7 +2943,7 @@ fn a_dying_memory_control_is_counted() {
 }
 
 /// The long run, outside `verify`: `DODOS_PROPERTY_SEEDS` seeds (2,000 if
-/// unset) from `DODOS_PROPERTY_FIRST` (the first seed after the 24 of
+/// unset) from `DODOS_PROPERTY_FIRST` (the first seed after the `SEEDS` of
 /// `verify` if unset), as many at once as the machine has cores, every
 /// invariant checked after every call; the seeds that fail are named. Run
 /// with

@@ -1874,9 +1874,19 @@ impl Model {
     }
 
     /// Order of checks, steps 1 and 2: the kind (`invalid`), then the rights
-    /// (`denied`).
+    /// (`denied`). A revoked task named where another kind is asked is
+    /// `gone` before its kind is judged (Tasks and marks, "A revoked task";
+    /// pass 35: it was `invalid`); where a task is asked, `task` judges it,
+    /// and `task_read` and `task_revoke` are exempt.
     fn is(&self, cap: CapId, kind: ObjectKind, rights: Rights) -> Result<&Cap, Error> {
         let held = &self.caps[&cap];
+        let revoked = self
+            .tasks
+            .get(&held.object)
+            .is_some_and(|task| task.revoked);
+        if revoked && kind != ObjectKind::Task {
+            return Err(Error::Gone);
+        }
         if self.objects[&held.object].kind != kind {
             return Err(Error::Invalid);
         }

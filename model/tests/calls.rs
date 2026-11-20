@@ -255,9 +255,12 @@ impl K {
         // to the end of the new object, padding included: it takes exactly
         // one call per step of clearing (rules of `untyped_retype`; Argon b4
         // of the seventh review). A child untyped and device memory are not
-        // cleared: one call.
+        // cleared, and a table untyped has no clean mark, the gate clearing
+        // what it takes within the call (D-154; pass 35: the first test to
+        // make an `its_table` through here found the count wrong): one call.
         if let Syscall::UntypedRetype { untyped, kind, .. } = call {
             let marks = self.m.untyped_marks(self.t, untyped);
+            let table = self.m.untyped_is_table(self.t, untyped) == Some(true);
             // The invariants are checked once at the end: the journal of
             // writes is kept until that check.
             let mut calls = 0;
@@ -272,7 +275,7 @@ impl K {
             assert_eq!(self.m.check(), Ok(()));
             let (_, clean, device) = marks.expect("an untyped");
             let (end, _, _) = self.m.untyped_marks(self.t, untyped).expect("an untyped");
-            let steps = match device || kind == Untyped {
+            let steps = match device || table || kind == Untyped {
                 true => 1,
                 false => clear_steps(clean, end),
             };
@@ -1600,7 +1603,11 @@ fn cspace_maximum_is_a_whole_number_of_segments_up_to_2_to_the_20() {
 #[test]
 fn size_argument_is_zero_for_the_other_kinds() {
     // A thread's size argument is its feature mask (tests/cores.rs); a
-    // timer, a task and an iospace take 0 too (the final review's H2).
+    // timer and a task take 0 too (the final review's H2). An aspace and an
+    // iospace take the slot address of a table untyped (D-154): 0, or the
+    // slot of an ordinary untyped, names none (the audit of lot 8b, F7:
+    // every case here went through `sized`, which writes the table
+    // untyped's slot for 0).
     let mut k = K::new();
     use ObjectKind::{IoSpace, Task, Timer};
     for kind in [
@@ -1616,10 +1623,44 @@ fn size_argument_is_zero_for_the_other_kinds() {
         for size in [1, 7, 4096, u64::MAX] {
             k.no(retype(UT, kind, size, s(30)), Error::Invalid);
         }
+        if matches!(kind, ASpace | IoSpace) {
+            for size in [0, UT.raw()] {
+                let raw = Syscall::UntypedRetype {
+                    untyped: UT,
+                    kind,
+                    size,
+                    page: PageSize::Page as u64,
+                    memory: 0,
+                    destination: s(30),
+                };
+                k.no(raw, Error::Invalid);
+            }
+        }
         k.ok(retype(UT, kind, 0, s(30)));
         assert_eq!(k.kind(30), Ok(kind));
         k.ok(Syscall::CapDelete(s(30)));
     }
+}
+
+/// An `its_table` comes from a table untyped only, as 2^k pages with k at
+/// most 4, and a table untyped makes only child table untypeds and
+/// `its_table`s (D-154; the audit of lot 8b, F11: only the random test
+/// reached these).
+#[test]
+fn an_its_table_comes_from_a_table_untyped_only_with_at_most_sixteen_pages() {
+    let mut k = K::new();
+    let its = ObjectKind::ItsTable;
+    k.no(retype(UT, its, 0, s(30)), Error::Invalid);
+    k.no(retype(DEV, its, 0, s(30)), Error::Invalid);
+    let beyond = u64::from(ITS_TABLE_K_MAX) + 1;
+    k.no(retype(START_UT, its, beyond, s(30)), Error::Invalid);
+    for kind in [Frame, Endpoint, Notify, Thread] {
+        let size = if kind == Frame { 1 } else { 0 };
+        k.no(retype(START_UT, kind, size, s(30)), Error::Invalid);
+    }
+    k.ok(retype(START_UT, its, u64::from(ITS_TABLE_K_MAX), s(30)));
+    assert_eq!(k.kind(30), Ok(its));
+    k.ok(Syscall::CapDelete(s(30)));
 }
 
 #[test]

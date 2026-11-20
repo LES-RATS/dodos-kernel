@@ -171,8 +171,10 @@ fn each_plain_argument_of_memory_take_is_refused_and_before_the_state() {
     let mut k = K::new();
     let (free, shift) = (k.free(), k.shift());
     let entries = u64::from(k.m.geometry().entries.trailing_zeros());
-    // The kind, before the size and the place.
-    k.no(take(2, 1, 0, 40), Error::Invalid);
+    // The kind, before the size and the place: kind 3 names none (kind 2
+    // takes a table run since D-154; the audit of lot 8b, F6: it stood
+    // here as the bad kind, refused for its place).
+    k.no(take(3, free, shift, 40), Error::Invalid);
     // Kind 0: the size from the chunk to the chunk times E.
     k.no(take(0, free, shift - 1, 40), Error::Invalid);
     k.no(take(0, free, shift + entries + 1, 40), Error::Invalid);
@@ -191,12 +193,15 @@ fn each_plain_argument_of_memory_take_is_refused_and_before_the_state() {
     k.no(take(1, capacity, 0, 40), Error::Invalid);
     // An unused entry is a state error, not a plain one.
     k.no(take(1, capacity - 1, 0, 40), Error::Busy);
+    // Kind 2 at a place and size kind 0 accepts is no plain fault.
+    k.ok(take(2, free, shift, 40));
 }
 
 /// The depth rule refuses a take through a memory_control at depth 64 and
-/// accepts one at 63. Both the kind and the depth give `invalid`, so the
-/// order the contract states between them cannot be seen from the result
-/// (the final review's F2 Opus 1: the test was named after that order).
+/// accepts one at 63. Both a bad kind (3) and the depth give `invalid`, so
+/// the order the contract states between them cannot be seen from the
+/// result (the final review's F2 Opus 1: the test was named after that
+/// order).
 #[test]
 fn a_take_through_a_memory_control_at_depth_64_is_refused_and_at_63_accepted() {
     let mut k = K::new();
@@ -207,7 +212,7 @@ fn a_take_through_a_memory_control_at_depth_64_is_refused_and_at_63_accepted() {
         k.ok(derive(from, slot, Rights::ALL));
         from = slot;
     }
-    k.no(take_through(162, 2, free, shift, 40), Error::Invalid);
+    k.no(take_through(162, 3, free, shift, 40), Error::Invalid);
     k.no(take_through(162, 0, free, shift, 40), Error::Invalid);
     k.ok(take_through(161, 0, free, shift, 40));
 }

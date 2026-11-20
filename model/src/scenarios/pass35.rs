@@ -7,7 +7,7 @@ use super::units::{PLATFORM, role_slot};
 use super::*;
 use crate::rings::UnitOp;
 use crate::table::RecordState;
-use dodos_abi::{CoreState, CoreWord, FENCE_NS, SETTLE_NS};
+use dodos_abi::{CoreState, CoreWord, FENCE_NS, MEMORY_TAKE_TABLES, SETTLE_NS};
 
 // The calls, `node_start`, effect of mode 0 (D-161): the core words first,
 // each from *free*, the member word last, from dead (g); on a failed
@@ -142,4 +142,175 @@ fn a_unit_request_whose_role_is_not_its_records_is_refused() {
     let state = requested_under_record_role(&mut m, 0, (role, role), detach);
     assert_ne!(state, RecordState::Refused);
     assert_eq!(m.sys.node(holder).refused.0, refused + 1);
+}
+
+// The derivation tree, the bounded sweep in two passes, across nested
+// dying `cspace`s (D-157 (3), D-161 (6)): an inner `cspace` at slot 3 of an
+// outer dying `cspace` holds a table untyped at its slot 5, which an
+// `aspace` at slot 9 of the outer `cspace` names. The inner `cspace`'s
+// pass 2 treats that `aspace` as outside it and returns `again`, and the
+// outer sweep waits at slot 3 for the inner one: the deletion of the
+// outer `cspace` stays `again`. The supervisor destroys the pinning object
+// by deleting the ordinary untyped its header came from; the outer
+// deletion then ends. (The audits of lot 8a, F7, and lot 8b, F3: no
+// nested layout was built.)
+#[test]
+fn a_space_in_an_outer_dying_cspace_pins_a_table_untyped_of_an_inner_one() {
+    use super::pass31::{BLOCK, INNER, TABLES, deleted, retype_at, via, with_blocks};
+    const NESTED: u32 = 240;
+    const DEEPER: u32 = 241;
+    const DEEPER_TABLES: u32 = 242;
+    const HEADERS: u32 = 250;
+    let (mut k, _, _) = with_blocks();
+    let page = k.m.geometry().page();
+    let cspace = |k: &mut N, untyped: u32, slot: u32| {
+        k.ok(retype_from(untyped, ObjectKind::CSpace, 128, slot));
+        let grow = Syscall::CSpaceGrow {
+            cspace: s(slot),
+            untyped: s(untyped),
+        };
+        assert_eq!(k.call(k.t, grow), Ok(Output::Slots(128)));
+    };
+    cspace(&mut k, BLOCK, INNER);
+    // The inner `cspace` one level deeper than the outer one, so that the
+    // outer one may hold its root, and its table untyped as deep as it.
+    k.ok(retype_from(BLOCK, ObjectKind::Untyped, 16 * page, DEEPER));
+    cspace(&mut k, DEEPER, NESTED);
+    k.ok(retype_at(
+        s(TABLES),
+        ObjectKind::Untyped,
+        8 * page,
+        s(DEEPER_TABLES),
+    ));
+    let nested = |index| SlotAddr::through(NESTED, index);
+    let table = ObjectKind::Untyped;
+    k.ok(retype_at(s(DEEPER_TABLES), table, 4 * page, nested(5)));
+    // The pinning `aspace`: its header from its own ordinary untyped.
+    k.ok(retype_from(BLOCK, ObjectKind::Untyped, 4 * page, HEADERS));
+    k.ok(retype_at(
+        s(HEADERS),
+        ObjectKind::ASpace,
+        nested(5).raw(),
+        via(9),
+    ));
+    // The inner `cspace` moves to slot 3 of the outer one.
+    let outer = k.m.object_at(k.t, s(INNER)).expect("the outer cspace");
+    let inner = k.m.object_at(k.t, s(NESTED)).expect("the inner cspace");
+    let moved = Syscall::CapMove {
+        source: s(NESTED),
+        destination: via(3),
+    };
+    k.ok(moved);
+    for _ in 0..8 {
+        k.no(Syscall::CapDelete(s(INNER)), Error::Again);
+        k.interrupts();
+    }
+    // The outer sweep waits at slot 3; the inner one is in pass 2 at slot
+    // 5, its table untyped pinned by the `aspace` at slot 9 of the outer.
+    let sweep = |k: &N, space| {
+        let sweep = k.m.cspaces[&space].sweep.as_ref().expect("dying");
+        (sweep.next, sweep.pass2)
+    };
+    assert_eq!(sweep(&k, outer).0, 3);
+    assert_eq!(sweep(&k, inner), (5, true));
+    assert!(matches!(k.m.cspaces[&outer].slots[9], crate::Slot::Full(_)));
+    // The way out D-161 (6) names: the header's untyped deleted first.
+    assert_eq!(deleted(&mut k, HEADERS), DONE);
+    k.interrupts();
+    assert_eq!(deleted(&mut k, INNER), DONE);
+    assert_eq!(k.m.check(), Ok(()));
+}
+
+// D-157 (2), gap 48: the start-up aspace's root and tables, drawn from the
+// first table-floor untyped, stay permanent live pieces of it for the life
+// of the node, even once that aspace is destroyed: the untyped's watermark
+// never returns, and a new space takes its root above them. (The audits
+// of lot 8a, F7, and lot 8b, F9: only the start-up state was asserted.)
+#[test]
+fn the_table_floor_untyped_keeps_the_start_up_aspaces_tables_after_its_destruction() {
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    let tables = k.tables();
+    let untyped = k.m.object_at(k.t, s(tables)).expect("the table untyped");
+    let before = k.m.untypeds[&untyped].watermark;
+    // A second thread, in an `aspace` whose root comes from a table block
+    // of its own, destroys the start-up one: nothing else is made from the
+    // table-floor untyped.
+    let shift = k.m.geometry().chunk_shift();
+    let chunk = super::pass31::free_chunk(&k.m, 0);
+    let block = super::pass22::take(MEMORY_TAKE_TABLES, chunk << shift, shift.into(), 355);
+    k.ok(block);
+    k.ok(retype_from(k.ut, ObjectKind::ASpace, s(355).raw(), 360));
+    assert_eq!(k.m.root_table(k.t, s(360)), Some(chunk << shift));
+    k.place_first(0);
+    let mut calls = thread_calls(k.ut, 0, 300, 0);
+    if let Syscall::ThreadConfigure { aspace, .. } = &mut calls[3] {
+        *aspace = s(360);
+    }
+    for call in calls {
+        k.ok(call);
+    }
+    let other = k.m.object_at(k.t, s(300)).expect("the thread");
+    let mut outcome = Err(Error::Again);
+    for _ in 0..64 {
+        let delete = Syscall::CapDelete(s(dodos_abi::START_SLOT_ASPACE));
+        outcome = k.call(other, delete);
+        if outcome != Err(Error::Again) {
+            break;
+        }
+        k.interrupts();
+    }
+    assert_eq!(outcome, DONE);
+    assert_eq!(k.m.object_at(k.t, s(dodos_abi::START_SLOT_ASPACE)), None);
+    // The watermark stays where the start-up left it, and is not even
+    // ready to return.
+    assert_eq!(k.m.untypeds[&untyped].ready, None);
+    assert_eq!(k.m.untypeds[&untyped].watermark, before);
+    assert_eq!(k.m.check(), Ok(()));
+}
+
+// D-156 F5: `untyped_retype` of an `aspace` applies the barrier rule of a
+// watermark that returns to the named table untyped too, before
+// `no_memory`. On a node of three cores, an `aspace`'s root came from a
+// child table untyped and the `aspace` is destroyed: that untyped's
+// watermark is ready to return. The next `aspace` named on it, its header
+// from an ordinary untyped with room, starts the barrier and is `again`
+// with nothing made; once every other core answered, it is made, its root
+// at the start of the table untyped. (The audits of lot 8a, F8, and lot
+// 8b, F10: only ordinary untypeds met the barrier.)
+#[test]
+fn an_aspace_waits_for_the_barrier_of_its_table_untypeds_returning_watermark() {
+    let mut k = N::on(&one_node(Arch::X86_64, 3));
+    let page = k.m.geometry().page();
+    let shift = k.m.geometry().chunk_shift();
+    let chunk = super::pass31::free_chunk(&k.m, 0);
+    let block = super::pass22::take(MEMORY_TAKE_TABLES, chunk << shift, shift.into(), 355);
+    k.ok(block);
+    let child = Syscall::UntypedRetype {
+        untyped: s(355),
+        kind: ObjectKind::Untyped,
+        size: 4 * page,
+        page: 0,
+        memory: 0,
+        destination: s(356),
+    };
+    k.ok(child);
+    let aspace = retype_from(k.ut, ObjectKind::ASpace, s(356).raw(), 360);
+    k.ok(aspace.clone());
+    k.ok(Syscall::CapDelete(s(360)));
+    let tables = k.m.object_at(k.t, s(356)).expect("the child");
+    assert!(k.m.untypeds[&tables].ready.is_some());
+    // Only the table untyped waits: the ordinary one holds other objects.
+    let primary = k.m.object_at(k.t, s(k.ut)).expect("the untyped");
+    assert_eq!(k.m.untypeds[&primary].ready, None);
+    assert_eq!(k.call(k.t, aspace.clone()), Err(Error::Again));
+    let request = k.m.cores[0].request.clone().expect("the barrier");
+    assert!(matches!(
+        request.completes,
+        crate::cores::Completes::Barrier(_)
+    ));
+    assert_eq!(k.m.object_at(k.t, s(360)), None);
+    k.interrupts();
+    k.ok(aspace);
+    assert_eq!(k.m.untypeds[&tables].ready, None);
+    assert_eq!(k.m.root_table(k.t, s(360)), Some(chunk << shift));
 }

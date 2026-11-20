@@ -205,10 +205,20 @@ fn an_iospace_root_is_of_class_root_with_0_devices_and_its_tables_of_their_level
         retype(common::UNTYPED, Frame, PageSize::Page, 1, 160),
     );
     ok(&mut m, t, map(IoSpace, s(160), BLOCK, AT, 1));
-    let level = m.page_class(base + page).iospace_level();
-    assert!(level.is_some_and(|l| l >= 1), "{level:?}");
+    // The lower tables follow the root, one per level down to 1, and the
+    // chunk counts the root and each of them as not *data* (the audits of
+    // lot 8b, F12 and D-8b F2: `>= 1` and `>= 2` were asserted).
+    let lower: Vec<u8> = (1..)
+        .map(|i| m.page_class(base + i * page).iospace_level())
+        .take_while(Option::is_some)
+        .flatten()
+        .collect();
+    let levels: Vec<u8> = (1..=lower.len() as u8).rev().collect();
+    assert!(!lower.is_empty());
+    assert_eq!(lower, levels);
     let chunk = base >> m.geometry().chunk_shift();
-    assert!(GateWord::from_raw(m.gate_word(chunk)).unwrap().not_data() >= 2);
+    let not_data = GateWord::from_raw(m.gate_word(chunk)).unwrap().not_data();
+    assert_eq!(usize::from(not_data), 1 + lower.len());
 }
 
 #[test]
@@ -219,7 +229,14 @@ fn a_device_leaf_counts_in_its_device_entry_and_in_no_chunk() {
         let index = (0..m.device_count())
             .find(|&i| m.device_entry(i).base() == Some(Machine::DEVICES))
             .unwrap();
-        let counts = |m: &Model| -> Vec<u64> { (0..64).map(|c| m.map_count(c)).collect() };
+        // Every chunk of the machine's memory (the audit of lot 8b, D-8b
+        // F1: chunks 0 to 63 only, below the memory the leaf could count
+        // in).
+        let shift = m.geometry().chunk_shift();
+        let memory = Machine::example().memory;
+        let end = memory.iter().map(|r| (r.base + r.len) >> shift);
+        let chunks = end.max().expect("memory");
+        let counts = |m: &Model| -> Vec<u64> { (0..chunks).map(|c| m.map_count(c)).collect() };
         ok(
             &mut m,
             t,

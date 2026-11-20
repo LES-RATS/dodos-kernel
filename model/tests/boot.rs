@@ -340,8 +340,16 @@ fn no_module_is_refused_for_its_size() {
         ..machine
     };
     let (m, t) = boot(&machine);
-    let pages = |slot| m.frame_at(t, own(slot)).map(|f| f.1);
-    assert!(pages(29).is_some() && pages(30).is_some());
+    // Its E + 1 pages are kept whole: one large page of E pages in slot
+    // 30, then the last page in slot 31 right after it (the audit of lot
+    // 8b, F12: only that slots 29 and 30 held a frame was asserted).
+    let large = m.frame_at(t, own(30)).expect("the large frame");
+    let last = m.frame_at(t, own(31)).expect("the last page");
+    assert_eq!((large.0, large.1), (PageSize::Large1, 1));
+    assert_eq!((last.0, last.1), (PageSize::Page, 1));
+    let page = machine.geometry.page();
+    let entries = u64::from(machine.geometry.entries);
+    assert_eq!(last.2, large.2 + entries * page);
 }
 
 #[test]

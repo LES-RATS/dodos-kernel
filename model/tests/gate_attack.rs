@@ -1,4 +1,8 @@
-//! The gate over page tables attacked from outside the gate.
+//! The gate over page tables attacked from outside the gate: by calls of
+//! user space whose arguments aim at what the gate guards. A faulty kernel
+//! calling its gate directly is in the scenarios of the model (`gate/`,
+//! `scenarios/`), where its words can be reached (the audit of lot 8b, F8:
+//! this said more than the file does).
 
 mod common;
 
@@ -325,6 +329,11 @@ fn a_block_whose_grantee_maps_it_is_not_given() {
         },
         Error::Busy,
     );
+    // What refuses it: the chunk's grant count, 1 for the live grant
+    // (D-148; the audit of lot 8b, F8: no state was asserted).
+    let chunk = place / geometry.chunk();
+    let word = GateWord::from_raw(m.sys.node(0).gate_word(chunk)).expect("a gate word");
+    assert_eq!(word.grants(), 1);
 }
 
 // 3. The map count of G4 and its limit.
@@ -582,6 +591,16 @@ fn a_partial_mapping_goes_on_only_with_the_page_count_it_started_with() {
     for n in 0..4 {
         assert!(m.sys.node(0).translated(m.t[0], AT + n * page).is_some());
     }
+    // The iospace half too: four leaves of each frame in the map counts of
+    // their chunks (the audit of lot 8b, D-8b F4: it was never read back).
+    let shift = m.geometry(0).chunk_shift();
+    let node = m.sys.node(0);
+    let chunks: std::collections::BTreeSet<u64> = [200, 211]
+        .iter()
+        .map(|&f| node.frame_at(m.t[0], s(f)).expect("a frame").2 >> shift)
+        .collect();
+    let leaves: u64 = chunks.iter().map(|&c| node.map_count(c)).sum();
+    assert_eq!(leaves, 8);
 }
 
 #[test]
@@ -595,4 +614,11 @@ fn a_protect_within_the_budget_of_a_gate_call_succeeds() {
         rights: Rights::READ.union(Rights::WRITE).bits(),
     };
     m.ok(0, protect);
+    // The three pages read and write (the audit of lot 8b, D-8b F3: only
+    // the outcome was asserted).
+    let page = m.geometry(0).page();
+    for n in 0..3 {
+        let rights = m.sys.node(0).translated(m.t[0], AT + n * page);
+        assert_eq!(rights, Some(Rights::READ.union(Rights::WRITE)));
+    }
 }

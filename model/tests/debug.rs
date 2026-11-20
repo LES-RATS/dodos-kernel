@@ -166,18 +166,22 @@ fn debug_write_judges_rights_before_length_and_the_registers_without_a_page() {
     });
     k.ok(Syscall::ThreadResume(s(101)));
     let other = k.m.object_at(k.t, s(101)).unwrap();
-    assert_eq!(k.m.apply(other, write(48)), DONE);
-    assert_eq!(k.m.apply(other, write(49)), Err(Error::Invalid));
+    // Each call of the second thread checked after it (the audit of lot
+    // 8b, D-8b F22: these four were not).
+    let mut by_other = |call| {
+        let outcome = k.m.apply(other, call);
+        assert_eq!(k.m.check(), Ok(()));
+        outcome
+    };
+    assert_eq!(by_other(write(48)), DONE);
+    assert_eq!(by_other(write(49)), Err(Error::Invalid));
     // `entropy_read` likewise: 6 words in the registers.
     let entropy = |length| Syscall::EntropyRead {
         length,
         mix: [0; 4],
     };
-    assert!(matches!(
-        k.m.apply(other, entropy(48)),
-        Ok(Output::Bytes(_))
-    ));
-    assert_eq!(k.m.apply(other, entropy(49)), Err(Error::Invalid));
+    assert!(matches!(by_other(entropy(48)), Ok(Output::Bytes(_))));
+    assert_eq!(by_other(entropy(49)), Err(Error::Invalid));
 }
 
 #[test]
@@ -349,6 +353,64 @@ fn a_breakpoint_hit_is_a_fault_of_kind_9() {
     // The fault record follows the block: kind 9, words 3 and 4.
     assert_eq!(read[REGS_WORDS], 9);
     assert_eq!(read[REGS_WORDS + 4..REGS_WORDS + 6], [1, 0xFFFF_0FF1]);
+}
+
+/// x86-64, the gate's `#DB` stub (D-143, D-155, D-156 F4), as the model
+/// holds it: the stub merges the causes of DR6 into the core's deferred
+/// word and loads DR6's reset value; the kernel consumes the word whole.
+/// A breakpoint of the thread hit on the kernel's entry of a fault is the
+/// thread's kind 9, kept behind that fault and judged against the control
+/// word at the `#DB`: a debugger that clears that word before kind 9 is
+/// raised does not take it back. The next `#DB` reads only its own cause.
+/// (The audit of lot 8b, F5: no test of `tests/` went through the stub;
+/// the model has no `deferred_events` word, and no bit of it.)
+#[test]
+fn a_db_at_the_entry_defers_dr6_and_its_kind_9_is_judged_at_the_db() {
+    const RESET: u64 = 0xFFFF_0FF0;
+    const B0: u64 = 1;
+    const BS: u64 = 1 << 14;
+    let mut k = K::new();
+    let mut watch = block();
+    watch[REG_DR0] = 0x1000;
+    watch[REG_DR7] = 1;
+    let b = k.spawn();
+    k.ok(Syscall::ThreadSuspend(s(101)));
+    let write = |block| Syscall::ThreadWriteRegs {
+        thread: s(101),
+        block,
+    };
+    k.ok(write(watch.clone()));
+    k.ok(Syscall::ThreadResume(s(101)));
+    // A `MOV SS` before an undefined instruction: the `#DB` on the
+    // kernel's entry of that fault, which goes first and suspends the
+    // thread (it has no fault endpoint); kind 9 is kept behind it.
+    let undefined = FaultKind::Undefined;
+    assert!(k.m.fault_with_debug(b, B0, undefined, [6, 0, 0]));
+    assert_eq!(k.m.check(), Ok(()));
+    // The debugger clears the control word, then resumes the thread.
+    watch[REG_DR7] = 0;
+    k.ok(write(watch.clone()));
+    k.ok(Syscall::ThreadResume(s(101)));
+    let Ok(Output::Regs(read)) = k.go(Syscall::ThreadReadRegs(s(101))) else {
+        panic!("registers");
+    };
+    // Raised all the same: word 3 the hit judged at the `#DB`, word 4 the
+    // value the stub read.
+    assert_eq!(read[REGS_WORDS], 9);
+    assert_eq!(read[REGS_WORDS + 4..REGS_WORDS + 6], [B0, RESET | B0]);
+    // Breakpoint 0 enabled again; the next `#DB`, a single step on the
+    // system-call entry, reads only its own cause (the stub reset DR6):
+    // ignored, and no kind 9 from a B0 left over.
+    watch[REG_DR7] = 1;
+    k.ok(write(watch));
+    k.ok(Syscall::ThreadResume(s(101)));
+    assert_eq!(k.m.call_with_debug(b, BS, Syscall::Yield), Some(DONE));
+    assert_eq!(k.m.check(), Ok(()));
+    k.ok(Syscall::ThreadSuspend(s(101)));
+    let Ok(Output::Regs(read)) = k.go(Syscall::ThreadReadRegs(s(101))) else {
+        panic!("registers");
+    };
+    assert_eq!(read[REGS_WORDS], 0, "a fault recorded");
 }
 
 // The I/O ports.

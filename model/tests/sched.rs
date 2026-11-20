@@ -531,10 +531,11 @@ fn yield_of_a_throttled_context_goes_behind_the_others_of_its_instant() {
     let other = k.thread(50, 40);
     k.advance(MS + 10 * US);
     // Both throttled to 10 ms, class 1: the first throttled entered first.
-    let first = k.m.running();
-    let yielder = if first == Some(k.t) { k.t } else { other };
-    assert_eq!(k.on(yielder, Syscall::Yield), DONE);
-    assert_ne!(k.m.running(), Some(yielder));
+    // The first thread's context was throttled first (the audit of lot
+    // 8b, F12: neither was named, and none running passed).
+    assert_eq!(k.m.running(), Some(k.t));
+    assert_eq!(k.on(k.t, Syscall::Yield), DONE);
+    assert_eq!(k.m.running(), Some(other));
 }
 
 #[test]

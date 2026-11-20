@@ -16,12 +16,12 @@ use dodos_abi::{
     GateWord, MEMORY_TAKE_RUN, MEMORY_TAKE_TABLES, MemberState, Owner, Ownership, PageClass,
 };
 
-const BLOCK: u32 = 200;
-const TABLES: u32 = 201;
+pub(super) const BLOCK: u32 = 200;
+pub(super) const TABLES: u32 = 201;
 const SPACE: u32 = 210;
 
 /// The first chunk no node holds and no reserve names, from `after` on.
-fn free_chunk(model: &Model, after: u64) -> u64 {
+pub(super) fn free_chunk(model: &Model, after: u64) -> u64 {
     let free = Ownership::free(Owner::Unclaimed).raw();
     (after..)
         .find(|&chunk| model.ownership(chunk) == free)
@@ -30,7 +30,7 @@ fn free_chunk(model: &Model, after: u64) -> u64 {
 
 /// A node alone with a table block of one chunk in `TABLES` and an
 /// ordinary block of one chunk in `BLOCK`; their chunks.
-fn with_blocks() -> (N, u64, u64) {
+pub(super) fn with_blocks() -> (N, u64, u64) {
     // Two node slots of one core each: node 0 runs beside a phantom.
     let mut k = N::on(&machine(Arch::X86_64, 2, &[&[0], &[1]]));
     let shift = u64::from(k.m.geometry().chunk_shift());
@@ -46,7 +46,7 @@ fn word(k: &N, chunk: u64) -> GateWord {
 }
 
 /// An `aspace` in `slot`: its header from `BLOCK`, its root from `tables`.
-fn aspace(tables: u32, slot: u32) -> Syscall {
+pub(super) fn aspace(tables: u32, slot: u32) -> Syscall {
     retype_from(BLOCK, ObjectKind::ASpace, s(tables).raw(), slot)
 }
 
@@ -593,14 +593,19 @@ fn r6_retires_every_handle_of_a_dead_nodes_cores_once_a_unit_failed() {
 
 // D-156, the review of pass 31.
 
-const INNER: u32 = 230;
+pub(super) const INNER: u32 = 230;
 
 /// A slot of the capability space in `INNER`.
-fn via(index: u32) -> SlotAddr {
+pub(super) fn via(index: u32) -> SlotAddr {
     SlotAddr::through(INNER, index)
 }
 
-fn retype_at(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAddr) -> Syscall {
+pub(super) fn retype_at(
+    untyped: SlotAddr,
+    kind: ObjectKind,
+    size: u64,
+    destination: SlotAddr,
+) -> Syscall {
     Syscall::UntypedRetype {
         untyped,
         kind,
@@ -614,7 +619,7 @@ fn retype_at(untyped: SlotAddr, kind: ObjectKind, size: u64, destination: SlotAd
 /// `with_blocks`, and a capability space of 128 slots in `INNER` whose
 /// slot 5 holds the root capability of a child of the table block; the
 /// space.
-fn with_inner_tables() -> (N, u64, ObjId) {
+pub(super) fn with_inner_tables() -> (N, u64, ObjId) {
     let (mut k, tables, _) = with_blocks();
     let page = k.m.geometry().page();
     k.ok(retype_from(BLOCK, ObjectKind::CSpace, 128, INNER));
@@ -630,7 +635,7 @@ fn with_inner_tables() -> (N, u64, ObjId) {
 }
 
 /// Deletes the capability in `slot` in at most 16 calls.
-fn deleted(k: &mut N, slot: u32) -> Outcome {
+pub(super) fn deleted(k: &mut N, slot: u32) -> Outcome {
     let mut outcome = Err(Error::Again);
     for _ in 0..16 {
         outcome = k.call(k.t, Syscall::CapDelete(s(slot)));

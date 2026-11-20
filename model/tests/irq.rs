@@ -190,7 +190,15 @@ fn each_bad_destination_source_and_vector_of_irq_claim_is_refused() {
         k.no(raw(msi().raw(), vector, 40), Error::Invalid);
     }
     let line = raw(IrqSource::line(23, false, false).raw(), 48, 40);
-    assert!(k.go(line).is_ok());
+    // The last input is claimed: a line's message words are 0 and 0 (the
+    // audit of lot 8b, F12: any success passed).
+    assert_eq!(
+        k.go(line),
+        Ok(Output::Msi {
+            address: 0,
+            data: 0
+        })
+    );
 }
 
 #[test]
@@ -465,4 +473,39 @@ fn arrival_on_a_dying_notify_is_handled_as_on_an_idle_irq() {
     k.make(Notify, 94);
     k.ok(bind(40, 94));
     assert_eq!(k.go(Syscall::Poll(s(94))), Ok(Output::Word(1)));
+}
+
+/// x86-64, kind 3 of the source word (D-161 (3)): a core event with event
+/// 1 is claimed where the processor has one, with no remapping entry and no
+/// unit asked, its message words 0 and 0; another event is `invalid`, a
+/// processor without the event `unsupported` (Unlike cores). (The audit of
+/// lot 8b, F5: `KIND_CORE_EVENT` was in no test of `tests/`.)
+#[test]
+fn a_core_event_is_claimed_with_event_1_only_and_only_where_the_processor_has_one() {
+    let raw = |event: u64| IrqSource::KIND_CORE_EVENT | event << 8;
+    let claim_raw = |source: u64, slot: u32| Syscall::IrqClaim {
+        control: s(CONTROL),
+        source,
+        core: 0,
+        vector: 48,
+        destination: s(slot),
+    };
+    let mut k = K::new();
+    assert!(!Machine::example().core_events);
+    k.no(claim_raw(raw(1), 40), Error::Unsupported);
+    let mut machine = Machine::example();
+    machine.core_events = true;
+    let mut k = K::on(&machine);
+    for event in [0, 2, 0xff] {
+        k.no(claim_raw(raw(event), 40), Error::Invalid);
+    }
+    let claimed = k.m.apply(k.t, claim_raw(raw(1), 40));
+    assert_eq!(
+        claimed,
+        Ok(Output::Msi {
+            address: 0,
+            data: 0
+        })
+    );
+    assert_eq!(k.m.check(), Ok(()));
 }

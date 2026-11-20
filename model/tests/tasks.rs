@@ -546,6 +546,10 @@ fn revoked_task_is_gone_before_its_kind_and_rights_are_judged() {
         badge: 0,
     });
     k.no(mark(41, U), Error::Denied);
+    // Named where a thread is asked: its kind is judged (the audit of lot
+    // 8b, F12: only the rights were tried).
+    k.no(Syscall::ThreadSuspend(s(41)), Error::Invalid);
     k.ok(Syscall::TaskRevoke(s(40)));
     k.no(mark(41, U), Error::Gone);
+    k.no(Syscall::ThreadSuspend(s(41)), Error::Gone);
 }
