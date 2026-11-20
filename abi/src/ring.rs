@@ -69,14 +69,9 @@ pub enum Ring {
 /// - `RevokeStep`: 1 if the root remote capability was removed, else 0.
 /// - `Release`, `Signal`: the grant index (0-11) and its serial (12-41).
 /// - `UnitRequest`: the role (0-15), the epoch (16-44) and the operation
-///   (48-55); then two operands, as the table of words by kind gives it.
-///   CONTRACT-GAP 53 (What crosses between nodes, the table of words by
-///   kind; Devices and shared hardware, the request record, D-151): since
-///   D-151 the holder reads the operation and its operands from the
-///   request record, and "The `UnitRequest` names the entry and its serial
-///   (its operand words are 0 and unread)"; the table still gives the
-///   words above and no place for the entry or the serial. Left as the
-///   table gives it, three words.
+///   (48-55); then the index of its entry in the requester's unit request
+///   table (0-5); then the serial of the entry's state word (0-60); no
+///   operand ([`UnitRequestWords`], D-160).
 /// - `UnitAnswer`: the result (`UnitResult`), then its value.
 /// - `Handed`, `ReportAsk`: the role (0-15) and the epoch (16-44); a
 ///   `ReportAsk` adds the key it asks from.
@@ -193,19 +188,12 @@ pub const fn ring_fits(
 }
 
 /// The consumer index the receiver starts from (What crosses between
-/// nodes): a producer index behind the consumer index moves the consumer to
-/// the producer (D-141); a producer index more than the ring's entries ahead
-/// of the consumer moves the consumer to the producer minus the ring's
-/// entries (D-131); otherwise it stays. Every difference is taken modulo
-/// 2^64.
-///
-/// CONTRACT-GAP 52 (What crosses between nodes, "every difference of two
-/// indices is taken modulo 2^64"): modulo 2^64 a producer behind the
-/// consumer is also more than the ring's entries ahead of it, and taken in
-/// the order written ("first moves") the behind rule never applies. Read as
-/// the model read it since D-141: behind when the consumer leads by 1 to
-/// the ring's entries; a consumer further ahead reads as a producer more
-/// than the ring's entries ahead.
+/// nodes): a producer index **behind** the consumer index (the consumer
+/// minus the producer, modulo 2^64, 1 to the ring's entries) moves the
+/// consumer to the producer (D-141); otherwise a producer index more than
+/// the ring's entries ahead of the consumer moves the consumer to the
+/// producer minus the ring's entries (D-131); otherwise it stays. The two
+/// are judged in that order (D-160, settling gap 52).
 pub const fn ring_resync(produced: u64, consumed: u64, entries: u64) -> u64 {
     let behind = consumed.wrapping_sub(produced);
     if behind != 0 && behind <= entries {
@@ -328,6 +316,66 @@ pub enum UnitOperation {
     Redirection = 5,
 }
 
+/// The three words after the header of a `UnitRequest` (What crosses
+/// between nodes, the table of words by kind, row 4; D-160, settling gap
+/// 53): the role (bits 0-15), the epoch (16-44) and the operation (48-55);
+/// then the index of the request's entry in the requester's unit request
+/// table (0-5); then the serial of that entry's state word (0-60); every
+/// other bit 0. The operation is a copy for the holder's trace: the
+/// holder's gate takes the operation and its operands from the request
+/// record alone (D-151), and answers only a record whose state word reads
+/// this serial with *open*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitRequestWords {
+    pub role: u16,
+    pub epoch: u32,
+    pub operation: u8,
+    pub entry: u8,
+    pub serial: u64,
+}
+
+/// The widths of the fields of a `UnitRequest` (D-160).
+const UNIT_REQUEST_EPOCH_MASK: u64 = (1 << 29) - 1;
+const UNIT_REQUEST_ENTRY_MASK: u64 = (1 << 6) - 1;
+const UNIT_REQUEST_SERIAL_MASK: u64 = (1 << 61) - 1;
+/// The bits of word 0 that hold a field: the role, the epoch, the
+/// operation.
+const UNIT_REQUEST_WORD0: u64 = 0xFFFF | UNIT_REQUEST_EPOCH_MASK << 16 | 0xFF << 48;
+
+impl UnitRequestWords {
+    /// The words, or `None` if a field is past its width.
+    pub const fn words(self) -> Option<[u64; 3]> {
+        let (epoch, entry) = (self.epoch as u64, self.entry as u64);
+        if epoch > UNIT_REQUEST_EPOCH_MASK
+            || entry > UNIT_REQUEST_ENTRY_MASK
+            || self.serial > UNIT_REQUEST_SERIAL_MASK
+        {
+            return None;
+        }
+        let word0 = self.role as u64 | epoch << 16 | (self.operation as u64) << 48;
+        Some([word0, entry, self.serial])
+    }
+
+    /// The request the words name, or `None` if a bit outside its fields
+    /// is set: such a message changes nothing (D-160).
+    pub const fn from_words(words: [u64; 3]) -> Option<Self> {
+        let [word0, entry, serial] = words;
+        if word0 & !UNIT_REQUEST_WORD0 != 0
+            || entry & !UNIT_REQUEST_ENTRY_MASK != 0
+            || serial & !UNIT_REQUEST_SERIAL_MASK != 0
+        {
+            return None;
+        }
+        Some(Self {
+            role: word0 as u16,
+            epoch: ((word0 >> 16) & UNIT_REQUEST_EPOCH_MASK) as u32,
+            operation: (word0 >> 48) as u8,
+            entry: entry as u8,
+            serial,
+        })
+    }
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -391,7 +439,7 @@ mod proofs {
             assert!(start == consumed);
         }
         // A producer behind the consumer moves the consumer to it (D-141,
-        // read by CONTRACT-GAP 52): nothing is read that was not produced.
+        // judged first, D-160): nothing is read that was not produced.
         let behind = consumed.wrapping_sub(produced);
         if behind != 0 && behind <= entries {
             assert!(start == produced);
@@ -453,5 +501,25 @@ mod proofs {
         // item, 2 + 3 × 28 = 86 words (F-10: the proof counted 85).
         assert!(message_entries(2 + 3 * 28) <= RING_MESSAGE_ENTRIES_MAX);
         assert!(message_entries(0) == 1);
+    }
+
+    /// D-160: a `UnitRequest` whose fields fit reads back; words read back
+    /// as the words written, and a bit outside the fields reads as none.
+    #[kani::proof]
+    fn a_unit_request_reads_back() {
+        let request = UnitRequestWords {
+            role: kani::any(),
+            epoch: kani::any(),
+            operation: kani::any(),
+            entry: kani::any(),
+            serial: kani::any(),
+        };
+        if let Some(words) = request.words() {
+            assert!(matches!(UnitRequestWords::from_words(words), Some(r) if r == request));
+        }
+        let words: [u64; 3] = [kani::any(), kani::any(), kani::any()];
+        if let Some(read) = UnitRequestWords::from_words(words) {
+            assert!(matches!(read.words(), Some(w) if w == words));
+        }
     }
 }

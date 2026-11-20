@@ -770,3 +770,64 @@ fn kernel_refuses_a_sixty_four_kb_granule() {
     machine.crash = (machine.crash.0.next_multiple_of(chunk), None);
     assert_eq!(Model::boot(&machine).err(), Some(Refusal::MachineValues));
 }
+
+/// A machine of `Machine::example` whose `BootPorts` lists `ranges`, each
+/// (first port, log2 of its count), its console a UART at 0x3F8.
+fn with_ports(ranges: &[(u16, u8)]) -> Machine {
+    let mut machine = Machine::example();
+    machine.console_port = Some(0x3F8);
+    machine.boot_ports.count = ranges.len() as u32;
+    for (entry, &(first, log2)) in machine.boot_ports.ranges.iter_mut().zip(ranges) {
+        (entry.first, entry.log2) = (first, log2);
+    }
+    machine
+}
+
+// D-160, gap 54 (I/O ports, Port entries): a `BootPorts` of aligned ranges
+// over no other and no kernel port is accepted.
+#[test]
+fn the_machine_starts_with_boot_ports_in_range() {
+    let machine = with_ports(&[(0x60, 0), (0x2F8, 3), (0x1000, 12)]);
+    assert!(Model::boot(&machine).is_ok());
+}
+
+// D-160, gap 54: "The machine start-up refuses to start, as for a value
+// of the machine outside its range" when the number is above 64, a log2
+// is above 16, a first port is not a multiple of its range's size, two
+// ranges overlap, a range covers a kernel port (the PIC, the console's
+// UART), or a reserved field or an entry past the number is not 0. (A
+// range that ends past port 65,535 is one whose first port is not a
+// multiple of its size.)
+#[test]
+fn the_machine_start_up_refuses_boot_ports_out_of_range() {
+    let mut over = with_ports(&[]);
+    over.boot_ports.count = 65;
+    let mut reserved = with_ports(&[(0x60, 0)]);
+    reserved.boot_ports.reserved = 1;
+    let mut byte = with_ports(&[(0x60, 0)]);
+    byte.boot_ports.ranges[0].reserved = 1;
+    let mut past = with_ports(&[(0x60, 0)]);
+    past.boot_ports.ranges[1].log2 = 2;
+    let refused = [
+        ("number above 64", over),
+        ("log2 above 16", with_ports(&[(0, 17)])),
+        ("first port not aligned", with_ports(&[(0x62, 2)])),
+        ("past port 65,535", with_ports(&[(0xC000, 15)])),
+        (
+            "two ranges overlap",
+            with_ports(&[(0x1000, 8), (0x1080, 4)]),
+        ),
+        ("over the PIC", with_ports(&[(0xA0, 1)])),
+        ("over the console", with_ports(&[(0x3F8, 0)])),
+        ("reserved word", reserved),
+        ("reserved byte", byte),
+        ("an entry past the number", past),
+    ];
+    for (why, machine) in refused {
+        assert_eq!(
+            Model::boot(&machine).err(),
+            Some(Refusal::MachineValues),
+            "{why}"
+        );
+    }
+}

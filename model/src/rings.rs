@@ -110,10 +110,15 @@ pub enum Body {
         grant: u16,
         serial: u32,
     },
+    /// The role, the epoch and the operation (a copy for the holder's
+    /// trace), the entry of the requester's unit request table and the
+    /// serial of its state word; no operand (D-160).
     UnitRequest {
         role: u16,
         epoch: u32,
         op: UnitOp,
+        entry: u8,
+        serial: u64,
     },
     UnitAnswer {
         result: UnitResult,
@@ -622,7 +627,7 @@ impl Model {
             let mut consumed = self.consumed(from, me, user);
             // A producer index behind the consumer, or more than the
             // ring's entries ahead of it, moves the consumer (D-131, D-141;
-            // `ring_resync`, CONTRACT-GAP 52).
+            // `ring_resync`, in that order, D-160).
             let start = ring_resync(produced, consumed, size);
             if start != consumed {
                 self.refused.0 += 1;
@@ -765,9 +770,13 @@ impl Model {
             } => self.revoke_received(from, (grant, serial, use_index), credit),
             Body::RevokeStep { removed } => self.revoke_answered(from, credit, removed),
             Body::Release { grant, serial } => self.release_received(from, grant, serial),
-            Body::UnitRequest { role, epoch, op } => {
-                self.unit_requested(from, credit, (role, epoch, op))
-            }
+            Body::UnitRequest {
+                role,
+                epoch,
+                entry,
+                serial,
+                ..
+            } => self.unit_requested(from, credit, (role, epoch), (entry, serial)),
             Body::UnitAnswer { result } => self.unit_answered(from, credit, result),
             Body::Handed { role, .. } => {
                 self.handed_applied.0 += 1;

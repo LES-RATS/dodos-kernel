@@ -163,6 +163,30 @@ pub(crate) struct RingPair {
 /// submitted and not yet confirmed (each with its submission instant and
 /// whether the unit will confirm it), and the node whose gate maps the
 /// unit's registers.
+/// The request record of an entry of a node slot's unit request table
+/// (Gate words, the request record and its state word; D-151, D-152):
+/// words 0 to 2, the role and the operation with its operands, written by
+/// the requester's gate only while the record is not *open*; and the state
+/// word: its serial, never reset, and its state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct UnitRecord {
+    pub(crate) role: usize,
+    pub(crate) op: Option<crate::rings::UnitOp>,
+    pub(crate) serial: u64,
+    pub(crate) state: RecordState,
+}
+
+/// The state of a request record's state word (bits 0-2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RecordState {
+    #[default]
+    Void,
+    Open,
+    Done,
+    Failed,
+    Refused,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct UnitState {
     pub(crate) entries: BTreeMap<u16, (u16, u32)>,
@@ -486,6 +510,9 @@ pub(crate) struct Table {
     /// table, as handles: set at a removal's answer *failed* and by R6,
     /// cleared only when the machine restarts (Interrupts, the irq, D-140).
     pub(crate) retired: BTreeSet<u16>,
+    /// The request records of each node slot's unit request table, by
+    /// entry (D-151).
+    pub(crate) unit_records: Vec<[UnitRecord; dodos_abi::UNIT_REQUESTS]>,
     /// The writes of ownership and identifier words since the last check of
     /// the invariants, and whether that check has run since (the next event
     /// then starts a new journal).
@@ -514,6 +541,49 @@ pub(crate) enum FenceStep {
 }
 
 impl Table {
+    /// The requester's gate writes words 0 to 2 of entry `entry` of
+    /// `node`'s record while it is not *open*, then opens it with the next
+    /// serial (Gate words, the request record, (*s*, not *open*) → (*s* +
+    /// 1, *open*)). Returns the serial opened.
+    pub(crate) fn open_unit_record(
+        &mut self,
+        node: u16,
+        entry: usize,
+        role: usize,
+        op: crate::rings::UnitOp,
+    ) -> u64 {
+        let record = &mut self.unit_records[usize::from(node)][entry];
+        assert!(
+            record.state != RecordState::Open,
+            "the words of an open record are written"
+        );
+        record.serial += 1;
+        (record.role, record.op, record.state) = (role, Some(op), RecordState::Open);
+        record.serial
+    }
+
+    /// The record of `node`'s entry `entry` if it reads `serial` with
+    /// *open*: the only record a holder answers (D-160).
+    pub(crate) fn open_record(&self, node: u16, entry: usize, serial: u64) -> Option<UnitRecord> {
+        let record = self.unit_records.get(usize::from(node))?.get(entry)?;
+        (record.state == RecordState::Open && record.serial == serial).then_some(*record)
+    }
+
+    /// The holder's gate answers the record of `node`'s entry `entry` from
+    /// (`serial`, *open*) only, to `state`; any other record is left as it
+    /// is.
+    pub(crate) fn answer_unit_record(
+        &mut self,
+        node: u16,
+        entry: usize,
+        serial: u64,
+        state: RecordState,
+    ) {
+        if self.open_record(node, entry, serial).is_some() {
+            self.unit_records[usize::from(node)][entry].state = state;
+        }
+    }
+
     pub(crate) fn member(&self, node: u16) -> Member {
         self.members[node as usize]
     }

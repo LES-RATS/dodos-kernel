@@ -820,14 +820,115 @@ pub const USE_ENTRY_BYTES: usize = 32;
 pub const DEVICE_TABLE_SPARE: usize = 8192;
 /// The most ranges of ports `BootPorts` lists, each cut into a port entry
 /// (x86-64; I/O ports, D-150).
-///
-/// CONTRACT-GAP 54 (Start-up state, the records of the boot image; I/O
-/// ports): the contract names `BootPorts`, "at most 64 ranges of ports",
-/// "each aligned on its power-of-two size, none over a kernel port", but
-/// gives no layout of the record (its size, and how a range is written: a
-/// first port and a count, or a first port and a log2). No record is
-/// defined here; `DeviceEntry::port` holds the entry each range becomes.
 pub const BOOT_PORTS_MAX: usize = 64;
+
+/// One range of `BootPorts` (4 bytes): its first port, the log2 of its
+/// number of ports (0 to 16) and a reserved byte of 0 (I/O ports, Port
+/// entries; D-160, settling gap 54).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootPortRange {
+    pub first: u16,
+    pub log2: u8,
+    pub reserved: u8,
+}
+
+/// The record `BootPorts` of the boot image (264 bytes, x86-64): the number
+/// of ranges, a reserved word of 0, then `BOOT_PORTS_MAX` ranges, those past
+/// the number 0 (I/O ports, Port entries; D-160, settling gap 54). The
+/// machine start-up cuts each range into a port entry
+/// (`DeviceEntry::port`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootPorts {
+    pub count: u32,
+    pub reserved: u32,
+    pub ranges: [BootPortRange; BOOT_PORTS_MAX],
+}
+
+impl Default for BootPorts {
+    /// No range.
+    fn default() -> Self {
+        Self {
+            count: 0,
+            reserved: 0,
+            ranges: [BootPortRange {
+                first: 0,
+                log2: 0,
+                reserved: 0,
+            }; BOOT_PORTS_MAX],
+        }
+    }
+}
+
+impl BootPorts {
+    /// Whether the machine start-up accepts the record (D-160): at most 64
+    /// ranges; each of at most 2^16 ports, its first port a multiple of its
+    /// size, ending at port 65,535 at most, over no other range and no
+    /// port of `kernel` (inclusive ranges: the legacy PIC, and the console
+    /// or the stub link when it is a UART on I/O ports); every reserved
+    /// field 0, and every entry past the number 0.
+    pub const fn valid(&self, kernel: &[(u64, u64)]) -> bool {
+        self.count as usize <= BOOT_PORTS_MAX
+            && self.reserved == 0
+            && Self::ranges_valid(&self.ranges, self.count as usize, kernel)
+    }
+
+    /// The ranges of `valid`: the first `count` well formed, over no other
+    /// and no port of `kernel`; the others 0.
+    const fn ranges_valid(ranges: &[BootPortRange], count: usize, kernel: &[(u64, u64)]) -> bool {
+        let mut i = 0;
+        while i < ranges.len() {
+            let range = ranges[i];
+            if i >= count {
+                if range.first != 0 || range.log2 != 0 || range.reserved != 0 {
+                    return false;
+                }
+                i += 1;
+                continue;
+            }
+            let Some((first, last)) = Self::span(range) else {
+                return false;
+            };
+            let mut k = 0;
+            while k < kernel.len() {
+                if first <= kernel[k].1 && kernel[k].0 <= last {
+                    return false;
+                }
+                k += 1;
+            }
+            let mut j = 0;
+            while j < i {
+                // Each earlier range already has its span.
+                let (other_first, other_last) = match Self::span(ranges[j]) {
+                    Some(span) => span,
+                    None => return false,
+                };
+                if first <= other_last && other_first <= last {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// The ports of a listed range, inclusive, if it is well formed: a log2
+    /// of 16 at most, its first port a multiple of its size, its reserved
+    /// byte 0. A first port below 2^16 that is a multiple of a size of at
+    /// most 2^16 ends the range at port 65,535 at most.
+    pub const fn span(range: BootPortRange) -> Option<(u64, u64)> {
+        if range.log2 > 16 || range.reserved != 0 {
+            return None;
+        }
+        let (first, size) = (range.first as u64, 1u64 << range.log2);
+        if first % size != 0 {
+            return None;
+        }
+        Some((first, first + size - 1))
+    }
+}
 /// The entries of the port table: one per port, 2 bytes each, in the global
 /// read-only set, naming the port entry of the port (I/O ports, D-150).
 pub const PORT_TABLE_ENTRIES: usize = 65_536;
@@ -2856,6 +2957,54 @@ mod proofs {
             let end = port as u128 + width as u128;
             let fits = matches!(width, 1 | 2 | 4) && first <= port && end - 1 <= last as u128;
             assert!(!fits || value.is_some_and(|v| v >> (8 * width) != 0));
+        }
+    }
+
+    /// D-160: a range `span` accepts is aligned on its size and ends at
+    /// port 65,535 at most.
+    #[kani::proof]
+    fn a_boot_port_range_is_aligned_and_inside_the_ports() {
+        let range = BootPortRange {
+            first: kani::any(),
+            log2: kani::any(),
+            reserved: kani::any(),
+        };
+        if let Some((first, last)) = BootPorts::span(range) {
+            let size = last - first + 1;
+            assert!(range.log2 <= 16 && size == 1 << range.log2);
+            assert!(first % size == 0 && last <= 0xFFFF);
+        }
+    }
+
+    /// D-160: ranges that `valid` accepts (here three, the loops of the
+    /// 64 being the same) are well formed, disjoint and over no kernel
+    /// port, and those past the number are 0.
+    #[kani::proof]
+    fn valid_boot_ports_are_disjoint_and_leave_the_kernel_ports() {
+        let ranges: [BootPortRange; 3] = core::array::from_fn(|_| BootPortRange {
+            first: kani::any(),
+            log2: kani::any(),
+            reserved: kani::any(),
+        });
+        let count: usize = kani::any();
+        kani::assume(count <= 3);
+        let kernel = crate::x86_64::KERNEL_PORTS;
+        if BootPorts::ranges_valid(&ranges, count, &kernel) {
+            for i in 0..3 {
+                if i >= count {
+                    assert!(ranges[i] == BootPortRange::default());
+                    continue;
+                }
+                let (first, last) = BootPorts::span(ranges[i]).expect("well formed");
+                for (low, high) in kernel {
+                    assert!(last < low || high < first);
+                }
+                for j in 0..i {
+                    let (other_first, other_last) =
+                        BootPorts::span(ranges[j]).expect("well formed");
+                    assert!(last < other_first || other_last < first);
+                }
+            }
         }
     }
 }

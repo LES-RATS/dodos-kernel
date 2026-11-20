@@ -523,8 +523,25 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   panicking; the grantee's R6 leaves a fenced granter's grant to that
   granter's own R6. Tests guard the serial of a late send answer, the
   line half of L4-02 and the x86-64 half of L4-08.
+- D-160. `ring_resync`'s order is the contract's now (no change). A
+  `UnitRequest` is the role, the epoch and the operation (a copy for the
+  trace), then the requester's entry and the serial of its record's state
+  word (`abi::UnitRequestWords`, which reads words with a bit outside
+  their fields as none). The node model gains the request records of
+  D-151 in the machine table (`Table::unit_records`): the requester's gate
+  opens its entry's record with the operation, the holder serves only a
+  record that reads the message's serial *open*, with the record's
+  operation, and its gate writes *done*, *failed* or *refused* as it
+  answers (*elsewhere* leaves it *open*); a fresh start voids the node's
+  open records. R0 of a holder that answered before it died ends the
+  request on the record's state, where sending it again would wait for
+  ever. `abi::BootPorts` is the 264-byte record with its check
+  (`BootPorts::valid`), and the machine start-up refuses a record out of
+  range on x86-64 (`Refusal::MachineValues`); the model still cuts no port
+  entry from it.
 - The scenarios are in `scenarios/pass32.rs`, `scenarios/pass32_node.rs`,
-  `scenarios/pass33.rs`, `gate/pass32_tests.rs` and `tests/calls.rs`.
+  `scenarios/pass33.rs`, `scenarios/pass22.rs`, `gate/pass32_tests.rs`,
+  `tests/calls.rs` and `tests/boot.rs`.
 
 ## Mutations shown equivalent
 
@@ -595,12 +612,15 @@ an exhaustion after a very long stop; the budgets of one exhaustion are
 bounded by `SCHED_MAX_DEBT`, the rest of the debt forgiven) and gap 51
 (`model/src/faults.rs`: a kept kind 9 of a thread that is not marked and
 has no context; kept until it is runnable with a configured context, not
-raised as the model first read it). Pass 33 found three, open: gap 52
-(`abi/src/ring.rs`: where a producer index "behind" the consumer ends
-and "more than the ring's entries ahead" begins, modulo 2^64), gap 53
-(`abi/src/ring.rs`: the words of a `UnitRequest` since D-151 moved its
-operands to the request record) and gap 54 (`abi/src/machine.rs`: the
-layout of the record `BootPorts`). Two earlier gaps were settled otherwise than the
+raised as the model first read it). Pass 33 found three, all settled by
+D-160 (no `CONTRACT-GAP` marker left; see Pass 34): gap 52
+(`abi/src/ring.rs`: *behind* is judged first, the consumer minus the
+producer 1 to the ring's entries, as the model read it), gap 53 (a
+`UnitRequest` names the requester's entry and the serial of its record's
+state word, and carries no operand) and gap 54 (`BootPorts`, 264 bytes,
+and what the machine start-up refuses). Pass 34 found one, open: gap 55
+(`model/src/units.rs`: a `UnitRequest` whose role is not its record's
+word 0). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

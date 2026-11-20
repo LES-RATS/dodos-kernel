@@ -1508,6 +1508,8 @@ impl Run {
                     let header =
                         RingHeader::new(NodeMessage::UnitRequest, 1, (f, fg), hg, Some((20, 1)));
                     let body = Body::UnitRequest {
+                        entry: 0,
+                        serial: 0,
                         role: IOMMU_ROLE as u16,
                         epoch,
                         op: crate::rings::UnitOp::Invalidate { domain: Some(1) },

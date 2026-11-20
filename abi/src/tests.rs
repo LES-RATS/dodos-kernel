@@ -2878,8 +2878,8 @@ fn a_producer_index_behind_the_consumer_moves_the_consumer_to_it() {
     // Across the wrap of the counts.
     assert_eq!(ring_resync(u64::MAX, 3, n), u64::MAX);
     assert_eq!(ring_resync(u64::MAX - 1, u64::MAX, n), u64::MAX - 1);
-    // CONTRACT-GAP 52: behind by more than the ring's entries reads as
-    // more than the ring's entries ahead.
+    // D-160 (gap 52): behind by more than the ring's entries reads as more
+    // than the ring's entries ahead.
     assert_eq!(ring_resync(c - n - 1, c, n), c - 2 * n - 1);
 }
 
@@ -3495,4 +3495,166 @@ fn a_sum_of_instants_saturates_at_the_time_limit() {
     assert_eq!(instant_after(TIME_LIMIT - 1, 1, 1), TIME_LIMIT);
     assert_eq!(instant_after(TIME_LIMIT - 2, 1, 1), TIME_LIMIT - 1);
     assert_eq!(instant_after(u64::MAX, u64::MAX, u64::MAX), TIME_LIMIT);
+}
+
+/// D-160, gap 53 (What crosses between nodes, the table of words by kind,
+/// row 4): a `UnitRequest` is three words: the role (0-15), the epoch
+/// (16-44) and the operation (48-55); then the entry index (0-5); then the
+/// serial of the entry's state word (0-60); the other bits 0.
+#[test]
+fn a_unit_request_is_its_role_epoch_operation_entry_and_serial() {
+    let request = UnitRequestWords {
+        role: 0xBEEF,
+        epoch: (1 << 29) - 1,
+        operation: UnitOperation::Redirection as u8,
+        entry: 63,
+        serial: (1 << 61) - 1,
+    };
+    let words = request.words().expect("in range");
+    assert_eq!(
+        words,
+        [0xBEEF | ((1 << 29) - 1) << 16 | 5 << 48, 63, (1 << 61) - 1]
+    );
+    assert_eq!(UnitRequestWords::from_words(words), Some(request));
+    // A field past its width is not written.
+    for wide in [
+        UnitRequestWords {
+            epoch: 1 << 29,
+            ..request
+        },
+        UnitRequestWords {
+            entry: 64,
+            ..request
+        },
+        UnitRequestWords {
+            serial: 1 << 61,
+            ..request
+        },
+    ] {
+        assert_eq!(wide.words(), None, "{wide:?}");
+    }
+}
+
+/// D-160, gap 53: "a message that names [...] bits outside its fields
+/// changes nothing": such words read as no request.
+#[test]
+fn a_unit_request_with_a_bit_outside_its_fields_reads_as_none() {
+    let words = [1 | 2 << 16 | 3 << 48, 4, 5];
+    assert!(UnitRequestWords::from_words(words).is_some());
+    for (word, bit) in [
+        (0, 45),
+        (0, 47),
+        (0, 56),
+        (0, 63),
+        (1, 6),
+        (1, 63),
+        (2, 61),
+        (2, 63),
+    ] {
+        let mut bad = words;
+        bad[word] |= 1 << bit;
+        assert_eq!(
+            UnitRequestWords::from_words(bad),
+            None,
+            "word {word} bit {bit}"
+        );
+    }
+}
+
+/// A `BootPorts` listing `ranges`, each (first port, log2 of its count).
+fn boot_ports(ranges: &[(u16, u8)]) -> BootPorts {
+    let mut record = BootPorts {
+        count: ranges.len() as u32,
+        ..BootPorts::default()
+    };
+    for (entry, &(first, log2)) in record.ranges.iter_mut().zip(ranges) {
+        (entry.first, entry.log2) = (first, log2);
+    }
+    record
+}
+
+/// The kernel ports of a machine whose console is a UART at 0x3F8.
+const KERNEL_AND_CONSOLE: [(u64, u64); 3] = [(0x20, 0x21), (0xA0, 0xA1), (0x3F8, 0x3FF)];
+
+/// D-160, gap 54 (I/O ports, Port entries): `BootPorts` is 264 bytes: the
+/// number of ranges (u32), a reserved u32, then 64 entries of 4 bytes, the
+/// first port (u16), the log2 of the number of ports (u8) and a reserved
+/// byte.
+#[test]
+fn boot_ports_is_264_bytes_laid_out_as_the_contract_gives_it() {
+    use core::mem::offset_of;
+    assert_eq!(size_of::<BootPorts>(), 264);
+    assert_eq!(size_of::<BootPortRange>(), 4);
+    assert_eq!(
+        [
+            offset_of!(BootPorts, count),
+            offset_of!(BootPorts, reserved),
+            offset_of!(BootPorts, ranges),
+        ],
+        [0, 4, 8]
+    );
+    assert_eq!(
+        [
+            offset_of!(BootPortRange, first),
+            offset_of!(BootPortRange, log2),
+            offset_of!(BootPortRange, reserved),
+        ],
+        [0, 2, 3]
+    );
+    assert_eq!(BootPorts::default().ranges.len(), BOOT_PORTS_MAX);
+}
+
+/// D-160, gap 54: a record of aligned ranges that overlap neither each
+/// other nor a kernel port is valid, the whole space of ports included.
+#[test]
+fn boot_ports_of_aligned_disjoint_ranges_are_valid() {
+    let k = &KERNEL_AND_CONSOLE;
+    assert!(boot_ports(&[]).valid(k));
+    assert!(boot_ports(&[(0x60, 0), (0x64, 0), (0x2F8, 3), (0x1000, 12)]).valid(k));
+    assert!(boot_ports(&[(0xFFFF, 0), (0x4000, 14)]).valid(k));
+    assert!(boot_ports(&[(0x8000, 15)]).valid(k));
+    assert!(boot_ports(&[(0, 16)]).valid(&[]));
+}
+
+/// D-160, gap 54: the machine start-up refuses a record whose number is
+/// above 64, a log2 above 16, a first port not a multiple of its range's
+/// size, a range ending past port 65,535, two ranges that overlap, a range
+/// over a kernel port, or a reserved field or an entry past the number
+/// that is not 0.
+#[test]
+fn boot_ports_out_of_range_are_refused() {
+    let k = &KERNEL_AND_CONSOLE;
+    let mut over = boot_ports(&[]);
+    over.count = 65;
+    let mut reserved = boot_ports(&[(0x60, 0)]);
+    reserved.reserved = 1;
+    let mut byte = boot_ports(&[(0x60, 0)]);
+    byte.ranges[0].reserved = 1;
+    let mut past = boot_ports(&[(0x60, 0)]);
+    past.ranges[1].first = 0x64;
+    let mut past_log2 = boot_ports(&[]);
+    past_log2.ranges[63].log2 = 1;
+    let refused = [
+        ("number above 64", over),
+        ("log2 above 16", boot_ports(&[(0, 17)])),
+        ("first port not aligned", boot_ports(&[(0x62, 2)])),
+        (
+            "two ranges overlap",
+            boot_ports(&[(0x1000, 8), (0x1080, 4)]),
+        ),
+        ("the same range twice", boot_ports(&[(0x60, 0), (0x60, 0)])),
+        ("over the PIC", boot_ports(&[(0x20, 1)])),
+        ("over the console", boot_ports(&[(0x3F0, 4)])),
+        ("reserved word", reserved),
+        ("reserved byte", byte),
+        ("an entry past the number", past),
+        ("a log2 past the number", past_log2),
+    ];
+    for (why, record) in refused {
+        assert!(!record.valid(k), "{why}");
+    }
+    // A range that would end past port 65,535 cannot be aligned: the first
+    // port of a range of 2^16 ports is 0, of 2^15 ports 0 or 0x8000.
+    assert!(!boot_ports(&[(0x8000, 16)]).valid(&[]));
+    assert!(!boot_ports(&[(0xC000, 15)]).valid(&[]));
 }

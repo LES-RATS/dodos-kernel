@@ -186,7 +186,7 @@ fn a_request_to_a_failed_unit_during_its_hand_over_is_answered_failed() {
     let op = UnitOp::Invalidate { domain: Some(1) };
     m.sys
         .node_mut(1)
-        .unit_requested(0, Some((0, 1)), (IOMMU_ROLE as u16, epoch, op));
+        .unit_requested_with_record(0, Some((0, 1)), (IOMMU_ROLE as u16, epoch, op));
     let ring = &m.sys.node(1).table.rings[1][0].kernel;
     assert!(ring.produced > before);
     let answer = ring.at(ring.produced - 1);

@@ -177,6 +177,9 @@ pub struct Machine {
     /// I/O ports; the loader's seed of the boot identifier; the crash area
     /// of the previous boot, if one is valid.
     pub console_port: Option<u64>,
+    /// `BootPorts` (x86-64): the ranges of ports the machine start-up cuts
+    /// into port entries (I/O ports, Port entries; D-150, D-160).
+    pub boot_ports: dodos_abi::BootPorts,
     pub boot_seed: u64,
     pub previous_crash: Option<crate::debug::CrashArea>,
     pub perf_caps: u64,
@@ -388,6 +391,7 @@ impl Machine {
             replacement_reads_sealed: true,
             perf_request: true,
             console_port: None,
+            boot_ports: dodos_abi::BootPorts::default(),
             boot_seed: 0x005E_ED0F_B007,
             previous_crash: None,
             perf_caps: 0x0A_1E_28_30,
@@ -855,7 +859,8 @@ impl Machine {
     /// every window of `BootNodes` below 1024; the iospaces' width from the
     /// page's shift to 63; a unit's domain numbers from 16 to 65,536; each
     /// crash area on a chunk boundary, its range clear of every other kept
-    /// range (the other crash area, the kept ranges, the feedback tables).
+    /// range (the other crash area, the kept ranges, the feedback tables);
+    /// on x86-64 `BootPorts` (`BootPorts::valid`, D-160).
     fn values_in_range(&self) -> bool {
         let geometry = self.geometry;
         let chunk_shift = geometry.chunk_shift();
@@ -916,7 +921,31 @@ impl Machine {
                 .crash
                 .1
                 .is_none_or(|p| p.is_multiple_of(chunk) && clear(p, &others));
-        ends_fit && apart && width && kinds && windows && io_width && domains && crash
+        ends_fit
+            && apart
+            && width
+            && kinds
+            && windows
+            && io_width
+            && domains
+            && crash
+            && self.ports_in_range()
+    }
+
+    /// `BootPorts` on x86-64 (I/O ports, Port entries; D-160): the machine
+    /// start-up refuses to start, as for a value of the machine outside its
+    /// range, when the record is out of range or a range covers a kernel
+    /// port: the legacy PIC, and the console's UART when it lies on I/O
+    /// ports. The record is not read on another architecture.
+    fn ports_in_range(&self) -> bool {
+        if self.arch != Arch::X86_64 {
+            return true;
+        }
+        let mut kernel = dodos_abi::x86_64::KERNEL_PORTS.to_vec();
+        if let Some(base) = self.console_port {
+            kernel.push((base, base + dodos_abi::x86_64::UART_PORTS - 1));
+        }
+        self.boot_ports.valid(&kernel)
     }
 
     /// The refusals of the start-up, and the layout of the machine table.
@@ -1256,6 +1285,7 @@ impl Machine {
             irq_tables: Default::default(),
             aplic: Default::default(),
             retired: Default::default(),
+            unit_records: vec![[Default::default(); dodos_abi::UNIT_REQUESTS]; n],
             geometry: self.geometry,
             nodes: n as u16,
             floors: layout.floors.clone(),
@@ -1739,6 +1769,13 @@ impl Model {
             .map(|_| crate::rings::Peer::new())
             .collect();
         self.unit_requests = vec![None; dodos_abi::UNIT_REQUESTS];
+        // Fresh start: each *open* request record is written void, its
+        // serial kept (Gate words, the request record, column Fresh).
+        for record in &mut self.table.unit_records[usize::from(self.node)] {
+            if record.state == crate::table::RecordState::Open {
+                record.state = crate::table::RecordState::Void;
+            }
+        }
         self.built = self.table.generation(self.node);
         self.ready = true;
         // Debugging: each core that starts in a node keeps its debug area

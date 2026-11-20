@@ -597,7 +597,7 @@ pub(super) fn judged(
     // fault of its own.
     let checked = m.sys.check();
     let model = m.sys.node_mut(holder);
-    model.unit_requested(requester, Some((0, 1)), (role as u16, epoch, op));
+    model.unit_requested_with_record(requester, Some((0, 1)), (role as u16, epoch, op));
     assert_eq!(m.sys.check(), checked);
     let refused = m.sys.node(holder).refused.0 == before + 1;
     if refused {

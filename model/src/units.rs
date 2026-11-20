@@ -87,6 +87,9 @@ pub(crate) struct Served {
     pub(crate) role: usize,
     pub(crate) op: UnitOp,
     pub(crate) serial: u32,
+    /// The requester's entry and the serial of its record's state word,
+    /// which the holder's gate answers (D-151, D-160).
+    pub(crate) record: (usize, u64),
     /// The submission and its instant; `None` while kept for a rebuild.
     pub(crate) submitted: Option<(u64, u64)>,
 }
@@ -200,6 +203,7 @@ impl Model {
             then: chain.then,
             elsewhere: false,
         });
+        self.table.open_unit_record(self.node, index, role, op);
         if let Waiter::Thread(Some(thread)) = waiter {
             live(&mut self.threads, thread).wait = Wait::Unit(index);
             self.wait_mark(crate::locks::WaitKind::Unit);
@@ -248,6 +252,7 @@ impl Model {
             elsewhere: false,
             ..entry
         });
+        self.table.open_unit_record(self.node, index, role, op);
         self.unit_send_queued();
         true
     }
@@ -458,6 +463,8 @@ impl Model {
                 role: entry.role as u16,
                 epoch,
                 op: entry.op,
+                entry: index as u8,
+                serial: self.table.unit_records[usize::from(self.node)][index].serial,
             };
             let completes = Completes::Unit { entry: index };
             if let Ok(Some((credit, _))) = self.write_message(holder, body, Some(completes), None) {
@@ -566,9 +573,31 @@ impl Model {
         &mut self,
         from: u16,
         credit: Option<(u8, u32)>,
-        (role, epoch, op): (u16, u32, UnitOp),
+        (role, epoch): (u16, u32),
+        (entry, record): (u8, u64),
     ) {
         let Some((index, serial)) = credit else {
+            return;
+        };
+        // The holder's gate reads the request record, never the ring, and
+        // answers only a record whose state word reads the serial the
+        // message names with *open*: a message that names another serial
+        // changes nothing (Devices and shared hardware, the request record;
+        // D-151, D-160). The operation and its operands are the record's;
+        // the message's operation is a copy for the trace.
+        //
+        // CONTRACT-GAP 55 (What crosses between nodes, row 4; Gate words,
+        // the request record, row (s, open) → (s, done): "words 0 to 2"):
+        // the message names a role, the record's word 0 another, and the
+        // contract says which the holder judges only for the operation.
+        // Read here as before D-160: the kernel judges the role word of the
+        // message's role and epoch, and the record's role is not read.
+        let entry = usize::from(entry);
+        let Some(op) = self
+            .table
+            .open_record(from, entry, record)
+            .and_then(|r| r.op)
+        else {
             return;
         };
         let role = role as usize;
@@ -577,7 +606,7 @@ impl Model {
             w.state() == RoleState::Held && w.holder() == self.node && w.epoch() == epoch
         });
         let answer = |model: &mut Self, result| {
-            let _ = model.write_message(from, Body::UnitAnswer { result }, None, credit);
+            model.answer_unit(from, credit, (entry, record), result);
         };
         // The holder of a failed unit answers *failed*, during a hand-over
         // too: the answer is final, no requester is turned away (D-145).
@@ -592,6 +621,10 @@ impl Model {
         // 11), and the request is answered done (D-134).
         let requester = (from, self.table.generation(from));
         if !self.operands_allowed(role, op, requester) {
+            // (*s*, *open*) → (*s*, *refused*): the checks fail (Gate
+            // words, the request record).
+            let refused = crate::table::RecordState::Refused;
+            self.table.answer_unit_record(from, entry, record, refused);
             self.refused.0 += 1;
             self.trace(TraceCode::Refused, None, [u64::from(from), 4, role as u64]);
             return answer(self, UnitResult::Done);
@@ -614,9 +647,49 @@ impl Model {
                 role,
                 op,
                 serial,
+                record: (entry, record),
                 submitted,
             },
         );
+    }
+
+    /// A `UnitRequest` of `from` received by this holder, for the tests:
+    /// the requester's gate first opens a free record of its table that
+    /// names `op` (D-151), which the message then names (D-160).
+    #[cfg(test)]
+    pub(crate) fn unit_requested_with_record(
+        &mut self,
+        from: u16,
+        credit: Option<(u8, u32)>,
+        (role, epoch, op): (u16, u32, UnitOp),
+    ) {
+        let records = &self.table.unit_records[usize::from(from)];
+        let open = |r: &&crate::table::UnitRecord| r.state == crate::table::RecordState::Open;
+        let entry = records
+            .iter()
+            .position(|r| !open(&r))
+            .expect("a free entry");
+        let serial = self
+            .table
+            .open_unit_record(from, entry, usize::from(role), op);
+        self.unit_requested(from, credit, (role, epoch), (entry as u8, serial));
+    }
+
+    /// The holder answers a request of `peer`: its gate answers the record
+    /// from (*s*, *open*) at a done or a *failed* (Gate words, the request
+    /// record), then its kernel writes the `UnitAnswer`; *elsewhere* leaves
+    /// the record *open*, for the node that serves it.
+    fn answer_unit(
+        &mut self,
+        peer: u16,
+        credit: Option<(u8, u32)>,
+        (entry, serial): (usize, u64),
+        result: UnitResult,
+    ) {
+        if let Some(state) = record_state(result) {
+            self.table.answer_unit_record(peer, entry, serial, state);
+        }
+        let _ = self.write_message(peer, Body::UnitAnswer { result }, None, credit);
     }
 
     /// A `UnitAnswer` received by the requester, applied in the event that
@@ -657,6 +730,14 @@ impl Model {
         let Some(entry) = self.unit_requests[index].take() else {
             return;
         };
+        // The record no longer reads *open*: answered by the holder's gate,
+        // this node's own for a role it holds (the model keeps the answer
+        // in the message for another holder; D-151).
+        let serial = self.table.unit_records[usize::from(self.node)][index].serial;
+        if let Some(state) = record_state(result) {
+            self.table
+                .answer_unit_record(self.node, index, serial, state);
+        }
         // A claim goes on to its next unit, or to its line's redirection
         // entry, at a done or a *failed* alike (gap 12, D-134).
         let failed = result == UnitResult::Failed;
@@ -772,8 +853,7 @@ impl Model {
                 continue;
             };
             self.unit_service.remove(&(peer, credit));
-            let answer = Body::UnitAnswer { result };
-            let _ = self.write_message(peer, answer, None, Some((credit, entry.serial)));
+            self.answer_unit(peer, Some((credit, entry.serial)), entry.record, result);
             any = true;
         }
         let before: Vec<Option<UnitEntry>> = self.unit_requests.clone();
@@ -893,10 +973,8 @@ impl Model {
             .collect();
         for (peer, credit) in held {
             let entry = self.unit_service.remove(&(peer, credit)).expect("listed");
-            let answer = Body::UnitAnswer {
-                result: UnitResult::Failed,
-            };
-            let _ = self.write_message(peer, answer, None, Some((credit, entry.serial)));
+            let credit = Some((credit, entry.serial));
+            self.answer_unit(peer, credit, entry.record, UnitResult::Failed);
         }
     }
 
@@ -905,11 +983,38 @@ impl Model {
     /// itself); the entries of its own requests this node serves are
     /// dropped, with no answer.
     pub(crate) fn unit_r0(&mut self, peer: u16) {
-        for entry in self.unit_requests.iter_mut().flatten() {
-            if matches!(entry.stage, Stage::Sent { to, .. } if to == peer) {
-                entry.stage = Stage::Queued;
+        for index in 0..UNIT_REQUESTS {
+            let Some(entry) = self.unit_requests[index].as_mut() else {
+                continue;
+            };
+            if !matches!(entry.stage, Stage::Sent { to, .. } if to == peer) {
+                continue;
+            }
+            // A record the holder's gate answered before it died ends on
+            // its state word, which the requester's gate reads (Devices and
+            // shared hardware, the request record, D-151): sent again, no
+            // holder would answer a record no longer *open*.
+            let state = self.table.unit_records[usize::from(self.node)][index].state;
+            match state {
+                crate::table::RecordState::Done | crate::table::RecordState::Refused => {
+                    self.unit_complete(index, UnitResult::Done);
+                }
+                crate::table::RecordState::Failed => self.unit_complete(index, UnitResult::Failed),
+                _ => entry.stage = Stage::Queued,
             }
         }
         self.unit_service.retain(|&(from, _), _| from != peer);
+    }
+}
+
+/// The state the holder's gate writes in a request record's state word for
+/// an answer (Gate words, the request record): none for *elsewhere*, which
+/// leaves the record *open* for the node that serves it. A refusal of the
+/// checks writes *refused*, answered done to the kernel (D-134).
+fn record_state(result: UnitResult) -> Option<crate::table::RecordState> {
+    match result {
+        UnitResult::Done => Some(crate::table::RecordState::Done),
+        UnitResult::Failed => Some(crate::table::RecordState::Failed),
+        UnitResult::Elsewhere => None,
     }
 }

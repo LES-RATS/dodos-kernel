@@ -454,6 +454,8 @@ fn a_message_whose_sender_generation_is_not_current_is_refused() {
     // judged here.
     let request = |sender| {
         let body = Body::UnitRequest {
+            entry: 0,
+            serial: 0,
             role: 0,
             epoch: u32::MAX,
             op: crate::rings::UnitOp::Invalidate { domain: None },
@@ -482,6 +484,8 @@ fn a_message_to_an_earlier_generation_of_the_receiver_is_refused() {
     let mut m = two();
     let before = refused_count(&m, 1);
     let body = Body::UnitRequest {
+        entry: 0,
+        serial: 0,
         role: 0,
         epoch: u32::MAX,
         op: crate::rings::UnitOp::Invalidate { domain: None },
@@ -503,6 +507,8 @@ fn a_message_whose_kind_is_not_that_of_its_body_is_refused() {
     let mut m = two();
     let before = refused_count(&m, 1);
     let body = Body::UnitRequest {
+        entry: 0,
+        serial: 0,
         role: 0,
         epoch: u32::MAX,
         op: crate::rings::UnitOp::Invalidate { domain: None },

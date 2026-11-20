@@ -165,7 +165,7 @@ fn a_holder_answers_elsewhere_to_a_request_of_another_epoch_and_serves_one_of_it
             _ => None,
         })
     };
-    k.m.unit_requested(1, Some((0, 1)), (IOMMU_ROLE as u16, epoch + 7, op));
+    k.m.unit_requested_with_record(1, Some((0, 1)), (IOMMU_ROLE as u16, epoch + 7, op));
     assert_eq!(answer(&k), Some(dodos_abi::UnitResult::Elsewhere));
     assert!(
         k.m.table
@@ -173,7 +173,7 @@ fn a_holder_answers_elsewhere_to_a_request_of_another_epoch_and_serves_one_of_it
             .get(&IOMMU_ROLE)
             .is_none_or(|u| u.entries.is_empty())
     );
-    k.m.unit_requested(1, Some((1, 1)), (IOMMU_ROLE as u16, epoch, op));
+    k.m.unit_requested_with_record(1, Some((1, 1)), (IOMMU_ROLE as u16, epoch, op));
     // Served: submitted to the unit, answered done at its confirmation (the
     // final review's E35).
     assert!(k.m.unit_service.contains_key(&(1, 1)));

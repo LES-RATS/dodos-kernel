@@ -160,6 +160,8 @@ fn a_detach_written_on_a_third_nodes_ring_in_the_owners_name_is_refused() {
         root: 0,
     };
     let body = Body::UnitRequest {
+        entry: 0,
+        serial: 0,
         role: IOMMU_ROLE as u16,
         epoch,
         op,
@@ -375,6 +377,8 @@ fn a_unit_request_with_a_send_credit_is_refused() {
     let mut m = three();
     let epoch = m.sys.role(IOMMU_ROLE).epoch();
     let body = Body::UnitRequest {
+        entry: 0,
+        serial: 0,
         role: IOMMU_ROLE as u16,
         epoch,
         op: UnitOp::Invalidate { domain: Some(1) },
@@ -400,6 +404,8 @@ fn a_request_whose_answer_would_not_fit_is_refused() {
     });
     let epoch = m.sys.role(IOMMU_ROLE).epoch();
     let body = Body::UnitRequest {
+        entry: 0,
+        serial: 0,
         role: IOMMU_ROLE as u16,
         epoch,
         op: UnitOp::Invalidate { domain: Some(1) },
@@ -409,6 +415,104 @@ fn a_request_whose_answer_would_not_fit_is_refused() {
     m.sys.inject(0, 1, request);
     m.sys.settle(200);
     assert_eq!(m.sys.node(1).refused.0, before + 1);
+}
+
+// D-160, gap 53 (What crosses between nodes, row 4; Devices and shared
+// hardware, the request record, D-151): a `UnitRequest` names the entry
+// of the requester's table and the serial of its state word, and the
+// holder's gate answers only a record that reads that serial with *open*.
+// Node 0's gate opened entry 5 for an invalidation of a domain of its
+// range; a request naming the serial before it changes nothing on the
+// holder (no service, no answer, no refusal); the same request with the
+// record's serial is served, with the record's operation, whatever
+// operation the message copies.
+#[test]
+fn a_unit_request_naming_another_serial_changes_nothing() {
+    use super::pass32::drive;
+    use super::units::{IOMMU_ROLE, three};
+    let mut m = three();
+    let holder = m.sys.role(IOMMU_ROLE).holder();
+    assert_ne!(holder, 0);
+    let domain = *m.sys.node(holder).domain_range(0, 0).start();
+    let op = UnitOp::Invalidate {
+        domain: Some(domain),
+    };
+    let mut serial = 0;
+    m.sys
+        .edit_table(|t| serial = t.open_unit_record(0, 5, IOMMU_ROLE, op));
+    let epoch = m.sys.role(IOMMU_ROLE).epoch();
+    let request = |m: &S, serial, credit| {
+        let body = Body::UnitRequest {
+            role: IOMMU_ROLE as u16,
+            epoch,
+            op: UnitOp::Invalidate { domain: None },
+            entry: 5,
+            serial,
+        };
+        forged(
+            m,
+            NodeMessage::UnitRequest,
+            0,
+            holder,
+            Some((credit, 1)),
+            body,
+        )
+    };
+    let produced = |m: &S| {
+        m.sys.canonical().rings[usize::from(holder)][0]
+            .kernel
+            .produced
+    };
+    let (before, refused) = (produced(&m), m.sys.node(holder).refused.0);
+    let stale = request(&m, serial - 1, 3);
+    m.sys.inject(0, holder, stale);
+    let consumed = |m: &S| m.sys.node(holder).consumed(0, holder, false);
+    let to = consumed(&m) + 1;
+    assert!(drive(&mut m, &[holder], |m| consumed(m) >= to));
+    assert_eq!(m.sys.node(holder).unit_service.get(&(0, 3)), None);
+    assert_eq!(
+        (produced(&m), m.sys.node(holder).refused.0),
+        (before, refused)
+    );
+    let record = m.sys.canonical().unit_records[0][5];
+    assert_eq!(record.state, crate::table::RecordState::Open);
+    let fresh = request(&m, serial, 4);
+    m.sys.inject(0, holder, fresh);
+    let served = |m: &S| m.sys.node(holder).unit_service.get(&(0, 4)).map(|s| s.op);
+    assert!(drive(&mut m, &[holder], |m| served(m).is_some()));
+    assert_eq!(served(&m), Some(op));
+}
+
+// D-151, the request record (Gate words): a record the holder's gate
+// answered ends the request on its state word, which the requester's gate
+// reads. The holder of the unit answers node 0's attach done (its record
+// reads done) and dies before node 0 reads the answer, which the dead
+// generation's ring no longer delivers; R0 ends the request done from the
+// record, where sending it again would wait for ever: no holder answers a
+// record that is no longer *open* (D-160).
+#[test]
+fn a_request_its_dead_holder_answered_ends_on_its_record() {
+    use super::pass32::drive;
+    use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach, three};
+    let mut m = three();
+    let holder = m.sys.role(IOMMU_ROLE).holder();
+    let killer = (0..3)
+        .find(|&n| n != 0 && n != holder)
+        .expect("a third node");
+    let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
+    m.ok(0, iospace);
+    let call = attach(&m, 0, IOSPACE, DEVICE);
+    assert_eq!(m.call(0, call), WAITS);
+    let index = m.sys.node(0).unit_requests.iter().position(Option::is_some);
+    let index = index.expect("the attach's entry");
+    let answered =
+        |m: &S| m.sys.canonical().unit_records[0][index].state == crate::table::RecordState::Done;
+    assert!(drive(&mut m, &[holder], answered), "never answered");
+    assert!(m.woken(0).is_none());
+    m.supervisor(killer, m.t[killer as usize]);
+    m.ok(killer, super::pass17::kill(holder));
+    m.run(100 * MS);
+    assert_eq!(m.woken(0), Some(&DONE));
 }
 
 // The ring's indices.
