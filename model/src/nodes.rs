@@ -206,39 +206,19 @@ impl Model {
         if image == dodos_abi::NODE_IMAGE_REPLACEMENT && !self.table.replacement {
             return Err(Error::Busy);
         }
-        // Effect. Fresh: in one gate call, the member word becomes starting
-        // (g + 1) with the class of the cores named, and each of their
-        // words joining; a compare-and-swap that fails puts the words back
-        // and the call is `busy`. Resume: starting (g), and each core word
-        // of the node owned → joining (D-158).
+        // Effect. Fresh: one gate call (`start_words`, D-161). Resume:
+        // starting (g), and each core word of the node owned → joining
+        // (D-158).
         let (next, cores) = match mode {
             NODE_START_FRESH => {
-                let next = generation.wrapping_add(1);
                 let class = cores
                     .iter()
                     .map(|&c| self.table.fence[c])
                     .min()
                     .unwrap_or(0);
-                let mut written = Vec::new();
-                for &core in &cores {
-                    let before = self.table.core_words[core];
-                    if !self
-                        .table
-                        .write_core(core, before, CoreWord::joining(target, next))
-                    {
-                        for (c, b) in written {
-                            self.table.core_words[c] = b;
-                        }
-                        return Err(Error::Busy);
-                    }
-                    written.push((core, before));
-                }
-                let starting =
-                    Member::new(MemberState::Starting, Evidence::None, DRIVER_NONE, next)
-                        .with_class(class);
-                self.table.write_member(self.node, target, starting);
+                self.start_words(target, member, class, &cores)?;
                 self.table.beacons[target as usize].panic = None;
-                (next, cores)
+                (generation.wrapping_add(1), cores)
             }
             _ => {
                 // A resume: starting (g) with the resume bit, so that other
@@ -286,6 +266,42 @@ impl Model {
                 image == dodos_abi::NODE_IMAGE_REPLACEMENT;
         }
         Ok(Output::Done)
+    }
+
+    /// The gate call of `node_start` mode 0 (The calls, `node_start`,
+    /// D-161): each word of the cores named from *free* to joining (N,
+    /// g + 1), by compare-and-swap, then, last, the member word from
+    /// `member` (dead (g), as the kernel read it) to starting (g + 1) with
+    /// `class`. If any compare-and-swap fails, the same call writes back to
+    /// *free* each word it wrote, leaves the member word, and is `busy`.
+    pub(crate) fn start_words(
+        &mut self,
+        target: u16,
+        member: Member,
+        class: u8,
+        cores: &[usize],
+    ) -> Result<(), Error> {
+        let next = member.generation().wrapping_add(1);
+        let joining = CoreWord::joining(target, next);
+        let free = CoreWord::free(false);
+        let mut written = Vec::new();
+        let cores_written = cores.iter().all(|&core| {
+            let wrote = self.table.write_core(core, free.raw(), joining);
+            if wrote {
+                written.push(core);
+            }
+            wrote
+        });
+        if cores_written && self.table.member(target) == member {
+            let starting = Member::new(MemberState::Starting, Evidence::None, DRIVER_NONE, next)
+                .with_class(class);
+            self.table.write_member(self.node, target, starting);
+            return Ok(());
+        }
+        for core in written {
+            self.table.write_core(core, joining.raw(), free);
+        }
+        Err(Error::Busy)
     }
 
     /// Whether a module of the kept image is flagged as a first service:

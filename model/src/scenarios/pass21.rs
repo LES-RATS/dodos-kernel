@@ -12,7 +12,7 @@ use dodos_abi::{AttachState, AttachWord, UnitResult};
 /// The detach operation of a device as an `iospace_attach` with iospace 0.
 /// Node 0 of four, with three IOMMU units, attaches the device through the
 /// first; returns the machine and the root its attach word names.
-fn attached_on_the_first_of_three_units() -> (S, u64) {
+pub(super) fn attached_on_the_first_of_three_units() -> (S, u64) {
     use super::units::{DEVICE, attached};
     let mut m = super::pass17::three_units();
     attached(&mut m, 0);

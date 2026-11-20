@@ -640,8 +640,11 @@ fn irq_source_follows_the_table_of_the_source_word() {
     assert!(line.is_line() && line.level() && line.active_low() && line.id() == 9);
     assert_eq!(IrqSource::from_raw(line.raw()), Ok(line));
     // A kind other than 1 to 3, a reserved bit, bits 8-9 on an MSI, a bit
-    // beyond the event on a core event.
+    // beyond the event on a core event, an event other than 1 (D-161).
     for raw in [
+        3,
+        0x203,
+        0xff03,
         0,
         4,
         1 << 10 | 2,

@@ -1054,13 +1054,14 @@ impl IrqSource {
     }
 
     /// `Invalid` for a kind other than 1, 2 or 3, a reserved bit set, bits
-    /// 8-9 set for an MSI, or any bit but the event set for a core event.
+    /// 8-9 set for an MSI, any bit but the event set for a core event, or
+    /// an event other than 1 (D-161).
     pub const fn from_raw(raw: u64) -> Result<Self, Error> {
         let reserved = raw >> 10 & 0x3f_ffff != 0;
         let valid = match raw & 0xff {
             Self::KIND_MSI => !reserved && raw & (Self::LEVEL | Self::ACTIVE_LOW) == 0,
             Self::KIND_LINE => !reserved,
-            Self::KIND_CORE_EVENT => raw >> 16 == 0,
+            Self::KIND_CORE_EVENT => raw >> 8 == CORE_EVENT_FEEDBACK as u64,
             _ => false,
         };
         if !valid {
@@ -1664,7 +1665,8 @@ mod proofs {
         assert!(line.level() == level && line.active_low() == low);
         let event: u8 = kani::any();
         let core = IrqSource::core_event(event);
-        assert!(IrqSource::from_raw(core.raw()) == Ok(core));
+        let read = IrqSource::from_raw(core.raw());
+        assert!((read == Ok(core)) == (event == CORE_EVENT_FEEDBACK));
         assert!(core.is_core_event() && core.event() == event && !core.level());
     }
 
@@ -1674,7 +1676,7 @@ mod proofs {
         if let Ok(source) = IrqSource::from_raw(raw) {
             let kind = raw & 0xff;
             assert!(kind >= 1 && kind <= 3 && source.raw() == raw);
-            assert!(kind != 3 || raw >> 16 == 0);
+            assert!(kind != 3 || raw >> 8 == CORE_EVENT_FEEDBACK as u64);
             assert!(kind == 3 || raw >> 10 & 0x3f_ffff == 0);
         }
     }

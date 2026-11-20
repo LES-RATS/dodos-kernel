@@ -15,8 +15,8 @@ use dodos_abi::{Evidence, FENCE_NS, IOMMU_WAIT_NS, NODE_STOP_SEAL, RoleState, SE
 /// IOAPIC, two reserves, the plain role `platform`.
 pub(super) const IOMMU_ROLE: usize = 0;
 pub(super) const IOAPIC_ROLE: usize = 1;
-const RESERVE: usize = 2;
-const PLATFORM: usize = 4;
+pub(super) const RESERVE: usize = 2;
+pub(super) const PLATFORM: usize = 4;
 pub(super) const IOSPACE: u32 = 150;
 pub(super) const DEVICE: u64 = 0x10;
 
@@ -358,14 +358,18 @@ fn a_plain_role_of_a_fenced_holder_can_be_claimed_a_reserve_role_only_once_it_is
     m.sys.hang(1, true);
     m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
-    m.settle();
     let plain = role_slot(&m, 0, PLATFORM);
     let reserve0 = role_slot(&m, 0, RESERVE);
-    // Fencing: the plain role is claimed; the reserve role is busy.
+    // Fencing: both are busy (D-161: fencing for a plain role too).
+    assert_eq!(m.state(1), MemberState::Fencing);
+    m.no(0, Syscall::RoleClaim(plain), Error::Busy);
+    m.no(0, Syscall::RoleClaim(reserve0), Error::Busy);
+    // Fenced, not yet dead: the plain role is claimed; the reserve role is
+    // busy (the audit's F11: this was asserted only if the node happened
+    // not to be dead yet).
+    assert!(m.step_until(|m| m.state(1) == MemberState::Fenced));
     assert!(m.call(0, Syscall::RoleClaim(plain)).is_ok());
-    if m.state(1) != MemberState::Dead {
-        m.no(0, Syscall::RoleClaim(reserve0), Error::Busy);
-    }
+    m.no(0, Syscall::RoleClaim(reserve0), Error::Busy);
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
     assert!(m.call(0, Syscall::RoleClaim(reserve0)).is_ok());

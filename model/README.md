@@ -560,6 +560,27 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   `scenarios/checker.rs`, `check/tests.rs`, `gate/pass32_tests.rs`,
   `tests/calls.rs` and `tests/boot.rs`.
 
+## Pass 35 (D-161, D-162, the audit of the tests)
+
+- D-161 (1). `node_start` mode 0's gate call (`Model::start_words`) writes
+  each core word from *free* to joining by compare-and-swap, then the
+  member word last, from dead (*g*) as the kernel read it; a failed
+  compare-and-swap writes back to *free* the words it wrote and leaves
+  the member word. The gate model holds no core words (its `fresh` writes
+  the member word only), so nothing there changes.
+- D-161 (2). `role_claim` of a plain role is `busy` while its holder or
+  target is fencing, and while it is unfenced until `FENCE_NS` +
+  `SETTLE_NS` have passed since the first fence action.
+- D-161 (3). The x86-64 source word accepts kind 3 with event 1 only
+  (`abi::IrqSource::from_raw`, its Kani proofs updated).
+- D-161 (4) and (5). The node model's `irq_claim` has no `its_table`
+  argument and no ARM64 LPI, so the order and codes of those checks have
+  no state there; the gate model's `its_claim` refuses an event beyond the
+  pinned table and another object, and pins last, as the contract has it.
+- D-162. The holder's gate answers *refused* a record whose word 0 names
+  another role than the message (`Model::unit_requested`).
+- The scenarios are in `scenarios/pass35.rs`.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a

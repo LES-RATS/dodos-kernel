@@ -584,20 +584,15 @@ impl Model {
         // message names with *open*: a message that names another serial
         // changes nothing (Devices and shared hardware, the request record;
         // D-151, D-160). The operation and its operands are the record's;
-        // the message's operation is a copy for the trace.
-        //
-        // CONTRACT-GAP 55 (What crosses between nodes, row 4; Gate words,
-        // the request record, row (s, open) → (s, done): "words 0 to 2"):
-        // the message names a role, the record's word 0 another, and the
-        // contract says which the holder judges only for the operation.
-        // Read here as before D-160: the kernel judges the role word of the
-        // message's role and epoch, and the record's role is not read.
+        // the message's operation is a copy for the trace. The kernel
+        // judges the role word of the message's role and epoch; the gate
+        // compares that role with the record's word 0 when it serves the
+        // message (D-162, below).
         let entry = usize::from(entry);
-        let Some(op) = self
-            .table
-            .open_record(from, entry, record)
-            .and_then(|r| r.op)
-        else {
+        let Some(opened) = self.table.open_record(from, entry, record) else {
+            return;
+        };
+        let Some(op) = opened.op else {
             return;
         };
         let role = role as usize;
@@ -618,9 +613,11 @@ impl Model {
         }
         // The holder's gate refuses operands that name what the requester
         // does not hold: nothing is written, the refusal is traced (code
-        // 11), and the request is answered done (D-134).
+        // 11), and the request is answered done (D-134). A record whose
+        // word 0 names another role than the message fails its checks as
+        // well (What crosses between nodes, row 4; D-162).
         let requester = (from, self.table.generation(from));
-        if !self.operands_allowed(role, op, requester) {
+        if opened.role != role || !self.operands_allowed(role, op, requester) {
             // (*s*, *open*) → (*s*, *refused*): the checks fail (Gate
             // words, the request record).
             let refused = crate::table::RecordState::Refused;

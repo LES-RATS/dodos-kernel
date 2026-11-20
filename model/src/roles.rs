@@ -64,23 +64,32 @@ impl Model {
         }
         if word.state() != RoleState::Vacant {
             let names = [word.holder(), word.target()];
+            let now = self.membership_now();
             let blocking = names
                 .iter()
                 .filter(|&&n| (n as usize) < self.table.members.len())
                 .any(|&n| {
-                    let state = self.table.member(n).state();
+                    let member = self.table.member(n);
+                    // Starting, live, sealing, sealed or fencing, for every
+                    // role (D-161: fencing for a plain role too).
                     let alive = matches!(
-                        state,
+                        member.state(),
                         MemberState::Starting
                             | MemberState::Live
                             | MemberState::Sealing
                             | MemberState::Sealed
+                            | MemberState::Fencing
                     );
-                    let fenced = matches!(
-                        state,
-                        MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
-                    );
-                    alive || (record.kind == RoleKind::Reserve && fenced)
+                    let fenced =
+                        matches!(member.state(), MemberState::Fenced | MemberState::Unfenced);
+                    // A plain role moves from an unfenced holder only once
+                    // `FENCE_NS` + `SETTLE_NS` have passed since the first
+                    // fence action (Roles, kinds of role, D-161).
+                    let unsettled = member.state() == MemberState::Unfenced
+                        && self.table.fences[n as usize]
+                            .begun(member.generation())
+                            .is_none_or(|begun| now < begun + FENCE_NS + SETTLE_NS);
+                    alive || (fenced && (record.kind == RoleKind::Reserve || unsettled))
                 });
             if blocking {
                 return Err(Error::Busy);
