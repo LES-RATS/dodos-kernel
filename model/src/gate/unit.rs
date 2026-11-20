@@ -225,12 +225,14 @@ impl Machine {
     }
 
     /// Each node's user space at start: a root at its table floor's third
-    /// page, bound to tag 1, a table at the fourth hooked at entry 0.
+    /// page, bound to tag 1 (tag 0 on an untagged machine), a table at the
+    /// fourth hooked at entry 0.
     pub(crate) fn with_spaces(mut self) -> Self {
+        let tag = usize::from(!self.is_untagged());
         for n in 0..self.layout.len() as u16 {
             let first = self.layout[usize::from(n)].floor.0;
             self.retype_root(n, first + 2).expect("a root");
-            self.bind(n, 1, first + 2).expect("bound");
+            self.bind(n, tag, first + 2).expect("bound");
             self.take_table(n, first + 3, LEVELS - 1).expect("a table");
             self.hook(n, first + 2, 0, first + 3).expect("hooked");
         }

@@ -760,17 +760,18 @@ impl GateWord {
     }
 }
 
-/// The number of tags the gate's tag table holds on a machine whose
+/// The number of entries the gate's tag table holds on a machine whose
 /// architecture gives `width` tag bits (12-bit PCIDs on x86-64, 8 or 16-bit
 /// ASIDs on ARM64, the ASID bits `satp` accepts on RISC-V), read at start:
 /// one tag is reserved for the gate and bound to no root, and the table
-/// holds at most `TAGS_USABLE_MAX` (G7, D-152, D-155).
+/// holds at most `TAGS_USABLE_MAX` (G7, D-152, D-155). Entry 0 is the
+/// kernel's own.
 ///
-/// With `ASIDLEN = 0` on RISC-V the gate reserves no ASID (a full
-/// `SFENCE.VMA` on every gate entry and exit), and the table holds its one
-/// tag, 0, shared by every root (D-157, settling gap 47).
+/// With a width below 2 (RISC-V only) the node runs untagged and the table
+/// holds entry 0 alone (The tag table, untagged mode; D-158, replacing
+/// D-157 (1), which gave such a machine one entry "shared by every root").
 pub const fn usable_tags(width: u32) -> u32 {
-    if width == 0 {
+    if tags_untagged(width) {
         return 1;
     }
     if width >= 12 {
@@ -780,13 +781,22 @@ pub const fn usable_tags(width: u32) -> u32 {
 }
 
 /// The tag the gate keeps for its own translation context: the one after
-/// the usable tags (`GATE_PCID` = 4,095 on x86-64); `None` where the
-/// architecture gives no tag bit (G7, D-155).
+/// the usable tags (`GATE_PCID` = 4,095 on x86-64); `None` in the untagged
+/// mode, where the gate reserves no tag and invalidates the core's whole
+/// TLB on every gate entry and exit (G7, D-155, D-158).
 pub const fn gate_tag(width: u32) -> Option<u32> {
-    if width == 0 {
+    if tags_untagged(width) {
         return None;
     }
     Some(usable_tags(width))
+}
+
+/// Whether a node of a machine with `width` tag bits runs untagged: "When
+/// the width read at start is below 2" (The tag table, untagged mode,
+/// D-158): with one bit the kernel, the gate and a user root cannot each
+/// have a tag. A fact of the machine, written at start and never changed.
+pub const fn tags_untagged(width: u32) -> bool {
+    width < 2
 }
 
 /// The most tags a tag table holds: 4,096 less the gate's (G7, D-155).
@@ -1334,7 +1344,8 @@ pub enum Transition {
 /// driver; every other row keeps both, except a start, which clears them,
 /// and a change of driver, which keeps the evidence. The fence class is
 /// written by a fresh start only, and every other row keeps it: a node's
-/// cores do not change while it lives.
+/// cores do not change while it lives. The resume bit is set in a resume's
+/// write and in no other.
 pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
     use MemberState::{Dead, Fenced, Fencing, Live, Sealed, Sealing, Starting, Unfenced};
     let (g, h) = (from.generation(), to.generation());
@@ -1342,7 +1353,7 @@ pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
     let kept = from.evidence() as u8 == to.evidence() as u8 && from.driver() == to.driver();
     let cleared = matches!(to.evidence(), Evidence::None) && to.driver() == DRIVER_NONE;
     let accused = !matches!(to.evidence(), Evidence::None) && to.driver() != DRIVER_NONE;
-    match (from.state(), to.state()) {
+    let row = match (from.state(), to.state()) {
         (Dead, Starting) if g.wrapping_add(1) == h && cleared => Some(Transition::Start),
         (Sealed, Starting) if same && cleared => Some(Transition::Resume),
         (Starting, Live) if same && kept => Some(Transition::Up),
@@ -1365,6 +1376,14 @@ pub const fn member_transition(from: Member, to: Member) -> Option<Transition> {
         (Unfenced, Fenced) if same && kept => Some(Transition::LateFence),
         (Fenced, Dead) if same && kept => Some(Transition::Reclaim),
         _ => None,
+    };
+    // The resume bit (The states of a node, D-144): "The gate composes the
+    // bit from the transition, never from an argument": 1 in the write of a
+    // resume, 0 in every other write.
+    match row {
+        Some(Transition::Resume) if !to.resuming() => None,
+        Some(row) if to.resuming() && !matches!(row, Transition::Resume) => None,
+        row => row,
     }
 }
 
@@ -1547,6 +1566,55 @@ impl CoreWord {
         matches!(self.state(), CoreState::Owned | CoreState::Joining)
             && self.slot() == slot
             && self.generation() == generation
+    }
+}
+
+/// The rows of the table of transitions of a core word (Node slots and core
+/// words). The gate checks the condition of each row besides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreTransition {
+    /// free → joining (N, g), by `node_start` mode fresh.
+    Join,
+    /// joining (N, g) → owned (N, g), by N's gate on that core.
+    Enter,
+    /// owned (N, g), no mark → joining (N, g), by `node_start` mode resume
+    /// (D-158).
+    Resume,
+    /// owned or joining (N, g) → the same with the mark, by the driver of
+    /// N's fence.
+    Mark,
+    /// a word naming (N, g) → free, keeping the flag unusable, by R6.
+    Free,
+    /// any → the same with the flag unusable: `node_stop` mode retire, or
+    /// the driver of a fence for a core not confirmed.
+    Unusable,
+}
+
+/// The gate's check of a core word's transition: the row of the table that
+/// changes `from` into `to`, `None` if none does. A row that names a node
+/// keeps its slot and generation, and every row keeps the flags it does not
+/// write; no row lowers the mark or writes *leaving*.
+pub const fn core_transition(from: CoreWord, to: CoreWord) -> Option<CoreTransition> {
+    use CoreState::{Free, Joining, Owned};
+    let named = from.slot() == to.slot() && from.generation() == to.generation();
+    let mark = (from.is_marked(), to.is_marked());
+    let unusable = (from.is_unusable(), to.is_unusable());
+    let kept = named && mark.0 == mark.1 && unusable.0 == unusable.1;
+    let free = to.slot() == CORE_NO_SLOT && to.generation() == 0 && !mark.1;
+    match (from.state(), to.state()) {
+        (Free, Joining) if !unusable.0 && !unusable.1 && !mark.1 => Some(CoreTransition::Join),
+        (Joining, Owned) if kept => Some(CoreTransition::Enter),
+        (Owned, Joining) if kept && !mark.0 => Some(CoreTransition::Resume),
+        (Owned | Joining, Free) if free && unusable.0 == unusable.1 => Some(CoreTransition::Free),
+        (Owned, Owned) | (Joining, Joining)
+            if named && unusable.0 == unusable.1 && !mark.0 && mark.1 =>
+        {
+            Some(CoreTransition::Mark)
+        }
+        (a, b) if a as u8 == b as u8 && named && mark.0 == mark.1 && !unusable.0 && unusable.1 => {
+            Some(CoreTransition::Unusable)
+        }
+        _ => None,
     }
 }
 
@@ -2283,7 +2351,8 @@ mod proofs {
                 assert!(to.generation() == from.generation().wrapping_add(1));
             }
             Some(Transition::Resume) => {
-                assert!(from.state() == Sealed && to.state() == Starting && same)
+                assert!(from.state() == Sealed && to.state() == Starting && same);
+                assert!(to.resuming());
             }
             Some(Transition::Up) => assert!(from.state() == Starting && to.state() == Live && same),
             Some(Transition::Seal) => {
@@ -2316,6 +2385,10 @@ mod proofs {
                 assert!(from.state() == Fenced && to.state() == Dead && same)
             }
             None => {}
+        }
+        // D-144: the bit is written by a resume and by no other row.
+        if let Some(row) = member_transition(from, to) {
+            assert!(to.resuming() == matches!(row, Transition::Resume));
         }
         if matches!(from.state(), Fenced | Unfenced | Dead)
             && matches!(to.state(), Live | Sealing | Sealed)
@@ -2371,6 +2444,43 @@ mod proofs {
         let word = if mark { word.marked() } else { word };
         let word = if unusable { word.unusable() } else { word };
         (word, slot, generation, mark, unusable)
+    }
+
+    /// Each row of the core word's table changes only what it writes: the
+    /// node named is kept, the mark is never lowered, *leaving* is never
+    /// written, and D-158's resume takes an unmarked owned word to joining.
+    #[kani::proof]
+    fn the_core_word_check_accepts_exactly_the_rows() {
+        let (from, _, _, _, _) = any_named_word();
+        let to = match kani::any::<u8>() % 3 {
+            0 => CoreWord::free(kani::any()),
+            _ => any_named_word().0,
+        };
+        let from = if kani::any() {
+            CoreWord::free(kani::any())
+        } else {
+            from
+        };
+        let Some(row) = core_transition(from, to) else {
+            return;
+        };
+        assert!(!from.is_marked() || to.is_marked() || to.state() == CoreState::Free);
+        assert!(to.state() != CoreState::Leaving);
+        let named = from.slot() == to.slot() && from.generation() == to.generation();
+        match row {
+            CoreTransition::Join => assert!(from.state() == CoreState::Free && !to.is_unusable()),
+            CoreTransition::Enter => assert!(named && to.state() == CoreState::Owned),
+            CoreTransition::Resume => {
+                assert!(from.state() == CoreState::Owned && !from.is_marked());
+                assert!(to.state() == CoreState::Joining && named && !to.is_marked());
+            }
+            CoreTransition::Mark => assert!(named && !from.is_marked() && to.is_marked()),
+            CoreTransition::Free => {
+                assert!(to.state() == CoreState::Free && to.slot() == CORE_NO_SLOT);
+                assert!(from.is_unusable() == to.is_unusable());
+            }
+            CoreTransition::Unusable => assert!(named && !from.is_unusable() && to.is_unusable()),
+        }
     }
 
     /// A core word read back, at the full widths of `CoreWord` (the eighth
@@ -2541,7 +2651,8 @@ mod proofs {
     }
 
     /// G7 (D-155): the tag table holds every tag of the width but the
-    /// gate's, at most 4,095, and the gate's tag is none of them.
+    /// gate's, at most 4,095, and the gate's tag is none of them; with
+    /// fewer than 2 bits there is no gate tag and one entry (D-158).
     #[kani::proof]
     fn the_gate_tag_is_outside_the_usable_tags() {
         let width: u32 = kani::any();
@@ -2549,12 +2660,14 @@ mod proofs {
         let usable = usable_tags(width);
         assert!(usable >= 1 && usable <= TAGS_USABLE_MAX);
         match gate_tag(width) {
+            // Tagged: the kernel's entry, at least one user tag, the gate's.
             Some(tag) => {
-                assert!(width != 0 && tag == usable);
+                assert!(width >= 2 && tag == usable && usable >= 3);
                 assert!(width >= 12 || u64::from(tag) == (1u64 << width) - 1);
                 assert!(tag <= 4095);
             }
-            None => assert!(width == 0 && usable == 1),
+            // Untagged (D-158): entry 0 alone, no tag for the gate.
+            None => assert!(width < 2 && usable == 1 && tags_untagged(width)),
         }
     }
 

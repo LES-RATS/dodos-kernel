@@ -19,11 +19,32 @@ impl Machine {
         require(p < self.layout[usize::from(n)].cores.len())
     }
 
-    /// Whether the entry of `tag` in node `n`'s tag table holds `root`; a
-    /// tag beyond the table holds nothing.
+    /// The check of every call that names a root and its tag: the entry of
+    /// `tag` in node `n`'s tag table holds `root` (a tag beyond the table
+    /// holds nothing). Untagged, in its place: the tag is 0, the root's
+    /// byte reads *live* or *dying* and the node owns the root (the tag
+    /// table, untagged mode, D-158).
     pub(super) fn tag_holds(&self, n: u16, tag: usize, root: Page) -> bool {
+        if self.is_untagged() {
+            let class = self.gate.classes.get(root as usize);
+            let live = matches!(class, Some(Class::Root(RootState::Live | RootState::Dying)));
+            return tag == 0 && live && self.holds(n, root);
+        }
         let tags = &self.gate.nodes[usize::from(n)].tags;
         tags.get(tag).is_some_and(|t| t.root == Some(root))
+    }
+
+    /// The call that loads the kernel's root on core `p`. Untagged, a root
+    /// load like any other: the core's loaded root written first, then its
+    /// whole TLB invalidated (D-158), so that it holds translations of the
+    /// root it has loaded and of no other.
+    fn load_kernel_root(&mut self, n: u16, p: usize) {
+        let kernel = self.layout[usize::from(n)].kernel_root;
+        self.gate.nodes[usize::from(n)].loaded[p] = (kernel, 0);
+        if self.is_untagged() && !self.old.untagged_load_keeps_the_tlb {
+            let core = self.core(n, p);
+            self.invalidate(core, Flush::All);
+        }
     }
 
     pub(super) fn class(&self, page: Page) -> Gated<Class> {
@@ -282,9 +303,18 @@ impl Machine {
 
     /// The asked set of a clearing call for a user tag: the tag's set less
     /// the caller and less each core whose idle mark the gate reads set,
-    /// whose owes bit it sets.
-    fn asked_for_tag(&mut self, n: u16, p: usize, tag: usize) -> BTreeSet<usize> {
+    /// whose owes bit it sets. Untagged: every other core of the node whose
+    /// loaded root is the root, read after the call cleared its entries; a
+    /// core that loads the root later invalidates in its load, and no owes
+    /// bit is set (the tag table, untagged mode, D-158).
+    fn asked_for_tag(&mut self, n: u16, p: usize, tag: usize, root: Page) -> BTreeSet<usize> {
         let node = &mut self.gate.nodes[usize::from(n)];
+        if dodos_abi::tags_untagged(self.tag_width) {
+            let cores = 0..node.loaded.len();
+            return cores
+                .filter(|&q| q != p && node.loaded[q].0 == root)
+                .collect();
+        }
         let mut asked = BTreeSet::new();
         for &q in &node.tags[tag].set.clone() {
             if q == p {
@@ -369,7 +399,7 @@ impl Machine {
             va: vec![(e0, e1)],
         };
         self.invalidate_here(n, p, &flush);
-        let asked = self.asked_for_tag(n, p, tag);
+        let asked = self.asked_for_tag(n, p, tag, root);
         let record = Clearing {
             leaves: vec![(page, counted)],
             ..Clearing::default()
@@ -415,7 +445,7 @@ impl Machine {
         let va: Vec<(usize, usize)> = (0..ENTRIES).map(|e1| (e0, e1)).collect();
         let flush = self.unhook_flush(tag, &va);
         self.invalidate_here(n, p, &flush);
-        let asked = self.asked_for_tag(n, p, tag);
+        let asked = self.asked_for_tag(n, p, tag, root);
         let record = Clearing {
             unhooked: vec![child],
             ..Clearing::default()
@@ -491,12 +521,22 @@ impl Machine {
     // The tag table.
 
     /// `bind(tag, root)`: the root *unbound* → *live*, the tag's entry 0
-    /// → (root, ∅). Tag 0 is the kernel's.
+    /// → (root, ∅). Tag 0 is the kernel's. Untagged, `bind(0, R)` is the
+    /// only bind: R from *unbound* to *live*, no entry written; a bind
+    /// that names another tag is `invalid` (D-158).
     pub(crate) fn bind(&mut self, n: u16, tag: usize, root: Page) -> Gated {
         self.writes(n)?;
+        if self.is_untagged() {
+            require(tag == 0 && self.holds(n, root))?;
+            return self.cas_class(
+                root,
+                Class::Root(RootState::Unbound),
+                Class::Root(RootState::Live),
+            );
+        }
         // G7 (D-155): one tag is the gate's own, bound to no kernel or user
         // root; the tag table holds the others.
-        let usable = tag < TAGS || (self.old.gate_tag_bound && tag == GATE_TAG);
+        let usable = tag < self.tags() || (self.old.gate_tag_bound && Some(tag) == self.gate_tag());
         require(tag != 0 && usable && self.holds(n, root))?;
         let entry = &self.gate.nodes[usize::from(n)].tags[tag];
         require(entry.root.is_none() && entry.set.is_empty())?;
@@ -516,10 +556,26 @@ impl Machine {
 
     /// The root load (G7): the root *live*, the tag's entry holding it; an
     /// owes bit invalidates every tag first; the core joins the tag's set.
+    /// Untagged, the load of (R, 0): R's byte *live* and the node owning
+    /// R; the core's loaded root written first, then its whole TLB
+    /// invalidated, then the root loaded, in one gate call; no set, and
+    /// the owes bit never set (D-158).
     pub(crate) fn load(&mut self, n: u16, p: usize, root: Page, tag: usize) -> Gated {
         self.writes_on(n, p)?;
+        if self.is_untagged() {
+            require(tag == 0 && self.holds(n, root))?;
+            require(self.class(root)? == Class::Root(RootState::Live))?;
+            let node = &mut self.gate.nodes[usize::from(n)];
+            node.idle[p] = IdleWord::default();
+            node.loaded[p] = (root, 0);
+            if !self.old.untagged_load_keeps_the_tlb {
+                let core = self.core(n, p);
+                self.invalidate(core, Flush::All);
+            }
+            return Ok(());
+        }
         // G7 (D-155): the gate never loads its own tag for a root.
-        require(tag < TAGS || (self.old.gate_tag_bound && tag == GATE_TAG))?;
+        require(tag < self.tags() || (self.old.gate_tag_bound && Some(tag) == self.gate_tag()))?;
         require(self.class(root)? == Class::Root(RootState::Live))?;
         require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
         let owes = self.gate.nodes[usize::from(n)].idle[p].owes;
@@ -538,10 +594,8 @@ impl Machine {
     /// set.
     pub(crate) fn idle(&mut self, n: u16, p: usize) -> Gated {
         self.writes_on(n, p)?;
-        let kernel = self.layout[usize::from(n)].kernel_root;
-        let node = &mut self.gate.nodes[usize::from(n)];
-        node.loaded[p] = (kernel, 0);
-        node.idle[p].idle = true;
+        self.load_kernel_root(n, p);
+        self.gate.nodes[usize::from(n)].idle[p].idle = true;
         Ok(())
     }
 
@@ -562,7 +616,6 @@ impl Machine {
                 continue;
             };
             let core = self.core(n, p);
-            let kernel = self.layout[usize::from(n)].kernel_root;
             match what {
                 // An asked core does on its own what the caller did: for a
                 // change that unhooked a table, RISC-V's whole-ASID fence
@@ -579,12 +632,12 @@ impl Machine {
                         && self.gate.nodes[usize::from(n)].loaded[p].0 == root
                         && self.class(root)? == Class::Root(RootState::Dying)
                     {
-                        self.gate.nodes[usize::from(n)].loaded[p] = (kernel, 0);
+                        self.load_kernel_root(n, p);
                     }
                     self.invalidate(core, Flush::Tag(tag));
                     // Out of the tag's set: a whole-tag invalidation while
-                    // its loaded tag is another.
-                    if self.gate.nodes[usize::from(n)].loaded[p].1 != tag {
+                    // its loaded tag is another. Untagged, no set is kept.
+                    if !self.is_untagged() && self.gate.nodes[usize::from(n)].loaded[p].1 != tag {
                         self.gate.nodes[usize::from(n)].tags[tag].set.remove(&p);
                     }
                 }
@@ -714,7 +767,7 @@ impl Machine {
     /// core left out would never leave the set.
     pub(crate) fn unbind(&mut self, n: u16, p: usize, tag: usize) -> Gated {
         self.writes_on(n, p)?;
-        require(tag != 0 && tag < TAGS)?;
+        require(tag != 0 && tag < self.tags())?;
         let Some(root) = self.gate.nodes[usize::from(n)].tags[tag].root else {
             return Err(Refused::Condition);
         };
@@ -741,6 +794,23 @@ impl Machine {
         )
     }
 
+    /// `unbind(0, R)` of the untagged mode: R from *live* to *unbound* at
+    /// once, with an empty asked set, on the condition that no core's
+    /// loaded root is R; otherwise `busy` (the tag table, D-158). No core
+    /// holds a translation of a root it has not loaded, so nothing is
+    /// invalidated.
+    pub(crate) fn unbind_root(&mut self, n: u16, p: usize, root: Page) -> Gated {
+        self.writes_on(n, p)?;
+        require(self.is_untagged() && self.holds(n, root))?;
+        let node = &self.gate.nodes[usize::from(n)];
+        require(!node.loaded.iter().any(|&(loaded, _)| loaded == root))?;
+        self.cas_class(
+            root,
+            Class::Root(RootState::Live),
+            Class::Root(RootState::Unbound),
+        )
+    }
+
     /// aspace root *live* → *dying*: the first step of the destruction,
     /// asking every core of the tag's set and every core whose loaded root
     /// is the root. A root *unbound* → *dying*: nothing to ask, no tag is
@@ -757,26 +827,37 @@ impl Machine {
             );
         }
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
-        let tag = self.tag_of(n, root).ok_or(Refused::Condition)?;
-        require(tag != 0)?;
+        // Untagged, every root is loaded with tag 0 and no entry names it:
+        // the asked set is the cores whose loaded root is the root, "the
+        // caller included when it has the root loaded" (D-158).
+        let untagged = self.is_untagged();
+        let tag = match untagged {
+            true => 0,
+            false => self.tag_of(n, root).ok_or(Refused::Condition)?,
+        };
+        require(untagged || tag != 0)?;
         self.cas_class(
             root,
             Class::Root(RootState::Live),
             Class::Root(RootState::Dying),
         )?;
         let node = &self.gate.nodes[usize::from(n)];
-        let mut asked: BTreeSet<usize> = node.tags[tag].set.clone();
+        let mut asked: BTreeSet<usize> = match untagged {
+            true => BTreeSet::new(),
+            false => node.tags[tag].set.clone(),
+        };
         asked.extend((0..node.loaded.len()).filter(|&q| node.loaded[q].0 == root));
         // The caller's own part (D-153, gap 26): it loads the kernel's
         // root if it had this one loaded, and invalidates the tag.
         if asked.remove(&p) {
-            let kernel = self.layout[usize::from(n)].kernel_root;
             if self.gate.nodes[usize::from(n)].loaded[p].0 == root {
-                self.gate.nodes[usize::from(n)].loaded[p] = (kernel, 0);
+                self.load_kernel_root(n, p);
             }
             let core = self.core(n, p);
             self.invalidate(core, Flush::Tag(tag));
-            self.gate.nodes[usize::from(n)].tags[tag].set.remove(&p);
+            if !untagged {
+                self.gate.nodes[usize::from(n)].tags[tag].set.remove(&p);
+            }
         }
         let record = Clearing {
             dying: Some(root),
@@ -793,7 +874,8 @@ impl Machine {
         self.writes(n)?;
         require(self.holds(n, root))?;
         require(self.class(root)? == Class::Root(RootState::Dying))?;
-        // The tag the root died under; none for a root that died unbound.
+        // The tag the root died under; none for a root that died unbound,
+        // nor untagged, where the last teardown call writes no entry (D-158).
         let tag = self.tag_of(n, root);
         let in_flight = self.gate.nodes[usize::from(n)].requests.iter().any(|r| {
             matches!(r, Request::InUse { what: Invalidates::Tag { root: r, .. }, .. } if *r == root)

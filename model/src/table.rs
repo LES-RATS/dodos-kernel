@@ -567,10 +567,22 @@ impl Table {
             .collect()
     }
 
-    /// The gate writes a core word by compare-and-swap; it refuses the
+    /// Whether a core word naming a node with a generation reads joining:
+    /// the node's starting → live waits until none does (The states of a
+    /// node, D-158).
+    pub(crate) fn joining(&self, node: u16, generation: u32) -> bool {
+        self.cores_of(node, generation).into_iter().any(|c| {
+            self.core_word(c)
+                .is_some_and(|w| w.state() == CoreState::Joining)
+        })
+    }
+
+    /// The gate writes a core word by compare-and-swap, on a row of the
+    /// table of its transitions (Node slots and core words): never the
     /// reserved state *leaving*.
     pub(crate) fn write_core(&mut self, core: usize, before: u64, after: CoreWord) -> bool {
-        if after.state() == CoreState::Leaving || self.core_words[core] != before {
+        let row = CoreWord::from_raw(before).and_then(|w| dodos_abi::core_transition(w, after));
+        if row.is_none() || self.core_words[core] != before {
             return false;
         }
         self.core_words[core] = after.raw();

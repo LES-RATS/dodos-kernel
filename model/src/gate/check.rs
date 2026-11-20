@@ -206,7 +206,8 @@ impl Machine {
 
     /// The tag table: a bound root reads *live* or *dying*; a root is
     /// bound to one tag at most; a core's loaded root is the root its
-    /// loaded tag's entry holds, or the kernel's with tag 0.
+    /// loaded tag's entry holds, or the kernel's with tag 0. Untagged
+    /// (D-158), `check_untagged` in its place.
     fn check_tags(&self) -> Check {
         for (n, node) in self.gate.nodes.iter().enumerate() {
             // A dead or accused node's gate part is never read again (its
@@ -218,7 +219,18 @@ impl Machine {
             ) {
                 continue;
             }
-            for (tag, entry) in node.tags.iter().enumerate().skip(1) {
+            // The width is a fact of the machine: the table has the entries
+            // of that width, and the gate's own tag after them if it has
+            // one (G7, D-155, D-158).
+            ensure(
+                node.tags.len() == self.tags() + usize::from(self.gate_tag().is_some()),
+                "TAG: a tag table that is not sized from the machine's tag width",
+            )?;
+            if self.is_untagged() {
+                self.check_untagged(n as u16, node)?;
+                continue;
+            }
+            for entry in node.tags.iter().skip(1) {
                 if let Some(root) = entry.root {
                     let class = self.gate.classes[root as usize];
                     ensure(
@@ -227,16 +239,17 @@ impl Machine {
                     )?;
                     let twice = node.tags.iter().filter(|t| t.root == Some(root)).count() > 1;
                     ensure(!twice, "TAG: a root bound to two tags")?;
-                    let _ = tag;
                 }
             }
             // G7 (D-155): the gate's own tag is bound to no root and loaded
             // for none.
-            ensure(
-                node.tags[GATE_TAG] == TagEntry::default()
-                    && node.loaded.iter().all(|&(_, tag)| tag != GATE_TAG),
-                "TAG: the gate's own tag bound to a root or loaded for one",
-            )?;
+            if let Some(gate) = self.gate_tag() {
+                ensure(
+                    node.tags[gate] == TagEntry::default()
+                        && node.loaded.iter().all(|&(_, tag)| tag != gate),
+                    "TAG: the gate's own tag bound to a root or loaded for one",
+                )?;
+            }
             for &(root, tag) in &node.loaded {
                 ensure(
                     node.tags[tag].root == Some(root),
@@ -249,7 +262,40 @@ impl Machine {
                     "LOADED: a core's loaded root is not a live or dying root",
                 )?;
             }
-            let _ = n;
+        }
+        Ok(())
+    }
+
+    /// The tag invariants of a node that runs untagged (the tag table,
+    /// untagged mode, D-158): the table holds entry 0 alone, the kernel's
+    /// root, and no set is kept; every root is loaded with tag 0; a core's
+    /// loaded root is the kernel's or a *live* or *dying* root the node
+    /// owns (an *unbound* root is loaded by no core: `unbind(0, R)` is
+    /// `busy` otherwise); the owes bit is never set. That a core holds
+    /// translations of the root it has loaded and of no other is
+    /// `check_reach`'s, which reads every translation of tag 0.
+    fn check_untagged(&self, n: u16, node: &NodeGate) -> Check {
+        let kernel = self.layout[usize::from(n)].kernel_root;
+        let entry_0 = TagEntry {
+            root: Some(kernel),
+            set: BTreeSet::new(),
+        };
+        ensure(
+            node.tags == [entry_0],
+            "UNTAGGED: the tag table holds more than the kernel's entry",
+        )?;
+        ensure(
+            node.idle.iter().all(|word| !word.owes),
+            "UNTAGGED: an owes bit is set",
+        )?;
+        for &(root, tag) in &node.loaded {
+            ensure(tag == 0, "UNTAGGED: a root loaded with a tag other than 0")?;
+            let class = self.gate.classes[root as usize];
+            let user = matches!(class, Class::Root(RootState::Live | RootState::Dying));
+            ensure(
+                root == kernel || user && self.holds(n, root),
+                "LOADED: a core's loaded root is not a live or dying root of its node",
+            )?;
         }
         Ok(())
     }

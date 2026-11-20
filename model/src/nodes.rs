@@ -213,7 +213,8 @@ impl Model {
         // Effect. Fresh: in one gate call, the member word becomes starting
         // (g + 1) with the class of the cores named, and each of their
         // words joining; a compare-and-swap that fails puts the words back
-        // and the call is `busy`. Resume: starting (g).
+        // and the call is `busy`. Resume: starting (g), and each core word
+        // of the node owned → joining (D-158).
         let (next, cores) = match mode {
             NODE_START_FRESH => {
                 let next = generation.wrapping_add(1);
@@ -255,7 +256,18 @@ impl Model {
                 .with_class(member.class())
                 .with_resume();
                 self.table.write_member(self.node, target, starting);
-                (generation, self.table.cores_of(target, generation))
+                // "The same gate call then writes each of those core words
+                // from *owned* to *joining*; a word that does not read
+                // *owned* (N, g) without the mark is left as it is" (The
+                // states of a node, D-158): each woken core writes itself
+                // owned through the entry stub.
+                let cores = self.table.cores_of(target, generation);
+                for &core in &cores {
+                    let before = self.table.core_words[core];
+                    self.table
+                        .write_core(core, before, CoreWord::joining(target, generation));
+                }
+                (generation, cores)
             }
         };
         // The caller writes each core's start request and starts it, in its
@@ -2053,7 +2065,9 @@ impl Model {
         if !steps {
             return any;
         }
-        if self.cores.iter().all(|c| !c.silent) {
+        // The gate's condition of starting → live: every core whose word
+        // names the node reads owned, none joining (D-158).
+        if !self.table.joining(me, member.generation()) {
             self.ready = true;
             self.resuming = false;
             self.sealed_view.clear();

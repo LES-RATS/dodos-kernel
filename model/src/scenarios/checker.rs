@@ -293,6 +293,22 @@ fn a_member_word_with_the_resume_bit_in_another_state_than_starting_is_reported(
     );
 }
 
+/// "starting (g) → live (g): Every core whose word names the node reads
+/// *owned*: none reads *joining*" (The states of a node, D-158), and no row
+/// writes a word joining under a node that is live, sealing or sealed.
+#[test]
+fn a_core_word_joining_under_a_live_node_is_reported() {
+    let mut m = S::two();
+    let word = dodos_abi::CoreWord::from_raw(m.sys.core_word(1)).expect("a word");
+    assert_eq!(word.state(), dodos_abi::CoreState::Owned);
+    let joining = dodos_abi::CoreWord::joining(word.slot(), word.generation());
+    m.sys.edit_table(|t| t.core_words[1] = joining.raw());
+    assert_eq!(
+        m.sys.check(),
+        Err("core word: joining under a node that is live, sealing or sealed".to_string())
+    );
+}
+
 /// R1's invalidation during a hand-over: judged by whether the node that
 /// hands still maps the unit (D-144).
 #[test]

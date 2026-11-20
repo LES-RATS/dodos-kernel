@@ -412,7 +412,10 @@ fn a_sealed_node_keeps_its_table_chunks_through_its_resume() {
 // for none, and the tag table holds the architecture's other tags.
 #[test]
 fn the_gates_own_tag_is_bound_to_no_root() {
-    assert_eq!((ARCH_TAGS, TAGS, GATE_TAG), (5, 4, 4));
+    let width_2 = Machine::new(2, 2, 8);
+    assert_eq!((width_2.tags(), width_2.gate_tag()), (3, Some(3)));
+    const TAGS: usize = 3;
+    const GATE_TAG: usize = TAGS;
     // As `abi/` sizes it: the tags of the width less the gate's, which is
     // the tag after them (`GATE_PCID` on x86-64).
     assert_eq!(dodos_abi::usable_tags(12), 4095);

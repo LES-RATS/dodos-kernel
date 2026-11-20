@@ -47,13 +47,14 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const ENTRIES: usize = 4;
 pub(crate) const LEVELS: u8 = 2;
 pub(crate) const PAGES_PER_CHUNK: u64 = 4;
-/// The tags of the small machine's architecture; one, the last, is the
-/// gate's own, bound to no kernel or user root, and the tag table holds
-/// the others (G7, D-155: `GATE_PCID` on x86-64, a reserved ASID on ARM64
-/// and RISC-V). Entry 0 is the kernel's own.
-pub(crate) const ARCH_TAGS: usize = 5;
-pub(crate) const TAGS: usize = ARCH_TAGS - 1;
-pub(crate) const GATE_TAG: usize = TAGS;
+/// The tag width of the small machine unless a test gives another: 2 bits,
+/// the smallest width with tags. The width is a fact of the machine, read
+/// at start (`Machine::tag_width`; G7, D-158): the tag table holds
+/// `usable_tags(width)` entries, entry 0 the kernel's own, and one tag
+/// after them is the gate's own, bound to no kernel or user root (D-155:
+/// `GATE_PCID` on x86-64, a reserved ASID on ARM64 and RISC-V); below 2
+/// bits the node runs untagged (`Machine::untagged`).
+pub(crate) const TAG_WIDTH: u32 = 2;
 
 /// A page number.
 pub(crate) type Page = u64;
@@ -415,6 +416,10 @@ pub(crate) struct OldRules {
     /// A chunk's counts left free between a give's call and its completion
     /// (the reading before D-153, gap 30).
     pub(crate) counts_free_during_give: bool,
+    /// A machine without tags run by the tagged rules: a root load that
+    /// does not invalidate the core's whole TLB (without D-158's untagged
+    /// mode).
+    pub(crate) untagged_load_keeps_the_tlb: bool,
     /// R1's invalidation of the interrupt entry cache covering only the
     /// handles the walk found present (the reading before D-153, gap 32).
     pub(crate) r1_present_handles_only: bool,
@@ -465,6 +470,11 @@ pub(crate) struct Machine {
     /// contain leaf page table entries" for the address when `rs1` is not
     /// `x0`; the Privileged Specification, `SFENCE.VMA`).
     pub(crate) riscv: bool,
+    /// The architecture's tag width, a fact of the machine read at start
+    /// and never changed (G7; the tag table, D-158): 12-bit PCIDs on
+    /// x86-64, 8 or 16-bit ASIDs on ARM64, the ASID bits `satp` accepts on
+    /// RISC-V. Below 2, the nodes run untagged.
+    pub(crate) tag_width: u32,
     /// The ICRs the gates composed: the sending node, the target core's
     /// number and the vector (x86-64, G10).
     pub(crate) icr: Vec<(u16, usize, u8)>,
@@ -515,16 +525,12 @@ impl Machine {
         }
         let nodes_gate = layout
             .iter()
-            .map(|l| {
-                let mut tags = vec![TagEntry::default(); ARCH_TAGS];
-                tags[0].root = Some(l.kernel_root);
-                NodeGate {
-                    loaded: vec![(l.kernel_root, 0); l.cores.len()],
-                    tags,
-                    requests: vec![Request::Free; l.cores.len()],
-                    pending: vec![BTreeSet::new(); l.cores.len()],
-                    idle: vec![IdleWord::default(); l.cores.len()],
-                }
+            .map(|l| NodeGate {
+                loaded: vec![(l.kernel_root, 0); l.cores.len()],
+                tags: Self::tag_table(TAG_WIDTH, l.kernel_root),
+                requests: vec![Request::Free; l.cores.len()],
+                pending: vec![BTreeSet::new(); l.cores.len()],
+                idle: vec![IdleWord::default(); l.cores.len()],
             })
             .collect();
         let mut not_data = vec![0; chunks as usize];
@@ -563,9 +569,50 @@ impl Machine {
             dev: devices::DeviceGate::new(nodes),
             ports: ports::PortGate::new(),
             riscv: false,
+            tag_width: TAG_WIDTH,
             icr: Vec::new(),
             chunks,
         }
+    }
+
+    /// The same machine, at start, on RISC-V hardware whose `satp` accepts
+    /// `width` ASID bits, fewer than 2: its nodes run untagged (the tag
+    /// table, untagged mode, D-158).
+    pub(crate) fn untagged(mut self, width: u32) -> Self {
+        assert!(dodos_abi::tags_untagged(width), "a width with tags");
+        self.riscv = true;
+        self.tag_width = width;
+        for (node, layout) in self.gate.nodes.iter_mut().zip(&self.layout) {
+            node.tags = Self::tag_table(width, layout.kernel_root);
+        }
+        self
+    }
+
+    /// A node's tag table at start and at a fresh start: zeroed, entry 0
+    /// the kernel's root. Tagged, it has the usable entries and, after
+    /// them, the place of the gate's own tag, which no rule writes;
+    /// untagged, entry 0 alone.
+    pub(crate) fn tag_table(width: u32, kernel_root: Page) -> Vec<TagEntry> {
+        let entries = dodos_abi::usable_tags(width) + u32::from(!dodos_abi::tags_untagged(width));
+        let mut tags = vec![TagEntry::default(); entries as usize];
+        tags[0].root = Some(kernel_root);
+        tags
+    }
+
+    /// Whether the nodes run untagged: a width below 2 (D-158).
+    pub(crate) fn is_untagged(&self) -> bool {
+        dodos_abi::tags_untagged(self.tag_width)
+    }
+
+    /// The entries of a node's tag table that a root can be bound or
+    /// loaded under, entry 0 included: the tags below this number.
+    pub(crate) fn tags(&self) -> usize {
+        dodos_abi::usable_tags(self.tag_width) as usize
+    }
+
+    /// The gate's own tag, if the width leaves it one (G7, D-155, D-158).
+    pub(crate) fn gate_tag(&self) -> Option<usize> {
+        dodos_abi::gate_tag(self.tag_width).map(|tag| tag as usize)
     }
 
     /// Node `n`'s kernel faulty (it skips what it likes; the gate model's

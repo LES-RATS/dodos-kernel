@@ -136,11 +136,9 @@ impl Machine {
         };
         if !self.old.fresh_keeps_gate_part {
             let cores = layout.cores.len();
-            let mut tags = vec![TagEntry::default(); ARCH_TAGS];
-            tags[0].root = Some(layout.kernel_root);
             self.gate.nodes[usize::from(n)] = NodeGate {
                 loaded: vec![(layout.kernel_root, 0); cores],
-                tags,
+                tags: Self::tag_table(self.tag_width, layout.kernel_root),
                 requests: vec![Request::Free; cores],
                 pending: vec![BTreeSet::new(); cores],
                 idle: vec![IdleWord::default(); cores],

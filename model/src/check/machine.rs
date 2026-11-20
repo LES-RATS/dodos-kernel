@@ -164,6 +164,20 @@ impl System {
                     "core word: a free word names a node",
                 )?;
             }
+            // A word joining since a start or a resume reads owned before
+            // its node is live (The states of a node, starting → live,
+            // D-158), and a seal keeps its cores owned.
+            if word.state() == CoreState::Joining {
+                let member = table.member(word.slot());
+                let up = matches!(
+                    member.state(),
+                    MemberState::Live | MemberState::Sealing | MemberState::Sealed
+                );
+                ensure(
+                    member.generation() != word.generation() || !up,
+                    "core word: joining under a node that is live, sealing or sealed",
+                )?;
+            }
             // The fence: "the driver raises p's park request, then marks
             // p's word, then stops p": a stop is never in flight under a
             // word that is not marked (the first verification's Test 4: a

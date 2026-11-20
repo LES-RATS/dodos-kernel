@@ -319,3 +319,60 @@ fn a_chunk_whose_give_is_in_flight_is_not_given_again_by_the_gate() {
     let free = dodos_abi::Ownership::free(dodos_abi::Owner::Node(1));
     assert_eq!(k.m.ownership(chunk), free.raw());
 }
+
+// D-158 (2), `node_start` mode resume: "The same gate call then writes each
+// of those core words from *owned* to *joining*"; a woken core writes
+// itself *owned* through the entry stub; starting → live needs "Every core
+// whose word names the node reads *owned*: none reads *joining*". Node 1
+// of two cores is sealed; core 2 hangs in its park and takes no wake. Core
+// 1 enters and writes itself owned; the node
+// stays starting while core 2 reads joining, and is accused with stale
+// after `START_NS` (lot 1, finding N-F08: the words stayed owned through
+// the seal, and the node went live with a core still parked).
+#[test]
+fn a_resumed_node_is_not_live_while_one_of_its_cores_has_not_woken() {
+    use super::pass17::{resume, seal};
+    use dodos_abi::{CoreState, CoreWord, Evidence, START_NS, SWEEP_NS};
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    let state = |m: &S, core: usize| CoreWord::from_raw(m.sys.core_word(core)).unwrap().state();
+    m.ok(0, seal(1));
+    m.run(3 * MS);
+    assert_eq!(m.state(1), MemberState::Sealed);
+    assert_eq!([state(&m, 1), state(&m, 2)], [CoreState::Owned; 2]);
+    m.hang(2, false);
+    m.ok(0, resume(1));
+    assert_eq!(m.state(1), MemberState::Starting);
+    assert_eq!([state(&m, 1), state(&m, 2)], [CoreState::Joining; 2]);
+    m.run(3 * MS);
+    assert_eq!(
+        [state(&m, 1), state(&m, 2)],
+        [CoreState::Owned, CoreState::Joining]
+    );
+    assert_eq!(m.state(1), MemberState::Starting);
+    // The heartbeat of core 2 observed at a sweep, unchanged `START_NS`
+    // later.
+    m.run(START_NS + SWEEP_NS + 250 * MS);
+    assert_eq!(m.sys.member(1).evidence(), Evidence::Stale);
+}
+
+// The gate writes a core word only on a row of its table (Node slots and
+// core words): at a resume, "a word that does not read *owned* (N, g)
+// without the mark is left as it is" (D-158), and no row writes *leaving*
+// or takes a word from one node to another.
+#[test]
+fn the_gate_writes_a_core_word_only_on_a_row_of_its_table() {
+    use dodos_abi::CoreWord;
+    let m = S::two();
+    let mut table = m.sys.canonical().clone();
+    let owned = CoreWord::from_raw(table.core_words[1]).expect("a word");
+    let (slot, generation) = (owned.slot(), owned.generation());
+    let joining = CoreWord::joining(slot, generation);
+    table.core_words[1] = owned.marked().raw();
+    assert!(!table.write_core(1, owned.marked().raw(), joining));
+    assert_eq!(table.core_words[1], owned.marked().raw());
+    table.core_words[1] = owned.raw();
+    assert!(!table.write_core(1, owned.raw(), CoreWord::joining(slot + 1, generation)));
+    assert!(!table.write_core(1, owned.raw(), CoreWord::free(true)));
+    assert!(table.write_core(1, owned.raw(), joining));
+    assert!(table.write_core(1, joining.raw(), owned));
+}

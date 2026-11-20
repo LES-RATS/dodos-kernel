@@ -1477,8 +1477,17 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
     let kill = |state, generation| m(state, Evidence::Kill, 1, generation);
     let rows = [
         (none(Dead, 3), none(Starting, 4), Transition::Start),
-        (none(Sealed, 3), none(Starting, 3), Transition::Resume),
+        (
+            none(Sealed, 3),
+            none(Starting, 3).with_resume(),
+            Transition::Resume,
+        ),
         (none(Starting, 3), none(Live, 3), Transition::Up),
+        (
+            none(Starting, 3).with_resume(),
+            none(Live, 3),
+            Transition::Up,
+        ),
         (none(Live, 3), none(Sealing, 3), Transition::Seal),
         (none(Sealing, 3), none(Sealed, 3), Transition::Sealed),
         (none(Sealing, 3), none(Live, 3), Transition::Abandon),
@@ -1524,7 +1533,19 @@ fn the_transition_check_accepts_the_rows_of_the_table() {
         (none(Live, 3), none(Sealed, 3)),
         (none(Starting, 3), none(Sealed, 3)),
         (none(Live, 3).with_class(2), none(Sealing, 3).with_class(1)),
-        (none(Sealed, 3).with_class(2), none(Starting, 3)),
+        (
+            none(Sealed, 3).with_class(2),
+            none(Starting, 3).with_resume(),
+        ),
+        // The resume bit (D-144): "resume bit 1 in the same write" of a
+        // resume, "resume bit 0" in a fresh start's starting and in every
+        // write that takes the word out of starting; "The gate composes the
+        // bit from the transition, never from an argument" (audit lot 2,
+        // F-04). This test first pinned a resume without the bit.
+        (none(Sealed, 3), none(Starting, 3)),
+        (none(Dead, 3), none(Starting, 4).with_resume()),
+        (none(Starting, 3), none(Live, 3).with_resume()),
+        (none(Live, 3), kill(Fencing, 3).with_resume()),
     ];
     for (from, to) in refused {
         assert_eq!(member_transition(from, to), None, "{from:?} {to:?}");
@@ -2620,6 +2641,53 @@ fn core_words_have_their_bits_and_refuse_a_bad_check() {
     assert!(word.unusable().is_unusable() && word.unusable().names(5, 9));
 }
 
+/// The rows of the core word's transitions (Node slots and core words),
+/// with D-158's resume: owned (N, g) without the mark to joining (N, g).
+#[test]
+fn the_core_word_check_accepts_the_rows_of_the_table() {
+    use CoreTransition::*;
+    let (owned, joining) = (CoreWord::owned(5, 9), CoreWord::joining(5, 9));
+    let rows = [
+        (CoreWord::free(false), joining, Join),
+        (joining, owned, Enter),
+        (owned, joining, Resume),
+        (owned, owned.marked(), Mark),
+        (joining, joining.marked(), Mark),
+        (owned.marked(), CoreWord::free(false), Free),
+        (joining.unusable(), CoreWord::free(true), Free),
+        (owned, owned.unusable(), Unusable),
+        (CoreWord::free(false), CoreWord::free(true), Unusable),
+        (joining.marked(), joining.marked().unusable(), Unusable),
+    ];
+    for (from, to, row) in rows {
+        assert_eq!(core_transition(from, to), Some(row), "{from:?} {to:?}");
+    }
+    let refused = [
+        // "owned (N, g), no mark": a marked word is the fence's.
+        (owned.marked(), joining.marked()),
+        (owned.marked(), joining),
+        // The same node and generation, the flags kept.
+        (owned, CoreWord::joining(5, 10)),
+        (owned, CoreWord::joining(6, 9)),
+        (owned.unusable(), joining),
+        (joining, CoreWord::owned(5, 10)),
+        // "the core is not unusable"; a free core joins unmarked.
+        (CoreWord::free(true), joining.unusable()),
+        (CoreWord::free(false), joining.marked()),
+        (CoreWord::free(false), owned),
+        // Free keeps the flag unusable.
+        (owned.unusable(), CoreWord::free(false)),
+        (owned, CoreWord::free(true)),
+        // A mark is lowered by no row, and *leaving* is written by none.
+        (owned.marked(), owned),
+        (owned, CoreWord::free(false).unusable().marked()),
+        (owned, owned),
+    ];
+    for (from, to) in refused {
+        assert_eq!(core_transition(from, to), None, "{from:?} {to:?}");
+    }
+}
+
 #[test]
 fn the_eleven_kinds_of_message_have_their_numbers_and_rings() {
     for (index, kind) in NodeMessage::ALL.into_iter().enumerate() {
@@ -3088,10 +3156,13 @@ fn floors_need_a_table_floor_of_at_least_one_chunk() {
 }
 
 /// D-155, G7: one tag is the gate's on each architecture, and the tag
-/// table holds the others, at most 4,095.
+/// table holds the others, at most 4,095. D-158 (the tag table, untagged
+/// mode, replacing D-157 (1)): with fewer than 2 tag bits the gate reserves
+/// no tag and the table holds entry 0 alone; this test pinned D-157's rule
+/// for a width of 1 (one usable tag and a gate tag) and changes with it.
 #[test]
 fn the_tag_table_leaves_the_gate_its_tag() {
-    use crate::{TAGS_USABLE_MAX, gate_tag, usable_tags};
+    use crate::{TAGS_USABLE_MAX, gate_tag, tags_untagged, usable_tags};
     assert_eq!(TAGS_USABLE_MAX, 4095);
     // x86-64: 12-bit PCIDs less `GATE_PCID`.
     assert_eq!(usable_tags(x86_64::PCID_BITS), 4095);
@@ -3102,14 +3173,21 @@ fn the_tag_table_leaves_the_gate_its_tag() {
     // ARM64: 8 or 16-bit ASIDs less the gate's.
     assert_eq!((usable_tags(8), gate_tag(8)), (255, Some(255)));
     assert_eq!((usable_tags(16), gate_tag(16)), (4095, Some(4095)));
-    // RISC-V: the ASID bits `satp` accepts; none, and no tag is reserved.
+    // RISC-V: the ASID bits `satp` accepts; with 2 or more the rules are
+    // the tagged ones, with fewer the node runs untagged.
     assert_eq!((usable_tags(4), gate_tag(4)), (15, Some(15)));
-    assert_eq!((usable_tags(1), gate_tag(1)), (1, Some(1)));
+    assert_eq!((usable_tags(2), gate_tag(2)), (3, Some(3)));
+    assert_eq!((usable_tags(1), gate_tag(1)), (1, None));
     assert_eq!((usable_tags(0), gate_tag(0)), (1, None));
     for width in 0..=64 {
         let usable = usable_tags(width);
         assert!((1..=TAGS_USABLE_MAX).contains(&usable), "width {width}");
         assert!(gate_tag(width).is_none_or(|tag| tag >= usable));
+        assert_eq!(tags_untagged(width), width < 2, "width {width}");
+        assert_eq!(gate_tag(width).is_none(), tags_untagged(width));
+        // Untagged, the table holds the kernel's entry alone; tagged, a
+        // user root has a tag beside the kernel's and the gate's.
+        assert_eq!(usable == 1, tags_untagged(width), "width {width}");
     }
 }
 

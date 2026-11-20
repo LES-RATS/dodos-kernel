@@ -24,8 +24,20 @@ fn faulty_kernels_keep_g_on_the_cpu_side() {
     assert!(done > 200 * 40, "only {done} calls performed");
 }
 
+/// The machine an exploration starts from: the small machine with its
+/// units and spaces, untagged when `DODOS_GATE_WIDTH` gives a width below 2
+/// (D-158).
+fn explored(width: Option<String>) -> Machine {
+    let m = Machine::new(2, 2, 8);
+    let m = match width.map(|w| w.parse::<u32>().expect("a width")) {
+        Some(width) if dodos_abi::tags_untagged(width) => m.untagged(width),
+        _ => m,
+    };
+    m.with_units().with_spaces()
+}
+
 /// Replays one seed of the exploration with its steps printed (a test's
-/// tool: `DODOS_GATE_SEED`).
+/// tool: `DODOS_GATE_SEED`, and `DODOS_GATE_WIDTH` for an untagged machine).
 #[test]
 fn replay_a_gate_seed() {
     let Some(seed) = std::env::var("DODOS_GATE_SEED")
@@ -38,7 +50,7 @@ fn replay_a_gate_seed() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(400);
-    let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
+    let mut m = explored(std::env::var("DODOS_GATE_WIDTH").ok());
     let mut rng = Rng(seed + 1);
     for step in 0..steps {
         let op = m.random_op(&mut rng);
@@ -653,7 +665,8 @@ fn a_seal_raises_every_park_request_of_its_node() {
     m.check().expect("the tables");
 }
 
-/// The long run of the exploration (`DODOS_GATE_SEEDS`, `DODOS_GATE_STEPS`).
+/// The long run of the exploration (`DODOS_GATE_SEEDS`, `DODOS_GATE_STEPS`,
+/// `DODOS_GATE_WIDTH`).
 #[test]
 #[ignore = "long: run with --release"]
 fn faulty_kernels_keep_g_long_run() {
@@ -666,8 +679,9 @@ fn faulty_kernels_keep_g_long_run() {
         number("DODOS_GATE_SEEDS", 5000),
         number("DODOS_GATE_STEPS", 800),
     );
+    let width = std::env::var("DODOS_GATE_WIDTH").ok();
     for seed in 0..seeds {
-        let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
+        let mut m = explored(width.clone());
         let mut rng = Rng(seed + 1);
         for step in 0..length {
             let op = m.random_op(&mut rng);

@@ -867,9 +867,10 @@ impl Model {
 
     /// A core enters the node by the entry stub: it invalidates its whole
     /// TLB, clears its interrupt table and, at a fresh start, writes its
-    /// word owned through the node's gate; the node becomes live when
-    /// every core it started reads owned. At a resume the words stay owned,
-    /// and the core at position 0 runs the steps of the resume.
+    /// word owned through the node's gate, joining since its start or its
+    /// resume (D-158); after a fresh start the node becomes live when no
+    /// core word naming it reads joining. At a resume the core at position
+    /// 0 runs the steps of the resume, which end with live.
     pub(crate) fn core_entered(&mut self, number: usize) {
         let Some(position) = self.position(number as u64) else {
             return;
@@ -941,11 +942,8 @@ impl Model {
                 }
             }
         }
-        let owned = self.cores.iter().all(|c| {
-            CoreWordOf::from_raw(self.table.core_words[c.number as usize])
-                .is_some_and(|w| w.state() == dodos_abi::CoreState::Owned)
-        });
         let member = self.table.member(self.node);
+        let owned = !self.table.joining(self.node, member.generation());
         if owned && fresh && member.state() == dodos_abi::MemberState::Starting {
             let live = dodos_abi::Member::new(
                 dodos_abi::MemberState::Live,

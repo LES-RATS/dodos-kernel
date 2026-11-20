@@ -469,6 +469,31 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   the later answer changes nothing; `role_hand` is `busy` while its
   holder rebuilds the unit; an aspace root *unbound* goes *dying* with
   nothing to ask (the gate model refused it for want of a tag).
+- D-158 (1), the untagged mode, replaces D-157 (1). The tag width is a
+  fact of the machine read at start (`Machine::tag_width`, 2 bits unless a
+  test gives another, where the gate model had `ARCH_TAGS = 5`); below 2
+  bits (`Machine::untagged`, RISC-V) the node runs untagged: no gate tag,
+  the tag table holds entry 0 alone, `bind(0, R)` and `unbind(0, R)`
+  (`Op::UnbindRoot`) change the root's byte without an entry, every root
+  load (the kernel's included) writes the core's loaded root and then
+  invalidates the core's whole TLB, a clearing call asks the other cores
+  whose loaded root is the root, and a call that clears entries checks
+  that the node owns a *live* or *dying* root in place of the tag's entry.
+  The gate checker reads its tag invariants for both modes
+  (`check_untagged`), and the gate's seeded exploration runs on untagged
+  machines too (`faulty_kernels_keep_g_on_untagged_machines`;
+  `DODOS_GATE_WIDTH` for the replay and the long run). In `abi/`,
+  `tags_untagged`, and `gate_tag(1)` is `None`.
+- D-158 (2), resume. `node_start` mode resume writes each core word of the
+  node from *owned* to *joining* in the call that writes starting; a woken
+  core writes itself *owned* through the entry stub, and the node goes
+  live only when no core word naming it reads *joining*
+  (`Table::joining`, the gate's condition in both modes of `node_start`).
+  `abi/` gains `core_transition`, the rows of the core word's table, which
+  the model's `write_core` applies; `member_transition` checks the resume
+  bit. The checker reports a word *joining* under a node that is live,
+  sealing or sealed. The gate model's own resume (`gate/events.rs`) has no
+  core words and is unchanged.
 - The scenarios are in `scenarios/pass33.rs` and `gate/pass33_tests.rs`.
 
 ## Mutations shown equivalent
@@ -525,7 +550,8 @@ split and merge found seven open points in the new cells (40 to 46, in
 tables live in dedicated table chunks (see Pass 31). Pass 31 found two,
 both settled by D-157 (no `CONTRACT-GAP` marker left):
 gap 47 (`abi/src/machine.rs`: on RISC-V with `ASIDLEN = 0`, where the
-gate reserves no ASID, the tag table holds its one tag, entry 0) and
+gate reserves no ASID, the tag table holds its one tag, entry 0; D-158
+replaces that rule with the untagged mode, see Pass 33) and
 gap 48 (`model/src/boot.rs`: the start-up aspace's root and tables drawn
 from the first table-floor untyped stay permanent live pieces for the
 life of the node, so its watermark never returns); D-157 also records

@@ -79,6 +79,12 @@ pub(crate) enum Op {
         p: usize,
         tag: usize,
     },
+    /// `unbind(0, R)` of the untagged mode, which names its root (D-158).
+    UnbindRoot {
+        n: u16,
+        p: usize,
+        root: Page,
+    },
     Destroy {
         n: u16,
         p: usize,
@@ -373,6 +379,7 @@ impl Machine {
             Op::Idle { n, p } => self.idle(n, p),
             Op::Ack { n, p } => self.ack(n, p),
             Op::Unbind { n, p, tag } => self.unbind(n, p, tag),
+            Op::UnbindRoot { n, p, root } => self.unbind_root(n, p, root),
             Op::Destroy { n, p, root } => self.destroy(n, p, root),
             Op::Teardown { n, root } => self.teardown(n, root),
             Op::Take { n, chunk, kind } => self.take(n, chunk, kind),
@@ -573,6 +580,8 @@ impl Machine {
         };
         let root = pick(rng, roots);
         let child = pick(rng, tables);
+        // The tags of the architecture: the table's and the gate's own.
+        let arch_tags = self.gate.nodes[usize::from(n)].tags.len().max(2);
         let bound: Vec<Page> = self.gate.nodes[usize::from(n)]
             .tags
             .iter()
@@ -581,8 +590,21 @@ impl Machine {
             .map(|(i, _)| i as u64)
             .collect();
         let tag = match bound.is_empty() || rng.below(3) == 0 {
-            true => rng.below(ARCH_TAGS as u64) as usize,
+            true => rng.below(arch_tags as u64) as usize,
             false => bound[rng.below(bound.len() as u64) as usize] as usize,
+        };
+        // Untagged, every root is named with tag 0 (D-158), and the root a
+        // call mostly names is a *live* one of the node, which no entry of
+        // the tag table holds.
+        let untagged = self.is_untagged();
+        let live: Vec<Page> = held
+            .iter()
+            .copied()
+            .filter(|&q| self.gate.classes[q as usize] == Class::Root(RootState::Live))
+            .collect();
+        let named = match untagged {
+            true => (!live.is_empty()).then(|| live[rng.0 as usize % live.len()]),
+            false => self.gate.nodes[usize::from(n)].tags[tag].root,
         };
         let mut e0 = rng.below(ENTRIES as u64) as usize;
         let mut e1 = rng.below(ENTRIES as u64) as usize;
@@ -590,7 +612,7 @@ impl Machine {
         // a leaf there; sometimes not.
         let mut root = root;
         if rng.below(4) != 0
-            && let Some(bound_root) = self.gate.nodes[usize::from(n)].tags[tag].root
+            && let Some(bound_root) = named
         {
             root = bound_root;
             if let Some(entries) = self.gate.tables.get(&root) {
@@ -622,7 +644,7 @@ impl Machine {
         let wild = rng.0.is_multiple_of(97);
         let own_core = self.core(n, p);
         let (p, tag) = match wild {
-            true => (p + cores as usize, tag + ARCH_TAGS),
+            true => (p + cores as usize, tag + arch_tags),
             false => (p, tag),
         };
         let beyond = |value: u64, range: u64| value + u64::from(wild) * range;
@@ -684,6 +706,7 @@ impl Machine {
             9 => Op::Load { n, p, root, tag },
             10 => Op::Idle { n, p },
             11 => Op::Ack { n, p },
+            12 if untagged => Op::UnbindRoot { n, p, root },
             12 => Op::Unbind { n, p, tag },
             13 => match rng.below(2) {
                 0 => Op::Destroy { n, p, root },
