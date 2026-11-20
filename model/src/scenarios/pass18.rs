@@ -33,6 +33,7 @@ fn fire_action(m: &mut S, pick: impl Fn(&(u16, HwAction)) -> bool) {
 /// start actions are in flight, none carried out.
 fn restarting(arch: Arch) -> S {
     let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(dodos_abi::FENCE_NS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -120,6 +121,7 @@ fn an_x86_64_core_in_vmx_root_that_waits_in_its_node_is_stopped_by_its_nmi() {
 #[test]
 fn a_stale_wake_of_a_halted_park_stub_writes_no_parked() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.sys.hardware(1), Hardware::Stub { window: false });
@@ -163,6 +165,7 @@ fn one_node_of_class_0_on_more_cores_than_one_window_runs_on_the_booted_core() {
 #[test]
 fn the_fence_record_is_written_anew_by_the_first_fence_action_not_by_the_accusation() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     let old = m.sys.member(1).generation();
@@ -187,6 +190,7 @@ fn the_fence_record_is_written_anew_by_the_first_fence_action_not_by_the_accusat
 #[test]
 fn the_fence_record_keeps_the_last_stop_of_a_core_at_its_number_mod_64() {
     let mut m = S::on(&machine(Arch::X86_64, 66, &[&[0], &[65]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(MS);
     let record = m.sys.canonical().fences[1].clone();
@@ -452,6 +456,7 @@ fn r6_frees_the_line_words_of_a_generation_that_is_over() {
         Ok(Output::Msi { .. })
     ));
     let killer = if holder != a { holder } else { b };
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(a));
     m.run(20 * MS);
     assert_eq!(m.state(a), MemberState::Dead);
@@ -485,6 +490,7 @@ fn a_line_beyond_the_last_line_word_is_unsupported() {
 fn unfence(m: &mut S, killer: u16) {
     m.sys.set_vmx(2, true);
     m.sys.hang(2, false);
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(2));
     m.run(dodos_abi::FENCE_NS + 10 * MS);
     assert_eq!(m.state(2), MemberState::Unfenced);
@@ -509,6 +515,7 @@ fn a_resume_keeps_the_reclaim_of_a_later_generation_of_a_peer_that_died_while_se
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     m.ok(0, seal(1));
     m.run(10 * MS);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(2));
     m.run(20 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
@@ -573,6 +580,7 @@ fn a_grant_freed_while_an_unfenced_holder_translates_to_it_is_reported_by_g6() {
     // grant freed under it.
     m.sys.set_vmx(1, true);
     m.sys.hang(1, false);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(dodos_abi::FENCE_NS + 10 * MS);
     assert_eq!(m.state(1), MemberState::Unfenced);
@@ -631,6 +639,7 @@ fn the_claim_of_a_remapped_line_asks_the_units_of_its_ioapics_segment_only() {
 #[test]
 fn a_start_wake_is_sent_again_every_start_retry_ns_until_the_core_takes_it() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);

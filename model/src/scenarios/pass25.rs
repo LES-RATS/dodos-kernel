@@ -130,6 +130,7 @@ fn a_request_kept_by_a_rebuild_whose_unit_never_confirms_is_answered_failed() {
     attached(&mut m, 2);
     let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
     m.ok(0, iospace);
+    m.supervisor(0, m.t[0]);
     m.ok(0, super::pass17::kill(1));
     m.run(200 * MS);
     let holder = m.sys.role(IOMMU_ROLE).holder();

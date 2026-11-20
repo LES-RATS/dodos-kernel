@@ -341,6 +341,7 @@ pub(super) fn granter_killed(fail: bool) -> Granted {
         g.m.settle();
         kept_without_root(&g);
     }
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(500 * MS);
     g
@@ -394,6 +395,7 @@ fn resumed_over_a_dead_granter(fail: bool, unfenced: bool) -> Granted {
         g.m.sys.set_vmx(0, true);
         g.m.sys.hang(0, false);
     }
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(dodos_abi::FENCE_NS + MS);
     let accused = if unfenced {
@@ -508,6 +510,7 @@ fn a_message_of_an_ended_generation_read_during_the_resumes_r2_is_refused() {
         waiting(&g.m),
         "the Revoke waits in the sealed holder's ring"
     );
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(dodos_abi::FENCE_NS + MS);
     assert_eq!(g.m.state(X), MemberState::Fenced);
@@ -562,6 +565,7 @@ fn an_answer_read_during_the_resumes_r2_wakes_its_thread_which_runs_only_after_t
         }
     }
     assert_eq!(g.m.state(Y), MemberState::Sealed);
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(dodos_abi::FENCE_NS + MS);
     let thread = g.m.t[Y as usize];
@@ -647,6 +651,7 @@ fn a_pending_release_sent_at_a_count_above_0_keeps_the_use_entry() {
 #[test]
 fn r0_drops_a_pending_release_at_a_count_above_0_and_keeps_the_use_entry() {
     let mut g = kept_with_release_pending();
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(10 * MS);
     kept_without_root(&g);
@@ -663,6 +668,7 @@ fn a_revoke_in_flight_when_the_granting_node_is_killed_leaves_a_credit_no_check_
     g.m.ok(Y, map);
     g.m.sys.break_unit(IOMMU_ROLE);
     assert_eq!(g.m.call(X, Syscall::CapRevoke(s(OBJ))), WAITS);
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(50 * MS);
     assert_ne!(g.m.state(X), MemberState::Live);

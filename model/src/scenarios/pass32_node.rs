@@ -210,3 +210,89 @@ fn a_thread_of_a_revoked_task_is_resumed() {
     assert!(k.m.tasks[&task].revoked && thread.cspace.is_some());
     k.ok(Syscall::ThreadResume(s(300)));
 }
+
+/// The level line `GSI` claimed by node `node` of `m` in slot `IRQ`, on
+/// core number `node` (each node of these machines runs on its own core).
+fn line_claimed(m: &mut S, node: u16) {
+    let claim = Syscall::IrqClaim {
+        control: s(START_SLOT_IRQ_CONTROL),
+        source: IrqSource::line(GSI, true, false).raw(),
+        core: u64::from(node),
+        vector: 48,
+        destination: s(IRQ),
+    };
+    succeeds(m, node, claim, 30 * MS);
+}
+
+/// The reference machine whose node 1 holds the roles of the IOAPIC of
+/// `GSI` and of its segment's IOMMU unit, and has claimed the line; its
+/// remapping entry is in the unit.
+fn line_on_the_holder() -> S {
+    let mut m = S::two();
+    let role = m.sys.node(1).ioapic_role(GSI).expect("the IOAPIC's role");
+    for role in [role, IOMMU_ROLE] {
+        assert_eq!(m.sys.role(role).holder(), 1);
+    }
+    line_claimed(&mut m, 1);
+    assert!(!m.sys.canonical().units[&IOMMU_ROLE].remap.is_empty());
+    m
+}
+
+// Pass 34, R-9 of the review of pass 32: the line half of L4-02. Once the
+// redirection entry is masked (served at once: the node holds the
+// IOAPIC's role), the invalidation of the interrupt entry cache is a
+// request also when the node holds every role concerned (Interrupts, the
+// irq; D-150): the step starts it and returns `again`, and the capability
+// goes once the unit confirmed.
+#[test]
+fn the_removal_of_a_line_is_a_request_on_the_holder_of_its_unit_too() {
+    let mut m = line_on_the_holder();
+    m.no(1, Syscall::CapDelete(s(IRQ)), Error::Again);
+    assert_eq!(requests_in_flight(&m, 1), 1, "no interrupt cache request");
+    m.run(30 * MS);
+    assert_eq!(requests_in_flight(&m, 1), 0);
+    m.ok(1, Syscall::CapDelete(s(IRQ)));
+    assert!(m.sys.canonical().units[&IOMMU_ROLE].remap.is_empty());
+}
+
+// Pass 34, R-9: the line half of L4-02, at a unit of the node that does
+// not confirm: the invalidation is answered *failed* and the handle is
+// retired (D-139).
+#[test]
+fn the_handle_of_a_line_removed_on_a_hung_unit_of_its_own_node_is_retired() {
+    let mut m = line_on_the_holder();
+    m.sys
+        .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
+    m.no(1, Syscall::CapDelete(s(IRQ)), Error::Again);
+    m.run(60 * MS);
+    assert!(!m.sys.canonical().retired.is_empty());
+    m.ok(1, Syscall::CapDelete(s(IRQ)));
+}
+
+// Pass 34, R-9: the x86-64 half of L4-08. Without a directed end of
+// interrupt a level source is masked at its IOAPIC at its arrival, by the
+// holder of the controller's role (D-147); unbinding masks it there too,
+// at once (Interrupts, the states of an irq: "a level source is masked at
+// the controller while the irq is idle or fired").
+#[test]
+fn unbinding_an_armed_level_line_masks_it_at_its_ioapic() {
+    let mut machine = machine(Arch::X86_64, 1, &[&[0]]);
+    machine.directed_eoi = false;
+    let mut m = S::on(&machine);
+    line_claimed(&mut m, 0);
+    let notify = m.retype(0, ObjectKind::Notify, 0, NOTIFY);
+    m.ok(0, notify);
+    let role = m.sys.node(0).ioapic_role(GSI).expect("the IOAPIC's role");
+    let masked = |m: &S| {
+        let units = &m.sys.canonical().units;
+        units.get(&role).is_some_and(|u| u.masked.contains(&GSI))
+    };
+    let bind = |notify| Syscall::IrqBind {
+        irq: s(IRQ),
+        notify,
+    };
+    m.ok(0, bind(s(NOTIFY)));
+    assert!(!masked(&m), "masked while armed");
+    m.ok(0, bind(SlotAddr::NONE));
+    assert!(masked(&m), "unmasked while idle");
+}

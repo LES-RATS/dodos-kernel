@@ -506,6 +506,26 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   values the contract fixes are pinned by tests.
 - The scenarios are in `scenarios/pass33.rs` and `gate/pass33_tests.rs`.
 
+## Pass 34 (the review of pass 32, D-160, the audit of the checkers)
+
+- The review of pass 32. The `busy` of a *move* of an untyped root that
+  has a descendant is a state check (`Model::movable`), judged after the
+  last capability and plain argument of each call: `call` refuses a
+  receive range of more than 4 slots, and `reply_recv` an empty endpoint,
+  before it. The gate of a faulty kernel gives a reserve chunk its node
+  took (`Table::taken_by`, as `memory_give`). The completion of a give or
+  a destruction writes each word only if it still reads the value read
+  when the request was opened (`FreedRun::opened`). The scenario harness
+  no longer claims a reserve role inside `call`: each test that kills or
+  retires says `supervisor` before its stop, so `call` and
+  `System::apply` behave alike. The gate checker's use-count rule skips
+  only a dead node, and reports a grantee's leaf in no table instead of
+  panicking; the grantee's R6 leaves a fenced granter's grant to that
+  granter's own R6. Tests guard the serial of a late send answer, the
+  line half of L4-02 and the x86-64 half of L4-08.
+- The scenarios are in `scenarios/pass32.rs`, `scenarios/pass32_node.rs`,
+  `scenarios/pass33.rs`, `gate/pass32_tests.rs` and `tests/calls.rs`.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a

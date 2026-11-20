@@ -137,6 +137,7 @@ fn node_watch_names_the_callers_node_and_is_signalled_at_each_change() {
     // Unbinding succeeds on an unbound index.
     m.ok(0, watch(0, 3, SlotAddr::NONE));
     // A change of a member word: the notify is signalled.
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.settle();
     assert_eq!(m.call(0, Syscall::Poll(s(100))), Ok(Output::Word(1)));
@@ -213,6 +214,7 @@ fn node_stop_is_judged_and_never_leaves_no_live_node() {
     m.no(0, stop(1, 4), Error::Invalid);
     // Modes kill and seal take core 0; retire a core whose word names the
     // node.
+    m.supervisor(0, m.t[0]);
     m.no(
         0,
         Syscall::NodeStop {
@@ -283,6 +285,7 @@ fn node_start_is_judged_in_order() {
 #[test]
 fn a_killed_node_is_fenced_reclaimed_and_dead_then_started_fresh() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     let member = m.sys.member(1);
     assert_eq!(
@@ -321,6 +324,7 @@ fn a_killed_node_is_fenced_reclaimed_and_dead_then_started_fresh() {
 #[test]
 fn a_fresh_start_on_several_cores_writes_joining_then_owned_then_live() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -343,6 +347,7 @@ fn a_fresh_start_on_several_cores_writes_joining_then_owned_then_live() {
 #[test]
 fn a_fresh_start_on_a_core_that_is_not_free_is_busy_and_changes_nothing() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(10 * MS);
     let before = m.sys.member(1);
@@ -364,6 +369,7 @@ fn a_fresh_start_on_cores_of_different_state_features_is_busy() {
     machine.cores[2].kind = 1;
     let mut m = S::on(&machine);
     for n in [1, 2] {
+        m.supervisor(0, m.t[0]);
         m.ok(0, stop(n, NODE_STOP_KILL));
     }
     m.run(10 * MS);
@@ -433,6 +439,7 @@ fn a_hung_bootstrap_core_that_cannot_run_its_handler_is_unfenced() {
     let mut m = S::two();
     m.sys.set_vmx(0, true);
     m.sys.hang(0, false);
+    m.supervisor(1, m.t[1]);
     m.ok(1, stop(0, NODE_STOP_KILL));
     m.run(FENCE_NS + MS);
     assert_eq!(m.state(0), MemberState::Unfenced);
@@ -448,6 +455,7 @@ fn a_core_in_vmx_root_operation_that_cannot_run_its_handler_is_unfenced_then_fen
     let mut m = S::two();
     m.sys.hang(1, false);
     m.sys.set_vmx(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(FENCE_NS + MS);
     assert_eq!(m.state(1), MemberState::Unfenced);
@@ -466,6 +474,7 @@ fn a_core_in_vmx_root_operation_that_cannot_run_its_handler_is_unfenced_then_fen
 #[test]
 fn a_retired_core_is_unusable_for_a_fresh_start() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(
         0,
         Syscall::NodeStop {
@@ -485,6 +494,7 @@ fn a_retired_core_is_unusable_for_a_fresh_start() {
 #[test]
 fn a_node_that_stops_itself_parks_and_another_drives_its_fence() {
     let mut m = S::two();
+    m.supervisor(1, m.t[1]);
     m.ok(1, stop(1, NODE_STOP_KILL));
     m.settle();
     m.run(10 * MS);
@@ -495,6 +505,7 @@ fn a_node_that_stops_itself_parks_and_another_drives_its_fence() {
 #[test]
 fn every_core_of_a_killed_node_of_several_cores_is_stopped_before_it_is_dead() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1, 2, 3]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.settle();
     for core in 1..4 {
@@ -520,6 +531,7 @@ fn every_core_of_a_killed_node_of_several_cores_is_stopped_before_it_is_dead() {
 fn the_fence_of_each_architecture_confirms_every_core() {
     for arch in [Arch::Aarch64, Arch::Riscv64] {
         let mut m = S::on(&machine(arch, 3, &[&[0], &[1, 2]]));
+        m.supervisor(0, m.t[0]);
         m.ok(0, stop(1, NODE_STOP_KILL));
         // ARM64 confirms at the second round's read, 11.2 ms (D-143).
         m.run(dodos_abi::FENCE_NS);
@@ -533,6 +545,7 @@ fn the_fence_of_each_architecture_confirms_every_core() {
 #[test]
 fn an_arm64_fence_is_confirmed_by_off_after_the_request_never_by_the_handlers_own_write() {
     let mut m = S::on(&machine(Arch::Aarch64, 3, &[&[0], &[1, 2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     // Every event but `CPU_OFF`: the handlers write `parked`, the cores do
     // not reach OFF, and the fence is not confirmed.
@@ -577,9 +590,11 @@ fn a_fence_whose_driver_dies_is_driven_again_by_another_node() {
     // the fence of node 2 lasts.
     m.sys.hang(2, false);
     m.sys.set_vmx(2, true);
+    m.supervisor(1, m.t[1]);
     m.ok(1, stop(2, NODE_STOP_KILL));
     assert_eq!(m.sys.member(2).driver(), 1);
     // The driver dies.
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(5 * MS);
     assert_eq!(m.sys.member(2).driver(), 0);
@@ -700,6 +715,7 @@ fn a_sealing_node_returns_to_live_if_no_other_node_is_live() {
     m.ok(0, stop(1, NODE_STOP_SEAL));
     // The seal began (the final review's E10: only the end was asserted).
     assert_eq!(m.state(1), MemberState::Sealing);
+    m.supervisor(2, m.t[2]);
     m.ok(2, stop(0, NODE_STOP_KILL));
     m.sys.fail(2, 0);
     m.run(20 * MS);
@@ -709,6 +725,7 @@ fn a_sealing_node_returns_to_live_if_no_other_node_is_live() {
 #[test]
 fn a_node_dying_while_starting_is_accused_stale_after_start_ns() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(10 * MS);
     // The core hangs before it reaches its entry: the node never beats.
@@ -729,6 +746,7 @@ fn a_node_dying_while_starting_is_accused_stale_after_start_ns() {
 #[test]
 fn a_wake_lost_in_the_park_stubs_window_is_sent_again_every_millisecond_until_the_stub_confirms() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -758,6 +776,7 @@ fn a_wake_lost_in_the_park_stubs_window_is_sent_again_every_millisecond_until_th
 #[test]
 fn a_crash_record_of_reason_fenced_is_written_by_the_handler_of_a_kernel_that_runs() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop(1, NODE_STOP_KILL));
     m.run(2 * MS);
     let record = m.sys.canonical().crash.areas[1].record;

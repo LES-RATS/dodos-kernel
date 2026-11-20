@@ -130,8 +130,9 @@ impl Model {
         range: Range,
     ) -> Outcome {
         message.check_header(self.has_page(thread))?;
-        self.listed(thread, &message.caps)?;
+        let caps = self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
+        self.movable(&caps)?;
         let parcel = Parcel::new(thread, message, badge);
         self.enter(thread, endpoint, parcel, window);
         Ok(Output::Waits)
@@ -191,9 +192,10 @@ impl Model {
         let rights = message.rights().union(Rights::RECV);
         let reply = self.object(thread, reply, ObjectKind::Reply, rights)?;
         message.check_header(self.has_page(thread))?;
-        self.listed(thread, &message.caps)?;
+        let caps = self.listed(thread, &message.caps)?;
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let window = self.window(thread, range)?;
+        self.movable(&caps)?;
         // IPC: the reply object may here be armed or idle; attached to
         // another thread is `busy`.
         if let ReplyState::Attached(_) = self.replies[&reply] {
@@ -230,7 +232,8 @@ impl Model {
     ) -> Outcome {
         // IPC: a reply carries badge 0, the badge of every reply capability.
         message.check_header(self.has_page(thread))?;
-        self.listed(thread, &message.caps)?;
+        let caps = self.listed(thread, &message.caps)?;
+        self.movable(&caps)?;
         let parcel = Parcel::new(thread, message, badge);
         let flags = if kind == ObjectKind::Reply {
             self.answer(target, parcel)
@@ -388,19 +391,24 @@ impl Model {
             }
             caps.push(listed);
         }
-        // A state check, after every listed slot: a *move* of the root
-        // capability of an untyped that has a descendant is `busy`, as for
-        // `cap_move` (Transfer of capabilities, D-131). Judged again at
-        // delivery, where a root that got a descendant meanwhile drops the
-        // capabilities.
+        Ok(caps)
+    }
+
+    /// Transfer of capabilities, a state check (Order of checks, step 4),
+    /// so each call judges it after its last capability and plain argument
+    /// (pass 34, R-1): a *move* of the root capability of an untyped that
+    /// has a descendant is `busy`, as for `cap_move` (D-131). Judged again
+    /// at delivery, where a root that got a descendant meanwhile drops the
+    /// capabilities.
+    fn movable(&self, caps: &[Listed]) -> Result<(), Error> {
         let stays = |listed: &Listed| match *listed {
             Listed::Move(cap) => self.root_with_copies(cap),
             Listed::Derive(..) => false,
         };
-        if caps.iter().any(stays) {
-            return Err(Error::Busy);
+        match caps.iter().any(stays) {
+            true => Err(Error::Busy),
+            false => Ok(()),
         }
-        Ok(caps)
     }
 
     /// IPC, the state part of `recv` and `reply_recv`, in order: a pending
@@ -553,6 +561,7 @@ impl Model {
         let listed = self
             .listed(parcel.sender, &parcel.caps)
             .ok()
+            .filter(|caps| self.movable(caps).is_ok())
             .filter(|caps| caps.is_empty() || !lost)
             .filter(|caps| {
                 caps.len() <= window.count as usize

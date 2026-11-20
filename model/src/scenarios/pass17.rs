@@ -192,6 +192,7 @@ fn a_fence_nmi_that_lands_in_the_entry_stub_gives_no_false_confirmation() {
     // Node 0 is on the bootstrap core, which INIT does not stop: only the
     // NMI and the entry stub's own read of its word can park it.
     let mut m = S::on(&machine(crate::Arch::X86_64, 2, &[&[0], &[1]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(0));
     m.run(10 * MS);
     assert_eq!(m.state(0), MemberState::Dead);
@@ -215,6 +216,7 @@ fn a_fence_nmi_that_lands_in_the_entry_stub_gives_no_false_confirmation() {
     // would stop it and let the park stub confirm it, is blocked: the NMI
     // alone acts, and confirms nothing (D-149).
     m.sys.set_vmx(0, true);
+    m.supervisor(1, m.t[1]);
     m.ok(1, kill(0));
     let request = loop {
         let stop = m
@@ -327,6 +329,7 @@ fn a_resume_after_a_peer_died_and_started_fresh_runs_r0_and_frees_the_grants_to_
     assert_eq!(m.state(0), MemberState::Sealed);
     // While node 0 is sealed, node 1 is killed, reclaimed and started
     // again with a new generation.
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(1));
     m.run(30 * MS);
     assert_eq!(m.state(1), MemberState::Dead);

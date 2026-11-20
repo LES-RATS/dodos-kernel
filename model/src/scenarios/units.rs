@@ -204,6 +204,7 @@ fn the_requester_keeps_its_request_through_the_death_of_the_holder_and_the_next_
         .flatten()
         .any(|e| matches!(e.stage, Stage::Sent { .. }));
     assert!(sent);
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(1));
     m.run(40 * MS);
     // R0 queued it again; the successor took the role over and served it.
@@ -355,6 +356,7 @@ fn a_plain_role_of_a_fenced_holder_can_be_claimed_a_reserve_role_only_once_it_is
     // it, and it is dead once the barrier holds (the final review's M2: the
     // comment described a hang without the handler).
     m.sys.hang(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.settle();
     let plain = role_slot(&m, 0, PLATFORM);
@@ -483,6 +485,7 @@ fn a_handing_word_whose_target_dies_is_taken_over_by_the_targets_successor() {
     }
     assert_eq!(m.sys.role(IOMMU_ROLE).state(), RoleState::Handing);
     // The take-over is judged on the target, never on the node that hands.
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(2));
     m.run(FENCE_NS + 10 * SETTLE_NS);
     let word = m.sys.role(IOMMU_ROLE);
@@ -495,6 +498,7 @@ fn a_handing_word_whose_target_dies_is_taken_over_by_the_targets_successor() {
 #[test]
 fn a_unit_role_is_taken_over_settle_ns_after_the_stop_is_confirmed() {
     let mut m = three();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     // Event by event, so that the instant the holder changes is exact: the
     // stop confirmed, then `SETTLE_NS` (the final review's E32: only
@@ -514,6 +518,7 @@ fn an_unfenced_holder_keeps_its_unit_roles_for_fence_ns_and_settle_ns() {
     let mut m = three();
     m.sys.hang(1, false);
     m.sys.set_vmx(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(FENCE_NS - MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
@@ -526,6 +531,7 @@ fn the_rebuild_of_a_unit_keeps_the_entries_of_live_nodes_and_clears_those_of_no_
     let mut m = three();
     attached(&mut m, 0);
     // The holder dies; node 2 takes over and rebuilds from the reports.
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(30 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
@@ -551,6 +557,7 @@ fn the_rebuild_keeps_without_a_report_the_entries_of_a_sealed_node() {
     );
     m.run(5 * MS);
     assert_eq!(m.state(0), MemberState::Sealed);
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(1));
     m.run(30 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
@@ -565,6 +572,7 @@ fn the_rebuild_keeps_without_a_report_the_entries_of_a_sealed_node() {
 fn a_node_that_dies_with_an_attached_device_leaves_no_context_entry_once_dead() {
     let mut m = three();
     attached(&mut m, 0);
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(0));
     m.run(30 * MS);
     assert_eq!(m.state(0), MemberState::Dead);

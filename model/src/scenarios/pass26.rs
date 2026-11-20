@@ -12,6 +12,7 @@ use crate::system::Hardware;
 /// Four nodes of one core each; node 3 dead, its core parked.
 fn four_with_3_dead() -> S {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(3));
     m.run(100 * MS);
     assert_eq!(m.state(3), MemberState::Dead);
@@ -61,6 +62,7 @@ fn start_3(m: &mut S, killer: Option<u16>) {
     // The starter killed at once by `killer`, before its retry: nobody
     // wakes node 3 again.
     if let Some(killer) = killer {
+        m.supervisor(killer, m.t[killer as usize]);
         m.ok(killer, kill(0));
     }
 }
@@ -158,6 +160,7 @@ fn a_resume_under_a_rebuild_reports_and_both_end() {
     m.ok(3, seal(2));
     m.run(50 * MS);
     assert_eq!(m.state(2), MemberState::Sealed);
+    m.supervisor(3, m.t[3]);
     m.ok(3, kill(0));
     m.run(dodos_abi::FENCE_NS + MS);
     m.ok(3, kill(holder));
@@ -197,6 +200,7 @@ fn a_starting_node_is_not_accused_stuck_before_start_ns() {
     // Node 1 starts node 3, its wake lost; node 2 kills node 1 at once.
     m.sys.set_window(3);
     m.ok(1, fresh(3, 1 << 3));
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(1));
     let stuck = m.sys.canonical().stuck_ns;
     m.run(stuck + 100 * MS);
@@ -235,6 +239,7 @@ fn a_hand_over_refused_at_step_4_writes_held_with_a_new_epoch() {
         node: node_cap(2),
     };
     assert_eq!(m.call(1, hand), WAITS);
+    m.supervisor(3, m.t[3]);
     m.ok(3, kill(2));
     set_broken(&mut m, false);
     m.run(20 * MS);
@@ -279,6 +284,7 @@ fn the_node_that_hands_a_unit_role_runs_r1_for_a_node_accused_during_steps_1_to_
     assert_eq!(m.call(1, hand), WAITS);
     // Node 2, whose device sits behind the unit, is killed.
     let generation = m.sys.member(2).generation();
+    m.supervisor(3, m.t[3]);
     m.ok(3, kill(2));
     let r1 = |m: &S| {
         m.sys
@@ -316,6 +322,7 @@ fn the_node_that_hands_a_unit_role_runs_r1_for_a_node_accused_during_steps_1_to_
 #[test]
 fn the_first_thread_of_a_node_starting_afresh_sends_and_gets_its_answer_before_it_is_live() {
     let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(3));
     m.run(100 * MS);
     assert_eq!(m.state(3), MemberState::Dead);

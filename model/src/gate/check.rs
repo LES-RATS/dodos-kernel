@@ -119,8 +119,7 @@ impl Machine {
         )?;
         // G6: a use entry counts the present leaves under its grant and
         // the cleared ones whose invalidation is not complete, no more
-        // and no fewer, while its node runs or is sealed (a dead or
-        // accused node's entries are freed by R6).
+        // and no fewer, while its node is not dead.
         let mut counted: BTreeMap<(u16, usize), u64> = BTreeMap::new();
         for (&(holder, _, _), &(_, _, index)) in &self.grants.remote {
             *counted.entry((holder, index)).or_default() += 1;
@@ -137,9 +136,11 @@ impl Machine {
                 }
             }
         }
+        // Only a dead node's entries are skipped: R6 frees them while its
+        // requests stay; a fenced node's gate writes nothing, so the
+        // equality holds there too (pass 34, R-7).
         for (n, uses) in self.grants.uses.iter().enumerate() {
-            let state = self.gate.members[n].state;
-            if !state.writes() && state != NodeState::Sealed {
+            if self.gate.members[n].state == NodeState::Dead {
                 continue;
             }
             for (index, used) in uses.iter().enumerate() {
@@ -302,7 +303,7 @@ impl Machine {
 
     /// A chunk's map count holds every present leaf toward it and every
     /// leaf a request in use cleared and has not yet seen invalidated.
-    fn check_counts(&self) -> Check {
+    pub(super) fn check_counts(&self) -> Check {
         let mut needed = vec![0u64; self.chunks as usize];
         for (page, entries) in &self.gate.tables {
             if matches!(
@@ -323,7 +324,10 @@ impl Machine {
             let page = self
                 .remote_leaf(root, va)
                 .ok_or("USE: the record of a grantee's leaf that is not present")?;
-            needed[Self::chunk_of(page) as usize] -= 1;
+            let count = &mut needed[Self::chunk_of(page) as usize];
+            *count = count
+                .checked_sub(1)
+                .ok_or("USE: a grantee's leaf in no table walked")?;
         }
         for (n, records) in self.unit.gate_records.iter().enumerate() {
             if !self.gate.members[n].state.writes()

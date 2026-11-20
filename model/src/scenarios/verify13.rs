@@ -315,6 +315,7 @@ fn rebuild_with(mut rewrite: impl FnMut(&mut u64, &mut Vec<crate::rings::Item>))
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill);
     let to = m.sys.now() + 200 * MS;
     let (mut seen, mut fired) = (false, 0);
@@ -533,6 +534,7 @@ fn a_device_count_frozen_by_a_killed_owner_is_judged_at_least() {
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill);
     // Checked every 100 µs while node 0 is fenced, dead and reclaimed.
     m.run(30 * MS);

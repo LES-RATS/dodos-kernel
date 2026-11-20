@@ -216,6 +216,79 @@ fn a_send_answer_acts_only_on_the_grants_its_send_made() {
     assert_eq!(after, Some(entry), "node 2's grant, with its leaf");
 }
 
+/// The index and serial of the credit node 0 holds towards node 1 that is
+/// not `except`.
+fn credit_to_1(m: &S, except: Option<u8>) -> (u8, u32) {
+    m.sys.node(0).peers[1]
+        .credits
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| Some(i as u8) != except)
+        .find_map(|(i, c)| c.as_ref().map(|c| (i as u8, c.serial)))
+        .expect("the send's credit")
+}
+
+/// A `SendAnswer` of node 1, "not delivered", on `credit`.
+fn not_delivered(credit: (u8, u32)) -> crate::rings::Message {
+    let answer = Body::SendAnswer {
+        delivered: false,
+        dropped: false,
+        uses: vec![None],
+    };
+    from_node_1(NodeMessage::SendAnswer, Some(credit), answer)
+}
+
+// Pass 34, R-3 of the review of pass 32 (Grants, release by the holder,
+// D-159 (4); G6: the answer is written once per serial). Node 1 releases a
+// grant its send made before it answers; node 0 grants the same entry anew
+// to node 1 itself, by a second send: the next serial, the same grantee.
+// The first send's late "not delivered" answer then names a serial no
+// entry holds: only the serial tells the two grants apart, and the second
+// stays, unanswered. Its own answer is then applied.
+#[test]
+fn a_late_answer_leaves_the_entry_granted_anew_to_the_same_node() {
+    let mut m = three();
+    for frame in [FRAME, SECOND] {
+        let retype = m.retype(0, ObjectKind::Frame, 1, frame);
+        m.ok(0, retype);
+    }
+    m.ok(0, super::place_first(0, 0));
+    let second = m.thread_on(0, 300, 0);
+    let rights = Rights::READ.union(Rights::WRITE);
+    assert_eq!(m.call(0, send(1, FRAME, rights)), WAITS);
+    let (grant, serial) = {
+        let entries = m.sys.node(0).grant_entries();
+        assert_eq!(entries.len(), 1);
+        (entries[0].0, entries[0].1.2)
+    };
+    let first = credit_to_1(&m, None);
+    let release = Body::Release { grant, serial };
+    m.sys
+        .inject(1, 0, from_node_1(NodeMessage::Release, None, release));
+    assert!(drive(&mut m, &[0], |m| m
+        .sys
+        .node(0)
+        .grant_entries()
+        .is_empty()));
+    assert_eq!(m.call_by(0, second, send(1, SECOND, rights)), WAITS);
+    let entry = m.sys.canonical().grants[0][&grant];
+    assert_eq!((entry.grantee, entry.serial), (1, serial + 1));
+    let again = credit_to_1(&m, Some(first.0));
+    m.sys.inject(1, 0, not_delivered(first));
+    let freed = |m: &S| m.sys.node(0).peers[1].credits[first.0 as usize].is_none();
+    assert!(
+        drive(&mut m, &[0], freed),
+        "the late answer frees its credit"
+    );
+    assert_eq!(m.sys.check(), Ok(()));
+    let after = m.sys.canonical().grants[0].get(&grant).copied();
+    assert_eq!(after, Some(entry), "the late answer freed the new grant");
+    m.sys.inject(1, 0, not_delivered(again));
+    let gone = |m: &S| !m.sys.canonical().grants[0].contains_key(&grant);
+    assert!(drive(&mut m, &[0], gone), "the grant's own answer frees it");
+    assert_eq!(m.sys.check(), Ok(()));
+}
+
 // Lot 5, F-02. A chunk of a reserve taken by the holder of its role keeps
 // the reserve's owner code with the holder's generation (rule 4 of
 // taking), and reads *taken* by that node wherever an ownership word is
@@ -494,4 +567,17 @@ fn a_kill_and_a_retire_need_a_reserve_role() {
     claim_reserve(&mut m, 0, 1);
     m.ok(0, retire);
     assert_eq!(m.state(1), MemberState::Fencing);
+}
+
+// Pass 34, R-4 of the review of pass 32. The gate of a faulty kernel reads
+// a reserve chunk its node took while it holds the role as its node's, as
+// the honest `memory_give` does (rule 4 of taking; the ownership row
+// *taken* (X, g) → *free*: X's, G5's counts all 0): it gives it.
+#[test]
+fn the_gate_gives_a_reserve_chunk_its_node_took() {
+    let mut m = three();
+    let chunk = reserve_block(&mut m, MEMORY_TAKE_RUN);
+    assert!(m.sys.node_mut(0).gate_give_chunk(chunk, 1));
+    let word = Ownership::from_raw(m.sys.canonical().owners[chunk as usize]).expect("a word");
+    assert_eq!(word, Ownership::free(Owner::Node(1)));
 }

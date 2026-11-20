@@ -64,6 +64,7 @@ fn a_core_asleep_when_its_node_is_fenced_is_parked_by_the_read_at_its_wake() {
     // node 1 parks core 2 for it, which, woken with nothing to run, would
     // go back at once to its deepest state.
     m.hang(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     let took = fence_ends(&mut m, 1);
     assert_eq!(m.state(1), MemberState::Fenced);
@@ -99,6 +100,7 @@ fn a_signal_lost_on_the_way_to_sleep_is_made_good_by_the_next_round_and_the_read
     let suspending = |m: &S| matches!(m.sys.hardware(2), Hardware::Suspending { .. });
     assert!(m.step_until(suspending), "core 2 never suspends");
     m.hang(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     // Events until the fence's stop of core 2 is in flight, its power-down
     // held back; then the stop, which lands in the window.
@@ -192,6 +194,7 @@ fn reused_after_a_fence(arch: Arch) {
         assert_eq!(m.state(1), MemberState::Sealed);
         assert_eq!(m.sys.hardware(2), Hardware::Off);
     }
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     let start = m.sys.now();
     while m.state(1) != MemberState::Dead && m.sys.now() < start + 100 * MS {
@@ -296,6 +299,7 @@ fn signal_lost_on_the_way_to_sleep(m: &mut S) {
     let suspending = |m: &S| matches!(m.sys.hardware(2), Hardware::Suspending { .. });
     assert!(m.step_until(suspending), "core 2 never suspends");
     m.hang(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     let stop = |m: &S| {
         m.sys
@@ -454,6 +458,7 @@ fn a_take_over_of_a_failed_unit_under_a_pin_leaves_the_old_holder_unacknowledged
     g.m.settle();
     kept_without_root(&g);
     let generation = g.m.sys.member(THIRD).generation();
+    g.m.supervisor(0, g.m.t[0]);
     g.m.ok(0, kill(THIRD));
     g.m.run(500 * MS);
     let word = g.m.sys.role(IOMMU_ROLE);
@@ -492,6 +497,7 @@ fn a_take_over_of_a_failed_unit_does_not_acknowledge_an_unfenced_old_holder() {
     m.sys.set_vmx(1, true);
     m.sys.hang(1, false);
     let generation = m.sys.member(1).generation();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(dodos_abi::FENCE_NS + 100 * MS);
     assert_eq!(m.state(1), MemberState::Unfenced);
@@ -522,6 +528,7 @@ fn a_take_over_of_a_healthy_unit_does_not_acknowledge_an_unfenced_old_holder() {
     m.sys.set_vmx(1, true);
     m.sys.hang(1, false);
     let generation = m.sys.member(1).generation();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(dodos_abi::FENCE_NS + 100 * MS);
     assert_eq!(m.state(1), MemberState::Unfenced);
@@ -546,6 +553,7 @@ fn a_take_over_of_a_healthy_unit_does_not_acknowledge_an_unfenced_old_holder() {
 #[test]
 fn node_stop_from_a_node_still_starting_is_busy() {
     let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(3));
     m.run(100 * MS);
     assert_eq!(m.state(3), MemberState::Dead);
@@ -556,6 +564,7 @@ fn node_stop_from_a_node_still_starting_is_busy() {
     assert!(m.step_until(built));
     m.restarted(3);
     assert_eq!(m.state(3), MemberState::Starting);
+    m.supervisor(3, m.t[3]);
     for mode in [kill(0), seal(1), kill(2)] {
         assert_eq!(m.call(3, mode), Err(Error::Busy));
     }
@@ -669,6 +678,7 @@ fn a_closed_observation_frees_its_slot() {
 fn a_release_held_for_a_node_starting_afresh_is_sent_once_it_is_live() {
     use crate::{Range, Transfer};
     let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(3));
     m.run(100 * MS);
     assert_eq!(m.state(3), MemberState::Dead);
@@ -742,6 +752,7 @@ fn a_release_held_for_a_fresh_start_that_seals_before_the_holders_step_is_sent()
     use crate::nodes::HwAction;
     use crate::{Range, Transfer};
     let mut m = S::on(&machine(Arch::X86_64, 5, &[&[0], &[1], &[2], &[3, 4]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(3));
     m.run(100 * MS);
     let old = m.sys.member(3).generation();
@@ -874,6 +885,7 @@ fn a_rebuild_after_the_holders_death_leaves_a_fired_level_line_of_another_node_o
     m.sys.node_mut(n).interrupt_on(0, 48);
     assert_eq!(irq_state(&m, n), crate::IrqState::Fired);
     let killer = (0..3).find(|&z| z != holder && z != n).unwrap();
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(holder));
     m.run(50 * MS);
     assert_ne!(m.sys.role(role).holder(), holder, "the role was taken over");
@@ -952,6 +964,7 @@ fn an_aplic_rebuild_leaves_a_level_line_acknowledged_after_its_report_working() 
     assert_eq!(deliver(&mut m), 1);
     assert_eq!(state_on(&m, n), crate::IrqState::Fired);
     let killer = others[1];
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(holder));
     let reported = |m: &S| {
         (0..4u16).any(|z| {
@@ -1005,6 +1018,7 @@ fn a_faulty_kernel_cannot_get_its_fence_confirmed_while_it_runs() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     let g = m.sys.member(1).generation();
     m.sys.set_vmx(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     let stop_in_flight = |m: &S| {
         m.sys
@@ -1053,6 +1067,7 @@ fn an_undeclared_bootstrap_core_is_kept_out_of_every_node() {
     assert_eq!(m.state(0), MemberState::Live);
     assert_eq!(m.state(1), MemberState::Live);
     assert!(matches!(m.sys.hardware(0), Hardware::Stub { .. }));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(100 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -1126,6 +1141,7 @@ fn a_denied_cpu_off_outside_a_fence_writes_panic_and_is_never_confirmed() {
 fn a_denied_cpu_off_at_a_fence_is_never_confirmed() {
     let mut m = S::on(&machine(Arch::Aarch64, 2, &[&[0], &[1]]));
     m.sys.refuse_parks(1);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(dodos_abi::FENCE_NS + 50 * MS);
     assert_eq!(m.sys.hardware(1), Hardware::Refused);
@@ -1225,6 +1241,7 @@ fn a_faulty_holders_early_acknowledgement_lets_no_device_reach_reused_memory() {
     m.sys
         .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
     let generation = m.sys.member(n).generation();
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(n));
     m.run(30 * MS);
     m.sys.make_faulty(holder);

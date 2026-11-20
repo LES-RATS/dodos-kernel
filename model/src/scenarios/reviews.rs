@@ -163,6 +163,7 @@ fn hydrogen_9_a_bootstrap_core_that_parked_itself_is_confirmed_at_the_fence_nmi_
     let mut m = S::two();
     // Node 0, on the bootstrap core, stops itself: its core parks in the
     // stub before the fence; the fence's NMI is answered by the stub.
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(0));
     m.run(10 * MS);
     assert_eq!(m.state(0), MemberState::Dead);
@@ -184,6 +185,7 @@ fn hydrogen_10_an_arm64_core_already_off_confirms_the_new_park_request() {
     // A sealed node accused with kill: its parked cores are confirmed by
     // their answer to the new park request, at the next round's read (11.2
     // ms on ARM64, D-143).
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(dodos_abi::FENCE_NS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -268,6 +270,7 @@ fn hydrogen_n3_the_node_that_hands_dies_after_step_4_and_the_target_completes_st
         (RoleState::Handing, 1, 2),
         "step 4 written"
     );
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(30 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -414,6 +417,7 @@ fn deepseek_15_node_send_is_busy_when_the_grant_table_has_fewer_free_entries_tha
 fn kernel_shape_the_fence_raises_the_park_request_before_it_marks_the_word_request_before_mark() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1, 2, 3]]));
     let before: Vec<u64> = (1..4).map(|c| m.sys.park_request(c)).collect();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     // Every step checks the invariants "fence: a word marked before its
     // park request was raised" and "a stop in flight under a word that is
@@ -435,6 +439,7 @@ fn kernel_shape_the_fence_raises_the_park_request_before_it_marks_the_word_reque
 #[test]
 fn kernel_shape_r6_frees_a_core_word_only_settle_ns_after_the_last_stop_sent_to_it() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     let mut freed = None;
     for _ in 0..200 {
@@ -480,6 +485,7 @@ fn kernel_shape_a_unit_role_is_not_handed_to_a_node_with_a_core_of_a_lesser_clas
 #[test]
 fn kernel_shape_the_fence_stops_the_joining_cores_of_a_starting_node() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1, 2], &[3]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -516,6 +522,7 @@ fn kernel_shape_a_resume_runs_r0_for_a_generation_that_ended_while_the_node_was_
     m.run(5 * MS);
     assert_eq!(m.state(1), MemberState::Sealed);
     // The granter's generation ends while the holder is sealed.
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(0));
     m.run(10 * MS);
     m.ok(2, resume(1));

@@ -5656,3 +5656,28 @@ fn an_untyped_root_that_got_a_descendant_before_delivery_is_dropped() {
     assert_eq!(k.inspect(s(33)).unwrap().0, Untyped);
     assert_eq!(k.kind(50), Err(Error::Invalid));
 }
+
+// Pass 34, R-1 of the review of pass 32. The `busy` of a *move* of an
+// untyped root that has a descendant is a state check (Order of checks,
+// step 4): `call` judges its receive range before it, a plain argument
+// (step 3), so a range of more than 4 slots is `invalid`.
+#[test]
+fn a_call_judges_its_receive_range_before_the_busy_of_a_move() {
+    let mut k = K::with_ipc();
+    let caller = k.spawn(40);
+    let moved = msg(1, vec![Transfer::Move(UT)]);
+    assert_eq!(
+        k.on(caller, call(EP, moved, range(50, 5))),
+        Err(Error::Invalid)
+    );
+}
+
+// Pass 34, R-1: `reply_recv` judges its endpoint (a capability argument,
+// step 2) before the `busy` of a *move* (step 4): an empty endpoint slot
+// is `invalid`.
+#[test]
+fn a_reply_recv_judges_its_endpoint_before_the_busy_of_a_move() {
+    let mut k = K::with_ipc();
+    let moved = msg(1, vec![Transfer::Move(UT)]);
+    k.no(reply_recv(RP, moved, 77), Error::Invalid);
+}

@@ -17,6 +17,7 @@ use dodos_abi::{CoreState, CoreWord, SETTLE_NS};
 #[test]
 fn f2_the_first_round_of_a_fence_cancels_the_start_requests_aimed_at_the_node() {
     let mut m = S::on(&machine(crate::Arch::X86_64, 4, &[&[0], &[1, 2], &[3]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -66,6 +67,7 @@ fn tick(sys: &mut crate::system::System) {
 #[test]
 fn f3_r6_keeps_a_core_word_until_settle_ns_after_the_last_stop_even_when_confirmed() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     let free = |sys: &crate::system::System| {
         CoreWord::from_raw(sys.core_word(1)).is_some_and(|w| w.state() == CoreState::Free)
@@ -103,6 +105,7 @@ fn f3_r6_keeps_a_core_word_until_settle_ns_after_the_last_stop_even_when_confirm
 #[test]
 fn f4_the_barrier_does_not_hold_while_a_context_entry_names_the_generation() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     for _ in 0..2000 {
         if m.state(1) == MemberState::Fenced && m.sys.node(0).barrier_holds(1) {
@@ -281,6 +284,7 @@ fn f8_a_hand_over_whose_target_died_before_step_4_returns_busy_and_writes_no_han
         unit.queue.push((unit.next, 0));
     });
     assert_eq!(m.call(holder, hand), WAITS);
+    m.supervisor(third, m.t[third as usize]);
     m.ok(third, kill(target));
     m.sys
         .edit_table(|t| t.units.entry(role).or_default().broken = false);

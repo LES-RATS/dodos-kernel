@@ -394,6 +394,7 @@ fn r6_clears_the_table_bit_and_a_fresh_start_writes_its_table_floor() {
     let (mut m, chunk) = second_node_with_tables();
     let floor = table_floor_chunks(&m);
     assert!(floor.iter().all(|&c| m.sys.canonical().table_chunk(c)));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -566,6 +567,7 @@ fn r6_retires_every_handle_of_a_dead_nodes_cores_once_a_unit_failed() {
     };
     // No unit failed: a death retires nothing.
     let mut healthy = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    healthy.supervisor(0, healthy.t[0]);
     healthy.ok(0, kill(1));
     healthy.run(10 * MS);
     assert_eq!(healthy.state(1), MemberState::Dead);
@@ -580,6 +582,7 @@ fn r6_retires_every_handle_of_a_dead_nodes_cores_once_a_unit_failed() {
     assert_eq!(m.call(0, call), WAITS);
     m.run(30 * MS);
     assert!(m.sys.role(IOMMU_ROLE).failed());
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);

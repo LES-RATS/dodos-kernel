@@ -114,6 +114,7 @@ fn a_take_over_of_a_failed_units_role_is_not_a_rebuild() {
     let generation = m.sys.member(1).generation();
     let submitted = |m: &S| m.sys.canonical().units[&IOMMU_ROLE].next;
     let before = submitted(&m);
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(1));
     watch(&mut m, |m| m.sys.role(IOMMU_ROLE).holder() != 1);
     // One submission, R1's for the old holder: no closing invalidation of
@@ -149,6 +150,7 @@ fn a_take_over_of_a_handing_word_with_bit_63_is_not_a_rebuild() {
         .expect("a killer");
     let submitted = |m: &S| m.sys.canonical().units[&IOMMU_ROLE].next;
     let before = submitted(&m);
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(target));
     watch(&mut m, |m| {
         let word = m.sys.role(IOMMU_ROLE);

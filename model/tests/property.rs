@@ -2764,9 +2764,13 @@ fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     // Since pass 32 an untyped root that has a descendant does not move
     // (D-131): 58 such moves are `busy`, among them the sends that the
     // earlier count had delivered or refused at random (4 and 1).
+    // Pass 34 (R-5 of the review of pass 32): the floors follow the rule
+    // above, three quarters of 2 and 58 rounded up; on 20 November 2026
+    // (pass 33's head) the smallest of the three page sizes measured 2 sent
+    // and 50 `busy`, still over both.
     at_least(reached.moved, [2893, 63]);
     at_least(reached.refused, [51, 10]);
-    at_least([reached.sent, reached.stayed], [1, 43]);
+    at_least([reached.sent, reached.stayed], [2, 44]);
     // The same moves listed by `call` and by `reply_recv`: 39 and 18.
     at_least([reached.called, reached.answered], [18, 6]);
 }

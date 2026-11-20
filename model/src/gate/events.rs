@@ -35,10 +35,16 @@ impl Machine {
         }
         self.r6_devices(n);
         // The dead node's use entries freed (its tables gone with R6 below),
-        // then the granters free their pinned grants on them.
+        // then the granters free their pinned grants on them; a fenced
+        // granter's gate refuses (the grant entry's cell Fence), its own R6
+        // frees them (pass 34, R-8).
         self.grants.uses[usize::from(n)] = [None; grants::GRANTS];
         self.grants.remote.retain(|&(holder, _, _), _| holder != n);
         for granter in 0..self.layout.len() as u16 {
+            let state = self.gate.members[usize::from(granter)].state;
+            if matches!(state, NodeState::Fencing | NodeState::Fenced) {
+                continue;
+            }
             for slot in 0..grants::GRANTS {
                 if self.grants.grants[usize::from(granter)][slot].is_some_and(|g| g.grantee == n) {
                     let _ = self.release_grant(granter, slot);

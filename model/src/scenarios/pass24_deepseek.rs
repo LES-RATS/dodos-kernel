@@ -187,6 +187,7 @@ fn pinned_by_a_failed_unit() -> Granted {
 fn a_holder_killed_under_a_count_a_failed_unit_kept_never_dies() {
     let mut g = pinned_by_a_failed_unit();
     let generation = g.m.sys.member(Y).generation();
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(Y));
     g.m.run(1_000 * MS);
     assert_ne!(g.m.state(Y), MemberState::Dead, "the holder died");
@@ -212,6 +213,7 @@ fn a_holder_killed_under_a_count_a_failed_unit_kept_never_dies() {
 #[test]
 fn a_fresh_start_of_a_holder_under_a_kept_count_is_busy() {
     let mut g = pinned_by_a_failed_unit();
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(Y));
     g.m.run(500 * MS);
     let call = super::pass17::fresh(Y, 1);
@@ -228,6 +230,7 @@ fn a_sealed_holder_under_a_kept_count_keeps_the_killed_granter_fenced() {
     g.m.ok(THIRD, super::pass17::seal(Y));
     g.m.run(50 * MS);
     assert_eq!(g.m.state(Y), MemberState::Sealed);
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(1_500 * MS);
     assert_eq!(g.m.state(X), MemberState::Fenced);
@@ -251,6 +254,7 @@ fn a_resumed_holder_under_a_kept_count_runs_and_the_killed_granters_chunk_stays_
     let mut g = pinned_by_a_failed_unit();
     g.m.ok(THIRD, super::pass17::seal(Y));
     g.m.run(50 * MS);
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(dodos_abi::FENCE_NS + MS);
     assert_eq!(g.m.state(X), MemberState::Fenced);
@@ -293,6 +297,7 @@ fn a_send_of_a_generation_that_ended_during_the_seal_is_refused_during_the_resum
         ring.produced != m.sys.canonical().beacons[Y as usize].consumed[X as usize].1
     };
     assert!(waiting(&g.m), "the Send waits in the sealed holder's ring");
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(dodos_abi::FENCE_NS + MS);
     assert_eq!(g.m.state(X), MemberState::Fenced);
@@ -433,6 +438,7 @@ fn killing_the_holder_and_the_granter_under_a_kept_count_leaves_the_granter_froz
         g.m.sys.canonical().beacons[Y as usize].maps_of[X as usize],
         "the holder never mapped under the grant"
     );
+    g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(Y));
     g.m.run(500 * MS);
     assert_ne!(g.m.state(Y), MemberState::Dead);
@@ -565,6 +571,7 @@ fn a_first_map_before_the_answer_is_again_while_the_granter_is_live_or_sealed_an
     assert_eq!(leaves(&m), 0, "a leaf was counted");
     // Accused: the remote capability is no longer valid, so the map is
     // `gone` at once, before the holder's R2 removes the root.
+    m.supervisor(THIRD, m.t[THIRD as usize]);
     m.ok(THIRD, super::pass17::kill(X));
     assert_ne!(m.state(X), MemberState::Live);
     m.no(Y, io_map(&m, GOT), Error::Gone);

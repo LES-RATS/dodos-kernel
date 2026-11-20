@@ -667,3 +667,71 @@ fn an_argument_out_of_its_range_is_refused() {
         assert_eq!(m.step(&op), Err(Refused::Condition), "{op:?}");
     }
 }
+
+// Pass 34, R-7 of the review of pass 32 (G6: "use count ± leaves: the
+// grantee's, its maps and the completions"). A fenced grantee's gate
+// writes nothing, so its use count still equals its leaves; only a dead
+// node's entries are skipped (R6 frees them while its requests stay).
+#[test]
+fn a_fenced_grantees_use_count_that_is_not_its_leaves_is_reported() {
+    let mut m = Machine::new(2, 2, 8);
+    steps(&mut m, &grantee_maps(0));
+    for state in [NodeState::Fencing, NodeState::Fenced] {
+        let mut m = m.clone();
+        m.gate.members[1].state = state;
+        assert_eq!(m.check(), Ok(()));
+        m.grants.uses[1][0].as_mut().expect("the use entry").count = 2;
+        assert_eq!(
+            m.check(),
+            Err("USE: a use count that is not the leaves under its grant".into())
+        );
+    }
+}
+
+// Pass 34, R-7: a grantee's record whose leaf the walk of the tables did
+// not count (its table page not of class table) is reported, not a
+// panic of the checker on the subtraction. The whole check reports the
+// class first (CLASS), so the rule of the counts is called alone.
+#[test]
+fn a_grantees_leaf_in_no_table_is_reported() {
+    let mut m = Machine::new(2, 2, 8);
+    steps(&mut m, &grantee_maps(0));
+    m.gate.classes[11] = Class::Data;
+    assert!(m.check().is_err());
+    assert_eq!(
+        m.check_counts(),
+        Err("USE: a grantee's leaf in no table walked".into())
+    );
+}
+
+// Pass 34, R-8 of the review of pass 32 (the grant entry's cell Fence:
+// "X's gate refuses"; cell Death: "as grantee, the granters pin (R3) and
+// free at its generation's end"). The grantee's R6 frees the grants of a
+// granter whose gate writes; a fenced granter's entry is left to its own
+// R6, which frees it.
+#[test]
+fn a_grantees_r6_leaves_a_fenced_granters_grant_to_its_own_r6() {
+    // Three nodes, so that node 2 holds the unit through both deaths; the
+    // first chunk past the floors is 6.
+    let mut m = Machine::new(3, 2, 8);
+    let mut ops = grantee_maps(0);
+    ops[0] = Op::Take {
+        n: 0,
+        chunk: 6,
+        kind: Take::Ordinary,
+    };
+    ops[1] = Op::Grant {
+        n: 0,
+        slot: 0,
+        page: 6 * PAGES_PER_CHUNK,
+        to: 1,
+    };
+    steps(&mut m, &ops);
+    steps(&mut m, &[Op::Fence { n: 0 }, Op::Death { n: 1 }]);
+    assert_eq!(m.gate.members[1].state, NodeState::Dead);
+    assert!(m.grants.grants[0][0].is_some(), "a fenced gate wrote");
+    m.recover(0);
+    steps(&mut m, &[Op::R6 { n: 0 }]);
+    assert_eq!(m.gate.members[0].state, NodeState::Dead);
+    assert_eq!(m.grants.grants[0][0], None);
+}

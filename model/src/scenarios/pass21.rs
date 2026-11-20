@@ -104,6 +104,7 @@ fn a_retired_vector_stays_retired_after_r6_and_the_next_start_of_its_core() {
     // behind it, so its barrier holds all the same and R6 runs.
     m.sys
         .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, super::pass17::kill(n));
     for _ in 0..20 {
         if m.state(n) == MemberState::Dead {
@@ -519,6 +520,7 @@ fn deepseek12_m29_the_removal_of_an_msi_waits_for_the_answer_of_its_invalidation
 #[test]
 fn deepseek12_m33_the_reclaim_of_a_second_death_of_one_slot_starts_afresh() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, super::pass17::kill(2));
     m.run(30 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
@@ -649,6 +651,7 @@ fn a_node_with_a_device_behind_a_failed_unit_stays_fenced() {
     attached(&mut m, n);
     m.sys
         .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, super::pass17::kill(n));
     m.run(100 * MS);
     assert!(m.sys.canonical().roles[IOMMU_ROLE].failed());

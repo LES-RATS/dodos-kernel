@@ -131,6 +131,7 @@ fn the_rebuild_clears_an_entry_of_a_live_node_that_its_report_does_not_claim() {
         unit.entries.insert(stray, (0, generation));
     });
     assert_eq!(m.sys.check(), Ok(()));
+    m.supervisor(2, m.t[2]);
     m.ok(2, pass17::kill(1));
     m.run(30 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
@@ -163,6 +164,7 @@ fn each_core_generator_is_seeded_from_its_nodes_seed_and_its_number() {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     let first = m.sys.node(1).cores[0].entropy;
     assert_ne!(m.sys.node(0).cores[0].entropy, first, "two nodes");
+    m.supervisor(0, m.t[0]);
     m.ok(0, pass17::kill(1));
     m.run(30 * MS);
     m.ok(0, pass17::fresh(1, 0b10));

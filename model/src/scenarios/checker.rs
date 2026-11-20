@@ -915,6 +915,7 @@ fn a_core_word_that_reads_leaving_is_reported() {
 #[test]
 fn a_park_request_that_goes_back_is_reported() {
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, super::pass17::kill(1));
     m.run(10 * MS);
     assert_ne!(m.sys.park_request(1), 0, "the fence raised it");
@@ -1039,6 +1040,7 @@ fn an_aplic_write_for_a_line_the_node_does_not_hold_is_reported() {
 fn an_unconfirmed_core_two_rounds_without_a_stop_is_reported() {
     let mut m = S::on(&machine(crate::Arch::Aarch64, 2, &[&[0], &[1]]));
     m.run(30 * MS);
+    m.supervisor(0, m.t[0]);
     m.ok(0, super::pass17::kill(1));
     let sent = |m: &S| m.sys.canonical().fences[1].last_stop(1) != 0;
     assert!(m.step_until(sent));
@@ -1221,6 +1223,7 @@ fn a_core_running_with_an_in_service_bit_of_its_last_node_is_reported() {
 fn a_dead_generations_device_still_attached_is_reported() {
     let mut m = S::on(&machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     let g = m.sys.member(1).generation();
+    m.supervisor(0, m.t[0]);
     m.ok(0, super::pass17::kill(1));
     m.run(100 * MS);
     assert_eq!(m.state(1), MemberState::Dead);

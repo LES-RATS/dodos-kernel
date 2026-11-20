@@ -376,3 +376,31 @@ fn the_gate_writes_a_core_word_only_on_a_row_of_its_table() {
     assert!(table.write_core(1, owned.raw(), joining));
     assert!(table.write_core(1, joining.raw(), owned));
 }
+
+// Pass 34, R-9 of the review of pass 32 (The machine table, releasing and
+// giving, D-159 (1)): the completion writes each word "by compare-and-swap
+// from the value read when the request was opened", not from a value read
+// at the completion. Node 0, holding a reserve role, gives its block; while
+// the give is in flight the word is changed to *taken* by that reserve with
+// the node's generation, a word the node holds too but not the one the
+// request read: the completion leaves it.
+#[test]
+fn a_gives_completion_writes_only_the_word_its_request_read() {
+    let (mut k, _, chunk) = block_taken();
+    let thread = k.t;
+    super::claim_a_reserve(&k.m.clone(), thread, |call| k.m.apply(thread, call));
+    let node = k.m.node;
+    let j = (0..u16::MAX)
+        .find(|&j| k.m.table.holds_reserve(node, j))
+        .expect("a reserve role");
+    assert_eq!(k.call(thread, give_block()), WAITS);
+    let request = k.m.cores[0].request.as_ref().expect("the give's request");
+    let crate::cores::Completes::Run(run) = request.completes.clone() else {
+        panic!("not a give");
+    };
+    let generation = k.m.table.generation(node);
+    let other = dodos_abi::Ownership::taken(dodos_abi::Owner::Reserve(j), generation).raw();
+    k.m.stray_write(chunk, other);
+    k.m.write_freed(run);
+    assert_eq!(k.m.ownership(chunk), other);
+}

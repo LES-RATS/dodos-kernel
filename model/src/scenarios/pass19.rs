@@ -157,6 +157,7 @@ fn a_rebuild_writes_the_entry_of_an_attached_device_whose_holder_died_before_wri
             .entries
             .remove(&(DEVICE as u16));
     });
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(30 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
@@ -181,6 +182,7 @@ fn a_rebuild_writes_no_entry_for_a_reported_device_whose_attach_word_is_0() {
             .entries
             .remove(&(DEVICE as u16));
     });
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(30 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
@@ -192,6 +194,7 @@ fn a_rebuild_writes_no_entry_for_a_reported_device_whose_attach_word_is_0() {
 fn r6_clears_the_attach_word_of_a_device_of_a_dead_generation() {
     let mut m = three();
     attached(&mut m, 0);
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill(0));
     m.run(30 * MS);
     assert_eq!(m.state(0), MemberState::Dead);
@@ -355,6 +358,7 @@ fn an_unfenced_holders_unit_role_is_taken_over_at_fence_ns_and_settle_ns_after_t
     let mut m = three();
     m.sys.hang(1, false);
     m.sys.set_vmx(1, true);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(MS);
     let generation = m.sys.member(1).generation();
@@ -378,6 +382,7 @@ fn an_unfenced_holders_unit_role_is_taken_over_at_fence_ns_and_settle_ns_after_t
 fn a_start_whose_core_never_takes_its_wake_ends_at_start_ns() {
     use super::pass17::fresh;
     let mut m = S::two();
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -452,6 +457,7 @@ fn a_resume_beside_an_unfenced_peer_waits_until_r2_removed_every_remote_capabili
     assert_eq!(m.state(1), MemberState::Sealed);
     m.sys.set_vmx(2, true);
     m.sys.hang(2, false);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(2));
     m.run(dodos_abi::FENCE_NS + 10 * MS);
     assert_eq!(m.state(2), MemberState::Unfenced);
@@ -613,6 +619,7 @@ fn a_new_holder_of_an_ioapic_rewrites_a_reported_lines_entry_from_its_operands()
     m.sys.edit_table(|t| {
         t.units.entry(role).or_default().lines.remove(&5);
     });
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(holder));
     m.run(30 * MS);
     assert_ne!(m.sys.role(role).holder(), holder);
@@ -712,6 +719,7 @@ fn acknowledged_after_grants(rounds: u32, blocks: u32) -> (usize, usize, bool) {
         .values()
         .filter(|u| u.block == Some(crate::Block::Run))
         .count();
+    m.supervisor(1, m.t[1]);
     m.ok(1, kill(2));
     let generation = m.sys.member(2).generation();
     // Event by event until node 2 is fenced, then node 0's reserve step by
@@ -763,6 +771,7 @@ fn r5_is_written_only_once_r4_audited_every_block() {
 fn a_start_on_a_core_that_never_beats_is_accused_after_start_ns_and_not_before() {
     use super::pass17::fresh;
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1]]));
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -785,6 +794,7 @@ fn a_start_on_a_reused_core_with_an_old_idle_until_is_not_accused_before_start_n
     let mut two = machine(Arch::X86_64, 2, &[&[0], &[1]]);
     two.membership.sweep_ms = 100;
     let mut m = S::on(&two);
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Dead);

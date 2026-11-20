@@ -221,8 +221,9 @@ impl Model {
 
     /// A faulty kernel's call of its gate, its derivation list ignored:
     /// give chunk `chunk` to node `to` (D-148). The gate checks what it
-    /// owns: the chunk's owner word taken by this node's generation, its
-    /// map count and its grant count 0 (G5), and that no request of the
+    /// owns: the chunk's owner word taken by this node's generation, or
+    /// a word of a reserve whose role it holds (`Table::taken_by`), its map
+    /// count and its grant count 0 (G5), and that no request of the
     /// node names a give or a destruction of the chunk (the gate's `busy`,
     /// D-159, settling gap 49). Says whether it gave.
     pub fn gate_give_chunk(&mut self, chunk: u64, to: u16) -> bool {
@@ -233,11 +234,9 @@ impl Model {
             return false;
         }
         let generation = self.table.generation(self.node);
-        let owned = Ownership::from_raw(raw).is_some_and(|w| {
-            w.state() == dodos_abi::OwnState::Taken
-                && w.owner() == Owner::Node(self.node)
-                && w.generation() == generation
-        });
+        // A reserve chunk the node took while it holds the role reads as
+        // its own (rule 4 of taking; pass 34, R-4).
+        let owned = self.table.taken_by(raw, self.node, generation);
         // G5 (D-148, D-150, D-154): map count 0, grant count 0 and count of
         // pages not *data* 0, so a table chunk that holds a table, a root
         // or an ITS table is never given.
@@ -347,7 +346,11 @@ impl Model {
             return Ok(Output::Done);
         }
         let flush = crate::cores::Flush::Kernel(freed.chunks(self.table.geometry.chunk_shift()));
-        match self.start_request(flush, crate::cores::Completes::Run(freed), Some(thread)) {
+        match self.start_request(
+            flush,
+            crate::cores::Completes::Run(freed.clone()),
+            Some(thread),
+        ) {
             crate::cores::Started::Asked => Ok(Output::Waits),
             _ => {
                 self.write_freed(freed);
@@ -382,7 +385,7 @@ impl Model {
             return Some(true);
         }
         let flush = crate::cores::Flush::Kernel(freed.chunks(self.table.geometry.chunk_shift()));
-        match self.start_request(flush, crate::cores::Completes::Run(freed), None) {
+        match self.start_request(flush, crate::cores::Completes::Run(freed.clone()), None) {
             crate::cores::Started::Complete => {
                 self.write_freed(freed);
                 Some(true)
@@ -488,31 +491,39 @@ impl Model {
             false => untyped.block.take()?,
         };
         let (base, bytes) = (untyped.base, untyped.bytes);
-        let run = FreedRun {
+        let mut run = FreedRun {
             object: keep.then_some(object),
             block,
             base,
             bytes,
             freed,
+            opened: Vec::new(),
         };
-        if block == Block::Run {
-            for chunk in run.chunks(self.table.geometry.chunk_shift()) {
-                self.kernel_runs.remove(&chunk);
-                self.kernel_read_only.remove(&chunk);
+        run.opened = match block {
+            Block::Run => {
+                let chunks = run.chunks(self.table.geometry.chunk_shift());
+                for chunk in &chunks {
+                    self.kernel_runs.remove(chunk);
+                    self.kernel_read_only.remove(chunk);
+                }
+                chunks
+                    .iter()
+                    .map(|&c| self.table.owners[c as usize])
+                    .collect()
             }
-        }
+            Block::Entry(index) => vec![self.table.devices[index].owner.raw()],
+        };
         Some(run)
     }
 
     /// Each word of a block becomes free, in ascending order, through the
     /// gate: with the same owner for a destruction (the reserve's code for
     /// a reserve chunk), with the node named for a give. Each is written by
-    /// compare-and-swap from the value read when the request was opened,
-    /// *taken* by this node with its generation: a word that reads
+    /// compare-and-swap from the value read when the request was opened
+    /// (*taken* by this node with its generation): a word that reads
     /// anything else is no longer this request's to write (The machine
-    /// table, releasing and giving; D-159).
+    /// table, releasing and giving; D-159; pass 34, R-9).
     pub(crate) fn write_freed(&mut self, run: FreedRun) {
-        let generation = self.table.generation(self.node);
         let owner = |before: u64| match (run.freed, Ownership::from_raw(before).map(|w| w.owner()))
         {
             (Freed::Given(node), _) => Owner::Node(node),
@@ -521,9 +532,9 @@ impl Model {
         };
         match run.block {
             Block::Run => {
-                for chunk in run.chunks(self.table.geometry.chunk_shift()) {
-                    let before = self.table.owners[chunk as usize];
-                    if !self.table.taken_by(before, self.node, generation) {
+                let chunks = run.chunks(self.table.geometry.chunk_shift());
+                for (chunk, &before) in chunks.into_iter().zip(&run.opened) {
+                    if self.table.owners[chunk as usize] != before {
                         continue;
                     }
                     let after = Ownership::free(owner(before));
@@ -532,6 +543,9 @@ impl Model {
             }
             Block::Entry(index) => {
                 let mut entry = self.table.devices[index];
+                if run.opened != [entry.owner.raw()] {
+                    return;
+                }
                 entry.owner = Ownership::free(owner(entry.owner.raw()));
                 assert!(self.table.write_entry(self.node, index, entry));
             }
@@ -554,13 +568,16 @@ pub(crate) enum Freed {
 /// The words of a block to write free once its run is unmapped from the
 /// kernel's own space on every core: the block (its untyped, while a
 /// destruction keeps it), its place, and what the words become.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FreedRun {
     pub(crate) object: Option<ObjId>,
     pub(crate) block: Block,
     pub(crate) base: u64,
     pub(crate) bytes: u64,
     pub(crate) freed: Freed,
+    /// The words read when the request was opened, in the order they are
+    /// written: each chunk's ownership word, or the entry's.
+    pub(crate) opened: Vec<u64>,
 }
 
 impl FreedRun {

@@ -172,6 +172,7 @@ fn node_send_is_judged_in_order() {
     };
     m.no(0, derive, Error::Denied);
     // A node that is not live: gone.
+    m.supervisor(0, m.t[0]);
     m.ok(
         0,
         Syscall::NodeStop {
@@ -698,6 +699,7 @@ fn r0_ends_with_gone_the_wait_for_an_answer_of_a_node_accused_first() {
         mode: NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(0, killer);
     assert_eq!(m.call_by(0, killer, stop), DONE);
     m.settle();
     assert_eq!(m.woken(0), Some(&Err(Error::Gone)));
@@ -713,6 +715,7 @@ fn a_fresh_start_consumes_nothing_sent_to_its_earlier_generation() {
         mode: NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(0, m.t[0]);
     m.ok(0, stop);
     m.run(10 * MS);
     // A raw entry left in the ring before the start.

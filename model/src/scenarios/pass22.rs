@@ -663,6 +663,7 @@ pub(super) fn restart_over(edit: impl FnOnce(&mut crate::debug::DebugArea)) -> S
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill);
     m.run(30 * MS);
     assert_eq!(m.state(1), MemberState::Dead);
@@ -808,6 +809,7 @@ fn a_report_whose_next_key_does_not_advance_ends_its_nodes_report() {
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill);
     let to = m.sys.now() + 200 * MS;
     let mut seen = false;
@@ -877,6 +879,7 @@ fn a_node_that_takes_a_unit_role_clears_the_entries_of_a_dead_generation() {
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill);
     m.run(30 * MS);
     assert_eq!(m.state(0), MemberState::Dead);
@@ -1203,6 +1206,7 @@ fn a_debugger_stop_during_r1_does_not_fail_the_unit() {
     };
     // The unit confirms nothing for a while: R1's invalidation of node 0's
     // devices waits on it.
+    m.supervisor(2, m.t[2]);
     m.ok(2, kill);
     m.sys
         .edit_table(|t| t.units.entry(IOMMU_ROLE).or_default().broken = true);
@@ -1546,6 +1550,7 @@ fn a_rebuild_clears_an_entry_whose_report_names_another_root() {
         mode: dodos_abi::NODE_STOP_KILL,
         core: 0,
     };
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill);
     run_rewriting_reports(&mut m, 300, |body| {
         if let Body::Report { items, .. } = body {
@@ -1816,6 +1821,7 @@ fn a_resume_after_a_peer_died_while_sealed_waits_until_r2_removed_every_remote_c
     m.run(10 * MS);
     assert_eq!(m.state(1), MemberState::Sealed);
     // Node 2 dies while node 1 is sealed: its generation ended.
+    m.supervisor(0, m.t[0]);
     m.ok(0, kill(2));
     m.run(10 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
@@ -1842,6 +1848,7 @@ fn a_resume_after_a_peer_died_while_sealed_waits_until_r2_removed_every_remote_c
 fn a_start_whose_page_does_not_fit_parks_its_core_again() {
     use crate::system::Hardware;
     let mut m = S::on(&machine(Arch::X86_64, 2, &[&[0], &[1]]));
+    m.supervisor(0, m.t[0]);
     m.ok(
         0,
         Syscall::NodeStop {

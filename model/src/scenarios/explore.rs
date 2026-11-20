@@ -75,6 +75,11 @@ pub(super) fn try_call(m: &mut S, node: u16, call: Syscall) -> Option<Outcome> {
         return None;
     }
     say(format_args!("{} node {node}: {call:?}", m.sys.now()));
+    // A kill or a retire needs a reserve role (`node_stop`, D-150): the
+    // node claims one first, as the supervisor that stops a node would.
+    if super::stops_with_evidence(&call) {
+        m.supervisor(node, thread);
+    }
     let outcome = m.call(node, call);
     say(format_args!("  -> {outcome:?}"));
     Some(outcome)

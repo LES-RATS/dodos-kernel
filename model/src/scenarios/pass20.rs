@@ -528,6 +528,7 @@ fn a_report_carries_a_lines_mask_and_the_new_holder_writes_an_idle_line_masked()
     let outcome = m.call(a, claim);
     assert!(outcome == WAITS || outcome == DONE, "{outcome:?}");
     m.run(2 * MS);
+    m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, super::pass17::kill(holder));
     m.run(30 * MS);
     assert_ne!(m.sys.role(role).holder(), holder);
