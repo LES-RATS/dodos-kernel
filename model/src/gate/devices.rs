@@ -418,7 +418,7 @@ impl Machine {
     /// untyped only, D-154), no give in flight (D-153, gap 30).
     pub(crate) fn retype_its(&mut self, n: u16, first: Page, k: u8) -> Gated {
         self.unit_writes(n)?;
-        require(k <= ITS_K_MAX)?;
+        require(k <= ITS_K_MAX && first < self.chunks * PAGES_PER_CHUNK)?;
         let pages = run(first, k);
         // Aligned on its size, so within one chunk (16 pages at most in a
         // chunk of 512 on the reference machine; the small machine's chunk

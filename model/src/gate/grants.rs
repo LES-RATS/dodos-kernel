@@ -73,7 +73,7 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state.writes())?;
         require(slot < GRANTS && to != n && usize::from(to) < self.layout.len())?;
         require(self.grants.grants[usize::from(n)][slot].is_none())?;
-        require(self.holds(n, page) && !self.giving(page))?;
+        require(self.holds(n, page) && !self.giving(n, page))?;
         require(self.gate.classes[page as usize] == Class::Data)?;
         // G6 (D-154): an anchor only over memory whose chunks' gate words
         // have the table bit clear; so a table chunk's grant count is 0.
@@ -120,8 +120,10 @@ impl Machine {
 
     /// A grantee's leaf toward a granted page: counted only in a use entry
     /// naming the grant, its serial and the granter's generation, the grant
-    /// *live* and *answered*; the map count of the page's chunk and the use
-    /// count + 1.
+    /// *live* and *answered*; the use count + 1. The map count of the
+    /// page's chunk is the granter's leaves, written by the granter's gate
+    /// alone (G4: "a grantee's leaves are counted in its use entry, so each
+    /// count has one writer"): the grant count holds the chunk meanwhile.
     pub(crate) fn map_remote(
         &mut self,
         n: u16,
@@ -139,7 +141,7 @@ impl Machine {
         require(self.gate.members[usize::from(used.granter)].generation == used.generation)?;
         require(e0 < ENTRIES - 1 && e1 < ENTRIES)?;
         require(self.gate.classes.get(root as usize) == Some(&Class::Root(RootState::Live)))?;
-        require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
+        require(self.tag_holds(n, tag, root))?;
         let Entry::Table(table) = self.gate.tables[&root][e0] else {
             return Err(Refused::Condition);
         };
@@ -148,7 +150,6 @@ impl Machine {
             page: grant.page,
             write: false,
         };
-        self.gate.map_counts[Self::chunk_of(grant.page) as usize] += 1;
         self.grants.uses[usize::from(n)][index]
             .as_mut()
             .expect("the use")
@@ -183,10 +184,18 @@ impl Machine {
         !names || used.count == 0
     }
 
+    /// *live*, *revoking* or *pinned* → *free*, by the granter's own call:
+    /// its gate writes only while its node does (G13; the grant entry's
+    /// cell Fence: "X's gate refuses").
+    pub(crate) fn free_grant(&mut self, n: u16, slot: usize) -> Gated {
+        require(self.gate.members[usize::from(n)].state.writes())?;
+        self.release_grant(n, slot)
+    }
+
     /// *live*, *revoking* or *pinned* → *free*, serial + 1: the granter's
     /// gate (or R6), the use entry at the recorded index counting 0 or no
     /// longer naming the grant; the grant count − 1.
-    pub(crate) fn free_grant(&mut self, n: u16, slot: usize) -> Gated {
+    pub(super) fn release_grant(&mut self, n: u16, slot: usize) -> Gated {
         require(slot < GRANTS)?;
         let grant = self.grants.grants[usize::from(n)][slot].ok_or(Refused::Condition)?;
         require(self.use_released(n, slot, grant))?;
@@ -195,39 +204,5 @@ impl Machine {
         let chunk = Self::chunk_of(grant.page) as usize;
         self.gate.grant_counts[chunk] = self.gate.grant_counts[chunk].saturating_sub(1);
         Ok(())
-    }
-
-    /// The holder's use count lowered at the completion of the invalidation
-    /// of its leaf (called by a completion naming the leaf's page).
-    pub(crate) fn lower_use(&mut self, n: u16, page: Page) {
-        let keys: Vec<_> = self
-            .grants
-            .remote
-            .iter()
-            .filter(|&(&(holder, _, _), &(granter, slot, _))| {
-                holder == n
-                    && self.grants.grants[usize::from(granter)][slot]
-                        .is_some_and(|g| g.page == page)
-            })
-            .map(|(&k, &v)| (k, v))
-            .collect();
-        for ((holder, root, va), (_, _, index)) in keys {
-            let present = self
-                .gate
-                .tables
-                .get(&root)
-                .and_then(|r| match r[va.0] {
-                    Entry::Table(t) => self.gate.tables.get(&t),
-                    _ => None,
-                })
-                .is_some_and(|t| matches!(t[va.1], Entry::Leaf { page: p, .. } if p == page));
-            if !present {
-                self.grants.remote.remove(&(holder, root, va));
-                if let Some(used) = self.grants.uses[usize::from(holder)][index].as_mut() {
-                    used.count = used.count.saturating_sub(1);
-                }
-                return;
-            }
-        }
     }
 }

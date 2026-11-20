@@ -11,6 +11,21 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state.writes())
     }
 
+    /// A call made on core `p` of node `n`: the node's gate writes, and
+    /// the position is one of the node's cores (whatever the kernel
+    /// passes, the gate indexes no word of a core the node does not have).
+    pub(super) fn writes_on(&self, n: u16, p: usize) -> Gated {
+        self.writes(n)?;
+        require(p < self.layout[usize::from(n)].cores.len())
+    }
+
+    /// Whether the entry of `tag` in node `n`'s tag table holds `root`; a
+    /// tag beyond the table holds nothing.
+    pub(super) fn tag_holds(&self, n: u16, tag: usize, root: Page) -> bool {
+        let tags = &self.gate.nodes[usize::from(n)].tags;
+        tags.get(tag).is_some_and(|t| t.root == Some(root))
+    }
+
     pub(super) fn class(&self, page: Page) -> Gated<Class> {
         self.gate
             .classes
@@ -56,23 +71,26 @@ impl Machine {
     /// read-only, is not touched.
     pub(super) fn leaves_data(&self, n: u16, page: Page) -> bool {
         let tables = self.table_chunk(page) || self.old.tables_in_ordinary_chunks;
-        self.holds(n, page) && tables && !self.giving(page)
+        self.holds(n, page) && tables && !self.giving(n, page)
     }
 
     /// While a request names a give or a destruction of a chunk, every
     /// write that would raise one of its counts is refused (Gate words, the
     /// ownership words and the page class byte; D-153, gap 30). Without it
     /// the completion gives a chunk that holds a root (pass 29's seeds 75
-    /// and 151, kept as tests).
-    pub(super) fn giving(&self, page: Page) -> bool {
+    /// and 151, kept as tests). The requests read are those of the calling
+    /// node `n`, the only one whose give of a chunk it holds can be in
+    /// flight: a request of a node that died with a give in flight is never
+    /// read again (a core's invalidation request, cell Death), so it holds
+    /// nothing of the chunk's next owner.
+    pub(super) fn giving(&self, n: u16, page: Page) -> bool {
         if self.old.counts_free_during_give {
             return false;
         }
         let chunk = Self::chunk_of(page);
-        self.gate
-            .nodes
+        self.gate.nodes[usize::from(n)]
+            .requests
             .iter()
-            .flat_map(|n| &n.requests)
             .any(|r| matches!(r, Request::InUse { what: Invalidates::KernelRun { chunk: c, .. }, .. } if *c == chunk))
     }
 
@@ -247,8 +265,8 @@ impl Machine {
         self.writes(n)?;
         require(e0 < ENTRIES - 1 && e1 < ENTRIES)?;
         require(self.class(root)? == Class::Root(RootState::Live))?;
-        require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
-        require(self.holds(n, page) && !self.giving(page))?;
+        require(self.tag_holds(n, tag, root))?;
+        require(self.holds(n, page) && !self.giving(n, page))?;
         require(!write || self.class(page)? == Class::Data)?;
         // G3 (3) (D-154): a leaf never points into a chunk whose gate word
         // has the table bit set; so its map count is always 0.
@@ -334,9 +352,9 @@ impl Machine {
         tag: usize,
         (e0, e1): (usize, usize),
     ) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         require(e0 < ENTRIES - 1 && e1 < ENTRIES)?;
-        require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
+        require(self.tag_holds(n, tag, root))?;
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
         let Entry::Table(table) = self.gate.tables[&root][e0] else {
             return Err(Refused::Condition);
@@ -345,6 +363,7 @@ impl Machine {
             return Err(Refused::Condition);
         };
         self.gate.tables.get_mut(&table).expect("a table")[e1] = Entry::Absent;
+        let counted = self.cleared(n, root, (e0, e1));
         let flush = Flush::Range {
             tag,
             va: vec![(e0, e1)],
@@ -352,7 +371,7 @@ impl Machine {
         self.invalidate_here(n, p, &flush);
         let asked = self.asked_for_tag(n, p, tag);
         let record = Clearing {
-            leaves: vec![page],
+            leaves: vec![(page, counted)],
             ..Clearing::default()
         };
         self.start_request(
@@ -372,9 +391,9 @@ impl Machine {
     /// every entry of the child read non-present; completed into *loose*
     /// by the request's completion.
     pub(crate) fn unhook(&mut self, n: u16, p: usize, root: Page, tag: usize, e0: usize) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         require(e0 < ENTRIES - 1)?;
-        require(self.gate.nodes[usize::from(n)].tags[tag].root == Some(root))?;
+        require(self.tag_holds(n, tag, root))?;
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
         let Entry::Table(child) = self.gate.tables[&root][e0] else {
             return Err(Refused::Condition);
@@ -498,7 +517,7 @@ impl Machine {
     /// The root load (G7): the root *live*, the tag's entry holding it; an
     /// owes bit invalidates every tag first; the core joins the tag's set.
     pub(crate) fn load(&mut self, n: u16, p: usize, root: Page, tag: usize) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         // G7 (D-155): the gate never loads its own tag for a root.
         require(tag < TAGS || (self.old.gate_tag_bound && tag == GATE_TAG))?;
         require(self.class(root)? == Class::Root(RootState::Live))?;
@@ -518,7 +537,7 @@ impl Machine {
     /// The call that loads the kernel's root before idle: the idle mark
     /// set.
     pub(crate) fn idle(&mut self, n: u16, p: usize) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         let kernel = self.layout[usize::from(n)].kernel_root;
         let node = &mut self.gate.nodes[usize::from(n)];
         node.loaded[p] = (kernel, 0);
@@ -531,7 +550,7 @@ impl Machine {
     /// *dying* root the request names; then the invalidation; then the
     /// acknowledgement, the last one completing the request.
     pub(crate) fn ack(&mut self, n: u16, p: usize) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         let pending: Vec<usize> = self.gate.nodes[usize::from(n)].pending[p]
             .iter()
             .copied()
@@ -588,6 +607,31 @@ impl Machine {
         Ok(())
     }
 
+    /// The count a leaf just cleared at (`root`, `va`) of node `n` is in:
+    /// the use entry its record names, for a leaf toward a granted page,
+    /// whose record of a present leaf ends here; the map count of its
+    /// chunk otherwise.
+    fn cleared(&mut self, n: u16, root: Page, va: (usize, usize)) -> Counted {
+        match self.grants.remote.remove(&(n, root, va)) {
+            Some((_, _, index)) => Counted::Use(index),
+            None => Counted::Map,
+        }
+    }
+
+    /// A cleared leaf's count lowered, at the completion of its
+    /// invalidation or at a teardown: the count the record of the clearing
+    /// names, and no other (G4, G6).
+    fn lower(&mut self, n: u16, page: Page, counted: Counted) {
+        let count = match counted {
+            Counted::Map => &mut self.gate.map_counts[Self::chunk_of(page) as usize],
+            Counted::Use(index) => match self.grants.uses[usize::from(n)][index].as_mut() {
+                Some(used) => &mut used.count,
+                None => return,
+            },
+        };
+        *count = count.saturating_sub(1);
+    }
+
     /// *in use* → *free*: the counts of the recorded run lowered, the
     /// recorded tables written *loose*, a give's words written.
     fn complete(&mut self, n: u16, q: usize) {
@@ -597,12 +641,8 @@ impl Machine {
         ) else {
             return;
         };
-        for page in record.leaves {
-            let chunk = Self::chunk_of(page) as usize;
-            self.gate.map_counts[chunk] = self.gate.map_counts[chunk].saturating_sub(1);
-            if !self.holds(n, page) {
-                self.lower_use(n, page);
-            }
+        for (page, counted) in record.leaves {
+            self.lower(n, page, counted);
         }
         let level = LEVELS - 1;
         for table in record.unhooked {
@@ -618,10 +658,19 @@ impl Machine {
                 },
             );
         }
-        // A give's words, written once every core invalidated the run.
+        // A give's words, written once every core invalidated the run, by
+        // a compare-and-swap from *taken* by the giving generation
+        // (Gate words, the ownership words, row *taken* → *free*): a word
+        // that reads anything else is no longer this request's to write.
         if let Invalidates::KernelRun { chunk, to } = what {
-            let after = Owner::Free { node: to };
-            self.gate.owners[chunk as usize] = after;
+            let before = Owner::Taken {
+                node: n,
+                generation: self.gate.members[usize::from(n)].generation,
+            };
+            let word = &mut self.gate.owners[chunk as usize];
+            if *word == before {
+                *word = Owner::Free { node: to };
+            }
             return;
         }
         if let (Invalidates::Tag { tag, .. }, None) = (&what, record.dying) {
@@ -659,7 +708,7 @@ impl Machine {
     /// cores included (Gate words, the tag table; D-153, gap 27): an idle
     /// core left out would never leave the set.
     pub(crate) fn unbind(&mut self, n: u16, p: usize, tag: usize) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         require(tag != 0 && tag < TAGS)?;
         let Some(root) = self.gate.nodes[usize::from(n)].tags[tag].root else {
             return Err(Refused::Condition);
@@ -691,7 +740,7 @@ impl Machine {
     /// asking every core of the tag's set and every core whose loaded root
     /// is the root.
     pub(crate) fn destroy(&mut self, n: u16, p: usize, root: Page) -> Gated {
-        self.writes(n)?;
+        self.writes_on(n, p)?;
         require(self.holds(n, root))?;
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
         let tag = self.tag_of(n, root).ok_or(Refused::Condition)?;
@@ -739,26 +788,18 @@ impl Machine {
         require(!node.loaded.iter().any(|&(_, t)| t == tag))?;
         let entries = self.gate.tables[&root];
         let level = LEVELS - 1;
-        for entry in entries.iter() {
+        for (e0, entry) in entries.iter().enumerate() {
             let Entry::Table(child) = *entry else {
                 continue;
             };
             let leaves = self.gate.tables[&child];
-            for leaf in leaves {
+            self.gate.tables.insert(child, [Entry::Absent; ENTRIES]);
+            for (e1, leaf) in leaves.into_iter().enumerate() {
                 if let Entry::Leaf { page, .. } = leaf {
-                    let chunk = Self::chunk_of(page) as usize;
-                    self.gate.map_counts[chunk] = self.gate.map_counts[chunk].saturating_sub(1);
+                    let counted = self.cleared(n, root, (e0, e1));
+                    self.lower(n, page, counted);
                 }
             }
-            self.gate.tables.insert(child, [Entry::Absent; ENTRIES]);
-            for leaf in leaves {
-                if let Entry::Leaf { page, .. } = leaf
-                    && !self.holds(n, page)
-                {
-                    self.lower_use(n, page);
-                }
-            }
-            self.gate.tables.insert(child, [Entry::Absent; ENTRIES]);
             self.cas_class(
                 child,
                 Class::Table {
@@ -797,8 +838,14 @@ impl Machine {
     pub(crate) fn take(&mut self, n: u16, chunk: u64, kind: Take) -> Gated {
         self.writes(n)?;
         require(chunk < self.chunks)?;
+        let dead = |node: u16| self.gate.members[usize::from(node)].state == NodeState::Dead;
         let takeable = match self.gate.owners[chunk as usize] {
-            Owner::Free { .. } => true,
+            // Rules 1 to 3 of taking (Chunks, floors and the ownership
+            // words): a word *free* with a node as owner is memory released
+            // or given to that node, and stays that node's while it is not
+            // dead; unclaimed memory is anyone's.
+            Owner::Free { node: None } => true,
+            Owner::Free { node: Some(owner) } => owner == n || dead(owner),
             Owner::Taken { node, generation } => {
                 let m = self.gate.members[usize::from(node)];
                 m.generation != generation || m.state == NodeState::Dead
@@ -832,8 +879,21 @@ impl Machine {
     /// core of the node, idle ones included, before the ownership word is
     /// written *free* for `to` (at the request's completion).
     pub(crate) fn give(&mut self, n: u16, p: usize, chunk: u64, to: u16) -> Gated {
-        self.writes(n)?;
-        require(chunk < self.chunks && to != n)?;
+        self.writes_on(n, p)?;
+        require(chunk < self.chunks && to != n && usize::from(to) < self.layout.len())?;
+        // CONTRACT-GAP 49 (Gate words, the ownership words, row *taken* →
+        // *free*; G5): the row gives the completion's compare-and-swap and
+        // G5's three counts, and the gate word's rows refuse, while a
+        // request names a give of the chunk, only the writes that raise a
+        // count. Nothing says what a second give of the same chunk does
+        // meanwhile, and the compare-and-swap alone does not hold G5: a
+        // chunk given twice, freed by the first completion and taken again
+        // by its node reads the value the second completion expects
+        // (`a_second_give_would_free_a_chunk_its_node_took_again`). The
+        // reading here: one request at most names a give of a chunk; a
+        // second give is refused between the first one's call and its
+        // completion.
+        require(!self.giving(n, chunk * PAGES_PER_CHUNK))?;
         let g = self.gate.members[usize::from(n)].generation;
         require(
             self.gate.owners[chunk as usize]

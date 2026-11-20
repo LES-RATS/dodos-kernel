@@ -117,18 +117,52 @@ impl Machine {
             counts == self.gate.grant_counts,
             "GATE WORD: a grant count not the grants over its chunk",
         )?;
-        let mut present: BTreeMap<(u16, usize), u64> = BTreeMap::new();
+        // G6: a use entry counts the present leaves under its grant and
+        // the cleared ones whose invalidation is not complete, no more
+        // and no fewer, while its node runs or is sealed (a dead or
+        // accused node's entries are freed by R6).
+        let mut counted: BTreeMap<(u16, usize), u64> = BTreeMap::new();
         for (&(holder, _, _), &(_, _, index)) in &self.grants.remote {
-            *present.entry((holder, index)).or_default() += 1;
+            *counted.entry((holder, index)).or_default() += 1;
         }
-        for ((holder, index), leaves) in present {
-            let count = self.grants.uses[usize::from(holder)][index].map_or(0, |u| u.count);
-            ensure(
-                count >= leaves,
-                "USE: a use count below the leaves under its grant",
-            )?;
+        for (n, node) in self.gate.nodes.iter().enumerate() {
+            for request in &node.requests {
+                let Request::InUse { record, .. } = request else {
+                    continue;
+                };
+                for &(_, count) in &record.leaves {
+                    if let Counted::Use(index) = count {
+                        *counted.entry((n as u16, index)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        for (n, uses) in self.grants.uses.iter().enumerate() {
+            let state = self.gate.members[n].state;
+            if !state.writes() && state != NodeState::Sealed {
+                continue;
+            }
+            for (index, used) in uses.iter().enumerate() {
+                let leaves = counted.get(&(n as u16, index)).copied().unwrap_or(0);
+                ensure(
+                    used.map_or(0, |u| u.count) == leaves,
+                    "USE: a use count that is not the leaves under its grant",
+                )?;
+            }
         }
         Ok(())
+    }
+
+    /// The page of the leaf a grantee's record names, if the leaf is
+    /// present.
+    fn remote_leaf(&self, root: Page, (e0, e1): (usize, usize)) -> Option<Page> {
+        let Entry::Table(table) = self.gate.tables.get(&root)?[e0] else {
+            return None;
+        };
+        match self.gate.tables.get(&table)?[e1] {
+            Entry::Leaf { page, .. } => Some(page),
+            _ => None,
+        }
     }
 
     /// The class byte and the non-data count; a free-list link is held
@@ -236,6 +270,15 @@ impl Machine {
                 }
             }
         }
+        // A grantee's leaf is counted in its use entry, never in the map
+        // count of the granter's chunk, which the granter's gate alone
+        // writes (G4, G6).
+        for &(_, root, va) in self.grants.remote.keys() {
+            let page = self
+                .remote_leaf(root, va)
+                .ok_or("USE: the record of a grantee's leaf that is not present")?;
+            needed[Self::chunk_of(page) as usize] -= 1;
+        }
         for (n, records) in self.unit.gate_records.iter().enumerate() {
             if !self.gate.members[n].state.writes()
                 && self.gate.members[n].state != NodeState::Sealed
@@ -268,8 +311,10 @@ impl Machine {
             }
             for request in &node.requests {
                 if let Request::InUse { record, .. } = request {
-                    for &page in &record.leaves {
-                        needed[Self::chunk_of(page) as usize] += 1;
+                    for &(page, counted) in &record.leaves {
+                        if counted == Counted::Map {
+                            needed[Self::chunk_of(page) as usize] += 1;
+                        }
                     }
                 }
             }
@@ -315,7 +360,7 @@ impl Machine {
             let mut counted: BTreeSet<Page> = BTreeSet::new();
             for request in &self.gate.nodes[usize::from(n)].requests {
                 if let Request::InUse { record, what, .. } = request {
-                    counted.extend(record.leaves.iter().copied());
+                    counted.extend(record.leaves.iter().map(|&(page, _)| page));
                     // A kernel run being unmapped: its words are written
                     // only at the request's completion.
                     if let Invalidates::KernelRun { chunk, .. } = what {

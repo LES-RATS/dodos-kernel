@@ -605,6 +605,19 @@ impl Machine {
                 }
             }
         }
+        // Now and then an argument out of its range (pass 32, lot 6's
+        // M-5): a position at which the node has no core, a tag beyond the
+        // tag table, a node or a chunk that does not exist, a run that ends
+        // beyond the address space. The gate refuses each. The generator's
+        // state is read here, not advanced, so every other step of a seed
+        // is what it was.
+        let wild = rng.0.is_multiple_of(97);
+        let own_core = self.core(n, p);
+        let (p, tag) = match wild {
+            true => (p + cores as usize, tag + ARCH_TAGS),
+            false => (p, tag),
+        };
+        let beyond = |value: u64, range: u64| value + u64::from(wild) * range;
         let category = match rng.below(5) {
             0 => 15,
             1 => 16,
@@ -733,7 +746,7 @@ impl Machine {
                 let first = pick(rng, objects);
                 let core = match rng.below(4) {
                     0 => rng.below(self.tlb.len() as u64) as usize,
-                    _ => self.core(n, p),
+                    _ => own_core,
                 };
                 let v = rng.below(devices::VECTORS as u64) as usize;
                 // Half the time, the next step a healthy holder takes for a
@@ -806,7 +819,10 @@ impl Machine {
                 match rng.below(12) {
                     0 => Op::ItsRetype {
                         n,
-                        first: tpage,
+                        first: match wild {
+                            true => u64::MAX - tpage,
+                            false => tpage,
+                        },
                         k: rng.below(3) as u8,
                     },
                     1 => Op::ItsClaim {
@@ -956,7 +972,7 @@ impl Machine {
                 _ => Op::Barrier { n, p },
             },
             14 if rng.below(2) == 0 => {
-                let chunk = rng.below(self.chunks);
+                let chunk = beyond(rng.below(self.chunks), self.chunks);
                 match rng.below(2) {
                     // A third of the takes are of kind 2, a table chunk.
                     0 => Op::Take {
@@ -971,7 +987,7 @@ impl Machine {
                         n,
                         p,
                         chunk,
-                        to: rng.below(nodes) as u16,
+                        to: beyond(rng.below(nodes), nodes) as u16,
                     },
                 }
             }

@@ -153,6 +153,12 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state.writes())
     }
 
+    /// Whether a request record of node `n` reads *open*.
+    pub(super) fn record_open(&self, n: u16) -> bool {
+        let records = &self.unit.records[usize::from(n)];
+        records.iter().any(|r| r.state == RecordState::Open)
+    }
+
     /// Whether node `n`'s generation holds an iospace root `root`, *live*
     /// (`dying` false) or *dying*.
     pub(super) fn ioroot_of(&self, n: u16, root: Page, dying: bool) -> bool {
@@ -237,7 +243,7 @@ impl Machine {
         self.unit_writes(n)?;
         require(self.ioroot_of(n, root, false))?;
         // Not into a chunk whose give is in flight (D-153, gap 30).
-        require(e < ENTRIES && self.holds(n, page) && !self.giving(page))?;
+        require(e < ENTRIES && self.holds(n, page) && !self.giving(n, page))?;
         require(self.gate.classes[page as usize] == Class::Data)?;
         // G3 (3) (D-154): no device leaf into a table chunk.
         require(!self.table_chunk(page) || self.old.leaves_into_table_chunks)?;
@@ -359,10 +365,18 @@ impl Machine {
     /// *pinned* → *attached* just before its `MAPD`.
     pub(crate) fn accept(&mut self, h: u16, slot: u16, entry: usize) -> Gated {
         self.unit_writes(h)?;
-        require(self.unit.holder == h && !self.unit.failed)?;
+        require(self.unit.holder == h)?;
         require(usize::from(slot) < self.unit.records.len() && entry < UNIT_ENTRIES)?;
         let record = self.unit.records[usize::from(slot)][entry];
         require(record.state == RecordState::Open)?;
+        // (*s*, *open*) → (*s*, *failed*): the holder's, whenever its role
+        // word reads *failed*, whether this call sets the bit or finds it
+        // set (Gate words, the request record). A record opened after the
+        // unit failed is answered here, with nothing accepted.
+        if self.unit.failed {
+            self.unit.records[usize::from(slot)][entry].state = RecordState::Failed;
+            return Ok(());
+        }
         let words = record.words.ok_or(Refused::Condition)?;
         let taken = self
             .unit

@@ -41,7 +41,7 @@ impl Machine {
         for granter in 0..self.layout.len() as u16 {
             for slot in 0..grants::GRANTS {
                 if self.grants.grants[usize::from(granter)][slot].is_some_and(|g| g.grantee == n) {
-                    let _ = self.free_grant(granter, slot);
+                    let _ = self.release_grant(granter, slot);
                 }
             }
         }
@@ -56,7 +56,7 @@ impl Machine {
                 self.grants.grants[usize::from(n)][slot] = None;
                 let chunk = Self::chunk_of(grant.page) as usize;
                 self.gate.grant_counts[chunk] = self.gate.grant_counts[chunk].saturating_sub(1);
-            } else if self.free_grant(n, slot).is_err() {
+            } else if self.release_grant(n, slot).is_err() {
                 return Err(Refused::Condition);
             }
         }
@@ -170,6 +170,9 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state == NodeState::Live)?;
         let node = &self.gate.nodes[usize::from(n)];
         require(node.requests.iter().all(|r| *r == Request::Free))?;
+        // The seal waits for the answers to its records sent (the request
+        // record, cell Seal); judged before any write.
+        require(!self.record_open(n))?;
         // Unit roles handed over (a target that runs; none, no seal): the
         // role word held by the target, its service records handed with the
         // unit.
@@ -222,7 +225,7 @@ impl Machine {
     /// other core of the node, idle ones included, and invalidates
     /// nothing.
     pub(crate) fn barrier(&mut self, n: u16, p: usize) -> Gated {
-        require(self.gate.members[usize::from(n)].state.writes())?;
+        self.writes_on(n, p)?;
         require(self.gate.nodes[usize::from(n)].requests[p] == Request::Free)?;
         let node = &self.gate.nodes[usize::from(n)];
         let asked: BTreeSet<usize> = (0..node.loaded.len())

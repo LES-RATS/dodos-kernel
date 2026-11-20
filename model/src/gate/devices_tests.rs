@@ -496,13 +496,13 @@ fn a_stale_free_list_link_is_never_followed() {
         ],
     )
     .expect("the stale link harms nothing");
-    assert_eq!(m.gate.links.get(&4), None, "the hook clears its own link");
+    assert_eq!(m.gate.links.get(&0), None, "the hook clears its own link");
     assert_eq!(
         m.step(&Op::Hook {
             n: 0,
             root: 2,
             e0: 2,
-            child: 5,
+            child: 1,
         }),
         Err(Refused::Cas),
         "a data page hooked through the link"

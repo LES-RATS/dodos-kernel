@@ -141,6 +141,7 @@ impl Machine {
     /// written with the request read; sealing with its generation.
     pub(crate) fn park_call(&mut self, n: u16, p: usize) -> Gated {
         require(self.gate.members[usize::from(n)].state == NodeState::Sealing)?;
+        require(p < self.layout[usize::from(n)].cores.len())?;
         let core = self.core(n, p);
         self.parks.seal_parked[core] = self.parks.park_requests[core];
         self.parks.parked[core] = true;
@@ -148,9 +149,15 @@ impl Machine {
     }
 
     /// The last call of a seal: sealed, once every other core of the node
-    /// reads `seal_parked` equal to its park request.
+    /// reads `seal_parked` equal to its park request. A sealed node holds
+    /// no unit role (the role word, cell Seal: "unit roles handed over")
+    /// and none of its request records is *open* (the request record, cell
+    /// Seal: "none *open* once the seal's waits end"): the gate writes
+    /// sealed only then, whatever steps the kernel skipped.
     pub(crate) fn sealed_call(&mut self, n: u16, p: usize) -> Gated {
         require(self.gate.members[usize::from(n)].state == NodeState::Sealing)?;
+        require(p < self.layout[usize::from(n)].cores.len())?;
+        require(self.unit.holder != n && !self.record_open(n))?;
         let confirmed = (0..self.layout[usize::from(n)].cores.len())
             .filter(|&q| q != p)
             .all(|q| {

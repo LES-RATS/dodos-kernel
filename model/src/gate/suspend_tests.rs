@@ -326,7 +326,7 @@ fn q9_an_its_with_its_tables_on_chip() {
     // the rebuild since the word reads *attached*.
     sleep_and_rebuild(&mut m);
     m.check().expect("the rebuild holds (G)");
-    assert_eq!(m.dev.its_mapped.get(&1), Some(&(12, 0)));
+    assert_eq!(m.dev.its_mapped.get(&1), Some(&(8, 0)));
     eprintln!("Q9: a lost MAPD of an attached word is reissued by the rebuild");
 }
 

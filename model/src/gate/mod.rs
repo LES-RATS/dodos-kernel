@@ -21,9 +21,10 @@
 //! A cell of a table that cannot be executed, or that the checker breaks,
 //! is marked `CONTRACT-GAP` and numbered (26 to 39 settled by D-153; 40 to
 //! 46, found in D-153's split and merge of the kernel's large leaf, closed
-//! by D-154, which replaces that design by dedicated table chunks). The
-//! earlier readings stay as `OldRules` switches, so that each scenario
-//! shows its attack failing.
+//! by D-154, which replaces that design by dedicated table chunks; 49, a
+//! second give of a chunk whose give is in flight, found by pass 32's
+//! audit, is open, `cpu.rs`). The earlier readings stay as `OldRules`
+//! switches, so that each scenario shows its attack failing.
 
 pub(crate) mod check;
 pub(crate) mod cpu;
@@ -240,12 +241,23 @@ pub(crate) enum Target {
     Its { first: Page, k: u8 },
 }
 
+/// The count a cleared leaf is in until its invalidation is complete (Gate
+/// words, a core's invalidation request: "the count they are in").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Counted {
+    /// The map count of the leaf's chunk: a leaf toward the node's own
+    /// memory (G4).
+    Map,
+    /// The node's use entry of this index: a leaf toward a granted page,
+    /// which the granter's map count never holds (G6).
+    Use(usize),
+}
+
 /// The gate's record of the clearing: the run of leaves cleared (their
-/// pages, in the chunks whose map counts hold them) and the tables
-/// unhooked.
+/// pages and the count each is in) and the tables unhooked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Clearing {
-    pub(crate) leaves: Vec<Page>,
+    pub(crate) leaves: Vec<(Page, Counted)>,
     pub(crate) unhooked: Vec<Page>,
     /// A dying root torn down once the request completes.
     pub(crate) dying: Option<Page>,
@@ -703,6 +715,8 @@ pub(crate) enum Flush {
 
 #[cfg(test)]
 mod devices_tests;
+#[cfg(test)]
+mod pass32_tests;
 #[cfg(test)]
 mod settled_tests;
 #[cfg(test)]
