@@ -77,9 +77,13 @@ pub const TRACE_SLOT_SHIFT: u32 = 17;
 pub const TRACE_SLOT_MASK: u64 = 0x7fff;
 
 /// The entry of sequence `seq` (at least 1) sits at index (seq − 1) mod
-/// `entries` of its ring.
-pub const fn trace_index(seq: u64, entries: u64) -> u64 {
-    (seq - 1) % entries
+/// `entries` of its ring; `None` for a sequence of 0 or a ring of none, as
+/// a reader may find in a faulty kernel's area (D-141).
+pub const fn trace_index(seq: u64, entries: u64) -> Option<u64> {
+    if seq == 0 || entries == 0 {
+        return None;
+    }
+    Some((seq - 1) % entries)
 }
 
 /// One entry of a trace ring: 8 words.
@@ -257,14 +261,16 @@ mod proofs {
         } else {
             TRACE_USER_ENTRIES
         };
-        kani::assume(seq >= 1);
-        let index = trace_index(seq, entries);
+        let Some(index) = trace_index(seq, entries) else {
+            assert!(seq == 0);
+            return;
+        };
         assert!(index < entries);
         if seq < u64::MAX {
-            assert!(trace_index(seq + 1, entries) == (index + 1) % entries);
+            assert!(trace_index(seq + 1, entries) == Some((index + 1) % entries));
         }
         if seq > entries {
-            assert!(trace_index(seq - entries, entries) == index);
+            assert!(trace_index(seq - entries, entries) == Some(index));
         }
     }
 }

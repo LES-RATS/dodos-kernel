@@ -129,7 +129,7 @@ fn device_index() -> u64 {
     *INDEX.get_or_init(|| {
         let (m, _) = Model::boot(&Machine::example()).unwrap();
         (0..m.device_count())
-            .find(|&i| m.device_entry(i).base() == Machine::DEVICES)
+            .find(|&i| m.device_entry(i).base() == Some(Machine::DEVICES))
             .unwrap() as u64
     })
 }

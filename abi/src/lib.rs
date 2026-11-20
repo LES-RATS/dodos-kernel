@@ -2,11 +2,12 @@
 //!
 //! Source of truth: `architecture/kernel-interface.md` in the documentation
 //! repository. This crate is the contract in code: the executable model, the
-//! kernel and user space all build against it. Every value is provisional
-//! until the one-core model is accepted.
+//! kernel and user space all build against it. A value the contract calls
+//! provisional is provisional here too.
 //!
-//! Call numbers are deliberately absent: they are private to the
-//! kernel-supplied code page and can change between kernel versions.
+//! Call numbers are private to the kernel-supplied code page and can change
+//! between kernel versions (Rules, 6): the discriminants of [`Call`] are
+//! the numbers the kernel and that page share, never named by user code.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -35,8 +36,8 @@ pub use features::{
     kind_covers, thread_bytes,
 };
 pub use machine::{
-    AttachState, AttachWord, BOOT_MEMBERSHIP_BSP_CLEARED, BOOT_MEMBERSHIP_FLAGS, BarrierView,
-    BootFloors, BootMembership, BootNode, BootNodes, CHECK_MUL, CORE_ANSWER_NS,
+    AttachState, AttachWord, BOOT_MEMBERSHIP_BSP_CLEARED, BOOT_MEMBERSHIP_FLAGS, BOOT_PORTS_MAX,
+    BarrierView, BootFloors, BootMembership, BootNode, BootNodes, CHECK_MUL, CORE_ANSWER_NS,
     CORE_ANSWER_RANGE_NS, CORE_EVENT_FEEDBACK, CORE_MARK, CORE_NO_SLOT, CORE_UNUSABLE,
     CORES_PER_KERNEL_MAX, CoreState, CoreTransition, CoreWord, DEVICE_TABLE_SPARE, DRIVER_NONE,
     DeviceEntry, Evidence, FENCE_CLASS_COOPERATIVE, FENCE_CLASS_FORCED, FENCE_CLASS_SIGNALLED,
@@ -49,25 +50,25 @@ pub use machine::{
     MEMORY_TAKE_TABLES, Member, MemberState, ModuleFrame, ModuleFrames, NMI_GRACE_NS,
     NODE_IMAGE_BOOT, NODE_IMAGE_REPLACEMENT, NODE_START_FRESH, NODE_START_RESUME,
     NODE_STATUS_CLASS_SHIFT, NODE_STATUS_CORES_MASK, NODE_STATUS_UNUSABLE, NODE_STATUS_WORDS,
-    NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL, NODE_WATCH_SLOTS, NODES_MAX,
-    OBSERVATION_LIFE, OBSERVATIONS_MAX, OWNER_RESERVE_BASE, OWNER_UNCLAIMED, OwnState, Owner,
-    Ownership, PAGE_CLASS_ITS_TABLE, PageClass, R1_UNITS_PER_STEP, R1State, R1Word,
-    RECOVERY_BANDWIDTH, RECOVERY_PERIOD_NS, REQUEST_RECORD_BYTES, REQUEST_SERIAL_MAX, RESERVES_MAX,
-    RESERVES_MIN, ROLE_EPOCH_MASK, ROLE_FAILED, ROLE_NOBODY, ROLE_PLAIN_PLATFORM, ROLES_PLAIN_MAX,
-    RemoteRef, RequestState, RequestWord, RoleKind, RoleState, RoleWord, RootState, SEAL_NS,
-    SEAL_RANGE_NS, SETTLE_NS, SLOT_BY_KIND_SHIFT, SLOT_DEAD, SLOT_DEPTH_SHIFT, SLOT_DYING,
-    SLOT_EMPTY, SLOT_FRAME_ASKED_MASK, SLOT_FRAME_DEVICE, SLOT_FRAME_FIRST_SHIFT,
-    SLOT_FRAME_MEMORY_SHIFT, SLOT_FRAME_PAGE_SHIFT, SLOT_FRAME_PAGES_SHIFT, SLOT_FULL,
-    SLOT_IRQ_CORE_SHIFT, SLOT_KIND_SHIFT, SLOT_RECORD_BINDING, SLOT_RECORD_EMPTY,
-    SLOT_RECORD_MAPPING, SLOT_RECORD_PARTIAL, SLOT_RECORD_RIGHTS_SHIFT, SLOT_RECORD_UNMAPPING,
-    SLOT_REMOTE, SLOT_REMOTE_GRANT_SHIFT, SLOT_REMOTE_SERIAL_SHIFT, SLOT_REMOTE_USE_SHIFT,
-    SLOT_RIGHTS_SHIFT, SLOT_ROOT, SLOT_STATE_MASK, SLOT_UNTYPED_BLOCK, SLOT_UNTYPED_CLEAN,
-    SLOT_UNTYPED_DEVICE, SLOT_UNTYPED_ENTRY, SLOT_UNTYPED_ENTRY_SHIFT, SLOT_UNTYPED_LOG2_SHIFT,
-    SLOT_UNTYPED_READY_WORD, SLOT_UNTYPED_TABLE, STALE_NS, STALE_RANGE_NS, START_NS,
-    START_RETRY_NS, STUCK_NS, SWEEP_NS, SWEEP_RANGE_NS, SuspendState, SuspendWord, TAGS_USABLE_MAX,
-    Transition, USE_ENTRY_BYTES, barrier, best_class, clear_step, clear_steps, core_transition,
-    device_leaf_word, floors, gate_tag, ioport_check, member_transition, module_frames, ports_meet,
-    successor, tags_untagged, usable_tags,
+    NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL, NODE_STOP_SUSPEND, NODE_WATCH_SLOTS,
+    NODES_MAX, OBSERVATION_LIFE, OBSERVATIONS_MAX, OWNER_RESERVE_BASE, OWNER_UNCLAIMED, OwnState,
+    Owner, Ownership, PAGE_CLASS_ITS_TABLE, PORT_TABLE_ENTRIES, PORT_TABLE_NONE, PageClass,
+    R1_UNITS_PER_STEP, R1State, R1Word, RECOVERY_BANDWIDTH, RECOVERY_PERIOD_NS,
+    REQUEST_RECORD_BYTES, REQUEST_SERIAL_MAX, RESERVES_MAX, RESERVES_MIN, ROLE_EPOCH_MASK,
+    ROLE_FAILED, ROLE_NOBODY, ROLE_PLAIN_PLATFORM, ROLES_PLAIN_MAX, RemoteRef, RequestState,
+    RequestWord, RoleKind, RoleState, RoleWord, RootState, SEAL_NS, SEAL_RANGE_NS, SETTLE_NS,
+    SLOT_BY_KIND_SHIFT, SLOT_DEAD, SLOT_DEPTH_SHIFT, SLOT_DYING, SLOT_EMPTY, SLOT_FRAME_ASKED_MASK,
+    SLOT_FRAME_DEVICE, SLOT_FRAME_FIRST_SHIFT, SLOT_FRAME_MEMORY_SHIFT, SLOT_FRAME_PAGE_SHIFT,
+    SLOT_FRAME_PAGES_SHIFT, SLOT_FULL, SLOT_IRQ_CORE_SHIFT, SLOT_KIND_SHIFT, SLOT_RECORD_BINDING,
+    SLOT_RECORD_EMPTY, SLOT_RECORD_MAPPING, SLOT_RECORD_PARTIAL, SLOT_RECORD_RIGHTS_SHIFT,
+    SLOT_RECORD_UNMAPPING, SLOT_REMOTE, SLOT_REMOTE_GRANT_SHIFT, SLOT_REMOTE_SERIAL_SHIFT,
+    SLOT_REMOTE_USE_SHIFT, SLOT_RIGHTS_SHIFT, SLOT_ROOT, SLOT_STATE_MASK, SLOT_UNTYPED_BLOCK,
+    SLOT_UNTYPED_CLEAN, SLOT_UNTYPED_DEVICE, SLOT_UNTYPED_ENTRY, SLOT_UNTYPED_ENTRY_SHIFT,
+    SLOT_UNTYPED_LOG2_SHIFT, SLOT_UNTYPED_READY_WORD, SLOT_UNTYPED_TABLE, STALE_NS, STALE_RANGE_NS,
+    START_NS, START_RETRY_NS, STUCK_NS, SWEEP_NS, SWEEP_RANGE_NS, SuspendState, SuspendWord,
+    TAGS_USABLE_MAX, Transition, UNIT_OWN_DEVICES_MAX, USE_ENTRY_BYTES, barrier, best_class,
+    clear_step, clear_steps, core_transition, device_leaf_word, floors, gate_tag, ioport_check,
+    member_transition, module_frames, ports_meet, successor, tags_untagged, usable_tags,
 };
 pub use ring::{
     CREDIT_NONE, CREDIT_SERIAL_MASK, NodeMessage, PENDING_STEP, REPORT_END, REPORT_KIND_DEVICE,
@@ -444,11 +445,12 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// The bytes of a page size, `None` where the processor has none.
+    /// The bytes of a page size, `None` where the processor has none (a
+    /// shift of 0) and for a shift of 64 or more, which no size has.
     pub const fn bytes(&self, size: PageSize) -> Option<u64> {
         match self.page_shift[size as usize] {
-            0 => None,
-            shift => Some(1 << shift),
+            shift @ 1..64 => Some(1 << shift),
+            _ => None,
         }
     }
 
@@ -627,7 +629,8 @@ pub const fn io_mapping_rights(word: u32) -> Result<Rights, Error> {
     Ok(Rights(word))
 }
 
-/// The system calls, by group. Numbering is not part of the interface.
+/// The system calls, by group. Their discriminants are shared by the kernel
+/// and its code page only (Rules, 6; "Values to add to `abi/`").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Call {
     CapDerive,
@@ -1130,9 +1133,10 @@ pub struct TaskId(u64);
 impl TaskId {
     pub const NONE: Self = Self(0);
 
-    /// The counter is below 2^48.
+    /// The counter is at least 1 and below 2^48: "a counter of that node
+    /// that starts at 1" (Tasks and marks).
     pub const fn new(node: u16, counter: u64) -> Self {
-        assert!(counter < 1 << 48);
+        assert!(counter != 0 && counter < 1 << 48);
         Self((node as u64) << 48 | counter)
     }
 
@@ -1165,6 +1169,23 @@ impl NodeGen {
         Self((node as u64) << 32 | generation as u64)
     }
 
+    /// The start request, and `started`, naming this node and generation:
+    /// the word with bit 63 set, so that 0 names none (Node slots and core
+    /// words, the start request and the entry stub; D-134).
+    pub const fn start_request(self) -> u64 {
+        1 << 63 | self.0
+    }
+
+    /// The node and generation a start request or `started` names; `None`
+    /// for 0, for a word without bit 63 and for a word with a bit of 48-62
+    /// set ("the other bits 0").
+    pub const fn from_start_request(raw: u64) -> Option<Self> {
+        if raw >> 48 != 1 << 15 {
+            return None;
+        }
+        Some(Self(raw & !(1 << 63)))
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -1182,6 +1203,20 @@ impl NodeGen {
 #[cfg(kani)]
 mod proofs {
     use super::*;
+
+    /// A start request reads back its node and generation, is never 0, and
+    /// a word that is none of them reads no request (D-134).
+    #[kani::proof]
+    fn a_start_request_reads_back_and_is_never_none() {
+        let (node, generation): (u16, u32) = (kani::any(), kani::any());
+        let request = NodeGen::new(node, generation).start_request();
+        assert!(request != 0);
+        assert!(NodeGen::from_start_request(request) == Some(NodeGen::new(node, generation)));
+        let raw: u64 = kani::any();
+        if let Some(named) = NodeGen::from_start_request(raw) {
+            assert!(named.start_request() == raw);
+        }
+    }
 
     /// Whether `value` is one of `list`, by a loop Kani unwinds (a slice's
     /// `contains` goes through `memchr` for bytes).
@@ -1263,15 +1298,16 @@ mod proofs {
     }
 
     /// A task identifier reads back its node and its counter (H6 of the
-    /// final review's verification of lot A).
+    /// final review's verification of lot A), and is never "no task": its
+    /// counter starts at 1 (audit lot 2, F-07).
     #[kani::proof]
     fn task_id_reads_back() {
         let (node, counter): (u16, u64) = (kani::any(), kani::any());
-        kani::assume(counter < 1 << 48);
+        kani::assume(counter >= 1 && counter < 1 << 48);
         let id = TaskId::new(node, counter);
         assert!(id.node() == node && id.counter() == counter);
         assert!(TaskId::from_raw(id.raw()) == id);
-        assert!((id == TaskId::NONE) == (node == 0 && counter == 0));
+        assert!(id != TaskId::NONE);
     }
 
     /// A node and its generation read back, bits 48-63 zero (H6).

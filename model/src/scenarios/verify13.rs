@@ -417,7 +417,7 @@ fn a_debug_area_at_2_to_the_63_that_agrees_with_its_ring_is_cleared() {
     let m = super::pass22::restart_over(|area| {
         let next = 1u64 << 63;
         area.next_user = next;
-        let at = dodos_abi::trace_index(next - 1, dodos_abi::TRACE_USER_ENTRIES);
+        let at = dodos_abi::trace_index(next - 1, dodos_abi::TRACE_USER_ENTRIES).unwrap();
         area.user[at as usize].seq = next - 1;
     });
     assert!(m.sys.canonical().crash.areas[1].next_user < 1 << 63);

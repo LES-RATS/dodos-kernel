@@ -592,12 +592,12 @@ impl Table {
     /// A start request naming a node of a generation: `NodeGen` with bit 63
     /// set, so that 0 names none.
     pub(crate) fn start_request(node: u16, generation: u32) -> u64 {
-        1 << 63 | NodeGen::new(node, generation).raw()
+        NodeGen::new(node, generation).start_request()
     }
 
     /// The node a start request names, if any.
     pub(crate) fn started_node(raw: u64) -> Option<(u16, u32)> {
-        (raw >> 63 == 1).then_some(((raw >> 32) as u16, raw as u32))
+        NodeGen::from_start_request(raw).map(|n| (n.node(), n.generation()))
     }
 
     /// Whether a node's member word lets it write: starting, live or
@@ -661,7 +661,8 @@ impl Table {
         let bytes = frame.pages << self.geometry.page_shift[frame.page as usize];
         let end = frame.base + bytes.max(1) - 1;
         let device = self.devices.iter().position(|e| {
-            e.is_used() && e.base() <= frame.base && frame.base < e.base() + (1 << e.log2())
+            e.base()
+                .is_some_and(|base| base <= frame.base && frame.base < base + (1 << e.log2()))
         });
         // A frame of the global read-only set is counted nowhere: an anchor
         // over it raises no count, and no gate word of a chunk that no node

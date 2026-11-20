@@ -700,7 +700,7 @@ fn n4_iospace_device_leaf_and_two_node_kept_mappings_write_none_chunk_gate_word(
     // 1. `iospace_map` of a device frame writes `table.maps[dev_chunk]`:
     let dev_delta = {
         let index = (0..sys.sys.node(0).device_count())
-            .find(|&i| sys.sys.node(0).device_entry(i).base() == Machine::DEVICES)
+            .find(|&i| sys.sys.node(0).device_entry(i).base() == Some(Machine::DEVICES))
             .unwrap();
         sys.ok(
             0,

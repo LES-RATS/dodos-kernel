@@ -154,7 +154,9 @@ impl Model {
             false => {
                 let entry = self.table.devices[place as usize];
                 (
-                    entry.base(),
+                    entry
+                        .base()
+                        .expect("the model's device table holds no port entry"),
                     1 << entry.log2(),
                     true,
                     Block::Entry(place as usize),
@@ -423,15 +425,19 @@ impl Model {
         // The entry keeps the lower half; the unused entry of lowest index
         // that is unclaimed gets the upper half; both are free, this node
         // their owner.
+        // The model's device table holds no port entry, whose split is
+        // `invalid` (I/O ports, D-150).
         let half = entry.log2() - 1;
+        let base = entry.base().expect("an entry of memory");
         let free = Ownership::free(Owner::Node(self.node));
+        let halves = |at| DeviceEntry::used(at, half).expect("a half of a page or more");
         let lower = DeviceEntry {
             owner: free,
-            ..DeviceEntry::used(entry.base(), half)
+            ..halves(base)
         };
         let upper = DeviceEntry {
             owner: free,
-            ..DeviceEntry::used(entry.base() + (1 << half), half)
+            ..halves(base + (1 << half))
         };
         assert!(self.table.write_entry(self.node, spare, upper));
         assert!(self.table.write_entry(self.node, index, lower));

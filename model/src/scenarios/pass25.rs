@@ -61,12 +61,11 @@ fn the_tables_of_each_vtd_unit_are_kept_at_start_up_out_of_the_ordinary_memory()
         // In no chunk, no floor and no device entry.
         assert!((start / chunk..end.div_ceil(chunk)).all(|c| model.ownership(c) == none));
         assert!(!model.table.floors.iter().flatten().any(overlaps));
-        let used = model.table.devices.iter().filter(|d| d.is_used());
-        assert!(
-            !used
-                .map(|d| (d.base(), d.base() + (1 << d.log2())))
-                .any(|r| overlaps(&r))
-        );
+        let mut used = model.table.devices.iter().filter_map(|d| {
+            let base = d.base()?;
+            Some((base, base + (1 << d.log2())))
+        });
+        assert!(!used.any(|r| overlaps(&r)));
     }
     // The example has room for them in its usable memory below 4 GB, which
     // holds no chunk: its ordinary memory has as many chunks as with no

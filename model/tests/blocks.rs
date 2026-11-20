@@ -60,7 +60,7 @@ impl K {
     /// The index of the device entry of the 2 MB device range at 2 MB.
     fn dev(&self) -> u64 {
         (0..self.m.device_count())
-            .find(|&i| self.m.device_entry(i).base() == Machine::DEVICES)
+            .find(|&i| self.m.device_entry(i).base() == Some(Machine::DEVICES))
             .expect("the device range") as u64
     }
 }
@@ -365,7 +365,7 @@ fn memory_split_cuts_a_device_entry_into_two_halves() {
     let half = 1 << (entry.log2() - 1);
     assert_eq!(
         (upper.base(), upper.log2()),
-        (entry.base() + half, entry.log2() - 1)
+        (entry.base().map(|base| base + half), entry.log2() - 1)
     );
     assert!(upper.is_used());
     for e in [lower, upper] {

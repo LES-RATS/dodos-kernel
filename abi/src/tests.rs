@@ -1419,12 +1419,48 @@ fn may_take_follows_rules_1_to_4() {
 
 #[test]
 fn device_entries_hold_a_range_and_an_owner() {
-    let entry = DeviceEntry::used(0xFE00_0000, 21);
-    assert!(entry.is_used());
-    assert_eq!((entry.base(), entry.log2()), (0xFE00_0000, 21));
+    let entry = DeviceEntry::used(0xFE00_0000, 21).expect("an entry");
+    assert!(entry.is_used() && !entry.is_port());
+    assert_eq!((entry.base(), entry.log2()), (Some(0xFE00_0000), 21));
+    assert_eq!(entry.first_port(), None);
     assert_eq!(entry.owner, Ownership::free(Owner::Unclaimed));
     assert!(!DeviceEntry::unused().is_used());
+    assert_eq!(DeviceEntry::unused().base(), None);
     assert_eq!(DeviceEntry::USED, 1 << 6);
+}
+
+/// "A port entry (x86-64) is a device entry whose first word has bit 7
+/// set: its first port in bits 12-27, the log2 of its number of ports in
+/// bits 0-5" (Ownership words; The device table; D-150, D-152). It has no
+/// base: `base()` read 0x3f8080 from the word of the 8 ports at 0x3F8, and
+/// `used` could not build it (audit lot 2, F-03).
+#[test]
+fn a_port_entry_holds_its_first_port_and_no_base() {
+    assert_eq!(DeviceEntry::PORT, 1 << 7);
+    let com1 = DeviceEntry::port(0x3F8, 3).expect("8 ports at 0x3F8");
+    assert_eq!(com1.range, 0x3F8 << 12 | 1 << 7 | 1 << 6 | 3);
+    assert!(com1.is_used() && com1.is_port());
+    assert_eq!(
+        (com1.first_port(), com1.log2(), com1.base()),
+        (Some(0x3F8), 3, None)
+    );
+    assert_eq!(com1.owner, Ownership::free(Owner::Unclaimed));
+    // The whole port space is one entry of 2^16 ports.
+    let all = DeviceEntry::port(0, 16).expect("every port");
+    assert_eq!((all.first_port(), all.log2()), (Some(0), 16));
+    // Each range aligned on its power-of-two size (`BootPorts`).
+    assert_eq!(DeviceEntry::port(0x3F9, 3), None);
+    assert_eq!(DeviceEntry::port(0x3F8, 17), None);
+}
+
+/// An entry the layout cannot hold is refused, not a panic (audit lot 2,
+/// F-03, F-08): below a page, misaligned, or of 2^64 bytes.
+#[test]
+fn a_device_entry_the_layout_cannot_hold_is_refused() {
+    assert_eq!(DeviceEntry::used(64, 6), None);
+    assert_eq!(DeviceEntry::used(0x1000, 13), None);
+    assert_eq!(DeviceEntry::used(0, 64), None);
+    assert!(DeviceEntry::used(1 << 63, 63).is_some());
 }
 
 #[test]
@@ -1627,14 +1663,21 @@ fn role_words_read_back() {
         ],
         [0, 1, 2]
     );
+    // "what it governs (u8: 0 IOMMU unit, 1 IOAPIC, 2 GIC distributor, 3
+    // GIC ITS, 4 console, 5 reserve, 6 plain, 7 RISC-V APLIC)" (entry
+    // `Roles`; audit lot 2, F-10: four of the eight were pinned).
     assert_eq!(
         [
             Governs::IommuUnit as u8,
+            Governs::IoApic as u8,
+            Governs::GicDistributor as u8,
+            Governs::GicIts as u8,
             Governs::Console as u8,
+            Governs::Reserve as u8,
             Governs::Plain as u8,
             Governs::Aplic as u8
         ],
-        [0, 4, 6, 7]
+        [0, 1, 2, 3, 4, 5, 6, 7]
     );
     assert_eq!(ROLE_PLAIN_PLATFORM, 0);
 }
@@ -1903,8 +1946,11 @@ fn debug_values_have_their_numbers() {
             trace_index(256, 256),
             trace_index(257, 256)
         ),
-        (0, 255, 0)
+        (Some(0), Some(255), Some(0))
     );
+    // A sequence of 0, read from a faulty kernel's area (D-141), is no
+    // entry's: refused, not an overflow (audit lot 2, F-08).
+    assert_eq!((trace_index(0, 256), trace_index(1, 0)), (None, None));
     let entry = TraceEntry {
         word2: 16 | TRACE_FLAG_CONTINUED | 3 << 32,
         ..TraceEntry::default()
@@ -1913,13 +1959,23 @@ fn debug_values_have_their_numbers() {
         (entry.code(), entry.continued(), entry.generation()),
         (16, true, 3)
     );
+    // "Reasons: 1 assertion of the kernel, 2 unexpected exception in kernel
+    // mode, 3 double fault, 4 uncorrected hardware error, 5 stopped by a
+    // fence, 6 an IOMMU unit that does not confirm, 7 containment violated,
+    // 8 start-up refused, 9 another core of the node did not answer" (The
+    // crash record; F-10: four of the nine were pinned).
     let reasons = [
         CrashReason::Assertion as u32,
+        CrashReason::KernelException as u32,
+        CrashReason::DoubleFault as u32,
+        CrashReason::HardwareError as u32,
         CrashReason::Fenced as u32,
+        CrashReason::UnitTimeout as u32,
+        CrashReason::Containment as u32,
         CrashReason::StartRefused as u32,
         CrashReason::CoreSilent as u32,
     ];
-    assert_eq!(reasons, [1, 5, 8, 9]);
+    assert_eq!(reasons, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     use ConsoleKind as C;
     assert_eq!(
         [
@@ -1931,13 +1987,28 @@ fn debug_values_have_their_numbers() {
         ],
         [0, 1, 2, 3, 4]
     );
-    assert_eq!(
-        (
-            ConsoleMessage::KernelStarts as u32,
-            ConsoleMessage::Suppressed as u32
-        ),
-        (1, 14)
-    );
+    // The table of messages of The console, 1 to 14 (F-10: two were
+    // pinned).
+    use ConsoleMessage as M;
+    let messages = [
+        M::KernelStarts,
+        M::NodeLive,
+        M::NodeAccused,
+        M::NodeDead,
+        M::NodeFailed,
+        M::NodeUnfenced,
+        M::RoleMoved,
+        M::StartRefused,
+        M::MachineStops,
+        M::IommuFaults,
+        M::UnitTimeout,
+        M::HardwareErrors,
+        M::FaultRecorded,
+        M::Suppressed,
+    ];
+    for (number, message) in (1..).zip(messages) {
+        assert_eq!(message as u32, number, "{message:?}");
+    }
     assert_eq!(
         (Build::Production as u32, Build::Development as u32),
         (0, 1)
@@ -2352,8 +2423,9 @@ fn r7_abi_survivors() {
     );
     // #016: SLOT_RECORD_PARTIAL == 1 << 5
     assert_eq!(SLOT_RECORD_PARTIAL, 1 << 5);
-    // #017: PageClass::table(8) == Some(PageClass(24))
-    assert!(PageClass::table(8).is_some());
+    // #017: PageClass::table(8) == Some(PageClass(24)), 16 + k (F-10: the
+    // test held only that it was some class other than table(7)'s).
+    assert_eq!(PageClass::table(8).map(PageClass::raw), Some(24));
     assert_ne!(PageClass::table(8), PageClass::table(7));
     // #023: PageClass::GLOBAL_READ_ONLY refuses device_type leaves
     assert!(!PageClass::GLOBAL_READ_ONLY.permits(Leaf {
@@ -2794,6 +2866,23 @@ fn ring_indices_count_free_entries_and_resynchronise() {
     assert_eq!(ring_resync(74, 10, n), 10);
 }
 
+/// "a producer index behind the consumer index moves the consumer index to
+/// the producer index [...] every difference of two indices is taken
+/// modulo 2^64" (What crosses between nodes, D-141). The rule was only in
+/// the model (audit lot 2, F-01): `ring_resync(5, 10, 64)` gave 5 − 64.
+#[test]
+fn a_producer_index_behind_the_consumer_moves_the_consumer_to_it() {
+    let (n, c) = (RING_KERNEL_ENTRIES, 1000);
+    assert_eq!(ring_resync(5, 10, n), 5);
+    assert_eq!(ring_resync(c - n, c, n), c - n);
+    // Across the wrap of the counts.
+    assert_eq!(ring_resync(u64::MAX, 3, n), u64::MAX);
+    assert_eq!(ring_resync(u64::MAX - 1, u64::MAX, n), u64::MAX - 1);
+    // CONTRACT-GAP 52: behind by more than the ring's entries reads as
+    // more than the ring's entries ahead.
+    assert_eq!(ring_resync(c - n - 1, c, n), c - 2 * n - 1);
+}
+
 /// The fence record holds a core's last stop at its core number modulo 64,
 /// which never moves while R6 frees the other words of the node (D-134).
 #[test]
@@ -2833,8 +2922,13 @@ fn dr7_refuses_an_io_breakpoint_a_length_of_ten_and_a_length_on_an_execution_bre
 
 #[test]
 fn a_credit_index_past_the_credits_is_none() {
+    let header = RingHeader::new(NodeMessage::Revoke, 1, (0, 1), 1, None);
     for index in 0..32u8 {
-        let header = RingHeader::new(NodeMessage::Revoke, 1, (0, 1), 1, Some((index, 1)));
+        // A header as a faulty sender may write it.
+        let header = RingHeader {
+            credit: u32::from(index) | 1 << 5,
+            ..header
+        };
         let credit = header.credit();
         assert_eq!(
             credit.is_some(),
@@ -2863,10 +2957,152 @@ fn a_deadline_at_the_time_limit_is_outside_firing_instant() {
     firing_instant(TIME_LIMIT, 0);
 }
 
+/// Constructors build only values the contract allows (audit lot 2, F-07):
+/// "0 to 15 the request credits, 16 to 23 the send credits, 31 none, and no
+/// other value is a credit" (D-141).
 #[test]
 #[should_panic]
-fn a_device_entry_below_a_page_is_refused() {
-    DeviceEntry::used(64, 6);
+fn a_header_with_a_credit_index_past_the_credits_is_not_built() {
+    RingHeader::new(NodeMessage::Revoke, 1, (0, 1), 1, Some((24, 1)));
+}
+
+/// "the node's fence class: [...] (0, 1 or 2; a word with 3 fails its
+/// check" (The states of a node, gap 1; F-07).
+#[test]
+#[should_panic]
+fn a_member_word_of_class_3_is_not_built() {
+    Member::never().with_class(3);
+}
+
+/// An owner code names a node below `NODES_MAX` (Chunks, floors and the
+/// ownership words; F-07): `Owner::Node(0xFFFF)` read back as unclaimed.
+#[test]
+#[should_panic]
+fn an_owner_past_the_nodes_is_not_built() {
+    Ownership::taken(Owner::Node(NODES_MAX as u16), 1);
+}
+
+/// A task identifier's counter "starts at 1" and is "not 0" (Tasks and
+/// marks; F-07): identifier 0 means no task.
+#[test]
+#[should_panic]
+fn a_task_identifier_with_a_counter_of_0_is_not_built() {
+    TaskId::new(5, 0);
+}
+
+/// A page shift of 64 or more is no page size: `bytes` refuses it rather
+/// than overflow (audit lot 2, F-08), as `valid` does.
+#[test]
+fn the_bytes_of_a_page_shift_past_63_are_none() {
+    let g = Geometry {
+        page_shift: [12, 64, 255, 0],
+        entries: 512,
+        levels: 4,
+        user_end: 1 << 30,
+    };
+    assert_eq!(g.bytes(PageSize::Page), Some(4096));
+    assert_eq!(
+        (g.bytes(PageSize::Large1), g.bytes(PageSize::Large2)),
+        (None, None)
+    );
+    assert_eq!(g.bytes(PageSize::Large3), None);
+}
+
+/// Values the contract fixes that `abi/` lacked (audit lot 2, F-09): mode 3
+/// of `node_stop` ("3 suspend the machine, `unsupported` since D-152"),
+/// `UNIT_OWN_DEVICES_MAX` ("32, provisional, per unit"), and for the ports
+/// "at most 64 ranges" of `BootPorts` and "the port table, 65,536 entries
+/// of 2 bytes [...] (0xFFFF for none)" (D-150).
+#[test]
+fn the_values_of_node_stop_units_and_ports_are_the_contracts() {
+    use crate::{
+        BOOT_PORTS_MAX, NODE_STOP_SUSPEND, PORT_TABLE_ENTRIES, PORT_TABLE_NONE,
+        UNIT_OWN_DEVICES_MAX,
+    };
+    assert_eq!(
+        (
+            NODE_STOP_KILL,
+            NODE_STOP_SEAL,
+            NODE_STOP_RETIRE,
+            NODE_STOP_SUSPEND
+        ),
+        (0, 1, 2, 3)
+    );
+    assert_eq!(UNIT_OWN_DEVICES_MAX, 32);
+    assert_eq!(
+        (BOOT_PORTS_MAX, PORT_TABLE_ENTRIES, PORT_TABLE_NONE),
+        (64, 65_536, 0xFFFF)
+    );
+}
+
+/// "A start request and `started` are 64-bit words: bit 63 set, the node
+/// slot in bits 32-47, the generation in bits 0-31, the other bits 0; 0
+/// means none" (Node slots and core words, D-134; F-09: the model composed
+/// the word itself).
+#[test]
+fn a_start_request_is_a_node_and_generation_with_bit_63() {
+    let request = NodeGen::new(0, 0).start_request();
+    assert_eq!(request, 1 << 63);
+    assert_eq!(
+        NodeGen::from_start_request(request),
+        Some(NodeGen::new(0, 0))
+    );
+    let request = NodeGen::new(7, 9).start_request();
+    assert_eq!(request, 1 << 63 | 7 << 32 | 9);
+    assert_eq!(
+        NodeGen::from_start_request(request),
+        Some(NodeGen::new(7, 9))
+    );
+    // None, a word without bit 63, a word with another bit set.
+    assert_eq!(NodeGen::from_start_request(0), None);
+    assert_eq!(NodeGen::from_start_request(7 << 32 | 9), None);
+    assert_eq!(NodeGen::from_start_request(request | 1 << 48), None);
+}
+
+/// Values of `abi/` the contract fixes and no test held (audit lot 2,
+/// F-10), each with the sentence it comes from.
+#[test]
+fn the_values_of_the_gate_words_and_unit_operations_are_the_contracts() {
+    use crate::{
+        FENCE_RECORD_CORES, Hook, IDENTIFIER_BITMAP_BYTES, IDENTIFIERS_PER_SEGMENT,
+        IOSPACE_TABLE_LEVEL_MAX, IRQ_LINES_MAX, ITS_TABLE_K_MAX, LINE_BITMAP_BYTES,
+        PAGE_CLASS_ITS_TABLE, R1_UNITS_PER_STEP, REQUEST_RECORD_BYTES, REQUEST_SERIAL_MAX,
+        UnitOperation,
+    };
+    // Devices and shared hardware, the table of operands: 1 attach, 2
+    // detach, 3 invalidation of translations, 4 of the interrupt entry
+    // cache, 5 redirection entry.
+    let operations = [
+        UnitOperation::Attach,
+        UnitOperation::Detach,
+        UnitOperation::Invalidate,
+        UnitOperation::InterruptCache,
+        UnitOperation::Redirection,
+    ];
+    assert_eq!(operations.map(|o| o as u8), [1, 2, 3, 4, 5]);
+    // "a table below a root, 0 *loose*, 1 *hooked*, 2 *unhooking*".
+    assert_eq!(
+        [Hook::Loose as u8, Hook::Hooked as u8, Hook::Unhooking as u8],
+        [0, 1, 2]
+    );
+    // "8 *ITS table*"; an `its_table` is "2^k pages, k ≤ 4".
+    assert_eq!((PAGE_CLASS_ITS_TABLE, ITS_TABLE_K_MAX), (8, 4));
+    // "32 + k iospace table of level k" below "40 + n": k at most 7.
+    assert_eq!(IOSPACE_TABLE_LEVEL_MAX, 7);
+    const { assert!(32 + IOSPACE_TABLE_LEVEL_MAX < 40) };
+    // "`IDENTIFIERS_PER_SEGMENT`, 65,536 words"; "at most `IRQ_LINES_MAX`
+    // (4,096) words"; the bitmaps "65,536 bits (8 KB)" and "`IRQ_LINES_MAX`
+    // bits (512 bytes)".
+    assert_eq!((IDENTIFIERS_PER_SEGMENT, IRQ_LINES_MAX), (65_536, 4_096));
+    assert_eq!((IDENTIFIER_BITMAP_BYTES, LINE_BITMAP_BYTES), (8_192, 512));
+    // "32 bytes per entry"; "a serial in bits 3-63".
+    assert_eq!(
+        (REQUEST_RECORD_BYTES, REQUEST_SERIAL_MAX),
+        (32, (1 << 61) - 1)
+    );
+    // "`FENCE_RECORD_CORES = 64`"; R1 "one unit per gate call, 32 per
+    // step" (D-152).
+    assert_eq!((FENCE_RECORD_CORES, R1_UNITS_PER_STEP), (64, 32));
 }
 
 #[test]
@@ -2906,14 +3142,15 @@ fn fields_of_every_record_lie_where_the_contract_puts_them() {
         [0, 8]
     );
     // The fence record: the generation (bits 0-31 of word 0), word 1 the
-    // first action, word 2 the confirmation, word 3 reserved, words 4 to 67
-    // the last stops.
+    // first action, word 2 the confirmation, word 3 the last seal's instant
+    // (D-150; audit lot 2, F-05: it was named reserved), words 4 to 67 the
+    // last stops.
     let fence = [
         offset_of!(FenceRecord, generation),
         offset_of!(FenceRecord, reserved),
         offset_of!(FenceRecord, first_action),
         offset_of!(FenceRecord, confirmed),
-        offset_of!(FenceRecord, reserved2),
+        offset_of!(FenceRecord, sealed_at),
         offset_of!(FenceRecord, last_stop),
     ];
     assert_eq!(fence, [0, 4, 8, 16, 24, 32]);

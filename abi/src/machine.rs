@@ -818,6 +818,24 @@ pub const GRANT_ENTRY_BYTES: usize = 128;
 pub const USE_ENTRY_BYTES: usize = 32;
 /// Unused entries of the device table, for splits.
 pub const DEVICE_TABLE_SPARE: usize = 8192;
+/// The most ranges of ports `BootPorts` lists, each cut into a port entry
+/// (x86-64; I/O ports, D-150).
+///
+/// CONTRACT-GAP 54 (Start-up state, the records of the boot image; I/O
+/// ports): the contract names `BootPorts`, "at most 64 ranges of ports",
+/// "each aligned on its power-of-two size, none over a kernel port", but
+/// gives no layout of the record (its size, and how a range is written: a
+/// first port and a count, or a first port and a log2). No record is
+/// defined here; `DeviceEntry::port` holds the entry each range becomes.
+pub const BOOT_PORTS_MAX: usize = 64;
+/// The entries of the port table: one per port, 2 bytes each, in the global
+/// read-only set, naming the port entry of the port (I/O ports, D-150).
+pub const PORT_TABLE_ENTRIES: usize = 65_536;
+/// A port table entry that names no port entry.
+pub const PORT_TABLE_NONE: u16 = 0xFFFF;
+/// The most devices the machine start-up attaches to a unit's own domain,
+/// recorded in the unit's record (IOMMU, the RMRR devices; provisional).
+pub const UNIT_OWN_DEVICES_MAX: usize = 32;
 /// Reserves, from 2 to 8 (1 on a machine with one usable core), and plain
 /// roles, at most 64 in all.
 pub const RESERVES_MIN: u32 = 2;
@@ -858,15 +876,18 @@ pub const FENCE_RECORD_CORES: usize = 64;
 /// Bytes of one fence record.
 pub const FENCE_RECORD_BYTES: usize = 544;
 
-/// The fence record of a node slot, in the living part, written by the gate
-/// of the node's fence driver (The fence: the fence record): the generation
-/// it concerns, the instant of the first fence action, the instant the fence
-/// was confirmed, and for each core of the node, at the index of its core
+/// The fence record of a node slot, in the living part (The fence record):
+/// the generation it concerns, the instant of the first fence action, the
+/// instant the fence was confirmed, the instant of the node's last seal
+/// (word 3, D-150), and for each core of the node, at the index of its core
 /// number modulo 64 (`stop_index`), the instant of the last stop sent to
 /// that core: a node's cores lie in one window of 64 core numbers, so the
 /// index never changes while R6 frees other words, as a position would
 /// (D-134). An instant of 0 means none; the instants are the gate's clock.
 /// The delays of a take-over (Roles) and of R6 are measured from them.
+/// Words 0-2 and 4-67 are written by the gate of the fence's driver, word 3
+/// by the node's own gate in the call that wrote sealed, from which
+/// evidence seal is judged (`SEAL_NS`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FenceRecord {
@@ -874,7 +895,7 @@ pub struct FenceRecord {
     pub reserved: u32,
     pub first_action: u64,
     pub confirmed: u64,
-    pub reserved2: u64,
+    pub sealed_at: u64,
     pub last_stop: [u64; FENCE_RECORD_CORES],
 }
 
@@ -911,6 +932,9 @@ pub const NODE_IMAGE_REPLACEMENT: u64 = 1;
 pub const NODE_STOP_KILL: u64 = 0;
 pub const NODE_STOP_SEAL: u64 = 1;
 pub const NODE_STOP_RETIRE: u64 = 2;
+/// Mode 3 of `node_stop`, the whole-machine suspend of the draft:
+/// `unsupported` since D-152 (The calls).
+pub const NODE_STOP_SUSPEND: u64 = 3;
 /// Word 1 of `node_status`: the number of cores whose words name the node
 /// (bits 0-15), its fence class (bits 16-17), and bit 18 set if the core
 /// asked is unusable.
@@ -965,7 +989,11 @@ pub enum Owner {
 impl Owner {
     pub const fn code(self) -> u16 {
         match self {
-            Self::Node(node) => node,
+            Self::Node(node) => {
+                // A node's index is below `NODES_MAX`.
+                assert!((node as usize) < NODES_MAX);
+                node
+            }
             Self::Unclaimed => OWNER_UNCLAIMED,
             Self::Reserve(j) => {
                 // A reserve's index is below `RESERVES_MAX`.
@@ -1116,9 +1144,12 @@ impl Ownership {
     }
 }
 
-/// One entry of the device table, 16 bytes: the base (aligned on the size,
-/// at least one page) with the log2 of the size in bits 0-5 and bit 6 when
-/// the entry is used; then an ownership word.
+/// One entry of the device table, 16 bytes (The device table): the base
+/// (aligned on the size, at least one page) with the log2 of the size in
+/// bits 0-5 and bit 6 when the entry is used; bit 7 for a port entry
+/// (x86-64), whose first port is in bits 12-27 in place of the base and
+/// whose bits 0-5 hold the log2 of its number of ports (D-150, D-152); then
+/// an ownership word.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceEntry {
@@ -1128,17 +1159,33 @@ pub struct DeviceEntry {
 
 impl DeviceEntry {
     pub const USED: u64 = 1 << 6;
+    pub const PORT: u64 = 1 << 7;
 
-    /// A used entry of `1 << log2` bytes at `base`, unclaimed.
-    pub const fn used(base: u64, log2: u32) -> Self {
-        // At least one page (12 bits), as the entry's base word keeps its
-        // low bits for the size and the bit *used* (the final review's
-        // verification of lot A, H4).
-        assert!(log2 >= 12 && log2 < 64 && base & ((1 << log2) - 1) == 0);
-        Self {
+    /// A used entry of `1 << log2` bytes at `base`, unclaimed; `None` for a
+    /// range the word cannot hold: below a page (the low bits keep the size
+    /// and the flags; the final review's verification of lot A, H4), of
+    /// 2^64 bytes or more, or not aligned on its size.
+    pub const fn used(base: u64, log2: u32) -> Option<Self> {
+        if log2 < 12 || log2 >= 64 || base & ((1 << log2) - 1) != 0 {
+            return None;
+        }
+        Some(Self {
             range: base | log2 as u64 | Self::USED,
             owner: Ownership::free(Owner::Unclaimed),
+        })
+    }
+
+    /// A port entry of `1 << log2` ports from `first`, unclaimed (I/O
+    /// ports, D-150); `None` for more than the 2^16 ports or a range not
+    /// aligned on its size ("each aligned on its power-of-two size").
+    pub const fn port(first: u16, log2: u32) -> Option<Self> {
+        if log2 > 16 || first as u64 & ((1 << log2) - 1) != 0 {
+            return None;
         }
+        Some(Self {
+            range: (first as u64) << 12 | Self::PORT | Self::USED | log2 as u64,
+            owner: Ownership::free(Owner::Unclaimed),
+        })
     }
 
     /// An unused entry, unclaimed.
@@ -1153,12 +1200,31 @@ impl DeviceEntry {
         self.range & Self::USED != 0
     }
 
+    /// Whether the entry names a range of ports (bit 7).
+    pub const fn is_port(&self) -> bool {
+        self.range & Self::PORT != 0
+    }
+
+    /// The log2 of the size: bytes, or ports for a port entry.
     pub const fn log2(&self) -> u32 {
         (self.range & 0x3f) as u32
     }
 
-    pub const fn base(&self) -> u64 {
-        self.range & !0x7f
+    /// The base of a used entry of memory; `None` for an unused entry and
+    /// for a port entry, which covers no memory.
+    pub const fn base(&self) -> Option<u64> {
+        if !self.is_used() || self.is_port() {
+            return None;
+        }
+        Some(self.range & !0xfff)
+    }
+
+    /// The first port of a used port entry, bits 12-27.
+    pub const fn first_port(&self) -> Option<u16> {
+        if !self.is_used() || !self.is_port() {
+            return None;
+        }
+        Some((self.range >> 12) as u16)
     }
 }
 
@@ -1227,7 +1293,8 @@ impl Member {
 
     /// The same word with the fence class `class` (0 to 2) in bits 7-8.
     pub const fn with_class(self, class: u8) -> Self {
-        Self(self.0 & !(0b11 << 7) | ((class & 0b11) as u64) << 7)
+        assert!(class < 3);
+        Self(self.0 & !(0b11 << 7) | (class as u64) << 7)
     }
 
     /// `None` for a state 8 to 15, an evidence 7, a class 3, a bit 10-15
@@ -2483,6 +2550,26 @@ mod proofs {
         }
     }
 
+    /// A device entry reads back what built it, memory or ports, and a port
+    /// entry has no base (D-152); a range the word cannot hold is refused.
+    #[kani::proof]
+    fn device_entries_read_back() {
+        let (base, log2): (u64, u32) = (kani::any(), kani::any());
+        match DeviceEntry::used(base, log2) {
+            Some(entry) => {
+                assert!(entry.base() == Some(base) && entry.log2() == log2);
+                assert!(!entry.is_port() && entry.first_port().is_none());
+            }
+            None => assert!(log2 < 12 || log2 >= 64 || base & ((1 << log2) - 1) != 0),
+        }
+        let (first, log2): (u16, u32) = (kani::any(), kani::any());
+        if let Some(entry) = DeviceEntry::port(first, log2) {
+            assert!(entry.first_port() == Some(first) && entry.log2() == log2);
+            assert!(entry.is_used() && entry.base().is_none());
+            assert!(first as u64 + (1u64 << log2) <= 1 << 16);
+        }
+    }
+
     /// A core word read back, at the full widths of `CoreWord` (the eighth
     /// model review found the proof narrowed to 4 bits of slot and of
     /// generation). `from_raw` accepts a word when the check it recomputes
@@ -2695,6 +2782,9 @@ mod proofs {
         }
     }
 
+    /// On a scaled geometry that `Geometry::valid` refuses (4 entries a
+    /// table, not a page's worth: audit lot 2, F-10), so that the solver
+    /// ends; `module_frames` reads only the page sizes, never `valid`.
     #[kani::proof]
     #[kani::unwind(10)]
     fn module_frames_cover_the_module_in_order() {

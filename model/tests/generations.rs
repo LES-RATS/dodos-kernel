@@ -151,7 +151,7 @@ impl S {
     fn device_index(&self) -> u64 {
         let node = self.sys.node(0);
         (0..node.device_count())
-            .find(|&i| node.device_entry(i).base() == Machine::DEVICES)
+            .find(|&i| node.device_entry(i).base() == Some(Machine::DEVICES))
             .unwrap() as u64
     }
 }

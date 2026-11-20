@@ -2646,7 +2646,7 @@ fn the_gate_refuses_to_give_a_block_whose_map_count_is_not_zero() {
 fn the_gate_refuses_to_give_a_device_block_whose_leaf_count_is_not_zero() {
     let (mut m, t) = Model::boot(&Machine::example()).unwrap();
     let index = (0..m.device_count())
-        .find(|&i| m.device_entry(i).base() == Machine::DEVICES)
+        .find(|&i| m.device_entry(i).base() == Some(Machine::DEVICES))
         .unwrap();
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),

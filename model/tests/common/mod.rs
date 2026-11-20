@@ -67,7 +67,7 @@ pub const fn slot(index: u32) -> u32 {
 /// chunks are device entries too).
 pub fn take_device(model: &mut Model, thread: ObjId) {
     let index = (0..model.device_count())
-        .find(|&i| model.device_entry(i).base() == dodos_model::Machine::DEVICES)
+        .find(|&i| model.device_entry(i).base() == Some(dodos_model::Machine::DEVICES))
         .expect("the 2 MB device range");
     let take = Syscall::MemoryTake {
         control: SlotAddr::own(START_SLOT_MEMORY_CONTROL),

@@ -141,7 +141,11 @@ fn a_thread_attached_to_no_task_sends_to_another_node_and_gets_its_answer() {
 
 #[test]
 fn a_send_whose_stamp_has_a_counter_of_0_is_refused() {
-    for stamp in [TaskId::new(1, 0).raw(), TaskId::new(2, 0).raw()] {
+    // Forged words: `TaskId::new` builds no counter of 0.
+    for stamp in [
+        TaskId::from_raw(1 << 48).raw(),
+        TaskId::from_raw(2 << 48).raw(),
+    ] {
         let mut m = S::two();
         let reply = m.retype(0, ObjectKind::Reply, 0, REPLY);
         m.ok(0, reply);

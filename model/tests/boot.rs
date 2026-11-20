@@ -493,9 +493,9 @@ fn device_memory_is_every_address_that_is_not_ram_kept_or_unusable() {
     // IOMMU unit among them (Argon F2); then the device ranges.
     let used = m.device_count() - DEVICE_TABLE_SPARE;
     let low = (0..used)
-        .filter(|&i| m.device_entry(i).base() < 2 << 20)
+        .filter(|&i| m.device_entry(i).base() < Some(2 << 20))
         .count();
-    assert!((0..low).all(|i| m.device_entry(i).base() >= 1 << 20));
+    assert!((0..low).all(|i| m.device_entry(i).base() >= Some(1 << 20)));
     let sizes: Vec<u32> = (low..used).map(|i| m.device_entry(i).log2()).collect();
     assert_eq!(sizes, [20, 21, 20]);
     assert!((0..used).all(|i| m.device_entry(i).is_used()));
@@ -657,8 +657,7 @@ fn no_usable_page_is_left_out_of_both_the_chunks_and_the_device_table() {
     let page = geometry.page();
     let entries: Vec<_> = (0..m.device_count())
         .map(|i| m.device_entry(i))
-        .filter(|e| e.is_used())
-        .map(|e| (e.base(), e.base() + (1 << e.log2())))
+        .filter_map(|e| Some((e.base()?, e.base()? + (1 << e.log2()))))
         .collect();
     let device = |at: u64| entries.iter().any(|&(s, e)| s <= at && at < e);
     let mut fragments = 0;

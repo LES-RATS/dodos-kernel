@@ -81,7 +81,9 @@ impl DebugArea {
     fn continues(&self) -> bool {
         let holds = |ring: &[TraceEntry], next: u64, entries: u64| {
             (1..1 << 63).contains(&next)
-                && (next == 1 || ring[trace_index(next - 1, entries) as usize].seq == next - 1)
+                && (next == 1
+                    || trace_index(next - 1, entries)
+                        .is_some_and(|at| ring[at as usize].seq == next - 1))
         };
         holds(&self.kernel, self.next_kernel, TRACE_KERNEL_ENTRIES)
             && holds(&self.user, self.next_user, TRACE_USER_ENTRIES)
@@ -105,7 +107,8 @@ impl DebugArea {
         };
         let seq = *next;
         entry.seq = seq;
-        ring[trace_index(seq, entries) as usize] = entry;
+        let at = trace_index(seq, entries).expect("a sequence of at least 1");
+        ring[at as usize] = entry;
         *next = seq + 1;
     }
 }
@@ -323,7 +326,7 @@ impl Model {
             false => (&area.kernel, area.next_kernel, TRACE_KERNEL_ENTRIES),
         };
         (next.saturating_sub(entries).max(1)..next)
-            .map(|s| ring[trace_index(s, entries) as usize])
+            .filter_map(|s| trace_index(s, entries).map(|at| ring[at as usize]))
             .filter(|e| e.seq != 0)
             .collect()
     }

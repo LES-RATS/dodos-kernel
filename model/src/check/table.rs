@@ -155,8 +155,8 @@ impl Model {
                 let end = start + bytes;
                 if frame.memory != dodos_abi::MemoryType::WriteBack {
                     let entry = table.devices.iter().position(|entry| {
-                        let base = entry.base();
-                        entry.is_used() && base <= start && end <= base + (1 << entry.log2())
+                        let within = |base| base <= start && end <= base + (1 << entry.log2());
+                        entry.base().is_some_and(within)
                     });
                     if let Some(entry) = entry {
                         entries[entry] += 1;
@@ -193,8 +193,8 @@ impl Model {
                 let end = start + bytes;
                 if frame.memory != dodos_abi::MemoryType::WriteBack {
                     let entry = table.devices.iter().position(|entry| {
-                        let base = entry.base();
-                        entry.is_used() && base <= start && end <= base + (1 << entry.log2())
+                        let within = |base| base <= start && end <= base + (1 << entry.log2());
+                        entry.base().is_some_and(within)
                     });
                     if let Some(entry) = entry {
                         entries[entry] += 1;
@@ -340,7 +340,8 @@ impl Model {
                         "53: two blocks on an entry",
                     )?;
                     let entry = table.devices.get(index).ok_or("54: block of no entry")?;
-                    let range = (entry.base(), entry.base() + (1 << entry.log2()));
+                    let base = entry.base().ok_or("54: block of a port entry")?;
+                    let range = (base, base + (1 << entry.log2()));
                     let same = range == (untyped.base, untyped.base + untyped.bytes);
                     ensure(
                         same && mine(entry.owner.raw()),
@@ -392,8 +393,11 @@ impl Model {
         let owned_entries: Vec<(u64, u64)> = table
             .devices
             .iter()
-            .filter(|entry| entry.is_used() && mine(entry.owner.raw()))
-            .map(|entry| (entry.base(), entry.base() + (1 << entry.log2())))
+            .filter(|entry| mine(entry.owner.raw()))
+            .filter_map(|entry| {
+                let base = entry.base()?;
+                Some((base, base + (1 << entry.log2())))
+            })
             .collect();
         let device_owned =
             |start: u64, end: u64| owned_entries.iter().any(|&(s, e)| s <= start && end <= e);

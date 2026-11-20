@@ -620,16 +620,10 @@ impl Model {
         while served < step {
             let produced = self.ring_of(from, me, user).produced;
             let mut consumed = self.consumed(from, me, user);
-            // A producer index more than the ring's entries ahead first
-            // moves the consumer index to the producer minus the entries.
-            // A producer index behind the consumer index moves the consumer
-            // index to it; every difference is taken modulo 2^64 (D-141).
-            let behind =
-                produced.wrapping_sub(consumed) > size && consumed.wrapping_sub(produced) <= size;
-            let start = match behind {
-                true => produced,
-                false => ring_resync(produced, consumed, size),
-            };
+            // A producer index behind the consumer, or more than the
+            // ring's entries ahead of it, moves the consumer (D-131, D-141;
+            // `ring_resync`, CONTRACT-GAP 52).
+            let start = ring_resync(produced, consumed, size);
             if start != consumed {
                 self.refused.0 += 1;
                 self.trace(TraceCode::Refused, None, [u64::from(from), 0, 0]);

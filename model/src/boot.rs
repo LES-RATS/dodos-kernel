@@ -1141,7 +1141,9 @@ impl Machine {
             .into_iter()
             .flat_map(blocks)
             .filter(|&(_, len)| len >= page)
-            .map(|(base, len)| DeviceEntry::used(base, len.trailing_zeros()))
+            .map(|(base, len)| {
+                DeviceEntry::used(base, len.trailing_zeros()).expect("a block of a page or more")
+            })
             .collect();
         devices.extend((0..DEVICE_TABLE_SPARE).map(|_| DeviceEntry::unused()));
         // The roles: a unit role per IOMMU unit, per IOAPIC and for the

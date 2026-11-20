@@ -94,8 +94,8 @@ impl Model {
         if frame.memory != dodos_abi::MemoryType::WriteBack {
             let end = frame.base + frame.pages * self.bytes(frame.page);
             let index = self.table.devices.iter().position(|entry| {
-                let base = entry.base();
-                entry.is_used() && base <= frame.base && end <= base + (1 << entry.log2())
+                let within = |base| base <= frame.base && end <= base + (1 << entry.log2());
+                entry.base().is_some_and(within)
             });
             // A device frame lies in an entry of the device table; one that
             // lies in none (a state only a test builds) is counted nowhere.

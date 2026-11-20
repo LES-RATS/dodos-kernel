@@ -1,5 +1,5 @@
-//! What crosses between nodes (D-128, D-129, D-131): the twelve kinds of
-//! message, the two rings of each ordered pair of node slots, the header
+//! What crosses between nodes (D-128, D-129, D-131): the eleven kinds of
+//! message (numbered 1 to 12, 9 reserved), the two rings of each ordered pair of node slots, the header
 //! at the start of a message's first entry, the credits and the bounds.
 //!
 //! The words that follow the header of each kind are the contract's table
@@ -60,15 +60,23 @@ pub enum Ring {
     User,
 }
 
-/// The twelve kinds of message between nodes, and nothing else. The words
-/// after the header, by kind (What crosses between nodes, gap 3):
+/// The eleven kinds of message between nodes (numbered 1 to 12, 9 reserved
+/// since D-135), and nothing else. The words after the header, by kind
+/// (What crosses between nodes, gap 3):
 ///
 /// - `Revoke`: the grant index (bits 0-11), its serial (12-41) and the use
 ///   index (42-53), one word.
 /// - `RevokeStep`: 1 if the root remote capability was removed, else 0.
 /// - `Release`, `Signal`: the grant index (0-11) and its serial (12-41).
 /// - `UnitRequest`: the role (0-15), the epoch (16-44) and the operation
-///   (48-55); then two operands.
+///   (48-55); then two operands, as the table of words by kind gives it.
+///   CONTRACT-GAP 53 (What crosses between nodes, the table of words by
+///   kind; Devices and shared hardware, the request record, D-151): since
+///   D-151 the holder reads the operation and its operands from the
+///   request record, and "The `UnitRequest` names the entry and its serial
+///   (its operand words are 0 and unread)"; the table still gives the
+///   words above and no place for the entry or the serial. Left as the
+///   table gives it, three words.
 /// - `UnitAnswer`: the result (`UnitResult`), then its value.
 /// - `Handed`, `ReportAsk`: the role (0-15) and the epoch (16-44); a
 ///   `ReportAsk` adds the key it asks from.
@@ -184,11 +192,25 @@ pub const fn ring_fits(
     }
 }
 
-/// The consumer index the receiver starts from: a producer index more than
-/// the ring's entries ahead of the consumer first moves the consumer to the
-/// producer minus the ring's entries (D-131); otherwise it stays.
+/// The consumer index the receiver starts from (What crosses between
+/// nodes): a producer index behind the consumer index moves the consumer to
+/// the producer (D-141); a producer index more than the ring's entries ahead
+/// of the consumer moves the consumer to the producer minus the ring's
+/// entries (D-131); otherwise it stays. Every difference is taken modulo
+/// 2^64.
+///
+/// CONTRACT-GAP 52 (What crosses between nodes, "every difference of two
+/// indices is taken modulo 2^64"): modulo 2^64 a producer behind the
+/// consumer is also more than the ring's entries ahead of it, and taken in
+/// the order written ("first moves") the behind rule never applies. Read as
+/// the model read it since D-141: behind when the consumer leads by 1 to
+/// the ring's entries; a consumer further ahead reads as a producer more
+/// than the ring's entries ahead.
 pub const fn ring_resync(produced: u64, consumed: u64, entries: u64) -> u64 {
-    if produced.wrapping_sub(consumed) > entries {
+    let behind = consumed.wrapping_sub(produced);
+    if behind != 0 && behind <= entries {
+        produced
+    } else if produced.wrapping_sub(consumed) > entries {
         produced.wrapping_sub(entries)
     } else {
         consumed
@@ -219,7 +241,11 @@ impl RingHeader {
         credit: Option<(u8, u32)>,
     ) -> Self {
         let credit = match credit {
-            Some((index, serial)) => (index & 0x1f) as u32 | (serial & CREDIT_SERIAL_MASK) << 5,
+            Some((index, serial)) => {
+                // A credit is an index below 24 (D-141).
+                assert!((index as usize) < REQUESTS_PER_PEER + SENDS_PER_PEER);
+                index as u32 | (serial & CREDIT_SERIAL_MASK) << 5
+            }
             None => CREDIT_NONE as u32,
         };
         Self {
@@ -272,7 +298,8 @@ pub enum UnitResult {
 
 /// The operations of a unit request (Devices and shared hardware), each
 /// idempotent, numbered as the contract numbers them (Devices and shared
-/// hardware, gap 3).
+/// hardware, gap 3). The two operands are words of the request record,
+/// which the holder's gate reads in place of the ring (D-151).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitOperation {
@@ -282,7 +309,9 @@ pub enum UnitOperation {
     /// root table (D-134).
     Attach = 1,
     /// Detach a device: operand 1 the device identifier (0-15) and the
-    /// domain number (16-31); operand 2 0.
+    /// domain number (16-31); operand 2 the physical address of the
+    /// iospace's root table the requester's header entry names (D-140; 0
+    /// before).
     Detach = 2,
     /// Invalidate the IOMMU translations of a domain, after an unmap or the
     /// unhooking of a table: operand 1 the domain number (0-15).
@@ -291,8 +320,9 @@ pub enum UnitOperation {
     /// operand 1 the handle (bits 0-15), index-selective (D-134).
     InterruptCache = 4,
     /// Program a line's redirection entry in an IOAPIC: operand 1 the GSI
-    /// (0-31), 1 claimed or 0 masked (32), the trigger (33) and the
-    /// polarity (34); operand 2 remapped the handle (0-15) and the vector
+    /// (0-31), 1 claimed or 0 masked (32), the trigger (33), the polarity
+    /// (34) and *release* (35, masked only: the holder's gate writes the
+    /// line word free, unclaimed, in the call that masks; D-150); operand 2 remapped the handle (0-15) and the vector
     /// (16-23), not remapped the vector (16-23) and the APIC ID (32-63),
     /// masked 0 (D-134).
     Redirection = 5,
@@ -360,6 +390,12 @@ mod proofs {
         if produced.wrapping_sub(consumed) <= entries {
             assert!(start == consumed);
         }
+        // A producer behind the consumer moves the consumer to it (D-141,
+        // read by CONTRACT-GAP 52): nothing is read that was not produced.
+        let behind = consumed.wrapping_sub(produced);
+        if behind != 0 && behind <= entries {
+            assert!(start == produced);
+        }
     }
 
     /// A credit (an index below 24, D-141) and its serial read back, and a
@@ -413,7 +449,9 @@ mod proofs {
         let words: usize = kani::any();
         kani::assume(words <= 64);
         assert!(message_entries(3 + SEND_GRANTS_MAX + words) <= 10);
-        assert!(message_entries(1 + 3 * 28) <= RING_MESSAGE_ENTRIES_MAX);
+        // A `Report`: the count, the key of the next item, three words per
+        // item, 2 + 3 × 28 = 86 words (F-10: the proof counted 85).
+        assert!(message_entries(2 + 3 * 28) <= RING_MESSAGE_ENTRIES_MAX);
         assert!(message_entries(0) == 1);
     }
 }

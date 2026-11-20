@@ -494,6 +494,16 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   bit. The checker reports a word *joining* under a node that is live,
   sealing or sealed. The gate model's own resume (`gate/events.rs`) has no
   core words and is unchanged.
+- The audit of `abi/` (lot 2). `ring_resync` holds the rule of a producer
+  index behind the consumer (D-141), which only the model applied; the
+  model's copy is gone. The device table's port entries (D-150, D-152)
+  have their layout (`DeviceEntry::port`, bit 7), and `base()` is `None`
+  for them. Constructors refuse or assert the values the contract allows
+  (a credit index, a fence class, an owner, a task counter, a trace
+  sequence, a page shift); `abi/` gains `NODE_STOP_SUSPEND`,
+  `UNIT_OWN_DEVICES_MAX`, the start request's word (`NodeGen::
+  start_request`, which the model now uses) and the port table's values;
+  values the contract fixes are pinned by tests.
 - The scenarios are in `scenarios/pass33.rs` and `gate/pass33_tests.rs`.
 
 ## Mutations shown equivalent
@@ -565,7 +575,12 @@ an exhaustion after a very long stop; the budgets of one exhaustion are
 bounded by `SCHED_MAX_DEBT`, the rest of the debt forgiven) and gap 51
 (`model/src/faults.rs`: a kept kind 9 of a thread that is not marked and
 has no context; kept until it is runnable with a configured context, not
-raised as the model first read it). Two earlier gaps were settled otherwise than the
+raised as the model first read it). Pass 33 found three, open: gap 52
+(`abi/src/ring.rs`: where a producer index "behind" the consumer ends
+and "more than the ring's entries ahead" begins, modulo 2^64), gap 53
+(`abi/src/ring.rs`: the words of a `UnitRequest` since D-151 moved its
+operands to the request record) and gap 54 (`abi/src/machine.rs`: the
+layout of the record `BootPorts`). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

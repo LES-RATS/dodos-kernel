@@ -16,14 +16,10 @@ use dodos_abi::{
     CoreState, CoreWord, DRIVER_NONE, Error, Evidence, FENCE_NS, IDLE_ENTRY_WORDS,
     IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_HALT, IDLE_METHOD_MWAIT, IDLE_METHOD_PSCI,
     IDLE_METHOD_SBI, IDLE_STATES_MAX, Member, MemberState, NODE_START_FRESH, NODE_START_RESUME,
-    NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL, NODE_WATCH_SLOTS, OBSERVATION_LIFE,
-    OBSERVATIONS_MAX, ObjectKind, RECOVERY_PERIOD_NS, REMOVAL_STEP, Rights, RoleKind, RoleState,
-    SETTLE_NS, START_NS, START_RETRY_NS, SlotAddr,
+    NODE_STOP_KILL, NODE_STOP_RETIRE, NODE_STOP_SEAL, NODE_STOP_SUSPEND, NODE_WATCH_SLOTS,
+    OBSERVATION_LIFE, OBSERVATIONS_MAX, ObjectKind, RECOVERY_PERIOD_NS, REMOVAL_STEP, Rights,
+    RoleKind, RoleState, SETTLE_NS, START_NS, START_RETRY_NS, SlotAddr,
 };
-
-/// Mode 3 of `node_stop`, the whole-machine suspend of the draft:
-/// `unsupported` since D-152.
-const NODE_STOP_SUSPEND: u64 = 3;
 
 /// What a node asks of the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

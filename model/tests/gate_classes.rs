@@ -217,7 +217,7 @@ fn a_device_leaf_counts_in_its_device_entry_and_in_no_chunk() {
         let (mut m, t, _) = with_space(kind);
         common::take_device(&mut m, t);
         let index = (0..m.device_count())
-            .find(|&i| m.device_entry(i).base() == Machine::DEVICES)
+            .find(|&i| m.device_entry(i).base() == Some(Machine::DEVICES))
             .unwrap();
         let counts = |m: &Model| -> Vec<u64> { (0..64).map(|c| m.map_count(c)).collect() };
         ok(
