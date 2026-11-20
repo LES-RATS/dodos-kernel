@@ -1575,8 +1575,9 @@ impl Run {
                 self.m.sys.inject_raw(f, to, true, bad, 1);
             }
             // 9: early `beacons[f].acked[x] = g` and `maps_of[x] = false`
-            // written by `f` (when `f` holds no unit role, has run R0 for
-            // `x`, and has no active grant or remote capability of `x`)
+            // written by `f` (when `f` holds no unit role, has run R0 and
+            // R4 for `x`, and has no active grant or remote capability of
+            // `x`)
             // while `x` is `Fenced`: R6's proof (`r6_held_back`, D-149)
             // still holds R6 back until every grantee's use entry counts no
             // leaf under `x`'s grants and no attach word of `x` reads
@@ -1591,13 +1592,13 @@ impl Run {
                     let xg = self.m.sys.member(x).generation();
                     x != f
                         && self.m.state(x) == MemberState::Fenced
-                        && self
-                            .m
-                            .sys
-                            .node(f)
-                            .reclaims
-                            .get(&x)
-                            .is_some_and(|r| r.generation == xg && r.isolated)
+                        && self.m.sys.node(f).reclaims.get(&x).is_some_and(|r| {
+                            // R4's audit ended too: `f`'s own check
+                            // holds R5 after it (pass 34).
+                            r.generation == xg
+                                && r.isolated
+                                && r.audit.as_ref().is_some_and(Vec::is_empty)
+                        })
                         && !table.grants[x as usize].values().any(|e| e.grantee == f)
                         && !table.grants[f as usize].values().any(|e| e.grantee == x)
                 });

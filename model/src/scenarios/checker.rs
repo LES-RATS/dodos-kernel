@@ -1470,11 +1470,57 @@ fn an_acknowledgement_before_r1_is_done_is_reported() {
     });
     let reclaim = m.sys.node_mut(1).reclaims.entry(0).or_default();
     reclaim.generation = g;
+    reclaim.audit = Some(Vec::new());
     reclaim.r1.insert(IOMMU_ROLE, Some(1));
     reported_on(
         &m,
         1,
         "ACKED: an acknowledgement before R1 is done on a unit this node holds",
+    );
+}
+
+// Reclaim, R5 after R2 and R4 (audit lot 7: R2 and R4 had no invariant):
+// node 1 acknowledges node 0 fenced while R4's audit of its blocks has not
+// ended, and while a remote capability of node 0 is left.
+#[test]
+fn an_acknowledgement_before_r2_or_r4_is_done_is_reported() {
+    let fenced = |m: &mut S| {
+        let g = m.sys.member(0).generation();
+        m.sys.edit_table(|t| {
+            let evidence = dodos_abi::Evidence::Stale;
+            t.members[0] = dodos_abi::Member::new(MemberState::Fenced, evidence, 1, g);
+            t.beacons[1].acked[0] = g;
+        });
+        let reclaim = m.sys.node_mut(1).reclaims.entry(0).or_default();
+        reclaim.generation = g;
+        reclaim.audit = Some(Vec::new());
+    };
+    let mut m = S::two();
+    fenced(&mut m);
+    assert_eq!(m.sys.node(1).check(), Ok(()));
+    let one = *m.sys.node(1).untypeds.keys().next().expect("an untyped");
+    m.sys.node_mut(1).reclaims.get_mut(&0).unwrap().audit = Some(vec![one]);
+    reported_on(
+        &m,
+        1,
+        "ACKED: an acknowledgement before R4 audited every block",
+    );
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let (x, y) = (super::pass24::X, super::pass24::Y);
+    let gx = m.sys.member(x).generation();
+    m.sys.edit_table(|t| {
+        let evidence = dodos_abi::Evidence::Stale;
+        t.members[usize::from(x)] = dodos_abi::Member::new(MemberState::Fenced, evidence, y, gx);
+        t.beacons[usize::from(y)].acked[usize::from(x)] = gx;
+    });
+    let reclaim = m.sys.node_mut(y).reclaims.entry(x).or_default();
+    reclaim.generation = gx;
+    reclaim.audit = Some(Vec::new());
+    reported_on(
+        &m,
+        y,
+        "ACKED: an acknowledgement before R2 removed every remote capability",
     );
 }
 

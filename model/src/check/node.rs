@@ -71,6 +71,17 @@ impl Model {
                 continue;
             }
             let reclaim = self.reclaims.get(&x).filter(|r| r.generation == g);
+            // R5 after R2 and R4 (Reclaim; audit lot 7): no remote
+            // capability of X left, and the audit of this node's blocks
+            // ended, when the acknowledgement is there.
+            ensure(
+                !self.remotes.values().any(|r| r.node == x),
+                "ACKED: an acknowledgement before R2 removed every remote capability",
+            )?;
+            ensure(
+                reclaim.is_none_or(|r| r.audit.as_ref().is_some_and(Vec::is_empty)),
+                "ACKED: an acknowledgement before R4 audited every block",
+            )?;
             for (role, word) in self.table.roles.iter().enumerate() {
                 if word.state() != RoleState::Held
                     || word.holder() != self.node

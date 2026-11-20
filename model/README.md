@@ -544,7 +544,8 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   a role word, a debug area, a trace sequence and a grantee's leaf are
   judged before they index or subtract. New rules: G9 (a context entry
   names the node its identifier word names, its attach word *attached*);
-  R0 (no wait, unit request or service left on a node it isolated); R3 (a
+  R0 (no wait, unit request or service left on a node it isolated); R2 and
+  R4 before R5 (no remote capability left, the audit ended); R3 (a
   grant pinned only for a grantee accused or over, or under a failed
   unit's count); a hand-over's caller (`Wait::Hand`); a ring window with
   no hole; the epoch at the entry of an event; a free word under a leaf an
