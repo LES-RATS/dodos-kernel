@@ -9,19 +9,64 @@ use super::*;
 #[test]
 fn faulty_kernels_keep_g_on_the_cpu_side() {
     let mut done = 0;
+    // What the exploration reaches, by operation done (pass 35: nothing
+    // asserted it reaches the states of D-154 to D-157), and the attacks on
+    // them: a give or a destruction of a table chunk that still holds a
+    // table, and a leaf toward a table chunk, each refused.
+    let mut reached: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut attacks = [0usize; 2];
     for seed in 0..200u64 {
         let mut m = Machine::new(2, 2, 8).with_units().with_spaces();
         let mut rng = Rng(seed + 1);
         for step in 0..400 {
             let op = m.random_op(&mut rng);
+            let holds_tables = |m: &Machine, chunk: u64| {
+                let chunk = chunk as usize;
+                m.gate.table_bits.get(chunk).copied().unwrap_or(false)
+                    && m.gate.not_data.get(chunk).is_some_and(|&n| n > 0)
+            };
+            let table_release = match op {
+                Op::Give { chunk, .. } | Op::DestroyBlock { chunk, .. } => holds_tables(&m, chunk),
+                _ => false,
+            };
+            let leaf_to_table = matches!(op, Op::Map { page, .. } if m.table_chunk(page));
             let outcome = m.step(&op);
             done += usize::from(outcome.is_ok());
             if let Err(rule) = m.check() {
                 panic!("seed {seed} step {step}: {op:?} -> {outcome:?}: {rule}");
             }
+            assert!(
+                !(table_release || leaf_to_table) || outcome.is_err(),
+                "{op:?}"
+            );
+            attacks[0] += usize::from(table_release);
+            attacks[1] += usize::from(leaf_to_table);
+            if outcome.is_err() {
+                continue;
+            }
+            let name = match op {
+                Op::Take {
+                    kind: Take::Tables, ..
+                } => "take of a table chunk",
+                Op::TakeTable { .. } => "table in a table chunk",
+                Op::Map { .. } => "map",
+                Op::Teardown { .. } => "aspace root torn down",
+                Op::IoMap { .. } => "iospace map",
+                Op::IoTeardown { .. } => "iospace root torn down",
+                Op::Give { .. } => "give",
+                Op::DestroyBlock { .. } => "block destroyed",
+                Op::Grant { .. } => "grant between nodes",
+                Op::Fence { .. } => "fence",
+                Op::R6 { .. } => "R6",
+                Op::Seal { .. } => "seal",
+                _ => continue,
+            };
+            *reached.entry(name).or_default() += 1;
         }
     }
     assert!(done > 200 * 40, "only {done} calls performed");
+    assert_eq!(reached.len(), 12, "{reached:?}");
+    assert!(attacks.iter().all(|&a| a > 0), "{attacks:?}");
 }
 
 /// The machine an exploration starts from: the small machine with its

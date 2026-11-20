@@ -1015,9 +1015,22 @@ impl Machine {
                         },
                     },
                     // A give, or one time in four a block's destruction
-                    // (the generator's state read, not advanced).
+                    // (the generator's state read, not advanced). Three in four of
+                    // them name a chunk the node holds, table chunks
+                    // among them (pass 35: no give or destruction
+                    // happened with a chunk drawn from all of them).
                     _ => {
                         let to = beyond(rng.below(nodes), nodes) as u16;
+                        let held: Vec<u64> = (0..self.chunks)
+                            .filter(|&c| {
+                                matches!(self.gate.owners[c as usize],
+                                    Owner::Taken { node, .. } if node == n)
+                            })
+                            .collect();
+                        let chunk = match held.is_empty() || rng.below(4) == 0 {
+                            true => chunk,
+                            false => held[rng.below(held.len() as u64) as usize],
+                        };
                         match rng.0.is_multiple_of(4) {
                             true => Op::DestroyBlock { n, p, chunk },
                             false => Op::Give { n, p, chunk, to },

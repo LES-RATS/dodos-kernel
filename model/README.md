@@ -579,6 +579,24 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   pinned table and another object, and pins last, as the contract has it.
 - D-162. The holder's gate answers *refused* a record whose word 0 names
   another role than the message (`Model::unit_requested`).
+- The audits of lot 8 (the scenarios, the tests). `judged` asserts every
+  invariant before and after a unit request (its roots are real iospaces
+  in table chunks); the combination test pins the combinations its 26
+  seeds reach and asserts every forged message consumed is refused; the
+  explorers count what they reach and run nowhere vacuously; `verify` runs
+  every test file on the three page sizes. Two rules found by repaired
+  tests: `node_send` reads the header before the doorbell, and a revoked
+  task named where another kind is asked is `gone`. Gap 56 (where
+  `node_send`'s `gone` of a node not live sits) is open.
+- The explorations reach the states of D-154 to D-157: in
+  `combinations.rs` a node takes a table run, cuts a child table untyped,
+  makes an `aspace` or an `iospace` on it, maps under it, destroys the
+  space with its mapping, and gives or destroys the run, among the deaths,
+  seals and fresh starts (`TABLE_STATES`, each asserted reached); the
+  faulty node's gate is refused toward the run it holds. The gate model's
+  exploration asserts the operations it reaches, gives and destructions of
+  blocks among them, and that a give of a table chunk holding a table and
+  a leaf toward a table chunk are always refused.
 - The scenarios are in `scenarios/pass35.rs`.
 
 ## Mutations shown equivalent

@@ -47,6 +47,14 @@ const BLOCK: u32 = 160;
 const ENTRY: u32 = 170;
 const IRQ: u32 = 210;
 const RECEIVER: u32 = 300;
+/// The slots of the table chunks' cycle (`Run::tables`): a table run, a
+/// child table untyped cut from it, an `aspace` and an `iospace` on that
+/// child, and a frame to map under them.
+const TBLOCK: u32 = 400;
+const TCHILD: u32 = 401;
+const TASPACE: u32 = 402;
+const TIOSPACE: u32 = 403;
+const TFRAME: u32 = 404;
 const STEPS: usize = 120;
 
 /// A grant between two nodes: the granting node and its frames from
@@ -315,6 +323,8 @@ struct Reach {
     handed_failed: usize,
     /// The forged messages of a faulty node seen refused by their receiver.
     refused: usize,
+    /// The seeds that reached each of `TABLE_STATES`.
+    tables: [usize; TABLE_STATES.len()],
     pairs: Vec<Vec<usize>>,
     resume: Vec<Vec<usize>>,
     death: Vec<Vec<usize>>,
@@ -329,7 +339,26 @@ struct Seen {
     death: BTreeSet<(usize, usize)>,
     events: BTreeSet<usize>,
     refused: usize,
+    /// The states of D-154 to D-157 reached (`TABLE_STATES`).
+    tables: BTreeSet<usize>,
 }
+
+/// The states of the table chunks' cycle and of the gate's defence of
+/// them, which the long and the short runs must reach (pass 35: the audits
+/// of lot 8 found the explorations never reached D-154 to D-157).
+const TABLE_STATES: [&str; 11] = [
+    "a table run taken",
+    "a child table untyped cut",
+    "an aspace on a child table untyped",
+    "an iospace on a child table untyped",
+    "a frame mapped under an aspace's table untyped",
+    "a frame mapped under an iospace's table untyped",
+    "an aspace destroyed with its mapping",
+    "an iospace destroyed with its mapping",
+    "a table run given or destroyed",
+    "a node fenced while another holds its grants",
+    "a faulty gate refused toward a table run it holds",
+];
 
 /// A forged message a faulty node wrote, to be refused by its receiver:
 /// once the receiver's consumer passes it, with the same generation, its
@@ -390,6 +419,7 @@ impl Reach {
             gap_21: 0,
             handed_failed: 0,
             refused: 0,
+            tables: [0; TABLE_STATES.len()],
             pairs: square(),
             resume: square(),
             death: square(),
@@ -411,6 +441,9 @@ impl Reach {
             self.events[e] += 1;
         }
         self.refused += seen.refused;
+        for &state in &seen.tables {
+            self.tables[state] += 1;
+        }
     }
 }
 
@@ -503,6 +536,8 @@ struct Run {
     faulty_node: u16,
     faulty_acts: usize,
     forged: Vec<Forged>,
+    /// The spaces of the table chunks' cycle that map their frame.
+    mapped: BTreeSet<(u16, u32)>,
 }
 
 impl Run {
@@ -553,6 +588,7 @@ impl Run {
             faulty_node,
             faulty_acts: 0,
             forged: Vec::new(),
+            mapped: BTreeSet::new(),
         };
         say(format_args!(
             "drivers {:?}, faulty node {}",
@@ -614,6 +650,15 @@ impl Run {
 
     fn note(&mut self) {
         self.judge_forged();
+        let table = self.m.sys.canonical();
+        let fenced_held = (0..NODES).any(|x| {
+            matches!(self.m.state(x), MemberState::Fenced | MemberState::Unfenced)
+                && (0..NODES)
+                    .any(|y| y != x && table.uses[y as usize].values().any(|u| u.granter == x))
+        });
+        if fenced_held {
+            self.seen.tables.insert(9);
+        }
         if replayed().is_some() {
             self.print_members();
         }
@@ -1452,6 +1497,151 @@ impl Run {
         }
     }
 
+    /// The table chunks of D-154 among the recovery states, one step of a
+    /// cycle on a node: a table run taken (kind 2), a child table untyped
+    /// cut from it, an `aspace` or an `iospace` made on the child, a frame
+    /// mapped under it with the child as its table untyped, the space
+    /// destroyed with its mapping in place, the child deleted, the run
+    /// given to another node or destroyed. Any step may meet a death, a
+    /// seal or a fresh start of the node or of another.
+    fn tables(&mut self) {
+        // A node already in the cycle, else one drawn; up to four steps.
+        let started = (0..NODES).find(|&n| {
+            self.healthy(n)
+                && self.m.sys.has(n)
+                && self
+                    .m
+                    .sys
+                    .node(n)
+                    .object_at(self.m.t[n as usize], s(TBLOCK))
+                    .is_some()
+        });
+        let node = started.unwrap_or_else(|| self.rng.below(NODES as usize) as u16);
+        for _ in 0..4 {
+            if !self.healthy(node) || !self.m.sys.has(node) {
+                return;
+            }
+            self.table_step(node);
+        }
+    }
+
+    /// One step of the cycle of `tables` on `node`.
+    fn table_step(&mut self, node: u16) {
+        let t = self.m.t[node as usize];
+        let model = self.m.sys.node(node);
+        let has = |slot: u32| model.object_at(t, s(slot)).is_some();
+        let (block, child, frame) = (has(TBLOCK), has(TCHILD), has(TFRAME));
+        let spaces = [(TASPACE, has(TASPACE)), (TIOSPACE, has(TIOSPACE))];
+        let ut = super::untyped_slot(model, t);
+        let geometry = self.m.sys.canonical().geometry;
+        let done = |outcome: Option<Outcome>| outcome == Some(DONE);
+        if !block && !child {
+            let shift = geometry.chunk_shift();
+            let table = self.m.sys.canonical();
+            let mine = Ownership::free(Owner::Node(node)).raw();
+            let free = Ownership::free(Owner::Unclaimed).raw();
+            let chunk = table
+                .owners
+                .iter()
+                .position(|&w| w == mine)
+                .or_else(|| table.owners.iter().position(|&w| w == free));
+            if let Some(chunk) = chunk {
+                let place = (chunk as u64) << shift;
+                let take = super::pass22::take(
+                    dodos_abi::MEMORY_TAKE_TABLES,
+                    place,
+                    u64::from(shift),
+                    TBLOCK,
+                );
+                if done(self.call(node, take)) {
+                    self.seen.tables.insert(0);
+                }
+            }
+            return;
+        }
+        if !frame {
+            let _ = self.call(node, retype_from(ut, ObjectKind::Frame, 1, TFRAME));
+            return;
+        }
+        if block && !child {
+            // One time in four the run goes: given or destroyed.
+            if self.rng.below(4) == 0 {
+                let control = s(dodos_abi::START_SLOT_MEMORY_CONTROL);
+                let other = (node + 1 + self.rng.below(NODES as usize - 1) as u16) % NODES;
+                let release = match self.rng.below(2) {
+                    0 => Syscall::MemoryGive {
+                        control,
+                        untyped: s(TBLOCK),
+                        node: u64::from(other),
+                    },
+                    _ => Syscall::CapDelete(s(TBLOCK)),
+                };
+                if done(self.call(node, release)) {
+                    self.seen.tables.insert(8);
+                }
+            } else {
+                let page = geometry.page();
+                let cut = retype_from(TBLOCK, ObjectKind::Untyped, 8 * page, TCHILD);
+                if done(self.call(node, cut)) {
+                    self.seen.tables.insert(1);
+                }
+            }
+            return;
+        }
+        let live: Vec<u32> = spaces.iter().filter(|s| s.1).map(|s| s.0).collect();
+        let Some(&space) = live.first() else {
+            // No space: one made on the child, or one time in four the
+            // child deleted.
+            if self.rng.below(4) == 0 {
+                let _ = self.call(node, Syscall::CapDelete(s(TCHILD)));
+                return;
+            }
+            let (slot, kind, state) = match self.rng.below(2) {
+                0 => (TASPACE, ObjectKind::ASpace, 2),
+                _ => (TIOSPACE, ObjectKind::IoSpace, 3),
+            };
+            let make = retype_from(ut, kind, s(TCHILD).raw(), slot);
+            if done(self.call(node, make)) {
+                self.seen.tables.insert(state);
+                self.mapped.remove(&(node, slot));
+            }
+            return;
+        };
+        let io = space == TIOSPACE;
+        if !self.mapped.contains(&(node, space)) {
+            let map = crate::Map {
+                space: s(space),
+                frame: s(TFRAME),
+                untyped: s(TCHILD),
+                address: 0x4000_0000,
+                first: 0,
+                count: 1,
+                rights: Rights::READ.bits(),
+            };
+            let call = match io {
+                true => Syscall::IoSpaceMap(map),
+                false => Syscall::ASpaceMap(map),
+            };
+            if done(self.call(node, call)) {
+                self.mapped.insert((node, space));
+                self.seen.tables.insert(if io { 5 } else { 4 });
+            }
+            return;
+        }
+        // Destroyed with its mapping in place, in bounded steps.
+        for _ in 0..16 {
+            match self.call(node, Syscall::CapDelete(s(space))) {
+                Some(DONE) => {
+                    self.mapped.remove(&(node, space));
+                    self.seen.tables.insert(if io { 7 } else { 6 });
+                    return;
+                }
+                Some(Err(Error::Again)) => self.run_by(MS, 100_000),
+                _ => return,
+            }
+        }
+    }
+
     /// A faulty node's action alongside the normal exploration: it attempts
     /// gate writes that its own gate must refuse when counts or state forbid
     /// them, and writes forged messages, sender slots, credits and early
@@ -1518,6 +1708,18 @@ impl Run {
             let node = self.m.sys.node_mut(f);
             assert!(!node.gate_retype_page(ordinary, class));
             assert!(!node.gate_leaf_allowed(last) && !node.gate_anchor_allowed(last));
+            // The same toward the table run of `tables` it holds: no leaf,
+            // no anchor into it, and no give while a table lies in it.
+            let block = node.object_at(self.m.t[f as usize], s(TBLOCK));
+            if let Some(base) = block.and_then(|b| node.untypeds.get(&b)).map(|u| u.base) {
+                let chunk = base >> geometry.chunk_shift();
+                let first = base / geometry.page();
+                assert!(!node.gate_leaf_allowed(first) && !node.gate_anchor_allowed(first));
+                if node.table.gate_word(chunk).not_data() > 0 {
+                    assert!(!node.gate_give_chunk(chunk, to));
+                }
+                self.seen.tables.insert(10);
+            }
         }
         let table = self.m.sys.canonical();
         match self.faulty_acts % 10 {
@@ -1734,7 +1936,8 @@ impl Run {
             6 => {
                 let _ = self.hand();
             }
-            7 => self.memory(),
+            7 if self.rng.below(2) == 0 => self.memory(),
+            7 => self.tables(),
             8 => self.recover(MemberState::Sealed),
             _ => self.recover(MemberState::Dead),
         }
@@ -1857,6 +2060,9 @@ fn report(reach: &Reach) -> Vec<String> {
     let print = std::env::var("DODOS_COUNTS").is_ok();
     let excluded = |a: usize, b: usize| IMPOSSIBLE.contains(&(a, b));
     if print {
+        for (state, seeds) in TABLE_STATES.iter().zip(reach.tables) {
+            eprintln!("seeds reaching {state}: {seeds}");
+        }
         eprintln!("seeds ending in gap 21: {}", reach.gap_21);
         eprintln!("seeds that hand a failed unit: {}", reach.handed_failed);
         for e in 0..EVENTS {
@@ -1888,7 +2094,7 @@ fn report(reach: &Reach) -> Vec<String> {
 
 /// The combinations the 26 seeds of `verify` do not reach, measured
 /// (`DODOS_COUNTS=1` prints them).
-const MISSED_BY_26_SEEDS: usize = 474;
+const MISSED_BY_26_SEEDS: usize = 451;
 
 /// The run of `verify`: 26 seeds spread over the triples of drivers, so
 /// that each driver is among them; the check after every step and the
@@ -1908,6 +2114,9 @@ fn combined_recovery_states_between_nodes() {
         // measured, so a change that loses some fails here (the audit of
         // lot 8a, F1: the list was thrown away).
         assert!(reach.refused > 0, "no forged message seen refused");
+        for (state, &seeds) in TABLE_STATES.iter().zip(&reach.tables) {
+            assert!(seeds > 0, "the seeds never reach {state}");
+        }
         assert!(
             missing.len() <= MISSED_BY_26_SEEDS,
             "{} combinations never reached, {MISSED_BY_26_SEEDS} measured: {missing:#?}",
