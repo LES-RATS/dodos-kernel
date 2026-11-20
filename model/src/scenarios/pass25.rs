@@ -303,6 +303,14 @@ fn an_observation_of_a_generation_that_ended_never_accuses_the_next() {
         });
     });
     assert_eq!(m.sys.node(1).evidence(2), None);
+    // The same observation of the current generation is evidence stale
+    // (the audit of lot 8a, D-8a F23: a model that never accuses passed).
+    let current = m.sys.member(2).generation();
+    m.sys.edit_table(|t| {
+        let observation = t.beacons[1].observations.last_mut().expect("pushed");
+        observation.generation = current;
+    });
+    assert_eq!(m.sys.node(1).evidence(2), Some(dodos_abi::Evidence::Stale));
 }
 
 // The combined exploration's seed 7: a node started afresh built its state

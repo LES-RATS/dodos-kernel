@@ -544,6 +544,10 @@ fn deepseek12_m33_the_reclaim_of_a_second_death_of_one_slot_starts_afresh() {
     if let Some(reclaim) = m.sys.node(0).reclaims.get(&2) {
         assert_eq!(reclaim.generation, generation);
     }
+    // Node 0's next step comes after node 2 is dead, so node 0 never holds
+    // one here: the condition is the model's, not a weak test (the audit
+    // of lot 8a, D-8a F37, checked: no record of node 0 in any 100 µs of
+    // the 30 ms).
     m.run(30 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
 }

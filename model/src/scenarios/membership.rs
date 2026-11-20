@@ -272,6 +272,12 @@ fn node_start_is_judged_in_order() {
     // A live node: busy for both modes.
     m.no(0, call(0, 0, 0, 0, 2), Error::Busy);
     m.no(0, call(1, 0, 0, 0, 0), Error::Busy);
+    // Two faults at once, the first judged (the audit of lot 8a, F10): a
+    // bad mode and a bad image, a bad image and a mask 0, a plain argument
+    // before the state of a live node.
+    m.no(0, call(2, 2, 0, 0, 2), Error::Invalid);
+    m.no(0, call(0, 2, 0, 0, 0), Error::Invalid);
+    m.no(0, call(0, 0, 0, 1024, 2), Error::Invalid);
     // More cores than the image supports: unsupported, after the plain
     // arguments and before the state.
     let mut machine = Machine::example();
@@ -394,10 +400,9 @@ fn a_hung_node_is_accused_stale_by_the_sweep() {
     // move for STALE_NS.
     m.run(SWEEP_NS + STALE_NS + 10 * MS);
     let member = m.sys.member(1);
-    assert!(
-        matches!(member.state(), MemberState::Fenced | MemberState::Dead),
-        "{member:?}"
-    );
+    // Dead by then (the audit of lot 8a, D-8a F36: fenced was accepted
+    // too).
+    assert_eq!(member.state(), MemberState::Dead, "{member:?}");
     assert_eq!(member.evidence(), Evidence::Stale);
 }
 

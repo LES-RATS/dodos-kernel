@@ -159,6 +159,11 @@ impl Model {
         // message: Order of checks, step 2; "`send`, and `grant` when the
         // header lists frames", `node_send`, gap 9). `invalid` if it names the
         // caller's own node; `gone` if that node is not live.
+        // CONTRACT-GAP 56 (Node slots and core words, the mailbox: "the
+        // call is `gone` if the node is not live"): the contract does not
+        // say whether this is a check of the node capability or of the
+        // state. Read here as the capability's (judged with it, before the
+        // header and the doorbell), as before.
         let need = match message.caps.is_empty() {
             true => Rights::SEND,
             false => Rights::SEND.union(Rights::GRANT),
@@ -172,6 +177,10 @@ impl Model {
         if self.table.member(target).state() != MemberState::Live {
             return Err(Error::Gone);
         }
+        // The header, as for `send`: read right after the capability the
+        // call acts on, before any other capability argument (Order of
+        // checks, step 2; pass 35: it was read after the doorbell).
+        message.check_header(self.has_page(thread))?;
         // The doorbell, if not 0: slot, kind notify, `send`; a notify of the
         // caller's node.
         let bell = match doorbell.is_none() {
@@ -182,8 +191,6 @@ impl Model {
                 Some((object, if badge == 0 { 1 } else { badge }))
             }
         };
-        // The header and the message as for `send`.
-        message.check_header(self.has_page(thread))?;
         // The list: frames of the caller's own node, each derived with its
         // rights; a move, another kind or a remote frame is `invalid`.
         let mut listed: Vec<(CapId, Rights)> = Vec::new();

@@ -247,7 +247,8 @@ fn survives_its_next_suspend(m: &mut S, arch: Arch, first: bool) {
     assert!(m.step_until(|m| asleep(m, 2)), "core 2 never sleeps");
     m.run(5 * MS);
     assert_eq!(m.state(1), MemberState::Live);
-    assert_ne!(m.sys.hardware(2), Hardware::Off);
+    // (The audit of lot 8a, D-8a F30: any state but off passed.)
+    assert_eq!(m.sys.hardware(2), Hardware::Running);
     let woken = m.sys.node(1).woken(thread);
     assert!(woken.is_some_and(|o| o.is_ok()), "the thread never woke");
 }
@@ -368,11 +369,13 @@ fn the_riscv_cooperative_fence_sends_its_interrupt_again_each_round() {
     };
     m.ok(1, idle);
     signal_lost_on_the_way_to_sleep(&mut m);
-    let took = fence_ends(&mut m, 1);
-    assert!(matches!(
-        m.state(1),
-        MemberState::Fenced | MemberState::Dead
-    ));
+    // Seen event by event: the event that confirms the last core finds the
+    // barrier held and writes dead (the audit of lot 8a, D-8a F29: fenced
+    // or dead passed).
+    let start = m.sys.now();
+    assert!(m.step_until(|m| m.state(1) != MemberState::Fencing));
+    let took = m.sys.now() - start;
+    assert_eq!(m.state(1), MemberState::Dead);
     assert!(
         took >= 11_200_000,
         "confirmed before the second round: {took}"
@@ -664,6 +667,9 @@ fn a_closed_observation_frees_its_slot() {
         "node 2 still live after {} ns",
         m.sys.now() - start
     );
+    // Accused with evidence stale (the audit of lot 8a, D-8a F31: any
+    // state but live passed).
+    assert_eq!(m.sys.member(2).evidence(), dodos_abi::Evidence::Stale);
 }
 
 // D-146, item 9: messages held for a node that starts fresh are work of
@@ -1026,14 +1032,8 @@ fn a_faulty_kernel_cannot_get_its_fence_confirmed_while_it_runs() {
             .iter()
             .any(|&(_, a)| a == crate::nodes::HwAction::Stop { core: 1 })
     };
-    for _ in 0..10_000 {
-        if stop_in_flight(&m) {
-            break;
-        }
-        let event = *m.sys.events().first().expect("an event");
-        m.sys.fire(event);
-    }
-    assert!(stop_in_flight(&m));
+    // (The audit of lot 8a, D-8a F32: no check between these events.)
+    assert!(m.step_until(stop_in_flight));
     let request = m.sys.park_request(1);
     // The faulty kernel's write and its gate call.
     m.sys.node_mut(1).table.core_beacons[1].parked = request;
@@ -1262,10 +1262,15 @@ fn a_faulty_holders_early_acknowledgement_lets_no_device_reach_reused_memory() {
 // it and has not mapped it, so the chunk's map count is 0. Node 0's
 // kernel, faulty, ignores its own derivation list and asks its gate to give
 // the chunk to node 1, then to turn the granted page into a page table. The
-// gate refuses both, on the chunk's grant count and on the anchor that
-// covers the page; then node 2 maps the frame, and its mapping reaches only
-// memory node 0 still owns. (With the map count alone the give passed, and
-// node 2's mapping reached node 1's memory.)
+// gate refuses the give on the chunk's grant count; then node 2 maps the
+// frame, and its mapping reaches only memory node 0 still owns. (With the
+// map count alone the give passed, and node 2's mapping reached node 1's
+// memory.) Since D-154 the retype is refused on the chunk's table bit,
+// before any grant is read: a page table lies only in a table chunk, and
+// no grant's anchor targets one (`gate_anchor_allowed`, refused in
+// `combinations.rs` and `pass31.rs`), so D-154 subsumes the anchor rule of
+// D-148 item 2 and this assertion is the table-bit rule's (the audit of lot
+// 8a, F3).
 #[test]
 fn a_faulty_kernel_cannot_give_or_retype_granted_memory() {
     use super::pass24::{GOT, X, Y, granted, io_map};
@@ -1515,7 +1520,8 @@ fn the_handler_resets_dr6_at_cpl3_as_well() {
 const GSI: u32 = 5;
 
 /// The period of the recovery reserve.
-const RECOVERY_PERIOD: u64 = 10 * MS;
+// (The audit of lot 8a, D-8a F28: the value was written in.)
+const RECOVERY_PERIOD: u64 = dodos_abi::RECOVERY_PERIOD_NS;
 
 fn claimed_on(nodes: usize, n: u16, level: bool) -> S {
     let groups: Vec<Vec<usize>> = (0..nodes).map(|c| vec![c]).collect();

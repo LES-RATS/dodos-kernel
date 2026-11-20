@@ -126,12 +126,14 @@ fn one_interrupt_never_serves_more_than_sixteen_entries() {
         served <= dodos_abi::RING_USER_STEP,
         "{served} entries in one interrupt"
     );
+    // Three messages of five entries: the fourth would carry the step to
+    // 20 (the audit of lot 8a, D-8a F12: serving none passed).
+    assert_eq!(served, 15);
 }
 
 #[track_caller]
 fn refused(machine: &Machine) -> bool {
     let refusal = System::boot(machine).err();
-    eprintln!("{refusal:?}");
     refusal == Some(crate::boot::Refusal::MachineValues)
 }
 
@@ -170,11 +172,16 @@ fn two_crash_areas_closer_than_their_length_are_refused() {
     assert_eq!(crash_len, machine.crash_len());
     // On 16 KB and 32 KB pages a chunk holds 32 debug areas: two areas on
     // distinct chunk boundaries cannot overlap there.
-    if crash_len == chunk {
-        return;
-    }
     // Apart by their length (as `machine` places them), the machine boots.
     assert!(System::boot(&machine).is_ok());
+    if crash_len == chunk {
+        // One chunk apart: their length, accepted (the audit of lot 8a,
+        // D-8a F11: nothing was asserted on these pages).
+        let (crash, _) = machine.crash;
+        machine.crash = (crash, Some(crash + chunk));
+        assert!(System::boot(&machine).is_ok());
+        return;
+    }
     let (crash, _) = machine.crash;
     machine.crash = (crash, Some(crash + chunk));
     assert!(refused(&machine));
@@ -269,6 +276,12 @@ fn a_frame_of_a_reserve_chunk_the_node_holds_is_granted() {
     );
     m.ok(0, retype_from(160, ObjectKind::Frame, 1, OBJ));
     assert_eq!(m.call(0, send_obj(1)), WAITS);
+    // The anchor is a child of the frame (the audit of lot 8a, D-8a F14:
+    // only the outcome was asserted).
+    let grant = m.sys.node(0).grant_entries()[0].0;
+    let anchor = m.sys.canonical().grants[0][&grant].anchor;
+    let frame = m.sys.node(0).object_at(m.t[0], s(OBJ)).expect("the frame");
+    assert_eq!(anchor.frame, m.sys.node(0).frames[&frame]);
 }
 
 // Finding 13 (own-01). The serial is 30 bits: an entry freed at the
@@ -388,6 +401,9 @@ fn a_report_asked_from_a_key_takes_the_item_of_that_key() {
         }
     });
     assert!(edited);
+    // No refusal: the item is taken (the audit's D-8a F13 read the
+    // comparison as vacuous at a baseline of 0, which is the point).
+    assert_eq!(baseline, 0);
     assert_eq!(report_refusals(&m, 2), baseline);
 }
 
@@ -446,7 +462,15 @@ fn a_resume_with_more_waiting_entries_than_a_step_takes_them_in_several_steps() 
         m.sys.inject_raw(1, 0, true, header, 1);
     }
     m.ok(1, resume(0));
+    // More than one step: once some entries are consumed, some still wait
+    // (the audit of lot 8a, D-8a F10: a drain in one step passed).
+    let waiting = |m: &S| {
+        let table = m.sys.canonical();
+        table.rings[1][0].user.produced - table.beacons[0].consumed[1].1
+    };
+    let mut partial = false;
     for _ in 0..100_000 {
+        partial |= (1..60).contains(&waiting(&m));
         if m.state(0) == MemberState::Live {
             break;
         }
@@ -459,6 +483,7 @@ fn a_resume_with_more_waiting_entries_than_a_step_takes_them_in_several_steps() 
         }
     }
     assert_eq!(m.state(0), MemberState::Live);
+    assert!(partial, "the entries were taken in one step");
     let table = m.sys.canonical();
     assert_eq!(
         table.beacons[0].consumed[1].1,

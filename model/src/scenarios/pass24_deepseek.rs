@@ -116,7 +116,10 @@ fn until_done(m: &mut S, node: u16, call: Syscall) {
         match m.call(node, call.clone()) {
             DONE => return,
             WAITS => m.run(30 * MS),
-            _ => m.run(10 * MS),
+            // A removal's step: time passes; any other answer fails the
+            // test (the audit of lot 8a, D-8a F20: every error was retried).
+            Err(Error::Again) => m.run(10 * MS),
+            other => panic!("{call:?}: {other:?}"),
         }
     }
     panic!("{call:?} never done");

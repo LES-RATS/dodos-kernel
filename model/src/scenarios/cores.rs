@@ -409,7 +409,9 @@ fn a_request_not_acknowledged_within_core_answer_ns_makes_the_node_accuse_itself
     // which loaded the space's tag, and is never acknowledged.
     sys.sys.hang(1, true);
     assert_eq!(sys.call(0, Syscall::ASpaceUnmap(s(FRAME))), WAITS);
-    sys.run(9 * MS);
+    // Live until `CORE_ANSWER_NS` has passed (the audit of lot 8a, D-8a
+    // F16: the deadline was written in as 10 ms).
+    sys.run(dodos_abi::CORE_ANSWER_NS - MS);
     assert_eq!(sys.state(0), MemberState::Live);
     sys.run(2 * MS);
     // The core that started the request sees it at the due event it armed:
@@ -496,12 +498,9 @@ fn a_node_of_one_core_pays_no_cost_of_several_cores() {
     k.ok(k.retype(ObjectKind::Frame, 1, FRAME));
     k.ok(map(FRAME, AT, rw()));
     k.ok(Syscall::ASpaceUnmap(s(FRAME)));
-    assert!(
-        k.m.locks
-            .steps
-            .iter()
-            .all(|s| !matches!(s, Step::Lock(_) | Step::Unlock(_) | Step::Pay(_)))
-    );
+    // Nothing is recorded at all (the audit of lot 8a, D-8a F15: `all` of
+    // no lock step held on an empty list, which is what width 1 writes).
+    assert_eq!(k.m.locks.steps, Vec::new());
 }
 
 /// Each event's own trace, read at its end: the node lock from entry to

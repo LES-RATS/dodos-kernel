@@ -102,32 +102,41 @@ fn a_node_that_holds_the_role_serves_its_own_request_with_no_message() {
 #[test]
 fn a_request_answered_elsewhere_is_sent_again_with_the_epoch_of_the_new_holder() {
     let mut m = three();
-    // Node 1 holds the units; node 0 asks; node 1 hands the IOMMU role to
-    // node 2 meanwhile: the request carries the old epoch.
+    // Node 1 holds the units and begins to hand the IOMMU role to node 2;
+    // node 0 asks meanwhile, with the epoch it reads: node 1 answers
+    // *elsewhere*, and the request goes again once the word reads held by
+    // node 2 with a new epoch.
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
     let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
     m.ok(0, iospace);
     let epoch = m.sys.role(IOMMU_ROLE).epoch();
-    let call = attach(&m, 0, IOSPACE, DEVICE);
-    assert_eq!(m.call(0, call), WAITS);
     let hand = Syscall::RoleHand {
         role: role_slot(&m, 1, IOMMU_ROLE),
         node: node_cap(2),
     };
-    let outcome = m.call(1, hand);
-    assert!(outcome == WAITS || matches!(outcome, Ok(Output::Epoch(_))));
+    assert_eq!(m.call(1, hand), WAITS);
+    let call = attach(&m, 0, IOSPACE, DEVICE);
+    assert_eq!(m.call(0, call), WAITS);
+    let entry = |m: &S| m.sys.node(0).unit_requests.iter().flatten().next().cloned();
+    assert_eq!(
+        entry(&m).map(|e| (e.epoch, e.elsewhere)),
+        Some((epoch, false))
+    );
+    // Answered *elsewhere* by node 1, which hands the role (the audit of
+    // lot 8a, D-8a F07: the request was served before the hand-over, and
+    // no epoch was read).
+    assert!(m.step_until(|m| entry(m).is_some_and(|e| e.elsewhere)));
+    assert_eq!(entry(&m).map(|e| e.epoch), Some(epoch));
+    // Sent again with the epoch of the new holder.
+    assert!(m.step_until(|m| entry(m).is_none_or(|e| !e.elsewhere)));
+    let sent = entry(&m).expect("the request still waits");
+    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
+    assert_eq!(sent.epoch, m.sys.role(IOMMU_ROLE).epoch());
+    assert_ne!(sent.epoch, epoch);
     m.run(40 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
     assert_ne!(m.sys.role(IOMMU_ROLE).epoch(), epoch);
-    // The request ended done, served by whichever holder had the role
-    // with the epoch it carried.
     assert_eq!(m.woken(0), Some(&DONE));
-    assert!(m.sys.node(0).unit_requests.iter().all(Option::is_none));
-    assert!(
-        m.sys.canonical().units[&IOMMU_ROLE]
-            .entries
-            .contains_key(&(DEVICE as u16))
-    );
 }
 
 #[test]
@@ -255,7 +264,6 @@ fn claim_msi() -> Syscall {
     }
 }
 
-/// The operations submitted to the unit of a role so far.
 #[test]
 fn the_claim_of_an_msi_asks_each_remapping_unit_of_its_segment_one_after_another() {
     let mut m = two_units();
@@ -390,7 +398,8 @@ fn role_hand_of_a_unit_role_is_judged_in_order() {
         },
         Error::Invalid,
     );
-    // Not held by the caller's node.
+    // Not held by the caller's node, its target the caller's node: the
+    // first state check, `busy`, before the success with no change.
     let theirs = role_slot(&m, 0, IOMMU_ROLE);
     m.no(
         0,
@@ -399,6 +408,16 @@ fn role_hand_of_a_unit_role_is_judged_in_order() {
             node: node_cap(0),
         },
         Error::Busy,
+    );
+    // Node 0 and not held by the caller's node: the plain check first (the
+    // audit of lot 8a, F10: no case had two faults).
+    m.no(
+        0,
+        Syscall::RoleHand {
+            role: theirs,
+            node: SlotAddr::NONE,
+        },
+        Error::Invalid,
     );
     // The target is the caller's node: success with no change.
     let epoch = m.sys.role(IOMMU_ROLE).epoch();
@@ -455,7 +474,8 @@ fn a_unit_role_is_handed_in_steps_handing_then_held_by_the_target_two_epochs_lat
     // word is handing (step 4), which the target turns into held (step 5).
     // Seen event by event: sampled every 100 µs, handing was never seen
     // (the final review's E33).
-    assert!(outcome == WAITS || outcome == DONE, "{outcome:?}");
+    // (The audit of lot 8a, D-8a F36: `DONE` was accepted too.)
+    assert_eq!(outcome, WAITS);
     assert!(m.step_until(|m| m.sys.role(IOMMU_ROLE).state() == RoleState::Handing));
     let word = m.sys.role(IOMMU_ROLE);
     assert_eq!(
@@ -474,13 +494,16 @@ fn a_handing_word_whose_target_dies_is_taken_over_by_the_targets_successor() {
     let unit = role_slot(&m, 1, IOMMU_ROLE);
     // The target hangs: it never completes step 5.
     m.sys.hang(2, true);
-    let _ = m.call(
+    // The caller waits while the queue drains (the audit of lot 8a, D-8a
+    // F18: the outcome was dropped).
+    let outcome = m.call(
         1,
         Syscall::RoleHand {
             role: unit,
             node: node_cap(2),
         },
     );
+    assert_eq!(outcome, WAITS);
     for _ in 0..200 {
         if m.sys.role(IOMMU_ROLE).state() == RoleState::Handing {
             break;

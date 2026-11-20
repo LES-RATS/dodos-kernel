@@ -346,6 +346,9 @@ fn f10_a_give_from_a_core_other_than_the_first_asks_every_other_core() {
 
 #[test]
 fn f11_a_node_has_sixteen_request_credits_toward_each_peer() {
+    // The contract's number, beside the constant (the audit of lot 8a,
+    // D-8a F33: lowering the constant kept the test green).
+    assert_eq!(dodos_abi::REQUESTS_PER_PEER, 16);
     let mut peer = crate::rings::Peer::new();
     for index in 0..dodos_abi::REQUESTS_PER_PEER {
         let free = peer.free(false).expect("a request credit");
@@ -409,6 +412,7 @@ fn f12_at_most_32_pending_signals_are_sent_in_one_event() {
     assert_eq!(m.sys.check(), Ok(()));
     let written = m.sys.node(1).table.rings[1][0].user.produced - before;
     assert_eq!(written, dodos_abi::PENDING_STEP as u64);
+    assert_eq!(dodos_abi::PENDING_STEP, 32);
 }
 
 // F13: observations are "at most 8 open per node" (Detection).
@@ -423,6 +427,7 @@ fn f13_a_node_opens_at_most_eight_observations() {
         most = most.max(m.sys.canonical().beacons[0].observations.len());
     }
     assert_eq!(most, dodos_abi::OBSERVATIONS_MAX);
+    assert_eq!(dodos_abi::OBSERVATIONS_MAX, 8);
 }
 
 // F14: a user ring is served "at most 16 entries per ring per interrupt"
@@ -452,4 +457,5 @@ fn f14_one_interrupt_serves_at_most_sixteen_entries_of_a_user_ring() {
     m.sys.fire(crate::system::Event::Ipi { node: 0, core: 0 });
     let after = m.sys.canonical().beacons[0].consumed[1].1;
     assert_eq!(after - before, dodos_abi::RING_USER_STEP);
+    assert_eq!(dodos_abi::RING_USER_STEP, 16);
 }

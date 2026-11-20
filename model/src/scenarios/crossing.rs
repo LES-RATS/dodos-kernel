@@ -171,6 +171,36 @@ fn node_send_is_judged_in_order() {
         doorbell: SlotAddr::NONE,
     };
     m.no(0, derive, Error::Denied);
+    // Two faults at once, each case judged by the first (the audit of lot
+    // 8a, F10: each case above has one). `grant`, judged with the node and
+    // the header, before a move in the list.
+    let moved = Syscall::NodeSend {
+        node: s(130),
+        message: msg(7, vec![Transfer::Move(s(OBJ))]),
+        doorbell: SlotAddr::NONE,
+    };
+    m.no(0, moved, Error::Denied);
+    // The header, read right after the capability the call acts on, before
+    // the doorbell, another capability argument (Order of checks, step 2):
+    // a flag bit other than `add_marks` with a doorbell without `send`.
+    m.ok(
+        0,
+        Syscall::CapDerive {
+            source: s(BELL),
+            destination: s(131),
+            rights: Rights::READ.bits(),
+            badge: 0,
+        },
+    );
+    let mut flagged = msg(7, vec![]);
+    flagged.flags = 1 << 5;
+    let doorbell = |message| Syscall::NodeSend {
+        node: node_cap(1),
+        message,
+        doorbell: s(131),
+    };
+    m.no(0, doorbell(msg(7, vec![])), Error::Denied);
+    m.no(0, doorbell(flagged), Error::Invalid);
     // A node that is not live: gone.
     m.supervisor(0, m.t[0]);
     m.ok(
@@ -182,6 +212,9 @@ fn node_send_is_judged_in_order() {
         },
     );
     m.no(0, send(1, vec![], SlotAddr::NONE), Error::Gone);
+    // CONTRACT-GAP 56: whether "`gone` if the node is not live" is a check
+    // of the node capability or of the state is not said, so no case here
+    // puts it beside a fault of a later argument.
 }
 
 #[test]

@@ -129,7 +129,10 @@ pub(super) fn until_done(m: &mut S, node: u16, call: Syscall) {
         match m.call(node, call.clone()) {
             DONE => return,
             WAITS => m.run(30 * MS),
-            _ => m.run(10 * MS),
+            // A removal's step: time passes; any other answer fails the
+            // test (the audit of lot 8a, D-8a F20: every error was retried).
+            Err(Error::Again) => m.run(10 * MS),
+            other => panic!("{call:?}: {other:?}"),
         }
     }
     panic!("{call:?} never done");
@@ -641,9 +644,20 @@ fn kept_with_release_pending() -> Granted {
 #[test]
 fn a_pending_release_sent_at_a_count_above_0_keeps_the_use_entry() {
     let mut g = kept_with_release_pending();
+    let before = written_to_x(&g);
     g.m.run(10 * MS);
     kept_without_root(&g);
     assert!(!g.m.sys.canonical().uses[Y as usize][&g.use_index].release_pending);
+    // Sent: one message more on Y's kernel ring toward X (the audit of lot
+    // 8a, D-8a F21: sent and dropped ended alike).
+    assert_eq!(written_to_x(&g), before + 1);
+}
+
+/// The entries Y wrote on its kernel ring toward X.
+fn written_to_x(g: &Granted) -> u64 {
+    g.m.sys.canonical().rings[Y as usize][X as usize]
+        .kernel
+        .produced
 }
 
 // R0 drops the pending release of a granting generation that is over, and
@@ -651,10 +665,13 @@ fn a_pending_release_sent_at_a_count_above_0_keeps_the_use_entry() {
 #[test]
 fn r0_drops_a_pending_release_at_a_count_above_0_and_keeps_the_use_entry() {
     let mut g = kept_with_release_pending();
+    let before = written_to_x(&g);
     g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(10 * MS);
     kept_without_root(&g);
+    // Dropped: nothing written toward X.
+    assert_eq!(written_to_x(&g), before);
     assert!(!g.m.sys.canonical().uses[Y as usize][&g.use_index].release_pending);
 }
 
@@ -668,8 +685,21 @@ fn a_revoke_in_flight_when_the_granting_node_is_killed_leaves_a_credit_no_check_
     g.m.ok(Y, map);
     g.m.sys.break_unit(IOMMU_ROLE);
     assert_eq!(g.m.call(X, Syscall::CapRevoke(s(OBJ))), WAITS);
+    // The `Revoke` holds a credit of X toward Y (the audit of lot 8a,
+    // D-8a F06: nothing showed it).
+    let credits = |g: &Granted| {
+        g.m.sys.node(X).peers[Y as usize]
+            .credits
+            .iter()
+            .flatten()
+            .count()
+    };
+    assert!(credits(&g) > 0, "no credit in use");
     g.m.supervisor(THIRD, g.m.t[THIRD as usize]);
     g.m.ok(THIRD, super::pass17::kill(X));
     g.m.run(50 * MS);
     assert_ne!(g.m.state(X), MemberState::Live);
+    // Y's R0 dropped the `Revoke` unanswered, and the check, run after
+    // every step, never judged the dead node's credit.
+    assert_eq!(g.m.sys.check(), Ok(()));
 }

@@ -528,7 +528,8 @@ fn a_report_carries_a_lines_mask_and_the_new_holder_writes_an_idle_line_masked()
     };
     // The claim is left in flight on purpose: the holder dies under it.
     let outcome = m.call(a, claim);
-    assert!(outcome == WAITS || outcome == DONE, "{outcome:?}");
+    // (The audit of lot 8a, D-8a F36: `DONE` was accepted too.)
+    assert_eq!(outcome, WAITS);
     m.run(2 * MS);
     m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, super::pass17::kill(holder));
@@ -610,7 +611,9 @@ fn the_removal_of_an_msi_with_remapping_is_a_request_that_clears_its_entry() {
         destination: s(211),
     };
     let outcome = m.call(0, again);
-    assert!(outcome == WAITS || matches!(outcome, Ok(Output::Msi { .. })));
+    // The MSI waits for its unit requests (the audit of lot 8a, D-8a F36:
+    // an immediate answer was accepted too).
+    assert_eq!(outcome, WAITS);
 }
 
 #[test]

@@ -138,9 +138,12 @@ fn a_send_written_on_a_third_nodes_ring_in_another_nodes_name_is_refused() {
         words: vec![42],
     };
     let send = forged(&m, NodeMessage::Send, 1, 0, Some((16, 1)), body);
+    let before = m.sys.node(0).refused.0;
     m.sys.inject(2, 0, send);
     m.run(20 * MS);
     assert!(m.woken(0).is_none(), "the forged send was delivered");
+    // Refused by the sender rule, not lost (the audit of lot 8a, F9).
+    assert_eq!(m.sys.node(0).refused.0, before + 1);
 }
 
 #[test]
@@ -209,11 +212,8 @@ fn a_revoke_step_reporting_the_root_removed_frees_nothing_while_the_holder_count
     // goes to node 1, whose answer node 1's faulty kernel rewrites.
     let revoke = Syscall::CapRevoke(s(OBJ));
     assert_eq!(m.call(0, revoke), WAITS);
-    m.sys.edit_table(|t| {
-        // Node 1 has not consumed the `Revoke` yet: it answers in its own
-        // ring that the root is removed, its leaf still counted.
-        let _ = t;
-    });
+    // Node 1 has not consumed the `Revoke` yet: it answers in its own ring
+    // that the root is removed, its leaf still counted.
     let credit = m.sys.node(0).peers[1]
         .credits
         .iter()
@@ -302,9 +302,11 @@ fn a_send_whose_grant_states_other_rights_than_the_anchor_is_refused() {
         }
     });
     // The faulty sender loses its credit, so the machine's check is not
-    // asked: the receiver's refusal is.
+    // asked: the receiver's refusal is (counted: the audit of lot 8a, F9).
+    let before = m.sys.node(1).refused.0;
     m.sys.settle(200);
     assert!(m.woken(1).is_none(), "the send was delivered");
+    assert_eq!(m.sys.node(1).refused.0, before + 1);
 }
 
 #[test]
@@ -314,8 +316,10 @@ fn a_send_whose_anchor_has_depth_0_is_refused() {
     m.sys.edit_table(move |t| {
         t.grants[0].get_mut(&grant).expect("the entry").anchor.depth = 0;
     });
+    let before = m.sys.node(1).refused.0;
     m.sys.settle(200);
     assert!(m.woken(1).is_none(), "the send was delivered");
+    assert_eq!(m.sys.node(1).refused.0, before + 1);
 }
 
 #[test]
@@ -1469,20 +1473,13 @@ fn a_level_line_on_a_node_without_the_ioapics_role_needs_a_directed_end_of_inter
         level_line_claim(Arch::X86_64, false),
         Err(Error::Unsupported)
     );
-    assert_ne!(
-        level_line_claim(Arch::X86_64, true),
-        Err(Error::Unsupported)
-    );
+    // Claimed: the claim waits for its unit requests (the audit of lot 8a,
+    // F9: any outcome but `unsupported` passed).
+    assert_eq!(level_line_claim(Arch::X86_64, true), WAITS);
     // RISC-V: any node may claim a level line, its gate writing the
     // APLIC's registers by number (D-146; `unsupported` before).
-    assert_ne!(
-        level_line_claim(Arch::Riscv64, true),
-        Err(Error::Unsupported)
-    );
-    assert_ne!(
-        level_line_claim(Arch::Aarch64, false),
-        Err(Error::Unsupported)
-    );
+    assert_eq!(level_line_claim(Arch::Riscv64, true), WAITS);
+    assert_eq!(level_line_claim(Arch::Aarch64, false), WAITS);
 }
 
 #[test]

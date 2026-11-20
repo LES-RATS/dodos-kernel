@@ -135,10 +135,11 @@ fn hydrogen_2_a_thread_that_waits_for_an_answer_while_its_node_seals_gets_it_at_
     assert_eq!(m.call(1, send), WAITS);
     m.ok(0, seal(1));
     m.run(5 * MS);
-    if m.state(1) == MemberState::Sealed {
-        m.ok(0, resume(1));
-        m.run(5 * MS);
-    }
+    // The seal completes before the answer is consumed (the audit of lot
+    // 8a, D-8a F05: the resume ran only if it had).
+    assert_eq!(m.state(1), MemberState::Sealed);
+    m.ok(0, resume(1));
+    m.run(5 * MS);
     assert_eq!(m.state(1), MemberState::Live);
     // The answer was consumed, before the seal or at the resume: the wait
     // ended with it, never with `gone`.
@@ -337,7 +338,9 @@ fn hydrogen_n5_a_revoke_step_that_needs_a_units_invalidation_completes_its_recor
         }
         // The step returned `again`: the caller repeats, and the next
         // `Revoke` goes on once the record is complete.
-        let _ = m.call(0, Syscall::CapRevoke(s(101)));
+        // (The audit of lot 8a, D-8a F19: the outcome was dropped.)
+        let outcome = m.call(0, Syscall::CapRevoke(s(101)));
+        assert!(outcome == DONE || outcome == WAITS || outcome == Err(Error::Again));
     }
     assert!(unmapping, "the step left the record unmapping");
     m.run(30 * MS);

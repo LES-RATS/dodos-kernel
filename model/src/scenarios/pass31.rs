@@ -799,7 +799,8 @@ fn node_send_of_a_frame_over_a_table_chunk_is_busy() {
         doorbell: SlotAddr::NONE,
     };
     // Over its ordinary block, the gate's reading refuses nothing.
-    assert_ne!(k.m.clone().apply(k.t, send.clone()), Err(Error::Busy));
+    // (The audit of lot 8a, D-8a F38: any outcome but `busy` passed.)
+    assert_eq!(k.m.clone().apply(k.t, send.clone()), Ok(Output::Waits));
     let frame = k.m.object_at(k.t, s(211)).expect("a frame");
     let (_, end) = k.m.table_floor(0)[0];
     crate::live(&mut k.m.frames, frame).base = end - k.m.geometry().page();
