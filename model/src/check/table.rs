@@ -303,6 +303,9 @@ impl Model {
         // One pass over the words: 55 on each free word; the counts of the
         // words this node holds (57) and of the words none (56), judged
         // below against the kernel's runs and the words of start-up.
+        // The leaves an unmapping record or a failed unit still counts keep
+        // a chunk held too (G4, G5, D-131; audit lot 7).
+        let kept = self.leaves_by_target().0;
         let (mut held, mut zero) = (0, 0);
         for (chunk, &raw) in table.owners.iter().enumerate() {
             zero += usize::from(raw == 0);
@@ -312,7 +315,7 @@ impl Model {
                 let chunk = chunk as u64;
                 ensure(!block_chunks.contains(&chunk), "55: block on a free word")?;
                 ensure(
-                    leaves[chunk as usize] == 0,
+                    leaves[chunk as usize] == 0 && kept[chunk as usize] == 0,
                     "55: translation to a free word",
                 )?;
             }
@@ -455,6 +458,14 @@ impl Model {
             let counted = granted.get(&entry).copied().unwrap_or(0) + frozen;
             ensure(used.leaves == counted, "58: leaves of a use entry")?;
         }
+        // And every leaf under a grant is under a use entry of this node
+        // (audit lot 7: a missing entry counted nothing and was not seen).
+        ensure(
+            granted
+                .keys()
+                .all(|entry| table.uses[node as usize].contains_key(entry)),
+            "58: leaves under a use entry that does not exist",
+        )?;
         // 59: the table pages, with their classes: the root of a space of
         // the class of its top level (an iospace's, iospace table), each
         // hooked table of the class of its level, a free one of a table
@@ -526,6 +537,18 @@ impl Model {
         // (The ITS word, D-152; audit lot 7: the check took every page for
         // unpinned).
         for (id, &(first, pages)) in &self.its_tables {
+            // 2^k pages, k at most 4, inside a table untyped (Objects,
+            // `its_table`; audit lot 7).
+            ensure(
+                pages.is_power_of_two() && pages <= 1 << dodos_abi::ITS_TABLE_K_MAX,
+                "59: an its_table of a size no retype makes",
+            )?;
+            let (start, end) = (first * page, (first + pages) * page);
+            let inside = self
+                .untypeds
+                .values()
+                .any(|u| u.table && u.base <= start && end <= u.base + u.bytes);
+            ensure(inside, "59: an its_table outside every table untyped")?;
             let class = dodos_abi::PageClass::its_table(self.its_pinned(*id));
             for at in first..first + pages {
                 tables.insert(at, Some(class));

@@ -119,6 +119,12 @@ fn a_core_silent_across_a_long_stop_is_stale_only_on_the_clock_less_the_stopped_
 /// entry in node 0's name for a device node 0 does not report (node 0
 /// live, its real device beside it) is cleared by the new holder's
 /// rebuild; the reported one stays. No test held the clearing.
+///
+/// Pass 34 (audit lot 7, G9): the stray entry is one the gate allows, its
+/// identifier word taken by node 0 and its attach word *attached* beside
+/// the real device's root, whose class counts both; node 0's kernel, taken for faulty, does not
+/// report it (its own rules, 88, are not judged then). The test planted an
+/// entry whose identifier word node 0 did not hold, which G9 forbids.
 #[test]
 fn the_rebuild_clears_an_entry_of_a_live_node_that_its_report_does_not_claim() {
     use super::units::{DEVICE, IOMMU_ROLE, attached, three};
@@ -126,7 +132,15 @@ fn the_rebuild_clears_an_entry_of_a_live_node_that_its_report_does_not_claim() {
     attached(&mut m, 0);
     let generation = m.sys.member(0).generation();
     let stray = 0x77;
+    m.sys.make_faulty(0);
     m.sys.edit_table(|t| {
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(0), generation);
+        t.identifiers.insert(u32::from(stray), taken.raw());
+        let word = t.attach_word(DEVICE as u32);
+        t.attach.insert(u32::from(stray), word.raw());
+        // The root's class counts both words (40 + n, D-137).
+        let root = word.root() / t.geometry.page();
+        t.set_class(root, dodos_abi::PageClass::iospace_root(2));
         let unit = t.units.entry(IOMMU_ROLE).or_default();
         unit.entries.insert(stray, (0, generation));
     });

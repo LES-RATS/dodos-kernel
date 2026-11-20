@@ -97,9 +97,18 @@ impl System {
                             matches!(w.owner(), dodos_abi::Owner::Reserve(j)
                                 if table.holds_reserve(granter as u16, j))
                         });
+                    // A sealing or sealed granter still holds its memory
+                    // (audit lot 7: every state but live was exempt); an
+                    // accused or dead one is being reclaimed, and a
+                    // starting one's grants of an earlier generation stay
+                    // pinned under a failed unit's count (D-142).
+                    let exempt = !matches!(
+                        table.member(granter as u16).state(),
+                        MemberState::Live | MemberState::Sealing | MemberState::Sealed
+                    );
                     let kept = table.holds_page(at.max(entry.anchor.frame.base), granter as u16, g)
                         || reserve
-                        || table.member(granter as u16).state() != MemberState::Live;
+                        || exempt;
                     ensure(kept, "G5: granted memory owned by another than its granter")?;
                 }
                 if let Some(index) = device {
@@ -362,11 +371,35 @@ impl System {
                 ensure(held, "G6: a grant freed while its holder translates to it")?;
             }
             for (&grant, entry) in &table.grants[slot as usize] {
+                let grantee = table.members.get(entry.grantee as usize);
+                let grantee = *grantee.ok_or("G6: a grant entry names a grantee past the table")?;
+                // R3: a grant is pinned for a grantee accused or over, or
+                // for good under a count a failed unit keeps (D-142); never
+                // for a grantee that runs (audit lot 7: LEAK passed over
+                // every pinned entry).
+                if entry.state == GrantState::Pinned {
+                    let accused = grantee.generation() != entry.generation
+                        || matches!(
+                            grantee.state(),
+                            MemberState::Fencing | MemberState::Fenced | MemberState::Dead
+                        );
+                    let frozen = table
+                        .uses
+                        .get(usize::from(entry.grantee))
+                        .is_some_and(|uses| {
+                            uses.values().any(|u| {
+                                (u.granter, u.grant, u.serial) == (slot, grant, entry.serial)
+                                    && u.leaves > 0
+                            })
+                        });
+                    ensure(
+                        accused || frozen,
+                        "R3: a grant pinned while its grantee runs and no failed unit holds it",
+                    )?;
+                }
                 if entry.answered || entry.state == GrantState::Pinned {
                     continue;
                 }
-                let grantee = table.members.get(entry.grantee as usize);
-                let grantee = *grantee.ok_or("G6: a grant entry names a grantee past the table")?;
                 let over = grantee.generation() != entry.generation
                     || !matches!(
                         grantee.state(),
@@ -457,6 +490,30 @@ impl System {
     /// that runs maps a unit's registers.
     fn check_units(&self) -> Check {
         let table = self.canonical();
+        // G9 (IOMMU, D-137): a context entry names the node and generation
+        // its device's identifier word reads taken by, and that word's
+        // attach word reads *attached* (written before the entry; *detached*
+        // only once the entry is cleared and invalidated). R1 clears a
+        // generation's entries before R6 frees its identifier words.
+        for (&role, unit) in &table.units {
+            let record = table.role_records[role];
+            if record.governs != dodos_abi::Governs::IommuUnit {
+                continue;
+            }
+            let segment = self.machine.iommus[usize::from(record.object)].segment;
+            for (&device, &(node, generation)) in &unit.entries {
+                let key = u32::from(segment) << 16 | u32::from(device);
+                let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation);
+                ensure(
+                    table.identifiers.get(&key) == Some(&taken.raw()),
+                    "G9: a context entry of a node its identifier word does not name",
+                )?;
+                ensure(
+                    table.attach_word(key).state() == Some(dodos_abi::AttachState::Attached),
+                    "G9: a context entry whose attach word is not attached",
+                )?;
+            }
+        }
         for unit in table.units.values() {
             let running = unit.mapped.iter().filter(|&&n| table.writes(n)).count();
             ensure(running <= 1, "ONE-HOLDER: two nodes map a unit's registers")?;
@@ -502,11 +559,6 @@ impl System {
             })
     }
 
-    /// The fence, inside the event that makes it: "the driver raises p's
-    /// park request, then marks p's word, then stops p". In the trace of
-    /// the event, a core marked was raised before, and a core both marked
-    /// and stopped was marked before it was stopped. The state after the
-    /// event cannot tell the orders apart (the eighth model review).
     /// G15, R6's proof (D-149): a dead generation's grant entries and
     /// attach words were freed only once no grantee's use entry counted a
     /// leaf under them and no attach word beside its identifiers read
@@ -585,6 +637,11 @@ impl System {
         Ok(())
     }
 
+    /// The fence, inside the event that makes it: "the driver raises p's
+    /// park request, then marks p's word, then stops p". In the trace of
+    /// the event, a core marked was raised before, and a core both marked
+    /// and stopped was marked before it was stopped. The state after the
+    /// event cannot tell the orders apart (the eighth model review).
     pub(crate) fn check_fence_order(&self) -> Check {
         use crate::table::FenceStep;
         let trace = &self.canonical().fence_trace;

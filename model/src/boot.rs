@@ -1730,6 +1730,7 @@ impl Model {
         }
         // Made from no untyped: its pages never go back to one.
         live(&mut self.untypeds, first_tables).lost += tables as u32 + 1;
+        self.startup_lost = Some((first_tables, tables as u32 + 1));
         let root = pages.remove(0);
         let start = live(&mut self.aspaces, aspace);
         start.tables = tables;

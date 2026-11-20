@@ -11,7 +11,8 @@ impl Model {
     ///     queue by deadline if it is eligible with budget, the slack queue
     ///     of its class if it is eligible and throttled, the sleeping queue
     ///     if it is throttled and not eligible, none otherwise; eligible
-    ///     meaning configured, not dying, and a runnable holder (the home if
+    ///     meaning configured, not dying, not moving to another core, and a
+    ///     runnable holder (the home if
     ///     runnable, else the receiver of the top lend); the orders of entry
     ///     were given out once each;
     /// 42. the admitted sum of each core of the node is the sum of the

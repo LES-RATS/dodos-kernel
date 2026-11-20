@@ -849,3 +849,46 @@ fn an_its_table_root_that_pass_1_deferred_stays_behind_the_sweep() {
     assert_eq!(deferred_its_table(true).m.check(), Ok(()));
     assert_eq!(deferred_its_table(false).m.check(), Ok(()));
 }
+
+// Audit lot 7 (sonnet F16): an `its_table` record of no object is reported
+// (59).
+#[test]
+fn an_its_table_of_no_object_is_reported() {
+    let (mut k, _, _) = with_blocks();
+    k.ok(retype_from(TABLES, ObjectKind::ItsTable, 0, 241));
+    let pages = *k.m.its_tables.values().next().expect("the its_table");
+    k.m.its_tables.insert(crate::ObjId(u32::MAX), pages);
+    assert_eq!(k.m.check(), Err("59: an its_table of no object"));
+}
+
+// Audit lot 7 (sonnet F5; Objects, `its_table`: "2^k pages, k ≤ 4, made by
+// `untyped_retype` from a table untyped"): a record of another size, or
+// outside every table untyped, is reported.
+#[test]
+fn an_its_table_of_a_size_or_place_no_retype_makes_is_reported() {
+    let (mut k, _, _) = with_blocks();
+    k.ok(retype_from(TABLES, ObjectKind::ItsTable, 2, 241));
+    let its = *k.m.its_tables.keys().next().expect("the its_table");
+    let (first, _) = k.m.its_tables[&its];
+    let mut odd = N {
+        m: k.m.clone(),
+        t: k.t,
+        ut: k.ut,
+    };
+    odd.m.its_tables.insert(its, (first, 3));
+    assert_eq!(
+        odd.m.check(),
+        Err("59: an its_table of a size no retype makes")
+    );
+    let block =
+        k.m.untypeds
+            .values()
+            .find(|u| !u.table && u.block.is_some());
+    let page = k.m.geometry().page();
+    let outside = block.expect("the ordinary block").base / page;
+    k.m.its_tables.insert(its, (outside, 4));
+    assert_eq!(
+        k.m.check(),
+        Err("59: an its_table outside every table untyped")
+    );
+}

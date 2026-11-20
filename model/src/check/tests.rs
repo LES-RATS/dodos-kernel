@@ -1903,6 +1903,18 @@ fn pending_parameters_with_a_budget_above_their_period_are_reported() {
     assert_eq!(broken, "43: parameters and state of a context");
 }
 
+// Audit lot 7 (deepseek F-7): 43's "budget left if and only if not
+// throttled", which the test below never reached (41 reports it first): a
+// context with no budget left, not throttled, still in the ready queue.
+#[test]
+fn context_with_no_budget_left_that_is_not_throttled_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        live(&mut m.scheds, context).remaining = 0;
+    });
+    assert_eq!(broken, "43: parameters and state of a context");
+}
+
 #[test]
 fn throttled_context_with_budget_left_is_reported() {
     let broken = spoiled(|m, at| {
@@ -2189,6 +2201,77 @@ fn start_up_untyped_outside_the_floor_is_reported() {
     assert_eq!(broken, "54: start-up untyped outside the floor");
 }
 
+// Audit lot 7 (deepseek F-13): a leaf a failed unit keeps counted for ever
+// (D-131), as one an unmapping record counts until its invalidation, keeps
+// its chunk from being freed (G5): a free word under one is reported.
+#[test]
+fn a_kept_leaf_on_a_free_word_is_reported() {
+    let broken = spoiled(|m, _| {
+        let free = m.table.owners.iter().position(|&raw| {
+            Ownership::from_raw(raw).is_some_and(|w| w.state() == dodos_abi::OwnState::Free)
+        });
+        let chunk = free.expect("a free word");
+        m.frozen.insert(chunk as u64, 1);
+        // The gate word counts it too, so that the map count agrees (58).
+        let words = std::sync::Arc::make_mut(&mut m.table.gate_words);
+        let word = dodos_abi::GateWord::from_raw(words[chunk]).expect("a gate word");
+        words[chunk] = word.with_map_count(word.map_count() + 1).raw();
+    });
+    assert_eq!(broken, "55: translation to a free word");
+}
+
+// Audit lot 7 (deepseek F-4; The gate word of a chunk: the table bit is
+// "fixed for the chunk's ownership", written whole at `memory_take` kind 2
+// or start-up, D-154). The audit found the bit tied to nothing; it is tied
+// to the block's kind through the kernel's view of the chunk (read-only
+// for a table chunk), which reports both: an ordinary block's chunk whose
+// word has the bit, and a table block's chunk whose word lacks it.
+#[test]
+fn a_table_bit_that_is_not_its_blocks_is_reported() {
+    let broken = spoiled_with_block(|m, _, chunk| {
+        std::sync::Arc::make_mut(&mut m.table.gate_words)[chunk as usize] =
+            dodos_abi::GateWord::TABLE.raw();
+    });
+    assert_eq!(broken, "TABLES: the kernel's view of a table chunk");
+    // A table block that holds no table yet (`memory_take` kind 2): its
+    // word without the bit, counts 0, reads as any ordinary word.
+    let mut m = state();
+    let thread = object(&m, START_SLOT_THREAD);
+    let geometry = m.machine.geometry;
+    let place = m.machine.memory[5].base + 10 * geometry.chunk();
+    let take = Syscall::MemoryTake {
+        control: SlotAddr::own(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        kind: dodos_abi::MEMORY_TAKE_TABLES,
+        place,
+        size: u64::from(geometry.chunk_shift()),
+        destination: SlotAddr::own(300),
+    };
+    assert_eq!(m.apply(thread, take), Ok(Output::Done));
+    assert_eq!(m.check(), Ok(()));
+    let chunk = place >> geometry.chunk_shift();
+    std::sync::Arc::make_mut(&mut m.table.gate_words)[chunk as usize] = 0;
+    let broken = m.check().expect_err("the state is spoiled");
+    assert_eq!(broken, "TABLES: the kernel's view of a table chunk");
+}
+
+// Audit lot 7 (sonnet F7; D-157 (2): the start-up aspace's root, tables
+// and free-table reserve stay permanent live pieces of the first table
+// floor untyped, "never returned to it"): its lost count lowered with its
+// live count, as a return of those pieces would, is reported.
+#[test]
+fn the_start_up_aspaces_pieces_returned_to_their_untyped_are_reported() {
+    let broken = spoiled(|m, _| {
+        let (id, _) = m.startup_lost.expect("the start-up aspace's pieces");
+        let untyped = live(&mut m.untypeds, id);
+        untyped.lost -= 1;
+        untyped.live -= 1;
+    });
+    assert_eq!(
+        broken,
+        "19: the start-up aspace's pieces returned to their untyped"
+    );
+}
+
 #[test]
 fn block_on_a_free_word_is_reported() {
     let broken = spoiled_with_block(|m, _, chunk| {
@@ -2462,6 +2545,38 @@ fn a_ring_entry_out_of_its_place_or_a_wrong_next_sequence_is_reported() {
         area.user[3].seq = 1;
     });
     assert_eq!(broken, "88: user ring");
+}
+
+// Audit lot 7 (sonnet F15): every sequence of the live window, the last N
+// below the next, is in its place: a hole inside it is reported.
+#[test]
+fn a_hole_inside_the_live_window_of_a_ring_is_reported() {
+    let broken = spoiled(|m, _| {
+        let area = &mut std::sync::Arc::make_mut(&mut m.table.crash).areas[0];
+        // Three entries of sequences 1 to 3, the second then lost.
+        area.kernel[1] = area.kernel[0];
+        area.kernel[2] = area.kernel[0];
+        (area.kernel[0].seq, area.kernel[2].seq, area.next_kernel) = (1, 3, 4);
+        area.kernel[1].seq = 0;
+    });
+    assert_eq!(broken, "88: kernel ring");
+}
+
+// Audit lot 7 (sonnet F15, deepseek F-10): values of the state used in an
+// index or a subtraction are judged first: a call's entries from sequence
+// 0, or past 2^64, and a core whose number has no debug area, are
+// reported, never a panic of the check.
+#[test]
+fn entries_from_sequence_0_or_a_core_with_no_area_are_reported() {
+    let broken = spoiled(|m, _| m.event.user_entries = Some((0, 1, (0, 0))));
+    assert_eq!(broken, "90: entries of a call on debug");
+    let broken = spoiled(|m, _| m.event.user_entries = Some((u64::MAX, 2, (0, 0))));
+    assert_eq!(broken, "90: entries of a call on debug");
+    let broken = spoiled(|m, _| {
+        let crash = std::sync::Arc::make_mut(&mut m.table.crash);
+        crash.areas.clear();
+    });
+    assert_eq!(broken, "88: the debug area of no core");
 }
 
 #[test]

@@ -29,8 +29,14 @@ fn ring_holds(ring: &[TraceEntry], next: u64, entries: u64) -> bool {
                     .is_some_and(|top| top >= next)
                 && (entry.seq - 1) % entries == index as u64)
     });
-    let last = next == 1 || ring[((next - 2) % entries) as usize].seq == next - 1;
-    placed && last
+    // Every sequence of the live window, the last N below the next, is in
+    // its place: no hole inside it (audit lot 7).
+    let window = next.saturating_sub(entries).max(1)..next;
+    let full = window.into_iter().all(|s| {
+        ring.get(((s - 1) % entries) as usize)
+            .is_some_and(|e| e.seq == s)
+    });
+    placed && full
 }
 
 impl Model {
@@ -81,7 +87,12 @@ impl Model {
     /// for a call on `debug` judge the area of the core the event ran on.
     fn check_area(&self, position: usize) -> Check {
         let core = &self.cores[position];
-        let area = &self.table.crash.areas[core.number as usize];
+        let area = self
+            .table
+            .crash
+            .areas
+            .get(core.number as usize)
+            .ok_or("88: the debug area of no core")?;
         let here = position == *self.at;
         ensure(
             ring_holds(&area.kernel, area.next_kernel, TRACE_KERNEL_ENTRIES),
@@ -109,7 +120,11 @@ impl Model {
                 "89: a call on debug wrote a kernel entry",
             )?;
             let entries = TRACE_USER_ENTRIES;
-            let written: Vec<&TraceEntry> = (first..first + count)
+            // Sequences start at 1 and never pass 2^64: judged before the
+            // index is computed (audit lot 7).
+            let end = first.checked_add(count).filter(|_| first != 0);
+            let end = end.ok_or("90: entries of a call on debug")?;
+            let written: Vec<&TraceEntry> = (first..end)
                 .map(|s| &area.user[((s - 1) % entries) as usize])
                 .collect();
             let consecutive = written.iter().zip(first..).all(|(e, s)| e.seq == s);

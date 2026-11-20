@@ -22,6 +22,16 @@ fn reported(k: &N, message: &str) {
     assert_eq!(k.m.check(), Err(message), "the check of the spoiled node");
 }
 
+/// The check of node `node` of `m` alone.
+#[track_caller]
+fn reported_on(m: &S, node: u16, message: &str) {
+    assert_eq!(
+        m.sys.node(node).check(),
+        Err(message),
+        "the check of node {node}"
+    );
+}
+
 #[track_caller]
 fn machine_reported(m: &S, message: &str) {
     let report = m.sys.check().expect_err("the spoiled machine");
@@ -704,6 +714,7 @@ fn a_request_whose_thread_is_gone_is_reported() {
 fn an_epoch_raised_by_two_is_reported() {
     let (mut k, untyped) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
     let e = k.m.kernel_epoch;
+    k.m.locks.entry_epoch = Some(e);
     k.m.kernel_epoch = e + 3;
     k.m.locks.steps = vec![
         Step::Epoch(e + 1),
@@ -715,10 +726,31 @@ fn an_epoch_raised_by_two_is_reported() {
     reported(&k, "epoch: raised by more than one at a time");
 }
 
+// Audit lot 7 (sonnet F8, deepseek F-17): the first raise of an event is
+// judged against the epoch at its entry, and an epoch that moved with no
+// raise is reported.
+#[test]
+fn an_epoch_raised_by_ten_in_one_raise_or_moved_with_none_is_reported() {
+    let (mut jumped, untyped) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
+    let e = jumped.m.kernel_epoch;
+    jumped.m.locks.entry_epoch = Some(e);
+    jumped.m.kernel_epoch = e + 10;
+    jumped.m.locks.steps = vec![Step::Epoch(e + 10), Step::Ready(untyped)];
+    jumped.m.untypeds.get_mut(&untyped).unwrap().ready = Some(e + 10);
+    reported(&jumped, "epoch: raised by more than one at a time");
+    let (mut k, _) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
+    k.m.locks.entry_epoch = Some(e);
+    k.m.kernel_epoch = e + 1;
+    k.m.locks.steps.clear();
+    reported(&k, "epoch: the node's epoch is not its last raise");
+}
+
 #[test]
 fn an_epoch_that_is_not_the_last_raise_is_reported() {
     let (mut k, untyped) = super::pass20::ready_untyped(crate::Arch::X86_64, 2);
     let e = k.m.kernel_epoch;
+    // The event the trace is of began at epoch e.
+    k.m.locks.entry_epoch = Some(e);
     k.m.kernel_epoch = e + 2;
     k.m.locks.steps = vec![Step::Epoch(e + 1), Step::Ready(untyped)];
     k.m.untypeds.get_mut(&untyped).unwrap().ready = Some(e + 1);
@@ -889,7 +921,7 @@ fn a_use_entry_that_names_a_granter_past_the_table_is_reported() {
         );
     });
     let report = m.sys.check().expect_err("spoiled");
-    assert!(report.ends_with("past the table"), "{report}");
+    assert_eq!(report, "G6: a use entry names a node past the table");
 }
 
 #[test]
@@ -1254,6 +1286,276 @@ fn a_dead_generations_device_still_attached_is_reported() {
         t.attach.insert(key, word.raw());
     });
     machine_reported(&m, "R6: a dead generation's device still attached");
+}
+
+// Audit lot 7 (sonnet F1; G9: "the gate of the unit's role holder writes a
+// context entry only for the node the identifier word names"; the attach
+// word *attached* is written before the context entry, D-137). Node 0
+// attached its device through the holder; a context entry that names
+// another node, or the device's attach word no longer *attached*, is
+// reported.
+#[test]
+fn a_context_entry_of_a_node_its_identifier_word_does_not_name_is_reported() {
+    use super::units::{DEVICE, IOMMU_ROLE, attached};
+    let device = DEVICE as u16;
+    let mut m = S::two();
+    attached(&mut m, 0);
+    assert_eq!(m.sys.check(), Ok(()));
+    let mut other = S::two();
+    attached(&mut other, 0);
+    let g = m.sys.member(1).generation();
+    m.sys.edit_table(|t| {
+        let unit = t.units.get_mut(&IOMMU_ROLE).expect("the unit");
+        unit.entries.insert(device, (1, g));
+    });
+    machine_reported(
+        &m,
+        "G9: a context entry of a node its identifier word does not name",
+    );
+    // Node 0's own rules (59, 88) judge its attach word first: its kernel
+    // is taken for faulty, so that the machine's rule is the one seen.
+    other.sys.make_faulty(0);
+    other.sys.edit_table(|t| {
+        let key = *t.attach.keys().next().expect("the attach word");
+        let root = t.attach_word(key).root();
+        let pinned = dodos_abi::AttachWord::new(dodos_abi::AttachState::Pinned, root);
+        t.attach.insert(key, pinned.expect("a word").raw());
+    });
+    machine_reported(
+        &other,
+        "G9: a context entry whose attach word is not attached",
+    );
+}
+
+// Audit lot 7 (sonnet F2 (a); Reclaim, R3: the grants made to a fencing
+// generation are pinned; D-142: or held by a failed unit's count): a grant
+// pinned while its grantee runs and no use entry of it counts a leaf is
+// reported, where LEAK passed over it.
+#[test]
+fn a_pinned_grant_of_a_grantee_that_runs_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let granter = super::pass24::X;
+    m.sys.edit_table(|t| {
+        let entry = t.grants[usize::from(granter)]
+            .get_mut(&g.grant)
+            .expect("the grant");
+        entry.state = crate::table::GrantState::Pinned;
+        let grantee = usize::from(entry.grantee);
+        t.uses[grantee]
+            .get_mut(&g.use_index)
+            .expect("its use entry")
+            .leaves = 0;
+    });
+    machine_reported(
+        &m,
+        "R3: a grant pinned while its grantee runs and no failed unit holds it",
+    );
+}
+
+// Audit lot 7 (deepseek F-6; Reclaim, R0: "it ends with `gone` every wait
+// of its threads for an answer of X", queues again the unit requests sent
+// to X and drops those of X it serves): once R0 ran for a generation that
+// is fencing, a thread that still waits for its answer is reported.
+#[test]
+fn a_wait_for_an_answer_of_a_node_r0_isolated_is_reported() {
+    let mut m = S::two();
+    let rights = Rights::READ.union(Rights::WRITE);
+    let retype = m.retype(0, ObjectKind::Frame, 1, super::pass32::FRAME);
+    m.ok(0, retype);
+    assert_eq!(
+        m.call(0, super::pass32::send(1, super::pass32::FRAME, rights)),
+        WAITS
+    );
+    let g = m.sys.member(1).generation();
+    m.sys.edit_table(|t| {
+        let evidence = dodos_abi::Evidence::Stale;
+        t.members[1] = dodos_abi::Member::new(MemberState::Fencing, evidence, 0, g);
+    });
+    let model = m.sys.node_mut(0);
+    let reclaim = model.reclaims.entry(1).or_default();
+    (reclaim.generation, reclaim.isolated) = (g, true);
+    reported_on(&m, 0, "R0: a wait for an answer of a node it isolated");
+}
+
+// Audit lot 7 (sonnet F11; G6: a grantee's leaves are counted in its use
+// entry): node Y maps the frame granted to it; its use entry then gone, the
+// translation counts in no entry, and is reported.
+#[test]
+fn a_translation_under_a_use_entry_that_does_not_exist_is_reported() {
+    use super::pass24::{GOT, Y};
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let map = Syscall::ASpaceMap(crate::Map {
+        space: s(dodos_abi::START_SLOT_ASPACE),
+        frame: s(GOT),
+        untyped: SlotAddr::NONE,
+        address: 1 << 30,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    });
+    m.ok(Y, map);
+    m.sys.edit_table(|t| {
+        t.uses[usize::from(Y)].remove(&g.use_index);
+    });
+    reported_on(&m, Y, "58: leaves under a use entry that does not exist");
+}
+
+// Audit lot 7 (sonnet F9; D-137: an attach word names a root of class
+// 40 + n "with n at least the words that name it"): node 0 attached its
+// device; a second attach word beside an identifier word of node 0 names
+// the same root, whose class still counts one device. Node 0's own rule
+// on its live root (59) is not judged (its kernel taken for faulty): node
+// 1's 88 reports it.
+#[test]
+fn a_root_named_by_more_attach_words_than_its_class_counts_is_reported() {
+    use super::units::{DEVICE, attached};
+    let mut m = S::two();
+    attached(&mut m, 0);
+    m.sys.make_faulty(0);
+    m.sys.edit_table(|t| {
+        let key = DEVICE as u32;
+        let (word, owner) = (t.attach[&key], t.identifiers[&key]);
+        t.attach.insert(key + 1, word);
+        t.identifiers.insert(key + 1, owner);
+    });
+    reported_on(
+        &m,
+        1,
+        "88: a root whose class counts fewer devices than the words that name it",
+    );
+}
+
+// Audit lot 7 (sonnet F16, deepseek F-8): the invariant messages no test
+// asserted, each fed the state it names.
+
+// A claimed level line whose APLIC source is inactive (D-147).
+#[test]
+fn a_claimed_lines_inactive_aplic_source_is_reported() {
+    let mut m = riscv_level_line();
+    m.sys
+        .edit_table(|t| t.aplic.get_mut(&5).unwrap().active = false);
+    reported_on(&m, 0, "SOURCECFG: a claimed line's APLIC source inactive");
+}
+
+// An APLIC source no line claims, inactive and pending (D-147).
+#[test]
+fn an_inactive_aplic_source_pending_is_reported() {
+    let mut m = riscv_level_line();
+    m.sys.edit_table(|t| {
+        let mut line = t.aplic[&5];
+        (line.active, line.pending, line.enabled) = (false, true, false);
+        t.aplic.insert(7, line);
+    });
+    reported_on(
+        &m,
+        0,
+        "SOURCECFG: an inactive APLIC source pending or enabled",
+    );
+}
+
+// Node 1, the holder of the unit, acknowledges node 0 fenced while its R1
+// on the unit is submitted and not confirmed (R5 after R1, D-140).
+#[test]
+fn an_acknowledgement_before_r1_is_done_is_reported() {
+    use super::units::IOMMU_ROLE;
+    let mut m = S::two();
+    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
+    let g = m.sys.member(0).generation();
+    m.sys.edit_table(|t| {
+        let evidence = dodos_abi::Evidence::Stale;
+        t.members[0] = dodos_abi::Member::new(MemberState::Fenced, evidence, 1, g);
+        t.beacons[1].acked[0] = g;
+    });
+    let reclaim = m.sys.node_mut(1).reclaims.entry(0).or_default();
+    reclaim.generation = g;
+    reclaim.r1.insert(IOMMU_ROLE, Some(1));
+    reported_on(
+        &m,
+        1,
+        "ACKED: an acknowledgement before R1 is done on a unit this node holds",
+    );
+}
+
+// A dead generation's grant still counted by a use entry of its grantee
+// (R6's proof, D-149).
+#[test]
+fn a_dead_generations_grant_still_counted_is_reported() {
+    let mut m = S::on(&machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let g = m.sys.member(1).generation();
+    m.supervisor(0, m.t[0]);
+    // Node 2, the holder of the use entry below, dead too: a running
+    // holder's count is G6's to report.
+    for dead in [1, 2] {
+        m.ok(0, super::pass17::kill(dead));
+        m.run(100 * MS);
+        assert_eq!(m.state(dead), MemberState::Dead);
+    }
+    for n in 0..3 {
+        m.sys.make_faulty(n);
+    }
+    m.sys.edit_table(|t| {
+        let used = crate::table::UseEntry {
+            granter: 1,
+            grant: 0,
+            serial: 1,
+            generation: g,
+            root: None,
+            leaves: 1,
+            release_pending: false,
+            signal_pending: false,
+        };
+        t.uses[2].insert(0, used);
+    });
+    machine_reported(
+        &m,
+        "R6: a dead generation's grant still counted by its grantee",
+    );
+}
+
+// A grant entry naming a grantee past the table (exact message: three
+// messages end with "past the table").
+#[test]
+fn a_grant_entry_that_names_a_grantee_past_the_table_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let granter = super::pass24::X;
+    m.sys.make_faulty(granter);
+    m.sys.edit_table(|t| {
+        let entry = t.grants[usize::from(granter)]
+            .get_mut(&g.grant)
+            .expect("the grant");
+        entry.grantee = 40;
+    });
+    let report = m.sys.check().expect_err("the spoiled machine");
+    assert_eq!(report, "G6: a grant entry names a grantee past the table");
+}
+
+// Audit lot 7 (sonnet F2 (b); G5: the memory under a grant's anchor
+// "stays its granter's [...] whatever the granter's kernel does"): a sealed
+// granter still holds it; its chunk written to another node is reported.
+#[test]
+fn granted_memory_of_a_sealed_granter_owned_by_another_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let granter = super::pass24::X;
+    for n in 0..3 {
+        m.sys.make_faulty(n);
+    }
+    m.sys.edit_table(|t| {
+        let member = t.member(granter);
+        let evidence = dodos_abi::Evidence::Stale;
+        let sealed = dodos_abi::Member::new(MemberState::Sealed, evidence, 0, member.generation());
+        t.members[usize::from(granter)] = sealed;
+        let other = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(1), t.generation(1));
+        std::sync::Arc::make_mut(&mut t.owners)[g.chunk as usize] = other.raw();
+    });
+    let report = m.sys.check().expect_err("the spoiled machine");
+    assert_eq!(
+        report,
+        "G5: granted memory owned by another than its granter"
+    );
 }
 
 // D-148: a gate word whose grant count is not the grants over its chunk.

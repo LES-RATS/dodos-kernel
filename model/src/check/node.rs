@@ -434,7 +434,9 @@ impl Model {
     /// slot and the barrier epoch never pass it.
     fn check_epoch(&self) -> Check {
         let steps = &self.locks.steps;
-        let mut last: Option<u64> = None;
+        // The first raise of the event is judged against the epoch at its
+        // entry, and with no raise the epoch stays (audit lot 7).
+        let mut last: Option<u64> = self.locks.entry_epoch;
         for (index, step) in steps.iter().enumerate() {
             let Step::Epoch(epoch) = *step else {
                 continue;

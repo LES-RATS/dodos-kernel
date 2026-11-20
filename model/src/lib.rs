@@ -1206,6 +1206,9 @@ pub struct Model {
     /// holds to at most one (`node_start` mode resume: "R0 once for that
     /// generation"; finding 8 of the tenth model review).
     r0_runs: BTreeMap<(u16, u32), u32>,
+    /// The first table floor untyped and the pieces the start-up aspace
+    /// took from it for good (D-157 (2)), which the check holds it to.
+    startup_lost: Option<(ObjId, u32)>,
     starts: BTreeMap<usize, nodes::Starting>,
     handing: BTreeMap<usize, roles::Handover>,
     unit_order: u64,

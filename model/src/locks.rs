@@ -92,6 +92,8 @@ pub(crate) struct Trace {
     pub(crate) lock_free: bool,
     /// The event made a waiting thread runnable.
     pub(crate) woke: bool,
+    /// The kernel epoch at the entry of the event, once one began.
+    pub(crate) entry_epoch: Option<u64>,
 }
 
 impl crate::Model {
@@ -110,6 +112,7 @@ impl crate::Model {
         self.locks.steps.clear();
         self.locks.lock_free = false;
         self.locks.woke = false;
+        self.locks.entry_epoch = Some(self.kernel_epoch);
         self.stalled = None;
     }
 

@@ -326,8 +326,8 @@ impl Model {
     ///     identifier word reads taken by this node's generation (IOMMU: a
     ///     device identifier has an owner); an attach word that is not 0
     ///     sits beside an identifier word taken by some generation, and
-    ///     names a root of class 48 + n with n at least the words that name
-    ///     it (D-137).
+    ///     names a root of class 40 + n (D-154) with n at least the words
+    ///     that name it (D-137).
     fn check_identifiers(&self) -> Check {
         let generation = self.table.generation(self.node);
         let taken =
@@ -346,6 +346,17 @@ impl Model {
             .filter(|&(_, &raw)| raw == taken)
             .map(|(&key, _)| key)
             .collect();
+        // The words that name each root, against its class (audit lot 7:
+        // only n > 0 was judged).
+        let mut naming: std::collections::BTreeMap<u64, u8> = std::collections::BTreeMap::new();
+        for &raw in self.table.attach.values() {
+            if let Some(word) = dodos_abi::AttachWord::from_raw(raw) {
+                let count = naming
+                    .entry(word.root() / self.table.geometry.page())
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+        }
         for (&key, &raw) in &self.table.attach {
             let word = dodos_abi::AttachWord::from_raw(raw);
             let named = self.table.identifiers.get(&key).copied();
@@ -359,6 +370,11 @@ impl Model {
             {
                 return Err("88: an attach word with no identifier word or root beside it");
             }
+            let names = naming.get(&root).copied().unwrap_or(0);
+            ensure(
+                counted.is_some_and(|n| n >= names),
+                "88: a root whose class counts fewer devices than the words that name it",
+            )?;
             if raw != 0 && named == Some(taken) {
                 attached.insert(key);
             }
@@ -413,7 +429,41 @@ impl Model {
         ensure(
             self.r0_runs.values().all(|&runs| runs <= 1),
             "R0: run twice for one generation",
-        )
+        )?;
+        // What R0 leaves (Reclaim, R0; audit lot 7): once it ran for a
+        // generation that is accused or dead, no thread waits for an answer
+        // of it, no unit request stays sent to it, and none of its requests
+        // is served.
+        for (&x, reclaim) in &self.reclaims {
+            let member = self.table.members.get(usize::from(x));
+            let isolated = reclaim.isolated
+                && member.is_some_and(|m| {
+                    m.generation() == reclaim.generation
+                        && matches!(
+                            m.state(),
+                            dodos_abi::MemberState::Fencing
+                                | dodos_abi::MemberState::Fenced
+                                | dodos_abi::MemberState::Dead
+                        )
+                });
+            if !isolated {
+                continue;
+            }
+            let waits = self
+                .threads
+                .values()
+                .any(|t| matches!(t.wait, Wait::Node { peer, .. } if peer == x));
+            ensure(!waits, "R0: a wait for an answer of a node it isolated")?;
+            let sent = self
+                .unit_requests
+                .iter()
+                .flatten()
+                .any(|e| matches!(e.stage, crate::units::Stage::Sent { to, .. } if to == x));
+            ensure(!sent, "R0: a unit request still sent to a node it isolated")?;
+            let served = self.unit_service.keys().any(|&(from, _)| from == x);
+            ensure(!served, "R0: a request of a node it isolated still served")?;
+        }
+        Ok(())
     }
 
     fn check_tree(&self) -> Check {
@@ -929,6 +979,11 @@ impl Model {
                 .map(|space| 1 + space.tables as usize)
                 .sum();
             let live = live + tables;
+            ensure(
+                self.startup_lost
+                    .is_none_or(|(first, pieces)| first != id || untyped.lost >= pieces),
+                "19: the start-up aspace's pieces returned to their untyped",
+            )?;
             ensure(
                 untyped.live as usize == live + untyped.lost as usize,
                 "19: live count",

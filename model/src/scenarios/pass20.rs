@@ -147,6 +147,8 @@ fn a_barrier_epoch_beyond_the_kernel_epoch_is_reported() {
 #[test]
 fn a_raise_of_the_kernel_epoch_other_than_at_a_last_destruction_is_reported() {
     let (mut k, untyped) = ready_untyped(Arch::X86_64, 2);
+    // The event the trace is of began at the epoch before the raise.
+    k.m.locks.entry_epoch = Some(k.m.kernel_epoch);
     k.m.kernel_epoch += 1;
     let epoch = k.m.kernel_epoch;
     k.m.locks.steps = vec![Step::Epoch(epoch)];

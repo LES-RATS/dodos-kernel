@@ -539,8 +539,24 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   (`BootPorts::valid`), and the machine start-up refuses a record out of
   range on x86-64 (`Refusal::MachineValues`); the model still cuts no port
   entry from it.
+- The audit of the checkers (lot 7). A checker reports a bad state and
+  never panics on one: the bandwidth of a context is summed once 43 holds,
+  a role word, a debug area, a trace sequence and a grantee's leaf are
+  judged before they index or subtract. New rules: G9 (a context entry
+  names the node its identifier word names, its attach word *attached*);
+  R0 (no wait, unit request or service left on a node it isolated); R3 (a
+  grant pinned only for a grantee accused or over, or under a failed
+  unit's count); a hand-over's caller (`Wait::Hand`); a ring window with
+  no hole; the epoch at the entry of an event; a free word under a leaf an
+  unmapping record or a failed unit counts (55); a leaf under a use entry
+  that does not exist (58); the devices a root's class counts against the
+  attach words naming it (88); an `its_table`'s size and place, pass 1
+  deferring its root, its pages pinned alike (27, 59); a table untyped's
+  only untyped children (TABLES); G5 for a sealing or sealed granter; the
+  start-up aspace's pieces never returned (D-157 (2)).
 - The scenarios are in `scenarios/pass32.rs`, `scenarios/pass32_node.rs`,
-  `scenarios/pass33.rs`, `scenarios/pass22.rs`, `gate/pass32_tests.rs`,
+  `scenarios/pass33.rs`, `scenarios/pass22.rs`, `scenarios/pass31.rs`,
+  `scenarios/checker.rs`, `check/tests.rs`, `gate/pass32_tests.rs`,
   `tests/calls.rs` and `tests/boot.rs`.
 
 ## Mutations shown equivalent
