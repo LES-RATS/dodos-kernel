@@ -280,8 +280,9 @@ fn a_fault_recorded_in_its_thread_is_traced_and_the_rate_limit_counts_the_rest()
         (3, vec![5, 4])
     );
     assert_eq!(ring[n - 1].code(), 5);
-    // Its words: the kind, word 0 and word 4 of the fault.
-    assert_eq!(ring[n - 1].payload[0], FaultKind::Page as u64);
+    // Its words: the kind with the exception number in its high half,
+    // word 0 and word 4 of the fault.
+    assert_eq!(ring[n - 1].payload[0], 14 << 32 | FaultKind::Page as u64);
     assert_eq!(ring[n - 1].payload[2], UNMAPPED);
 }
 

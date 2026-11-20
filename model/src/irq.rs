@@ -431,24 +431,13 @@ impl Model {
             // by the claiming node's gate (Interrupts, rule 1, D-146).
             let source = irq.source;
             if source.is_line() && source.level() {
-                self.aplic_write(source.id(), AplicReg::ClrIe);
+                self.mask_level(source);
                 self.event.arrival_enabled |= self.machine.arch == crate::Arch::Riscv64
                     && self
                         .table
                         .aplic
                         .get(&source.id())
                         .is_some_and(|l| l.enabled);
-                if self.masks_at_arrival()
-                    && let Some(role) = self.ioapic_role(source.id())
-                    && self.holds_role(role)
-                {
-                    self.table
-                        .units
-                        .entry(role)
-                        .or_default()
-                        .masked
-                        .insert(source.id());
-                }
             }
             let dying = self.irqs[&id]
                 .notify
@@ -487,14 +476,36 @@ impl Model {
         self.hand_over(notify);
     }
 
-    /// Unbinding: the irq is idle, bound to no notify; pending is kept.
+    /// A level source masked where it is masked at its arrival: on RISC-V
+    /// at its APLIC, by the claiming node's gate (Interrupts, rule 1,
+    /// D-146); on x86-64 without a directed end of interrupt at its
+    /// IOAPIC, by the holder of the controller's role (D-147).
+    fn mask_level(&mut self, source: dodos_abi::IrqSource) {
+        self.aplic_write(source.id(), AplicReg::ClrIe);
+        if self.masks_at_arrival()
+            && let Some(role) = self.ioapic_role(source.id())
+            && self.holds_role(role)
+        {
+            let unit = self.table.units.entry(role).or_default();
+            unit.masked.insert(source.id());
+        }
+    }
+
+    /// Unbinding: the irq is idle, bound to no notify; pending is kept. A
+    /// level source is masked where it is masked at its arrival, at once
+    /// (Interrupts, the states of an irq: "a level source is masked at the
+    /// controller while the irq is idle or fired").
     pub(crate) fn unbind_irq(&mut self, irq: ObjId) {
         let entry = live(&mut self.irqs, irq);
         entry.state = IrqState::Idle;
+        let source = entry.source;
         if let Some((notify, _)) = entry.notify.take() {
             live(&mut self.notifies, notify)
                 .irqs
                 .retain(|&other| other != irq);
+        }
+        if source.is_line() && source.level() {
+            self.mask_level(source);
         }
     }
 
@@ -570,9 +581,10 @@ impl Model {
     /// clears the remapping entry, and the invalidation of the interrupt
     /// entry cache is asked of each unit that serves the source's segment,
     /// one after another as for a claim; the next step removes the
-    /// capability once the last is answered. Served at once by a unit this
-    /// node holds. A handle whose invalidation a unit answered *failed* is
-    /// retired: not reused while the unit is failed (D-139).
+    /// capability once the last is answered. A unit this node holds is
+    /// asked by the same entry, with no message. A handle whose
+    /// invalidation a unit answered *failed* is retired: not reused while
+    /// the unit is failed (D-139).
     fn msi_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
         use crate::caps::Undone;
         let entry = self.irqs[&irq];
@@ -590,26 +602,11 @@ impl Model {
         if entry.removing {
             return Undone::Nothing;
         }
-        // Every unit of the segment held by this node itself: no holder is
-        // needed, and the removal is one unit of the step.
-        let held = |role: usize| {
-            let word = self.table.roles[role];
-            word.state() == dodos_abi::RoleState::Held && word.holder() == self.node
-        };
-        if units
-            .iter()
-            .all(|&role| held(role) && !self.unit_failed(role))
-        {
-            for &unit in &units {
-                self.table
-                    .units
-                    .entry(unit)
-                    .or_default()
-                    .remap
-                    .remove(&u32::from(handle));
-            }
-            return Undone::Nothing;
-        }
+        // A request also when this node holds every role concerned: the
+        // same entry of the unit request table, served with no message
+        // (Interrupts, the irq; D-150: the shortcut of a node that held
+        // every unit skipped the claim that must end first and the
+        // retirement at a failed unit).
         if self.unit_requests.iter().all(Option::is_some) {
             return Undone::Wait;
         }
@@ -645,7 +642,7 @@ impl Model {
     /// entry is masked: its gate clears the remapping entry of its handle in
     /// each unit of the IOAPIC's segment, and the invalidation of the
     /// interrupt entry cache is asked of each, one after another as for a
-    /// claim; a unit held by this node is served at once. Nothing when no
+    /// claim; a unit held by this node is asked with no message. Nothing when no
     /// unit holds the entry any more and no invalidation is in flight. A
     /// handle whose invalidation a unit answered *failed* is retired.
     fn line_remap_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
@@ -674,23 +671,15 @@ impl Model {
         let Some(&first) = units.iter().find(|&&role| remapped(self, role)) else {
             return Undone::Nothing;
         };
-        let held = |role: usize| {
-            let word = self.table.roles[role];
-            word.state() == dodos_abi::RoleState::Held && word.holder() == self.node
-        };
-        let local = units
-            .iter()
-            .all(|&role| held(role) && !self.unit_failed(role));
-        if !local && self.unit_requests.iter().all(Option::is_some) {
+        // A request also when this node holds every role concerned, as
+        // for an MSI (D-150).
+        if self.unit_requests.iter().all(Option::is_some) {
             return Undone::Wait;
         }
         for &unit in &units {
             if let Some(state) = self.table.units.get_mut(&unit) {
                 state.remap.remove(&u32::from(handle));
             }
-        }
-        if local {
-            return Undone::Nothing;
         }
         let op = crate::rings::UnitOp::InterruptCache { handle };
         let chain = crate::units::Chain {

@@ -248,9 +248,23 @@ impl Model {
         let cap = self.cap(thread, source, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
         self.fits(place.space, cap, Placing::Moved)?;
+        // State, `busy` first: the root capability of an untyped that has a
+        // descendant (`cap_move`, D-131).
+        if self.root_with_copies(cap) {
+            return Err(Error::Busy);
+        }
         self.vacant(place)?;
         self.place(cap, place);
         Ok(Output::Done)
+    }
+
+    /// Whether a capability is the root capability of an untyped that has
+    /// a descendant. It does not move, by `cap_move` or by a *move* in a
+    /// message: its copies name its slot, where the watermark and the
+    /// clean mark are (The capability slot, D-131).
+    pub(crate) fn root_with_copies(&self, cap: CapId) -> bool {
+        let untyped = |object: ObjId| self.objects[&object].kind == ObjectKind::Untyped;
+        self.rooted(cap).is_some_and(untyped) && !self.caps[&cap].children.is_empty()
     }
 
     pub(crate) fn cap_delete(&mut self, thread: ObjId, slot: SlotAddr) -> Outcome {

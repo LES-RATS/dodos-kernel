@@ -1791,6 +1791,9 @@ struct Reached {
     /// depths.
     sent: u32,
     sent_refused: u32,
+    /// Moves of an untyped root that has a descendant, which stays: `busy`
+    /// (D-131).
+    stayed: u32,
     /// `call` and `reply_recv` that list such a move and did not fail.
     called: u32,
     answered: u32,
@@ -2451,6 +2454,7 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             }
             (Some(_), Ok(Output::Sent { flags: 0 })) => reached.sent += 1,
             (Some(risk), Ok(Output::Sent { .. })) if risk.fits_derived => reached.sent_refused += 1,
+            (Some(Risk { kind: 0, .. }), Err(Error::Busy)) => reached.stayed += 1,
             (Some(_), Ok(_)) if name == 10 => reached.called += 1,
             (Some(_), Ok(_)) if name == 12 => reached.answered += 1,
             _ => {}
@@ -2540,6 +2544,7 @@ impl Reached {
         self.bound += other.bound;
         self.sent += other.sent;
         self.sent_refused += other.sent_refused;
+        self.stayed += other.stayed;
         self.called += other.called;
         self.answered += other.answered;
         self.with_four += other.with_four;
@@ -2753,13 +2758,16 @@ fn waits_of_every_sort_and_their_ends_are_reached() {
 #[test]
 fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     let reached = all_seeds();
-    // Measured: untyped 3,857 accepted and 68 refused, cspace 84 and 13;
-    // by `send` 4 delivered and 1 refused at random (the directed case
+    // Measured: untyped 6,688 accepted and 175 refused, cspace 176 and 26;
+    // by `send` 2 delivered at random and none refused (the directed case
     // apart: the final review's H6 found the 24 refused all directed).
+    // Since pass 32 an untyped root that has a descendant does not move
+    // (D-131): 58 such moves are `busy`, among them the sends that the
+    // earlier count had delivered or refused at random (4 and 1).
     at_least(reached.moved, [2893, 63]);
     at_least(reached.refused, [51, 10]);
-    at_least([reached.sent, reached.sent_refused], [3, 1]);
-    // The same moves listed by `call` and by `reply_recv`: 23 and 8.
+    at_least([reached.sent, reached.stayed], [1, 43]);
+    // The same moves listed by `call` and by `reply_recv`: 39 and 18.
     at_least([reached.called, reached.answered], [18, 6]);
 }
 

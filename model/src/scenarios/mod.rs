@@ -26,6 +26,7 @@ mod pass27;
 mod pass28;
 mod pass31;
 mod pass32;
+mod pass32_node;
 mod reviews;
 mod units;
 mod verify13;

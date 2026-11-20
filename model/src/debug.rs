@@ -296,9 +296,7 @@ impl Model {
             let right = area.magic == DEBUG_AREA_MAGIC && area.version == DEBUG_AREA_VERSION;
             if !right || !area.continues() {
                 *area = DebugArea::new(generation);
-                if right {
-                    area.write(false, cleared);
-                }
+                area.write(false, cleared);
             }
             (area.generation, area.slot) = (generation, self.node);
         }

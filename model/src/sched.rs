@@ -555,6 +555,15 @@ impl Model {
 
     /// Exhaustion: with n = 1 + ⌊−r / B⌋, the replenishment instant is
     /// d + (n − 1) × T; not after now, the context is replenished at once.
+    ///
+    /// CONTRACT-GAP 50 (Scheduling contexts, exhaustion and replenishment;
+    /// Debugging, "a stop is time that passed for the scheduler"): the
+    /// contract gives no width to d + (n − 1) × T, n × B and n × T. A
+    /// context of the smallest budget and the longest period that a stop
+    /// of 50 minutes charges gives products beyond 64 bits (pass 32's
+    /// audit, lot 4, L4-04), which this arithmetic does not hold: the
+    /// model panics there. No call reaches it (each exhaustion fires its
+    /// timer; only a clock that jumps does), and the reading is left open.
     fn exhaust(&mut self, context: ObjId) {
         let sched = live(&mut self.scheds, context);
         let budget = sched.budget.max(1);
@@ -835,7 +844,17 @@ impl Model {
             let sched = live(&mut self.scheds, context);
             sched.moving |= moving;
             sched.core = target;
-            sched.queue = None;
+            // The context keeps its place in a queue and enters the one of
+            // its new core after the contexts already there. A move wakes
+            // nothing: a context eligible before and after the event keeps
+            // its budget and its deadline, and its new parameters stay
+            // pending (Scheduling contexts; with the queue emptied here,
+            // the wake-up rule renewed the budget of a waiting context at
+            // each move).
+            if let Some(place) = sched.queue.as_mut() {
+                place.entered = self.entered;
+                self.entered += 1;
+            }
             if !self.change_list.contains(&context) {
                 self.change_list.push(context);
             }
@@ -1185,11 +1204,20 @@ impl Model {
     }
 
     /// Destroying a context, or a thread: what is left of it is unlinked.
+    /// Another core of the node that ran it is sent the reschedule
+    /// interrupt: what it runs is no longer what it would choose, and it
+    /// still holds the thread until it takes the interrupt (Scheduling:
+    /// "a core whose choice changed is sent the reschedule interrupt").
     pub(crate) fn sched_destroyed(&mut self, context: ObjId) {
         self.scheds.remove(&context);
-        for core in &mut self.cores {
-            if core.running.is_some_and(|(running, _)| running == context) {
-                core.running = None;
+        let at = *self.at;
+        for core in 0..self.cores.len() {
+            if !(self.cores[core].running).is_some_and(|(running, _)| running == context) {
+                continue;
+            }
+            self.cores[core].running = None;
+            if core != at && !self.cores[core].ipis.contains(&crate::Ipi::Reschedule) {
+                self.post(core, crate::Ipi::Reschedule);
             }
         }
     }

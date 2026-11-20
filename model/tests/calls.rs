@@ -10,6 +10,10 @@ use dodos_model::*;
 const SPACE: SlotAddr = SlotAddr::own(START_SLOT_CSPACE);
 const UT: SlotAddr = s(START_SLOT_FIRST);
 const DEV: SlotAddr = s(START_SLOT_FIRST + 1);
+/// The table untyped of the table floor, at depth 1 like `UT`: a root that
+/// no capability comes from (its pieces are tables, not capabilities), so
+/// one with no descendant.
+const START_UT: SlotAddr = SlotAddr::own(common::TABLES);
 /// The `core` capability of the boot core.
 const CORE: SlotAddr = SlotAddr::own(16);
 /// The first slot beyond the table of the start-up space of the machine of
@@ -1431,13 +1435,15 @@ fn capability_moved_by_ipc_into_a_space_that_cannot_hold_it_is_dropped() {
     let mut k = K::with_ipc();
     k.make(CSpace, 31);
     k.go(grow(31)).unwrap();
-    caller_with(&mut k, vec![Transfer::Move(UT)], Range::NONE);
+    // The table untyped, a root with no descendant: an untyped root that
+    // has one does not move at all (D-131).
+    caller_with(&mut k, vec![Transfer::Move(START_UT)], Range::NONE);
     let range = Range {
         first: via(31, 5),
         count: 1,
     };
     assert_eq!(got(k.go(recv(EP, RP, range))), (1, 0, 0, DROPPED));
-    assert_eq!(k.inspect(UT).unwrap().0, Untyped);
+    assert_eq!(k.inspect(START_UT).unwrap().0, Untyped);
 }
 
 #[test]
@@ -3364,11 +3370,11 @@ fn depth_rule_is_judged_on_each_capability_of_a_message() {
     let mut k = K::with_ipc();
     k.make(CSpace, 31);
     k.go(grow(31)).unwrap();
-    // The notify can go anywhere; the first untyped is less deep than the
-    // space.
+    // The notify can go anywhere; the table untyped is less deep than the
+    // space (and has no descendant: one that has does not move, D-131).
     let caps = vec![
         Transfer::Derive(s(NT), Rights::ALL.bits()),
-        Transfer::Move(UT),
+        Transfer::Move(START_UT),
     ];
     caller_with(&mut k, caps, Range::NONE);
     let range = Range {
@@ -5589,4 +5595,64 @@ fn padding_is_cleared_with_the_object() {
     k.ok(retype(s(30), Endpoint, 0, s(31)));
     k.no(pages(30, kb(64), 32), Error::Again);
     k.ok(pages(30, kb(64), 32));
+}
+
+// Lot 3, F-01 and lot 4, L4-07 of pass 32's audit. An untyped root that
+// has a descendant does not move: its copies name its slot (The capability
+// slot, D-131). `cap_move` of it is `busy`, whether the descendant is an
+// object made from it or a copy of it.
+#[test]
+fn cap_move_of_an_untyped_root_that_has_a_descendant_is_busy() {
+    let mut k = K::new();
+    k.make(Notify, 31);
+    k.no(mv(UT, s(40)), Error::Busy);
+    let mut k = K::new();
+    k.ok(retype(UT, Untyped, 1 << 16, s(33)));
+    k.ok(derive(s(33), s(31), Rights::ALL, 0));
+    k.no(mv(s(33), s(40)), Error::Busy);
+    // A copy is no root: it moves.
+    k.ok(mv(s(31), s(41)));
+}
+
+// A fresh untyped, the usual thing a creator hands on, has no descendant
+// and moves freely; once its only descendant is deleted it moves again.
+#[test]
+fn an_untyped_root_with_no_descendant_moves() {
+    let mut k = K::new();
+    k.ok(retype(UT, Untyped, 1 << 16, s(33)));
+    k.ok(mv(s(33), s(34)));
+    k.ok(derive(s(34), s(31), Rights::ALL, 0));
+    k.no(mv(s(34), s(35)), Error::Busy);
+    k.ok(Syscall::CapDelete(s(31)));
+    k.ok(mv(s(34), s(35)));
+}
+
+// A *move* in a message of the root capability of an untyped that has a
+// descendant is `busy`, as for `cap_move`, checked when the call is made:
+// an error, and nothing is sent (Transfer of capabilities, D-131).
+#[test]
+fn a_move_by_ipc_of_an_untyped_root_that_has_a_descendant_is_busy() {
+    let mut k = K::with_ipc();
+    let caller = k.spawn(40);
+    let moved = msg(1, vec![Transfer::Move(UT)]);
+    assert_eq!(k.on(caller, call(EP, moved, Range::NONE)), Err(Error::Busy));
+    assert_eq!(
+        k.on(caller, send(EP, msg(1, vec![Transfer::Move(UT)]))),
+        Err(Error::Busy)
+    );
+    assert_eq!(k.inspect(UT).unwrap().0, Untyped);
+}
+
+// The same check is made again at delivery, against what the sender's
+// slots hold then: an untyped root that got a descendant while its caller
+// waited is not moved, and the capabilities are dropped.
+#[test]
+fn an_untyped_root_that_got_a_descendant_before_delivery_is_dropped() {
+    let mut k = K::with_ipc();
+    k.ok(retype(UT, Untyped, 1 << 16, s(33)));
+    caller_with(&mut k, vec![Transfer::Move(s(33))], Range::NONE);
+    k.ok(derive(s(33), s(31), Rights::ALL, 0));
+    assert_eq!(got(k.go(recv(EP, RP, range(50, 2)))), (1, 0, 0, DROPPED));
+    assert_eq!(k.inspect(s(33)).unwrap().0, Untyped);
+    assert_eq!(k.kind(50), Err(Error::Invalid));
 }

@@ -92,7 +92,12 @@ impl Model {
     /// thread bound to a dying space can be resumed.
     pub(crate) fn thread_resume(&mut self, thread: ObjId, target: SlotAddr) -> Outcome {
         let target = self.object(thread, target, ObjectKind::Thread, Rights::MANAGE)?;
-        self.bound_space(target).or(Err(Error::Busy))?;
+        // Bound to no space: not `bound_space`, which is the caller's
+        // check and is `gone` for a thread of a revoked task too, though
+        // that thread still has its space.
+        if self.threads[&target].cspace.is_none() {
+            return Err(Error::Busy);
+        }
         // Register calls: resuming a suspended thread clears its fault
         // record.
         let resumed = live(&mut self.threads, target);

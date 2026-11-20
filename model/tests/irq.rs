@@ -260,6 +260,11 @@ fn revoking_the_control_capability_releases_its_vectors() {
         destination: s(40),
     };
     k.go(through).unwrap();
+    // The removal of a remapped MSI's irq is a request of its unit, also on
+    // the node that holds the unit (D-150): the step that starts it returns
+    // `again`, and the call made once the unit confirmed finds it answered.
+    k.no(Syscall::CapRevoke(s(CONTROL)), Error::Again);
+    k.m.settle();
     k.ok(Syscall::CapRevoke(s(CONTROL)));
     k.go(claim(msi(), 48, 41)).unwrap();
 }
@@ -381,6 +386,9 @@ fn destroying_the_irq_frees_its_vector() {
     let mut k = K::new();
     k.go(claim(msi(), 48, 40)).unwrap();
     k.ok(bind(40, NT));
+    // A request of the unit, also on the node that holds it (D-150).
+    k.no(Syscall::CapDelete(s(40)), Error::Again);
+    k.m.settle();
     k.ok(Syscall::CapDelete(s(40)));
     k.go(claim(msi(), 48, 41)).unwrap();
     k.arrive(48);

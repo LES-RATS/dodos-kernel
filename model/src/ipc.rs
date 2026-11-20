@@ -388,6 +388,18 @@ impl Model {
             }
             caps.push(listed);
         }
+        // A state check, after every listed slot: a *move* of the root
+        // capability of an untyped that has a descendant is `busy`, as for
+        // `cap_move` (Transfer of capabilities, D-131). Judged again at
+        // delivery, where a root that got a descendant meanwhile drops the
+        // capabilities.
+        let stays = |listed: &Listed| match *listed {
+            Listed::Move(cap) => self.root_with_copies(cap),
+            Listed::Derive(..) => false,
+        };
+        if caps.iter().any(stays) {
+            return Err(Error::Busy);
+        }
         Ok(caps)
     }
 

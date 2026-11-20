@@ -119,6 +119,17 @@ impl Model {
     /// first, a thread also marked *no context* raises kind 8 first and
     /// keeps kind 9, and a thread that waits or is suspended keeps it;
     /// raising it, delivered or recorded, clears the word (D-146, D-147).
+    ///
+    /// CONTRACT-GAP 51 (Debugging, kind 9 from a #DB at CPL0; Scheduling
+    /// contexts): the kept fault is "raised at the end of the event in
+    /// which the thread is runnable", and only a thread *marked* no
+    /// context "keeps its kind 9 until it is runnable with a context";
+    /// yet "a thread that has no context and is not marked [...] does not
+    /// run, and raises nothing". For a thread that is not marked and has
+    /// no context (it unbound its own context in the call the #DB came
+    /// with: pass 32's audit, lot 4, L4-05) the two sentences disagree.
+    /// The reading here, which the checker's rule KIND 9 holds too: it is
+    /// runnable, so the fault is raised, and recorded if nobody takes it.
     pub(crate) fn raise_kept_debug(&mut self) {
         let kept: Vec<ObjId> = self
             .threads
@@ -228,8 +239,10 @@ impl Model {
         let recorded = live(&mut self.threads, thread);
         (recorded.suspended, recorded.recorded) = (true, Some((kind, words)));
         self.observe();
-        // Debugging: code 5, the fault recorded in its thread.
-        let payload = [u64::from(kind), words[0], words[4]];
+        // Debugging: code 5, the fault recorded in its thread: the fault
+        // kind (low 32 bits) and the architecture's exception number (high
+        // 32), then words 0 and 4 of the fault.
+        let payload = [u64::from(kind) | words[2] << 32, words[0], words[4]];
         self.trace(dodos_abi::TraceCode::FaultRecorded, Some(thread), payload);
     }
 

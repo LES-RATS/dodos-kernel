@@ -403,6 +403,49 @@ order.
   table chunk itself (G3 (3)). The ITS word of an `its_table` is in the
   gate model only, so the sweep defers no `its_table` here.
 
+## Pass 32 (the full audit's confirmed defects)
+
+A full audit of the model, re-judged by another model with a failing test
+per finding, found defects of the model against the contract as it stands.
+No decision is applied here; each fix names the sentence it follows, and
+comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
+`scenarios/pass32_node.rs`, `tests/calls.rs`).
+
+- The gate model. A second give of a chunk is refused while a request
+  names its give, and the completion writes the word by compare-and-swap
+  (two cores giving one chunk freed the next owner's word; the contract
+  states the compare-and-swap only, gap 49). `memory_take` follows rules
+  1 to 3 of taking for a word free with a node as owner. A grantee's leaf
+  is counted in its use entry alone, and the record of a clearing names
+  the count its leaf is in (`Counted`): the granter's map count has one
+  writer, and the checker holds each use count equal to its leaves,
+  present or being invalidated. The counts of a chunk read the calling
+  node's requests only. A fenced granter frees no grant; sealed is written
+  only by a node that holds no unit role and has no open record; the
+  holder answers *failed* a record opened after the unit failed; an
+  argument out of its range is refused, and the faulty driver passes some.
+- Several nodes. A `SendAnswer` acts on the entries its send wrote, named
+  with their serials. A reserve chunk taken by its role's holder reads
+  taken by that node wherever a word is judged (`Table::taken_by`: R4's
+  audit, the checks of a unit request, the gate's own calls). A seal hands
+  no unit over while its node rebuilds it, and a node that sealed after
+  its report was asked is passed over as sealed. Unfenced marks every
+  unconfirmed core unusable on every architecture. A kind is refused on
+  the ring that does not carry it; a kept frame touches no chunk.
+  `node_stop` mode 3 is `unsupported`, and modes 0 and 2 ask a reserve
+  role of the caller's node: the harnesses claim one for a node before it
+  kills or retires (`S::supervisor`), as the supervisor that does it would.
+- One node. Destroying a context that runs on another core sends that core
+  the reschedule interrupt. The root capability of an untyped that has a
+  descendant does not move, by `cap_move` or by a *move* in a message,
+  judged at the call and again at delivery (D-131). The removal of an
+  irq behind a remapping unit is a request also on the node that holds
+  the unit (D-150). Moving a waiting context to another core wakes
+  nothing. Unbinding masks a level source at once. Trace code 5 carries
+  the exception number; a debug area whose magic or version is wrong is
+  traced (code 12) as it is cleared; `thread_resume` reads the target's
+  own space.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a
@@ -461,7 +504,14 @@ gate reserves no ASID, the tag table holds its one tag, entry 0) and
 gap 48 (`model/src/boot.rs`: the start-up aspace's root and tables drawn
 from the first table-floor untyped stay permanent live pieces for the
 life of the node, so its watermark never returns); D-157 also records
-that D-156's two-pass sweep defers pinned roots per dying `cspace`. Two earlier gaps were settled otherwise than the
+that D-156's two-pass sweep defers pinned roots per dying `cspace`.
+Pass 32 found three, open: gap 49 (`model/src/gate/cpu.rs`: a second
+give of a chunk whose give is in flight, which the compare-and-swap of
+the completion alone does not stop; refused here), gap 50
+(`model/src/sched.rs`: the width of the products of an exhaustion after a
+very long stop; left as it is, the model panics there) and gap 51
+(`model/src/faults.rs`: a kept kind 9 of a thread that is not marked and
+has no context; raised, as before). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after
