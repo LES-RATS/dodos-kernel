@@ -13,8 +13,11 @@
 //! After every step the exploration notes which events are in progress
 //! (`probe`), and counts the seeds that reach each pair of them, each
 //! triple of a resume and two others, and each triple of a death and two
-//! others (`Reach`). A combination no seed reaches fails the test, unless
-//! `IMPOSSIBLE` shows from the contract that it cannot happen. Then the
+//! others (`Reach`). In the long run (`#[ignore]`, `--release`), a
+//! combination no seed reaches fails the test, unless `IMPOSSIBLE` shows
+//! from the contract that it cannot happen; the 26 seeds of `verify` reach
+//! about half of them, and fail if they miss more than when measured
+//! (`MISSED_BY_26_SEEDS`). Then the
 //! machine runs until it is quiet, and its liveness is asserted: no node is
 //! accused that was not harmed (killed, failed, hung, retired or sealed past
 //! `SEAL_NS`), and no wait of a live node for another node, a unit or its
@@ -310,6 +313,8 @@ struct Reach {
     /// handed (D-145).
     gap_21: usize,
     handed_failed: usize,
+    /// The forged messages of a faulty node seen refused by their receiver.
+    refused: usize,
     pairs: Vec<Vec<usize>>,
     resume: Vec<Vec<usize>>,
     death: Vec<Vec<usize>>,
@@ -323,6 +328,21 @@ struct Seen {
     resume: BTreeSet<(usize, usize)>,
     death: BTreeSet<(usize, usize)>,
     events: BTreeSet<usize>,
+    refused: usize,
+}
+
+/// A forged message a faulty node wrote, to be refused by its receiver:
+/// once the receiver's consumer passes it, with the same generation, its
+/// count of refusals is above the one read at the write (the audit of lot
+/// 8a, F6: the comments said "refused" and nothing asserted it).
+struct Forged {
+    from: u16,
+    to: u16,
+    generation: u32,
+    user: bool,
+    end: u64,
+    refused: u64,
+    action: usize,
 }
 
 /// The death of a node, around which the triples are counted: any
@@ -369,6 +389,7 @@ impl Reach {
         Self {
             gap_21: 0,
             handed_failed: 0,
+            refused: 0,
             pairs: square(),
             resume: square(),
             death: square(),
@@ -389,6 +410,7 @@ impl Reach {
         for &e in &seen.events {
             self.events[e] += 1;
         }
+        self.refused += seen.refused;
     }
 }
 
@@ -480,6 +502,7 @@ struct Run {
     /// gates and recovery reserves must refuse or withstand.
     faulty_node: u16,
     faulty_acts: usize,
+    forged: Vec<Forged>,
 }
 
 impl Run {
@@ -529,6 +552,7 @@ impl Run {
             late_start: 0,
             faulty_node,
             faulty_acts: 0,
+            forged: Vec::new(),
         };
         say(format_args!(
             "drivers {:?}, faulty node {}",
@@ -538,7 +562,58 @@ impl Run {
         run
     }
 
+    /// The message just written by `from` on a ring toward `to` is forged:
+    /// noted, with `to`'s count of refusals.
+    fn forged(&mut self, from: u16, to: u16) {
+        let pair = &self.m.sys.canonical().rings[from as usize][to as usize];
+        // Actions 6 and 8 write on the user ring, the others on the kernel
+        // ring.
+        let action = self.faulty_acts % 10;
+        let user = matches!(action, 6 | 8);
+        let end = match user {
+            true => pair.user.produced,
+            false => pair.kernel.produced,
+        };
+        self.forged.push(Forged {
+            from,
+            to,
+            generation: self.m.sys.member(to).generation(),
+            user,
+            end,
+            refused: self.m.sys.node(to).refused.0,
+            action,
+        });
+    }
+
+    /// Each forged message its receiver consumed is refused.
+    fn judge_forged(&mut self) {
+        for forged in std::mem::take(&mut self.forged) {
+            let to = forged.to;
+            let same = self.m.sys.has(to)
+                && self.m.sys.member(to).generation() == forged.generation
+                && self.m.sys.canonical().writes(to);
+            if !same {
+                continue;
+            }
+            let consumed =
+                self.m.sys.canonical().beacons[to as usize].consumed[forged.from as usize];
+            let consumed = if forged.user { consumed.1 } else { consumed.0 };
+            if consumed.wrapping_sub(forged.end) >= 1 << 63 {
+                self.forged.push(forged);
+                continue;
+            }
+            assert!(
+                self.m.sys.node(to).refused.0 > forged.refused,
+                "the forged message of action {} from node {} to node {to} was not refused",
+                forged.action,
+                forged.from
+            );
+            self.seen.refused += 1;
+        }
+    }
+
     fn note(&mut self) {
+        self.judge_forged();
         if replayed().is_some() {
             self.print_members();
         }
@@ -611,8 +686,14 @@ impl Run {
             let iospace = m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
             m.ok(node, iospace);
             let call = attach_call(m, node, device, true);
-            if m.call(node, call) == WAITS {
-                m.run(30 * MS);
+            // Every seed starts with the device attached (the audit of lot
+            // 8a, F15: a failed attach went unnoticed).
+            match m.call(node, call) {
+                WAITS => {
+                    m.run(30 * MS);
+                    assert_eq!(m.woken(node), Some(&DONE), "the attach of node {node}");
+                }
+                outcome => assert_eq!(outcome, DONE, "the attach of node {node}"),
             }
         }
         for pair in PAIRS {
@@ -1051,10 +1132,13 @@ impl Run {
             Driver::Retire => self.retire(),
             // Sealed, then time passes until the node is accused with
             // evidence seal (within `SEAL_NS` + `SWEEP_NS`).
+            // The driver is spent only by a seal that happened (the audit
+            // of lot 8a, F5).
             Driver::SealLate => {
-                if first(self)
+                if !self.once.contains(&(driver as usize))
                     && let Some(node) = self.seal()
                 {
+                    first(self);
                     self.late = Some(node);
                     let table = self.m.sys.canonical();
                     let end = self.m.sys.now() + table.seal_ns + table.sweep_ns;
@@ -1454,6 +1538,7 @@ impl Run {
                     serial: 1,
                 };
                 self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
             }
             // 2: forged `Release` for a live grant `f` holds while `uses[f]`
             // still counts leaves > 0: refused by the granter (D-141).
@@ -1478,6 +1563,7 @@ impl Run {
                     let header = RingHeader::new(NodeMessage::Release, 1, (f, fg), gg, None);
                     let body = Body::Release { grant, serial };
                     self.m.sys.inject(f, granter, Message { header, body });
+                    self.forged(f, granter);
                 }
             }
             // 3: forged `RevokeStep` naming a credit `to` does not have in
@@ -1492,6 +1578,7 @@ impl Run {
                 );
                 let body = Body::RevokeStep { removed: true };
                 self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
             }
             // 4: forged `UnitRequest` to the IOMMU role holder with a send
             // credit (index 20, outside 0..16): refused by the holder's
@@ -1515,6 +1602,7 @@ impl Run {
                         op: crate::rings::UnitOp::Invalidate { domain: Some(1) },
                     };
                     self.m.sys.inject(f, holder, Message { header, body });
+                    self.forged(f, holder);
                 }
             }
             // 5: forged `UnitAnswer` to the IOMMU role holder naming a
@@ -1539,6 +1627,7 @@ impl Run {
                         result: dodos_abi::UnitResult::Done,
                     };
                     self.m.sys.inject(f, holder, Message { header, body });
+                    self.forged(f, holder);
                 }
             }
             // 6: forged `Send` on the user ring with no credit (`None`,
@@ -1554,6 +1643,7 @@ impl Run {
                 let header =
                     RingHeader::new(NodeMessage::Send, body.entries() as u8, (f, fg), tg, None);
                 self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
             }
             // 7: forged `Report` to `to` with an unused credit: refused by
             // `to` (`credit_in_use`), leaving any active rebuild untouched.
@@ -1565,6 +1655,7 @@ impl Run {
                     items: vec![crate::rings::Item::Device(0, 0)],
                 };
                 self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
             }
             // 8: unreadable raw header on the user ring (length 0 or
             // reserved kind 9): `to` consumes 1 entry, traces `Refused` and
@@ -1573,6 +1664,7 @@ impl Run {
                 let mut bad = RingHeader::new(NodeMessage::Release, 0, (f, fg), tg, None);
                 bad.kind = 9;
                 self.m.sys.inject_raw(f, to, true, bad, 1);
+                self.forged(f, to);
             }
             // 9: early `beacons[f].acked[x] = g` and `maps_of[x] = false`
             // written by `f` (when `f` holds no unit role, has run R0 and
@@ -1794,22 +1886,33 @@ fn report(reach: &Reach) -> Vec<String> {
     missing
 }
 
+/// The combinations the 26 seeds of `verify` do not reach, measured
+/// (`DODOS_COUNTS=1` prints them).
+const MISSED_BY_26_SEEDS: usize = 474;
+
 /// The run of `verify`: 26 seeds spread over the triples of drivers, so
 /// that each driver is among them; the check after every step and the
 /// liveness of each seed are asserted, and each event is reached.
 #[test]
 fn combined_recovery_states_between_nodes() {
-    if !super::explore::once() {
-        return;
-    }
     // Over the three rounds of the triples, one per architecture.
     let seeds = 3 * 286;
     let reach = explore((0..26).map(|i| i * seeds / 26).collect());
-    let _ = report(&reach);
+    let missing = report(&reach);
     if replayed().is_none() {
         for e in 0..EVENTS {
             assert!(reach.events[e] > 0, "the seeds never reach {}", NAMES[e]);
         }
+        // The 26 seeds reach part of the combinations only (the long run
+        // below asserts every one): as many as they reached when this was
+        // measured, so a change that loses some fails here (the audit of
+        // lot 8a, F1: the list was thrown away).
+        assert!(reach.refused > 0, "no forged message seen refused");
+        assert!(
+            missing.len() <= MISSED_BY_26_SEEDS,
+            "{} combinations never reached, {MISSED_BY_26_SEEDS} measured: {missing:#?}",
+            missing.len()
+        );
     }
 }
 
@@ -1842,9 +1945,6 @@ fn every_combination_of_recovery_states_is_reached() {
 // reclaims and accuses nothing once it has written sealed.
 #[test]
 fn seed_867_of_pass_28_a_node_that_wrote_sealed_accuses_no_one() {
-    if !super::explore::once() {
-        return;
-    }
     let reach = explore(vec![867]);
     assert!(reach.events[SEALED] > 0);
 }
@@ -1854,9 +1954,6 @@ fn seed_867_of_pass_28_a_node_that_wrote_sealed_accuses_no_one() {
 // reserve. Only a live or sealing node writes fencing.
 #[test]
 fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
-    if !super::explore::once() {
-        return;
-    }
     let reach = explore(vec![1434]);
     assert!(reach.events[FRESH] > 0);
 }
@@ -1870,8 +1967,5 @@ fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
 // goes to a node with one in flight (Roles, the reports are pulled).
 #[test]
 fn a_late_report_of_a_node_passed_over_moves_no_rebuild() {
-    if !super::explore::once() {
-        return;
-    }
     let _ = explore_one(1109);
 }

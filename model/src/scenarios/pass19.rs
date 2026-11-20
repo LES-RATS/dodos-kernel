@@ -43,7 +43,9 @@ fn a_core_that_answers_again_replenishes_its_contexts_whose_instant_has_passed()
 // devices, and the attach word of each device identifier (findings 12 of
 // the tenth model review, B.3.1 and B.3.2 of Hydrogen's verification).
 
-use super::pass17::{hold_identifier, holder_requester_third, iospace_root, judged, kill};
+use super::pass17::{
+    hold_identifier, holder_requester_third, iospace_root, judged, judged_on, kill,
+};
 use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attached, three};
 use crate::rings::UnitOp;
 use dodos_abi::{AttachState, AttachWord, PageClass};
@@ -51,7 +53,6 @@ use dodos_abi::{AttachState, AttachWord, PageClass};
 #[test]
 fn the_holder_refuses_a_root_pinned_by_the_requester_unless_its_class_is_an_iospace_root() {
     let (mut m, holder, requester, _) = holder_requester_third();
-    hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let root = iospace_root(&mut m, requester, 0x10);
     let attach = UnitOp::Attach {
@@ -65,16 +66,20 @@ fn the_holder_refuses_a_root_pinned_by_the_requester_unless_its_class_is_an_iosp
             std::sync::Arc::make_mut(&mut t.classes).insert(page, class.expect("a class"));
         });
     };
+    // Class bytes only a faulty gate writes, which the check reports and
+    // the holder's gate refuses all the same.
+    let unrooted = format!("node {requester}: 59: page classes");
+    let by = (holder, requester, 0);
     // A lower table named as root: the unit would read its leaves as table
     // pointers into pages the node can write (B.3.1).
     class(&mut m, PageClass::iospace_table(1));
-    assert!(judged(&mut m, holder, requester, 0, attach));
+    assert!(judged_on(&mut m, &unrooted, by, attach));
     // A data page of the requester, the attach word pinned with it.
     class(&mut m, Some(PageClass::DATA));
-    assert!(judged(&mut m, holder, requester, 0, attach));
+    assert!(judged_on(&mut m, &unrooted, by, attach));
     // A root with no device pinned to it.
     class(&mut m, PageClass::iospace_root(0));
-    assert!(judged(&mut m, holder, requester, 0, attach));
+    assert!(judged_on(&mut m, &unrooted, by, attach));
     class(&mut m, PageClass::iospace_root(1));
     assert!(!judged(&mut m, holder, requester, 0, attach));
     // Served: the holder's gate moved the word to attached.
@@ -85,17 +90,20 @@ fn the_holder_refuses_a_root_pinned_by_the_requester_unless_its_class_is_an_iosp
 #[test]
 fn the_holder_refuses_an_attach_that_the_requesters_gate_did_not_pin() {
     let (mut m, holder, requester, _) = holder_requester_third();
-    hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     // A root of the requester's class, but pinned for another device: the
-    // requester's kernel forged the operands in its ring (B.3.2).
+    // requester's kernel forged the operands in its ring (B.3.2). Device
+    // 0x10 is held by the requester with no word of its own, a state the
+    // check reports (an identifier is taken at the pin).
     let root = iospace_root(&mut m, requester, 0x11);
+    hold_identifier(&mut m, requester, 0x10);
     let forged = UnitOp::Attach {
         device: 0x10,
         domain: own,
         root,
     };
-    assert!(judged(&mut m, holder, requester, 0, forged));
+    let unpinned = format!("node {requester}: 88: identifier words and attached devices");
+    assert!(judged_on(&mut m, &unpinned, (holder, requester, 0), forged));
     assert_eq!(m.sys.canonical().attach_word(0x10), AttachWord::NONE);
 }
 

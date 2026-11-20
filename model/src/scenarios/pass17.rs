@@ -581,7 +581,10 @@ pub(super) fn holder_requester_third() -> (S, u16, u16, u16) {
 }
 
 /// The holder judges `op` from `requester`; returns whether its gate
-/// refused it, and checks that a refusal changed nothing on the unit.
+/// refused it, and checks that a refusal changed nothing on the unit. The
+/// state before the request holds every invariant, so that the check after
+/// it judges what the request did (the audit of lot 8a, F2: the check was
+/// compared with a fault already there).
 pub(super) fn judged(
     m: &mut S,
     holder: u16,
@@ -589,16 +592,35 @@ pub(super) fn judged(
     role: usize,
     op: crate::rings::UnitOp,
 ) -> bool {
+    judged_from(m, Ok(()), (holder, requester, role), op)
+}
+
+/// As `judged`, on a state the check refuses before the request with
+/// `fault`, one only a faulty gate writes (a class byte), which the
+/// holder's gate must still judge: the check reports that same fault
+/// before and after the request.
+pub(super) fn judged_on(
+    m: &mut S,
+    fault: &str,
+    (holder, requester, role): (u16, u16, usize),
+    op: crate::rings::UnitOp,
+) -> bool {
+    judged_from(m, Err(fault.to_string()), (holder, requester, role), op)
+}
+
+fn judged_from(
+    m: &mut S,
+    checked: Result<(), String>,
+    (holder, requester, role): (u16, u16, usize),
+    op: crate::rings::UnitOp,
+) -> bool {
     let epoch = m.sys.role(role).epoch();
     let before = m.sys.node(holder).refused.0;
     let unit = m.sys.node(holder).table.units.get(&role).cloned();
-    // Some callers write a state by hand that the check refuses before the
-    // call (a word of another node, a line of no claim): the call adds no
-    // fault of its own.
-    let checked = m.sys.check();
+    assert_eq!(m.sys.check(), checked, "the state before the request");
     let model = m.sys.node_mut(holder);
     model.unit_requested_with_record(requester, Some((0, 1)), (role as u16, epoch, op));
-    assert_eq!(m.sys.check(), checked);
+    assert_eq!(m.sys.check(), checked, "the state after the request");
     let refused = m.sys.node(holder).refused.0 == before + 1;
     if refused {
         // A refused request "is not written to the unit": none of its
@@ -610,12 +632,25 @@ pub(super) fn judged(
     refused
 }
 
-/// A page of a node's floor made an iospace's root, with `device` pinned to
-/// it by the node's gate (G9, the attach word, D-137): what a correct
-/// requester names in an attach.
+/// The root of a real iospace of `node`, retyped from its table untyped
+/// (in a table chunk, D-154), with `device` pinned to it by the node's gate
+/// (G9, the attach word, D-137), its identifier word taken by the node in
+/// the same write: what a correct requester names in an attach. (The audit
+/// of lot 8a, F2: the root was a page of the ordinary floor, a state the
+/// check refuses since D-154.)
 pub(super) fn iospace_root(m: &mut S, node: u16, device: u16) -> u64 {
-    let at = m.sys.canonical().floors[node as usize][0].0;
+    let slot = 180 + u32::from(device);
+    let iospace = m.retype(node, ObjectKind::IoSpace, 0, slot);
+    m.ok(node, iospace);
+    let at = {
+        let model = m.sys.node(node);
+        let object = model.object_at(m.t[node as usize], s(slot)).unwrap();
+        model.aspaces[&object].root.unwrap()
+    };
+    let generation = m.sys.canonical().generation(node);
     m.sys.edit_table(|t| {
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation);
+        t.identifiers.insert(u32::from(device), taken.raw());
         let pinned = dodos_abi::AttachWord::new(dodos_abi::AttachState::Pinned, at);
         t.attach
             .insert(u32::from(device), pinned.expect("a root").raw());
@@ -646,7 +681,6 @@ pub(super) fn hold_identifier(m: &mut S, node: u16, device: u16) {
 #[test]
 fn the_holder_refuses_an_attach_under_a_domain_number_of_another_node() {
     let (mut m, holder, requester, third) = holder_requester_third();
-    hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let other = *m.sys.node(holder).domain_range(0, third).start();
     let root = iospace_root(&mut m, requester, 0x10);
@@ -664,7 +698,8 @@ fn the_holder_refuses_an_attach_under_a_domain_number_of_another_node() {
 #[test]
 fn the_holder_refuses_an_attach_of_a_device_whose_identifier_word_names_another_node() {
     let (mut m, holder, requester, third) = holder_requester_third();
-    hold_identifier(&mut m, third, 0x10);
+    // The third node holds the device, pinned to its own root.
+    iospace_root(&mut m, third, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let op = crate::rings::UnitOp::Attach {
         device: 0x10,
@@ -677,7 +712,6 @@ fn the_holder_refuses_an_attach_of_a_device_whose_identifier_word_names_another_
 #[test]
 fn the_holder_refuses_a_detach_of_a_context_entry_of_another_node() {
     let (mut m, holder, requester, third) = holder_requester_third();
-    hold_identifier(&mut m, third, 0x10);
     let domain = *m.sys.node(holder).domain_range(0, third).start();
     let root = iospace_root(&mut m, third, 0x10);
     let attach = crate::rings::UnitOp::Attach {
@@ -735,8 +769,14 @@ fn the_holder_of_an_ioapic_refuses_a_redirection_entry_aimed_at_another_nodes_co
         true => (third, (0..3).find(|&n| n != holder && n != third).unwrap()),
         false => (requester, third),
     };
-    // The requester's claim of the line took its word (D-135).
-    hold_line(&mut m, requester, 5);
+    // The requester's claim of the line took its word (D-135): a real
+    // claim, so that the state before each request holds every invariant
+    // (the audit of lot 8a, F2: the word was written by hand, with no irq).
+    let line = dodos_abi::IrqSource::line(5, false, false).raw();
+    let outcome = m.call(requester, claim(line, 50, 200));
+    assert_eq!(outcome, WAITS);
+    m.run(30 * MS);
+    assert!(m.woken(requester).is_some_and(|o| o.is_ok()));
     let redirection = |target| crate::rings::UnitOp::Redirection {
         gsi: 5,
         claimed: true,

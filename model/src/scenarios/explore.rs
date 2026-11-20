@@ -12,8 +12,10 @@
 //!
 //! A failure names its seed, and the run replays from it.
 //!
-//! These scenarios do not depend on the page: they run once, in the run of
-//! `verify` without `DODOS_PAGE`.
+//! These scenarios do not depend on the page: `verify` runs them once,
+//! without `DODOS_PAGE`, and skips them by name in its runs of 16 KB and
+//! 32 KB pages (they pass there too; the audits of lot 8a, F12 and F45:
+//! they returned before their first assertion there, reported as passed).
 
 use super::pass17::{fresh, kill, seal};
 use super::*;
@@ -22,10 +24,6 @@ use crate::system::Rng;
 use dodos_abi::NODE_START_RESUME;
 
 const SEEDS: u64 = 24;
-
-pub(super) fn once() -> bool {
-    std::env::var("DODOS_PAGE").is_err()
-}
 
 /// The seed `DODOS_SEED` names, read once: a value that does not parse is
 /// refused, never taken as unset (ver2-D 7).
@@ -212,9 +210,6 @@ fn reached(what: &str, count: usize) {
 
 #[test]
 fn crossing_a_release_and_a_revoke_of_one_grant_in_every_order() {
-    if !once() {
-        return;
-    }
     let mut crossings = 0;
     for seed in seeds(SEEDS) {
         say(format_args!("seed {seed}"));
@@ -330,9 +325,6 @@ fn resume_asks_a_unit(m: &S) -> bool {
 
 #[test]
 fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
-    if !once() {
-        return;
-    }
     let (mut reached_failed, mut pinned, mut resumed_kept) = (0, 0, 0);
     let mut resume_asked_unit = 0;
     for seed in seeds(SEEDS) {
@@ -510,9 +502,6 @@ fn a_unit_fails_under_a_granted_frame_at_any_step_of_its_use() {
 
 #[test]
 fn unit_a_request_across_a_hand_over_and_the_deaths_of_its_parties() {
-    if !once() {
-        return;
-    }
     let mut handed = 0;
     for seed in seeds(SEEDS) {
         let mut rng = Rng(seed + 101);
@@ -596,9 +585,6 @@ fn applied_handed(m: &S) -> usize {
 
 #[test]
 fn rings_a_send_and_a_signal_while_the_sender_seals_and_the_receiver_dies_and_starts_fresh() {
-    if !once() {
-        return;
-    }
     for seed in seeds(SEEDS) {
         let mut rng = Rng(seed + 201);
         let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
@@ -674,9 +660,9 @@ fn rings_a_send_and_a_signal_while_the_sender_seals_and_the_receiver_dies_and_st
 
 #[test]
 fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_dies() {
-    if !once() {
-        return;
-    }
+    // What the seeds reach (the audit of lot 8a, F12: nothing showed a send
+    // in flight when node 1 died, or a waiting sender destroyed).
+    let (mut in_flight_at_death, mut waiter_destroyed) = (0, 0);
     for seed in seeds(SEEDS) {
         let mut rng = Rng(seed + 301);
         let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
@@ -693,7 +679,7 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
             match rng.below(8) {
                 0 => {
                     let k = rng.below(3);
-                    let (_, thread) = senders[k];
+                    let (slot, thread) = senders[k];
                     let ready = m.sys.has(0)
                         && m.sys.node(0).threads.contains_key(&thread)
                         && m.sys.node(0).runnable().contains(&thread);
@@ -709,15 +695,26 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
                             },
                             doorbell: SlotAddr::NONE,
                         };
-                        let _ = m.call_by(0, thread, send);
+                        // Steered: one time in two, the sender is destroyed
+                        // while it waits for the answer.
+                        if m.call_by(0, thread, send) == WAITS && rng.below(2) == 0 {
+                            let deleted = try_call(&mut m, 0, Syscall::CapDelete(s(slot)));
+                            waiter_destroyed += usize::from(deleted.is_some());
+                        }
                     }
                 }
                 1 => {
-                    let (slot, _) = senders[rng.below(3)];
-                    let _ = try_call(&mut m, 0, Syscall::CapDelete(s(slot)));
+                    let (slot, thread) = senders[rng.below(3)];
+                    let waiting = m.sys.has(0)
+                        && m.sys.node(0).threads.contains_key(&thread)
+                        && !m.sys.node(0).runnable().contains(&thread);
+                    let deleted = try_call(&mut m, 0, Syscall::CapDelete(s(slot)));
+                    waiter_destroyed += usize::from(waiting && deleted.is_some());
                 }
                 2 => {
-                    let _ = try_call(&mut m, 2, kill(1));
+                    let sends = m.sys.has(0) && m.sys.node(0).peers[1].sends().0 > 0;
+                    let killed = try_call(&mut m, 2, kill(1)) == Some(DONE);
+                    in_flight_at_death += usize::from(sends && killed);
                 }
                 _ => churn(&mut m, &mut rng),
             }
@@ -729,6 +726,11 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
         assert_eq!(m.sys.node(0).peers[1].sends().0, 0, "seed {seed}");
         assert_live(&m, seed, 3);
     }
+    reached(
+        "a send in flight when its receiver is killed",
+        in_flight_at_death,
+    );
+    reached("a waiting sender destroyed", waiter_destroyed);
 }
 
 // The kernel-shape explorer: the fence of a node of several cores, the
@@ -736,9 +738,10 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
 
 #[test]
 fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
-    if !once() {
-        return;
-    }
+    // What the seeds reach (the audit of lot 8a, F12): each kind of step
+    // done at least once, and the end states the liveness judges.
+    let mut done = [0usize; 4];
+    let (mut hangs, mut unfenced, mut dead) = (0, 0, 0);
     for seed in seeds(SEEDS) {
         let mut rng = Rng(seed + 401);
         let arch = [Arch::X86_64, Arch::Aarch64, Arch::Riscv64][seed as usize % 3];
@@ -752,13 +755,13 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
             let victim = (actor + 1 + rng.below(2) as u16) % 3;
             match rng.below(9) {
                 0 => {
-                    let _ = try_call(&mut m, actor, kill(victim));
+                    done[0] += usize::from(try_call(&mut m, actor, kill(victim)) == Some(DONE));
                 }
                 1 => {
-                    let _ = try_call(&mut m, actor, seal(victim));
+                    done[1] += usize::from(try_call(&mut m, actor, seal(victim)) == Some(DONE));
                 }
                 2 => {
-                    let _ = try_call(&mut m, actor, resume(victim));
+                    done[2] += usize::from(try_call(&mut m, actor, resume(victim)) == Some(DONE));
                 }
                 3 => {
                     let mask = match victim {
@@ -767,6 +770,7 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
                         _ => 0b10000,
                     };
                     if try_call(&mut m, actor, fresh(victim, mask)) == Some(DONE) {
+                        done[3] += 1;
                         m.run(3 * MS);
                         refresh(&mut m);
                     }
@@ -785,6 +789,7 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
                         say(format_args!("{} hang core {core} nmi {nmi}", m.sys.now()));
                         m.hang(core, nmi);
                         hung = true;
+                        hangs += 1;
                         unstoppable =
                             !nmi && (arch == Arch::Aarch64 || (arch == Arch::X86_64 && core == 0));
                     }
@@ -820,18 +825,26 @@ fn deaths_seals_resumes_and_fresh_starts_of_nodes_of_several_cores() {
                 state != MemberState::Unfenced || unstoppable,
                 "seed {seed}: node {n} unfenced with every core stoppable"
             );
+            unfenced += usize::from(state == MemberState::Unfenced);
+            dead += usize::from(state == MemberState::Dead);
         }
         assert_live(&m, seed, 3);
     }
+    for (what, count) in ["a kill", "a seal", "a resume", "a fresh start"]
+        .into_iter()
+        .zip(done)
+    {
+        reached(what, count);
+    }
+    reached("a hung core", hangs);
+    reached("a node left unfenced", unfenced);
+    reached("a node left dead", dead);
 }
 
 // The kernel-shape explorer: `credits`.
 
 #[test]
 fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
-    if !once() {
-        return;
-    }
     let mut full = 0;
     for seed in seeds(SEEDS / 2) {
         let mut rng = Rng(seed + 501);
@@ -910,9 +923,6 @@ fn credits_user_and_kernel_messages_with_receivers_that_never_read() {
 
 #[test]
 fn a_core_stops_in_the_middle_of_a_request_of_another_core() {
-    if !once() {
-        return;
-    }
     let mut stopped_in_request = 0;
     for seed in seeds(SEEDS / 2) {
         let mut rng = Rng(seed + 601);

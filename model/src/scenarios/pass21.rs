@@ -21,6 +21,19 @@ pub(super) fn attached_on_the_first_of_three_units() -> (S, u64) {
     (m, word.root())
 }
 
+/// Node 0 asks the detach of the device by `iospace_attach` with iospace
+/// 0, and the machine runs until the holder has served it and its answer
+/// is not yet consumed: the context entry is gone and the attach word reads
+/// *detached* with `root`. (The audit of lot 8a, F2: the word was written
+/// by hand beside the context entry, a state G9 refuses.)
+fn detached_by_its_owner(m: &mut S, root: u64) {
+    use super::units::{DEVICE, attach};
+    let detach = attach(m, 0, 0, DEVICE);
+    assert_eq!(m.call(0, detach), WAITS);
+    let detached = AttachWord::new(AttachState::Detached, root).unwrap();
+    assert!(m.step_until(|m| m.sys.canonical().attach_word(DEVICE as u32) == detached));
+}
+
 // Devices and shared hardware, the operands of each operation: a detach is
 // tied to its requester as an attach is (D-140).
 
@@ -43,10 +56,7 @@ fn a_forged_detach_from_another_node_through_another_unit_is_refused() {
     assert_eq!(word.state(), Some(AttachState::Attached));
     // Even where the word reads *detached* with that root, the identifier
     // word names node 0, not the requester.
-    let detached = AttachWord::new(AttachState::Detached, root).unwrap().raw();
-    m.sys.edit_table(|t| {
-        t.attach.insert(DEVICE as u32, detached);
-    });
+    detached_by_its_owner(&mut m, root);
     assert!(super::pass17::judged(&mut m, holder, 1, role, forged));
 }
 
@@ -65,10 +75,7 @@ fn an_owners_detach_on_the_wrong_unit_with_no_entry_is_refused_unless_the_word_r
     assert!(super::pass17::judged(&mut m, holder, 0, role, detach));
     // A detach served again once the word reads *detached* with that root:
     // accepted, it is idempotent.
-    let detached = AttachWord::new(AttachState::Detached, root).unwrap().raw();
-    m.sys.edit_table(|t| {
-        t.attach.insert(DEVICE as u32, detached);
-    });
+    detached_by_its_owner(&mut m, root);
     assert!(!super::pass17::judged(&mut m, holder, 0, role, detach));
     // With another root, refused.
     let other = UnitOp::Detach {

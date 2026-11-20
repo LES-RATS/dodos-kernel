@@ -5,20 +5,22 @@ cd "$(dirname "$0")"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-# The page size is a value of the machine (D-121): the tests whose rules
-# involve the page run again on two more geometries, 16 KB pages (three
-# levels, 47 bits) and 32 KB pages (E = 4,096, 51 bits). Debugging is among
-# them: its breakpoint words are judged against the user range end. The
-# tests of membership, roles, scheduling, interrupts and tasks do not
-# depend on the page and run once, above.
+# The page size is a value of the machine (D-121): every test file runs
+# again on two more geometries, 16 KB pages (three levels, 47 bits) and
+# 32 KB pages (E = 4,096, 51 bits); the cores, interrupts, scheduling and
+# tasks files are among them (the audit of lot 8b, F1: a test of cores
+# assumed 4 KB pages and no run showed it). The seeded explorations of
+# the shape of nodes do not depend on the page and are long: they run
+# once, above, and are skipped here by name.
 # The two runs share the binaries the first run built (the page is read at
 # run time), so they run side by side; each must pass.
 geometry() {
 	DODOS_PAGE=$1 cargo test -p dodos-model --lib \
-		--test blocks --test boot --test calls \
+		--test blocks --test boot --test calls --test cores \
 		--test debug --test faults --test gate_attack --test gate_classes \
-		--test gate_words --test generations --test memory \
-		--test property --test verify7_deepseek
+		--test gate_words --test generations --test irq --test memory \
+		--test property --test sched --test tasks --test verify7_deepseek \
+		-- --skip scenarios::explore:: --skip scenarios::combinations::
 }
 geometry 16k &
 sixteen=$!

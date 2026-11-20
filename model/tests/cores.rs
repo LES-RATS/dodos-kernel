@@ -170,18 +170,27 @@ fn thread_size_is_the_power_of_two_above_its_area() {
     let amx = FeatureMask::from_raw(1 << AMX);
     assert_eq!(thread_bytes(amx, list, &kind), Some(16384));
     // The untyped gives a thread of mask AMX 16 KB, one of mask 0 2 KB, each
-    // aligned on its size or on a page if larger (`untyped_retype`): AMX at
-    // 0, mask 0 at 16 KB, AMX at 20 KB, ending at 36 KB (the final review's
-    // F2 Opus 8: the identities compared always rose, and the comment
-    // placed the third at 32 KB).
+    // aligned on its size, or on a page if it is larger (`untyped_retype`).
+    // With 4 KB pages: AMX at 0, mask 0 at 16 KB, AMX at 20 KB, ending at
+    // 36 KB (the final review's F2 Opus 8: the identities compared always
+    // rose, and the comment placed the third at 32 KB). With 16 KB and
+    // 32 KB pages the second AMX is aligned on 16 KB: at 32 KB, ending at
+    // 48 KB (the audit of lot 8b, F1: the 4 KB offsets were written in).
     let mut k = K::new();
+    let page = k.m.geometry().page();
+    let next = |at: u64, size: u64| at.next_multiple_of(size.min(page)) + size;
     let watermark = |k: &K| k.m.untyped_marks(k.t, UT).unwrap().0;
     k.ok(retype(Thread, 1 << AMX, 100));
     let first = watermark(&k) - (16 << 10);
     k.ok(retype(Thread, 0, 101));
-    assert_eq!(watermark(&k), first + (16 << 10) + 2048);
+    let second = next(first + (16 << 10), 2048);
+    assert_eq!(watermark(&k), second);
+    assert_eq!(second, first + (16 << 10) + 2048);
     k.ok(retype(Thread, 1 << AMX, 102));
-    assert_eq!(watermark(&k), first + (36 << 10));
+    let third = next(second, 16 << 10);
+    assert_eq!(watermark(&k), third);
+    let end = if page == 4096 { 36 << 10 } else { 48 << 10 };
+    assert_eq!(third, first + end);
 }
 
 #[test]

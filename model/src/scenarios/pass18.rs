@@ -286,13 +286,13 @@ fn a_line_claim_served_at_once_by_the_claimers_own_ioapic_returns_its_result() {
 // model review, finding 6 and its mutations M26 and M31; Devices and shared
 // hardware, the operands of each operation, G9).
 
-use super::pass17::{hold_identifier, holder_requester_third, iospace_root, judged};
+use super::pass17::{holder_requester_third, iospace_root, judged};
 use crate::rings::{Target, UnitOp};
 
 #[test]
 fn the_holder_refuses_an_attach_whose_root_is_not_an_iospace_table_of_the_requester() {
     let (mut m, holder, requester, third) = holder_requester_third();
-    hold_identifier(&mut m, requester, 0x10);
+    let root = iospace_root(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let attach = |root| UnitOp::Attach {
         device: 0x10,
@@ -306,14 +306,12 @@ fn the_holder_refuses_an_attach_whose_root_is_not_an_iospace_table_of_the_reques
     assert!(judged(&mut m, holder, requester, 0, attach(0)));
     assert!(judged(&mut m, holder, requester, 0, attach(data)));
     assert!(judged(&mut m, holder, requester, 0, attach(foreign)));
-    let root = iospace_root(&mut m, requester, 0x10);
     assert!(!judged(&mut m, holder, requester, 0, attach(root)));
 }
 
 #[test]
 fn the_holder_refuses_a_detach_of_the_requesters_device_under_another_domain_number() {
     let (mut m, holder, requester, _) = holder_requester_third();
-    hold_identifier(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let root = iospace_root(&mut m, requester, 0x10);
     let attach = UnitOp::Attach {

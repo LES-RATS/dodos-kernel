@@ -40,7 +40,9 @@ fn take_over(m: &mut S, killer: Option<u16>) -> u16 {
     assert!(holder != 0 && holder != 3);
     let epoch = m.sys.role(IOMMU_ROLE).epoch();
     m.ok(0, kill(holder));
+    let end = m.sys.now() + 100 * MS;
     while m.state(holder) != MemberState::Fenced {
+        assert!(m.sys.now() < end, "the holder is never fenced");
         m.run(10_000);
     }
     start_3(m, killer);
@@ -164,7 +166,9 @@ fn a_resume_under_a_rebuild_reports_and_both_end() {
     m.ok(3, kill(0));
     m.run(dodos_abi::FENCE_NS + MS);
     m.ok(3, kill(holder));
+    let end = m.sys.now() + 100 * MS;
     while m.state(holder) != MemberState::Fenced {
+        assert!(m.sys.now() < end, "the holder is never fenced");
         m.run(10_000);
     }
     // At the holder's fence, node 2 resumes: its member word carries the

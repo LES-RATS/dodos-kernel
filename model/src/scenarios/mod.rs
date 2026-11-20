@@ -44,6 +44,11 @@ pub(crate) const DONE: Outcome = Ok(Output::Done);
 pub(crate) const WAITS: Outcome = Ok(Output::Waits);
 pub(crate) const MS: u64 = 1_000_000;
 
+/// The most calls `ok` makes of one `untyped_retype` that returns `again`
+/// (each clears a bounded part): a call still `again` after them fails the
+/// test instead of hanging it (the audits of lot 8a, F14 and F09).
+const RETYPE_STEPS: u32 = 40_000;
+
 pub(crate) const fn s(index: u32) -> SlotAddr {
     SlotAddr::own(index)
 }
@@ -198,7 +203,10 @@ impl N {
     #[track_caller]
     pub(crate) fn ok(&mut self, call: Syscall) {
         let mut outcome = self.call(self.t, call.clone());
+        let mut steps = 0;
         while matches!(call, Syscall::UntypedRetype { .. }) && outcome == Err(Error::Again) {
+            steps += 1;
+            assert!(steps < RETYPE_STEPS, "{call:?} never ends");
             outcome = self.call(self.t, call.clone());
         }
         assert_eq!(outcome, DONE, "{call:?}");
@@ -429,7 +437,10 @@ impl S {
     #[track_caller]
     pub(crate) fn ok(&mut self, node: u16, call: Syscall) {
         let mut outcome = self.call(node, call.clone());
+        let mut steps = 0;
         while matches!(call, Syscall::UntypedRetype { .. }) && outcome == Err(Error::Again) {
+            steps += 1;
+            assert!(steps < RETYPE_STEPS, "{call:?} never ends");
             outcome = self.call(node, call.clone());
         }
         assert_eq!(outcome, DONE, "{call:?}");
