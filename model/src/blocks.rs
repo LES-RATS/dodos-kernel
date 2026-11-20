@@ -220,11 +220,16 @@ impl Model {
     /// A faulty kernel's call of its gate, its derivation list ignored:
     /// give chunk `chunk` to node `to` (D-148). The gate checks what it
     /// owns: the chunk's owner word taken by this node's generation, its
-    /// map count and its grant count 0 (G5). Says whether it gave.
+    /// map count and its grant count 0 (G5), and that no request of the
+    /// node names a give or a destruction of the chunk (the gate's `busy`,
+    /// D-159, settling gap 49). Says whether it gave.
     pub fn gate_give_chunk(&mut self, chunk: u64, to: u16) -> bool {
         let Some(&raw) = self.table.owners.get(chunk as usize) else {
             return false;
         };
+        if self.run_in_flight(chunk) {
+            return false;
+        }
         let generation = self.table.generation(self.node);
         let owned = Ownership::from_raw(raw).is_some_and(|w| {
             w.state() == dodos_abi::OwnState::Taken
@@ -240,6 +245,19 @@ impl Model {
         }
         self.table
             .write_owner(self.node, chunk, raw, Ownership::free(Owner::Node(to)))
+    }
+
+    /// Whether a request of the node names a give or a destruction of
+    /// `chunk` (The machine table, releasing and giving; D-159).
+    fn run_in_flight(&self, chunk: u64) -> bool {
+        let shift = self.table.geometry.chunk_shift();
+        let requests = self.cores.iter().filter_map(|c| c.request.as_ref());
+        requests
+            .filter_map(|r| match &r.completes {
+                crate::cores::Completes::Run(freed) => Some(freed),
+                _ => None,
+            })
+            .any(|freed| freed.block == Block::Run && freed.chunks(shift).contains(&chunk))
     }
 
     /// A faulty kernel's call of its gate: change page `page`, of its own
@@ -482,8 +500,13 @@ impl Model {
 
     /// Each word of a block becomes free, in ascending order, through the
     /// gate: with the same owner for a destruction (the reserve's code for
-    /// a reserve chunk), with the node named for a give.
+    /// a reserve chunk), with the node named for a give. Each is written by
+    /// compare-and-swap from the value read when the request was opened,
+    /// *taken* by this node with its generation: a word that reads
+    /// anything else is no longer this request's to write (The machine
+    /// table, releasing and giving; D-159).
     pub(crate) fn write_freed(&mut self, run: FreedRun) {
+        let generation = self.table.generation(self.node);
         let owner = |before: u64| match (run.freed, Ownership::from_raw(before).map(|w| w.owner()))
         {
             (Freed::Given(node), _) => Owner::Node(node),
@@ -494,6 +517,9 @@ impl Model {
             Block::Run => {
                 for chunk in run.chunks(self.table.geometry.chunk_shift()) {
                     let before = self.table.owners[chunk as usize];
+                    if !self.table.taken_by(before, self.node, generation) {
+                        continue;
+                    }
                     let after = Ownership::free(owner(before));
                     assert!(self.table.write_owner(self.node, chunk, before, after));
                 }

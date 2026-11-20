@@ -117,7 +117,9 @@ impl Model {
         // A role already in a hand-over, or rebuilding, is on its way out
         // or not yet served: `busy`, as `hand_all_units` judges it (the
         // final review's verification of lot C, O18 and H17: a second call
-        // orphaned the first, which never returned).
+        // orphaned the first, which never returned; Roles, the planned
+        // hand-over, D-159: "never while X rebuilds u: `role_hand` is then
+        // `busy`").
         if self.handing.contains_key(&role) || self.rebuilds.contains_key(&role) {
             return Err(Error::Busy);
         }
@@ -204,9 +206,11 @@ impl Model {
             done = false;
             // A unit this node is rebuilding is not handed yet: the seal
             // waits for the rebuild, which ends in bounded time, as
-            // `role_hand` is `busy` for it (a hand-over begun under a
-            // rebuild dropped the rebuild before its closing invalidation
-            // and left its `ReportAsk` credits in use for ever).
+            // `role_hand` is `busy` for it (Roles, D-159: "a sealing node
+            // begins the hand-over of u when its rebuild has ended"; a
+            // hand-over begun under a rebuild dropped the rebuild before
+            // its closing invalidation and left its `ReportAsk` credits in
+            // use for ever).
             if self.rebuilds.contains_key(&role) {
                 continue;
             }

@@ -113,28 +113,19 @@ impl Model {
 
     /// Kind 9 kept from a #DB at CPL0, raised as the fault *no context* is:
     /// at the end of the event in which its thread is runnable with a
-    /// context, before it runs any user instruction, words 0 and 1 where it
-    /// would resume and its stack pointer, word 3 the hits of bits 32-35,
-    /// word 4 the DR6 value of bits 0-31; a fault of the entry itself goes
-    /// first, a thread also marked *no context* raises kind 8 first and
-    /// keeps kind 9, and a thread that waits or is suspended keeps it;
-    /// raising it, delivered or recorded, clears the word (D-146, D-147).
-    ///
-    /// CONTRACT-GAP 51 (Debugging, kind 9 from a #DB at CPL0; Scheduling
-    /// contexts): the kept fault is "raised at the end of the event in
-    /// which the thread is runnable", and only a thread *marked* no
-    /// context "keeps its kind 9 until it is runnable with a context";
-    /// yet "a thread that has no context and is not marked [...] does not
-    /// run, and raises nothing". For a thread that is not marked and has
-    /// no context (it unbound its own context in the call the #DB came
-    /// with: pass 32's audit, lot 4, L4-05) the two sentences disagree.
-    /// The reading here, which the checker's rule KIND 9 holds too: it is
-    /// runnable, so the fault is raised, and recorded if nobody takes it.
+    /// configured context, before it runs any user instruction, words 0 and
+    /// 1 where it would resume and its stack pointer, word 3 the hits of
+    /// bits 32-35, word 4 the DR6 value of bits 0-31; a fault of the entry
+    /// itself goes first, a thread also marked *no context* raises kind 8
+    /// first and keeps kind 9, a thread with no context and no mark raises
+    /// nothing and keeps it too (D-159, settling gap 51), and a thread that
+    /// waits or is suspended keeps it; raising it, delivered or recorded,
+    /// clears the word (D-146, D-147).
     pub(crate) fn raise_kept_debug(&mut self) {
         let kept: Vec<ObjId> = self
             .threads
             .iter()
-            .filter(|(_, t)| t.debug_kept.is_some() && !t.lost && Self::runnable_thread(t))
+            .filter(|(id, t)| t.debug_kept.is_some() && self.raises_kept_debug(**id))
             .map(|(&id, _)| id)
             .collect();
         for thread in kept {
@@ -144,6 +135,17 @@ impl Model {
             let (hit, read) = (word >> 32 & 0xF, word & 0xFFFF_FFFF);
             self.raise(thread, FaultKind::HardwareBreakpoint, [1, hit, read]);
         }
+    }
+
+    /// Whether a thread that keeps a kind 9 raises it now: it is runnable
+    /// with a configured context, its own or one lent to it, and is not
+    /// marked *no context* (Debugging, kind 9 from a #DB at CPL0; D-159).
+    /// The checker's rule KIND 9 reads the same condition.
+    pub(crate) fn raises_kept_debug(&self, thread: ObjId) -> bool {
+        let t = &self.threads[&thread];
+        let context = self.context_of(thread);
+        let configured = context.is_some_and(|c| self.scheds[&c].configured);
+        !t.lost && Self::runnable_thread(t) && configured
     }
 
     /// The #DB handler reads DR6 once and loads it with its reset value

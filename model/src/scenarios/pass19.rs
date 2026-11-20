@@ -20,7 +20,7 @@ fn a_core_that_answers_again_replenishes_its_contexts_whose_instant_has_passed()
     {
         let sched = k.m.scheds.get_mut(&context).unwrap();
         sched.remaining = 0;
-        sched.throttled = Some((now, 1));
+        sched.throttled = Some((now, dodos_abi::sched_debt(0, 1)));
         let entered = sched.queue.map(|q| q.entered).unwrap_or(0);
         sched.queue = Some(crate::Queued {
             queue: crate::Queue::Sleeping,

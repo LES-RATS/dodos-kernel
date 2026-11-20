@@ -895,7 +895,10 @@ impl Model {
 
     /// A `Release` received by the granting node: it frees the entry if
     /// its anchor has no descendant, otherwise the anchor stays, held by
-    /// nobody. On a *revoking* entry it ends the revocation as a
+    /// nobody. The entry may be one whose send is not answered yet: it is
+    /// freed all the same, and the answer that comes later finds no entry
+    /// of its serial unanswered and changes nothing (Grants, release by
+    /// the holder, D-159; `send_answered`). On a *revoking* entry it ends the revocation as a
     /// `RevokeStep` reporting the root removed would: the entry is freed,
     /// a `Revoke` of it still in flight stops counting as in flight (its
     /// credit freed, its thread woken with `again`), and the removal step

@@ -1871,7 +1871,8 @@ fn context_with_a_budget_below_10_microseconds_is_reported() {
 fn throttled_context_with_budget_left_is_reported() {
     let broken = spoiled(|m, at| {
         let context = first_context(m, at);
-        live(&mut m.scheds, context).throttled = Some((m.now + 1, 1));
+        let debt = dodos_abi::sched_debt(0, 1);
+        live(&mut m.scheds, context).throttled = Some((m.now + 1, debt));
     });
     // Throttled with its holder runnable: it belongs in a slack queue.
     assert_eq!(broken, "41: queue of a context");

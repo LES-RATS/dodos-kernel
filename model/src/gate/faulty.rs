@@ -314,6 +314,13 @@ pub(crate) enum Op {
         chunk: u64,
         to: u16,
     },
+    /// The destruction of the block of a chunk (its run unmapped, its word
+    /// written *free* with the same owner).
+    DestroyBlock {
+        n: u16,
+        p: usize,
+        chunk: u64,
+    },
     /// An interrupt to core `target` with `vector` (G10).
     Ipi {
         n: u16,
@@ -441,6 +448,7 @@ impl Machine {
             Op::Seal { n } => self.seal(n),
             Op::Resume { n } => self.resume(n),
             Op::Give { n, p, chunk, to } => self.give(n, p, chunk, to),
+            Op::DestroyBlock { n, p, chunk } => self.destroy_block(n, p, chunk),
             Op::Write { n, page, value } => {
                 // Only a data page its node holds is mapped writable in a
                 // kernel's view (G2): any other store faults.
@@ -983,12 +991,15 @@ impl Machine {
                             _ => Take::Ordinary,
                         },
                     },
-                    _ => Op::Give {
-                        n,
-                        p,
-                        chunk,
-                        to: beyond(rng.below(nodes), nodes) as u16,
-                    },
+                    // A give, or one time in four a block's destruction
+                    // (the generator's state read, not advanced).
+                    _ => {
+                        let to = beyond(rng.below(nodes), nodes) as u16;
+                        match rng.0.is_multiple_of(4) {
+                            true => Op::DestroyBlock { n, p, chunk },
+                            false => Op::Give { n, p, chunk, to },
+                        }
+                    }
                 }
             }
             _ => Op::Write {

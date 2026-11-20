@@ -906,19 +906,19 @@ impl Model {
         // once"; finding 4 of the tenth model review, finding 15 of the
         // ninth: invariant 43 failed at a resume).
         let now = self.now;
-        let late: Vec<(ObjId, u64)> = self
+        let late: Vec<(ObjId, dodos_abi::SchedDebt)> = self
             .scheds
             .iter()
             .filter(|(_, sched)| sched.core == position)
             .filter_map(|(&id, sched)| {
-                let (instant, n) = sched.throttled?;
-                (instant <= now).then_some((id, n))
+                let (instant, debt) = sched.throttled?;
+                (instant <= now).then_some((id, debt))
             })
             .collect();
         if !late.is_empty() {
             let entry = self.begin_on(position);
-            for (context, n) in late {
-                self.replenish(context, n);
+            for (context, debt) in late {
+                self.replenish(context, debt);
             }
             self.end(entry);
         }

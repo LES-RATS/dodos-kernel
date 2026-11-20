@@ -858,6 +858,9 @@ pub const ACCESS_PRESENT: u64 = 1 << 3;
 pub const TIME_LIMIT: u64 = 1 << 63;
 pub const SCHED_MIN_BUDGET_NS: u64 = 10_000;
 pub const SCHED_MAX_PERIOD_NS: u64 = 1 << 36;
+/// The budgets of one exhaustion, at most (Exhaustion and replenishment,
+/// D-159): with it n × T and n × B stay below 2^62.
+pub const SCHED_MAX_DEBT: u64 = 1 << 26;
 pub const SCHED_CLASS_FRAME: u64 = 0;
 pub const SCHED_CLASS_INTERACTIVE: u64 = 1;
 pub const SCHED_CLASS_BACKGROUND: u64 = 2;
@@ -909,6 +912,44 @@ pub const fn bandwidth(budget: u64, period: u64) -> u64 {
     } else {
         quotient + 1
     }
+}
+
+/// The budgets of an exhaustion: n, and whether `SCHED_MAX_DEBT` bounded
+/// it, in which case the replenishment writes r = B and the rest of the
+/// debt is forgiven (Exhaustion and replenishment, D-159).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedDebt {
+    pub budgets: u64,
+    pub forgiven: bool,
+}
+
+/// Exhaustion: n = min(1 + ⌊−r / B⌋, `SCHED_MAX_DEBT`) for a remaining
+/// budget r ≤ 0 (a positive one owes nothing: n = 1). A configured
+/// context has B ≥ `SCHED_MIN_BUDGET_NS`; a budget of 0 is read as 1, so
+/// that no value divides by zero.
+pub const fn sched_debt(remaining: i64, budget: u64) -> SchedDebt {
+    let owed = if remaining < 0 {
+        remaining.unsigned_abs()
+    } else {
+        0
+    };
+    let budget = if budget == 0 { 1 } else { budget };
+    let budgets = 1 + owed / budget;
+    SchedDebt {
+        budgets: if budgets < SCHED_MAX_DEBT {
+            budgets
+        } else {
+            SCHED_MAX_DEBT
+        },
+        forgiven: budgets > SCHED_MAX_DEBT,
+    }
+}
+
+/// The instant `budgets` periods after `instant`: a sum of instants
+/// saturates at `TIME_LIMIT` (Exhaustion and replenishment, D-159).
+pub const fn instant_after(instant: u64, budgets: u64, period: u64) -> u64 {
+    let sum = instant.saturating_add(budgets.saturating_mul(period));
+    if sum < TIME_LIMIT { sum } else { TIME_LIMIT }
 }
 
 /// Timers: the firing instant of a timer. With `x` the smaller of deadline +
@@ -1508,6 +1549,55 @@ mod proofs {
         assert!(deadline <= f && f <= x);
         if deadline <= other && other <= x {
             assert!(other.trailing_zeros() <= f.trailing_zeros());
+        }
+    }
+
+    // The two proofs of `sched_debt` share the work so that neither holds
+    // two symbolic multipliers, which Kani does not finish: the bounds for
+    // every budget, the exact payment for the two ends of a budget's range.
+    #[kani::proof]
+    fn the_budgets_of_an_exhaustion_are_bounded_for_every_budget() {
+        let (remaining, budget): (i64, u64) = (kani::any(), kani::any());
+        let debt = sched_debt(remaining, budget);
+        assert!(1 <= debt.budgets && debt.budgets <= SCHED_MAX_DEBT);
+        assert!(!debt.forgiven || debt.budgets == SCHED_MAX_DEBT);
+        // A debt smaller than one budget is one budget.
+        if budget != 0 && remaining > i64::MIN && remaining.unsigned_abs() < budget {
+            assert!(debt.budgets == 1 && !debt.forgiven);
+        }
+    }
+
+    #[kani::proof]
+    fn the_budgets_of_an_exhaustion_pay_the_debt_or_are_forgiven() {
+        let remaining: i64 = kani::any();
+        kani::assume(remaining <= 0);
+        let budget = if kani::any() {
+            SCHED_MIN_BUDGET_NS
+        } else {
+            SCHED_MAX_PERIOD_NS
+        };
+        let debt = sched_debt(remaining, budget);
+        let paid = remaining as i128 + debt.budgets as i128 * budget as i128;
+        if debt.forgiven {
+            // A debt the bound does not pay.
+            assert!(debt.budgets == SCHED_MAX_DEBT && paid <= 0);
+        } else {
+            // The fewest budgets that make r positive.
+            assert!(0 < paid && paid <= budget as i128);
+        }
+    }
+
+    #[kani::proof]
+    fn a_sum_of_instants_never_passes_the_time_limit() {
+        let (instant, budgets, period): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let sum = instant_after(instant, budgets, period);
+        assert!(sum <= TIME_LIMIT);
+        assert!(sum == TIME_LIMIT || sum >= instant);
+        if budgets == 0 || period == 0 {
+            assert!(sum == core::cmp::min(instant, TIME_LIMIT));
+        }
+        if budgets == 1 {
+            assert!(sum == core::cmp::min(instant.saturating_add(period), TIME_LIMIT));
         }
     }
 

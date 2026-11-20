@@ -16,7 +16,7 @@ use dodos_abi::{
 };
 
 const REPLY: u32 = 100;
-const FRAME: u32 = 101;
+pub(super) const FRAME: u32 = 101;
 const SECOND: u32 = 102;
 const GOT: u32 = 110;
 const BLOCK: u32 = 160;
@@ -35,7 +35,7 @@ fn recv() -> Syscall {
 
 /// A `node_send` to node `to` that grants the frame of slot `frame` with
 /// `rights`.
-fn send(to: u16, frame: u32, rights: Rights) -> Syscall {
+pub(super) fn send(to: u16, frame: u32, rights: Rights) -> Syscall {
     Syscall::NodeSend {
         node: node_cap(to),
         message: Message {
@@ -49,7 +49,11 @@ fn send(to: u16, frame: u32, rights: Rights) -> Syscall {
 }
 
 /// A message of node 1's generation 1 to a node of generation 1.
-fn from_node_1(kind: NodeMessage, credit: Option<(u8, u32)>, body: Body) -> crate::rings::Message {
+pub(super) fn from_node_1(
+    kind: NodeMessage,
+    credit: Option<(u8, u32)>,
+    body: Body,
+) -> crate::rings::Message {
     crate::rings::Message {
         header: RingHeader::new(kind, body.entries() as u8, (1, 1), 1, credit),
         body,
@@ -58,7 +62,7 @@ fn from_node_1(kind: NodeMessage, credit: Option<(u8, u32)>, body: Body) -> crat
 
 /// Fires the events of the nodes in `only`, the others holding still,
 /// until `until` holds.
-fn drive(m: &mut S, only: &[u16], until: impl Fn(&S) -> bool) -> bool {
+pub(super) fn drive(m: &mut S, only: &[u16], until: impl Fn(&S) -> bool) -> bool {
     use crate::system::Event;
     for _ in 0..20_000 {
         if until(m) {
@@ -83,7 +87,7 @@ fn drive(m: &mut S, only: &[u16], until: impl Fn(&S) -> bool) -> bool {
 /// One event, the earliest; or, with none left at this instant, the whole
 /// check, then the clock moved to the next timer (`to` at most), whose
 /// events can then happen. False once nothing is left to do.
-fn pump(m: &mut S, to: u64) -> bool {
+pub(super) fn pump(m: &mut S, to: u64) -> bool {
     if let Some(&event) = m.sys.events().first() {
         m.sys.fire(event);
         return true;

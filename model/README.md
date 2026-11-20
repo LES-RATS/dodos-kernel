@@ -446,6 +446,31 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   traced (code 12) as it is cleared; `thread_resume` reads the target's
   own space.
 
+## Pass 33 (D-158, D-159, the audit of `abi/`)
+
+- D-159 settles pass 32's three gaps, and the model follows. Gap 49: a
+  give or a destruction of a block is refused while a request of the node
+  names a give or a destruction of one of its chunks, and the completion
+  writes each word by compare-and-swap from *taken* by the giving
+  generation. The gate model gains the destruction of a block
+  (`Op::DestroyBlock`, the word written *free* with the same owner), and
+  the node model's gate refuses a faulty kernel's give under a request in
+  flight (`gate_give_chunk`); a healthy kernel never asks twice, since
+  `memory_give` of a dying block is `gone` by the order of checks. Gap 50:
+  `abi/` gains `SCHED_MAX_DEBT`, `sched_debt` and `instant_after`; the
+  budgets of an exhaustion are bounded, a bounded one is replenished with
+  r = B, and a sum of instants saturates at `TIME_LIMIT`, so no stop of
+  the machine overflows the scheduler's products. Gap 51: a kept kind 9
+  is raised only when its thread is runnable with a configured context
+  (`raises_kept_debug`, which the checker's rule KIND 9 reads too); the
+  model first raised it for a thread with no context and no mark.
+- D-159's two questions and its missing row hold tests and no change of
+  behaviour: a `Release` of a grant not yet answered frees the entry and
+  the later answer changes nothing; `role_hand` is `busy` while its
+  holder rebuilds the unit; an aspace root *unbound* goes *dying* with
+  nothing to ask (the gate model refused it for want of a tag).
+- The scenarios are in `scenarios/pass33.rs` and `gate/pass33_tests.rs`.
+
 ## Mutations shown equivalent
 
 - C2 of D-142 in `audited` (no use entry naming the generation counts a
@@ -505,13 +530,16 @@ gap 48 (`model/src/boot.rs`: the start-up aspace's root and tables drawn
 from the first table-floor untyped stay permanent live pieces for the
 life of the node, so its watermark never returns); D-157 also records
 that D-156's two-pass sweep defers pinned roots per dying `cspace`.
-Pass 32 found three, open: gap 49 (`model/src/gate/cpu.rs`: a second
-give of a chunk whose give is in flight, which the compare-and-swap of
-the completion alone does not stop; refused here), gap 50
-(`model/src/sched.rs`: the width of the products of an exhaustion after a
-very long stop; left as it is, the model panics there) and gap 51
+Pass 32 found three, all settled by D-159 (no `CONTRACT-GAP` marker left;
+see Pass 33): gap 49 (`model/src/gate/cpu.rs`: a second give of a chunk
+whose give is in flight, which the compare-and-swap of the completion
+alone does not stop; `busy`, as the model read it, and so for a block's
+destruction), gap 50 (`model/src/sched.rs`: the width of the products of
+an exhaustion after a very long stop; the budgets of one exhaustion are
+bounded by `SCHED_MAX_DEBT`, the rest of the debt forgiven) and gap 51
 (`model/src/faults.rs`: a kept kind 9 of a thread that is not marked and
-has no context; raised, as before). Two earlier gaps were settled otherwise than the
+has no context; kept until it is runnable with a configured context, not
+raised as the model first read it). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

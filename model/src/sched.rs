@@ -7,7 +7,8 @@ use dodos_abi::{
     ADMISSION_WHOLE_CORE, CORE_WINDOWS, Error, FaultKind, ObjectKind, Rights, SCHED_COUNT_OFF,
     SCHED_COUNT_ON, SCHED_MAX_PERIOD_NS, SCHED_MIN_BUDGET_NS, SCHED_STATE_CONFIGURED,
     SCHED_STATE_COUNTED, SCHED_STATE_HOME, SCHED_STATE_HW_CLASS_SHIFT, SCHED_STATE_LENT,
-    SCHED_STATE_THROTTLED, SlotAddr, TIME_EVENT_STEP, TIME_LIMIT, bandwidth, firing_instant,
+    SCHED_STATE_THROTTLED, SchedDebt, SlotAddr, TIME_EVENT_STEP, TIME_LIMIT, bandwidth,
+    firing_instant, instant_after, sched_debt,
 };
 
 /// Due events and the hardware timer: one due event, in the order in which
@@ -39,7 +40,7 @@ impl Sched {
 pub(crate) struct Snap {
     eligible: bool,
     remaining: i64,
-    throttled: Option<(u64, u64)>,
+    throttled: Option<(u64, SchedDebt)>,
     wanted: Option<(Queue, u64)>,
 }
 
@@ -553,46 +554,44 @@ impl Model {
         }
     }
 
-    /// Exhaustion: with n = 1 + ⌊−r / B⌋, the replenishment instant is
-    /// d + (n − 1) × T; not after now, the context is replenished at once.
-    ///
-    /// CONTRACT-GAP 50 (Scheduling contexts, exhaustion and replenishment;
-    /// Debugging, "a stop is time that passed for the scheduler"): the
-    /// contract gives no width to d + (n − 1) × T, n × B and n × T. A
-    /// context of the smallest budget and the longest period that a stop
-    /// of 50 minutes charges gives products beyond 64 bits (pass 32's
-    /// audit, lot 4, L4-04), which this arithmetic does not hold: the
-    /// model panics there. No call reaches it (each exhaustion fires its
-    /// timer; only a clock that jumps does), and the reading is left open.
+    /// Exhaustion: with n = min(1 + ⌊−r / B⌋, `SCHED_MAX_DEBT`), the
+    /// replenishment instant is d + (n − 1) × T; not after now, the context
+    /// is replenished at once. The bound keeps n × T and n × B below 2^62
+    /// after a stop of any length, and a sum of instants saturates at
+    /// `TIME_LIMIT` (Exhaustion and replenishment; D-159, settling gap 50).
     fn exhaust(&mut self, context: ObjId) {
         let sched = live(&mut self.scheds, context);
-        let budget = sched.budget.max(1);
-        let n = 1 + sched.remaining.unsigned_abs() / budget;
-        let instant = sched.deadline + (n - 1) * sched.period;
+        let debt = sched_debt(sched.remaining, sched.budget);
+        let instant = instant_after(sched.deadline, debt.budgets - 1, sched.period);
         if instant <= self.now {
-            self.replenish(context, n);
+            self.replenish(context, debt);
         } else {
-            sched.throttled = Some((instant, n));
+            sched.throttled = Some((instant, debt));
         }
         self.observe();
     }
 
-    /// Replenishment: r += n × B, d += n × T, and if d is not after now,
-    /// d = now + T.
+    /// Replenishment: r += n × B, or r = B when n was bounded by
+    /// `SCHED_MAX_DEBT` (the rest of the debt is forgiven, D-159); d += n ×
+    /// T, and if d is not after now, d = now + T.
     ///
     /// If r is still not positive, the context is exhausted again at once,
     /// in the same event; its next instant is after now, so this ends.
-    pub(crate) fn replenish(&mut self, context: ObjId, n: u64) {
+    pub(crate) fn replenish(&mut self, context: ObjId, debt: SchedDebt) {
         let now = self.now;
         self.event.resets.push(context);
         let sched = live(&mut self.scheds, context);
         if let Some((budget, period)) = sched.pending.take() {
             (sched.budget, sched.period) = (budget, period);
         }
-        sched.remaining = sched.remaining.saturating_add((n * sched.budget) as i64);
-        sched.deadline += n * sched.period;
+        let n = debt.budgets;
+        sched.remaining = match debt.forgiven {
+            true => sched.budget as i64,
+            false => sched.remaining.saturating_add((n * sched.budget) as i64),
+        };
+        sched.deadline = instant_after(sched.deadline, n, sched.period);
         if sched.deadline <= now {
-            sched.deadline = now + sched.period;
+            sched.deadline = instant_after(now, 1, sched.period);
         }
         sched.throttled = None;
         if sched.remaining <= 0 {
@@ -727,8 +726,8 @@ impl Model {
         for (_, event) in due.into_iter().take(TIME_EVENT_STEP) {
             match event {
                 Due::Replenish(_, context) => {
-                    let n = self.scheds[&context].throttled.expect("throttled").1;
-                    self.replenish(context, n);
+                    let debt = self.scheds[&context].throttled.expect("throttled").1;
+                    self.replenish(context, debt);
                 }
                 Due::Fire(timer) => self.fire(timer),
             }

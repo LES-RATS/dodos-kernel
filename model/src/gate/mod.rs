@@ -23,8 +23,9 @@
 //! 46, found in D-153's split and merge of the kernel's large leaf, closed
 //! by D-154, which replaces that design by dedicated table chunks; 49, a
 //! second give of a chunk whose give is in flight, found by pass 32's
-//! audit, is open, `cpu.rs`). The earlier readings stay as `OldRules`
-//! switches, so that each scenario shows its attack failing.
+//! audit, settled by D-159 as the model read it, `cpu.rs`). The earlier
+//! readings stay as `OldRules` switches, so that each scenario shows its
+//! attack failing.
 
 pub(crate) mod check;
 pub(crate) mod cpu;
@@ -717,6 +718,8 @@ pub(crate) enum Flush {
 mod devices_tests;
 #[cfg(test)]
 mod pass32_tests;
+#[cfg(test)]
+mod pass33_tests;
 #[cfg(test)]
 mod settled_tests;
 #[cfg(test)]

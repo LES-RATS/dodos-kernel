@@ -940,9 +940,9 @@ struct Sched {
     /// Signed nanoseconds left in the current period.
     remaining: i64,
     deadline: u64,
-    /// While throttled: the replenishment instant, and the number of
-    /// budgets it brings.
-    throttled: Option<(u64, u64)>,
+    /// While throttled: the replenishment instant, and the budgets it
+    /// brings (bounded by `SCHED_MAX_DEBT`, D-159).
+    throttled: Option<(u64, dodos_abi::SchedDebt)>,
     consumed: u64,
     home: Option<ObjId>,
     /// The budget follows the call: the reply objects that carry its lends,

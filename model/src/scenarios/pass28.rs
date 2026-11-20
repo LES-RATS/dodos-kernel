@@ -1307,13 +1307,13 @@ fn a_level_line_without_a_directed_end_of_interrupt_needs_one_node() {
 // The DR6 rules of D-143, x86-64: a #DB at CPL0 on the core that runs the
 // first thread of a node, whose control word enables breakpoint 0.
 
-const B0: u64 = 1;
+pub(super) const B0: u64 = 1;
 const BD: u64 = 1 << 13;
 const BS: u64 = 1 << 14;
 const BT: u64 = 1 << 15;
-const RESET: u64 = 0xFFFF_0FF0;
+pub(super) const RESET: u64 = 0xFFFF_0FF0;
 
-fn debugged() -> N {
+pub(super) fn debugged() -> N {
     let mut k = N::on(&one_node(Arch::X86_64, 1));
     let regs = &mut k.m.threads.get_mut(&k.t).unwrap().regs;
     regs[dodos_abi::x86_64::REG_DR7] = 1;

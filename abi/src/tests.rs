@@ -3143,3 +3143,41 @@ fn dr7_refuses_general_detect() {
     assert!(!dr7_valid(DR7_GD) && !dr7_valid(good | DR7_GD));
     assert!(!dr7_valid(good | 0b10 << 20));
 }
+
+/// D-159, gap 50 (Exhaustion and replenishment): the budgets of an
+/// exhaustion are min(1 + ⌊−r / B⌋, `SCHED_MAX_DEBT`); the rest of a debt
+/// beyond the bound is forgiven, and the products stay below 2^62.
+#[test]
+fn the_budgets_of_an_exhaustion_are_bounded_by_sched_max_debt() {
+    use crate::{SCHED_MAX_DEBT, SchedDebt, sched_debt};
+    assert_eq!(SCHED_MAX_DEBT, 1 << 26);
+    let debt = |budgets, forgiven| SchedDebt { budgets, forgiven };
+    let b = SCHED_MIN_BUDGET_NS;
+    assert_eq!(sched_debt(0, b), debt(1, false));
+    assert_eq!(sched_debt(-(b as i64) + 1, b), debt(1, false));
+    assert_eq!(sched_debt(-(b as i64), b), debt(2, false));
+    // The bound: a debt of exactly `SCHED_MAX_DEBT` budgets is whole, one
+    // nanosecond more is bounded.
+    let last = (SCHED_MAX_DEBT * b - 1) as i64;
+    assert_eq!(sched_debt(-last, b), debt(SCHED_MAX_DEBT, false));
+    assert_eq!(sched_debt(-last - 1, b), debt(SCHED_MAX_DEBT, true));
+    assert_eq!(sched_debt(i64::MIN, b), debt(SCHED_MAX_DEBT, true));
+    assert_eq!(sched_debt(i64::MIN, 1), debt(SCHED_MAX_DEBT, true));
+    const { assert!(SCHED_MAX_DEBT * SCHED_MAX_PERIOD_NS <= 1 << 62) };
+}
+
+/// D-159, gap 50: "a sum of instants saturates at `TIME_LIMIT`".
+#[test]
+fn a_sum_of_instants_saturates_at_the_time_limit() {
+    use crate::{SCHED_MAX_DEBT, instant_after};
+    assert_eq!(instant_after(5, 3, 10), 35);
+    assert_eq!(instant_after(5, 0, 10), 5);
+    let far = SCHED_MAX_DEBT * SCHED_MAX_PERIOD_NS;
+    assert_eq!(
+        instant_after(far, SCHED_MAX_DEBT, SCHED_MAX_PERIOD_NS),
+        TIME_LIMIT
+    );
+    assert_eq!(instant_after(TIME_LIMIT - 1, 1, 1), TIME_LIMIT);
+    assert_eq!(instant_after(TIME_LIMIT - 2, 1, 1), TIME_LIMIT - 1);
+    assert_eq!(instant_after(u64::MAX, u64::MAX, u64::MAX), TIME_LIMIT);
+}
