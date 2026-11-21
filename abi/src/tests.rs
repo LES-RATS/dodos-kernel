@@ -30,7 +30,7 @@ fn thread_cancel_comes_after_the_calls_that_were_there_before() {
 }
 
 #[test]
-fn irq_claim_and_sched_read_come_last() {
+fn irq_claim_and_sched_read_keep_their_numbers() {
     assert_eq!(Call::IrqClaim as u32, 46);
     assert_eq!(Call::SchedRead as u32, 47);
 }

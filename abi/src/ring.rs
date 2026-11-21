@@ -480,11 +480,11 @@ mod proofs {
             credit: 0,
         };
         let available: u64 = kani::any();
-        if header.readable(available) {
-            assert!(NodeMessage::from_raw(header.kind).is_some());
-            assert!(header.length >= 1 && header.length as usize <= RING_MESSAGE_ENTRIES_MAX);
-            assert!(header.length as u64 <= available);
-        }
+        let expected = NodeMessage::from_raw(header.kind).is_some()
+            && header.length >= 1
+            && header.length as usize <= RING_MESSAGE_ENTRIES_MAX
+            && header.length as u64 <= available;
+        assert_eq!(header.readable(available), expected);
         if header.length == 0 {
             assert!(!header.readable(available));
         }

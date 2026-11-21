@@ -684,7 +684,9 @@ impl GateWord {
     /// The word of an ordinary chunk just taken: every bit 0.
     pub const ORDINARY: Self = Self(0);
 
-    /// The word of an ordinary chunk with these counts and no grant.
+    /// A word with these map and not-data counts, no grant and the table bit
+    /// clear. Under `consistent`, an ordinary chunk has `not_data == 0`;
+    /// pass `.as_table()` (with `map_count == 0`) for a table chunk.
     pub const fn new(map_count: u32, not_data: u16) -> Option<Self> {
         if not_data > 1 << 12 {
             return None;

@@ -1376,8 +1376,13 @@ mod proofs {
         let device: bool = kani::any();
         match MemoryType::for_memory(raw, device) {
             Ok(MemoryType::WriteBack) => assert!(raw == 0 && !device),
-            Ok(_) => assert!(device && (raw == 1 || raw == 2)),
-            Err(e) => assert!(e as u8 == Error::Invalid as u8 && !(raw == 0 && !device)),
+            Ok(MemoryType::Uncached) => assert!(device && raw == 1),
+            Ok(MemoryType::WriteCombining) => assert!(device && raw == 2),
+            Err(e) => assert!(
+                e as u8 == Error::Invalid as u8
+                    && !(raw == 0 && !device)
+                    && !(device && (raw == 1 || raw == 2))
+            ),
         }
         match Marks::from_bits(raw) {
             Ok(marks) => assert!(raw >> 2 == 0 && marks.bits() == raw),

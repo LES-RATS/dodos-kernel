@@ -273,7 +273,7 @@ const fn sme_use(code: u8) -> Option<ExceptionUse> {
     }
 }
 
-/// What an exception of class `ec` other than an abort from EL0 is.
+/// What an exception of class `ec` other than an EL0 abort or SME trap is.
 const fn class_use(ec: u8) -> Option<ExceptionUse> {
     use crate::ExceptionUse::{Call, Fault, Feature, NotThread, Own};
     use FaultKind::{Arithmetic, Debug, HardwareBreakpoint, Protection, Undefined};
@@ -285,7 +285,6 @@ const fn class_use(ec: u8) -> Option<ExceptionUse> {
         // thread: a trap of them is the kernel's lazy state.
         EC_FP_SIMD => Own,
         EC_SVE => Feature(SVE),
-        EC_SME => Feature(SME),
         EC_BTI | EC_ILLEGAL_STATE | EC_PC_ALIGN | EC_SP_ALIGN | EC_PAC_FAIL | EC_GCS => {
             Fault(Protection)
         }

@@ -193,10 +193,9 @@ mod proofs {
     #[kani::proof]
     fn a_kind_covers_another_with_its_features_and_length() {
         let (host, node) = (any_kind(), any_kind());
-        if kind_covers(&host, &node) {
-            assert!(node.features & !host.features == 0);
-            assert!(node.vector_bytes == 0 || node.vector_bytes == host.vector_bytes);
-        }
+        let expected = (node.features & !host.features == 0)
+            && (node.vector_bytes == 0 || node.vector_bytes == host.vector_bytes);
+        assert_eq!(kind_covers(&host, &node), expected);
         assert!(kind_covers(&node, &node));
     }
 }
