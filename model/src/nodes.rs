@@ -796,15 +796,36 @@ impl Model {
             .is_empty()
     }
 
+    /// The two sealed nodes this sweep reads, following `seal_cursor` in
+    /// cyclic index order; advances the cursor to the last one read (D-168).
+    fn sweep_sealed(&mut self) -> Vec<u16> {
+        let n = self.table.nodes;
+        if n == 0 {
+            return Vec::new();
+        }
+        let start = self.seal_cursor % n;
+        let read: Vec<u16> = (1..=n)
+            .map(|step| (start + step) % n)
+            .filter(|&z| z != self.node && self.table.member(z).state() == MemberState::Sealed)
+            .take(2)
+            .collect();
+        if let Some(&last) = read.last() {
+            self.seal_cursor = last;
+        }
+        read
+    }
+
     /// Observations: the gate opens one per needed node and core, and per
     /// ring that holds a message, at most 8, each expiring after 4 ×
-    /// `STALE_NS`. A sealed node does not beat: it is never observed.
-    fn observe_needed(&mut self) -> bool {
+    /// `STALE_NS`. A sealed node does not beat: it is never observed. At a
+    /// sweep, a live or sealing node also reads the seal instant of two
+    /// sealed nodes from its cyclic cursor (D-168).
+    fn observe_needed(&mut self) -> (bool, Vec<u16>) {
         // In a development image no gate records an observation while the
         // release word of the stub is raised, and every instant is read
         // from the clock of membership (D-137).
         if self.table.release {
-            return false;
+            return (false, Vec::new());
         }
         let now = self.membership_now();
         let me = self.node as usize;
@@ -884,7 +905,14 @@ impl Model {
             .observations
             .iter()
             .any(|o| !o.holds(members[o.node as usize]));
+        let mut sealed_read = Vec::new();
         if swept {
+            if matches!(
+                self.table.member(self.node).state(),
+                MemberState::Live | MemberState::Sealing
+            ) {
+                sealed_read = self.sweep_sealed();
+            }
             // The next sweep, at a due event of the first core's timer queue
             // (`reserve_due`): a live or sealing node is never idle with
             // nothing armed, so the sweep sends no message (D-135: the
@@ -892,12 +920,13 @@ impl Model {
             self.next_sweep = self.now + self.table.sweep_ns;
             changed = true;
         }
-        changed
+        (changed, sealed_read)
     }
 
     /// Accusations, with evidence the gate checks: at least one other node
-    /// live or sealing, except for evidence self.
-    fn accuse_with_evidence(&mut self) -> bool {
+    /// live or sealing, except for evidence self. Sealed nodes are judged
+    /// only when read by this sweep (`sealed_read`, D-168).
+    fn accuse_with_evidence(&mut self, sealed_read: &[u16]) -> bool {
         // No accusation while the release word of the stub is raised, and
         // none by a node that is not live or sealing: only such a node
         // writes fencing (D-146; seed 1434 of pass 28: a node starting
@@ -906,8 +935,14 @@ impl Model {
         if self.table.release || !matches!(me, MemberState::Live | MemberState::Sealing) {
             return false;
         }
-        for node in (0..self.table.nodes).filter(|&z| z != self.node) {
+        let mut accused = false;
+        let me_node = self.node;
+        let nodes = self.table.nodes;
+        for node in (0..nodes).filter(|&z| z != me_node) {
             let state = self.table.member(node).state();
+            if state == MemberState::Sealed && !sealed_read.contains(&node) {
+                continue;
+            }
             let accusable = matches!(
                 state,
                 MemberState::Starting
@@ -930,10 +965,13 @@ impl Model {
             });
             if evidence == Evidence::SelfReported || others {
                 self.accuse(node, evidence);
-                return true;
+                accused = true;
+                if state != MemberState::Sealed {
+                    return true;
+                }
             }
         }
-        false
+        accused
     }
 
     // The fence.
@@ -2281,9 +2319,6 @@ impl Model {
             for &last in record.last_stop.values() {
                 membership.push(last + SETTLE_NS);
             }
-            if let Some(sealed) = self.table.beacons[node as usize].sealed_at {
-                membership.push(sealed + self.table.seal_ns);
-            }
         }
         for hand in self.handing.values() {
             membership.push(hand.started + dodos_abi::IOMMU_WAIT_NS);
@@ -2381,8 +2416,9 @@ impl Model {
             progressed |= self.roles_step(&mut units);
             self.send_pending();
             self.event.held_after_step = self.held_sendable();
-            progressed |= self.observe_needed();
-            progressed |= self.accuse_with_evidence();
+            let (observed, sealed_read) = self.observe_needed();
+            progressed |= observed;
+            progressed |= self.accuse_with_evidence(&sealed_read);
         }
         self.observe_watched();
         progressed |= seen != self.seen

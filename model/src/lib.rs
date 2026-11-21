@@ -1205,6 +1205,9 @@ pub struct Model {
     watchers: [Option<(ObjId, u64)>; 4],
     seen: (Vec<dodos_abi::Member>, Vec<dodos_abi::RoleWord>),
     next_sweep: u64,
+    /// Cursor of the sweep over sealed nodes: index of the last sealed node
+    /// read by the previous sweep, starting at this node's own index (D-168).
+    pub(crate) seal_cursor: u16,
     /// The seal of this node, its step; whether the node consumes and
     /// runs threads (false while it resumes); the starts it drives, and the
     /// image and module of the last `node_start`; the planned hand-overs it

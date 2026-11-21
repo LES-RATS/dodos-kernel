@@ -1455,6 +1455,7 @@ impl Model {
             // start writes (its trace entry, code 1) has its instant (pass
             // 38: a start at run time stamped it 0).
             now,
+            seal_cursor: node,
             ..Self::default()
         };
         let thread = model.build(layout, &untypeds, start_pages)?;
