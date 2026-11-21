@@ -685,7 +685,7 @@ fn more_tables_unhooked_by_one_change_than_its_request_lists_are_reported() {
     let levels = k.m.levels(space) as usize;
     let aspace = k.m.aspaces.get_mut(&space).unwrap();
     for i in 0..(2 * (levels - 1) + 1) as u64 {
-        aspace.unhooked.push((Some(cap), i));
+        aspace.unhooked.push((crate::UnhookedBy::Cap(cap), i));
     }
     assert_eq!(
         k.m.check(),
@@ -778,7 +778,7 @@ fn a_table_unhooked_by_a_record_whose_invalidation_is_in_flight_stays_off_the_fr
         k.m.aspaces[&space]
             .unhooked
             .iter()
-            .filter(|&&(by, _)| by == Some(cap))
+            .filter(|&&(by, _)| by == crate::UnhookedBy::Cap(cap))
             .count()
     };
     let second = of(&k, caps[1]);

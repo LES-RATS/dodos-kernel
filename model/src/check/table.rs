@@ -505,7 +505,6 @@ impl Model {
             let listed = space
                 .unhooked
                 .iter()
-                .filter(|(by, _)| by.is_some())
                 .all(|(by, _)| space.unhooked.iter().filter(|(b, _)| b == by).count() <= most);
             ensure(
                 listed,

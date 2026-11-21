@@ -444,3 +444,70 @@ fn a_report_ask_behind_a_revoke_on_a_sealing_node_is_answered_empty_at_resume() 
     assert_eq!(m.state(sealing), MemberState::Live);
     assert_eq!(m.sys.check(), Ok(()));
 }
+
+// Address spaces and their tables (rule 59, D-139; the review of passes 37
+// and 38, finding 4): a change unhooks at most 2 × (L − 1) tables, including
+// when the requester holds the failed unit itself and the tables are frozen
+// inside the same call.
+#[test]
+fn more_tables_unhooked_and_frozen_in_one_call_than_its_request_lists_are_reported() {
+    use super::units::{IOMMU_ROLE, IOSPACE, attached, three};
+    use crate::Map;
+    let mut m = three();
+    let holder = m.sys.role(IOMMU_ROLE).holder();
+    attached(&mut m, holder);
+    let space = m
+        .sys
+        .node(holder)
+        .object_at(m.t[holder as usize], s(IOSPACE))
+        .unwrap();
+    let levels = m.sys.node(holder).levels(space) as usize;
+    let max_tables = 2 * (levels - 1);
+    let extra = max_tables + 1;
+    let frame = m.retype(holder, ObjectKind::Frame, 1, 420);
+    m.ok(holder, frame);
+    let untyped = s(super::table_slot(m.sys.node(holder), m.t[holder as usize]));
+    let map = || {
+        Syscall::IoSpaceMap(Map {
+            space: s(IOSPACE),
+            frame: s(420),
+            untyped,
+            address: 0x1000_0000,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        })
+    };
+    m.ok(holder, map());
+    // Break the unit and drive an unmap on the holder itself to the timeout
+    // so the unit is known failed locally.
+    m.sys.break_unit(IOMMU_ROLE);
+    assert_eq!(m.call(holder, Syscall::IoSpaceUnmap(s(420))), WAITS);
+    m.run(2 * dodos_abi::IOMMU_WAIT_NS + 60 * MS);
+    assert!(m.sys.role(IOMMU_ROLE).failed());
+
+    // Map again and simulate a faulty mapping change on the space that
+    // hooked more than 2 × (L − 1) lower tables not needed once the mapping
+    // is cleared, then unmap behind the failed unit held locally so
+    // `freeze_unmapping` runs inside the same `IoSpaceUnmap` call.
+    m.ok(holder, map());
+    {
+        let node = m.sys.node_mut(holder);
+        let aspace = node.aspaces.get_mut(&space).unwrap();
+        for i in 0..(extra as u64) {
+            aspace.hooked.insert((1, 100 + i), i);
+        }
+    }
+    let first = m.t[holder as usize];
+    assert_eq!(
+        m.sys.apply(holder, first, Syscall::IoSpaceUnmap(s(420))),
+        Err(Error::Busy)
+    );
+    assert_eq!(
+        m.sys.check(),
+        Err(format!(
+            "node {holder}: 59: more tables unhooked by one change than its request lists"
+        ))
+    );
+}
+

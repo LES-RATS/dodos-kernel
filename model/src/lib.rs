@@ -677,13 +677,16 @@ struct ASpace {
     table_untyped: Option<ObjId>,
     hooked: BTreeMap<(u32, u64), u64>,
     free: Vec<u64>,
-    /// The tables unhooked by the clearing of a record, by its capability,
-    /// which join the free list only at the completion of the invalidation
-    /// that covers their unhooking (Address spaces and their tables, D-137);
-    /// by no capability once a failed unit left that invalidation undone:
-    /// they never join it (IOMMU), and the record's next change unhooks
-    /// its own (pass 38, seed 89 of the long run).
-    unhooked: Vec<(Option<CapId>, u64)>,
+    /// The tables unhooked by the clearing of a record, by its capability
+    /// while its invalidation is open, which join the free list only at the
+    /// completion of that invalidation (Address spaces and their tables,
+    /// D-137); or by a frozen change once a failed unit left that
+    /// invalidation undone: they never join it (IOMMU), each frozen change
+    /// keeps its own bound of at most 2 × (L − 1) tables, and the record's
+    /// next change unhooks its own (pass 38, seed 89 of the long run).
+    unhooked: Vec<(UnhookedBy, u64)>,
+    /// Number of changes whose unhooked tables a failed unit left frozen.
+    frozen_changes: u64,
     /// A node of several cores: the set of the node's cores that loaded its
     /// tag since it was last invalidated on them, by position (TLB).
     cores: u64,
@@ -692,6 +695,16 @@ struct ASpace {
     flushed: bool,
     /// An iospace: the IOMMU units whose devices it served.
     units: std::collections::BTreeSet<usize>,
+}
+
+/// The change that unhooked a table from an address space or iospace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnhookedBy {
+    /// An open unmapping of this capability's record.
+    Cap(CapId),
+    /// A change whose invalidation a failed unit left undone, numbered in
+    /// the order the space froze its changes.
+    Frozen(u64),
 }
 
 impl ASpace {
