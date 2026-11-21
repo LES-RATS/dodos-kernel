@@ -292,6 +292,10 @@ pub(crate) enum Op {
         n: u16,
         slot: usize,
     },
+    PinRevoking {
+        n: u16,
+        slot: usize,
+    },
     FreeGrant {
         n: u16,
         slot: usize,
@@ -448,6 +452,7 @@ impl Machine {
                 index,
             } => self.map_remote(n, root, tag, va, index),
             Op::Revoke { n, slot } => self.revoke(n, slot),
+            Op::PinRevoking { n, slot } => self.pin_revoking(n, slot),
             Op::FreeGrant { n, slot } => self.free_grant(n, slot),
             Op::Refuse { h, slot, entry } => self.refuse(h, slot, entry),
             Op::Death { n } => self.death(n),
@@ -750,7 +755,7 @@ impl Machine {
             16 => {
                 let slot = rng.below(grants::GRANTS as u64) as usize;
                 let other = rng.below(nodes) as u16;
-                match rng.below(5) {
+                match rng.below(6) {
                     0 => Op::Grant {
                         n,
                         slot,
@@ -790,6 +795,7 @@ impl Machine {
                         }
                     }
                     3 => Op::Revoke { n, slot },
+                    4 => Op::PinRevoking { n, slot },
                     _ => Op::FreeGrant { n, slot },
                 }
             }

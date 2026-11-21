@@ -137,8 +137,9 @@ impl Machine {
         }
     }
 
-    /// A core's own park call, which does not return: `seal_parked`
-    /// written with the request read; sealing with its generation.
+    /// A core's own park call, which releases the gate lock after writing
+    /// `seal_parked` and then stops the core without returning (D-168);
+    /// sealing with its generation.
     pub(crate) fn park_call(&mut self, n: u16, p: usize) -> Gated {
         require(self.gate.members[usize::from(n)].state == NodeState::Sealing)?;
         require(p < self.layout[usize::from(n)].cores.len())?;
@@ -149,7 +150,8 @@ impl Machine {
     }
 
     /// The last call of a seal: sealed, once every other core of the node
-    /// reads `seal_parked` equal to its park request. A sealed node holds
+    /// reads `seal_parked` equal to its park request; releases the gate lock
+    /// before parking the calling core (D-168). A sealed node holds
     /// no unit role (the role word, cell Seal: "unit roles handed over")
     /// and none of its request records is *open* (the request record, cell
     /// Seal: "none *open* once the seal's waits end"): the gate writes

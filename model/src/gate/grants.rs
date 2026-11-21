@@ -178,6 +178,21 @@ impl Machine {
         Ok(())
     }
 
+    /// *revoking* → *pinned*: the granter's gate, at a `RevokeStep` reporting
+    /// the root removed or a `Release`, while the use entry at the recorded
+    /// index counts more than 0 and still names the grant (D-142, D-165, D-168).
+    pub(crate) fn pin_revoking(&mut self, n: u16, slot: usize) -> Gated {
+        require(self.gate.members[usize::from(n)].state.writes() && slot < GRANTS)?;
+        let grant = self.grants.grants[usize::from(n)][slot].ok_or(Refused::Condition)?;
+        require(grant.state == GrantState::Revoking)?;
+        require(!self.use_released(n, slot, grant))?;
+        self.grants.grants[usize::from(n)][slot]
+            .as_mut()
+            .expect("the grant")
+            .state = GrantState::Pinned;
+        Ok(())
+    }
+
     /// Whether the use entry a grant records counts no leaf under it, or no
     /// longer names it.
     pub(super) fn use_released(&self, granter: u16, slot: usize, grant: Grant) -> bool {

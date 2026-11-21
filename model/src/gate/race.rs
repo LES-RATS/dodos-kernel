@@ -437,4 +437,69 @@ mod tests {
             "{path:?}"
         );
     }
+
+    // D-168 (3): the seal's park call acquires the gate lock, writes
+    // `seal_parked`, and releases the gate lock before stopping the core
+    // without returning. If the lock were left held, the resumed node's first
+    // gate call would spin forever on the lock.
+    #[test]
+    fn seal_park_releases_the_gate_lock_before_stopping_the_core() {
+        let run = |release_on_park: bool| -> Findings {
+            // Core 0 entered the seal's park call (taking the gate lock),
+            // wrote `seal_parked`, and parked; if `release_on_park` is true
+            // (D-168), it released the lock before stopping. The node then
+            // resumed and core 1 runs its first gate call (core 0 already
+            // done).
+            let mut start = State::new();
+            start.lock = if release_on_park { None } else { Some(0) };
+            start.cores = [Pc::Done, Pc::Attach(0)];
+            let v = Variant { lock: true };
+            let mut seen = BTreeSet::new();
+            let mut findings = Findings::default();
+            let mut stack = vec![(start, Vec::new())];
+            while let Some((state, path)) = stack.pop() {
+                if !seen.insert(state.clone()) {
+                    continue;
+                }
+                findings.states += 1;
+                if let Err(rule) = state.check(v)
+                    && findings.broken.is_none()
+                {
+                    findings.broken = Some((rule, path.clone()));
+                }
+                let steps = state.steps(v);
+                let moving: Vec<Step> = steps
+                    .iter()
+                    .copied()
+                    .filter(|s| !matches!(s, Step::Fence | Step::Fill))
+                    .collect();
+                let pending = state.member == Member::Live
+                    && state
+                        .cores
+                        .iter()
+                        .any(|pc| matches!(pc, Pc::Attach(_) | Pc::Release(_)));
+                if moving.is_empty() && pending && findings.wedge.is_none() {
+                    findings.wedge = Some(path.clone());
+                }
+                for step in steps {
+                    let mut next = state.clone();
+                    next.take(step, v);
+                    let mut p = path.clone();
+                    p.push(step);
+                    stack.push((next, p));
+                }
+            }
+            findings
+        };
+
+        let ok = run(true);
+        assert_eq!(ok.broken, None, "{ok:?}");
+        assert_eq!(ok.wedge, None, "{ok:?}");
+
+        let wedged = run(false);
+        assert!(
+            wedged.wedge.is_some(),
+            "leaving the gate lock held in park must wedge the resumed node's first gate call"
+        );
+    }
 }

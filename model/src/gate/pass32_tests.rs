@@ -806,3 +806,76 @@ fn a_resume_frees_a_grant_to_a_grantee_that_started_again_while_it_was_sealed() 
         Err("GRANT: a writing granter's entry for a generation that is over".into())
     );
 }
+
+// D-168 (2): *revoking* → *pinned* while the grantee's use entry at the
+// recorded index still counts > 0 and names the grant (and refused while
+// live or once the use count drops to 0).
+#[test]
+fn revoking_grant_with_live_use_can_be_pinned() {
+    let mut m = Machine::new(2, 2, 8);
+    let ops = grantee_maps(0);
+    steps(&mut m, &ops);
+    // Refused while still live.
+    assert_eq!(
+        m.step(&Op::PinRevoking { n: 0, slot: 0 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.grants.grants[0][0].map(|g| g.state),
+        Some(GrantState::Live)
+    );
+    // Move to revoking, then pin while the grantee still maps the page.
+    steps(&mut m, &[Op::Revoke { n: 0, slot: 0 }]);
+    assert_eq!(
+        m.grants.grants[0][0].map(|g| g.state),
+        Some(GrantState::Revoking)
+    );
+    steps(&mut m, &[Op::PinRevoking { n: 0, slot: 0 }]);
+    assert_eq!(
+        m.grants.grants[0][0].map(|g| g.state),
+        Some(GrantState::Pinned)
+    );
+    assert_eq!(m.check(), Ok(()));
+    // Once unmapped, a pinned grant can still be freed, and a revoking grant
+    // with count 0 cannot be pinned.
+    let unmap = Op::Unmap {
+        n: 1,
+        p: 0,
+        root: 10,
+        tag: 1,
+        va: (0, 0),
+    };
+    steps(
+        &mut m,
+        &[unmap, Op::Ack { n: 1, p: 1 }, Op::FreeGrant { n: 0, slot: 0 }],
+    );
+    assert_eq!(m.grants.grants[0][0], None);
+
+    // Count == 0: revoking -> pinned is refused.
+    steps(
+        &mut m,
+        &[
+            Op::Grant {
+                n: 0,
+                slot: 0,
+                page: 16,
+                to: 1,
+            },
+            Op::Deliver {
+                to: 1,
+                index: 1,
+                granter: 0,
+                slot: 0,
+            },
+            Op::Revoke { n: 0, slot: 0 },
+        ],
+    );
+    assert_eq!(
+        m.step(&Op::PinRevoking { n: 0, slot: 0 }),
+        Err(Refused::Condition)
+    );
+    assert_eq!(
+        m.grants.grants[0][0].map(|g| g.state),
+        Some(GrantState::Revoking)
+    );
+}
