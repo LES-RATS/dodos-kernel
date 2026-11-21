@@ -148,7 +148,11 @@ impl Model {
                 unit.is_some_and(|unit| self.machine.kernel_devices.contains(&(unit, device)))
             });
             let few = devices.len() <= IOSPACE_MAX_DEVICES;
-            ensure(one_unit && few && !kernel, "39: devices of an iospace")?;
+            let distinct = devices.iter().collect::<BTreeSet<_>>().len() == devices.len();
+            ensure(
+                one_unit && few && !kernel && distinct,
+                "39: devices of an iospace",
+            )?;
         }
         for (&id, unit) in &self.iommus {
             let listed = |(&device, iospace): (&u16, &ObjId)| {

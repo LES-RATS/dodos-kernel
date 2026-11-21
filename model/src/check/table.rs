@@ -516,14 +516,16 @@ impl Model {
             // The root table and the lower tables of a space lie in the
             // table untyped named at its creation (Address spaces and their
             // tables, D-154); the start-up aspace's in its table floor.
-            let inside = |at: u64| match space.table_untyped {
-                Some(tables) => self
-                    .untypeds
-                    .get(&tables)
-                    .is_some_and(|u| u.table && u.base <= at && at + page <= u.base + u.bytes),
-                None => table.table_floors[node as usize]
-                    .iter()
-                    .any(|&(s, e)| s <= at && at < e),
+            let inside = |at: u64| {
+                at.is_multiple_of(page)
+                    && match space.table_untyped {
+                        Some(tables) => self.untypeds.get(&tables).is_some_and(|u| {
+                            u.table && u.base <= at && at + page <= u.base + u.bytes
+                        }),
+                        None => table.table_floors[node as usize]
+                            .iter()
+                            .any(|&(s, e)| s <= at && at + page <= e),
+                    }
             };
             ensure(
                 space.table_pages().all(inside),

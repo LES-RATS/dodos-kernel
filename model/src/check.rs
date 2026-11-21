@@ -86,8 +86,6 @@ impl Model {
         depths
     }
 
-    /// Whether the root capability of an object is marked dying, read from
-    /// the capability itself and not through `Model::dying`.
     /// Whether `object` is an `its_table` whose pages read pinned (The ITS
     /// word: bits 6-7 of the class 1 from the first LPI's claim).
     fn its_pinned(&self, object: ObjId) -> bool {
@@ -96,6 +94,8 @@ impl Model {
         })
     }
 
+    /// Whether the root capability of an object is marked dying, read from
+    /// the capability itself and not through `Model::dying`.
     fn marked(&self, object: ObjId) -> bool {
         let root = self.objects.get(&object).map(|object| object.root);
         let root = root.and_then(|root| self.caps.get(&root));
@@ -349,11 +349,10 @@ impl Model {
         // The words that name each root, against its class (audit lot 7:
         // only n > 0 was judged).
         let mut naming: std::collections::BTreeMap<u64, u8> = std::collections::BTreeMap::new();
+        let page = self.table.geometry.page();
         for &raw in self.table.attach.values() {
             if let Some(word) = dodos_abi::AttachWord::from_raw(raw) {
-                let count = naming
-                    .entry(word.root() / self.table.geometry.page())
-                    .or_default();
+                let count = naming.entry(word.root() / page).or_default();
                 *count = count.saturating_add(1);
             }
         }
@@ -363,10 +362,12 @@ impl Model {
             let owned = named
                 .and_then(dodos_abi::Ownership::from_raw)
                 .is_some_and(|w| w.state() == dodos_abi::OwnState::Taken);
-            let root = word.map_or(0, |w| w.root()) / self.table.geometry.page();
+            let root = word.map_or(0, |w| w.root()) / page;
             let class = self.table.classes.get(&root).copied();
             let counted = class.and_then(dodos_abi::PageClass::root_devices);
-            if word.is_none_or(|w| w.state().is_none()) || !owned || counted.is_none_or(|n| n == 0)
+            if word.is_none_or(|w| w.state().is_none() || !w.root().is_multiple_of(page))
+                || !owned
+                || counted.is_none_or(|n| n == 0)
             {
                 return Err("88: an attach word with no identifier word or root beside it");
             }
@@ -375,7 +376,7 @@ impl Model {
                 counted.is_some_and(|n| n >= names),
                 "88: a root whose class counts fewer devices than the words that name it",
             )?;
-            if raw != 0 && named == Some(taken) {
+            if named == Some(taken) {
                 attached.insert(key);
             }
         }
@@ -995,7 +996,10 @@ impl Model {
                 "18: watermark on 8 bytes",
             )?;
             // A watermark ready to return waits, above 0, with nothing live.
-            let zero = untyped.ready.is_some() || (untyped.watermark == 0) == (untyped.live == 0);
+            let zero = match untyped.ready.is_some() {
+                true => untyped.watermark > 0,
+                false => (untyped.watermark == 0) == (untyped.live == 0),
+            };
             ensure(zero, "18: watermark is zero when nothing is live")?;
             ensure(
                 untyped.ready.is_none() || untyped.live == 0,

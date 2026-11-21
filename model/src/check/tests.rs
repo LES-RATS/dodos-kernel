@@ -3395,3 +3395,83 @@ fn aspace_table_page_with_pinned_its_class_is_reported() {
     std::sync::Arc::make_mut(&mut model.table.classes).insert(page, pinned_its);
     assert_eq!(model.check(), Err("59: page classes"));
 }
+
+// Pass 40 (v1-E #6): a start-up aspace table page sitting on an unaligned
+// address inside the table floor (s <= at && at < e, but !at.is_multiple_of(page)
+// or at + page > e) must fail check_table.
+#[test]
+fn startup_aspace_table_page_unaligned_in_table_floor_is_reported() {
+    let broken = spoiled(|m, _| {
+        let space = object(m, dodos_abi::START_SLOT_ASPACE);
+        let floor_end = m.table.table_floors[0][0].1;
+        let bad = floor_end - 8;
+        let aspace = live(&mut m.aspaces, space);
+        assert!(aspace.table_untyped.is_none());
+        let old = aspace.root.expect("start-up aspace root");
+        aspace.root = Some(bad);
+        // Keep page classes aligned with `bad / page` so only `inside` fires.
+        let page = m.table.geometry.page();
+        if let Some(class) = m.table.classes.get(&(old / page)).copied() {
+            std::sync::Arc::make_mut(&mut m.table.classes).insert(bad / page, class);
+        }
+    });
+    assert_eq!(
+        broken,
+        "TABLES: a table of a space outside its table untyped"
+    );
+}
+
+// Pass 40 (v1-E #7): on a 16 KiB-page machine, an attach word whose root
+// address is 4 KiB-aligned (accepted by AttachWord::from_raw) but not
+// 16 KiB-aligned must fail check_iommus.
+#[test]
+fn attach_word_with_unaligned_root_on_16k_page_is_reported() {
+    let (mut m, _) = Model::boot(&Machine::example_on(SIXTEEN_KB)).unwrap();
+    let (_, iommu) = with_device(&mut m);
+    let segment = u32::from(m.machine.iommus[m.iommus[&iommu].unit].segment);
+    let key = segment << 16 | 0x10;
+    let raw = m.table.attach[&key];
+    let word = dodos_abi::AttachWord::from_raw(raw).expect("attach word");
+    let unaligned =
+        dodos_abi::AttachWord::new(word.state().unwrap(), word.root() + 4096).expect("4k aligned");
+    assert_eq!(
+        unaligned.root() / m.table.geometry.page(),
+        word.root() / m.table.geometry.page()
+    );
+    m.table.attach.insert(key, unaligned.raw());
+    assert_eq!(
+        m.check_identifiers(),
+        Err("88: an attach word with no identifier word or root beside it")
+    );
+}
+
+// Pass 40 (v1-E #8): an untyped marked `ready` with `watermark == 0` must fail
+// rule 18.
+#[test]
+fn ready_untyped_with_zero_watermark_is_reported() {
+    let (mut m, _) = Model::boot(&Machine::example()).unwrap();
+    assert_eq!(m.check(), Ok(()));
+    let (_, u) = m
+        .untypeds
+        .iter_mut()
+        .find(|(_, u)| u.live == 0 && u.watermark == 0 && !u.device && !u.table)
+        .expect("an empty ordinary untyped");
+    u.ready = Some(1);
+    assert_eq!(
+        m.check(),
+        Err("18: watermark is zero when nothing is live")
+    );
+}
+
+// Pass 40 (v1-E #9): an iospace listing the same (iommu, device) twice must
+// fail check_devices rule 39.
+#[test]
+fn iospace_with_duplicate_device_is_reported() {
+    let broken = spoiled(|m, _| {
+        let (iospace, _) = with_device(m);
+        let first = m.iospaces[&iospace][0];
+        live(&mut m.iospaces, iospace).push(first);
+    });
+    assert_eq!(broken, "39: devices of an iospace");
+}
+
