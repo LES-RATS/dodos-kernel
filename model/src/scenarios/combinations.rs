@@ -2397,19 +2397,26 @@ fn reaches(seen: &Seen, name: &str) -> bool {
 /// excluded too. (Pass 25 excluded a failed unit under a hand-over, handed
 /// by a seal since D-145.)
 ///
-/// Pass 38: a release pending and a first thread before live. A release is
-/// pending only while the kernel ring to the granting node has no room
-/// beyond its reserve of 34 answers (Grants, release by the holder; a
-/// granting node starting afresh has a new generation, so its grants died
-/// and no release is due); only the 32 releases at once of the second
-/// pair's holder, node 4, fill the 30 entries left: node 2's ring to node
-/// 0 carries one grant's release and at most 16 requests beside the
-/// answers (Credits). A first thread before live is the wide node's, node
-/// 4, starting afresh (a node of one core is live in the event its first
-/// thread is made ready). A node started fresh empties its use table
-/// (G13), and no node writes into a ring toward it until it is live (What
-/// crosses between nodes, a fresh start, D-144): it receives no grant, so
-/// no use entry of it holds a release pending.
+/// Pass 38: a release pending and a first thread before live on this
+/// five-node machine. A release is pending only while the kernel ring to the
+/// granting node has no room beyond its reserve of 34 answers (Grants,
+/// release by the holder; What crosses between nodes, what a full ring
+/// returns: non-answer messages share the 30 entries beyond that reserve
+/// with unread answers; a granting node starting afresh has a new
+/// generation, so its grants died and no release is due). Only the 32
+/// releases at once of the second pair's holder, node 4, fill those 30
+/// entries here: node 2's ring to node 0 carries one grant (at most 8
+/// `SendAnswer` entries, 16 requests and 1 `Release`, 25 < 30, and node 0
+/// drains its ring before sealing). A first thread before live is also the
+/// wide node's, node 4, starting afresh (a node of one core is live in the
+/// event its first thread is made ready). A node started fresh empties its
+/// use table (G13), `node_send` answers `gone` if the target is not live
+/// (Calls between nodes, `node_send`), and no node writes a non-answer
+/// message into a ring toward a node whose member word reads starting with
+/// the resume bit clear until the word no longer reads so (What crosses
+/// between nodes, a fresh start, D-144, D-147; only an answer to a message
+/// the starting generation itself sent may be written): node 4 receives no
+/// grant while starting, so no use entry of it holds a release pending.
 const IMPOSSIBLE: &[(usize, usize)] = &[(RELEASE_PENDING, PRE_LIVE)];
 
 /// The combinations possible under the contract that neither the seeds of
@@ -2605,22 +2612,6 @@ fn seed_605_of_pass_35_a_removal_refused_by_a_busy_request_is_no_progress() {
 #[test]
 fn seed_763_of_pass_35_a_sleeping_core_is_roused_at_its_timer() {
     let _ = explore_one(763);
-}
-
-// Seed 867 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
-// node 3's last seal step wrote sealed, its last gate call, and went on in
-// the same step to accuse node 0, which had just failed. A node fences,
-// reclaims and accuses nothing once it has written sealed. The seed's draws
-// no longer meet that interleaving (the review of passes 35 and 36, finding
-// 2): its deterministic twin is
-// `pass38::a_node_that_writes_sealed_fences_and_accuses_nothing_in_the_same_step`,
-// and the checker's rule SEALED judges every step of every exploration.
-// Since pass 38's visiting drivers moved the draws the seed no longer seals
-// at all; its count of seals was dropped, and the seed is replayed under
-// the whole check as any other.
-#[test]
-fn seed_867_of_pass_28_a_node_that_wrote_sealed_accuses_no_one() {
-    let _ = explore(vec![867]);
 }
 
 // Seed 1434 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
