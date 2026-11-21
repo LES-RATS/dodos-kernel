@@ -152,3 +152,35 @@ fn a_resumed_node_with_a_marked_core_word_stays_starting_and_is_accused_stale() 
     m.run(START_NS + SWEEP_NS + 250 * MS);
     assert_eq!(m.sys.member(1).evidence(), Evidence::Stale);
 }
+
+// D-164 and CONTRACT-GAP 58: `gone` for a node that is not live is a check
+// of the state, read here as the first one: a frame over a table chunk,
+// which the gate's reading refuses `busy` (G3 (2), D-156), sent to a node
+// that is not live is `gone`; sent to a live node, `busy`.
+#[test]
+fn node_send_judges_gone_before_the_busy_of_a_frame_its_gate_refuses() {
+    use super::pass31::{BLOCK, with_blocks};
+    let (mut k, _, _) = with_blocks();
+    k.ok(retype_from(BLOCK, ObjectKind::Frame, 1, 211));
+    let frame = k.m.object_at(k.t, s(211)).expect("a frame");
+    let (_, end) = k.m.table_floor(0)[0];
+    crate::live(&mut k.m.frames, frame).base = end - k.m.geometry().page();
+    let send = Syscall::NodeSend {
+        node: node_cap(1),
+        message: crate::Message {
+            caps: vec![crate::Transfer::Derive(s(211), Rights::READ.bits())],
+            ..crate::Message::default()
+        },
+        doorbell: SlotAddr::NONE,
+    };
+    assert_eq!(k.m.clone().apply(k.t, send.clone()), Err(Error::Busy));
+    let member = k.m.table.member(1);
+    let fencing = dodos_abi::Member::new(
+        MemberState::Fencing,
+        dodos_abi::Evidence::Stale,
+        dodos_abi::DRIVER_NONE,
+        member.generation(),
+    );
+    k.m.table.members[1] = fencing;
+    assert_eq!(k.m.apply(k.t, send), Err(Error::Gone));
+}

@@ -212,9 +212,25 @@ fn node_send_is_judged_in_order() {
         },
     );
     m.no(0, send(1, vec![], SlotAddr::NONE), Error::Gone);
-    // CONTRACT-GAP 56: whether "`gone` if the node is not live" is a check
-    // of the node capability or of the state is not said, so no case here
-    // puts it beside a fault of a later argument.
+    // D-164 (the mailbox of a node): that `gone` "is a check of the state:
+    // it is judged after every capability the call names (the node, the
+    // doorbell, the frames) and after the plain arguments, the header among
+    // them". With the node not live, each later fault is judged first.
+    let mut flagged = msg(7, vec![]);
+    flagged.flags = 1 << 5;
+    let to_1 = |message, doorbell| Syscall::NodeSend {
+        node: node_cap(1),
+        message,
+        doorbell,
+    };
+    m.no(0, to_1(flagged, SlotAddr::NONE), Error::Invalid);
+    m.no(0, to_1(msg(7, vec![]), s(131)), Error::Denied);
+    m.no(0, to_1(msg(7, vec![]), s(OBJ)), Error::Invalid);
+    let moved = msg(7, vec![Transfer::Move(s(OBJ))]);
+    m.no(0, to_1(moved, SlotAddr::NONE), Error::Invalid);
+    let rights = frame_rights() | 1 << 31;
+    let bad_rights = msg(7, vec![Transfer::Derive(s(OBJ), rights)]);
+    m.no(0, to_1(bad_rights, SlotAddr::NONE), Error::Invalid);
 }
 
 #[test]

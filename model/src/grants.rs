@@ -158,12 +158,8 @@ impl Model {
         // frames, judged with the capability the call acts on, as for every
         // message: Order of checks, step 2; "`send`, and `grant` when the
         // header lists frames", `node_send`, gap 9). `invalid` if it names the
-        // caller's own node; `gone` if that node is not live.
-        // CONTRACT-GAP 56 (Node slots and core words, the mailbox: "the
-        // call is `gone` if the node is not live"): the contract does not
-        // say whether this is a check of the node capability or of the
-        // state. Read here as the capability's (judged with it, before the
-        // header and the doorbell), as before.
+        // caller's own node. That node not live is a check of the state,
+        // judged below (D-164).
         let need = match message.caps.is_empty() {
             true => Rights::SEND,
             false => Rights::SEND.union(Rights::GRANT),
@@ -173,9 +169,6 @@ impl Model {
         let target = self.nodes[&held.object];
         if target == self.node {
             return Err(Error::Invalid);
-        }
-        if self.table.member(target).state() != MemberState::Live {
-            return Err(Error::Gone);
         }
         // The header, as for `send`: read right after the capability the
         // call acts on, before any other capability argument (Order of
@@ -220,6 +213,20 @@ impl Model {
                 return Err(Error::Invalid);
             }
             listed.push((cap, rights));
+        }
+        // `gone` if the node is not live: "a check of the state: it is
+        // judged after every capability the call names (the node, the
+        // doorbell, the frames) and after the plain arguments, the header
+        // among them" (the mailbox of a node, D-164, gap 56).
+        // CONTRACT-GAP 58 (`node_send`, Checks): the call's own list still
+        // places `gone` right after the node's three checks, against D-164's
+        // sentence, and its list of state checks ("Then the state, in
+        // order: `busy` ...") does not name `gone`, nor where the gate's
+        // `busy` over a frame it does not hold (G3 (2), D-141, D-156) falls.
+        // Read here as the first check of the state: nothing is sent to a
+        // node that is not live, and no other state is read for it.
+        if self.table.member(target).state() != MemberState::Live {
+            return Err(Error::Gone);
         }
         // The gate writes an anchor only over memory its node holds (G3
         // (2), D-141): a refusal here is the gate's, before any entry.
