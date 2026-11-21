@@ -1402,6 +1402,9 @@ impl Model {
                 return any;
             }
             let root = self.objects[&object].root;
+            if self.seal == Some(SealStep::Parking) && self.revoke_step_opens_request(root) {
+                return any;
+            }
             live(&mut self.caps, root).dying = true;
             *units -= 1;
             any = true;
@@ -1861,6 +1864,18 @@ impl Model {
 
     // The seal, the resume, the starts.
 
+    /// Whether this node has an open request of one of its cores or a unit
+    /// request of its own in a sent or local stage (`node_stop` mode 1, D-167).
+    fn has_open_request(&self) -> bool {
+        self.cores.iter().any(|c| c.request.is_some())
+            || self.unit_requests.iter().flatten().any(|e| {
+                matches!(
+                    e.stage,
+                    crate::units::Stage::Sent { .. } | crate::units::Stage::Local { .. }
+                )
+            })
+    }
+
     /// The steps of a seal of this node (`node_stop` mode seal): it hands
     /// each unit role it holds over, answers its kernel rings, completes the
     /// requests of its cores and waits for its unit requests already sent;
@@ -1896,13 +1911,7 @@ impl Model {
             SealStep::Quiescing => {
                 self.seal = Some(SealStep::Quiescing);
                 let handed = self.hand_all_units();
-                let quiet = !self.cores.iter().any(|c| c.request.is_some())
-                    && !self.unit_requests.iter().flatten().any(|e| {
-                        matches!(
-                            e.stage,
-                            crate::units::Stage::Sent { .. } | crate::units::Stage::Local { .. }
-                        )
-                    })
+                let quiet = !self.has_open_request()
                     && !(0..self.table.nodes).any(|z| z != me && self.has_kernel_message(z));
                 *units = units.saturating_sub(1);
                 if handed && quiet {
@@ -1932,16 +1941,16 @@ impl Model {
                             && (w.holder() == me
                                 || (w.state() == RoleState::Handing && w.target() == me))
                     });
-                // What reached its kernel rings while its other cores parked
-                // is answered before it writes sealed, by this step's
-                // service of the rings, which runs while it is sealing (Roles,
-                // the reports are pulled: "a node that seals during the
-                // rebuild answers the asks that reached it before it
-                // sealed"; pass 38, a focused run of seed 574: a `ReportAsk`
-                // left unread, refused at the resume once the role's holder
-                // had changed, kept its asker's credit in use).
-                let waiting = (0..self.table.nodes).any(|z| z != me && self.has_kernel_message(z));
-                if !others || named || waiting {
+                // Once its other cores park, the node still answers what comes
+                // into its kernel rings except a message whose step would open
+                // a request of a core or a unit request (a `Revoke` of a mapped
+                // frame): that message and what follows it in the same ring
+                // wait until the resume, and sealed is written only when no
+                // request is open and no ring holds a message it may still
+                // answer (`node_stop` mode 1, D-167).
+                let waiting = (0..self.table.nodes)
+                    .any(|z| z != me && self.has_answerable_kernel_message(z));
+                if !others || named || self.has_open_request() || waiting {
                     return false;
                 }
                 let core = self.cores[0].number as usize;

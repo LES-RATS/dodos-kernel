@@ -532,19 +532,19 @@ impl Model {
             }
             return true;
         }
-        if rebuild.asked {
+        if rebuild.asked.is_some() {
             // A node accused during the rebuild is skipped; one that sealed
             // before it answered is then treated as sealed, as one whose
             // turn finds it sealed (Roles: "a node that seals during the
-            // rebuild [...] is then treated as sealed"): its entries are
-            // kept even if it resumes before the rebuild ends.
+            // rebuild [...] is then treated as sealed", D-167): its entries
+            // are kept even if it resumes before the rebuild ends.
             if self.table.writes(rebuild.node) {
                 return false;
             }
             if self.table.member(rebuild.node).state() == MemberState::Sealed {
                 rebuild.sealed.insert(rebuild.node);
             }
-            rebuild.asked = false;
+            rebuild.asked = None;
             rebuild.node += 1;
             rebuild.key = 0;
         }
@@ -586,7 +586,7 @@ impl Model {
                 key: rebuild.key,
             };
             let asked = self.write_message(z, body, Some(Completes::Report { role }), None);
-            rebuild.asked = asked.is_ok();
+            rebuild.asked = asked.ok().flatten();
             self.rebuilds.insert(role, rebuild);
             // An ask that found no room or no credit is no progress, so a
             // step does not spend its units on it (the final review's
@@ -866,16 +866,32 @@ impl Model {
     }
 
     /// A `ReportAsk`: answered at once with one `Report`, its items from
-    /// the key asked, as many as fit, and the key of the next item or end.
-    /// The asked node keeps nothing.
+    /// the key asked, as many as fit, and the key of the next item or end;
+    /// an ask whose role, epoch or holder is stale is answered with no item
+    /// and next key *end* so its credit is freed (D-167). The asked node
+    /// keeps nothing.
     pub(crate) fn report_asked(
         &mut self,
         from: u16,
         credit: Option<(u8, u32)>,
         role: u16,
-        _epoch: u32,
+        epoch: u32,
         key: u64,
     ) {
+        let current = self.table.roles.get(role as usize).is_some_and(|w| {
+            self.table.role_records[role as usize].kind == RoleKind::Unit
+                && w.state() == RoleState::Held
+                && w.epoch() == epoch
+                && w.holder() == from
+        });
+        if !current {
+            let body = Body::Report {
+                next: REPORT_END,
+                items: Vec::new(),
+            };
+            let _ = self.write_message(from, body, None, credit);
+            return;
+        }
         let items: Vec<Item> = self
             .items(role as usize)
             .into_iter()
@@ -891,7 +907,9 @@ impl Model {
     }
 
     /// A `Report` received by the new holder: its items kept, and the next
-    /// ask from the next key, or the next node at the end.
+    /// ask from the next key, or the next node at the end. Taken only for
+    /// the ask the cursor currently waits on; any other frees its credit
+    /// and is dropped (D-167).
     pub(crate) fn report_received(
         &mut self,
         from: u16,
@@ -899,21 +917,21 @@ impl Model {
         next: u64,
         items: Vec<Item>,
     ) {
-        let Some((index, _)) = credit else { return };
+        let Some((index, serial)) = credit else { return };
         let Some(taken) = self.take_credit(from, index) else {
             return;
         };
         let Completes::Report { role } = taken.completes else {
             return;
         };
-        // A report of a node the rebuild no longer asks (it was skipped,
-        // accused or sealed, while its ask was in flight) is the answer of
-        // an abandoned ask: it frees the credit and moves nothing (pass
-        // 26: it moved the cursor back while another node was asked).
+        // A report for any ask other than the one the cursor currently waits
+        // on (e.g. a node passed over as accused or sealed, or an ask from
+        // an earlier epoch) frees its credit and moves nothing (pass 26,
+        // D-167).
         let Some(rebuild) = self
             .rebuilds
             .get(&role)
-            .filter(|r| r.asked && r.node == from)
+            .filter(|r| r.asked == Some((index, serial)) && r.node == from)
         else {
             return;
         };
@@ -939,7 +957,7 @@ impl Model {
         if good {
             rebuild.items.extend(items.into_iter().map(|i| (from, i)));
         }
-        rebuild.asked = false;
+        rebuild.asked = None;
         match next {
             key if good && key != REPORT_END => rebuild.key = key,
             _ => {

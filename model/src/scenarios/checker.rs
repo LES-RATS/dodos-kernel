@@ -1843,3 +1843,56 @@ fn a_level_line_without_a_directed_end_of_interrupt_beside_other_nodes_is_report
         )
     );
 }
+
+// D-167 (`node_stop` mode 1, Gate words request record column Seal): a member
+// word reading sealed with an open request of one of its cores is reported.
+#[test]
+fn a_sealed_node_with_an_open_core_request_is_reported() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    m.ok(0, super::pass17::seal(1));
+    assert!(m.step_until(|m| m.state(1) == MemberState::Sealed));
+    let space = m.sys.node(1).object_at_start(dodos_abi::START_SLOT_ASPACE);
+    m.sys.node_mut(1).cores[0].request = Some(crate::cores::Request {
+        flush: Flush::Tag(space),
+        asked: 0b10,
+        acked: 0,
+        started: 0,
+        completes: crate::cores::Completes::Destroy(space),
+        waiter: None,
+    });
+    m.sys.node_mut(1).cores[0].request_state = crate::cores::RequestState::InUse;
+    m.sys.node_mut(1).cores[1].pending.insert(0);
+    assert_eq!(
+        m.sys.check(),
+        Err("node 1: SEALED: a sealed node has an open request of a core".into())
+    );
+}
+
+// D-167 (`node_stop` mode 1, Gate words request record column Seal): a member
+// word reading sealed with a unit request of its own in a sent or local stage
+// is reported.
+#[test]
+fn a_sealed_node_with_an_open_unit_request_is_reported() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.ok(0, super::pass17::seal(2));
+    assert!(m.step_until(|m| m.state(2) == MemberState::Sealed));
+    m.sys.node_mut(2).unit_requests[0] = Some(crate::units::UnitEntry {
+        role: super::units::IOMMU_ROLE,
+        op: crate::rings::UnitOp::Invalidate { domain: None },
+        epoch: 0,
+        stage: crate::units::Stage::Sent { to: 1, credit: 0 },
+        waiter: crate::units::Waiter::Step,
+        record: None,
+        order: 1,
+        words: None,
+        segment: None,
+        failed: false,
+        then: None,
+        elsewhere: false,
+    });
+    assert_eq!(
+        m.sys.check(),
+        Err("node 2: SEALED: a sealed node has an open unit request".into())
+    );
+}
+

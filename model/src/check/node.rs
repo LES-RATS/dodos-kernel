@@ -47,6 +47,24 @@ impl Model {
             sealed.is_none_or(|at| self.table.member_writes[at + 1..].iter().all(|w| w.1 != me)),
             "SEALED: a member word written after the write of sealed",
         )?;
+        // `node_stop` mode 1 and Gate words (the request record, column Seal;
+        // D-167): a member word reading sealed has no open request of its
+        // cores and no unit request of its own in a sent or local stage.
+        if self.table.member(me).state() == dodos_abi::MemberState::Sealed {
+            ensure(
+                !self.cores.iter().any(|c| c.request.is_some()),
+                "SEALED: a sealed node has an open request of a core",
+            )?;
+            ensure(
+                !self.unit_requests.iter().flatten().any(|e| {
+                    matches!(
+                        e.stage,
+                        crate::units::Stage::Sent { .. } | crate::units::Stage::Local { .. }
+                    )
+                }),
+                "SEALED: a sealed node has an open unit request",
+            )?;
+        }
         // `node_stop` and the watchers: only a live or sealing node writes
         // fencing (D-146).
         ensure(

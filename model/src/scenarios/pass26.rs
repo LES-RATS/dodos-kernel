@@ -372,12 +372,12 @@ fn a_report_of_a_node_no_longer_asked_frees_its_credit_and_moves_no_cursor() {
         .expect("room");
     let rebuild = crate::units::Rebuild {
         node: 3,
-        asked: true,
+        asked: Some((1, 1)),
         ..Default::default()
     };
     node.rebuilds.insert(IOMMU_ROLE, rebuild);
     node.report_received(0, credit, dodos_abi::REPORT_END, Vec::new());
     let rebuild = &node.rebuilds[&IOMMU_ROLE];
-    assert_eq!((rebuild.node, rebuild.asked), (3, true));
+    assert_eq!((rebuild.node, rebuild.asked), (3, Some((1, 1))));
     assert!(node.peers[0].credits.iter().all(Option::is_none));
 }

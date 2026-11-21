@@ -101,7 +101,9 @@ pub(crate) struct Served {
 pub(crate) struct Rebuild {
     pub(crate) node: u16,
     pub(crate) key: u64,
-    pub(crate) asked: bool,
+    /// The credit `(index, serial)` of the `ReportAsk` the cursor currently
+    /// waits on, if one is in flight (D-167).
+    pub(crate) asked: Option<(u8, u32)>,
     pub(crate) items: Vec<(u16, crate::rings::Item)>,
     /// The nodes the rebuild passed over because they were sealed: their
     /// entries are kept without a report, even if they resume before the
@@ -412,6 +414,9 @@ impl Model {
     /// an entry for a role this node holds is submitted to the unit with no
     /// message.
     pub(crate) fn unit_send_queued(&mut self) {
+        if self.seal == Some(crate::nodes::SealStep::Parking) {
+            return;
+        }
         let mut queued: Vec<(u64, usize)> = self
             .unit_requests
             .iter()

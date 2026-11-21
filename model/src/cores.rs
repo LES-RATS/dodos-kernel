@@ -303,7 +303,7 @@ impl Model {
     /// the node (x86-64 and RISC-V, a node of several cores, another core
     /// in the space's set of cores that loaded its tag); the kernel's own
     /// space (`None`) asks every other core, idle ones included.
-    fn others_hold(&self, space: Option<ObjId>) -> bool {
+    pub(crate) fn others_hold(&self, space: Option<ObjId>) -> bool {
         if self.width() == 1 || self.machine.arch == crate::Arch::Aarch64 {
             return false;
         }
@@ -884,6 +884,7 @@ impl Model {
         part.running = None;
         part.thread = None;
         part.ipis.clear();
+        part.idle = IdleWord::default();
         // The header of the core's debug area counts the entries
         // suppressed since machine start (Debugging, the trace rings): a
         // kernel that starts on the core counts those of the earlier
@@ -972,12 +973,17 @@ impl Model {
     }
 
     /// A resume: the node's cores start from their park, and no thread runs
-    /// before the steps of the resume are done. A sealed block the image
-    /// cannot read makes the node accuse itself.
+    /// before the steps of the resume are done. Every core passes through the
+    /// entry stub and invalidates its whole TLB before running any thread, so
+    /// no core holds any address space's tag across a seal and resume. A
+    /// sealed block the image cannot read makes the node accuse itself.
     pub(crate) fn begin_resume(&mut self, readable: bool) {
         self.ready = false;
         self.resuming = true;
         self.seal = None;
+        for aspace in self.aspaces.values_mut() {
+            aspace.cores = 0;
+        }
         if !readable {
             *self.at = 0;
             self.accuse_self(dodos_abi::CrashReason::StartRefused as u32);

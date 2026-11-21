@@ -511,17 +511,10 @@ impl Model {
                 });
                 (!matches).then_some(u64::from(*role))
             }
-            // A `ReportAsk` names the role's current epoch and comes from
-            // the node the role word names as holder.
-            Body::ReportAsk { role, epoch, .. } => {
-                let word = self.table.roles.get(*role as usize);
-                let matches = word.is_some_and(|w| {
-                    w.state() == dodos_abi::RoleState::Held
-                        && w.epoch() == *epoch
-                        && w.holder() == sender
-                });
-                (!matches).then_some(u64::from(*role))
-            }
+            // A `ReportAsk` passes whatever its role, its epoch and its
+            // sender; one whose role, epoch or holder is stale is answered
+            // with an empty `Report` (*end*) so its credit is freed (D-167).
+            Body::ReportAsk { .. } => None,
             // A `UnitRequest` passes whatever its epoch.
             Body::UnitRequest { .. } => None,
             // A `Send`'s stamp carries 0 (a sender attached to no task) or
@@ -722,8 +715,11 @@ impl Model {
     }
 
     /// The kernel rings into this node, in a step of the recovery reserve:
-    /// every message waiting, each a unit of the step. Returns whether one
-    /// was consumed.
+    /// every message waiting, each a unit of the step. Once a sealing node
+    /// has parked its other cores, each ring stops at a message whose step
+    /// would open a request of a core or a unit request, leaving that
+    /// message and what follows it in that ring until the resume (D-167).
+    /// Returns whether one was consumed.
     pub(crate) fn serve_kernel_rings(&mut self, units: &mut usize) -> bool {
         if !self.consumes() {
             return false;
@@ -731,7 +727,7 @@ impl Model {
         let mut any = false;
         let me = self.node;
         for from in (0..self.table.nodes).filter(|&f| f != me) {
-            while *units > 0 && self.has_kernel_message(from) {
+            while *units > 0 && self.has_answerable_kernel_message(from) {
                 self.consume(from, false, 1);
                 *units -= 1;
                 any = true;
@@ -742,6 +738,60 @@ impl Model {
 
     pub(crate) fn has_kernel_message(&self, from: u16) -> bool {
         self.ring_of(from, self.node, false).produced != self.consumed(from, self.node, false)
+    }
+
+    /// Whether the kernel ring `from` → this node holds a message the node
+    /// may still answer now (`node_stop` mode 1, D-167).
+    pub(crate) fn has_answerable_kernel_message(&self, from: u16) -> bool {
+        self.has_kernel_message(from) && !self.seal_waits_ring(from)
+    }
+
+    /// Whether the next unread message in the kernel ring `from` → this node
+    /// would open a request of a core or a unit request, and so must wait
+    /// (with what follows it in that ring) until the resume once the sealing
+    /// node has parked its other cores (`node_stop` mode 1, D-167).
+    fn seal_waits_ring(&self, from: u16) -> bool {
+        if self.seal != Some(crate::nodes::SealStep::Parking) {
+            return false;
+        }
+        let me = self.node;
+        let ring = self.ring_of(from, me, false);
+        let produced = ring.produced;
+        let consumed = ring_resync(produced, self.consumed(from, me, false), RING_KERNEL_ENTRIES);
+        if produced == consumed {
+            return false;
+        }
+        let available = produced.wrapping_sub(consumed);
+        let Some(RingEntry::Message(message)) = ring.at(consumed) else {
+            return false;
+        };
+        if !message.header.readable(available) {
+            return false;
+        }
+        if self.refused(from, Ring::Kernel, message).is_some() {
+            return false;
+        }
+        self.message_opens_request(message)
+    }
+
+    /// Whether a valid kernel message's step would open a request of a core
+    /// or a unit request (a `Revoke` of a mapped frame).
+    fn message_opens_request(&self, message: &Message) -> bool {
+        let Body::Revoke { use_index, .. } = message.body else {
+            return false;
+        };
+        let me = self.node as usize;
+        let Some(&entry) = self.table.uses[me].get(&use_index) else {
+            return false;
+        };
+        if entry.release_pending {
+            return false;
+        }
+        let Some(root_obj) = entry.root.filter(|r| self.objects.contains_key(r)) else {
+            return false;
+        };
+        let root_cap = self.objects[&root_obj].root;
+        self.revoke_step_opens_request(root_cap)
     }
 
     /// Whether any ring into this node holds something.

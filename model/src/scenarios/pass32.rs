@@ -422,7 +422,7 @@ fn a_node_sealed_after_its_report_was_asked_is_passed_over_as_sealed() {
             .sys
             .has(2)
             .then(|| m.sys.node(2).rebuilds.get(&IOMMU_ROLE));
-        rebuild.flatten().map(|r| (r.node, r.asked))
+        rebuild.flatten().map(|r| (r.node, r.asked.is_some()))
     };
     // The rebuild has sent its ask to node 0, which seals before it
     // consumes it.

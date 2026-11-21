@@ -381,6 +381,56 @@ impl Model {
             false => self.request_free().is_err(),
         }
     }
+
+    /// Whether `begin_unmap` of `cap` would open a request of a core or a
+    /// unit request (`node_stop` mode 1, D-167).
+    pub(crate) fn unmap_opens_request(&self, cap: CapId) -> bool {
+        let Record::Mapping(mapping) = self.caps[&cap].record else {
+            return false;
+        };
+        let space = mapping.space;
+        if self.aspaces[&space].flushed {
+            return false;
+        }
+        if self.iospaces.contains_key(&space) {
+            return self.unit_of_space(space).is_some();
+        }
+        if !self.others_hold(Some(space)) {
+            return false;
+        }
+        let me = 1u64 << *self.at;
+        let candidates = self.aspaces[&space].cores & !me;
+        (0..self.width())
+            .filter(|&c| candidates & (1 << c) != 0)
+            .any(|c| !self.cores[c].idle.mark)
+    }
+
+    /// Whether one step of `remove_root(root)` on a remote frame would open
+    /// a request of a core or a unit request (`node_stop` mode 1, D-167).
+    pub(crate) fn revoke_step_opens_request(&self, root: CapId) -> bool {
+        let mut remaining = dodos_abi::REMOVAL_STEP;
+        // Post-order DFS, last child first, matching `next_removed` in `caps.rs`.
+        let mut stack = vec![(root, false)];
+        while let Some((cap, visited)) = stack.pop() {
+            if remaining == 0 {
+                return false;
+            }
+            if !visited {
+                stack.push((cap, true));
+                for &child in &self.caps[&cap].children {
+                    stack.push((child, false));
+                }
+                continue;
+            }
+            remaining -= 1;
+            match self.caps[&cap].record {
+                Record::Unmapping(_) => return false,
+                Record::Mapping(_) if self.unmap_opens_request(cap) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
 }
 
 /// What `begin_unmap` did.
