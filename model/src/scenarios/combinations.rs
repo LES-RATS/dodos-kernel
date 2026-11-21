@@ -2749,6 +2749,11 @@ fn directed_combination(events: [usize; 3]) -> Seen {
     // 1. If FAILED_UNIT is wanted, break the IOMMU unit and drive an attach
     // or unmap to the timeout so the role word reads failed.
     if has(FAILED_UNIT) {
+        if has(PRE_LIVE) {
+            let detach = attach_call(&run.m, WIDE, 0x11, false);
+            let _ = run.call(WIDE, detach);
+            run.m.run(30 * MS);
+        }
         run.m.sys.break_unit(IOMMU_ROLE);
         let _ = run.call(2, Syscall::IoSpaceUnmap(s(pair0.got)));
         run.run(2 * dodos_abi::IOMMU_WAIT_NS + 60 * MS);
@@ -2789,7 +2794,7 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         let _ = run.call(2, detach);
         run.m.settle();
     }
-    if has(CROSSING) && has(PRE_LIVE) {
+    if (has(CROSSING) || has(RELEASE)) && (has(PRE_LIVE) || has(DETACHED) || has(LINE)) {
         let _ = run.call(pair0.holder, Syscall::IoSpaceUnmap(s(pair0.got)));
         run.m.settle();
         let aspace_map = Syscall::ASpaceMap(crate::Map {
@@ -2817,6 +2822,14 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         let settle_end = run.m.sys.now() + dodos_abi::SETTLE_NS + 5 * MS;
         while run.m.sys.now() < settle_end {
             run.run_by(2 * MS, 500_000);
+        }
+        if has(STUCK) {
+            let sweep = run.m.sys.canonical().sweep_ns;
+            let next = (run.m.sys.now() / sweep + 1) * sweep;
+            let delta = next.saturating_sub(run.m.sys.now());
+            if delta > 0 {
+                run.run_by(delta, 500_000);
+            }
         }
     }
 
@@ -2853,31 +2866,23 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         assert_eq!(run.m.state(0), MemberState::Unfenced);
     }
     if has(SEAL_LATE) {
-        let victim = if has(PRE_LIVE) || fresh_node == Some(4) {
-            1
-        } else {
-            0
-        };
-        let actor = if victim == 0 { 1 } else { 0 };
+        let victim = 0;
+        let actor = 1;
         assert_eq!(run.call(actor, seal(victim)), Some(DONE));
         let table = run.m.sys.canonical();
         let end = run.m.sys.now() + table.seal_ns + 2 * table.sweep_ns + 50 * MS;
         while run.m.sys.now() < end && !accused(run.m.state(victim)) {
-            run.run_by(2 * MS, 500_000);
+            run.run_by(500_000, 100_000);
         }
         assert!(accused(run.m.state(victim)));
     }
     if has(STALE) {
-        let victim = if has(PRE_LIVE) || fresh_node == Some(4) {
-            1
-        } else {
-            0
-        };
+        let victim = 0;
         run.hang(victim, true);
         let table = run.m.sys.canonical();
         let end = run.m.sys.now() + table.stale_ns + 2 * table.sweep_ns + 50 * MS;
         while run.m.sys.now() < end && !accused(run.m.state(victim)) {
-            run.run_by(2 * MS, 500_000);
+            run.run_by(500_000, 100_000);
         }
         assert!(accused(run.m.state(victim)));
     }
@@ -2897,7 +2902,7 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         let table = run.m.sys.canonical();
         let end = run.m.sys.now() + table.stuck_ns + 2 * table.sweep_ns + 50 * MS;
         while run.m.sys.now() < end && !accused(run.m.state(victim)) {
-            run.run_by(2 * MS, 500_000);
+            run.run_by(500_000, 100_000);
         }
         assert!(accused(run.m.state(victim)));
     }
@@ -2946,6 +2951,7 @@ fn directed_combination(events: [usize; 3]) -> Seen {
                     && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
                     && (!(has(CROSSING) && (has(RELEASE_PENDING) || has(PRE_LIVE)))
                         || (n != 0 && n != 2))
+                    && (!(has(RELEASE) && has(PRE_LIVE)) || (n != 0 && n != 2))
                     && (!(has(SIGNAL_PENDING) && (has(PRE_LIVE) || has(RELEASE_PENDING)))
                         || (n != 0 && n != 2))
                     && (!(has(REVOKING) && has(PRE_LIVE)) || (n != 0 && n != 2))
@@ -3068,7 +3074,7 @@ fn directed_combination(events: [usize; 3]) -> Seen {
                 && m.sys.node(WIDE).generation_built() == member.generation()
                 && m.sys.node(WIDE).is_ready()
         };
-        if is_x86 {
+        if is_x86 && !has(STUCK) && !has(STALE) && !has(SEAL_LATE) {
             assert!(run.m.step_until(built));
         } else {
             for _ in 0..10_000 {
@@ -3076,10 +3082,29 @@ fn directed_combination(events: [usize; 3]) -> Seen {
                     break;
                 }
                 let next = run.m.sys.events().into_iter().find(|e| {
-                    let crate::system::Event::Action(i) = *e else {
-                        return true;
-                    };
-                    run.m.sys.actions()[i].1 != crate::nodes::HwAction::Start { core: second }
+                    match *e {
+                        crate::system::Event::Action(i) => {
+                            let act = run.m.sys.actions()[i].1;
+                            if act == (crate::nodes::HwAction::Start { core: second }) {
+                                return false;
+                            }
+                            if (has(STUCK) || has(STALE) || has(SEAL_LATE))
+                                && act == (crate::nodes::HwAction::Stop { core: 0 })
+                            {
+                                return false;
+                            }
+                            true
+                        }
+                        crate::system::Event::Timer { node, .. }
+                        | crate::system::Event::Ipi { node, .. }
+                            if (has(STUCK) || has(STALE) || has(SEAL_LATE))
+                                && node != WIDE
+                                && node != actor =>
+                        {
+                            false
+                        }
+                        _ => true,
+                    }
                 });
                 let Some(ev) = next else {
                     break;
@@ -3221,6 +3246,18 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         };
         let _ = run.call(r_pair.granter, Syscall::CapRevoke(s(r_pair.obj)));
         assert!(probe(&run.m, run.splittable) & (1 << REVOKING) != 0);
+    } else if has(RELEASE) && !has(RELEASE_PENDING) {
+        let rel_pair = if has(PRE_LIVE)
+            || fresh_node == Some(4)
+            || resume_node == Some(3)
+            || resume_node == Some(4)
+        {
+            pair0
+        } else {
+            pair1
+        };
+        let _ = run.call(rel_pair.holder, Syscall::CapDelete(s(rel_pair.got)));
+        assert!(probe(&run.m, run.splittable) & (1 << RELEASE) != 0);
     }
 
     // 13. Short accusations: KILLED, SELF, RETIRED.
@@ -3468,35 +3505,62 @@ fn directed_combination(events: [usize; 3]) -> Seen {
 #[ignore = "long: run with --release"]
 fn directed_combinations_reach_all_45() {
     let list = [
+        "pair + accused stuck + release pending",
         "pair + unfenced + release pending",
         "pair + release crossing revoke + release pending",
         "pair + release pending + wake from sleep",
+        "pair + signal pending + first thread before live",
+        "pair + mid-attach + first thread before live",
         "resume + accused self + holder's death mid-hand",
+        "resume + accused self + first thread before live",
+        "resume + accused stale + release crossing revoke",
         "resume + accused stale + release pending",
+        "resume + accused stale + mid-attach",
         "resume + accused stale + first thread before live",
+        "resume + accused stuck + accused retire",
+        "resume + accused stuck + holder's death mid-hand",
+        "resume + accused stuck + release crossing revoke",
         "resume + accused stuck + release pending",
+        "resume + accused stuck + first thread before live",
         "resume + accused retire + release crossing revoke",
+        "resume + accused retire + mid-attach",
+        "resume + accused retire + first thread before live",
         "resume + accused seal + holder's death mid-hand",
         "resume + accused seal + release crossing revoke",
+        "resume + accused seal + release pending",
+        "resume + accused seal + first thread before live",
         "resume + unfenced + release crossing revoke",
         "resume + unfenced + release pending",
+        "resume + unfenced + first thread before live",
+        "resume + sealed + holder's death mid-hand",
         "resume + sealed + release crossing revoke",
+        "resume + sealed + release pending",
+        "resume + sealed + first thread before live",
         "resume + fresh start + holder's death mid-hand",
         "resume + fresh start + release crossing revoke",
         "resume + fresh start + wake from sleep",
         "resume + failed unit + holder's death mid-hand",
+        "resume + failed unit + release pending",
+        "resume + failed unit + first thread before live",
         "resume + role handing + release crossing revoke",
+        "resume + role handing + mid-attach",
         "resume + role handing + first thread before live",
         "resume + holder's death mid-hand + grant unanswered",
+        "resume + holder's death mid-hand + release",
         "resume + holder's death mid-hand + release crossing revoke",
         "resume + holder's death mid-hand + release pending",
         "resume + holder's death mid-hand + mid-attach",
+        "resume + holder's death mid-hand + wake from sleep",
         "resume + holder's death mid-hand + first thread before live",
         "resume + grant unanswered + first thread before live",
+        "resume + revoking + mid-attach",
         "resume + revoking + first thread before live",
+        "resume + release + first thread before live",
         "resume + release crossing revoke + release pending",
         "resume + release crossing revoke + chunk given",
+        "resume + release crossing revoke + device detached",
         "resume + release crossing revoke + mid-attach",
+        "resume + release crossing revoke + line moving",
         "resume + release crossing revoke + wake from sleep",
         "resume + release crossing revoke + first thread before live",
         "resume + release pending + signal pending",
@@ -3505,12 +3569,14 @@ fn directed_combinations_reach_all_45() {
         "resume + release pending + wake from sleep",
         "resume + signal pending + mid-attach",
         "resume + signal pending + first thread before live",
+        "resume + chunk given + first thread before live",
         "resume + device detached + first thread before live",
         "resume + mid-attach + first thread before live",
         "resume + wake from sleep + first thread before live",
         "death + release crossing revoke + release pending",
         "death + release pending + signal pending",
         "death + release pending + wake from sleep",
+        "death + signal pending + mid-attach",
         "death + signal pending + first thread before live",
         "death + mid-attach + first thread before live",
     ];
@@ -3533,6 +3599,10 @@ fn directed_combinations_sample() {
         "resume + failed unit + holder's death mid-hand",
         "resume + fresh start + wake from sleep",
         "resume + wake from sleep + first thread before live",
+        "resume + accused stuck + first thread before live",
+        "resume + failed unit + first thread before live",
+        "resume + holder's death mid-hand + release",
+        "resume + release crossing revoke + device detached",
     ] {
         let events = combination(name);
         let seen = directed_combination(events);
