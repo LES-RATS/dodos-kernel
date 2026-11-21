@@ -15,13 +15,13 @@ use dodos_abi::{
     START_SLOT_MACHINE_LIVING, START_SLOT_MAILBOX,
 };
 
-const REPLY: u32 = 100;
+pub(super) const REPLY: u32 = 100;
 pub(super) const FRAME: u32 = 101;
 const SECOND: u32 = 102;
 const GOT: u32 = 110;
 const BLOCK: u32 = 160;
 
-fn recv() -> Syscall {
+pub(super) fn recv() -> Syscall {
     Syscall::Recv {
         endpoint: s(START_SLOT_MAILBOX),
         reply: s(REPLY),

@@ -572,8 +572,10 @@ impl Model {
     }
 
     /// Replenishment: r += n × B, or r = B when n was bounded by
-    /// `SCHED_MAX_DEBT` (the rest of the debt is forgiven, D-159); d += n ×
-    /// T, and if d is not after now, d = now + T.
+    /// `SCHED_MAX_DEBT`, that is when 1 + ⌊−r / B⌋ is above it (the rest of
+    /// the debt is forgiven, D-159; at exactly `SCHED_MAX_DEBT` the debt is
+    /// paid whole, D-163); d += n × T, and if d is not after now, d = now +
+    /// T.
     ///
     /// If r is still not positive, the context is exhausted again at once,
     /// in the same event; its next instant is after now, so this ends.

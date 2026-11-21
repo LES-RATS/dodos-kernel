@@ -15,9 +15,9 @@
 //! triple of a resume and two others, and each triple of a death and two
 //! others (`Reach`). In the long run (`#[ignore]`, `--release`), a
 //! combination no seed reaches fails the test, unless `IMPOSSIBLE` shows
-//! from the contract that it cannot happen; the 26 seeds of `verify` reach
+//! from the contract that it cannot happen; the 27 seeds of `verify` reach
 //! about half of them, and fail if they miss more than when measured
-//! (`MISSED_BY_26_SEEDS`). Then the
+//! (`MISSED_BY_THE_SEEDS`). Then the
 //! machine runs until it is quiet, and its liveness is asserted: no node is
 //! accused that was not harmed (killed, failed, hung, retired or sealed past
 //! `SEAL_NS`), and no wait of a live node for another node, a unit or its
@@ -323,6 +323,8 @@ struct Reach {
     handed_failed: usize,
     /// The forged messages of a faulty node seen refused by their receiver.
     refused: usize,
+    /// Faulty action 9 written while `f`'s R4 for the node had not ended.
+    early_acks: usize,
     /// The seeds that reached each of `TABLE_STATES`.
     tables: [usize; TABLE_STATES.len()],
     pairs: Vec<Vec<usize>>,
@@ -339,6 +341,8 @@ struct Seen {
     death: BTreeSet<(usize, usize)>,
     events: BTreeSet<usize>,
     refused: usize,
+    /// Faulty action 9 written while `f`'s R4 for the node had not ended.
+    early_acks: usize,
     /// The states of D-154 to D-157 reached (`TABLE_STATES`).
     tables: BTreeSet<usize>,
 }
@@ -419,6 +423,7 @@ impl Reach {
             gap_21: 0,
             handed_failed: 0,
             refused: 0,
+            early_acks: 0,
             tables: [0; TABLE_STATES.len()],
             pairs: square(),
             resume: square(),
@@ -441,6 +446,7 @@ impl Reach {
             self.events[e] += 1;
         }
         self.refused += seen.refused;
+        self.early_acks += seen.early_acks;
         for &state in &seen.tables {
             self.tables[state] += 1;
         }
@@ -1869,9 +1875,9 @@ impl Run {
                 self.forged(f, to);
             }
             // 9: early `beacons[f].acked[x] = g` and `maps_of[x] = false`
-            // written by `f` (when `f` holds no unit role, has run R0 and
-            // R4 for `x`, and has no active grant or remote capability of
-            // `x`)
+            // written by `f` (when `f` holds no unit role, has run R0 for
+            // `x`, its R4 ended or not, and has no active grant or remote
+            // capability of `x`)
             // while `x` is `Fenced`: R6's proof (`r6_held_back`, D-149)
             // still holds R6 back until every grantee's use entry counts no
             // leaf under `x`'s grants and no attach word of `x` reads
@@ -1886,17 +1892,29 @@ impl Run {
                     let xg = self.m.sys.member(x).generation();
                     x != f
                         && self.m.state(x) == MemberState::Fenced
-                        && self.m.sys.node(f).reclaims.get(&x).is_some_and(|r| {
-                            // R4's audit ended too: `f`'s own check
-                            // holds R5 after it (pass 34).
-                            r.generation == xg
-                                && r.isolated
-                                && r.audit.as_ref().is_some_and(Vec::is_empty)
-                        })
+                        && self
+                            .m
+                            .sys
+                            .node(f)
+                            .reclaims
+                            .get(&x)
+                            .is_some_and(|r| r.generation == xg && r.isolated)
                         && !table.grants[x as usize].values().any(|e| e.grantee == f)
                         && !table.grants[f as usize].values().any(|e| e.grantee == x)
                 });
                 if let Some(x) = fenced {
+                    // Written before R4's audit may have ended: `f`'s kernel
+                    // is declared faulty from here on, so that its own
+                    // state is no longer judged against the rules only a
+                    // correct kernel keeps (R2 and R4 before R5); the rules
+                    // that protect the other nodes, R6's proof among them,
+                    // still hold (pass 36: pass 34 held the adversary to
+                    // the end of R4 instead, a weakening the review of
+                    // passes 33 and 34 found).
+                    self.m.sys.make_faulty(f);
+                    let reclaim = &self.m.sys.node(f).reclaims[&x];
+                    let audited = reclaim.audit.as_ref().is_some_and(Vec::is_empty);
+                    self.seen.early_acks += usize::from(!audited);
                     let xg = self.m.sys.member(x).generation();
                     self.m.sys.edit_table(|t| {
                         t.beacons[f as usize].acked[x as usize] = xg;
@@ -2092,34 +2110,40 @@ fn report(reach: &Reach) -> Vec<String> {
     missing
 }
 
-/// The combinations the 26 seeds of `verify` do not reach, measured
+/// The combinations the 27 seeds of `verify` do not reach, measured
 /// (`DODOS_COUNTS=1` prints them).
-const MISSED_BY_26_SEEDS: usize = 451;
+const MISSED_BY_THE_SEEDS: usize = 448;
 
 /// The run of `verify`: 26 seeds spread over the triples of drivers, so
-/// that each driver is among them; the check after every step and the
-/// liveness of each seed are asserted, and each event is reached.
+/// that each driver is among them, and seed 2; the check after every step
+/// and the liveness of each seed are asserted, and each event is reached.
+/// (Pass 36: the faulty action 9 that writes an acknowledgement before R4
+/// ended moved the paths of the 26 seeds, which then missed 452, one more
+/// than measured; seed 2 was added rather than the bound raised.)
 #[test]
 fn combined_recovery_states_between_nodes() {
     // Over the three rounds of the triples, one per architecture.
     let seeds = 3 * 286;
-    let reach = explore((0..26).map(|i| i * seeds / 26).collect());
+    let mut chosen: Vec<u64> = (0..26).map(|i| i * seeds / 26).collect();
+    chosen.push(2);
+    let reach = explore(chosen);
     let missing = report(&reach);
     if replayed().is_none() {
         for e in 0..EVENTS {
             assert!(reach.events[e] > 0, "the seeds never reach {}", NAMES[e]);
         }
-        // The 26 seeds reach part of the combinations only (the long run
+        // The 27 seeds reach part of the combinations only (the long run
         // below asserts every one): as many as they reached when this was
         // measured, so a change that loses some fails here (the audit of
         // lot 8a, F1: the list was thrown away).
         assert!(reach.refused > 0, "no forged message seen refused");
+        assert!(reach.early_acks > 0, "no acknowledgement before R4 ended");
         for (state, &seeds) in TABLE_STATES.iter().zip(&reach.tables) {
             assert!(seeds > 0, "the seeds never reach {state}");
         }
         assert!(
-            missing.len() <= MISSED_BY_26_SEEDS,
-            "{} combinations never reached, {MISSED_BY_26_SEEDS} measured: {missing:#?}",
+            missing.len() <= MISSED_BY_THE_SEEDS,
+            "{} combinations never reached, {MISSED_BY_THE_SEEDS} measured: {missing:#?}",
             missing.len()
         );
     }

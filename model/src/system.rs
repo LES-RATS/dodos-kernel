@@ -1309,9 +1309,10 @@ impl System {
     }
 
     /// The machine table, changed as every kernel then reads it.
-    pub(crate) fn edit_table(&mut self, edit: impl FnOnce(&mut crate::table::Table)) {
+    pub(crate) fn edit_table<R>(&mut self, edit: impl FnOnce(&mut crate::table::Table) -> R) -> R {
         let mut table = self.table().clone();
-        edit(&mut table);
+        let result = edit(&mut table);
         self.share(table);
+        result
     }
 }

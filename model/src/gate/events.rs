@@ -35,14 +35,16 @@ impl Machine {
         }
         self.r6_devices(n);
         // The dead node's use entries freed (its tables gone with R6 below),
-        // then the granters free their pinned grants on them; a fenced
-        // granter's gate refuses (the grant entry's cell Fence), its own R6
-        // frees them (pass 34, R-8).
+        // then the granters free their pinned grants on them (R3), each
+        // through its own gate: a granter whose gate writes nothing leaves
+        // them, a fenced one to its own R6 (the grant entry's cell Fence;
+        // pass 34, R-8), a sealed one to R3 at its resume (G13; Grants,
+        // Generations; pass 36, finding 11 of the review of passes 33 and
+        // 34).
         self.grants.uses[usize::from(n)] = [None; grants::GRANTS];
         self.grants.remote.retain(|&(holder, _, _), _| holder != n);
         for granter in 0..self.layout.len() as u16 {
-            let state = self.gate.members[usize::from(granter)].state;
-            if matches!(state, NodeState::Fencing | NodeState::Fenced) {
+            if !self.gate.members[usize::from(granter)].state.writes() {
                 continue;
             }
             for slot in 0..grants::GRANTS {
@@ -216,6 +218,19 @@ impl Machine {
         for p in 0..self.layout[usize::from(n)].cores.len() {
             let core = self.core(n, p);
             self.parks.parked[core] = false;
+        }
+        // R3 for the generations that ended while the node was sealed: it
+        // frees at once the grants it made to a generation already over
+        // (Grants, Generations), whose use entries that generation's R6
+        // freed.
+        for slot in 0..grants::GRANTS {
+            let Some(grant) = self.grants.grants[usize::from(n)][slot] else {
+                continue;
+            };
+            let grantee = self.gate.members[usize::from(grant.grantee)];
+            if grantee.state == NodeState::Dead || grantee.generation != grant.generation {
+                let _ = self.release_grant(n, slot);
+            }
         }
         for p in 0..self.layout[usize::from(n)].cores.len() {
             let core = self.core(n, p);

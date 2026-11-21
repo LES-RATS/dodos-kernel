@@ -381,6 +381,14 @@ fn an_untagged_clearing_call_asks_the_cores_whose_loaded_root_is_the_root() {
         (m.gate.map_counts[4], cached(&m, 1)),
         (2, vec![((0, 0), 16)])
     );
+    // "Every *other* core of the node": the caller, its loaded root the
+    // root too, is not asked (finding 7 of the review of passes 33 and 34).
+    let mut both = untagged(1, OldRules::default());
+    steps(&mut both, &[load0(0, A), load0(1, A), unmap.clone()]);
+    let Request::InUse { asked, .. } = &both.gate.nodes[0].requests[0] else {
+        panic!("the request completed with core 1 holding the leaf");
+    };
+    assert_eq!(asked, &BTreeSet::from([1]));
     steps(&mut m, &[Op::Ack { n: 0, p: 1 }]);
     assert_eq!((m.gate.map_counts[4], cached(&m, 1)), (1, vec![]));
     for other in [load0(1, B), Op::Idle { n: 0, p: 1 }] {
@@ -490,6 +498,11 @@ fn an_untagged_dying_root_asks_every_core_that_has_it_loaded() {
 fn faulty_kernels_keep_g_on_untagged_machines() {
     use super::faulty::Rng;
     let (mut done, mut loads, mut asked) = (0, 0, 0);
+    // Loads of another root by a core that has translations cached, which
+    // the load's invalidation is for; and calls that name another node's
+    // root, which `tag_holds` refuses (finding 7 of the review of passes 33
+    // and 34: the exploration reached neither).
+    let (mut switches, mut foreign) = (0, 0);
     for seed in 0..200u64 {
         let width = (seed % 2) as u32;
         let mut m = Machine::new(2, 2, 8)
@@ -499,8 +512,27 @@ fn faulty_kernels_keep_g_on_untagged_machines() {
         let mut rng = Rng(seed + 1);
         for step in 0..400 {
             let op = m.random_op(&mut rng);
+            let switch = match op {
+                Op::Load { n, p, root, .. } if p < m.layout[usize::from(n)].cores.len() => {
+                    let core = m.core(n, p);
+                    m.gate.nodes[usize::from(n)].loaded[p].0 != root
+                        && !m.tlb[core].leaves.is_empty()
+                }
+                _ => false,
+            };
+            let named = match op {
+                Op::Map { n, root, .. } | Op::Unmap { n, root, .. } | Op::Load { n, root, .. } => {
+                    let live =
+                        m.gate.classes.get(root as usize) == Some(&Class::Root(RootState::Live));
+                    live && !m.holds(n, root)
+                }
+                _ => false,
+            };
             let outcome = m.step(&op);
             done += usize::from(outcome.is_ok());
+            switches += usize::from(switch && outcome.is_ok());
+            foreign += usize::from(named);
+            assert!(!named || outcome.is_err(), "{op:?} on another node's root");
             loads += usize::from(outcome.is_ok() && matches!(op, Op::Load { .. }));
             let requests = m.gate.nodes.iter().flat_map(|n| &n.requests);
             asked += requests
@@ -513,4 +545,8 @@ fn faulty_kernels_keep_g_on_untagged_machines() {
     }
     assert!(done > 200 * 40, "only {done} calls performed");
     assert!(loads > 200 && asked > 200, "{loads} loads, {asked} asked");
+    assert!(
+        switches > 0 && foreign > 0,
+        "{switches} switches, {foreign} foreign"
+    );
 }

@@ -54,7 +54,8 @@ fn replenished(k: &mut N, context: ObjId) -> i64 {
 // D-159 (2), gap 50 (Exhaustion and replenishment): "Let n = min(1 +
 // ⌊−r / B⌋, SCHED_MAX_DEBT)". A debt of exactly `SCHED_MAX_DEBT` budgets
 // is not bounded: the instant is d + (n − 1) × T and the replenishment
-// pays the whole debt, r += n × B.
+// pays the whole debt, r += n × B (D-163 (2): "at exactly `SCHED_MAX_DEBT`
+// the debt is paid whole").
 #[test]
 fn a_debt_of_exactly_sched_max_debt_budgets_is_paid_whole() {
     let (mut k, context, d) = charged_after_a_stop(SCHED_MAX_DEBT * B + 3);

@@ -378,10 +378,15 @@ impl System {
                 // for a grantee that runs (audit lot 7: LEAK passed over
                 // every pinned entry).
                 if entry.state == GrantState::Pinned {
+                    // "Its grantee is fenced or unfenced" (R3; finding 1 of
+                    // the review of passes 33 and 34: unfenced was left out).
                     let accused = grantee.generation() != entry.generation
                         || matches!(
                             grantee.state(),
-                            MemberState::Fencing | MemberState::Fenced | MemberState::Dead
+                            MemberState::Fencing
+                                | MemberState::Fenced
+                                | MemberState::Unfenced
+                                | MemberState::Dead
                         );
                     let frozen = table
                         .uses

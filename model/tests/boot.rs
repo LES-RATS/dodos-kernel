@@ -779,6 +779,25 @@ fn kernel_refuses_a_sixty_four_kb_granule() {
     assert_eq!(Model::boot(&machine).err(), Some(Refusal::MachineValues));
 }
 
+// Finding 9 of the review of passes 33 and 34: a fence class is 0, 1 or 2
+// (The fence); a core of class 3 is a value of the machine outside its
+// range, refused at start, not a panic of the start-up.
+#[test]
+fn the_machine_start_up_refuses_a_fence_class_above_2() {
+    for core in [0, 1] {
+        let mut machine = Machine::example();
+        machine.cores[core].fence = 3;
+        assert_eq!(
+            Model::boot(&machine).err(),
+            Some(Refusal::MachineValues),
+            "core {core}"
+        );
+    }
+    let mut two = Machine::example();
+    two.cores[1].fence = 2;
+    assert!(Model::boot(&two).is_ok());
+}
+
 /// A machine of `Machine::example` whose `BootPorts` lists `ranges`, each
 /// (first port, log2 of its count), its console a UART at 0x3F8.
 fn with_ports(ranges: &[(u16, u8)]) -> Machine {
@@ -808,7 +827,11 @@ fn the_machine_starts_with_boot_ports_in_range() {
 // multiple of its size.)
 #[test]
 fn the_machine_start_up_refuses_boot_ports_out_of_range() {
-    let mut over = with_ports(&[]);
+    // 64 disjoint single ports, accepted; with a number of 65, refused for
+    // the number alone (finding 2 of the review of passes 33 and 34).
+    let full: Vec<(u16, u8)> = (0..64).map(|i| (0x1000 + i, 0)).collect();
+    assert!(Model::boot(&with_ports(&full)).is_ok());
+    let mut over = with_ports(&full);
     over.boot_ports.count = 65;
     let mut reserved = with_ports(&[(0x60, 0)]);
     reserved.boot_ports.reserved = 1;

@@ -735,3 +735,35 @@ fn a_grantees_r6_leaves_a_fenced_granters_grant_to_its_own_r6() {
     assert_eq!(m.gate.members[0].state, NodeState::Dead);
     assert_eq!(m.grants.grants[0][0], None);
 }
+
+// Pass 36, finding 11 of the review of passes 33 and 34 (G13: a sealed
+// node's gate refuses every write; Grants, Generations: "A node that was
+// sealed while X's generation ended ... when it resumes ... runs R0, R2 and
+// R3 ... (R3 frees at once the grants it made to a generation already
+// over)"). The grantee's R6 leaves a sealed granter's grant entry as it
+// is; the granter's resume frees it.
+#[test]
+fn a_grantees_r6_leaves_a_sealed_granters_grant_to_its_resume() {
+    let mut m = Machine::new(3, 2, 8);
+    let mut ops = grantee_maps(0);
+    ops[0] = Op::Take {
+        n: 0,
+        chunk: 6,
+        kind: Take::Ordinary,
+    };
+    ops[1] = Op::Grant {
+        n: 0,
+        slot: 0,
+        page: 6 * PAGES_PER_CHUNK,
+        to: 1,
+    };
+    steps(&mut m, &ops);
+    steps(&mut m, &[Op::Seal { n: 0 }]);
+    assert_eq!(m.gate.members[0].state, NodeState::Sealed);
+    steps(&mut m, &[Op::Death { n: 1 }]);
+    assert_eq!(m.gate.members[1].state, NodeState::Dead);
+    assert!(m.grants.grants[0][0].is_some(), "a sealed gate wrote");
+    steps(&mut m, &[Op::Resume { n: 0 }]);
+    assert_eq!(m.gate.members[0].state, NodeState::Live);
+    assert_eq!(m.grants.grants[0][0], None, "R3 at the resume");
+}

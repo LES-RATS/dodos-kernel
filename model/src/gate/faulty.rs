@@ -578,7 +578,7 @@ impl Machine {
             0 => page,
             _ => pick(rng, loose),
         };
-        let root = pick(rng, roots);
+        let root = pick(rng, roots.clone());
         let child = pick(rng, tables);
         // The tags of the architecture: the table's and the gate's own.
         let arch_tags = self.gate.nodes[usize::from(n)].tags.len().max(2);
@@ -602,7 +602,23 @@ impl Machine {
             .copied()
             .filter(|&q| self.gate.classes[q as usize] == Class::Root(RootState::Live))
             .collect();
+        // Untagged, now and then another node's *live* root, which a faulty
+        // kernel names though its node does not own it; and mostly a root
+        // other than the one core `p` has loaded, so that a load leaves
+        // translations of the root before (finding 7 of the review of
+        // passes 33 and 34: neither the ownership in `tag_holds` nor the
+        // invalidation of a load was seen by this exploration).
+        let foreign: Vec<Page> = (0..pages)
+            .filter(|&q| self.gate.classes[q as usize] == Class::Root(RootState::Live))
+            .filter(|&q| !self.holds(n, q))
+            .collect();
+        let loaded = self.gate.nodes[usize::from(n)].loaded[p].0;
+        let others: Vec<Page> = live.iter().copied().filter(|&q| q != loaded).collect();
         let named = match untagged {
+            true if !foreign.is_empty() && rng.below(6) == 0 => {
+                Some(foreign[rng.below(foreign.len() as u64) as usize])
+            }
+            true if !others.is_empty() => Some(others[rng.0 as usize % others.len()]),
             true => (!live.is_empty()).then(|| live[rng.0 as usize % live.len()]),
             false => self.gate.nodes[usize::from(n)].tags[tag].root,
         };
@@ -652,6 +668,10 @@ impl Machine {
             0 => 15,
             1 => 16,
             2 => 17,
+            // Untagged, a root load more often: a core that changes roots
+            // with translations cached is what the load's invalidation is
+            // for (finding 7 of the review of passes 33 and 34).
+            _ if untagged && rng.below(3) == 0 => 9,
             _ => rng.below(15),
         };
         match category {
@@ -702,6 +722,21 @@ impl Machine {
                 next: (rng.below(3) != 0).then_some(page),
             },
             7 => Op::TableFree { n, page },
+            // Untagged, mostly `bind(0, R)` of an unbound root of the node,
+            // so that a node has several live roots for its cores to load
+            // in turn (finding 7 of the review of passes 33 and 34).
+            8 if untagged && rng.below(4) != 0 => {
+                let unbound: Vec<Page> = roots
+                    .iter()
+                    .copied()
+                    .filter(|&q| self.gate.classes[q as usize] == Class::Root(RootState::Unbound))
+                    .collect();
+                let root = match unbound.is_empty() {
+                    true => root,
+                    false => unbound[rng.below(unbound.len() as u64) as usize],
+                };
+                Op::Bind { n, tag: 0, root }
+            }
             8 => Op::Bind { n, tag, root },
             9 => Op::Load { n, p, root, tag },
             10 => Op::Idle { n, p },

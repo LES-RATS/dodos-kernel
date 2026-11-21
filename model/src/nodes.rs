@@ -2078,8 +2078,8 @@ impl Model {
             return any;
         }
         // The gate's condition of starting → live: every core whose word
-        // names the node reads owned, none joining (D-158).
-        if !self.table.joining(me, member.generation()) {
+        // names the node reads owned without the mark (D-158, D-163).
+        if self.table.owned_unmarked(me, member.generation()) {
             self.ready = true;
             self.resuming = false;
             self.sealed_view.clear();

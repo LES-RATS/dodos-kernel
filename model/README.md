@@ -164,7 +164,7 @@ pair (kind 9 reserved since the sweep's `Ping` was removed, D-135).
   was not harmed and no wait left; drivers hold the short states open: a
   resume whose first wake is lost, under a rebuild, or beside an
   accusation, and a pending release whose holder's events are held back;
-  `verify` runs 26 seeds, and `cargo test --release -p dodos-model --lib
+  `verify` runs 27 seeds, and `cargo test --release -p dodos-model --lib
   every_combination -- --ignored` explores 858, `DODOS_COMBINATION_SEEDS`
   another number and `DODOS_COMBINATION_FIRST` the first, and fails on a
   combination no seed reaches that `IMPOSSIBLE` does not exclude; on 18

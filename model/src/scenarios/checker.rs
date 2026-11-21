@@ -1378,6 +1378,76 @@ fn a_wait_for_an_answer_of_a_node_r0_isolated_is_reported() {
     reported_on(&m, 0, "R0: a wait for an answer of a node it isolated");
 }
 
+/// Node `x` read in `state` by node `by`'s table, and R0 run there for
+/// its generation.
+fn isolated_in(m: &mut S, by: u16, x: u16, state: MemberState) {
+    let g = m.sys.member(x).generation();
+    m.sys.edit_table(|t| {
+        let evidence = dodos_abi::Evidence::Stale;
+        t.members[usize::from(x)] = dodos_abi::Member::new(state, evidence, 0, g);
+    });
+    let reclaim = m.sys.node_mut(by).reclaims.entry(x).or_default();
+    (reclaim.generation, reclaim.isolated) = (g, true);
+}
+
+// Finding 1 of the review of passes 33 and 34: R0's isolation holds for a
+// node left unfenced as for a fenced one ("fencing → fenced or unfenced →
+// dead"): a wait for it is reported.
+#[test]
+fn a_wait_for_an_answer_of_an_unfenced_node_r0_isolated_is_reported() {
+    let mut m = S::two();
+    let rights = Rights::READ.union(Rights::WRITE);
+    let retype = m.retype(0, ObjectKind::Frame, 1, super::pass32::FRAME);
+    m.ok(0, retype);
+    assert_eq!(
+        m.call(0, super::pass32::send(1, super::pass32::FRAME, rights)),
+        WAITS
+    );
+    isolated_in(&mut m, 0, 1, MemberState::Unfenced);
+    reported_on(&m, 0, "R0: a wait for an answer of a node it isolated");
+}
+
+// Finding 5 of the review of passes 33 and 34 (Reclaim, R0: "each unit
+// request sent to X goes back to waiting for a holder"): a request left
+// sent to a node R0 isolated is reported.
+#[test]
+fn a_unit_request_still_sent_to_a_node_r0_isolated_is_reported() {
+    use super::units::{DEVICE, IOSPACE, attach, three};
+    let mut m = three();
+    let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
+    m.ok(0, iospace);
+    m.hang(1, true);
+    let call = attach(&m, 0, IOSPACE, DEVICE);
+    assert_eq!(m.call(0, call), WAITS);
+    m.run(MS);
+    isolated_in(&mut m, 0, 1, MemberState::Fenced);
+    reported_on(&m, 0, "R0: a unit request still sent to a node it isolated");
+}
+
+// Finding 5 (Reclaim, R0: "each request of X that this node serves ends
+// unanswered"): a request of a node R0 isolated, still served, is
+// reported.
+#[test]
+fn a_request_of_a_node_r0_isolated_still_served_is_reported() {
+    use super::units::{DEVICE, IOMMU_ROLE, IOSPACE, attach};
+    let mut m = S::two();
+    let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
+    m.ok(0, iospace);
+    m.sys.break_unit(IOMMU_ROLE);
+    let call = attach(&m, 0, IOSPACE, DEVICE);
+    assert_eq!(m.call(0, call), WAITS);
+    let served = |m: &S| {
+        m.sys
+            .node(1)
+            .unit_service
+            .keys()
+            .any(|&(from, _)| from == 0)
+    };
+    assert!(m.step_until(served), "node 1 serves node 0's request");
+    isolated_in(&mut m, 1, 0, MemberState::Fencing);
+    reported_on(&m, 1, "R0: a request of a node it isolated still served");
+}
+
 // Audit lot 7 (sonnet F11; G6: a grantee's leaves are counted in its use
 // entry): node Y maps the frame granted to it; its use entry then gone, the
 // translation counts in no entry, and is reported.

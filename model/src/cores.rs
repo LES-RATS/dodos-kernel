@@ -943,7 +943,7 @@ impl Model {
             }
         }
         let member = self.table.member(self.node);
-        let owned = !self.table.joining(self.node, member.generation());
+        let owned = self.table.owned_unmarked(self.node, member.generation());
         if owned && fresh && member.state() == dodos_abi::MemberState::Starting {
             let live = dodos_abi::Member::new(
                 dodos_abi::MemberState::Live,

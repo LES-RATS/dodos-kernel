@@ -890,6 +890,9 @@ impl Machine {
             .all(|c| usize::from(c.kind) < self.kinds.len());
         // `BootMembership`'s flags: none but those defined (D-149).
         let kinds = kinds && self.membership.flags & !dodos_abi::BOOT_MEMBERSHIP_FLAGS == 0;
+        // A fence class is 0, 1 or 2 (The fence; finding 9 of the review of
+        // passes 33 and 34: a class of 3 reached a panic of the start-up).
+        let kinds = kinds && self.cores.iter().all(|c| c.fence <= 2);
         let windows = self.boot_nodes.as_ref().is_none_or(|(_, nodes)| {
             nodes
                 .iter()

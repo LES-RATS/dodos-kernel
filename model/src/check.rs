@@ -443,6 +443,7 @@ impl Model {
                             m.state(),
                             dodos_abi::MemberState::Fencing
                                 | dodos_abi::MemberState::Fenced
+                                | dodos_abi::MemberState::Unfenced
                                 | dodos_abi::MemberState::Dead
                         )
                 });

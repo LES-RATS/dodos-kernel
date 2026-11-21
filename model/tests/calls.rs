@@ -5722,3 +5722,14 @@ fn a_reply_recv_judges_its_endpoint_before_the_busy_of_a_move() {
     let moved = msg(1, vec![Transfer::Move(UT)]);
     k.no(reply_recv(RP, moved, 77), Error::Invalid);
 }
+
+// Finding 4 of the review of passes 33 and 34: `reply_recv` judges the
+// `busy` of a *move* of an untyped root that has a descendant (Order of
+// checks, step 4), as `call` and `send` do.
+#[test]
+fn a_reply_recv_that_moves_an_untyped_root_with_a_descendant_is_busy() {
+    let mut k = K::with_ipc();
+    let moved = msg(1, vec![Transfer::Move(UT)]);
+    k.no(reply_recv(RP, moved, EP), Error::Busy);
+    assert_eq!(k.inspect(UT).unwrap().0, Untyped);
+}

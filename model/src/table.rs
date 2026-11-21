@@ -637,13 +637,14 @@ impl Table {
             .collect()
     }
 
-    /// Whether a core word naming a node with a generation reads joining:
-    /// the node's starting → live waits until none does (The states of a
-    /// node, D-158).
-    pub(crate) fn joining(&self, node: u16, generation: u32) -> bool {
-        self.cores_of(node, generation).into_iter().any(|c| {
+    /// Whether every core word naming a node with a generation reads
+    /// *owned* without the mark: the gate's condition of the node's
+    /// starting → live, none *joining* (D-158) and none marked (D-163: a
+    /// marked word, which a resume leaves as it is, let the node go live).
+    pub(crate) fn owned_unmarked(&self, node: u16, generation: u32) -> bool {
+        self.cores_of(node, generation).into_iter().all(|c| {
             self.core_word(c)
-                .is_some_and(|w| w.state() == CoreState::Joining)
+                .is_some_and(|w| w.state() == CoreState::Owned && !w.is_marked())
         })
     }
 

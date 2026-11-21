@@ -921,7 +921,9 @@ pub const fn bandwidth(budget: u64, period: u64) -> u64 {
 
 /// The budgets of an exhaustion: n, and whether `SCHED_MAX_DEBT` bounded
 /// it, in which case the replenishment writes r = B and the rest of the
-/// debt is forgiven (Exhaustion and replenishment, D-159).
+/// debt is forgiven (Exhaustion and replenishment, D-159). Bounded means
+/// 1 + ⌊−r / B⌋ above the bound: at exactly the bound the debt is paid
+/// whole (D-163 (2)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedDebt {
     pub budgets: u64,

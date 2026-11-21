@@ -1454,6 +1454,10 @@ fn a_port_entry_holds_its_first_port_and_no_base() {
     // Each range aligned on its power-of-two size (`BootPorts`).
     assert_eq!(DeviceEntry::port(0x3F9, 3), None);
     assert_eq!(DeviceEntry::port(0x3F8, 17), None);
+    // More than 2^16 ports, from port 0, which every size aligns (finding 8
+    // of the review of passes 33 and 34: only the alignment refused 17).
+    assert_eq!(DeviceEntry::port(0, 17), None);
+    assert_eq!(DeviceEntry::port(0, 63), None);
 }
 
 /// An entry the layout cannot hold is refused, not a panic (audit lot 2,
@@ -2757,6 +2761,11 @@ fn the_core_word_check_accepts_the_rows_of_the_table() {
         (owned.marked(), owned),
         (owned, CoreWord::free(false).unusable().marked()),
         (owned, owned),
+        // R6 writes the word free without the mark, which it clears
+        // (finding 8 of the review of passes 33 and 34: no case had a
+        // marked free target with every other flag kept).
+        (owned.marked(), CoreWord::free(false).marked()),
+        (joining.unusable(), CoreWord::free(true).marked()),
     ];
     for (from, to) in refused {
         assert_eq!(core_transition(from, to), None, "{from:?} {to:?}");
@@ -3474,7 +3483,8 @@ fn the_budgets_of_an_exhaustion_are_bounded_by_sched_max_debt() {
     assert_eq!(sched_debt(0, b), debt(1, false));
     assert_eq!(sched_debt(-(b as i64) + 1, b), debt(1, false));
     assert_eq!(sched_debt(-(b as i64), b), debt(2, false));
-    // The bound: a debt of exactly `SCHED_MAX_DEBT` budgets is whole, one
+    // The bound: a debt of exactly `SCHED_MAX_DEBT` budgets is whole (D-163
+    // (2): "at exactly `SCHED_MAX_DEBT` the debt is paid whole"), one
     // nanosecond more is bounded.
     let last = (SCHED_MAX_DEBT * b - 1) as i64;
     assert_eq!(sched_debt(-last, b), debt(SCHED_MAX_DEBT, false));
@@ -3627,7 +3637,14 @@ fn boot_ports_of_aligned_disjoint_ranges_are_valid() {
 #[test]
 fn boot_ports_out_of_range_are_refused() {
     let k = &KERNEL_AND_CONSOLE;
-    let mut over = boot_ports(&[]);
+    // 64 disjoint ranges that the record accepts; the same with a number
+    // of 65 is refused for the number alone (finding 2 of the review of
+    // passes 33 and 34: 65 over 64 entries of 0 was refused as overlapping).
+    let full: Vec<(u16, u8)> = (0..BOOT_PORTS_MAX as u16)
+        .map(|i| (0x1000 + i, 0))
+        .collect();
+    assert!(boot_ports(&full).valid(k));
+    let mut over = boot_ports(&full);
     over.count = 65;
     let mut reserved = boot_ports(&[(0x60, 0)]);
     reserved.reserved = 1;
