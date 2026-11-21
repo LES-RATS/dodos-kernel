@@ -2416,26 +2416,27 @@ fn focus_missing(reach: &mut Reach, missing: &[String]) {
                     let mut seens = Vec::new();
                     for name in mine {
                         let events = combination(name);
-                        // A third of the seeds on each architecture; on
-                        // ARM64 and RISC-V only for a first thread before
-                        // live or a wake (`Run::recover_node`, `WAKE`).
-                        let arches = match events.iter().any(|&e| e == PRE_LIVE || e == WAKE) {
-                            true => 1..3,
-                            false => 0..3,
-                        };
-                        let rounds = arches.end - arches.start;
-                        let mut reached = false;
-                        for k in 0..FOCUS_SEEDS {
-                            let seed = 286 * (arches.start + k % rounds) + k / rounds;
-                            let seen = focus(events, seed);
-                            reached = reaches(&seen, name);
-                            seens.push(seen);
-                            if reached {
-                                break;
-                            }
-                        }
+                        let seen = directed_combination(events);
+                        let mut reached = reaches(&seen, name);
+                        seens.push(seen);
                         if !reached {
-                            seens.push(directed_combination(events));
+                            // A third of the seeds on each architecture; on
+                            // ARM64 and RISC-V only for a first thread before
+                            // live or a wake (`Run::recover_node`, `WAKE`).
+                            let arches = match events.iter().any(|&e| e == PRE_LIVE || e == WAKE) {
+                                true => 1..3,
+                                false => 0..3,
+                            };
+                            let rounds = arches.end - arches.start;
+                            for k in 0..FOCUS_SEEDS {
+                                let seed = 286 * (arches.start + k % rounds) + k / rounds;
+                                let seen = focus(events, seed);
+                                reached = reaches(&seen, name);
+                                seens.push(seen);
+                                if reached {
+                                    break;
+                                }
+                            }
                         }
                     }
                     seens
@@ -2882,7 +2883,11 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         assert!(accused(run.m.state(victim)));
     }
     if has(STUCK) {
-        let victim = 0;
+        let victim = if has(PRE_LIVE) || fresh_node == Some(4) {
+            1
+        } else {
+            0
+        };
         let _ = run.call(
             victim,
             Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)),
