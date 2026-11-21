@@ -214,22 +214,16 @@ impl Model {
             }
             listed.push((cap, rights));
         }
-        // `gone` if the node is not live: "a check of the state: it is
-        // judged after every capability the call names (the node, the
-        // doorbell, the frames) and after the plain arguments, the header
-        // among them" (the mailbox of a node, D-164, gap 56).
-        // CONTRACT-GAP 58 (`node_send`, Checks): the call's own list still
-        // places `gone` right after the node's three checks, against D-164's
-        // sentence, and its list of state checks ("Then the state, in
-        // order: `busy` ...") does not name `gone`, nor where the gate's
-        // `busy` over a frame it does not hold (G3 (2), D-141, D-156) falls.
-        // Read here as the first check of the state: nothing is sent to a
-        // node that is not live, and no other state is read for it.
+        // The state, in order (`node_send`, Checks, D-164, D-165): `gone` if
+        // the node is not live, the first check of the state (nothing is
+        // sent to a node that is not live, and no other state is read for
+        // it); then the gate's `busy` over a frame its node does not hold;
+        // then the other `busy`s.
         if self.table.member(target).state() != MemberState::Live {
             return Err(Error::Gone);
         }
         // The gate writes an anchor only over memory its node holds (G3
-        // (2), D-141): a refusal here is the gate's, before any entry.
+        // (2), D-141, D-156): a refusal here is the gate's, before any entry.
         if !listed
             .iter()
             .all(|&(cap, _)| self.holds_frame(self.frames[&self.caps[&cap].object]))
@@ -713,14 +707,32 @@ impl Model {
             self.free_grant(grant);
             return Ok(true);
         }
-        // A pinned grant, or one whose grantee is accused: `again`, with no
-        // message and no wait, until the grantee's generation is over.
+        // A grant whose grantee is accused: `again`, with no message and no
+        // wait, until the grantee's generation is over (R3).
+        //
+        // CONTRACT-GAP 59 (Reclaim, R3, against Grants, release by the
+        // holder, D-165): R3 says a removal that reaches the anchor of a grant
+        // it pinned "returns `again` until" the grantee's generation is over,
+        // and D-165 that a pinned entry is judged again "whenever a removal
+        // step on X reaches its anchor", freed at a count of 0. Read here as
+        // R3 for a grantee that is accused (R3 pins only for one), D-165 for
+        // a grant pinned by a `RevokeStep` or a `Release` (D-142).
         let accused = matches!(
             self.table.member(entry.grantee).state(),
             MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
         );
-        if entry.state == GrantState::Pinned || accused {
+        if accused {
             return Ok(false);
+        }
+        // A pinned grant is judged again (D-165, gap 57): at a count of 0 it
+        // is freed as a revoking one is, with the credit of a `Revoke` in
+        // flight, and the anchor may go; otherwise `again`, with no message.
+        if entry.state == GrantState::Pinned {
+            if self.holder_count(grant, &entry) != 0 {
+                return Ok(false);
+            }
+            self.end_revocation(entry.grantee, grant);
+            return Ok(true);
         }
         // Not answered yet: `again`, with no message.
         if !entry.answered {
@@ -838,19 +850,42 @@ impl Model {
         // use entry counts no leaf (D-141); otherwise a failed unit kept the
         // count, the grant is pinned until the machine restarts and the
         // step traced (D-142): the removal step then returns `again` with
-        // no message.
-        if removed {
-            let me = self.node as usize;
-            match self.table.grants[me].get(&grant).copied() {
-                Some(entry) if self.holder_count(grant, &entry) == 0 => self.free_grant(grant),
-                Some(_) => {
-                    self.pin(grant);
-                    self.refuse_trace(from, dodos_abi::NodeMessage::RevokeStep, grant);
+        // no message. A pinned entry is judged again by any step that names
+        // it, removed or not (D-165, gap 57): freed at a count of 0, left
+        // pinned otherwise.
+        let me = self.node as usize;
+        match self.table.grants[me].get(&grant).copied() {
+            Some(entry) if removed || entry.state == GrantState::Pinned => {
+                match self.holder_count(grant, &entry) {
+                    0 => self.free_grant(grant),
+                    _ if removed => {
+                        self.pin(grant);
+                        self.refuse_trace(from, dodos_abi::NodeMessage::RevokeStep, grant);
+                    }
+                    _ => {}
                 }
-                None => {}
             }
+            _ => {}
         }
         self.wake_remover(from, index);
+    }
+
+    /// A revoking or pinned grant ends at a count of 0 (Grants, a `Release`
+    /// crossing a `Revoke`, D-131, D-165): the entry is freed, a `Revoke` of
+    /// it still in flight stops counting as in flight (its credit freed, the
+    /// thread that waits for its answer woken with `again`), and its late
+    /// answer, naming a credit serial that is over, is refused.
+    fn end_revocation(&mut self, grantee: u16, grant: u16) {
+        self.free_grant(grant);
+        let credit = self.peers[grantee as usize].credits.iter().position(|c| {
+            c.as_ref().is_some_and(
+                |c| matches!(c.completes, Completes::Revoke { grant: g } if g == grant),
+            )
+        });
+        if let Some(index) = credit {
+            self.peers[grantee as usize].credits[index] = None;
+            self.wake_remover(grantee, index as u8);
+        }
     }
 
     /// The thread that waits for the answer of a revocation step goes on:
@@ -918,7 +953,7 @@ impl Model {
     /// credit freed, its thread woken with `again`), and the removal step
     /// finds the entry freed at its next call; or, at a count above 0, the
     /// entry is pinned and the credit stays in use until its answer
-    /// (D-142).
+    /// (D-142). A pinned entry is judged again as a revoking one (D-165).
     pub(crate) fn release_received(&mut self, from: u16, grant: u16, _serial: u32) {
         let me = self.node as usize;
         let Some(entry) = self.table.grants[me].get(&grant).copied() else {
@@ -936,33 +971,13 @@ impl Model {
             self.refuse_trace(from, dodos_abi::NodeMessage::Release, grant);
             return;
         }
-        if entry.state == GrantState::Revoking {
-            self.free_grant(grant);
-            let credit = self.peers[from as usize].credits.iter().position(|c| {
-                c.as_ref().is_some_and(
-                    |c| matches!(c.completes, Completes::Revoke { grant: g } if g == grant),
-                )
-            });
-            if let Some(index) = credit {
-                self.peers[from as usize].credits[index] = None;
-                self.wake_remover(from, index as u8);
-            }
-            return;
+        // A revoking entry, or a pinned one judged again (D-165, gap 57),
+        // ends its revocation; a live entry is freed, its anchor removed if
+        // it has no descendant and otherwise left, held by nobody.
+        match entry.state {
+            GrantState::Revoking | GrantState::Pinned => self.end_revocation(from, grant),
+            GrantState::Live => self.free_with_anchor(grant),
         }
-        // The entry is freed; its anchor is removed if it has no
-        // descendant, and otherwise stays, held by nobody.
-        //
-        // CONTRACT-GAP 57 (Grants, a `Release` crossing a `Revoke`): a
-        // revoking entry is pinned by a `Release` read at a count above 0,
-        // on the ground that only a failed unit keeps a count. A faulty
-        // holder sends one at a count it then lowers to 0: the entry stays
-        // pinned while its grantee runs (the checker's R3 refuses that),
-        // and if the holder also frees its use entry, the `Revoke` in
-        // flight is refused, never answered, and its credit stays in use;
-        // a second `Release`, at a count of 0, finds the entry pinned, not
-        // revoking. Read here as a live entry's: freed, the credit left in
-        // use.
-        self.free_with_anchor(grant);
     }
 
     /// A grant whose holder removed its root while a failed unit kept its

@@ -132,6 +132,12 @@ pub struct System {
     /// of that kernel's own state against it, only the machine's: what it
     /// can do to the others.
     pub(crate) faulty: std::collections::BTreeSet<u16>,
+    /// The nodes whose kernel wrote a `Release` of a grant while its use
+    /// entry still counted a leaf (a test's input: a forged message). Only
+    /// such a holder can leave a granter's pinned entry with its count
+    /// lowered and nothing in flight (D-165); the checker's R3 lets that
+    /// state be, and still judges the holder's own state.
+    pub(crate) undue_releases: std::collections::BTreeSet<u16>,
     /// ARM64: `parked` written for a core whose word carried no fence mark
     /// (D-147: only at a fence).
     pub(crate) parked_unfenced: bool,
@@ -188,6 +194,7 @@ impl System {
             park_went_back: false,
             refusing: Default::default(),
             faulty: Default::default(),
+            undue_releases: Default::default(),
             parked_unfenced: false,
             in_service: vec![false; machine.cores.len()],
             now: 0,
@@ -1025,6 +1032,12 @@ impl System {
     /// Node `node`'s kernel becomes faulty (a test's input).
     pub fn make_faulty(&mut self, node: u16) {
         self.faulty.insert(node);
+    }
+
+    /// Node `node`'s kernel wrote a `Release` while it counted a leaf under
+    /// the grant (a test's input, beside the forged message).
+    pub fn undue_release(&mut self, node: u16) {
+        self.undue_releases.insert(node);
     }
 
     /// The firmware refuses a park (a test's input): ARM64 `CPU_OFF`

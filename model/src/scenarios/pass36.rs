@@ -153,10 +153,10 @@ fn a_resumed_node_with_a_marked_core_word_stays_starting_and_is_accused_stale() 
     assert_eq!(m.sys.member(1).evidence(), Evidence::Stale);
 }
 
-// D-164 and CONTRACT-GAP 58: `gone` for a node that is not live is a check
-// of the state, read here as the first one: a frame over a table chunk,
-// which the gate's reading refuses `busy` (G3 (2), D-156), sent to a node
-// that is not live is `gone`; sent to a live node, `busy`.
+// D-164 and D-165 (gap 58): `gone` for a node that is not live is the
+// first check of the state: a frame over a table chunk, which the gate's
+// reading refuses `busy` (G3 (2), D-156), sent to a node that is not live
+// is `gone`; sent to a live node, `busy`.
 #[test]
 fn node_send_judges_gone_before_the_busy_of_a_frame_its_gate_refuses() {
     use super::pass31::{BLOCK, with_blocks};

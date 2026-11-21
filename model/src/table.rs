@@ -26,6 +26,9 @@ pub(crate) enum GrantState {
     Revoking,
     /// Marked by step R3 of a reclaim, its grantee fencing: the entry stays
     /// used and its frames pinned until the grantee's generation is over.
+    /// Or by a `RevokeStep` or a `Release` read at a count above 0 (D-142),
+    /// judged again by each later one and by a removal step that reaches
+    /// its anchor (D-165).
     Pinned,
 }
 

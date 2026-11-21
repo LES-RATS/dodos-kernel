@@ -49,17 +49,15 @@ const IRQ: u32 = 210;
 const RECEIVER: u32 = 300;
 /// The slots of the table chunks' cycle (`Run::tables`): a table run, a
 /// child table untyped cut from it, an `aspace` and an `iospace` on that
-/// child, and a frame to map under them. On node 3 they are frames of
-/// `PAIRS`, so its steps there fail (`invalid`, nothing changed) and the
-/// cycle runs on the other nodes. Moved above those frames, the draws
-/// change and the seeds of `verify` meet gap 57 (seed 2: a pinned grant
-/// whose holder runs, which the checker's R3 refuses): to move once the
-/// contract settles it (pass 35).
-const TBLOCK: u32 = 400;
-const TCHILD: u32 = 401;
-const TASPACE: u32 = 402;
-const TIOSPACE: u32 = 403;
-const TFRAME: u32 = 404;
+/// child, and a frame to map under them; above the frames of `PAIRS`
+/// (node 3's 400 to 431, node 4's 500 to 531), so the cycle runs on every
+/// node (pass 37: until gap 57 was settled they overlapped node 3's
+/// frames on purpose).
+const TBLOCK: u32 = 600;
+const TCHILD: u32 = 601;
+const TASPACE: u32 = 602;
+const TIOSPACE: u32 = 603;
+const TFRAME: u32 = 604;
 const STEPS: usize = 120;
 
 /// A grant between two nodes: the granting node and its frames from
@@ -1784,6 +1782,9 @@ impl Run {
                     let header = RingHeader::new(NodeMessage::Release, 1, (f, fg), gg, None);
                     let body = Body::Release { grant, serial };
                     self.m.sys.inject(f, granter, Message { header, body });
+                    // Read after a removal made the entry revoking, it
+                    // pins it, and `f`'s count may then fall (D-165).
+                    self.m.sys.undue_release(f);
                     self.forged(f, granter);
                     if let Some(forged) = self.forged.last_mut() {
                         forged.grant = Some(grant);
@@ -2127,8 +2128,9 @@ fn report(reach: &Reach) -> Vec<String> {
 }
 
 /// The combinations the 27 seeds of `verify` do not reach, measured
-/// (`DODOS_COUNTS=1` prints them).
-const MISSED_BY_THE_SEEDS: usize = 448;
+/// (`DODOS_COUNTS=1` prints them): 437 of 919 since pass 37, when the
+/// table cycle's slots left node 3's frames (448 before).
+const MISSED_BY_THE_SEEDS: usize = 437;
 
 /// The run of `verify`: 26 seeds spread over the triples of drivers, so
 /// that each driver is among them, and seed 2; the check after every step

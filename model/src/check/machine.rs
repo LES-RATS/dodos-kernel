@@ -408,8 +408,22 @@ impl System {
                             .iter()
                             .flatten()
                             .any(|c| c.completes == crate::rings::Completes::Revoke { grant });
+                    // Or its grantee's kernel wrote a `Release` while it
+                    // counted a leaf (or is faulty): the `Release` pinned
+                    // the revoking entry at a count above 0, and the holder
+                    // then lowered the count (its `Revoke` step done after
+                    // its answer, or its gate's unmap) and sent nothing
+                    // more, so nothing reads the entry again until a
+                    // removal reaches it (D-165: "one whose holder sends
+                    // nothing more stays until an ancestor's removal or the
+                    // end of the holder's generation"). A correct holder's
+                    // count under a pinned entry is a failed unit's, never
+                    // lowered (pass 37, the seed 2 of `verify` once the
+                    // table cycle ran on node 3).
+                    let faulty = self.faulty.contains(&entry.grantee)
+                        || self.undue_releases.contains(&entry.grantee);
                     ensure(
-                        accused || frozen || revoking,
+                        accused || frozen || revoking || faulty,
                         "R3: a grant pinned while its grantee runs and no failed unit holds it",
                     )?;
                 }

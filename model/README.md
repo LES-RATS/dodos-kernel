@@ -614,12 +614,35 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   then leaves unjudged; the short run has 27 seeds.
 - D-164: `node_send` judges `gone` for a node that is not live with the
   state, after every capability and plain argument; gap 58 (where among
-  the state checks) is open.
+  the state checks) was settled by D-165.
 - The property test runs the table chunks' cycle at random
   (`TABLE_CASES`, each asserted reached), and the untagged gate
   exploration names other nodes' roots and switches roots with
   translations cached.
 - The scenarios are in `scenarios/pass36.rs`.
+
+## Pass 37 (D-165, the two open seeds of the long combination run)
+
+- D-165 (1), gap 57: a pinned grant entry is judged again by a `Release`
+  or a `RevokeStep` that names it (removed or not) and by a removal step
+  that reaches its anchor; at a count of 0 it is freed as a revoking one
+  is (`Model::end_revocation`: the entry, the credit of a `Revoke` still in
+  flight, the thread that waits for it woken), and a late answer of that
+  `Revoke` is refused by the receive check. At a count above 0 it stays
+  pinned. A removal that reaches a grant whose grantee is accused still
+  returns `again` (R3; gap 59).
+- The checker's R3 lets a pinned entry of a running grantee be when the
+  grantee wrote an undue `Release` (`System::undue_release`, set by the
+  combinations' faulty action 2) or is faulty: only such a holder lowers
+  the count under a pinned entry and then sends nothing (D-165). For a
+  correct grantee R3 still reports it.
+- D-165 (2), gap 58: `node_send` judges `gone`, then the gate's `busy` over
+  a frame its node does not hold, then the other `busy`s; each `busy` is
+  tested against `gone`.
+- The table chunks' cycle of `combinations.rs` uses slots 600 to 604,
+  above the frames of the grant pairs, so it runs on node 3 too; the 27
+  seeds of `verify` then miss 437 combinations (448 before).
+- The scenarios are in `scenarios/pass37.rs`.
 
 ## Mutations shown equivalent
 
@@ -700,9 +723,12 @@ and what the machine start-up refuses). Pass 34 found one, settled by D-162: gap
 (`model/src/units.rs`: a `UnitRequest` whose role is not its record's
 word 0). Pass 35 found two: gap 56 (where `node_send` judges `gone`),
 settled by D-164, and gap 57 (`model/src/grants.rs`, a `Release`
-crossing a `Revoke`), open. Pass 36 found one, open: gap 58
-(`model/src/grants.rs`: where `gone` falls among `node_send`'s state
-checks). Two earlier gaps were settled otherwise than the
+crossing a `Revoke`), settled by D-165. Pass 36 found one, settled by
+D-165: gap 58 (where `gone` falls among `node_send`'s state checks).
+Pass 37 found one, open: gap 59 (`model/src/grants.rs`, `revoke_anchor`:
+whether a removal that reaches a grant R3 pinned for an accused grantee
+judges it again, as D-165 says of every pinned entry, or returns `again`
+until the grantee's generation is over, as R3 says). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

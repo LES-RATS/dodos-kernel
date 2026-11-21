@@ -361,14 +361,11 @@ fn a_grant_pinned_by_a_faulty_release_while_its_revoke_is_in_flight_is_no_fault(
     assert!(m.sys.canonical().grants[0].contains_key(&grant));
 }
 
-// CONTRACT-GAP 57: node 1, which freed its use entry, refuses the `Revoke`
-// when it reads it, so no answer comes; its own `Release`, at a count of 0,
-// finds the entry pinned, not revoking. The model then frees the entry and
-// leaves the `Revoke`'s credit in use, which the checker's CREDIT reports.
-// The contract says the answer "comes, since Y kept its use entry": a
-// faulty Y did not.
+// Node 1, which freed its use entry, refuses the `Revoke` when it reads it,
+// so no answer comes; its own `Release`, at a count of 0, finds the entry
+// pinned and judges it again: the entry is freed as a revoking one is, and
+// the `Revoke`'s credit with it (D-165, gap 57).
 #[test]
-#[ignore = "CONTRACT-GAP 57: the credit of a Revoke a faulty holder never answers"]
 fn a_grant_pinned_by_a_faulty_release_ends_with_its_revokes_credit_freed() {
     let (mut m, grant) = pinned_by_a_faulty_release();
     m.run(30 * MS);
