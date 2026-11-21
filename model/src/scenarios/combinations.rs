@@ -1165,7 +1165,7 @@ impl Run {
                     let pair = PAIRS[self.rng.below(PAIRS.len())];
                     self.regrant(pair, 0);
                     if wide {
-                        self.before_live(target);
+                        let _ = self.before_live(target);
                     }
                 }
             }
@@ -1175,7 +1175,7 @@ impl Run {
     /// The wide node's first thread, once its node is built and before
     /// it is live, sends to a live node and waits for the answer (pass 28:
     /// the window before live, interleaved with the rest).
-    fn before_live(&mut self, node: u16) {
+    fn before_live(&mut self, node: u16) -> Option<Outcome> {
         let built = |run: &Self| {
             let member = run.m.sys.member(node);
             member.state() == MemberState::Starting
@@ -1190,12 +1190,18 @@ impl Run {
             self.churn();
         }
         if !built(self) {
-            return;
+            return None;
         }
         self.m.restarted(node);
-        let Some(peer) = self.live_other(node) else {
-            return;
-        };
+        let thread = self.m.t[node as usize];
+        if !self.m.sys.node(node).runnable().contains(&thread) {
+            return None;
+        }
+        let core = self.m.sys.node(node).core_of(thread);
+        if self.m.sys.node(node).is_silent(core) {
+            return None;
+        }
+        let peer = self.live_other(node)?;
         let send = Syscall::NodeSend {
             node: node_cap(peer),
             message: Message::default(),
@@ -1205,7 +1211,10 @@ impl Run {
             "{} node {node}: send before live",
             self.m.sys.now()
         ));
-        let _ = self.call(node, send);
+        let outcome = self.m.call(node, send);
+        say(format_args!("  -> {outcome:?}"));
+        self.note();
+        Some(outcome)
     }
 
     fn drive(&mut self, driver: Driver) {
@@ -2633,4 +2642,32 @@ fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
 #[test]
 fn a_late_report_of_a_node_passed_over_moves_no_rebuild() {
     let _ = explore_one(1109);
+}
+
+// Review of passes 37 and 38, finding 6: `before_live` executes the first
+// thread's `NodeSend` while the starting wide node is still `Starting`
+// ("its first thread runs before it is live and may make requests and sends").
+#[test]
+fn before_live_executes_the_first_threads_node_send_while_the_node_is_starting() {
+    let mut run = Run::new(0);
+    let _ = run.call(0, kill(WIDE));
+    run.run(30 * MS);
+    assert_eq!(run.m.state(WIDE), MemberState::Dead);
+    run.m.sys.set_window((WIDE + 1) as usize);
+    assert_eq!(run.call(0, fresh(WIDE, 0b11 << WIDE)), Some(DONE));
+    let built = |m: &S| {
+        let member = m.sys.member(WIDE);
+        member.state() == MemberState::Starting
+            && m.sys.has(WIDE)
+            && m.sys.node(WIDE).generation_built() == member.generation()
+            && m.sys.node(WIDE).is_ready()
+    };
+    assert!(run.m.step_until(built));
+    let outcome = run.before_live(WIDE);
+    assert_eq!(run.m.state(WIDE), MemberState::Starting);
+    assert_eq!(outcome, Some(WAITS));
+    let produced = (0..NODES)
+        .filter(|&p| p != WIDE)
+        .any(|p| run.m.sys.canonical().rings[WIDE as usize][p as usize].user.produced > 0);
+    assert!(produced, "NodeSend wrote to a peer's user ring while WIDE was Starting");
 }
