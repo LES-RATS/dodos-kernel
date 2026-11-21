@@ -2416,26 +2416,27 @@ fn focus_missing(reach: &mut Reach, missing: &[String]) {
                     let mut seens = Vec::new();
                     for name in mine {
                         let events = combination(name);
-                        // A third of the seeds on each architecture; on
-                        // ARM64 and RISC-V only for a first thread before
-                        // live or a wake (`Run::recover_node`, `WAKE`).
-                        let arches = match events.iter().any(|&e| e == PRE_LIVE || e == WAKE) {
-                            true => 1..3,
-                            false => 0..3,
-                        };
-                        let rounds = arches.end - arches.start;
-                        let mut reached = false;
-                        for k in 0..FOCUS_SEEDS {
-                            let seed = 286 * (arches.start + k % rounds) + k / rounds;
-                            let seen = focus(events, seed);
-                            reached = reaches(&seen, name);
-                            seens.push(seen);
-                            if reached {
-                                break;
-                            }
-                        }
+                        let seen = directed_combination(events);
+                        let mut reached = reaches(&seen, name);
+                        seens.push(seen);
                         if !reached {
-                            seens.push(directed_combination(events));
+                            // A third of the seeds on each architecture; on
+                            // ARM64 and RISC-V only for a first thread before
+                            // live or a wake (`Run::recover_node`, `WAKE`).
+                            let arches = match events.iter().any(|&e| e == PRE_LIVE || e == WAKE) {
+                                true => 1..3,
+                                false => 0..3,
+                            };
+                            let rounds = arches.end - arches.start;
+                            for k in 0..FOCUS_SEEDS {
+                                let seed = 286 * (arches.start + k % rounds) + k / rounds;
+                                let seen = focus(events, seed);
+                                reached = reaches(&seen, name);
+                                seens.push(seen);
+                                if reached {
+                                    break;
+                                }
+                            }
                         }
                     }
                     seens
@@ -3081,30 +3082,28 @@ fn directed_combination(events: [usize; 3]) -> Seen {
                 if built(&run.m) {
                     break;
                 }
-                let next = run.m.sys.events().into_iter().find(|e| {
-                    match *e {
-                        crate::system::Event::Action(i) => {
-                            let act = run.m.sys.actions()[i].1;
-                            if act == (crate::nodes::HwAction::Start { core: second }) {
-                                return false;
-                            }
-                            if (has(STUCK) || has(STALE) || has(SEAL_LATE))
-                                && act == (crate::nodes::HwAction::Stop { core: 0 })
-                            {
-                                return false;
-                            }
-                            true
+                let next = run.m.sys.events().into_iter().find(|e| match *e {
+                    crate::system::Event::Action(i) => {
+                        let act = run.m.sys.actions()[i].1;
+                        if act == (crate::nodes::HwAction::Start { core: second }) {
+                            return false;
                         }
-                        crate::system::Event::Timer { node, .. }
-                        | crate::system::Event::Ipi { node, .. }
-                            if (has(STUCK) || has(STALE) || has(SEAL_LATE))
-                                && node != WIDE
-                                && node != actor =>
+                        if (has(STUCK) || has(STALE) || has(SEAL_LATE))
+                            && act == (crate::nodes::HwAction::Stop { core: 0 })
                         {
-                            false
+                            return false;
                         }
-                        _ => true,
+                        true
                     }
+                    crate::system::Event::Timer { node, .. }
+                    | crate::system::Event::Ipi { node, .. }
+                        if (has(STUCK) || has(STALE) || has(SEAL_LATE))
+                            && node != WIDE
+                            && node != actor =>
+                    {
+                        false
+                    }
+                    _ => true,
                 });
                 let Some(ev) = next else {
                     break;
