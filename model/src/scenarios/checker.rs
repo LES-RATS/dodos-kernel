@@ -1704,6 +1704,7 @@ fn an_early_acknowledgement_passes_over_r4_alone_for_that_generation() {
         t.members[usize::from(x)] = dodos_abi::Member::new(MemberState::Fenced, evidence, y, gx);
         t.beacons[usize::from(y)].acked[usize::from(x)] = gx;
     });
+    let one = *m.sys.node(y).untypeds.keys().next().expect("an untyped");
     let reclaim = m.sys.node_mut(y).reclaims.entry(x).or_default();
     reclaim.generation = gx;
     reclaim.audit = Some(vec![one]);

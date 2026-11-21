@@ -887,10 +887,16 @@ fn each_node_slot_takes_its_domain_numbers_from_its_own_range() {
 // state features, otherwise the core firmware booted.
 
 #[test]
-fn one_node_on_a_machine_of_class_0_holds_the_boot_core_alone_when_the_cores_differ_in_state() {
+fn one_node_on_a_machine_of_class_0_groups_same_kind_cores_ignoring_fence() {
     let mut machine = machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]);
     machine.cores[2].fence = 0;
     assert_eq!(machine.initial_nodes(), vec![vec![0, 1, 2]]);
+}
+
+#[test]
+fn one_node_on_a_machine_of_class_0_holds_the_boot_core_alone_when_the_cores_differ_in_state() {
+    let mut machine = machine(crate::Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    machine.cores[2].fence = 0;
     // A second kind, with another set of state features, on core 1.
     let mut other = machine.kinds[0];
     other.features ^= 1 << 2;

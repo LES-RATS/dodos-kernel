@@ -217,7 +217,7 @@ fn role_hand_is_busy_while_its_holder_rebuilds_the_unit() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]));
     attached(&mut m, 0);
     m.supervisor(2, m.t[2]);
-    m.sys.apply(2, m.t[2], kill(1)).expect("the kill");
+    assert_eq!(m.sys.apply(2, m.t[2], kill(1)), DONE);
     let to = m.sys.now() + 400 * MS;
     let asking = |m: &S| {
         let rebuild = m.sys.node(2).rebuilds.get(&IOMMU_ROLE);

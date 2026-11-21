@@ -21,7 +21,7 @@ fn a_grant_pinned_for_a_grantee_left_unfenced_is_no_fault() {
     let reply = m.retype(1, ObjectKind::Reply, 0, REPLY);
     m.ok(1, reply);
     assert_eq!(m.call(1, recv()), WAITS);
-    m.call(0, send(1, FRAME, Rights::READ)).expect("the send");
+    assert_eq!(m.call(0, send(1, FRAME, Rights::READ)), WAITS);
     m.settle();
     let entries = m.sys.node(0).grant_entries();
     assert_eq!(entries.len(), 1, "the grant to node 1");

@@ -293,6 +293,7 @@ fn f8_a_hand_over_whose_target_died_before_step_4_returns_busy_and_writes_no_han
     let word = m.sys.role(role);
     assert_eq!(word.state(), dodos_abi::RoleState::Held);
     assert_eq!(word.holder(), holder);
+    assert!(m.sys.node(holder).handing.is_empty());
 }
 
 // F9: the header of an aspace "holds the set of the node's cores that have

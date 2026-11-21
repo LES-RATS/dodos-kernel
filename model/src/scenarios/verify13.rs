@@ -89,9 +89,11 @@ fn a_grant_whose_anchor_stays_is_not_reused_by_the_next_node_send() {
     assert!(!m.sys.canonical().grants[0].contains_key(&grant));
     assert!(m.sys.node(0).anchor(grant).is_some());
     let outcome = m.sys.apply(0, other, send_obj(2));
+    assert!(outcome == DONE || outcome == WAITS, "{outcome:?}");
     assert_eq!(m.sys.check(), Ok(()), "{outcome:?}");
     // The new grant took another index; the old anchor's removal ends.
     let granted: Vec<u16> = m.sys.canonical().grants[0].keys().copied().collect();
+    assert_eq!(granted.len(), 1, "{granted:?}");
     assert!(!granted.contains(&grant), "{granted:?}");
     m.settle();
     let again = m.call(0, Syscall::CapRevoke(s(OBJ)));
@@ -408,6 +410,12 @@ fn a_report_asked_from_a_key_takes_the_item_of_that_key() {
     // comparison as vacuous at a baseline of 0, which is the point).
     assert_eq!(baseline, 0);
     assert_eq!(report_refusals(&m, 2), baseline);
+    assert!(
+        m.sys.canonical().units[&super::units::IOMMU_ROLE]
+            .entries
+            .contains_key(&(super::units::DEVICE as u16)),
+        "the item reported at the next key was not taken by the rebuild"
+    );
 }
 
 // Finding 19 (own-09). A reported device whose identifier word names

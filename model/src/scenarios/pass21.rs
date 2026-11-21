@@ -407,8 +407,7 @@ fn deepseek12_8_a_second_attach_on_a_pinned_word_is_busy_and_a_failed_attach_fre
     let call = attach(&m, 0, IOSPACE, DEVICE);
     assert_eq!(m.call(0, call.clone()), WAITS);
     let root = m.sys.canonical().attach_word(DEVICE as u32).root();
-    let again = call;
-    assert_eq!(m.call_by(0, other, again), Err(Error::Busy));
+    assert_eq!(m.call_by(0, other, call), Err(Error::Busy));
     let node = m.sys.node_mut(0);
     node.attach_answered(IOMMU_ROLE, DEVICE as u16, root, UnitResult::Failed);
     assert_eq!(m.sys.canonical().identifiers.get(&(DEVICE as u32)), None);

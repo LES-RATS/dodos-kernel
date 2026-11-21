@@ -398,11 +398,13 @@ fn a_node_started_afresh_counts_the_suppressed_entries_of_its_cores_earlier_kern
     }
     let table = m.sys.node(2).table.clone();
     m.sys.edit_table(|t| *t = table);
-    assert!(m.sys.canonical().crash.areas[2].suppressed > 0);
+    let before = m.sys.canonical().crash.areas[2].suppressed;
+    assert!(before > 0);
     m.sys.fail(2, 0);
     m.run(100 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
     m.ok(1, super::pass17::fresh(2, 1 << 2));
     m.run(5 * MS);
     assert_eq!(m.state(2), MemberState::Live);
+    assert_eq!(m.sys.canonical().crash.areas[2].suppressed, before);
 }

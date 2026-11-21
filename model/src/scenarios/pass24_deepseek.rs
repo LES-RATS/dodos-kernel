@@ -6,10 +6,11 @@
 //! unit's failure (`System::break_unit`).
 
 use super::pass22::take;
-use super::units::{IOMMU_ROLE, IOSPACE, attached};
+use super::pass24::{Granted, io_map, unmapping, until_done};
+use super::units::{IOMMU_ROLE, attached};
 use super::*;
 use crate::table::GrantState;
-use crate::{Message, Range, Record, Transfer};
+use crate::{Message, Range, Transfer};
 use dodos_abi::START_SLOT_MAILBOX;
 
 const REPLY: u32 = 100;
@@ -49,80 +50,10 @@ fn send(slot: u32) -> Syscall {
     }
 }
 
-fn io_map(m: &S, frame: u32) -> Syscall {
-    Syscall::IoSpaceMap(crate::Map {
-        space: s(IOSPACE),
-        frame: s(frame),
-        untyped: s(super::table_slot(m.sys.node(Y), m.t[Y as usize])),
-        address: 0x1000_0000 + u64::from(frame) * 0x10_0000,
-        first: 0,
-        count: 1,
-        rights: Rights::READ.bits(),
-    })
-}
-
-struct Granted {
-    m: S,
-    chunk: u64,
-    frame: ObjId,
-    grant: u16,
-    use_index: u16,
-}
-
 /// Node `X` grants node `Y` a frame of a chunk it took; `Y`'s iospace has a
 /// device of `Y` behind the unit of `THIRD`.
 fn granted() -> Granted {
-    let mut machine = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
-    machine.caching_mode = false;
-    let mut m = S::on(&machine);
-    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), THIRD);
-    attached(&mut m, Y);
-    let shift = m.sys.canonical().geometry.chunk_shift();
-    let free = dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed).raw();
-    let chunk = m
-        .sys
-        .canonical()
-        .owners
-        .iter()
-        .position(|&w| w == free)
-        .expect("a free chunk") as u64;
-    m.ok(X, take(0, chunk << shift, u64::from(shift), BLOCK));
-    m.ok(X, retype_from(BLOCK, ObjectKind::Frame, 1, OBJ));
-    let frame = m.sys.node(X).object_at(m.t[0], s(OBJ)).expect("the frame");
-    for node in [X, Y] {
-        let reply = m.retype(node, ObjectKind::Reply, 0, REPLY);
-        m.ok(node, reply);
-    }
-    assert_eq!(m.call(Y, recv(GOT)), WAITS);
-    assert_eq!(m.call(X, send(OBJ)), WAITS);
-    m.settle();
-    let (&grant, entry) = m.sys.canonical().grants[X as usize]
-        .iter()
-        .next()
-        .expect("the grant");
-    let use_index = entry.use_index.expect("answered");
-    Granted {
-        m,
-        chunk,
-        frame,
-        grant,
-        use_index,
-    }
-}
-
-#[track_caller]
-fn until_done(m: &mut S, node: u16, call: Syscall) {
-    for _ in 0..20 {
-        match m.call(node, call.clone()) {
-            DONE => return,
-            WAITS => m.run(30 * MS),
-            // A removal's step: time passes; any other answer fails the
-            // test (the audit of lot 8a, D-8a F20: every error was retried).
-            Err(Error::Again) => m.run(10 * MS),
-            other => panic!("{call:?}: {other:?}"),
-        }
-    }
-    panic!("{call:?} never done");
+    super::pass24::granted(false)
 }
 
 fn chunk_shift(m: &S) -> u64 {
@@ -144,14 +75,6 @@ fn chunk_frozen(m: &mut S, chunk: u64) {
 
 fn uses(m: &S) -> usize {
     m.sys.canonical().uses[Y as usize].len()
-}
-
-fn unmapping(m: &S) -> bool {
-    m.sys
-        .node(Y)
-        .caps
-        .values()
-        .any(|c| matches!(c.record, Record::Unmapping(_)))
 }
 
 /// The state of pass 24 (a): the unit fails under a remote frame the holder

@@ -314,7 +314,7 @@ fn hydrogen_n5_a_revoke_step_that_needs_a_units_invalidation_completes_its_recor
     // The granter revokes: the holder's step clears the record, which is
     // left unmapping, and completed by a unit request no thread waits for.
     assert_eq!(m.call(0, Syscall::CapRevoke(s(101))), WAITS);
-    let mut unmapping = false;
+    let (mut unmapping, mut saw_again) = (false, false);
     for _ in 0..20 {
         // Event by event, so that the state between the step and the
         // unit's confirmation is seen.
@@ -332,6 +332,7 @@ fn hydrogen_n5_a_revoke_step_that_needs_a_units_invalidation_completes_its_recor
                 .caps
                 .values()
                 .any(|c| matches!(c.record, Record::Unmapping(_)));
+            saw_again |= m.woken(0) == Some(&Err(Error::Again));
         }
         if m.sys.node(0).grant_entries().is_empty() {
             break;
@@ -341,8 +342,10 @@ fn hydrogen_n5_a_revoke_step_that_needs_a_units_invalidation_completes_its_recor
         // (The audit of lot 8a, D-8a F19: the outcome was dropped.)
         let outcome = m.call(0, Syscall::CapRevoke(s(101)));
         assert!(outcome == DONE || outcome == WAITS || outcome == Err(Error::Again));
+        saw_again |= outcome == Err(Error::Again);
     }
     assert!(unmapping, "the step left the record unmapping");
+    assert!(saw_again, "CapRevoke never returned Again while unmapping");
     m.run(30 * MS);
     assert!(m.sys.node(0).grant_entries().is_empty());
     assert!(

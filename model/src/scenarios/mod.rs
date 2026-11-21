@@ -81,7 +81,12 @@ pub(crate) fn machine(arch: Arch, cores: usize, nodes: &[&[usize]]) -> Machine {
     let layout = nodes
         .iter()
         .map(|cores| {
+            assert!(!cores.is_empty(), "a node must have at least one core");
             let window = cores[0] as u64 / 64;
+            assert!(
+                cores.iter().all(|&c| c as u64 / 64 == window),
+                "a node's cores must lie in one 64-core window: {cores:?}"
+            );
             let mask = cores.iter().fold(0, |m, &c| m | 1 << (c % 64));
             (window, mask)
         })
@@ -493,6 +498,7 @@ impl S {
     /// Time passes `ns`, checked every `step`.
     #[track_caller]
     pub(crate) fn run_by(&mut self, ns: u64, step: u64) {
+        assert!(step > 0, "run_by step must be positive");
         let to = self.sys.now() + ns;
         while self.sys.now() < to && !self.sys.stopped {
             let at = (self.sys.now() + step).min(to);

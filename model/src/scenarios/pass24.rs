@@ -452,7 +452,7 @@ fn a_holder_resumed_under_a_count_a_failed_unit_kept_runs_again_beside_an_unfenc
 }
 
 /// Whether the holder has a record unmapping.
-fn unmapping(m: &S) -> bool {
+pub(super) fn unmapping(m: &S) -> bool {
     m.sys
         .node(Y)
         .caps

@@ -456,6 +456,8 @@ fn an_attach_the_holder_served_and_the_unit_did_not_confirm_stays_attached_out_o
 fn one_request_at_a_time_per_device_and_an_attached_device_attached_again_succeeds() {
     use super::units::{DEVICE, IOSPACE, attach, attached, three};
     let mut m = three();
+    m.ok(0, super::place_first(0, 0));
+    let other = m.thread_on(0, 300, 0);
     attached(&mut m, 0);
     // Already attached to this iospace, nothing in flight: success.
     let again = attach(&m, 0, IOSPACE, DEVICE);
@@ -463,6 +465,8 @@ fn one_request_at_a_time_per_device_and_an_attached_device_attached_again_succee
     // A detach in flight: a second detach and an attach are `busy`.
     let detach = super::pass17::detach_of(again.clone());
     assert_eq!(m.call(0, detach.clone()), WAITS);
+    assert_eq!(m.call_by(0, other, detach), Err(Error::Busy));
+    assert_eq!(m.call_by(0, other, again), Err(Error::Busy));
     assert_eq!(m.sys.node(0).census().detaching, 1);
     assert_eq!(m.sys.node(0).census().devices, 1);
     m.run(30 * MS);
@@ -511,13 +515,13 @@ fn a_detach_while_an_attach_is_in_flight_is_busy_and_the_destruction_waits_for_i
 }
 
 #[test]
-fn a_report_carries_a_lines_mask_and_the_new_holder_writes_an_idle_line_masked() {
+fn a_report_carries_a_lines_mask_and_the_new_holder_writes_an_idle_line_unmasked() {
     let (mut m, _, _, _) = super::pass17::holder_requester_third();
     let role = m.sys.node(0).ioapic_role(5).unwrap();
     let holder = m.sys.role(role).holder();
     let a = (0..3).find(|&n| n != holder).unwrap();
     let killer = (0..3).find(|&n| n != holder && n != a).unwrap();
-    // A level line, its irq idle: masked at the controller.
+    // A level line, its irq idle: unmasked at the controller with directed EOI (D-147).
     let line = dodos_abi::IrqSource::line(5, true, false).raw();
     let claim = Syscall::IrqClaim {
         control: s(dodos_abi::START_SLOT_IRQ_CONTROL),

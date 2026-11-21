@@ -217,15 +217,17 @@ fn probe(m: &S, splittable: usize) -> u32 {
         let state = member.state();
         if accused(state) {
             let kind = match member.evidence() {
-                Evidence::Kill => KILLED,
-                Evidence::SelfReported => SELF,
-                Evidence::Stale => STALE,
-                Evidence::Stuck => STUCK,
-                Evidence::Retire => RETIRED,
-                Evidence::Seal => SEAL_LATE,
-                Evidence::None => continue,
+                Evidence::Kill => Some(KILLED),
+                Evidence::SelfReported => Some(SELF),
+                Evidence::Stale => Some(STALE),
+                Evidence::Stuck => Some(STUCK),
+                Evidence::Retire => Some(RETIRED),
+                Evidence::Seal => Some(SEAL_LATE),
+                Evidence::None => None,
             };
-            set(kind, true);
+            if let Some(kind) = kind {
+                set(kind, true);
+            }
         }
         set(FENCED, state == MemberState::Fenced);
         set(UNFENCED, state == MemberState::Unfenced);
@@ -564,6 +566,10 @@ struct Run {
 
 impl Run {
     fn new(seed: u64) -> Self {
+        Self::new_with_idle(seed, true)
+    }
+
+    fn new_with_idle(seed: u64, configure_idle: bool) -> Self {
         // Five nodes, the last of two cores; the architecture by round.
         let cores: Vec<Vec<usize>> = (0..NODES as usize)
             .map(|c| match c as u16 == WIDE {
@@ -617,54 +623,6 @@ impl Run {
             "drivers {:?}, faulty node {}",
             run.drivers, run.faulty_node
         ));
-        run.set_up();
-        run
-    }
-
-    fn new_with_idle(seed: u64, configure_idle: bool) -> Self {
-        let cores: Vec<Vec<usize>> = (0..NODES as usize)
-            .map(|c| match c as u16 == WIDE {
-                true => vec![c, c + 1],
-                false => vec![c],
-            })
-            .collect();
-        let layout: Vec<&[usize]> = cores.iter().map(Vec::as_slice).collect();
-        let arch = ARCHES[(seed / 286) as usize % ARCHES.len()];
-        let mut machine = machine(arch, NODES as usize + 1, &layout);
-        machine.membership.sweep_ms = 100;
-        machine.membership.seal_ms = 30;
-        machine.membership.stale_ms = 40;
-        machine.membership.stuck_ms = 40;
-        let m = S::on(&machine);
-        let splittable = m
-            .sys
-            .canonical()
-            .devices
-            .iter()
-            .filter(|e| e.is_used())
-            .count();
-        let faulty_node = (seed % u64::from(NODES)) as u16;
-        let mut run = Self {
-            m,
-            rng: Rng(seed + 701),
-            seen: Seen::default(),
-            drivers: drivers(seed),
-            splittable,
-            receivers: vec![None; NODES as usize],
-            once: BTreeSet::new(),
-            late: None,
-            kept: None,
-            members: Vec::new(),
-            gap_21: false,
-            handed_failed: false,
-            deferred: None,
-            late_start: 0,
-            faulty_node,
-            faulty_acts: 0,
-            forged: Vec::new(),
-            mapped: BTreeSet::new(),
-            spared: BTreeSet::new(),
-        };
         run.set_up_with(configure_idle);
         run
     }
@@ -772,10 +730,6 @@ impl Run {
         let outcome = try_call(&mut self.m, node, call);
         self.note();
         outcome
-    }
-
-    fn set_up(&mut self) {
-        self.set_up_with(true);
     }
 
     fn set_up_with(&mut self, configure_idle: bool) {
@@ -2685,8 +2639,8 @@ fn seed_763_of_pass_35_a_sleeping_core_is_roused_at_its_timer() {
 // reserve. Only a live or sealing node writes fencing.
 #[test]
 fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
-    let reach = explore(vec![1434]);
-    assert!(reach.events[FRESH] > 0);
+    let (seen, _) = explore_one(1434);
+    assert!(seen.events.contains(&FRESH));
 }
 
 // Seed 1109 of the long run of pass 26: a rebuild's `ReportAsk` to a node
@@ -3502,7 +3456,7 @@ fn directed_combination(events: [usize; 3]) -> Seen {
 
 #[test]
 #[ignore = "long: run with --release"]
-fn directed_combinations_reach_all_45() {
+fn directed_combinations_reach_all_74() {
     let list = [
         "pair + accused stuck + release pending",
         "pair + unfenced + release pending",

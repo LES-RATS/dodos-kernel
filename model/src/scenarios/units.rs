@@ -547,9 +547,11 @@ fn an_unfenced_holder_keeps_its_unit_roles_for_fence_ns_and_settle_ns() {
     m.sys.set_vmx(1, true);
     m.supervisor(0, m.t[0]);
     m.ok(0, kill(1));
-    m.run(FENCE_NS - MS);
+    assert!(m.step_until(|m| m.state(1) == MemberState::Unfenced));
+    let unfenced = m.sys.now();
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
-    m.run(2 * MS + 2 * SETTLE_NS);
+    assert!(m.step_until(|m| m.sys.role(IOMMU_ROLE).holder() != 1));
+    assert_eq!(m.sys.now(), unfenced + SETTLE_NS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);
 }
 

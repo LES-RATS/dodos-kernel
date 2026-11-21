@@ -1701,7 +1701,7 @@ fn a_rebuild_keeps_the_entries_of_a_node_it_passed_over_sealed_even_once_it_resu
         core: 0,
     };
     m.supervisor(2, m.t[2]);
-    m.sys.apply(2, m.t[2], kill).expect("the kill");
+    assert_eq!(m.sys.apply(2, m.t[2], kill), DONE);
     let to = m.sys.now() + 300 * MS;
     let mut resumed = false;
     while m.sys.now() < to {
@@ -1770,7 +1770,7 @@ fn a_rebuild_keeps_the_reported_remapping_handles_and_clears_the_others() {
         core: 0,
     };
     m.supervisor(0, m.t[0]);
-    m.sys.apply(0, m.t[0], kill).expect("the kill");
+    assert_eq!(m.sys.apply(0, m.t[0], kill), DONE);
     m.sys.settle(100_000);
     m.sys.advance(m.sys.now() + 300 * MS);
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 2);

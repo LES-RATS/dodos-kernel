@@ -359,7 +359,7 @@ fn a_seal_hands_no_unit_over_while_its_node_rebuilds_it() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]));
     attached(&mut m, 0);
     m.supervisor(2, m.t[2]);
-    m.sys.apply(2, m.t[2], kill(1)).expect("the kill");
+    assert_eq!(m.sys.apply(2, m.t[2], kill(1)), DONE);
     let to = m.sys.now() + 400 * MS;
     let asking = |m: &S| {
         let rebuild = m
@@ -415,7 +415,7 @@ fn a_node_sealed_after_its_report_was_asked_is_passed_over_as_sealed() {
         }
     };
     m.supervisor(2, m.t[2]);
-    m.sys.apply(2, m.t[2], kill(1)).expect("the kill");
+    assert_eq!(m.sys.apply(2, m.t[2], kill(1)), DONE);
     let to = m.sys.now() + 400 * MS;
     let cursor = |m: &S| {
         let rebuild = m
