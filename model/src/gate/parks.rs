@@ -108,12 +108,19 @@ impl Machine {
     }
 
     /// The line word *taken* → *free*: the controller holder's call that
-    /// writes the masked entry, at a removal (the holder is node 0 here).
+    /// writes the masked entry and `GICD_ICACTIVER`, at a removal (D-148).
     pub(crate) fn remove_spi(&mut self, n: u16, spi: usize) -> Gated {
-        require(spi < SPIS)?;
+        require(
+            self.gate.members[usize::from(n)].state.writes()
+                && self.gate.members[usize::from(self.unit.holder)]
+                    .state
+                    .writes()
+                && spi < SPIS,
+        )?;
         let g = self.gate.members[usize::from(n)].generation;
         require(self.parks.lines[spi] == Some((n, g)))?;
         self.parks.lines[spi] = None;
+        self.parks.active[spi] = false;
         Ok(())
     }
 

@@ -115,15 +115,32 @@ fn q4_who_abandons_if_s_hangs() {
             ..BASE
         },
     );
-    eprintln!(
-        "Q4 alarm wedge: {:?}",
-        alarm.wedge.map(|(p, s)| (p, s.cores))
+    for (name, f) in [
+        ("only_s", &only_s),
+        ("any", &any),
+        ("watchdog", &watchdog),
+        ("alarm", &alarm),
+    ] {
+        assert!(f.isolation.is_none(), "{name} broke isolation");
+        assert!(f.healthy_wedge.is_none(), "{name} wedged while healthy");
+        assert!(f.slept, "{name} never reached sleep");
+    }
+    assert!(
+        only_s.wedge.is_some(),
+        "abandon by S only must wedge when S hangs"
     );
-    eprintln!(
-        "Q4 wedges: S only {:?}\n  any running {:?}\n  watchdog {:?}",
-        only_s.wedge.map(|(p, s)| (p, s.cores)),
-        any.wedge.map(|(p, s)| (p, s.cores)),
-        watchdog.wedge.map(|(p, s)| (p, s.cores)),
+    assert!(
+        any.wedge.is_some(),
+        "abandon by any running core must wedge once every other core parked"
+    );
+    assert!(
+        watchdog.wedge.is_some(),
+        "watchdog must still wedge if S hangs after the watchdog parks"
+    );
+    assert!(
+        alarm.wedge.is_none(),
+        "waking parked cores by alarm at the bound must prevent the wedge: {:?}",
+        alarm.wedge.map(|(p, s)| (p, s.cores))
     );
 }
 

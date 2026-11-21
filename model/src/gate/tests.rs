@@ -682,6 +682,39 @@ fn a_stale_drop_bit_deactivates_no_line_of_another_node() {
     );
 }
 
+// Pass 40 (v1-D #1): `remove_spi` must refuse a node that does not write (G13)
+// and must deactivate an active SPI (`GICD_ICACTIVER`, D-148) so another node
+// claiming the line later can take arrivals.
+#[test]
+fn remove_spi_requires_writing_node_and_deactivates_active_line() {
+    let mut m = Machine::new(2, 2, 8);
+    steps(
+        &mut m,
+        &[Op::ClaimSpi { n: 1, spi: 0 }, Op::Fence { n: 1 }],
+    )
+    .expect("claim and fence");
+    assert_eq!(
+        m.step(&Op::RemoveSpi { n: 1, spi: 0 }),
+        Err(Refused::Condition),
+        "a fenced node's gate must refuse remove_spi"
+    );
+    m.check().expect("the tables");
+
+    let mut m = Machine::new(2, 2, 8);
+    steps(
+        &mut m,
+        &[
+            Op::ClaimSpi { n: 1, spi: 0 },
+            Op::SpiArrives { spi: 0 },
+            Op::RemoveSpi { n: 1, spi: 0 },
+            Op::ClaimSpi { n: 0, spi: 0 },
+            Op::SpiArrives { spi: 0 },
+        ],
+    )
+    .expect("removal deactivates active SPI so the next claimant receives arrivals");
+    m.check().expect("the tables");
+}
+
 // (viii): a seal whose park requests are raised by a later call, which a
 // faulty kernel skips: its other core never parks, yet its `seal_parked`
 // equals its unraised request and the seal ends sealed with the core

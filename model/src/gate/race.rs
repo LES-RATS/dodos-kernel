@@ -32,6 +32,7 @@ pub(crate) enum Attach {
     Zero,
     Pinned,
     Attached,
+    Detached,
 }
 
 /// Node *X*'s member word.
@@ -288,12 +289,13 @@ impl State {
             Step::R1 => {
                 // R1 for *X*: each attach word of *X*'s generation reading
                 // *attached* has its context entry cleared, the unit's cache
-                // invalidated, the word written *detached* (here 0 at R6).
+                // invalidated, and the word written *detached* (leaving
+                // `root_count` unchanged until R6 clears both).
                 for d in 0..2 {
                     if self.ids[d] && self.attach[d] == Attach::Attached {
                         self.context[d] = false;
                         self.cache[d] = false;
-                        self.attach[d] = Attach::Zero;
+                        self.attach[d] = Attach::Detached;
                     }
                 }
                 self.r1_done = true;
@@ -336,11 +338,20 @@ impl State {
         {
             return Err("RECORD: an open record's words are not its opener's");
         }
-        let live_calls = self.cores.iter().all(|pc| !matches!(pc, Pc::Stopped(..)));
-        if live_calls && self.member == Member::Live {
+        // Between `Attach(2)` (attach word written *pinned*) and `Attach(3)`
+        // (root's count raised) the count lags by one; a fence may stop a core
+        // there, and R6 clears both at *dead*. Outside that window — across
+        // live, fenced (R1 writes *detached*, keeping the count) and dead —
+        // the root's count must equal the non-zero attach words.
+        let mid_live = self.cores.iter().any(|pc| matches!(pc, Pc::Attach(3)));
+        let mid_stopped = self.member == Member::Fenced
+            && self
+                .cores
+                .iter()
+                .any(|pc| matches!(pc, Pc::Stopped(3, true)));
+        if !mid_live && !mid_stopped {
             let counted = self.attach.iter().filter(|&&a| a != Attach::Zero).count() as u8;
-            let mid = self.cores.iter().any(|pc| matches!(pc, Pc::Attach(3..=6)));
-            if !mid && counted != self.root_count {
+            if counted != self.root_count {
                 return Err("COUNT: an iospace root's count is not its attach words");
             }
         }
@@ -501,5 +512,39 @@ mod tests {
             wedged.wedge.is_some(),
             "leaving the gate lock held in park must wedge the resumed node's first gate call"
         );
+    }
+
+    // Pass 40 (v1-D #2): `Step::R1` writes *detached* (keeping `root_count`
+    // matched until R6) and `COUNT` is checked while fenced too.
+    #[test]
+    fn r1_writes_detached_and_count_is_checked_while_fenced() {
+        let mut s = State::new();
+        s.ids[0] = true;
+        s.attach[0] = Attach::Attached;
+        s.root_count = 1;
+        s.domain = true;
+        s.context[0] = true;
+        s.cores = [Pc::Done, Pc::Done];
+        let v = Variant { lock: true };
+
+        s.take(Step::Fence, v);
+        s.take(Step::R1, v);
+        assert_eq!(s.attach[0], Attach::Detached);
+        assert_eq!(s.root_count, 1);
+        assert_eq!(s.check(v), Ok(()));
+
+        // Corrupting the attach word to Zero while fenced (the old R1 bug)
+        // must trip COUNT.
+        let mut broken = s.clone();
+        broken.attach[0] = Attach::Zero;
+        assert_eq!(
+            broken.check(v),
+            Err("COUNT: an iospace root's count is not its attach words")
+        );
+
+        s.take(Step::R6, v);
+        assert_eq!(s.attach[0], Attach::Zero);
+        assert_eq!(s.root_count, 0);
+        assert_eq!(s.check(v), Ok(()));
     }
 }

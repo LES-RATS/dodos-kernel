@@ -122,6 +122,9 @@ pub(crate) enum Op {
         n: u16,
         spi: usize,
     },
+    /// Authorized seal-initiation event (`node_stop` mode 1: live → sealing,
+    /// which in the contract requires `node` `manage` and another live node),
+    /// exposed separately from `Op::Seal` to test out-of-order seal steps.
     Sealing {
         n: u16,
     },
@@ -268,6 +271,8 @@ pub(crate) enum Op {
         n: u16,
         entry: usize,
     },
+    /// Hardware/holder event: the unit failed to confirm within `IOMMU_WAIT_NS`
+    /// and its holder's gate set bit 63 (*failed*) of the role word (Roles).
     UnitFails,
     Grant {
         n: u16,
