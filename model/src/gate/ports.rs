@@ -173,7 +173,11 @@ impl Machine {
                 Some((entry, owner)) => {
                     ensure(
                         self.ports.table.get(&port) == Some(&entry)
-                            && self.ports.entries.get(entry).is_some_and(|e| e.holds_port(port)),
+                            && self
+                                .ports
+                                .entries
+                                .get(entry)
+                                .is_some_and(|e| e.holds_port(port)),
                         "PORT: an access on a port whose entry does not hold it",
                     )?;
                     ensure(

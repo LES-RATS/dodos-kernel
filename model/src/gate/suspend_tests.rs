@@ -445,4 +445,3 @@ fn watchdog_core_skips_non_live_nodes() {
     s.members[2].0 = Member::Fencing;
     assert_eq!(s.watchdog_core(), None);
 }
-

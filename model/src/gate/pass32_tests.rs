@@ -847,7 +847,11 @@ fn revoking_grant_with_live_use_can_be_pinned() {
     };
     steps(
         &mut m,
-        &[unmap, Op::Ack { n: 1, p: 1 }, Op::FreeGrant { n: 0, slot: 0 }],
+        &[
+            unmap,
+            Op::Ack { n: 1, p: 1 },
+            Op::FreeGrant { n: 0, slot: 0 },
+        ],
     );
     assert_eq!(m.grants.grants[0][0], None);
 

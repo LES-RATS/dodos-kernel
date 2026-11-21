@@ -577,4 +577,3 @@ fn an_untagged_seal_invalidates_each_cores_tlb() {
     assert_eq!(cached(&m, 0), []);
     assert_eq!(cached(&m, 1), []);
 }
-

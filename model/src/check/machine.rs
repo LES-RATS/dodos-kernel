@@ -101,16 +101,14 @@ impl System {
                 for &chunk in &chunks {
                     counts[chunk as usize] += 1;
                     let at = chunk << table.geometry.chunk_shift();
-                    let kept =
-                        table.holds_page(at.max(entry.anchor.frame.base), granter as u16, g)
-                            || exempt;
+                    let kept = table.holds_page(at.max(entry.anchor.frame.base), granter as u16, g)
+                        || exempt;
                     ensure(kept, "G5: granted memory owned by another than its granter")?;
                 }
                 if let Some(index) = device {
                     devices[index] += 1;
-                    let kept =
-                        table.taken_by(table.devices[index].owner.raw(), granter as u16, g)
-                            || exempt;
+                    let kept = table.taken_by(table.devices[index].owner.raw(), granter as u16, g)
+                        || exempt;
                     ensure(kept, "G5: granted device owned by another than its granter")?;
                 }
                 let frame = entry.anchor.frame;

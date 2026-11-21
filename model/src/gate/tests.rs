@@ -688,11 +688,7 @@ fn a_stale_drop_bit_deactivates_no_line_of_another_node() {
 #[test]
 fn remove_spi_requires_writing_node_and_deactivates_active_line() {
     let mut m = Machine::new(2, 2, 8);
-    steps(
-        &mut m,
-        &[Op::ClaimSpi { n: 1, spi: 0 }, Op::Fence { n: 1 }],
-    )
-    .expect("claim and fence");
+    steps(&mut m, &[Op::ClaimSpi { n: 1, spi: 0 }, Op::Fence { n: 1 }]).expect("claim and fence");
     assert_eq!(
         m.step(&Op::RemoveSpi { n: 1, spi: 0 }),
         Err(Refused::Condition),
@@ -886,4 +882,3 @@ fn check_counts_reports_leaked_map_count_on_live_chunk() {
         Err("COUNT: a map count above the leaves it holds".into())
     );
 }
-

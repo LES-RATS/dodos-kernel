@@ -3337,7 +3337,9 @@ fn kernel_tlb_chunk_of_stale_generation_is_reported() {
     model.cores[0].kernel_tlb.insert(chunk);
     assert_eq!(
         model.check(),
-        Err("G5: a run given or destroyed while a core may still translate it in the kernel's own space")
+        Err(
+            "G5: a run given or destroyed while a core may still translate it in the kernel's own space"
+        )
     );
 }
 
@@ -3457,10 +3459,7 @@ fn ready_untyped_with_zero_watermark_is_reported() {
         .find(|(_, u)| u.live == 0 && u.watermark == 0 && !u.device && !u.table)
         .expect("an empty ordinary untyped");
     u.ready = Some(1);
-    assert_eq!(
-        m.check(),
-        Err("18: watermark is zero when nothing is live")
-    );
+    assert_eq!(m.check(), Err("18: watermark is zero when nothing is live"));
 }
 
 // Pass 40 (v1-E #9): an iospace listing the same (iommu, device) twice must
@@ -3474,4 +3473,3 @@ fn iospace_with_duplicate_device_is_reported() {
     });
     assert_eq!(broken, "39: devices of an iospace");
 }
-

@@ -157,7 +157,11 @@ fn seal_hands_unit_role_past_phantom_to_real_successor() {
     // Move the unit role onto node 1 so that its cyclic successor is phantom 2.
     if m.sys.role(unit_role).holder() != 1 {
         let holder = m.sys.role(unit_role).holder();
-        let roles = slots_of(m.sys.node(holder), m.t[usize::from(holder)], ObjectKind::Role);
+        let roles = slots_of(
+            m.sys.node(holder),
+            m.t[usize::from(holder)],
+            ObjectKind::Role,
+        );
         assert_eq!(
             m.call(
                 holder,
@@ -199,11 +203,17 @@ fn destroying_revoked_task_waits_for_thread_leaving_other_core() {
     });
     assert_eq!(k.m.cores[1].thread, Some(other));
     // First call sets `revoked` and marks `other` leaving on core 1.
-    assert_eq!(k.m.apply(k.t, Syscall::TaskRevoke(s(310))), Err(Error::Again));
+    assert_eq!(
+        k.m.apply(k.t, Syscall::TaskRevoke(s(310))),
+        Err(Error::Again)
+    );
     assert!(k.m.threads[&other].leaving);
     // Deleting the task before core 1 handles the leave IPI must return
     // `Again` without suspending or detaching `other`.
-    assert_eq!(k.m.apply(k.t, Syscall::CapDelete(s(310))), Err(Error::Again));
+    assert_eq!(
+        k.m.apply(k.t, Syscall::CapDelete(s(310))),
+        Err(Error::Again)
+    );
     assert_eq!(k.m.check(), Ok(()));
     assert!(!k.m.threads[&other].suspended);
     assert!(k.m.threads[&other].task.is_some());
@@ -299,4 +309,3 @@ fn boot_refuses_iommu_with_more_than_65536_domains() {
         Some(crate::Refusal::MachineValues)
     );
 }
-
