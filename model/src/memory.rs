@@ -183,7 +183,7 @@ impl Model {
         for key in gone.iter().rev() {
             let page = aspace.hooked.remove(key).expect("hooked");
             match by {
-                Some(cap) => aspace.unhooked.push((cap, page)),
+                Some(cap) => aspace.unhooked.push((Some(cap), page)),
                 None => aspace.free.push(page),
             }
         }
@@ -258,8 +258,10 @@ impl Model {
         if let Some(aspace) = self.aspaces.get_mut(&mapping.space) {
             aspace.records.retain(|&other| other != cap);
             // Its unhooked tables join the free list now (D-137).
-            let (done, kept): (Vec<_>, Vec<_>) =
-                aspace.unhooked.iter().partition(|&&(by, _)| by == cap);
+            let (done, kept): (Vec<_>, Vec<_>) = aspace
+                .unhooked
+                .iter()
+                .partition(|&&(by, _)| by == Some(cap));
             aspace.unhooked = kept;
             aspace.free.extend(done.into_iter().map(|(_, page)| page));
         }
@@ -278,6 +280,13 @@ impl Model {
         };
         if let Some(aspace) = self.aspaces.get_mut(&mapping.space) {
             aspace.records.retain(|&other| other != cap);
+            // Its unhooked tables stay out of the free list for good, and
+            // no longer stand for a change of this record.
+            for (by, _) in &mut aspace.unhooked {
+                if *by == Some(cap) {
+                    *by = None;
+                }
+            }
         }
         live(&mut self.caps, cap).record = Record::Empty;
         let object = self.caps[&cap].object;

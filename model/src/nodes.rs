@@ -1932,7 +1932,16 @@ impl Model {
                             && (w.holder() == me
                                 || (w.state() == RoleState::Handing && w.target() == me))
                     });
-                if !others || named {
+                // What reached its kernel rings while its other cores parked
+                // is answered before it writes sealed, by this step's
+                // service of the rings, which runs while it is sealing (Roles,
+                // the reports are pulled: "a node that seals during the
+                // rebuild answers the asks that reached it before it
+                // sealed"; pass 38, a focused run of seed 574: a `ReportAsk`
+                // left unread, refused at the resume once the role's holder
+                // had changed, kept its asker's credit in use).
+                let waiting = (0..self.table.nodes).any(|z| z != me && self.has_kernel_message(z));
+                if !others || named || waiting {
                     return false;
                 }
                 let core = self.cores[0].number as usize;

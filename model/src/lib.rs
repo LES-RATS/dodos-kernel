@@ -679,8 +679,11 @@ struct ASpace {
     free: Vec<u64>,
     /// The tables unhooked by the clearing of a record, by its capability,
     /// which join the free list only at the completion of the invalidation
-    /// that covers their unhooking (Address spaces and their tables, D-137).
-    unhooked: Vec<(CapId, u64)>,
+    /// that covers their unhooking (Address spaces and their tables, D-137);
+    /// by no capability once a failed unit left that invalidation undone:
+    /// they never join it (IOMMU), and the record's next change unhooks
+    /// its own (pass 38, seed 89 of the long run).
+    unhooked: Vec<(Option<CapId>, u64)>,
     /// A node of several cores: the set of the node's cores that loaded its
     /// tag since it was last invalidated on them, by position (TLB).
     cores: u64,

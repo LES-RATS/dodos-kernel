@@ -1406,17 +1406,18 @@ impl Model {
             }
         }
         let cores = layout.nodes[0].clone();
-        Self::start(machine, &layout, table, 0, &cores)
+        Self::start(machine, &layout, table, 0, (&cores, 0))
     }
 
     /// The node start-up of `node` on `cores` (core numbers, in position
-    /// order), with the machine table it shares.
+    /// order), with the machine table it shares, at instant `now` of the
+    /// machine's clock.
     pub(crate) fn start(
         machine: &Machine,
         layout: &Layout,
         table: Table,
         node: u16,
-        cores: &[usize],
+        (cores, now): (&[usize], u64),
     ) -> Result<(Self, ObjId), Refusal> {
         let page = machine.geometry.page();
         let untypeds = layout.untypeds(node as usize);
@@ -1450,6 +1451,10 @@ impl Model {
             // The kernel epoch starts at 1; the barrier epoch at 0 covers
             // no watermark (D-135, D-138).
             kernel_epoch: 1,
+            // The clock is the machine's from the start-up on: what the
+            // start writes (its trace entry, code 1) has its instant (pass
+            // 38: a start at run time stamped it 0).
+            now,
             ..Self::default()
         };
         let thread = model.build(layout, &untypeds, start_pages)?;
@@ -1483,6 +1488,16 @@ impl Model {
             return Err(Refusal::Floors);
         };
         self.reset_floor();
+        // G13: a node started fresh writes its node beacon anew (no failure,
+        // no acknowledgement, no bit of `maps_of`) and zeroes the gate part
+        // of its node block, the observations among it (seed 632 of pass
+        // 38's long run: an acknowledgement of a node still fenced, written
+        // by the generation that died, stood under the new one's reclaim).
+        let beacon = &mut self.table.beacons[usize::from(self.node)];
+        beacon.panic = None;
+        beacon.acked.fill(0);
+        beacon.maps_of.fill(false);
+        beacon.observations.clear();
         // The copied frames counted where they are placed: each segment
         // from the start-up untyped's watermark as the frames before it
         // left it, each frame at its own alignment (H2).

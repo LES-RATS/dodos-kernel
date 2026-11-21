@@ -159,7 +159,8 @@ impl System {
         let mut nodes: Vec<Option<Model>> = vec![None; machine.nodes()];
         let mut firsts = Vec::new();
         for (slot, cores) in layout.nodes.clone().iter().enumerate() {
-            let (mut model, first) = Model::start(machine, &layout, table, slot as u16, cores)?;
+            let (mut model, first) =
+                Model::start(machine, &layout, table, slot as u16, (cores, 0))?;
             model.shared = true;
             model.manual = true;
             model.ready = true;
@@ -1225,9 +1226,13 @@ impl System {
             // leaves no core in a state no event leaves: the core parks
             // again, or goes off, and the starter's `START_NS` ends the
             // start (O22).
-            let Ok((mut model, _)) =
-                Model::start(&self.machine, &self.layout, table, node, &joining)
-            else {
+            let Ok((mut model, _)) = Model::start(
+                &self.machine,
+                &self.layout,
+                table,
+                node,
+                (&joining, self.now),
+            ) else {
                 match self.machine.arch {
                     Arch::X86_64 => self.park(core),
                     _ => self.hardware[core] = Hardware::Off,
@@ -1236,11 +1241,10 @@ impl System {
             };
             model.shared = true;
             model.manual = true;
-            // The clock is the machine's (Clock): a kernel started at run
-            // time reads it as the others do (pass 25: it read 0 until
-            // the clock next moved, and stamped its first observations at
-            // instant 0).
-            model.set_now(self.now);
+            // The clock is the machine's (Clock), given to the start-up:
+            // a kernel started at run time reads it as the others do (pass
+            // 25: it read 0 until the clock next moved, and stamped its
+            // first observations at instant 0; pass 38: its start entry).
             model.begin_fresh();
             self.nodes[node as usize] = Some(model);
         } else if (0..self.model(node).core_count()).all(|p| self.model(node).is_silent(p)) {
