@@ -186,7 +186,8 @@ fn a_pinned_grant_whose_faulty_holder_lowers_its_count_and_sends_nothing_stays_u
     );
     m.sys.inject(1, 0, step);
     assert!(m.step_until(|m| revoke_in_flight(m).is_none()));
-    m.sys.undue_release(1);
+    let serial = m.sys.canonical().grants[0][&grant].serial;
+    m.sys.undue_release(0, grant, serial);
     unmapped(&mut m);
     assert_eq!(state(&m, grant), Some(GrantState::Pinned));
     assert_eq!(m.sys.check(), Ok(()));

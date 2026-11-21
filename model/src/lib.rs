@@ -1146,6 +1146,12 @@ pub struct Model {
     /// wait is a time and not an interleaving; what reads the clock under
     /// the lock reads it this much later than the event's entry.
     pub(crate) lock_wait: u64,
+    /// A test's input: the acknowledgements (node, generation) this node's
+    /// faulty kernel wrote before its R4 for that node ended
+    /// (`System::early_ack`). ACKED does not judge R4's order for them and
+    /// judges every other rule; once the audit ends there is nothing left
+    /// to pass over.
+    pub(crate) early_acks: BTreeSet<(u16, u32)>,
     /// The barrier epoch: the largest kernel epoch a complete barrier
     /// covers; a watermark ready at an epoch it covers returns (A node of
     /// several cores, D-138).

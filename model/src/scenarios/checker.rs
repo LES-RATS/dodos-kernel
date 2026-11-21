@@ -1133,6 +1133,29 @@ fn an_accusation_by_a_node_that_is_not_live_is_reported() {
     reported(&k, "ACCUSE: a node that is not live or sealing accused");
 }
 
+// D-146: a member word written by a node after its own write of sealed in
+// the same event (the write of sealed is its last gate call).
+#[test]
+fn a_member_word_written_after_the_write_of_sealed_is_reported() {
+    let mut k = node2();
+    let me = k.m.node;
+    let own = k.m.table.member(me);
+    let sealed = dodos_abi::Member::new(
+        dodos_abi::MemberState::Sealed,
+        own.evidence(),
+        own.driver(),
+        own.generation(),
+    );
+    k.m.table.write_member(me, me, sealed);
+    assert_eq!(k.m.check(), Ok(()), "the write of sealed alone");
+    // Any word after it, its own included (one node here).
+    k.m.table.member_writes.push((me, me, sealed, sealed));
+    reported(
+        &k,
+        "SEALED: a member word written after the write of sealed",
+    );
+}
+
 // D-146: a unit role held by a node whose member word reads starting.
 #[test]
 fn a_unit_role_held_by_a_starting_node_is_reported() {
@@ -1346,6 +1369,45 @@ fn a_pinned_grant_of_a_grantee_that_runs_is_reported() {
             .get_mut(&g.use_index)
             .expect("its use entry")
             .leaves = 0;
+    });
+    machine_reported(
+        &m,
+        "R3: a grant pinned while its grantee runs and no failed unit holds it",
+    );
+}
+
+// D-165 (the review of passes 35 and 36, finding 3): an undue `Release`
+// lets R3 pass over the one entry it named, with its serial; the same
+// grantee's entry of another serial, pinned with no count, is reported.
+#[test]
+fn a_pinned_grant_is_passed_over_only_for_the_entry_its_undue_release_named() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let granter = super::pass24::X;
+    let serial = m.sys.canonical().grants[usize::from(granter)][&g.grant].serial;
+    m.sys.edit_table(|t| {
+        let entry = t.grants[usize::from(granter)]
+            .get_mut(&g.grant)
+            .expect("the grant");
+        entry.state = crate::table::GrantState::Pinned;
+        let grantee = usize::from(entry.grantee);
+        t.uses[grantee]
+            .get_mut(&g.use_index)
+            .expect("its use entry")
+            .leaves = 0;
+    });
+    m.sys.undue_release(granter, g.grant, serial);
+    assert_eq!(m.sys.check(), Ok(()), "the entry the Release named");
+    m.sys.edit_table(|t| {
+        let entry = t.grants[usize::from(granter)]
+            .get_mut(&g.grant)
+            .expect("the grant");
+        entry.serial += 1;
+        let grantee = usize::from(entry.grantee);
+        t.uses[grantee]
+            .get_mut(&g.use_index)
+            .expect("its use entry")
+            .serial += 1;
     });
     machine_reported(
         &m,
@@ -1587,6 +1649,51 @@ fn an_acknowledgement_before_r2_or_r4_is_done_is_reported() {
     let reclaim = m.sys.node_mut(y).reclaims.entry(x).or_default();
     reclaim.generation = gx;
     reclaim.audit = Some(Vec::new());
+    reported_on(
+        &m,
+        y,
+        "ACKED: an acknowledgement before R2 removed every remote capability",
+    );
+}
+
+// The early acknowledgement of the combination run's faulty action 9 (the
+// review of passes 35 and 36, finding 3): `System::early_ack` passes over
+// R4's order for that acknowledgement alone; R2's order is still judged on
+// the same node, and so is R4's for another generation.
+#[test]
+fn an_early_acknowledgement_passes_over_r4_alone_for_that_generation() {
+    let mut m = S::two();
+    let g = m.sys.member(0).generation();
+    m.sys.edit_table(|t| {
+        let evidence = dodos_abi::Evidence::Stale;
+        t.members[0] = dodos_abi::Member::new(MemberState::Fenced, evidence, 1, g);
+        t.beacons[1].acked[0] = g;
+    });
+    let one = *m.sys.node(1).untypeds.keys().next().expect("an untyped");
+    let reclaim = m.sys.node_mut(1).reclaims.entry(0).or_default();
+    reclaim.generation = g;
+    reclaim.audit = Some(vec![one]);
+    let r4 = "ACKED: an acknowledgement before R4 audited every block";
+    reported_on(&m, 1, r4);
+    m.sys.early_ack(1, 0, g + 1);
+    reported_on(&m, 1, r4);
+    m.sys.early_ack(1, 0, g);
+    assert_eq!(m.sys.node(1).check(), Ok(()));
+    // A remote capability of the fenced node left, R4 not ended: R2's
+    // order is reported, the early acknowledgement notwithstanding.
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let (x, y) = (super::pass24::X, super::pass24::Y);
+    let gx = m.sys.member(x).generation();
+    m.sys.edit_table(|t| {
+        let evidence = dodos_abi::Evidence::Stale;
+        t.members[usize::from(x)] = dodos_abi::Member::new(MemberState::Fenced, evidence, y, gx);
+        t.beacons[usize::from(y)].acked[usize::from(x)] = gx;
+    });
+    let reclaim = m.sys.node_mut(y).reclaims.entry(x).or_default();
+    reclaim.generation = gx;
+    reclaim.audit = Some(vec![one]);
+    m.sys.early_ack(y, x, gx);
     reported_on(
         &m,
         y,

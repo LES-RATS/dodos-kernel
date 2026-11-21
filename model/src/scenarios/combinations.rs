@@ -1784,7 +1784,7 @@ impl Run {
                     self.m.sys.inject(f, granter, Message { header, body });
                     // Read after a removal made the entry revoking, it
                     // pins it, and `f`'s count may then fall (D-165).
-                    self.m.sys.undue_release(f);
+                    self.m.sys.undue_release(granter, grant, serial);
                     self.forged(f, granter);
                     if let Some(forged) = self.forged.last_mut() {
                         forged.grant = Some(grant);
@@ -1920,19 +1920,23 @@ impl Run {
                         && !table.grants[f as usize].values().any(|e| e.grantee == x)
                 });
                 if let Some(x) = fenced {
-                    // Written before R4's audit may have ended: `f`'s kernel
-                    // is declared faulty from here on, so that its own
-                    // state is no longer judged against the rules only a
-                    // correct kernel keeps (R2 and R4 before R5); the rules
-                    // that protect the other nodes, R6's proof among them,
-                    // still hold (pass 36: pass 34 held the adversary to
-                    // the end of R4 instead, a weakening the review of
-                    // passes 33 and 34 found).
-                    self.m.sys.make_faulty(f);
+                    // Written before R4's audit may have ended (pass 36:
+                    // pass 34 held the adversary to the end of R4, a
+                    // weakening the review of passes 33 and 34 found). Only
+                    // then is a rule of `f`'s own state broken, R4 before
+                    // R5 of ACKED, and only that rule is passed over, for
+                    // that acknowledgement alone; every other rule of `f`,
+                    // R6's proof and the rings toward `f` among them, is
+                    // still judged (the review of passes 35 and 36, finding
+                    // 3: the whole kernel was declared faulty for the rest
+                    // of the seed at every early acknowledgement).
                     let reclaim = &self.m.sys.node(f).reclaims[&x];
                     let audited = reclaim.audit.as_ref().is_some_and(Vec::is_empty);
-                    self.seen.early_acks += usize::from(!audited);
                     let xg = self.m.sys.member(x).generation();
+                    if !audited {
+                        self.m.sys.early_ack(f, x, xg);
+                        self.seen.early_acks += 1;
+                    }
                     self.m.sys.edit_table(|t| {
                         t.beacons[f as usize].acked[x as usize] = xg;
                         t.beacons[f as usize].maps_of[x as usize] = false;
@@ -2218,7 +2222,11 @@ fn seed_763_of_pass_35_a_sleeping_core_is_roused_at_its_timer() {
 // Seed 867 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
 // node 3's last seal step wrote sealed, its last gate call, and went on in
 // the same step to accuse node 0, which had just failed. A node fences,
-// reclaims and accuses nothing once it has written sealed.
+// reclaims and accuses nothing once it has written sealed. The seed's draws
+// no longer meet that interleaving (the review of passes 35 and 36, finding
+// 2): its deterministic twin is
+// `pass38::a_node_that_writes_sealed_fences_and_accuses_nothing_in_the_same_step`,
+// and the checker's rule SEALED judges every step of every exploration.
 #[test]
 fn seed_867_of_pass_28_a_node_that_wrote_sealed_accuses_no_one() {
     let reach = explore(vec![867]);

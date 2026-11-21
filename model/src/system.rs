@@ -132,12 +132,13 @@ pub struct System {
     /// of that kernel's own state against it, only the machine's: what it
     /// can do to the others.
     pub(crate) faulty: std::collections::BTreeSet<u16>,
-    /// The nodes whose kernel wrote a `Release` of a grant while its use
-    /// entry still counted a leaf (a test's input: a forged message). Only
-    /// such a holder can leave a granter's pinned entry with its count
-    /// lowered and nothing in flight (D-165); the checker's R3 lets that
-    /// state be, and still judges the holder's own state.
-    pub(crate) undue_releases: std::collections::BTreeSet<u16>,
+    /// The grant entries (granter, grant, serial) for which the holder's
+    /// kernel wrote a `Release` while its use entry still counted a leaf (a
+    /// test's input: a forged message). Only such a holder can leave a
+    /// granter's pinned entry with its count lowered and nothing in flight
+    /// (D-165); the checker's R3 lets that entry be, and still judges
+    /// every other entry and the holder's own state.
+    pub(crate) undue_releases: std::collections::BTreeSet<(u16, u16, u32)>,
     /// ARM64: `parked` written for a core whose word carried no fence mark
     /// (D-147: only at a fence).
     pub(crate) parked_unfenced: bool,
@@ -1044,10 +1045,19 @@ impl System {
         self.faulty.insert(node);
     }
 
-    /// Node `node`'s kernel wrote a `Release` while it counted a leaf under
-    /// the grant (a test's input, beside the forged message).
-    pub fn undue_release(&mut self, node: u16) {
-        self.undue_releases.insert(node);
+    /// The holder's kernel wrote a `Release` of grant `grant` of `granter`
+    /// with serial `serial` while it counted a leaf under it (a test's
+    /// input, beside the forged message).
+    pub fn undue_release(&mut self, granter: u16, grant: u16, serial: u32) {
+        self.undue_releases.insert((granter, grant, serial));
+    }
+
+    /// Node `node`'s faulty kernel wrote the acknowledgement of node `x`'s
+    /// generation `generation` before its R4 for `x` ended (a test's
+    /// input, beside the write): only R4's order of ACKED is not judged
+    /// for it.
+    pub fn early_ack(&mut self, node: u16, x: u16, generation: u32) {
+        self.model(node).early_acks.insert((x, generation));
     }
 
     /// The firmware refuses a park (a test's input): ARM64 `CPU_OFF`

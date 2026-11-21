@@ -32,6 +32,21 @@ impl Model {
             !self.event.held_after_step,
             "HELD: a message held after a step of the reserve that could send it",
         )?;
+        // `node_stop` mode seal (D-146): the write of sealed is the node's
+        // last gate call; it writes no member word after it in that event
+        // (seed 867 of pass 28; the review of passes 35 and 36, finding 2).
+        let me = self.node;
+        let sealed = self
+            .table
+            .member_writes
+            .iter()
+            .position(|&(node, writer, _, to)| {
+                node == me && writer == me && to.state() == dodos_abi::MemberState::Sealed
+            });
+        ensure(
+            sealed.is_none_or(|at| self.table.member_writes[at + 1..].iter().all(|w| w.1 != me)),
+            "SEALED: a member word written after the write of sealed",
+        )?;
         // `node_stop` and the watchers: only a live or sealing node writes
         // fencing (D-146).
         ensure(
@@ -79,7 +94,8 @@ impl Model {
                 "ACKED: an acknowledgement before R2 removed every remote capability",
             )?;
             ensure(
-                reclaim.is_none_or(|r| r.audit.as_ref().is_some_and(Vec::is_empty)),
+                reclaim.is_none_or(|r| r.audit.as_ref().is_some_and(Vec::is_empty))
+                    || self.early_acks.contains(&(x, g)),
                 "ACKED: an acknowledgement before R4 audited every block",
             )?;
             for (role, word) in self.table.roles.iter().enumerate() {

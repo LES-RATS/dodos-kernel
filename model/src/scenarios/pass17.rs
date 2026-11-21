@@ -698,15 +698,20 @@ fn the_holder_refuses_an_attach_under_a_domain_number_of_another_node() {
 #[test]
 fn the_holder_refuses_an_attach_of_a_device_whose_identifier_word_names_another_node() {
     let (mut m, holder, requester, third) = holder_requester_third();
-    // The third node holds the device, pinned to its own root.
-    iospace_root(&mut m, third, 0x10);
+    // The requester's own iospace root, with the device pinned to it: every
+    // operand but the identifier word is the requester's (the review of
+    // passes 35 and 36, finding 1: a root of no one was refused first).
+    let root = iospace_root(&mut m, requester, 0x10);
     let own = *m.sys.node(holder).domain_range(0, requester).start();
     let op = crate::rings::UnitOp::Attach {
         device: 0x10,
         domain: own,
-        root: 1 << 30,
+        root,
     };
+    hold_identifier(&mut m, third, 0x10);
     assert!(judged(&mut m, holder, requester, 0, op));
+    hold_identifier(&mut m, requester, 0x10);
+    assert!(!judged(&mut m, holder, requester, 0, op));
 }
 
 #[test]
@@ -720,12 +725,22 @@ fn the_holder_refuses_a_detach_of_a_context_entry_of_another_node() {
         root,
     };
     assert!(!judged(&mut m, holder, third, 0, attach));
+    // The identifier word now names the requester, so only the owner of the
+    // context entry tells the detach apart (finding 1: the word named the
+    // third node and was refused first). The holder's gate wrote the entry
+    // in its own table; the machine's table is that one from now on. A
+    // context entry whose identifier word names another node is a state
+    // only a faulty gate writes (G9), which the holder must still judge.
+    let written = m.sys.node(holder).table.clone();
+    m.sys.edit_table(|t| *t = written);
+    hold_identifier(&mut m, requester, 0x10);
     let detach = crate::rings::UnitOp::Detach {
         device: 0x10,
         domain,
         root,
     };
-    assert!(judged(&mut m, holder, requester, 0, detach));
+    let fault = "G9: a context entry of a node its identifier word does not name";
+    assert!(judged_on(&mut m, fault, (holder, requester, 0), detach));
     assert!(
         m.sys.node(holder).table.units[&0]
             .entries
