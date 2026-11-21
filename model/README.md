@@ -587,7 +587,7 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   every test file on the three page sizes. Two rules found by repaired
   tests: `node_send` reads the header before the doorbell, and a revoked
   task named where another kind is asked is `gone`. Gap 56 (where
-  `node_send`'s `gone` of a node not live sits) is open.
+  `node_send`'s `gone` of a node not live sits) was settled by D-164.
 - The explorations reach the states of D-154 to D-157: in
   `combinations.rs` a node takes a table run, cuts a child table untyped,
   makes an `aspace` or an `iospace` on it, maps under it, destroys the
@@ -598,6 +598,28 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   blocks among them, and that a give of a table chunk holding a table and
   a leaf toward a table chunk are always refused.
 - The scenarios are in `scenarios/pass35.rs`.
+
+## Pass 36 (the review of passes 33 and 34, D-163, D-164)
+
+- R3 and R0 of the checker read an unfenced node as accused, as the
+  contract has it ("fenced or unfenced").
+- A fence class above 2 is refused at start (`MachineValues`).
+- D-163 (1): starting → live needs every core word naming the node owned
+  without the mark (`Table::owned_unmarked`); D-163 (2) is the model's
+  reading since pass 33.
+- The gate model: a grantee's R6 leaves the grants of a granter whose gate
+  writes nothing, a sealed one to R3 at its resume (G13).
+- The faulty action 9 of the combinations writes its early acknowledgement
+  before R4 ends and declares its node faulty, whose own state the checker
+  then leaves unjudged; the short run has 27 seeds.
+- D-164: `node_send` judges `gone` for a node that is not live with the
+  state, after every capability and plain argument; gap 58 (where among
+  the state checks) is open.
+- The property test runs the table chunks' cycle at random
+  (`TABLE_CASES`, each asserted reached), and the untagged gate
+  exploration names other nodes' roots and switches roots with
+  translations cached.
+- The scenarios are in `scenarios/pass36.rs`.
 
 ## Mutations shown equivalent
 
@@ -674,9 +696,13 @@ D-160 (no `CONTRACT-GAP` marker left; see Pass 34): gap 52
 producer 1 to the ring's entries, as the model read it), gap 53 (a
 `UnitRequest` names the requester's entry and the serial of its record's
 state word, and carries no operand) and gap 54 (`BootPorts`, 264 bytes,
-and what the machine start-up refuses). Pass 34 found one, open: gap 55
+and what the machine start-up refuses). Pass 34 found one, settled by D-162: gap 55
 (`model/src/units.rs`: a `UnitRequest` whose role is not its record's
-word 0). Two earlier gaps were settled otherwise than the
+word 0). Pass 35 found two: gap 56 (where `node_send` judges `gone`),
+settled by D-164, and gap 57 (`model/src/grants.rs`, a `Release`
+crossing a `Revoke`), open. Pass 36 found one, open: gap 58
+(`model/src/grants.rs`: where `gone` falls among `node_send`'s state
+checks). Two earlier gaps were settled otherwise than the
 model first read them, and the model follows: a node's cores lie in one
 window of 64 core numbers (gap 7, checked after every step), and the
 claim of an MSI asks every IOMMU unit of the source's segment, one after

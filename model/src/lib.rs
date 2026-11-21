@@ -1350,6 +1350,11 @@ impl Model {
         self.table.owners[chunk as usize]
     }
 
+    /// The number of chunks the ownership table names.
+    pub fn chunk_count(&self) -> u64 {
+        self.table.owners.len() as u64
+    }
+
     /// The watermark and the clean mark of an untyped, as offsets from its
     /// first byte, and whether it is device memory (rules of
     /// `untyped_retype`).

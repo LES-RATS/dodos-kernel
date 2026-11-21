@@ -1723,11 +1723,102 @@ impl Generator<'_> {
         ]
     }
 
+    /// The cycle of the table chunks (D-154 to D-157; the audit of lot 8b,
+    /// F2: no space was made on a child table untyped, no table run taken
+    /// at random, given or destroyed): a run of one chunk taken for tables
+    /// (`memory_take` kind 2) where the node has a free chunk, a child table
+    /// untyped cut from it, an aspace and an iospace on that child, a frame
+    /// mapped into each under it, an `its_table` of 2^k pages; then, in an
+    /// order drawn, the spaces destroyed with their mappings in place and
+    /// the `its_table`; then the child and the frames deleted, last the run
+    /// given to the phantom node or deleted.
+    fn tables(&mut self, plan: &mut Plan) -> Vec<Syscall> {
+        if self.space != Some(self.home) || !self.whole(MEMORY) {
+            return Vec::new();
+        }
+        let shift = geometry().chunk_shift();
+        let free: Vec<u64> = (ram() >> shift..self.model.chunk_count())
+            .filter(|&c| {
+                Ownership::from_raw(self.model.ownership(c)).is_some_and(|w| {
+                    w.state() == OwnState::Free
+                        && matches!(w.owner(), Owner::Unclaimed | Owner::Node(0))
+                })
+            })
+            .collect();
+        if free.is_empty() {
+            return Vec::new();
+        }
+        let chunk = self.rng.pick(&free);
+        let slots = self.spare(plan, 7);
+        let &[run, child, aspace, iospace, frame, copy, its] = slots.as_slice() else {
+            return Vec::new();
+        };
+        let from = |untyped: u32, kind, size, slot: u32| Syscall::UntypedRetype {
+            untyped: own(untyped),
+            kind,
+            size,
+            page: PageSize::Page as u64,
+            memory: 0,
+            destination: own(slot),
+        };
+        let map = |space: u32, frame: u32, address, rights: Rights| Map {
+            space: own(space),
+            frame: own(frame),
+            untyped: own(child),
+            address,
+            first: 0,
+            count: 1,
+            rights: rights.bits(),
+        };
+        let (r, w) = (Rights::READ, Rights::WRITE);
+        let mut calls = vec![
+            Syscall::MemoryTake {
+                control: own(START_SLOT_MEMORY_CONTROL),
+                kind: MEMORY_TAKE_TABLES,
+                place: chunk << shift,
+                size: u64::from(shift),
+                destination: own(run),
+            },
+            from(run, ObjectKind::Untyped, 8 * page(), child),
+            retype(ObjectKind::ASpace, own(child).raw(), own(aspace)),
+            retype(ObjectKind::IoSpace, own(child).raw(), own(iospace)),
+            retype(ObjectKind::Frame, 2, own(frame)),
+            derive(own(frame), own(copy)),
+            Syscall::ASpaceMap(map(aspace, frame, 1 << 30, r.union(w))),
+            Syscall::IoSpaceMap(map(iospace, copy, 0x1_0000, w)),
+            from(run, ObjectKind::ItsTable, self.rng.below(5), its),
+        ];
+        let mut ends = vec![
+            vec![Syscall::CapDelete(own(aspace)); 3],
+            vec![Syscall::CapDelete(own(iospace)); 3],
+            vec![Syscall::CapDelete(own(its)); 2],
+        ];
+        while !ends.is_empty() {
+            let at = self.rng.below(ends.len() as u64) as usize;
+            calls.extend(ends.swap_remove(at));
+        }
+        calls.extend(vec![Syscall::CapDelete(own(child)); 2]);
+        calls.extend([
+            Syscall::CapDelete(own(frame)),
+            Syscall::CapDelete(own(copy)),
+        ]);
+        calls.extend(match self.rng.chance(50) {
+            true => vec![Syscall::MemoryGive {
+                control: own(START_SLOT_MEMORY_CONTROL),
+                untyped: own(run),
+                node: 1,
+            }],
+            false => vec![Syscall::CapDelete(own(run)); 2],
+        });
+        calls
+    }
+
     fn script(&mut self, plan: &mut Plan) -> Vec<Syscall> {
         match self.rng.below(100) {
             0..18 => self.spawn(),
             18..44 => self.chain(plan),
-            44..66 => self.fan(plan),
+            44..63 => self.fan(plan),
+            63..66 => self.tables(plan),
             66..74 => self.nest(plan),
             74..78 => self.kill(),
             78..86 => self.listen(plan),
@@ -1859,6 +1950,67 @@ struct Reached {
     revoked: u32,
     unmapped_by_removal: u32,
     detached_by_removal: u32,
+    /// Calls that reached each state of the table chunks' cycle, by its
+    /// place in `TABLE_CASES`.
+    tables: [u32; TABLE_CASES.len()],
+}
+
+/// The states of the table chunks' cycle (D-154 to D-157) that the random
+/// calls must reach (the audit of lot 8b, F2).
+const TABLE_CASES: [&str; 10] = [
+    "a table run taken (memory_take kind 2)",
+    "a child table untyped cut from a table untyped",
+    "an aspace on a child table untyped",
+    "an iospace on a child table untyped",
+    "a frame mapped under a child table untyped",
+    "an aspace destroyed with a mapping in place",
+    "an iospace destroyed with a mapping in place",
+    "a table untyped given",
+    "a table untyped deleted",
+    "an its_table of more than one page",
+];
+
+/// The places in `TABLE_CASES` a call reaches, judged from the state before
+/// it (`table`: whether a slot holds a table untyped; `kind`: what a slot
+/// holds) and its outcome, with the mappings counted before and after.
+fn table_cases(
+    call: &Syscall,
+    outcome: &Outcome,
+    table: impl Fn(SlotAddr) -> bool,
+    kind: impl Fn(SlotAddr) -> Option<ObjectKind>,
+    unmapped: bool,
+) -> Vec<usize> {
+    let done = matches!(outcome, Ok(Output::Done));
+    let ok = outcome.is_ok();
+    let on_child = |size: u64| size != TABLES.raw() && table(SlotAddr::from_raw(size));
+    let cases = match *call {
+        Syscall::MemoryTake { kind, .. } => vec![(kind == MEMORY_TAKE_TABLES && done, 0)],
+        Syscall::UntypedRetype {
+            untyped,
+            kind: made,
+            size,
+            ..
+        } => vec![
+            (made == ObjectKind::Untyped && table(untyped) && done, 1),
+            (made == ObjectKind::ASpace && on_child(size) && done, 2),
+            (made == ObjectKind::IoSpace && on_child(size) && done, 3),
+            (made == ObjectKind::ItsTable && size > 0 && done, 9),
+        ],
+        Syscall::ASpaceMap(map) | Syscall::IoSpaceMap(map) => {
+            vec![(map.untyped != TABLES && table(map.untyped) && ok, 4)]
+        }
+        Syscall::CapDelete(slot) => vec![
+            (kind(slot) == Some(ObjectKind::ASpace) && unmapped, 5),
+            (kind(slot) == Some(ObjectKind::IoSpace) && unmapped, 6),
+            (table(slot) && done, 8),
+        ],
+        Syscall::MemoryGive { untyped, .. } => vec![(table(untyped) && ok, 7)],
+        _ => Vec::new(),
+    };
+    cases
+        .into_iter()
+        .filter_map(|(reached, case)| reached.then_some(case))
+        .collect()
 }
 
 impl Reached {
@@ -2412,7 +2564,37 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
             .iter()
             .filter_map(|&thread| Some((thread, model.marks(thread)?)))
             .collect();
+        // What the table chunks' cycle reads of the state before the call:
+        // the slots it names that hold a table untyped, and what the slot
+        // of a `cap_delete` holds.
+        let named = match &call {
+            Syscall::UntypedRetype { untyped, size, .. } => {
+                vec![*untyped, SlotAddr::from_raw(*size)]
+            }
+            Syscall::ASpaceMap(map) | Syscall::IoSpaceMap(map) => vec![map.untyped],
+            Syscall::CapDelete(slot) | Syscall::MemoryGive { untyped: slot, .. } => vec![*slot],
+            _ => Vec::new(),
+        };
+        let tables: Vec<SlotAddr> = named
+            .into_iter()
+            .filter(|&slot| model.untyped_is_table(thread, slot) == Some(true))
+            .collect();
+        let deleted = match call {
+            Syscall::CapDelete(slot) => {
+                match model.clone().apply(thread, Syscall::CapInspect(slot)) {
+                    Ok(Output::Inspect { kind, .. }) => Some(kind),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let shape = call.clone();
         let outcome = model.apply(thread, call);
+        let unmapped = model.census().mappings < before.mappings;
+        let table = |slot: SlotAddr| tables.contains(&slot);
+        for case in table_cases(&shape, &outcome, table, |_| deleted, unmapped) {
+            reached.tables[case] += 1;
+        }
         // A call that waits for a unit ends at the unit's confirmation, at
         // the next step of the recovery reserve of node 0, which holds every
         // unit role: what is due at this instant runs.
@@ -2598,6 +2780,9 @@ impl Reached {
         self.revoked += other.revoked;
         self.unmapped_by_removal += other.unmapped_by_removal;
         self.detached_by_removal += other.detached_by_removal;
+        for (sum, n) in self.tables.iter_mut().zip(&other.tables) {
+            *sum += n;
+        }
         for (sum, n) in self.ok.iter_mut().zip(&other.ok) {
             *sum += n;
         }
@@ -2796,6 +2981,16 @@ fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     at_least([reached.sent, reached.stayed], [2, 44]);
     // The same moves listed by `call` and by `reply_recv`: 39 and 18.
     at_least([reached.called, reached.answered], [18, 6]);
+}
+
+/// The table chunks' cycle (D-154 to D-157) is reached by the random calls
+/// (the audit of lot 8b, F2: none of it was).
+#[test]
+fn the_table_chunks_cycle_is_reached() {
+    let reached = all_seeds();
+    for (case, &count) in TABLE_CASES.iter().zip(&reached.tables) {
+        assert!(count > 0, "the seeds never reach {case}");
+    }
 }
 
 #[test]
