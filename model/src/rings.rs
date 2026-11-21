@@ -757,7 +757,11 @@ impl Model {
         let me = self.node;
         let ring = self.ring_of(from, me, false);
         let produced = ring.produced;
-        let consumed = ring_resync(produced, self.consumed(from, me, false), RING_KERNEL_ENTRIES);
+        let consumed = ring_resync(
+            produced,
+            self.consumed(from, me, false),
+            RING_KERNEL_ENTRIES,
+        );
         if produced == consumed {
             return false;
         }

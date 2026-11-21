@@ -1948,8 +1948,8 @@ impl Model {
                 // wait until the resume, and sealed is written only when no
                 // request is open and no ring holds a message it may still
                 // answer (`node_stop` mode 1, D-167).
-                let waiting = (0..self.table.nodes)
-                    .any(|z| z != me && self.has_answerable_kernel_message(z));
+                let waiting =
+                    (0..self.table.nodes).any(|z| z != me && self.has_answerable_kernel_message(z));
                 if !others || named || self.has_open_request() || waiting {
                     return false;
                 }

@@ -287,14 +287,20 @@ fn a_report_ask_behind_a_revoke_on_a_sealing_node_is_answered_empty_at_resume() 
     // successor) will take over IOMMU_ROLE at `confirmed + SETTLE_NS`.
     m.supervisor(driver, m.t[driver as usize]);
     m.ok(driver, kill(old_holder));
-    assert!(m.step_until(|m| m.sys.canonical().fences[old_holder as usize].confirmed.is_some()));
+    assert!(m.step_until(|m| {
+        m.sys.canonical().fences[old_holder as usize]
+            .confirmed
+            .is_some()
+    }));
 
     // Seal node 4 and stop once it enters `SealStep::Parking` (core 5 is
     // parking, not yet confirmed).
     m.ok(driver, seal(sealing));
     assert!(m.step_until(|m| {
         m.state(sealing) == MemberState::Sealing
-            && m.sys.canonical().beacons[sealing as usize].sealed_at.is_some()
+            && m.sys.canonical().beacons[sealing as usize]
+                .sealed_at
+                .is_some()
     }));
     assert!(!m.sys.node(sealing).park_confirmed(5));
     assert_eq!(m.sys.role(IOMMU_ROLE).holder(), old_holder);
@@ -336,12 +342,7 @@ fn a_report_ask_behind_a_revoke_on_a_sealing_node_is_answered_empty_at_resume() 
         };
         let mut fired_any = 0;
         while !ready(&m) && fired_any < 64 {
-            let Some(ev) = m
-                .sys
-                .events()
-                .into_iter()
-                .find(|&e| !is_core5_park(&m, e))
-            else {
+            let Some(ev) = m.sys.events().into_iter().find(|&e| !is_core5_park(&m, e)) else {
                 break;
             };
             m.sys.fire(ev);
@@ -428,7 +429,10 @@ fn a_report_ask_behind_a_revoke_on_a_sealing_node_is_answered_empty_at_resume() 
             assert_eq!(m.sys.check(), Ok(()));
         }
         steps += 1;
-        assert!(steps < 500, "resume did not answer ReportAsk and free credit");
+        assert!(
+            steps < 500,
+            "resume did not answer ReportAsk and free credit"
+        );
     }
     assert!(
         saw_empty_report,
@@ -510,4 +514,3 @@ fn more_tables_unhooked_and_frozen_in_one_call_than_its_request_lists_are_report
         ))
     );
 }
-

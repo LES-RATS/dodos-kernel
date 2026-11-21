@@ -621,6 +621,54 @@ impl Run {
         run
     }
 
+    fn new_with_idle(seed: u64, configure_idle: bool) -> Self {
+        let cores: Vec<Vec<usize>> = (0..NODES as usize)
+            .map(|c| match c as u16 == WIDE {
+                true => vec![c, c + 1],
+                false => vec![c],
+            })
+            .collect();
+        let layout: Vec<&[usize]> = cores.iter().map(Vec::as_slice).collect();
+        let arch = ARCHES[(seed / 286) as usize % ARCHES.len()];
+        let mut machine = machine(arch, NODES as usize + 1, &layout);
+        machine.membership.sweep_ms = 100;
+        machine.membership.seal_ms = 30;
+        machine.membership.stale_ms = 40;
+        machine.membership.stuck_ms = 40;
+        let m = S::on(&machine);
+        let splittable = m
+            .sys
+            .canonical()
+            .devices
+            .iter()
+            .filter(|e| e.is_used())
+            .count();
+        let faulty_node = (seed % u64::from(NODES)) as u16;
+        let mut run = Self {
+            m,
+            rng: Rng(seed + 701),
+            seen: Seen::default(),
+            drivers: drivers(seed),
+            splittable,
+            receivers: vec![None; NODES as usize],
+            once: BTreeSet::new(),
+            late: None,
+            kept: None,
+            members: Vec::new(),
+            gap_21: false,
+            handed_failed: false,
+            deferred: None,
+            late_start: 0,
+            faulty_node,
+            faulty_acts: 0,
+            forged: Vec::new(),
+            mapped: BTreeSet::new(),
+            spared: BTreeSet::new(),
+        };
+        run.set_up_with(configure_idle);
+        run
+    }
+
     /// The message just written by `from` on a ring toward `to` is forged:
     /// noted, with `to`'s count of refusals.
     fn forged(&mut self, from: u16, to: u16) {
@@ -727,13 +775,17 @@ impl Run {
     }
 
     fn set_up(&mut self) {
+        self.set_up_with(true);
+    }
+
+    fn set_up_with(&mut self, configure_idle: bool) {
         let m = &mut self.m;
         // ARM64 and RISC-V: every core idles in a state that loses its
         // context (`node_idle`, D-143, D-146).
         let lossy = match m.sys.arch() {
-            Arch::Aarch64 => Some(dodos_abi::IDLE_METHOD_PSCI | 1 << 16 << 32),
-            Arch::Riscv64 => Some(dodos_abi::IDLE_METHOD_SBI | 0x8000_0000 << 32),
-            Arch::X86_64 => None,
+            Arch::Aarch64 if configure_idle => Some(dodos_abi::IDLE_METHOD_PSCI | 1 << 16 << 32),
+            Arch::Riscv64 if configure_idle => Some(dodos_abi::IDLE_METHOD_SBI | 0x8000_0000 << 32),
+            _ => None,
         };
         for node in 0..NODES {
             let cores: Vec<u64> = match node == WIDE {
@@ -792,6 +844,7 @@ impl Run {
             let map = map_call(&self.m, pair);
             let _ = self.call(pair.holder, map);
         }
+        self.m.settle();
     }
 
     /// The holder's receiver waits for up to four frames from `group`, and
@@ -2350,8 +2403,9 @@ fn combination(name: &str) -> [usize; 3] {
 }
 
 /// The focused runs of the combinations `missing` names, each until one
-/// of its seeds reaches it, side by side on the machine's cores; what they
-/// reached is added to `reach`.
+/// of its seeds reaches it (or, if none of the focused seeds does, its
+/// directed scenario `directed_combination`), side by side on the machine's
+/// cores; what they reached is added to `reach`.
 fn focus_missing(reach: &mut Reach, missing: &[String]) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let seens: Vec<Seen> = std::thread::scope(|scope| {
@@ -2370,14 +2424,18 @@ fn focus_missing(reach: &mut Reach, missing: &[String]) {
                             false => 0..3,
                         };
                         let rounds = arches.end - arches.start;
+                        let mut reached = false;
                         for k in 0..FOCUS_SEEDS {
                             let seed = 286 * (arches.start + k % rounds) + k / rounds;
                             let seen = focus(events, seed);
-                            let reached = reaches(&seen, name);
+                            reached = reaches(&seen, name);
                             seens.push(seen);
                             if reached {
                                 break;
                             }
+                        }
+                        if !reached {
+                            seens.push(directed_combination(events));
                         }
                     }
                     seens
@@ -2429,12 +2487,10 @@ fn reaches(seen: &Seen, name: &str) -> bool {
 const IMPOSSIBLE: &[(usize, usize)] = &[(RELEASE_PENDING, PRE_LIVE)];
 
 /// The combinations possible under the contract that neither the seeds of
-/// the long run nor their focused runs reach, as measured in pass 38, one
-/// per line: the long run asserts every other one. Each wants a resume, a
-/// release crossing a revocation or a release pending at the same instant
-/// as two other short states; they are left for directed scenarios. A
-/// list and not a count: a change that loses another fails, one that
-/// reaches one of these prints it, to be taken off.
+/// the long run nor their focused runs nor `directed_combination` reach,
+/// one per line (empty since pass 39, which reached all 45 remaining
+/// combinations via `directed_combination`): the long run asserts every
+/// combination not excluded by `IMPOSSIBLE`.
 const NOT_REACHED_YET: &str = include_str!("long_run_not_reached.txt");
 
 fn report(reach: &Reach) -> Vec<String> {
@@ -2666,8 +2722,823 @@ fn before_live_executes_the_first_threads_node_send_while_the_node_is_starting()
     let outcome = run.before_live(WIDE);
     assert_eq!(run.m.state(WIDE), MemberState::Starting);
     assert_eq!(outcome, Some(WAITS));
-    let produced = (0..NODES)
-        .filter(|&p| p != WIDE)
-        .any(|p| run.m.sys.canonical().rings[WIDE as usize][p as usize].user.produced > 0);
-    assert!(produced, "NodeSend wrote to a peer's user ring while WIDE was Starting");
+    let produced = (0..NODES).filter(|&p| p != WIDE).any(|p| {
+        run.m.sys.canonical().rings[WIDE as usize][p as usize]
+            .user
+            .produced
+            > 0
+    });
+    assert!(
+        produced,
+        "NodeSend wrote to a peer's user ring while WIDE was Starting"
+    );
+}
+
+/// A directed scenario for one combination `events` (Part C, pass 39):
+/// drives the three events to hold at the same moment using valid calls and
+/// events on the five-node machine, checking all invariants after every
+/// step, and then runs `liveness`.
+fn directed_combination(events: [usize; 3]) -> Seen {
+    let has = |e: usize| events.contains(&e);
+    let seed = if has(WAKE) { 286 } else { 0 };
+    let mut run = Run::new_with_idle(seed, false);
+    let all = events.iter().fold(0u32, |m, &e| m | 1 << e);
+    let pair0 = PAIRS[0]; // granter 0, holder 2 (1 frame, io)
+    let pair1 = PAIRS[1]; // granter 3, holder 4 (32 frames, aspace)
+
+    // 1. If FAILED_UNIT is wanted, break the IOMMU unit and drive an attach
+    // or unmap to the timeout so the role word reads failed.
+    if has(FAILED_UNIT) {
+        run.m.sys.break_unit(IOMMU_ROLE);
+        let _ = run.call(2, Syscall::IoSpaceUnmap(s(pair0.got)));
+        run.run(2 * dodos_abi::IOMMU_WAIT_NS + 60 * MS);
+        assert!(run.m.sys.role(IOMMU_ROLE).failed());
+    }
+
+    // 2. If GIVEN is wanted, node 1 takes a free chunk and gives it to node 3.
+    if has(GIVEN) {
+        let table = run.m.sys.canonical();
+        let shift = table.geometry.chunk_shift();
+        let free = Ownership::free(Owner::Unclaimed).raw();
+        let chunk = table
+            .owners
+            .iter()
+            .position(|&w| w == free)
+            .expect("a free chunk");
+        assert_eq!(
+            run.call(
+                1,
+                super::pass22::take(0, (chunk as u64) << shift, u64::from(shift), BLOCK)
+            ),
+            Some(DONE)
+        );
+        let give = Syscall::MemoryGive {
+            control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),
+            untyped: s(BLOCK),
+            node: 3,
+        };
+        assert_eq!(run.call(1, give), Some(DONE));
+        assert!(probe(&run.m, run.splittable) & (1 << GIVEN) != 0);
+    }
+
+    // 2b. If MID_ATTACH is wanted, detach node 2's device (0x10) now and settle
+    // so step 15 can launch an attach that stays in `unit_requests` at the
+    // snapshot instant.
+    if has(MID_ATTACH) {
+        let detach = attach_call(&run.m, 2, 0x10, false);
+        let _ = run.call(2, detach);
+        run.m.settle();
+    }
+    if has(CROSSING) && has(PRE_LIVE) {
+        let _ = run.call(pair0.holder, Syscall::IoSpaceUnmap(s(pair0.got)));
+        run.m.settle();
+        let aspace_map = Syscall::ASpaceMap(crate::Map {
+            space: s(dodos_abi::START_SLOT_ASPACE),
+            frame: s(pair0.got),
+            untyped: SlotAddr::NONE,
+            address: 0x1000_0000,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        });
+        assert_eq!(run.call(pair0.holder, aspace_map), Some(DONE));
+    }
+
+    // 3. If PRE_LIVE is wanted, kill WIDE (node 4) and wait until it is Dead
+    // and settled (`SETTLE_NS`) so any accusation or seal in later steps is
+    // not blocked by single-death grace.
+    if has(PRE_LIVE) {
+        assert_eq!(run.call(1, kill(WIDE)), Some(DONE));
+        let end = run.m.sys.now() + 60 * MS;
+        while run.m.sys.now() < end && run.m.state(WIDE) != MemberState::Dead {
+            run.run_by(MS, 200_000);
+        }
+        assert_eq!(run.m.state(WIDE), MemberState::Dead);
+        let settle_end = run.m.sys.now() + dodos_abi::SETTLE_NS + 5 * MS;
+        while run.m.sys.now() < settle_end {
+            run.run_by(2 * MS, 500_000);
+        }
+    }
+
+    // 4. If FRESH (without PRE_LIVE) is wanted, pick a node to kill and start
+    // fresh later at the instant of the snapshot.
+    let fresh_node = if has(FRESH) && !has(PRE_LIVE) {
+        let n = if has(HAND_DEATH) { 0 } else { 1 };
+        let actor = if n == 1 { 3 } else { 1 };
+        assert_eq!(run.call(actor, kill(n)), Some(DONE));
+        let end = run.m.sys.now() + 60 * MS;
+        while run.m.sys.now() < end && run.m.state(n) != MemberState::Dead {
+            run.run_by(MS, 200_000);
+        }
+        assert_eq!(run.m.state(n), MemberState::Dead);
+        let settle_end = run.m.sys.now() + dodos_abi::SETTLE_NS + 5 * MS;
+        while run.m.sys.now() < settle_end {
+            run.run_by(2 * MS, 500_000);
+        }
+        Some(n)
+    } else {
+        None
+    };
+
+    // 5. Long-lasting accusations (UNFENCED, SEAL_LATE, STALE, STUCK).
+    if has(UNFENCED) {
+        run.m.sys.set_vmx(0, true);
+        run.hang(0, false);
+        let table = run.m.sys.canonical();
+        let wait = table.stale_ns + 2 * table.sweep_ns + dodos_abi::FENCE_NS + 50 * MS;
+        let end = run.m.sys.now() + wait;
+        while run.m.sys.now() < end && run.m.state(0) != MemberState::Unfenced {
+            run.run_by(2 * MS, 500_000);
+        }
+        assert_eq!(run.m.state(0), MemberState::Unfenced);
+    }
+    if has(SEAL_LATE) {
+        let victim = if has(PRE_LIVE) || fresh_node == Some(4) {
+            1
+        } else {
+            0
+        };
+        let actor = if victim == 0 { 1 } else { 0 };
+        assert_eq!(run.call(actor, seal(victim)), Some(DONE));
+        let table = run.m.sys.canonical();
+        let end = run.m.sys.now() + table.seal_ns + 2 * table.sweep_ns + 50 * MS;
+        while run.m.sys.now() < end && !accused(run.m.state(victim)) {
+            run.run_by(2 * MS, 500_000);
+        }
+        assert!(accused(run.m.state(victim)));
+    }
+    if has(STALE) {
+        let victim = if has(PRE_LIVE) || fresh_node == Some(4) {
+            1
+        } else {
+            0
+        };
+        run.hang(victim, true);
+        let table = run.m.sys.canonical();
+        let end = run.m.sys.now() + table.stale_ns + 2 * table.sweep_ns + 50 * MS;
+        while run.m.sys.now() < end && !accused(run.m.state(victim)) {
+            run.run_by(2 * MS, 500_000);
+        }
+        assert!(accused(run.m.state(victim)));
+    }
+    if has(STUCK) {
+        let victim = 0;
+        let _ = run.call(
+            victim,
+            Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)),
+        );
+        run.hang(victim, false);
+        let send = Syscall::NodeSend {
+            node: node_cap(victim),
+            message: Message::default(),
+            doorbell: SlotAddr::NONE,
+        };
+        let _ = run.call(3, send);
+        let table = run.m.sys.canonical();
+        let end = run.m.sys.now() + table.stuck_ns + 2 * table.sweep_ns + 50 * MS;
+        while run.m.sys.now() < end && !accused(run.m.state(victim)) {
+            run.run_by(2 * MS, 500_000);
+        }
+        assert!(accused(run.m.state(victim)));
+    }
+
+    // 5b. If UNANSWERED is wanted, delete the frame first and wait for the
+    // delete and its Release to finish so the slot is free to be re-granted
+    // in step 8d without waking the holder's thread during a seal.
+    let unanswered_pair = if has(UNANSWERED) {
+        let u_pair = if has(PRE_LIVE) || fresh_node == Some(4) || has(HANDING) || has(HAND_DEATH) {
+            pair0
+        } else {
+            pair1
+        };
+        let _ = run.call(u_pair.holder, Syscall::CapDelete(s(u_pair.got)));
+        run.m.settle();
+        assert!(run.m.step_until(|m| {
+            m.sys.canonical().beacons[u_pair.granter as usize].consumed[u_pair.holder as usize].0
+                == m.sys.canonical().rings[u_pair.holder as usize][u_pair.granter as usize]
+                    .kernel
+                    .produced
+        }));
+        Some(u_pair)
+    } else {
+        None
+    };
+
+    // 6. If RESUME is wanted, pick a node to seal now so it is ready in
+    // `MemberState::Sealed` to be resumed at the snapshot instant.
+    let resume_node = if has(RESUME) {
+        // Choose a node that is live and not needed by another role.
+        let holder = run.m.sys.role(IOMMU_ROLE).holder();
+        let ioapic_holder = run.m.sys.role(super::units::IOAPIC_ROLE).holder();
+        let candidate = [2, 1, 3, 4, 0]
+            .into_iter()
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && (!has(RELEASE_PENDING) || (n != 3 && n != 4))
+                    && (!has(PRE_LIVE) || n != WIDE)
+                    && Some(n) != fresh_node
+                    && (!has(HANDING)
+                        && !has(HAND_DEATH)
+                        && !has(MID_ATTACH)
+                        && !has(DETACHED)
+                        && !(has(CROSSING) && has(PRE_LIVE))
+                        || n != holder)
+                    && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+                    && (!(has(CROSSING) && (has(RELEASE_PENDING) || has(PRE_LIVE)))
+                        || (n != 0 && n != 2))
+                    && (!(has(SIGNAL_PENDING) && (has(PRE_LIVE) || has(RELEASE_PENDING)))
+                        || (n != 0 && n != 2))
+                    && (!(has(REVOKING) && has(PRE_LIVE)) || (n != 0 && n != 2))
+                    && (unanswered_pair
+                        .map(|p| (p.granter, p.holder))
+                        .is_none_or(|(g, h)| n != g && n != h))
+                    && (!(has(FAILED_UNIT) && (has(HANDING) || has(HAND_DEATH))) || n != 0)
+                    && (!has(LINE) || (n != ioapic_holder && n != 1))
+            })
+            .expect("a node to seal and resume");
+        let actor = [1, 3, 4, 2, 0]
+            .into_iter()
+            .find(|&a| {
+                a != candidate && run.m.state(a) == MemberState::Live && (!has(LINE) || a != 1)
+            })
+            .expect("an actor to seal");
+        assert_eq!(run.call(actor, seal(candidate)), Some(DONE));
+        assert!(run.m.step_until(|m| {
+            m.state(candidate) == MemberState::Sealed
+                && m.sys.node(actor).park_confirmed(candidate as usize)
+        }));
+        Some(candidate)
+    } else {
+        None
+    };
+
+    // 7. If SEALED is wanted (alongside RESUME), seal another node (or node 0).
+    if has(SEALED) {
+        let extra = (0..NODES)
+            .find(|&n| {
+                Some(n) != resume_node
+                    && run.m.state(n) == MemberState::Live
+                    && (!has(CROSSING) || (n != 3 && n != 4))
+            })
+            .expect("a node to keep sealed");
+        let actor = (0..NODES)
+            .find(|&a| a != extra && run.m.state(a) == MemberState::Live)
+            .expect("an actor");
+        assert_eq!(run.call(actor, seal(extra)), Some(DONE));
+        assert!(run.m.step_until(|m| {
+            m.state(extra) == MemberState::Sealed
+                && m.sys.node(actor).park_confirmed(extra as usize)
+        }));
+    }
+
+    // 8a-2. If HANDING, HAND_DEATH, or LINE is wanted, ensure the unit roles
+    // are Held and not rebuilding, and any seal actor's park confirmation has
+    // finished so its thread is runnable.
+    if has(HANDING) || has(HAND_DEATH) || has(LINE) {
+        let ioapic = super::units::IOAPIC_ROLE;
+        run.m.settle();
+        assert!(run.m.step_until(|m| {
+            let w = m.sys.role(IOMMU_ROLE);
+            let iw = m.sys.role(ioapic);
+            w.state() == RoleState::Held
+                && !m.sys.node(w.holder()).rebuilds.contains_key(&IOMMU_ROLE)
+                && !m.sys.node(w.holder()).handing.contains_key(&IOMMU_ROLE)
+                && iw.state() == RoleState::Held
+                && !m.sys.node(iw.holder()).rebuilds.contains_key(&ioapic)
+                && !m.sys.node(iw.holder()).handing.contains_key(&ioapic)
+                && (0..NODES).all(|n| {
+                    m.state(n) != MemberState::Live
+                        || m.sys.node(n).runnable().contains(&m.t[n as usize])
+                })
+        }));
+    }
+
+    // 8a-3. If LINE is wanted, claim GSI 5 on a live liner and step until
+    // `UnitOp::Redirection` is in `unit_requests` (`probe` has `LINE` set)
+    // before step 9c (`RELEASE_PENDING`) runs synchronously on node 4.
+    if has(LINE) {
+        let ioapic_holder = run.m.sys.role(super::units::IOAPIC_ROLE).holder();
+        let liner = LINERS
+            .into_iter()
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live && Some(n) != resume_node && n != ioapic_holder
+            })
+            .expect("a liner that does not hold IOAPIC_ROLE");
+        let claim = Syscall::IrqClaim {
+            control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+            source: IrqSource::line(GSI, false, false).raw(),
+            core: u64::from(liner),
+            vector: 48,
+            destination: s(IRQ),
+        };
+        assert_eq!(run.m.call(liner, claim), WAITS);
+        let splittable = run.splittable;
+        assert!(
+            run.m
+                .step_until(|m| probe(m, splittable) & (1 << LINE) != 0)
+        );
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(probe(&run.m, run.splittable) & (1 << LINE) != 0);
+    }
+
+    // 8b. Now start WIDE fresh with core 5's second-core start held back if
+    // PRE_LIVE is wanted. On x86_64 (`seed == 0`), core 5 is in `Hardware::Stub`
+    // and `set_window(5)` drops the first start IPI; on ARM64 (`seed == 286`,
+    // when `WAKE` is also wanted), core 5 is `Hardware::PoweredOff` and we step
+    // actions while holding back `HwAction::Start { core: 5 }`.
+    if has(PRE_LIVE) {
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != WIDE
+                    && run.m.state(a) == MemberState::Live
+                    && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+            })
+            .expect("an actor to start WIDE fresh");
+        let second = (WIDE + 1) as usize;
+        let is_x86 = run.m.sys.arch() == Arch::X86_64;
+        if is_x86 {
+            run.m.sys.set_window(second);
+        }
+        assert_eq!(run.call(actor, fresh(WIDE, 0b11 << WIDE)), Some(DONE));
+        let built = |m: &S| {
+            let member = m.sys.member(WIDE);
+            member.state() == MemberState::Starting
+                && m.sys.has(WIDE)
+                && m.sys.node(WIDE).generation_built() == member.generation()
+                && m.sys.node(WIDE).is_ready()
+        };
+        if is_x86 {
+            assert!(run.m.step_until(built));
+        } else {
+            for _ in 0..10_000 {
+                if built(&run.m) {
+                    break;
+                }
+                let next = run.m.sys.events().into_iter().find(|e| {
+                    let crate::system::Event::Action(i) = *e else {
+                        return true;
+                    };
+                    run.m.sys.actions()[i].1 != crate::nodes::HwAction::Start { core: second }
+                });
+                let Some(ev) = next else {
+                    break;
+                };
+                run.m.sys.fire(ev);
+                assert_eq!(run.m.sys.check(), Ok(()));
+            }
+            assert!(built(&run.m));
+        }
+        run.m.restarted(WIDE);
+        let _ = run.before_live(WIDE);
+        assert!(probe(&run.m, run.splittable) & (1 << PRE_LIVE) != 0);
+    }
+
+    // 9. If HANDING or HAND_DEATH is wanted:
+    let hand_death_target = if has(HANDING) || has(HAND_DEATH) {
+        let holder = run.m.sys.role(IOMMU_ROLE).holder();
+        if has(FAILED_UNIT) {
+            // A failed unit's role cannot be handed by `role_hand` (`busy`),
+            // only by a seal (`hand_all_units`, D-145).
+            let actor = (0..NODES)
+                .find(|&a| {
+                    a != holder
+                        && run.m.state(a) == MemberState::Live
+                        && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+                })
+                .expect("an actor to seal holder of failed unit");
+            assert_eq!(run.call(actor, seal(holder)), Some(DONE));
+            assert!(
+                run.m
+                    .step_until(|m| m.sys.role(IOMMU_ROLE).state() == RoleState::Handing)
+            );
+            let target = run.m.sys.role(IOMMU_ROLE).target();
+            has(HAND_DEATH).then_some((holder, target))
+        } else {
+            let best = dodos_abi::best_class(&run.m.sys.canonical().members).unwrap_or(0);
+            let target = (0..NODES)
+                .find(|&n| {
+                    n != holder
+                        && run.m.state(n) == MemberState::Live
+                        && run.m.sys.member(n).class() >= best
+                        && Some(n) != resume_node
+                        && (!has(PRE_LIVE) || n != WIDE)
+                        && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+                        && (unanswered_pair.map(|p| p.holder) != Some(n))
+                })
+                .expect("a target for RoleHand");
+            let t = run.m.t[holder as usize];
+            let roles = slots_of(run.m.sys.node(holder), t, ObjectKind::Role);
+            let hand = Syscall::RoleHand {
+                role: s(roles[IOMMU_ROLE]),
+                node: node_cap(target),
+            };
+            assert_eq!(run.call(holder, hand), Some(WAITS));
+            assert!(
+                run.m
+                    .step_until(|m| m.sys.role(IOMMU_ROLE).state() == RoleState::Handing)
+            );
+            has(HAND_DEATH).then_some((holder, target))
+        }
+    } else {
+        None
+    };
+
+    // 9b. Complete UNANSWERED by posting the new grant without stepping the
+    // receiver's ring service.
+    if let Some(u_pair) = unanswered_pair {
+        assert!(run.receive(u_pair, 0));
+        run.send(u_pair, 0);
+        assert!(probe(&run.m, run.splittable) & (1 << UNANSWERED) != 0);
+    }
+
+    // 9c. If RELEASE_PENDING is wanted, release all 32 frames of pair 1
+    // (node 4 -> node 3) at once so ring 4 -> 3 has 30 Releases and 2
+    // use entries keep `release_pending = true`. If CROSSING is also wanted,
+    // first revoke frame 0 on granter 3 while holder 4 still maps it so that
+    // the grant is `Revoking`, then delete all 32 frames on holder 4 so
+    // frame 0's Release crosses its Revoke while `release_pending` holds.
+    if has(RELEASE_PENDING) {
+        if has(CROSSING) {
+            let _ = run.call(pair1.granter, Syscall::CapRevoke(s(pair1.obj)));
+        }
+        for i in (0..pair1.frames).rev() {
+            let _ = run.call(pair1.holder, Syscall::CapDelete(s(pair1.got + i)));
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << RELEASE_PENDING) != 0);
+        if has(CROSSING) {
+            assert!(probe(&run.m, run.splittable) & (1 << CROSSING) != 0);
+        }
+    }
+
+    // 10. If SIGNAL_PENDING is wanted, flood the user ring of a live grant pair
+    // with `GrantSignal` calls until `signal_pending` is set on the use entry.
+    if has(SIGNAL_PENDING) {
+        let sig_pair = if !has(PRE_LIVE) && !has(RELEASE_PENDING) && fresh_node != Some(4) {
+            pair1
+        } else {
+            pair0
+        };
+        let slot = sig_pair.got;
+        let holder = sig_pair.holder;
+        for _ in 0..70 {
+            if run.call(holder, Syscall::GrantSignal(s(slot))) != Some(DONE) {
+                break;
+            }
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << SIGNAL_PENDING) != 0);
+    }
+
+    // 12. If REVOKING (or CROSSING without RELEASE_PENDING) is wanted:
+    if has(CROSSING) && !has(RELEASE_PENDING) {
+        let c_pair = if has(PRE_LIVE)
+            || fresh_node == Some(4)
+            || resume_node == Some(3)
+            || resume_node == Some(4)
+        {
+            pair0
+        } else {
+            pair1
+        };
+        let rev = run.call(c_pair.granter, Syscall::CapRevoke(s(c_pair.obj)));
+        let del = run.call(c_pair.holder, Syscall::CapDelete(s(c_pair.got)));
+        assert!(
+            probe(&run.m, run.splittable) & (1 << CROSSING) != 0,
+            "CROSSING failed on c_pair=({}, {}): rev={rev:?}, del={del:?}, grant={:?}",
+            c_pair.granter,
+            c_pair.holder,
+            run.m.sys.canonical().grants[c_pair.granter as usize]
+        );
+    } else if has(REVOKING) {
+        let r_pair = if has(PRE_LIVE)
+            || fresh_node == Some(4)
+            || resume_node == Some(3)
+            || resume_node == Some(4)
+        {
+            pair0
+        } else {
+            pair1
+        };
+        let _ = run.call(r_pair.granter, Syscall::CapRevoke(s(r_pair.obj)));
+        assert!(probe(&run.m, run.splittable) & (1 << REVOKING) != 0);
+    }
+
+    // 13. Short accusations: KILLED, SELF, RETIRED.
+    if has(KILLED) && !has(HAND_DEATH) {
+        let victim = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(RELEASE_PENDING) || (n != 3 && n != 4))
+                    && (!has(PRE_LIVE) || n != WIDE)
+                    && (!has(MID_ATTACH) && !has(DETACHED)
+                        || (n != run.m.sys.role(IOMMU_ROLE).holder() && n != 2))
+            })
+            .expect("a victim to kill");
+        let actor = (0..NODES)
+            .find(|&a| a != victim && run.m.state(a) == MemberState::Live)
+            .expect("an actor");
+        assert_eq!(run.call(actor, kill(victim)), Some(DONE));
+    }
+    if has(SELF) && !has(HAND_DEATH) {
+        let victim = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(RELEASE_PENDING) || (n != 3 && n != 4))
+                    && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+            })
+            .expect("a victim to fail");
+        run.m.fail(victim);
+        assert!(run.m.step_until(|m| accused(m.state(victim))));
+    }
+    if has(RETIRED) {
+        let victim = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(CROSSING) || (n != 3 && n != 4))
+                    && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+            })
+            .expect("a victim to retire");
+        let actor = (0..NODES)
+            .find(|&a| a != victim && run.m.state(a) == MemberState::Live)
+            .expect("an actor");
+        let retire = Syscall::NodeStop {
+            node: node_cap(victim),
+            mode: NODE_STOP_RETIRE,
+            core: u64::from(victim),
+        };
+        assert_eq!(run.call(actor, retire), Some(DONE));
+    }
+
+    // 14. If DETACHED is wanted, detach a device on a live node that is not the
+    // IOMMU role holder so its unit request is in flight (`detaching` non-empty).
+    if has(DETACHED) {
+        let (dev_node, dev_id) = DEVICES
+            .into_iter()
+            .find(|&(n, _)| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(PRE_LIVE) || n != WIDE)
+            })
+            .expect("a device node to detach");
+        let call = attach_call(&run.m, dev_node, dev_id, false);
+        assert_eq!(run.m.call(dev_node, call), WAITS);
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(probe(&run.m, run.splittable) & (1 << DETACHED) != 0);
+    }
+
+    // 15. If MID_ATTACH is wanted, start an attach on a live node other than
+    // the IOMMU role holder so `UnitOp::Attach` is in `unit_requests`.
+    if has(MID_ATTACH) {
+        let (dev_node, dev_id) = DEVICES
+            .into_iter()
+            .find(|&(n, _)| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(PRE_LIVE) || n != WIDE)
+            })
+            .unwrap_or((4, 0x11));
+        let call = attach_call(&run.m, dev_node, dev_id, true);
+        assert_eq!(run.m.call(dev_node, call), WAITS);
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(probe(&run.m, run.splittable) & (1 << MID_ATTACH) != 0);
+    }
+
+    // 17. If WAKE is wanted (on Arch::Aarch64), put a live node's core to sleep
+    // by configuring its lossy idle state, suspending its first thread, and
+    // firing `Event::Sleep`, then rouse it.
+    if has(WAKE) {
+        let sleeper = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(PRE_LIVE) || n != WIDE)
+                    && (!has(RELEASE_PENDING) || n != 4)
+                    && (0..NODES).all(|from| {
+                        let pair = &run.m.sys.canonical().rings[from as usize][n as usize];
+                        let c = run.m.sys.canonical().beacons[n as usize].consumed[from as usize];
+                        c.0 == pair.kernel.produced && c.1 == pair.user.produced
+                    })
+            })
+            .expect("a sleeper node");
+        let lossy = dodos_abi::IDLE_METHOD_PSCI | 1 << 16 << 32;
+        let idle = Syscall::NodeIdle {
+            node: node_cap(sleeper),
+            core: u64::from(sleeper),
+            words: vec![200, 100, lossy, dodos_abi::IDLE_FLAG_LOSES_CONTEXT],
+        };
+        assert_eq!(run.call(sleeper, idle), Some(DONE));
+        let _ = run.call(
+            sleeper,
+            Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)),
+        );
+        loop {
+            let ipi = crate::system::Event::Ipi {
+                node: sleeper,
+                core: 0,
+            };
+            let timer = crate::system::Event::Timer {
+                node: sleeper,
+                core: 0,
+            };
+            let evs = run.m.sys.events();
+            if evs.contains(&ipi) {
+                run.m.sys.fire(ipi);
+                assert_eq!(run.m.sys.check(), Ok(()));
+                run.note();
+            } else if evs.contains(&timer) {
+                run.m.sys.fire(timer);
+                assert_eq!(run.m.sys.check(), Ok(()));
+                run.note();
+            } else {
+                break;
+            }
+        }
+        let core = sleeper as usize;
+        assert!(
+            run.m
+                .sys
+                .events()
+                .contains(&crate::system::Event::Sleep { core })
+        );
+        run.m.sys.fire(crate::system::Event::Sleep { core });
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(
+            run.m
+                .sys
+                .events()
+                .contains(&crate::system::Event::PowerDown { core })
+        );
+        run.m.sys.fire(crate::system::Event::PowerDown { core });
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != sleeper && run.m.state(a) == MemberState::Live && Some(a) != resume_node
+            })
+            .expect("an actor to rouse sleeper");
+        let send = Syscall::NodeSend {
+            node: node_cap(sleeper),
+            message: Message::default(),
+            doorbell: SlotAddr::NONE,
+        };
+        let _ = run.call(actor, send);
+        for (i, &(_, act)) in run.m.sys.actions().iter().enumerate() {
+            if matches!(act, crate::nodes::HwAction::Ring { node } if node == sleeper) {
+                run.m.sys.fire(crate::system::Event::Action(i));
+                assert_eq!(run.m.sys.check(), Ok(()));
+                run.note();
+                break;
+            }
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << WAKE) != 0);
+    }
+
+    // 17b. Trigger HAND_DEATH if pending.
+    if let Some((holder, target)) = hand_death_target {
+        let victim = if Some(target) == resume_node
+            || unanswered_pair.is_some_and(|p| target == p.granter || target == p.holder)
+            || (has(RELEASE_PENDING) && (target == 3 || target == 4))
+        {
+            holder
+        } else {
+            target
+        };
+        if has(SELF) {
+            run.m.fail(victim);
+            assert!(run.m.step_until(|m| accused(m.state(victim))));
+        } else {
+            let actor = (0..NODES)
+                .find(|&a| {
+                    a != victim
+                        && run.m.state(a) == MemberState::Live
+                        && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+                })
+                .unwrap_or(if victim == target { holder } else { target });
+            let _ = run.call(actor, kill(victim));
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << HAND_DEATH) != 0);
+    }
+
+    // 18. Trigger FRESH if pending.
+    if let Some(n) = fresh_node {
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != n
+                    && run.m.state(a) == MemberState::Live
+                    && Some(a) != resume_node
+                    && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+            })
+            .expect("an actor to start fresh");
+        let mask = if n == WIDE { 0b11 << n } else { 1 << n };
+        assert_eq!(run.call(actor, fresh(n, mask)), Some(DONE));
+        assert!(probe(&run.m, run.splittable) & (1 << FRESH) != 0);
+    }
+
+    // 19. Trigger RESUME if pending.
+    if let Some(n) = resume_node {
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != n
+                    && run.m.state(a) == MemberState::Live
+                    && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+            })
+            .expect("an actor to resume");
+        assert_eq!(run.call(actor, resume(n)), Some(DONE));
+        assert!(probe(&run.m, run.splittable) & (1 << RESUME) != 0);
+    }
+
+    run.note();
+    let mask = probe(&run.m, run.splittable);
+    assert_eq!(
+        mask & all,
+        all,
+        "directed_combination({events:?}) did not have all bits set at once: mask={mask:#x}, wanted={all:#x}"
+    );
+    run.liveness(seed);
+    run.seen
+}
+
+#[test]
+#[ignore = "long: run with --release"]
+fn directed_combinations_reach_all_45() {
+    let list = [
+        "pair + unfenced + release pending",
+        "pair + release crossing revoke + release pending",
+        "pair + release pending + wake from sleep",
+        "resume + accused self + holder's death mid-hand",
+        "resume + accused stale + release pending",
+        "resume + accused stale + first thread before live",
+        "resume + accused stuck + release pending",
+        "resume + accused retire + release crossing revoke",
+        "resume + accused seal + holder's death mid-hand",
+        "resume + accused seal + release crossing revoke",
+        "resume + unfenced + release crossing revoke",
+        "resume + unfenced + release pending",
+        "resume + sealed + release crossing revoke",
+        "resume + fresh start + holder's death mid-hand",
+        "resume + fresh start + release crossing revoke",
+        "resume + fresh start + wake from sleep",
+        "resume + failed unit + holder's death mid-hand",
+        "resume + role handing + release crossing revoke",
+        "resume + role handing + first thread before live",
+        "resume + holder's death mid-hand + grant unanswered",
+        "resume + holder's death mid-hand + release crossing revoke",
+        "resume + holder's death mid-hand + release pending",
+        "resume + holder's death mid-hand + mid-attach",
+        "resume + holder's death mid-hand + first thread before live",
+        "resume + grant unanswered + first thread before live",
+        "resume + revoking + first thread before live",
+        "resume + release crossing revoke + release pending",
+        "resume + release crossing revoke + chunk given",
+        "resume + release crossing revoke + mid-attach",
+        "resume + release crossing revoke + wake from sleep",
+        "resume + release crossing revoke + first thread before live",
+        "resume + release pending + signal pending",
+        "resume + release pending + mid-attach",
+        "resume + release pending + line moving",
+        "resume + release pending + wake from sleep",
+        "resume + signal pending + mid-attach",
+        "resume + signal pending + first thread before live",
+        "resume + device detached + first thread before live",
+        "resume + mid-attach + first thread before live",
+        "resume + wake from sleep + first thread before live",
+        "death + release crossing revoke + release pending",
+        "death + release pending + signal pending",
+        "death + release pending + wake from sleep",
+        "death + signal pending + first thread before live",
+        "death + mid-attach + first thread before live",
+    ];
+    for name in list {
+        let events = combination(name);
+        let seen = directed_combination(events);
+        assert!(
+            reaches(&seen, name),
+            "directed scenario did not record {name}"
+        );
+    }
+}
+
+#[test]
+fn directed_combinations_sample() {
+    for name in [
+        "pair + release crossing revoke + release pending",
+        "resume + release pending + line moving",
+        "resume + release crossing revoke + first thread before live",
+        "resume + failed unit + holder's death mid-hand",
+        "resume + fresh start + wake from sleep",
+        "resume + wake from sleep + first thread before live",
+    ] {
+        let events = combination(name);
+        let seen = directed_combination(events);
+        assert!(
+            reaches(&seen, name),
+            "directed scenario did not record {name}"
+        );
+    }
 }

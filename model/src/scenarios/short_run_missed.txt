@@ -3,6 +3,7 @@ pair + accused kill + revoking
 pair + accused kill + release crossing revoke
 pair + accused kill + release pending
 pair + accused kill + signal pending
+pair + accused kill + mid-attach
 pair + accused kill + first thread before live
 pair + accused self + accused retire
 pair + accused self + holder's death mid-hand
@@ -240,7 +241,6 @@ resume + sealed + role handing
 resume + sealed + holder's death mid-hand
 resume + sealed + grant unanswered
 resume + sealed + revoking
-resume + sealed + release
 resume + sealed + release crossing revoke
 resume + sealed + release pending
 resume + sealed + signal pending

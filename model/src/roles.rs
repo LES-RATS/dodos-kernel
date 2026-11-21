@@ -917,7 +917,9 @@ impl Model {
         next: u64,
         items: Vec<Item>,
     ) {
-        let Some((index, serial)) = credit else { return };
+        let Some((index, serial)) = credit else {
+            return;
+        };
         let Some(taken) = self.take_credit(from, index) else {
             return;
         };
