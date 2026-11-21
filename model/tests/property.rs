@@ -402,6 +402,9 @@ struct Plan {
     /// In each capability space, the slot of an endpoint on which a thread
     /// began to wait for a message of four capabilities.
     listening: BTreeMap<ObjId, u32>,
+    /// The capability spaces in which `listen` asked for a fresh `cspace`
+    /// that `speak` makes and moves into a range in a space as deep as it.
+    roots: BTreeSet<ObjId>,
 }
 
 enum Wanted {
@@ -1494,25 +1497,89 @@ impl Generator<'_> {
         // space whose root capability `speak` may move there: the depths
         // refuse that move (8.6; the final review's H6: only the directed
         // case reached a refused send).
+        let mut calls = Vec::new();
         let range = match self.rng.chance(40) {
-            true => Range {
-                first: self.inside(SPARE),
-                count: 1,
-            },
+            true => {
+                // A fresh `cspace`, as deep as the spaces made from the same
+                // untyped, for `speak` to move into the range: the depths
+                // refuse it at delivery (pass 36: R-5 of the review of pass
+                // 32; a send refused by the depths at random read 0).
+                match self.deep_slot().filter(|_| self.whole(MEMORY)) {
+                    Some(first) => {
+                        plan.roots.insert(space);
+                        Range { first, count: 1 }
+                    }
+                    None => Range {
+                        first: self.inside(SPARE),
+                        count: 1,
+                    },
+                }
+            }
             false => Range { first, count: 4 },
         };
-        vec![Syscall::Recv {
+        calls.push(Syscall::Recv {
             endpoint: own(endpoint),
             reply: own(reply),
             range,
             wait: 0,
-        }]
+        });
+        calls
+    }
+
+    /// An empty slot of a `cspace` held in this space at a slot of its
+    /// class: a range there is in a space whose root is as deep as a
+    /// `cspace` made from the same untyped (most come from `MEMORY`).
+    fn deep_slot(&mut self) -> Option<SlotAddr> {
+        let spaces: Vec<u32> = (0..8).map(|_| self.class_slot(CSPACE)).collect();
+        let via = spaces.into_iter().find(|&via| {
+            self.inspect(own(via))
+                .is_some_and(|(kind, _)| kind == ObjectKind::CSpace)
+        })?;
+        let slots: Vec<u32> = (0..8).map(|_| self.class_slot(SPARE)).collect();
+        let index = slots
+            .into_iter()
+            .find(|&index| !self.full(SlotAddr::through(via, index)))?;
+        Some(SlotAddr::through(via, index))
     }
 
     /// A message of four capabilities for the thread that `listen` made
     /// wait in this capability space, if there is one.
     fn speak(&mut self, plan: &mut Plan) -> Option<Syscall> {
-        let endpoint = plan.listening.remove(&self.space?)?;
+        let space = self.space?;
+        let &endpoint = plan.listening.get(&space)?;
+        // The fresh `cspace` of `listen`, moved by a `send` only once a
+        // receiver waits on the endpoint and this thread can send one
+        // capability (a copy of the endpoint's, tried on a copy of the
+        // state, is delivered): before, most such moves found no
+        // receiver or a sender with no message page.
+        if plan.roots.contains(&space) {
+            let probe = Syscall::Send {
+                target: own(endpoint),
+                message: Message {
+                    caps: vec![Transfer::Derive(own(endpoint), 0)],
+                    ..Message::default()
+                },
+            };
+            let fits =
+                self.model.clone().apply(self.thread, probe) == Ok(Output::Sent { flags: 0 });
+            let fresh = self.find_own(CSPACE, Wanted::Free);
+            let (true, Some(root)) = (fits, fresh) else {
+                return None;
+            };
+            plan.listening.remove(&space);
+            plan.roots.remove(&space);
+            // The `cspace` made now, moved at this thread's next call.
+            let send = Syscall::Send {
+                target: own(endpoint),
+                message: Message {
+                    caps: vec![Transfer::Move(own(root))],
+                    ..Message::default()
+                },
+            };
+            plan.scripts.insert(self.thread, VecDeque::from([send]));
+            return Some(retype(ObjectKind::CSpace, 128, own(root)));
+        }
+        plan.listening.remove(&space);
         let caps = match self.rng.chance(40) {
             true => vec![Transfer::Move(self.bound())],
             false => self.four(),
@@ -2105,12 +2172,16 @@ fn at_risk(model: &Model, thread: ObjId, call: &Syscall) -> Option<Risk> {
             })
         }
         Syscall::Send { target, message } => {
+            // In place of the move, a copy of the capability sent to, which
+            // every space that sends holds (a space a script made has no
+            // thread capability in its start-up slot: pass 36, the refused
+            // sends of those spaces were never counted).
             let mut derived = message.clone();
             let mut found = None;
             for transfer in &mut derived.caps {
                 if let Transfer::Move(slot) = *transfer {
                     found = found.or(kind(slot));
-                    *transfer = Transfer::Derive(ordinary, Rights::NONE.bits());
+                    *transfer = Transfer::Derive(*target, Rights::NONE.bits());
                 }
             }
             let derived = Syscall::Send {
@@ -2979,6 +3050,15 @@ fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     at_least(reached.moved, [2893, 63]);
     at_least(reached.refused, [51, 10]);
     at_least([reached.sent, reached.stayed], [2, 44]);
+    // Pass 36 (R-5 of the review of pass 32, second half): a `send` whose
+    // move the depths refuse at delivery, reached at random again (2, 2
+    // and 5 on the three page sizes). `at_risk` judged "refused only by the
+    // depths" with a copy of the thread capability, which no space a
+    // script made holds, so those spaces' refusals were never counted (0
+    // without that change); and `listen` asks for a range in a `cspace`
+    // held here, where `speak` moves a fresh `cspace` once a receiver
+    // waits (1 of the 2 without it).
+    at_least([reached.sent_refused], [1]);
     // The same moves listed by `call` and by `reply_recv`: 39 and 18.
     at_least([reached.called, reached.answered], [18, 6]);
 }
