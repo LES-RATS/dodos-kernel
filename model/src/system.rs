@@ -132,13 +132,13 @@ pub struct System {
     /// of that kernel's own state against it, only the machine's: what it
     /// can do to the others.
     pub(crate) faulty: std::collections::BTreeSet<u16>,
-    /// The grant entries (granter, grant, serial) for which the holder's
-    /// kernel wrote a `Release` while its use entry still counted a leaf (a
-    /// test's input: a forged message). Only such a holder can leave a
-    /// granter's pinned entry with its count lowered and nothing in flight
-    /// (D-165); the checker's R3 lets that entry be, and still judges
-    /// every other entry and the holder's own state.
-    pub(crate) undue_releases: std::collections::BTreeSet<(u16, u16, u32)>,
+    /// The grant entries (granter, granter's generation, grant, serial) for
+    /// which the holder's kernel wrote a `Release` while its use entry still
+    /// counted a leaf (a test's input: a forged message). Only such a holder
+    /// can leave a granter's pinned entry with its count lowered and nothing
+    /// in flight (D-165); the checker's R3 lets that entry be, and still
+    /// judges every other entry and the holder's own state.
+    pub(crate) undue_releases: std::collections::BTreeSet<(u16, u32, u16, u32)>,
     /// ARM64: `parked` written for a core whose word carried no fence mark
     /// (D-147: only at a fence).
     pub(crate) parked_unfenced: bool,
@@ -1050,7 +1050,9 @@ impl System {
     /// with serial `serial` while it counted a leaf under it (a test's
     /// input, beside the forged message).
     pub fn undue_release(&mut self, granter: u16, grant: u16, serial: u32) {
-        self.undue_releases.insert((granter, grant, serial));
+        let generation = self.canonical().generation(granter);
+        self.undue_releases
+            .insert((granter, generation, grant, serial));
     }
 
     /// Node `node`'s faulty kernel wrote the acknowledgement of node `x`'s

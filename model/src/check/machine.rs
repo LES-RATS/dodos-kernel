@@ -421,7 +421,12 @@ impl System {
                     // lowered (pass 37, the seed 2 of `verify` once the
                     // table cycle ran on node 3).
                     let faulty = self.faulty.contains(&entry.grantee)
-                        || self.undue_releases.contains(&(slot, grant, entry.serial));
+                        || self.undue_releases.contains(&(
+                            slot,
+                            table.generation(slot),
+                            grant,
+                            entry.serial,
+                        ));
                     ensure(
                         accused || frozen || revoking || faulty,
                         "R3: a grant pinned while its grantee runs and no failed unit holds it",

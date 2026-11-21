@@ -1896,3 +1896,66 @@ fn a_sealed_node_with_an_open_unit_request_is_reported() {
     );
 }
 
+// Review of passes 37 and 38, finding 5: `undue_releases` is keyed by the
+// granter's generation as well as `(granter, grant, serial)`, so an undue
+// release recorded for an earlier generation of the granter does not excuse
+// a pinned grant at the same index and serial in a later generation.
+#[test]
+fn an_undue_release_of_an_earlier_generation_of_the_granter_does_not_excuse_a_pinned_grant() {
+    use super::pass17::{fresh, kill};
+    use super::pass22::{OBJ, forged, granted_on, map_got, the_grant};
+    use super::pass37::{revoke_in_flight, state, unmapped};
+    use crate::rings::Body;
+    use crate::table::GrantState;
+    let mut m = granted_on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m.settle();
+    assert_eq!(m.call(1, map_got(1 << 30)), DONE);
+    let (grant, serial) = the_grant(&m);
+    assert_eq!(m.call(0, Syscall::CapRevoke(s(OBJ))), WAITS);
+    let release = forged(
+        &m,
+        dodos_abi::NodeMessage::Release,
+        1,
+        0,
+        None,
+        Body::Release { grant, serial },
+    );
+    m.sys.inject(1, 0, release);
+    assert!(m.step_until(|m| state(m, grant) == Some(GrantState::Pinned)));
+    let credit = revoke_in_flight(&m).expect("in flight");
+    let step = forged(
+        &m,
+        dodos_abi::NodeMessage::RevokeStep,
+        1,
+        0,
+        Some(credit),
+        Body::RevokeStep { removed: false },
+    );
+    m.sys.inject(1, 0, step);
+    assert!(m.step_until(|m| revoke_in_flight(m).is_none()));
+    m.sys.undue_release(0, grant, serial);
+    unmapped(&mut m);
+    assert_eq!(state(&m, grant), Some(GrantState::Pinned));
+    assert_eq!(m.sys.check(), Ok(()));
+    let entry = m.sys.canonical().grants[0][&grant];
+
+    // Granter 0 dies and starts a new generation; a pinned grant at the
+    // same `(0, grant, serial)` in the new generation is not excused by the
+    // earlier generation's undue release.
+    let sup = m.t[2];
+    m.supervisor(2, sup);
+    m.ok(2, kill(0));
+    m.run(30 * MS);
+    assert_eq!(m.state(0), MemberState::Dead);
+    m.ok(2, fresh(0, 0b001));
+    m.run(5 * MS);
+    assert_eq!(m.state(0), MemberState::Live);
+    m.sys.edit_table(|t| {
+        t.grants[0].insert(grant, entry);
+    });
+    m.sys.node_mut(0).table.grants[0].insert(grant, entry);
+    assert_eq!(
+        m.sys.check(),
+        Err("R3: a grant pinned while its grantee runs and no failed unit holds it".into())
+    );
+}
