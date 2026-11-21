@@ -17,12 +17,14 @@ fn a_free_word_with_a_generation_is_refused() {
     // "No block covers the chunk; its generation is 0."
     let unclaimed = Owner::Unclaimed.code();
     let node = Owner::Node(3).code();
-    assert!(Ownership::from_raw(word(1, unclaimed, 0)).is_some());
     assert_eq!(
         Ownership::from_raw(word(1, unclaimed, 0)),
         Some(Ownership::free(Owner::Unclaimed))
     );
-    assert!(Ownership::from_raw(word(1, node, 0)).is_some());
+    assert_eq!(
+        Ownership::from_raw(word(1, node, 0)),
+        Some(Ownership::free(Owner::Node(3)))
+    );
     for generation in [1, 2, 0x8000_0000] {
         assert_eq!(
             Ownership::from_raw(word(1, unclaimed, generation)),

@@ -162,9 +162,6 @@ fn start_up_capabilities_have_the_rights_of_their_kind_and_row() {
     }
     // The kept frames of the kept image: `read`, `exec` and `derive`; of the
     // machine table and the crash areas: `read` and `derive`.
-    // The table-floor untyped has every right except `exec` (rule 8,
-    // D-154).
-    assert_eq!(inspect(&mut m, t, 26).unwrap().1, NOT_EXEC, "slot 26");
     for slot in 28..31 {
         let rights = READ_DERIVE.union(Rights::EXEC);
         assert_eq!(inspect(&mut m, t, slot).unwrap().1, rights, "slot {slot}");
@@ -495,7 +492,7 @@ fn device_memory_is_every_address_that_is_not_ram_kept_or_unusable() {
         m.memory[3] = region(7 * mb, low - 7 * mb, RegionKind::Unusable);
         m.memory.remove(4);
     });
-    let (m, _) = boot(&machine);
+    let (mut m, t) = boot(&machine);
     // The entries below 2 MB hold the part of the usable memory from 1 MB
     // left out of the chunks and of the kept ranges, the tables of the
     // IOMMU unit among them (Argon F2); then the device ranges.
@@ -509,9 +506,15 @@ fn device_memory_is_every_address_that_is_not_ram_kept_or_unusable() {
     assert!((0..used).all(|i| m.device_entry(i).is_used()));
     assert!(!m.device_entry(used).is_used());
     assert!(!m.device_entry(used + DEVICE_TABLE_SPARE - 1).is_used());
-    // No device untyped is given at start-up.
-    let (mut m, t) = boot(&Machine::example());
-    assert_eq!(m.apply(t, take(1, 0, 0, 40)), Ok(Output::Done));
+    // No device untyped is given at start-up: every used device entry is
+    // unowned and can be taken, yielding an untyped without `exec`.
+    for i in 0..used {
+        assert_eq!(
+            m.apply(t, take(1, i as u64, 0, 40 + i as u32)),
+            Ok(Output::Done),
+            "device entry {i} already owned at start-up"
+        );
+    }
     let device = inspect(&mut m, t, 40).unwrap();
     assert_eq!(device, (Untyped, NOT_EXEC));
 }

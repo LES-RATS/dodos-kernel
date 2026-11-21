@@ -292,20 +292,14 @@ fn f2_partial_aspace_map_rejects_different_page_count() {
     // Resuming with a smaller count equal to the done count (1) returns Busy;
     // the finding was that count = 3 (smaller than the original 4, larger
     // than the done 1) succeeded with Ok(Done): it is `busy` too.
-    let mut retry_short = Err(Error::Again);
-    for _ in 0..3 {
-        retry_short = k.call(aspace_map(
-            slot(30),
-            slot(32),
-            TABLES,
-            VADDR,
-            3,
-            Rights::READ,
-        ));
-        if retry_short != Err(Error::Again) {
-            break;
-        }
-    }
+    let retry_short = k.call(aspace_map(
+        slot(30),
+        slot(32),
+        TABLES,
+        VADDR,
+        3,
+        Rights::READ,
+    ));
     assert_eq!(
         retry_short,
         Err(Error::Busy),
@@ -584,20 +578,14 @@ fn n2_partial_iospace_map_rejects_different_page_count() {
         iospace_map(slot(30), slot(31), TABLES, VADDR, 4, Rights::READ),
         Error::Again,
     );
-    let mut retry_short = Err(Error::Again);
-    for _ in 0..3 {
-        retry_short = k.call(iospace_map(
-            slot(30),
-            slot(31),
-            TABLES,
-            VADDR,
-            3,
-            Rights::READ,
-        ));
-        if retry_short != Err(Error::Again) {
-            break;
-        }
-    }
+    let retry_short = k.call(iospace_map(
+        slot(30),
+        slot(31),
+        TABLES,
+        VADDR,
+        3,
+        Rights::READ,
+    ));
     assert_eq!(
         retry_short,
         Err(Error::Busy),

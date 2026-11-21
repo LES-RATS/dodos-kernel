@@ -323,8 +323,8 @@ fn each_plain_argument_of_aspace_map_is_refused_and_the_range_before_the_rights(
 }
 
 #[test]
-fn rights_of_a_mapping_are_read_and_write_or_execute_within_the_frame_s() {
-    let (mut k, _) = with_aspace();
+fn rights_of_a_mapping_are_read_and_write_or_execute_within_the_frame() {
+    let (mut k, v) = with_aspace();
     k.small(1, 40);
     for word in [
         W,
@@ -338,7 +338,7 @@ fn rights_of_a_mapping_are_read_and_write_or_execute_within_the_frame_s() {
     k.derive(40, 41, R.union(X));
     k.no(map(30, 41, TB, AT, 0, 1, rw()), Error::Denied);
     k.ok(map(30, 41, TB, AT, 0, 1, R.union(X)));
-    assert_eq!(k.m.translated(k.t, AT), None);
+    assert_eq!(seen(&k, v, AT), Some(R.union(X)));
 }
 
 #[test]

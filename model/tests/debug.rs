@@ -108,9 +108,20 @@ fn debug_write_writes_one_entry_per_24_bytes_all_but_the_last_continued() {
         [0x0404_0404_0404_0404, 0x0505_0505_0505_0505, 0]
     );
     // The task identifier of the caller, its effective marks.
-    assert!(entries.iter().all(|e| e.task != 0));
+    let task_id = match k.go(Syscall::TaskRead(s(START_SLOT_TASK))) {
+        Ok(Output::Task { id, .. }) => id,
+        other => panic!("{other:?}"),
+    };
+    assert!(task_id != 0);
+    assert!(entries.iter().all(|e| e.task == task_id && e.marks == 0));
+    k.ok(Syscall::TaskMark {
+        task: s(START_SLOT_TASK),
+        marks: 3,
+    });
     k.ok(write(512));
-    assert_eq!(k.user().len(), 2 + 22);
+    let all = k.user();
+    assert_eq!(all.len(), 2 + 22);
+    assert!(all[2..].iter().all(|e| e.task == task_id && e.marks == 3));
 }
 
 /// Rights before the length: a weak capability with a length too long is

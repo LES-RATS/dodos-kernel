@@ -183,9 +183,8 @@ fn thread_size_is_the_power_of_two_above_its_area() {
     k.ok(retype(Thread, 1 << AMX, 100));
     let first = watermark(&k) - (16 << 10);
     k.ok(retype(Thread, 0, 101));
-    let second = next(first + (16 << 10), 2048);
+    let second = first + (16 << 10) + 2048;
     assert_eq!(watermark(&k), second);
-    assert_eq!(second, first + (16 << 10) + 2048);
     k.ok(retype(Thread, 1 << AMX, 102));
     let third = next(second, 16 << 10);
     assert_eq!(watermark(&k), third);

@@ -3322,10 +3322,14 @@ fn destroying_an_object_wakes_its_waiters_first_in_first_out() {
     for &thread in &threads {
         assert_eq!(k.on(thread, Syscall::Wait(s(NT), 0)), WAITS);
     }
-    // 32 wakes in the first call: all but the last to come.
+    // 32 wakes in the first call: the first 32 to wait, not the 33rd.
     k.no(Syscall::CapDelete(s(NT)), Error::Again);
-    assert_eq!(k.woken(threads[31]), Some(Err(Error::Gone)));
+    for &thread in &threads[..32] {
+        assert_eq!(k.woken(thread), Some(Err(Error::Gone)));
+    }
     assert_eq!(k.woken(threads[32]), None);
+    k.ok(Syscall::CapDelete(s(NT)));
+    assert_eq!(k.woken(threads[32]), Some(Err(Error::Gone)));
 }
 
 #[test]

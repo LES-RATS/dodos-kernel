@@ -106,7 +106,7 @@ fn start(n: u32, mode: u64) -> Syscall {
 }
 
 /// A run of ordinary memory that no floor and no reserve covers: the base
-/// of the machine's ordinary memory past its eight floor and reserve
+/// of the machine's ordinary memory past its ten floor and reserve
 /// chunks, aligned on the size of the run.
 fn free_run(geometry: Geometry, log2: u32) -> u64 {
     let machine = Machine::example_on(geometry);
@@ -158,10 +158,15 @@ impl S {
         // A creation clears its memory 64 KB per call: with large pages it
         // may take several.
         let mut outcome = self.on_node(node, call.clone());
-        while matches!(call, Syscall::UntypedRetype { .. }) && outcome == Err(Error::Again) {
+        let mut calls = 1u32;
+        while matches!(call, Syscall::UntypedRetype { .. })
+            && outcome == Err(Error::Again)
+            && calls < 40_000
+        {
+            calls += 1;
             outcome = self.on_node(node, call.clone());
         }
-        assert_eq!(outcome, DONE);
+        assert_eq!(outcome, DONE, "{call:?} did not end in {calls} calls");
     }
 
     #[track_caller]
