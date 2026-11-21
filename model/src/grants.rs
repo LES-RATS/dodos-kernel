@@ -944,6 +944,17 @@ impl Model {
         }
         // The entry is freed; its anchor is removed if it has no
         // descendant, and otherwise stays, held by nobody.
+        //
+        // CONTRACT-GAP 57 (Grants, a `Release` crossing a `Revoke`): a
+        // revoking entry is pinned by a `Release` read at a count above 0,
+        // on the ground that only a failed unit keeps a count. A faulty
+        // holder sends one at a count it then lowers to 0: the entry stays
+        // pinned while its grantee runs (the checker's R3 refuses that),
+        // and if the holder also frees its use entry, the `Revoke` in
+        // flight is refused, never answered, and its credit stays in use;
+        // a second `Release`, at a count of 0, finds the entry pinned, not
+        // revoking. Read here as a live entry's: freed, the credit left in
+        // use.
         self.free_with_anchor(grant);
     }
 

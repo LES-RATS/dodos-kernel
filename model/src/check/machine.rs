@@ -397,8 +397,19 @@ impl System {
                                     && u.leaves > 0
                             })
                         });
+                    // Or pinned by a `Release` crossing its `Revoke` at a
+                    // count above 0, the `Revoke`'s credit still in use
+                    // until its answer (Grants, a `Release` crossing a
+                    // `Revoke`, D-142; pass 35: a faulty holder's
+                    // `Release`, the long combination run's seed 154).
+                    let revoking = self.has(slot)
+                        && self.node(slot).peers[usize::from(entry.grantee)]
+                            .credits
+                            .iter()
+                            .flatten()
+                            .any(|c| c.completes == crate::rings::Completes::Revoke { grant });
                     ensure(
-                        accused || frozen,
+                        accused || frozen || revoking,
                         "R3: a grant pinned while its grantee runs and no failed unit holds it",
                     )?;
                 }

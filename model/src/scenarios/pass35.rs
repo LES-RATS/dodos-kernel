@@ -314,3 +314,64 @@ fn an_aspace_waits_for_the_barrier_of_its_table_untypeds_returning_watermark() {
     assert_eq!(k.m.untypeds[&tables].ready, None);
     assert_eq!(k.m.root_table(k.t, s(360)), Some(chunk << shift));
 }
+
+// Found by the long combination run (seed 154): a faulty holder writes a
+// `Release` of a grant it still maps while its granter revokes it. The
+// granter, reading the count above 0, pins the revoking entry and keeps
+// the credit of its `Revoke` in use until its answer (Grants, a `Release`
+// crossing a `Revoke`, D-131, D-142). The holder then deletes its copy:
+// its use entry goes. The checker's R3 (pass 34) reported the pinned entry
+// of a running grantee whose `Revoke` is still in flight.
+fn pinned_by_a_faulty_release() -> (S, u16) {
+    use super::pass22::{GOT, OBJ, forged, granted, map_got, the_grant};
+    use crate::rings::Body;
+    use crate::table::GrantState;
+    let mut m = granted(true);
+    assert_eq!(m.call(1, map_got(1 << 30)), DONE);
+    let (grant, serial) = the_grant(&m);
+    assert_eq!(m.call(0, Syscall::CapRevoke(s(OBJ))), WAITS);
+    // Node 1's faulty kernel writes the `Release` before it reads the
+    // `Revoke`, its leaf still counted.
+    let release = forged(
+        &m,
+        dodos_abi::NodeMessage::Release,
+        1,
+        0,
+        None,
+        Body::Release { grant, serial },
+    );
+    m.sys.inject(1, 0, release);
+    let pinned = |m: &S| {
+        let entry = m.sys.canonical().grants[0].get(&grant).copied();
+        entry.is_some_and(|e| e.state == GrantState::Pinned)
+    };
+    assert!(m.step_until(pinned));
+    // Node 1 deletes its copy before it reads the `Revoke` (the call is
+    // followed by the check).
+    m.ok(1, Syscall::CapDelete(s(GOT)));
+    assert!(m.sys.canonical().uses[1].is_empty());
+    (m, grant)
+}
+
+#[test]
+fn a_grant_pinned_by_a_faulty_release_while_its_revoke_is_in_flight_is_no_fault() {
+    let (m, grant) = pinned_by_a_faulty_release();
+    let in_flight = m.sys.node(0).peers[1].credits.iter().flatten().count();
+    assert_eq!(in_flight, 1, "the Revoke still in flight");
+    assert!(m.sys.canonical().grants[0].contains_key(&grant));
+}
+
+// CONTRACT-GAP 57: node 1, which freed its use entry, refuses the `Revoke`
+// when it reads it, so no answer comes; its own `Release`, at a count of 0,
+// finds the entry pinned, not revoking. The model then frees the entry and
+// leaves the `Revoke`'s credit in use, which the checker's CREDIT reports.
+// The contract says the answer "comes, since Y kept its use entry": a
+// faulty Y did not.
+#[test]
+#[ignore = "CONTRACT-GAP 57: the credit of a Revoke a faulty holder never answers"]
+fn a_grant_pinned_by_a_faulty_release_ends_with_its_revokes_credit_freed() {
+    let (mut m, grant) = pinned_by_a_faulty_release();
+    m.run(30 * MS);
+    assert!(!m.sys.canonical().grants[0].contains_key(&grant));
+    assert_eq!(m.sys.node(0).peers[1].credits.iter().flatten().count(), 0);
+}

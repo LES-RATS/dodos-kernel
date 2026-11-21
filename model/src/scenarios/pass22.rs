@@ -10,8 +10,8 @@ use crate::{Map, Message, Range, Transfer};
 use dodos_abi::{Header, NodeMessage, RingHeader, START_SLOT_ASPACE, START_SLOT_MAILBOX};
 
 const REPLY: u32 = 100;
-const OBJ: u32 = 101;
-const GOT: u32 = 110;
+pub(super) const OBJ: u32 = 101;
+pub(super) const GOT: u32 = 110;
 
 fn recv(first: u32) -> Syscall {
     Syscall::Recv {
@@ -54,7 +54,7 @@ pub(crate) fn forged(
     crate::rings::Message { header, body }
 }
 
-fn map_got(address: u64) -> Syscall {
+pub(super) fn map_got(address: u64) -> Syscall {
     Syscall::ASpaceMap(Map {
         space: s(START_SLOT_ASPACE),
         frame: s(GOT),
@@ -68,7 +68,7 @@ fn map_got(address: u64) -> Syscall {
 
 /// Three nodes; node 0 sends node 1 one frame (slot `OBJ`) with `derive`;
 /// node 1 receives it in slot `GOT`. Settled unless `settle` is false.
-fn granted(settle: bool) -> S {
+pub(super) fn granted(settle: bool) -> S {
     let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
     for node in [0, 1] {
         let reply = m.retype(node, ObjectKind::Reply, 0, REPLY);
@@ -96,7 +96,7 @@ fn granted(settle: bool) -> S {
     m
 }
 
-fn the_grant(m: &S) -> (u16, u32) {
+pub(super) fn the_grant(m: &S) -> (u16, u32) {
     let grant = m.sys.node(0).grant_entries()[0].0;
     (grant, m.sys.canonical().grants[0][&grant].serial)
 }

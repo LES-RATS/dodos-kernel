@@ -49,7 +49,12 @@ const IRQ: u32 = 210;
 const RECEIVER: u32 = 300;
 /// The slots of the table chunks' cycle (`Run::tables`): a table run, a
 /// child table untyped cut from it, an `aspace` and an `iospace` on that
-/// child, and a frame to map under them.
+/// child, and a frame to map under them. On node 3 they are frames of
+/// `PAIRS`, so its steps there fail (`invalid`, nothing changed) and the
+/// cycle runs on the other nodes. Moved above those frames, the draws
+/// change and the seeds of `verify` meet gap 57 (seed 2: a pinned grant
+/// whose holder runs, which the checker's R3 refuses): to move once the
+/// contract settles it (pass 35).
 const TBLOCK: u32 = 400;
 const TCHILD: u32 = 401;
 const TASPACE: u32 = 402;
