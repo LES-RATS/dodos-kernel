@@ -2205,12 +2205,13 @@ fn seed_605_of_pass_35_a_removal_refused_by_a_busy_request_is_no_progress() {
     let _ = explore_one(605);
 }
 
-// Seed 763: node 4's context fails rule 43 (its parameters and its state)
-// after its core 4 powered down: a throttled context whose replenishment
-// came due while the core slept deeper than the latency the rule allows.
+// Seed 763: node 4's context failed rule 43 after its core 4 powered down:
+// the machine's clock jumped past core 4's replenishment instant, stopped
+// by core 5's timer already reached while it slept roused, so core 4 woke
+// past its timer plus the exit latency (pass 37,
+// `pass37::a_sleeping_core_is_roused_at_its_timer_while_another_core_waits_for_its_wake`).
 #[test]
-#[ignore = "pass 35: rule 43 after a power-down in seed 763; not fixed"]
-fn seed_763_of_pass_35_a_context_fails_rule_43_after_a_power_down() {
+fn seed_763_of_pass_35_a_sleeping_core_is_roused_at_its_timer() {
     let _ = explore_one(763);
 }
 

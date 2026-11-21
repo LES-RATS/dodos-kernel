@@ -359,3 +359,110 @@ fn a_removal_of_r2_refused_by_the_busy_request_of_the_core_is_no_progress() {
     assert!(m.sys.node(1).remotes.is_empty());
     assert_eq!(m.sys.node(1).object_at(m.t[1], s(GOT)), None);
 }
+
+// Seed 763 of the long combination run (pass 35; drivers Stuck, Resume,
+// SignalPending): node 4's cores 4 and 5 slept in a state that loses the
+// context (exit latency 200 µs). Core 5's timer came due first: it was
+// roused, its wake 200 µs later, its timer still due. Core 4's context was
+// throttled until 130.2 ms. The machine's clock (`System::advance`) took
+// the earliest instant of every core's timer, which was core 5's, already
+// reached: no event at it, so the loop ended and the clock jumped to the
+// end of the step, past 130.2 ms. Core 4 was roused only then, its wake
+// 200 µs after the jump, 297 µs after its timer: rule 43 (a replenishment
+// on a sleeping core is taken at most the exit latency late, Idle) saw the
+// context still throttled. A fault of the simulated machine, not of the
+// kernel model nor of the rule: a sleeping core wakes at its timer plus
+// its exit latency. The same with node 1's harts 1 and 2: each waits for a
+// timer, the second 100 µs after the first.
+/// The exit latency of the harts' state that loses the context.
+const LATENCY: u64 = 200_000;
+
+/// Node 1's harts 1 and 2 asleep in a state that loses the context, each
+/// with a thread that waits for a timer: hart 1's at the instant returned,
+/// hart 2's 100 µs later, neither on a step of 100 µs from now.
+fn two_harts_asleep_with_timers() -> (S, u64) {
+    use dodos_abi::{IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_SBI};
+    let mut m = S::on(&machine(Arch::Riscv64, 3, &[&[0], &[1, 2]]));
+    for core in [1, 2] {
+        let idle = Syscall::NodeIdle {
+            node: node_cap(1),
+            core,
+            words: vec![
+                LATENCY,
+                100_000,
+                IDLE_METHOD_SBI | 0x8000_0000 << 32,
+                IDLE_FLAG_LOSES_CONTEXT,
+            ],
+        };
+        m.ok(1, idle);
+    }
+    m.ok(1, super::place_first(1, 1));
+    let other = m.thread_on(1, 300, 2);
+    let first = m.sys.now() + 2 * MS + 50_000;
+    for slot in [310, 320] {
+        let timer = m.retype(1, ObjectKind::Timer, 0, slot);
+        m.ok(1, timer);
+        let notify = m.retype(1, ObjectKind::Notify, 0, slot + 1);
+        m.ok(1, notify);
+    }
+    for (thread, slot, deadline) in [(other, 320, first + 100_000), (m.t[1], 310, first)] {
+        let set = Syscall::TimerSet {
+            timer: s(slot),
+            notify: s(slot + 1),
+            deadline,
+            tolerance: 0,
+        };
+        assert!(m.call_by(1, thread, set).is_ok());
+        assert_eq!(m.call_by(1, thread, Syscall::Wait(s(slot + 1), 0)), WAITS);
+    }
+    m.run(MS);
+    for core in [1, 2] {
+        let asleep = matches!(
+            m.sys.hardware(core),
+            crate::system::Hardware::Asleep { wake: None, .. }
+        );
+        assert!(asleep, "hart {core} asleep");
+    }
+    (m, first)
+}
+
+fn wake(m: &S, core: usize) -> Option<u64> {
+    match m.sys.hardware(core) {
+        crate::system::Hardware::Asleep { wake, .. } => wake,
+        _ => None,
+    }
+}
+
+#[test]
+fn a_sleeping_core_is_roused_at_its_timer_while_another_core_waits_for_its_wake() {
+    let (mut m, first) = two_harts_asleep_with_timers();
+    // Steps of 100 µs, as `run`: each hart is roused at its timer, its
+    // wake its exit latency later.
+    let (mut one, mut two) = (None, None);
+    while m.sys.now() < first + MS {
+        m.run(100_000);
+        one = one.or(wake(&m, 1));
+        two = two.or(wake(&m, 2));
+    }
+    assert_eq!(one, Some(first + LATENCY));
+    assert_eq!(two, Some(first + 100_000 + LATENCY));
+}
+
+// The same in one step of the clock that passes both wakes: an instant
+// that only rouses a sleeping core has no event, and the clock goes on to
+// the next instant rather than to the end of the step (where hart 2 was
+// roused, its wake past the step).
+#[test]
+fn one_step_of_the_clock_past_two_timers_wakes_both_sleeping_cores() {
+    let (mut m, first) = two_harts_asleep_with_timers();
+    let end = first + 100_000 + LATENCY + 50_000;
+    m.sys.advance(end);
+    assert_eq!(m.sys.check(), Ok(()));
+    for core in [1, 2] {
+        assert_eq!(
+            m.sys.hardware(core),
+            crate::system::Hardware::Running,
+            "hart {core}"
+        );
+    }
+}

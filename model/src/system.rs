@@ -530,12 +530,19 @@ impl System {
     }
 
     /// The next instant something is due: a timer of a core awake, a sleeping
-    /// core's timer (which wakes it) or the end of its exit latency.
+    /// core's timer (which wakes it) or the end of its exit latency. The
+    /// timer of a core that is not awake counts only until it is reached:
+    /// it has roused the core then, whose wake is listed (pass 37, seed 763:
+    /// a reached timer of one sleeping core was the earliest instant, and
+    /// the clock jumped past another's timer, which woke late).
     fn next_instant(&self) -> Option<u64> {
         let timers = self.nodes.iter().flatten().flat_map(|m| {
             (0..m.core_count())
                 .filter(|&p| !m.is_silent(p))
-                .filter_map(move |p| m.timer_of(p))
+                .filter_map(move |p| {
+                    m.timer_of(p)
+                        .filter(|&at| at > self.now || self.awake(m, p))
+                })
         });
         let wakes = self.hardware.iter().filter_map(|h| match *h {
             Hardware::Asleep { wake, .. } => wake,
@@ -648,8 +655,11 @@ impl System {
             self.settle(10_000);
             let next = self.next_instant().filter(|&at| at <= to);
             let Some(at) = next else { break };
+            let before = self.now;
             self.set_clock(at.max(self.now));
-            if self.events().is_empty() {
+            // An instant that only rouses a sleeping core has no event: the
+            // clock goes on to the next one.
+            if self.events().is_empty() && self.now == before {
                 // A timer due at an instant already reached is taken, on a
                 // core awake (a sleeping core's timer wakes it).
                 let due = self.nodes.iter().enumerate().find_map(|(slot, m)| {

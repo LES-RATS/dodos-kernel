@@ -647,6 +647,13 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
   (`Model::unmap_refused`, shared with `begin_unmap`); the reserve ran
   again at one instant for ever while the core the request waited for
   slept. A removal that meets it is no progress (`removal_waits`).
+- Seed 763 of the long run: the machine's clock (`System::advance`) took
+  for its next instant a timer already reached on a sleeping core that
+  was roused, found no event there and jumped to the end of the step,
+  past another sleeping core's timer, which then woke later than its exit
+  latency allows (rule 43). A reached timer of a core not awake is no
+  instant any more (its wake is), and an instant that only rouses a core
+  goes on to the next one.
 - The scenarios are in `scenarios/pass37.rs`.
 
 ## Mutations shown equivalent
