@@ -537,17 +537,15 @@ fn deepseek12_m33_the_reclaim_of_a_second_death_of_one_slot_starts_afresh() {
     let generation = m.sys.member(2).generation();
     m.ok(0, super::pass17::kill(2));
     m.run(MS);
-    // Node 1 holds a record of the second death's generation; node 0 may
-    // have none yet (the final review's E26: both were conditional).
+    // Node 1 holds a record of the second death's generation (the final
+    // review's E26: it was conditional). Node 0's next step comes after
+    // node 2 is dead, so node 0 holds none here (the audit of lot 8a, D-8a
+    // F37, checked: no record of node 0 in any 100 µs of the 30 ms); the
+    // review of passes 35 and 36, finding 9: asserted, not a branch never
+    // taken.
     let reclaim = m.sys.node(1).reclaims.get(&2).expect("node 1's record");
     assert_eq!(reclaim.generation, generation);
-    if let Some(reclaim) = m.sys.node(0).reclaims.get(&2) {
-        assert_eq!(reclaim.generation, generation);
-    }
-    // Node 0's next step comes after node 2 is dead, so node 0 never holds
-    // one here: the condition is the model's, not a weak test (the audit
-    // of lot 8a, D-8a F37, checked: no record of node 0 in any 100 µs of
-    // the 30 ms).
+    assert!(!m.sys.node(0).reclaims.contains_key(&2));
     m.run(30 * MS);
     assert_eq!(m.state(2), MemberState::Dead);
 }

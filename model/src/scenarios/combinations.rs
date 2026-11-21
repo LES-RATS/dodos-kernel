@@ -16,8 +16,8 @@
 //! others (`Reach`). In the long run (`#[ignore]`, `--release`), a
 //! combination no seed reaches fails the test, unless `IMPOSSIBLE` shows
 //! from the contract that it cannot happen; the 27 seeds of `verify` reach
-//! about half of them, and fail if they miss more than when measured
-//! (`MISSED_BY_THE_SEEDS`). Then the
+//! about half of them, and fail if they miss one they reached when
+//! measured (`MISSED_BY_THE_SEEDS`, the list of those missed). Then the
 //! machine runs until it is quiet, and its liveness is asserted: no node is
 //! accused that was not harmed (killed, failed, hung, retired or sealed past
 //! `SEAL_NS`), and no wait of a live node for another node, a unit or its
@@ -2131,10 +2131,12 @@ fn report(reach: &Reach) -> Vec<String> {
     missing
 }
 
-/// The combinations the 27 seeds of `verify` do not reach, measured
-/// (`DODOS_COUNTS=1` prints them): 437 of 919 since pass 37, when the
-/// table cycle's slots left node 3's frames (448 before).
-const MISSED_BY_THE_SEEDS: usize = 437;
+/// The combinations the 27 seeds of `verify` do not reach, as measured
+/// (437 of 919 since pass 37), one per line: the seeds must reach every
+/// other one. A list and not a count (the review of passes 35 and 36,
+/// finding 8: a change that lost some combinations and gained as many
+/// passed); a change that reaches more prints them, to be taken off.
+const MISSED_BY_THE_SEEDS: &str = include_str!("short_run_missed.txt");
 
 /// The run of `verify`: 26 seeds spread over the triples of drivers, so
 /// that each driver is among them, and seed 2; the check after every step
@@ -2159,14 +2161,27 @@ fn combined_recovery_states_between_nodes() {
         // measured, so a change that loses some fails here (the audit of
         // lot 8a, F1: the list was thrown away).
         assert!(reach.refused > 0, "no forged message seen refused");
+        // Reached by one seed of the 27 (363): a floor of reachability, which
+        // has no margin below it (the long run counts it over 858 seeds).
         assert!(reach.early_acks > 0, "no acknowledgement before R4 ended");
         for (state, &seeds) in TABLE_STATES.iter().zip(&reach.tables) {
             assert!(seeds > 0, "the seeds never reach {state}");
         }
+        let measured: Vec<&str> = MISSED_BY_THE_SEEDS.lines().collect();
+        let lost: Vec<&String> = missing
+            .iter()
+            .filter(|m| !measured.contains(&m.as_str()))
+            .collect();
+        let gained: Vec<&&str> = measured
+            .iter()
+            .filter(|m| !missing.iter().any(|n| n == *m))
+            .collect();
+        if !gained.is_empty() {
+            eprintln!("reached now, to take off `short_run_missed.txt`: {gained:#?}");
+        }
         assert!(
-            missing.len() <= MISSED_BY_THE_SEEDS,
-            "{} combinations never reached, {MISSED_BY_THE_SEEDS} measured: {missing:#?}",
-            missing.len()
+            lost.is_empty(),
+            "reached when measured, no longer: {lost:#?}"
         );
     }
 }

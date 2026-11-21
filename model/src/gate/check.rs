@@ -111,6 +111,20 @@ impl Machine {
                     !live || self.holds(granter as u16, grant.page),
                     "GRANT: a granted page no longer its granter's",
                 )?;
+                // R3 (Grants, Generations): a grant dies with its grantee's
+                // generation; the grantee's R6 frees it through a granter's
+                // gate that writes, and a granter sealed then frees it at
+                // its resume, both within one event of this model; so a
+                // node whose gate writes holds no entry for a generation
+                // that is over (the review of passes 35 and 36, finding 7),
+                // unless it was made to a generation already dead.
+                let grantee = self.gate.members[usize::from(grant.grantee)];
+                let over =
+                    grantee.state == NodeState::Dead || grantee.generation != grant.generation;
+                ensure(
+                    !self.gate.members[granter].state.writes() || !over || grant.to_dead,
+                    "GRANT: a writing granter's entry for a generation that is over",
+                )?;
             }
         }
         ensure(

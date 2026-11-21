@@ -767,3 +767,42 @@ fn a_grantees_r6_leaves_a_sealed_granters_grant_to_its_resume() {
     assert_eq!(m.gate.members[0].state, NodeState::Live);
     assert_eq!(m.grants.grants[0][0], None, "R3 at the resume");
 }
+
+// The review of passes 35 and 36, finding 7 (Grants, Generations: the
+// resume's R3 "frees at once the grants it made to a generation already
+// over": dead, or started again). The grantee dies and starts afresh while
+// the granter is sealed; the resume frees the entry of the old generation.
+#[test]
+fn a_resume_frees_a_grant_to_a_grantee_that_started_again_while_it_was_sealed() {
+    let mut m = Machine::new(3, 2, 8);
+    let mut ops = grantee_maps(0);
+    ops[0] = Op::Take {
+        n: 0,
+        chunk: 6,
+        kind: Take::Ordinary,
+    };
+    ops[1] = Op::Grant {
+        n: 0,
+        slot: 0,
+        page: 6 * PAGES_PER_CHUNK,
+        to: 1,
+    };
+    steps(&mut m, &ops);
+    steps(
+        &mut m,
+        &[Op::Seal { n: 0 }, Op::Death { n: 1 }, Op::Fresh { n: 1 }],
+    );
+    assert_eq!(m.gate.members[1].state, NodeState::Live);
+    let leaked = m.grants.grants[0][0].expect("a sealed gate wrote");
+    assert_ne!(leaked.generation, m.gate.members[1].generation);
+    steps(&mut m, &[Op::Resume { n: 0 }]);
+    assert_eq!(m.gate.members[0].state, NodeState::Live);
+    assert_eq!(m.grants.grants[0][0], None, "R3 at the resume");
+    // The entry left there is what the check reports.
+    m.grants.grants[0][0] = Some(leaked);
+    m.gate.grant_counts[Machine::chunk_of(leaked.page) as usize] += 1;
+    assert_eq!(
+        m.check(),
+        Err("GRANT: a writing granter's entry for a generation that is over".into())
+    );
+}

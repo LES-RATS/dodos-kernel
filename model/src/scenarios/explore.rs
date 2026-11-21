@@ -699,7 +699,7 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
                         // while it waits for the answer.
                         if m.call_by(0, thread, send) == WAITS && rng.below(2) == 0 {
                             let deleted = try_call(&mut m, 0, Syscall::CapDelete(s(slot)));
-                            waiter_destroyed += usize::from(deleted.is_some());
+                            waiter_destroyed += usize::from(deleted == Some(DONE));
                         }
                     }
                 }
@@ -709,7 +709,7 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
                         && m.sys.node(0).threads.contains_key(&thread)
                         && !m.sys.node(0).runnable().contains(&thread);
                     let deleted = try_call(&mut m, 0, Syscall::CapDelete(s(slot)));
-                    waiter_destroyed += usize::from(waiting && deleted.is_some());
+                    waiter_destroyed += usize::from(waiting && deleted == Some(DONE));
                 }
                 2 => {
                     let sends = m.sys.has(0) && m.sys.node(0).peers[1].sends().0 > 0;

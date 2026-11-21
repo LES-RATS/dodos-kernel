@@ -24,6 +24,11 @@ pub(crate) struct Grant {
     pub(crate) state: GrantState,
     /// The grantee's use index, once answered.
     pub(crate) use_index: Option<usize>,
+    /// Read by the check only: the grant was made while its grantee was
+    /// dead, a generation already over (the gate does not read the
+    /// grantee's member word; only a faulty kernel asks for it), so no R6
+    /// of the grantee is left to free it.
+    pub(crate) to_dead: bool,
 }
 
 /// A use entry of the holding node (living part).
@@ -79,6 +84,7 @@ impl Machine {
         // have the table bit clear; so a table chunk's grant count is 0.
         require(!self.table_chunk(page) || self.old.anchors_over_table_chunks)?;
         let generation = self.gate.members[usize::from(to)].generation;
+        let to_dead = self.gate.members[usize::from(to)].state == NodeState::Dead;
         let serial = self.grants.serials[usize::from(n)][slot];
         self.grants.grants[usize::from(n)][slot] = Some(Grant {
             page,
@@ -87,6 +93,7 @@ impl Machine {
             serial,
             state: GrantState::Live,
             use_index: None,
+            to_dead,
         });
         self.gate.grant_counts[Self::chunk_of(page) as usize] += 1;
         Ok(())

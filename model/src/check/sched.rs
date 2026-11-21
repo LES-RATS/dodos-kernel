@@ -264,15 +264,21 @@ impl Model {
             .filter(|&(at, _)| at >= event.entered_from)
             .collect();
         entered.sort();
-        // A context's place is its last in the list: an event that observes
-        // its changes twice (a `reply_recv` that moves a capability) lists
-        // it again when it enters again (pass 36, seed 2011 of the long
-        // property run).
-        let positions: Option<Vec<usize>> = entered
-            .iter()
-            .map(|(_, id)| event.changes.iter().rposition(|c| c == id))
-            .collect();
-        let ordered = positions.is_some_and(|p| p.is_sorted());
+        // A context is on a change list once, from the first change of its
+        // eligibility, budget or key (What runs next); an event whose choice
+        // is made again (a holder that raises a fault, step 7) runs step 6
+        // again on a new list, so the event's lists, one after the other,
+        // can name a context twice: at a second round where it entered
+        // again (pass 36, seed 2011 of the long property run), or where it
+        // stayed where it was (the review of passes 35 and 36, finding 4).
+        // The entries, in their order, must each take a place of their
+        // context in the lists, later than the place of the one before:
+        // the earliest such place, taken in turn, finds one if any exists.
+        let mut after = 0;
+        let ordered = entered.iter().all(|(_, id)| {
+            let place = event.changes[after..].iter().position(|c| c == id);
+            place.inspect(|p| after += p + 1).is_some()
+        });
         ensure(ordered, "60: order of entry and the change list")?;
         for (id, sched) in &self.scheds {
             let before = event.params.get(id).copied().unwrap_or((0, 0));

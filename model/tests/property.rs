@@ -2067,8 +2067,14 @@ fn table_cases(
             vec![(map.untyped != TABLES && table(map.untyped) && ok, 4)]
         }
         Syscall::CapDelete(slot) => vec![
-            (kind(slot) == Some(ObjectKind::ASpace) && unmapped, 5),
-            (kind(slot) == Some(ObjectKind::IoSpace) && unmapped, 6),
+            (
+                kind(slot) == Some(ObjectKind::ASpace) && unmapped && done,
+                5,
+            ),
+            (
+                kind(slot) == Some(ObjectKind::IoSpace) && unmapped && done,
+                6,
+            ),
             (table(slot) && done, 8),
         ],
         Syscall::MemoryGive { untyped, .. } => vec![(table(untyped) && ok, 7)],
@@ -2447,6 +2453,11 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
     // Every thread that could run at some step: those that can be woken.
     let mut known: BTreeSet<ObjId> = BTreeSet::new();
     let mut walked = false;
+    // The slots of an aspace or an iospace whose removal unmapped a leaf
+    // and returned `again`: its destruction "with a mapping in place" is
+    // counted when the removal ends (the review of passes 35 and 36,
+    // finding 8: a step that returned `again` was counted).
+    let mut unmapping: BTreeSet<u64> = BTreeSet::new();
     crowd(&mut model, first);
     refused_send(&mut model, first);
     destroyed_space(&mut model, first);
@@ -2662,6 +2673,18 @@ fn run(seed: u64, reached: &mut Reached) -> Model {
         let shape = call.clone();
         let outcome = model.apply(thread, call);
         let unmapped = model.census().mappings < before.mappings;
+        let unmapped = match shape {
+            Syscall::CapDelete(slot) => match outcome {
+                Err(Error::Again) => {
+                    if unmapped {
+                        unmapping.insert(slot.raw());
+                    }
+                    false
+                }
+                _ => unmapping.remove(&slot.raw()) || unmapped,
+            },
+            _ => unmapped,
+        };
         let table = |slot: SlotAddr| tables.contains(&slot);
         for case in table_cases(&shape, &outcome, table, |_| deleted, unmapped) {
             reached.tables[case] += 1;
@@ -3057,7 +3080,11 @@ fn moves_that_the_depths_rule_on_are_accepted_and_refused() {
     // script made holds, so those spaces' refusals were never counted (0
     // without that change); and `listen` asks for a range in a `cspace`
     // held here, where `speak` moves a fresh `cspace` once a receiver
-    // waits (1 of the 2 without it).
+    // waits (1 of the 2 without it). Measured again in pass 38: 2, 2 and
+    // 5. The floor is three quarters of the smallest, rounded down: 1
+    // (rounded up it would be 2, the measure itself, which any draw that
+    // moves one such send would break; the review of passes 35 and 36,
+    // finding 8). It asserts the case is reached at random at all.
     at_least([reached.sent_refused], [1]);
     // The same moves listed by `call` and by `reply_recv`: 39 and 18.
     at_least([reached.called, reached.answered], [18, 6]);
