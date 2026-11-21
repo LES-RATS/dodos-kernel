@@ -286,6 +286,7 @@ impl Model {
                     dodos_abi::Ownership::from_raw(raw).is_some_and(|w| {
                         w.state() == dodos_abi::OwnState::Taken
                             && w.owner() == dodos_abi::Owner::Node(self.node)
+                            && w.generation() == self.table.generation(self.node)
                     })
                 });
                 ensure(

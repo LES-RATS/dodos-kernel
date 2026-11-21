@@ -1916,7 +1916,7 @@ fn context_with_no_budget_left_that_is_not_throttled_is_reported() {
 }
 
 #[test]
-fn throttled_context_with_budget_left_is_reported() {
+fn throttled_context_in_ready_queue_is_reported() {
     let broken = spoiled(|m, at| {
         let context = first_context(m, at);
         let debt = dodos_abi::sched_debt(0, 1);
@@ -1924,6 +1924,25 @@ fn throttled_context_with_budget_left_is_reported() {
     });
     // Throttled with its holder runnable: it belongs in a slack queue.
     assert_eq!(broken, "41: queue of a context");
+}
+
+// Pass 40 (v1-E #5): rule 43's other half of "budget left iff not throttled":
+// a throttled context properly placed in its slack queue still has budget left.
+#[test]
+fn throttled_context_with_budget_left_is_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        let wake = m.now + 1;
+        let debt = dodos_abi::sched_debt(0, 1);
+        let sched = live(&mut m.scheds, context);
+        assert!(sched.remaining > 0);
+        sched.throttled = Some((wake, debt));
+        if let Some(q) = sched.queue.as_mut() {
+            q.queue = Queue::Slack(sched.class);
+            q.key = wake;
+        }
+    });
+    assert_eq!(broken, "43: parameters and state of a context");
 }
 
 #[test]
@@ -3293,4 +3312,86 @@ fn translations_that_overlap_are_reported() {
     mapping.address = 0;
     live(&mut model.caps, frame_cap).record = Record::Mapping(mapping);
     assert_eq!(model.check(), Err("35: translations that overlap"));
+}
+
+// Pass 40 (v1-E #3): a core's kernel_tlb holds a chunk no longer in
+// kernel_runs whose ownership word names this node slot with a stale
+// generation.
+#[test]
+fn kernel_tlb_chunk_of_stale_generation_is_reported() {
+    let mut model = state();
+    let chunk = model
+        .table
+        .owners
+        .iter()
+        .enumerate()
+        .find_map(|(i, &raw)| {
+            Ownership::from_raw(raw)
+                .is_some_and(|w| w.state() == dodos_abi::OwnState::Free)
+                .then_some(i as u64)
+        })
+        .expect("a free chunk");
+    let stale_gen = model.table.generation(model.node).wrapping_add(1);
+    let stale = Ownership::taken(Owner::Node(model.node), stale_gen);
+    std::sync::Arc::make_mut(&mut model.table.owners)[chunk as usize] = stale.raw();
+    model.cores[0].kernel_tlb.insert(chunk);
+    assert_eq!(
+        model.check(),
+        Err("G5: a run given or destroyed while a core may still translate it in the kernel's own space")
+    );
+}
+
+// Pass 40 (v1-E #4): a free table page of an aspace whose stored PageClass
+// has class <= 16 (e.g. a pinned ITS table, raw = 72 > 16, class = 8) must
+// fail check_table's class > 16 check.
+#[test]
+fn aspace_table_page_with_pinned_its_class_is_reported() {
+    let mut model = state();
+    let thread = object(&model, START_SLOT_THREAD);
+    let page_bytes = model.table.geometry.page();
+    let retype = Syscall::UntypedRetype {
+        untyped: SlotAddr::own(UNTYPED),
+        kind: ObjectKind::Frame,
+        size: 1,
+        page: 0,
+        memory: 0,
+        destination: SlotAddr::own(331),
+    };
+    let mut outcome = model.apply(thread, retype.clone());
+    while outcome == Err(Error::Again) {
+        outcome = model.apply(thread, retype.clone());
+    }
+    assert_eq!(outcome, Ok(Output::Done));
+    let addr = 0x4000_0000;
+    assert_eq!(
+        model.apply(
+            thread,
+            Syscall::ASpaceMap(Map {
+                space: SlotAddr::own(dodos_abi::START_SLOT_ASPACE),
+                frame: SlotAddr::own(331),
+                untyped: SlotAddr::NONE,
+                address: addr,
+                first: 0,
+                count: 1,
+                rights: Rights::READ.bits(),
+            })
+        ),
+        Ok(Output::Done)
+    );
+    assert_eq!(
+        model.apply(thread, Syscall::ASpaceUnmap(SlotAddr::own(331))),
+        Ok(Output::Done)
+    );
+    assert_eq!(model.check(), Ok(()));
+    let page = model
+        .aspaces
+        .values()
+        .flat_map(|s| s.free.iter().copied())
+        .next()
+        .expect("a free aspace table page")
+        / page_bytes;
+    let pinned_its = dodos_abi::PageClass::its_table(true);
+    assert!(pinned_its.raw() > 16 && pinned_its.class() <= 16);
+    std::sync::Arc::make_mut(&mut model.table.classes).insert(page, pinned_its);
+    assert_eq!(model.check(), Err("59: page classes"));
 }

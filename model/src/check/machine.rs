@@ -88,31 +88,30 @@ impl System {
                     continue;
                 }
                 let (chunks, device) = table.frame_touches(&entry.anchor.frame);
+                let g = table.generation(granter as u16);
+                // A sealing or sealed granter still holds its memory
+                // (audit lot 7: every state but live was exempt); an
+                // accused or dead one is being reclaimed, and a
+                // starting one's grants of an earlier generation stay
+                // pinned under a failed unit's count (D-142).
+                let exempt = !matches!(
+                    table.member(granter as u16).state(),
+                    MemberState::Live | MemberState::Sealing | MemberState::Sealed
+                );
                 for &chunk in &chunks {
                     counts[chunk as usize] += 1;
-                    let g = table.generation(granter as u16);
                     let at = chunk << table.geometry.chunk_shift();
-                    let reserve = dodos_abi::Ownership::from_raw(table.owners[chunk as usize])
-                        .is_some_and(|w| {
-                            matches!(w.owner(), dodos_abi::Owner::Reserve(j)
-                                if table.holds_reserve(granter as u16, j))
-                        });
-                    // A sealing or sealed granter still holds its memory
-                    // (audit lot 7: every state but live was exempt); an
-                    // accused or dead one is being reclaimed, and a
-                    // starting one's grants of an earlier generation stay
-                    // pinned under a failed unit's count (D-142).
-                    let exempt = !matches!(
-                        table.member(granter as u16).state(),
-                        MemberState::Live | MemberState::Sealing | MemberState::Sealed
-                    );
-                    let kept = table.holds_page(at.max(entry.anchor.frame.base), granter as u16, g)
-                        || reserve
-                        || exempt;
+                    let kept =
+                        table.holds_page(at.max(entry.anchor.frame.base), granter as u16, g)
+                            || exempt;
                     ensure(kept, "G5: granted memory owned by another than its granter")?;
                 }
                 if let Some(index) = device {
                     devices[index] += 1;
+                    let kept =
+                        table.taken_by(table.devices[index].owner.raw(), granter as u16, g)
+                            || exempt;
+                    ensure(kept, "G5: granted device owned by another than its granter")?;
                 }
                 let frame = entry.anchor.frame;
                 let page = table.geometry.page();

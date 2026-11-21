@@ -577,7 +577,7 @@ impl Model {
             let stored = table.classes.get(page);
             match class {
                 Some(class) => stored == Some(class),
-                None => stored.is_some_and(|c| c.raw() > 16 && c.root_devices().is_none()),
+                None => stored.is_some_and(|c| c.class() > 16 && c.root_devices().is_none()),
             }
         });
         ensure(classes_right, "59: page classes")?;

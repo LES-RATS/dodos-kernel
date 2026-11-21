@@ -65,3 +65,61 @@ fn sweep_cursor_accuses_third_sealed_node_with_evidence_seal() {
     // All three were accused within ceil(3 / 2) * SWEEP_NS + SEAL_NS.
     assert!(m.sys.now() <= 2 * SWEEP_NS + SEAL_NS + 50 * MS);
 }
+
+/// Pass 40 (v1-E #1): `check_granted` must require `OwnState::Taken` and the
+/// granter's current generation on a reserve chunk; a `Free` reserve chunk
+/// belonging to a reserve the granter holds must be reported under G5.
+#[test]
+fn granted_free_reserve_chunk_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let granter = super::pass24::X;
+    m.supervisor(granter, m.t[usize::from(granter)]);
+    let t0 = &m.sys.node(0).table;
+    let reserve = (0..16u16)
+        .find(|&j| t0.holds_reserve(granter, j))
+        .expect("granter holds a reserve role");
+    for n in 0..3 {
+        m.sys.make_faulty(n);
+    }
+    m.sys.edit_table(|t| {
+        let free_reserve = dodos_abi::Ownership::free(dodos_abi::Owner::Reserve(reserve));
+        std::sync::Arc::make_mut(&mut t.owners)[g.chunk as usize] = free_reserve.raw();
+    });
+    assert_eq!(
+        m.sys.check().expect_err("free reserve chunk under grant"),
+        "G5: granted memory owned by another than its granter"
+    );
+}
+
+/// Pass 40 (v1-E #2): `check_granted` must verify ownership of a granted
+/// device entry; a live granter holding a grant over a device entry it does
+/// not own must be reported under G5.
+#[test]
+fn granted_device_owned_by_another_is_reported() {
+    let g = super::pass24::granted(false);
+    let mut m = g.m;
+    let granter = super::pass24::X;
+    for n in 0..3 {
+        m.sys.make_faulty(n);
+    }
+    m.sys.edit_table(|t| {
+        let dev_base = t.devices[0].base().expect("used device");
+        let entry = t.grants[usize::from(granter)]
+            .values_mut()
+            .next()
+            .expect("a grant entry");
+        entry.anchor.frame.base = dev_base;
+        entry.anchor.frame.pages = 1;
+        let cleared = t.gate_word(g.chunk).with_grants(0).unwrap();
+        std::sync::Arc::make_mut(&mut t.gate_words)[g.chunk as usize] = cleared.raw();
+        std::sync::Arc::make_mut(&mut t.device_grants)[0] = 1;
+        // Device 0 is free (not taken by granter).
+        std::sync::Arc::make_mut(&mut t.devices)[0].owner =
+            dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed);
+    });
+    assert_eq!(
+        m.sys.check().expect_err("unowned device grant"),
+        "G5: granted device owned by another than its granter"
+    );
+}
