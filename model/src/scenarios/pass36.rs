@@ -184,3 +184,36 @@ fn node_send_judges_gone_before_the_busy_of_a_frame_its_gate_refuses() {
     k.m.table.members[1] = fencing;
     assert_eq!(k.m.apply(k.t, send), Err(Error::Gone));
 }
+
+// The long property run of pass 36 (seed 2011, also on b20f664): an event
+// whose change list is observed twice (a `reply_recv` that moves a
+// capability: its reply's part, then its receive's) lists a context
+// twice, [A, B, A], and A's entry in its queue is the later one, after
+// B's. Invariant 60 (the contexts that entered a queue in the last event
+// entered in the order of the change list) read A at its first place and
+// reported the state; its place is its last.
+#[test]
+fn a_context_listed_twice_in_one_event_is_judged_at_its_last_place() {
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.place_first(0);
+    let second = k.thread_on(300, 0);
+    let context = |k: &N, thread| k.m.threads[&thread].home.expect("a context");
+    let entered = |k: &N, id| k.m.scheds[&id].queue.expect("in a queue").entered;
+    let (mut a, mut b) = (context(&k, k.t), context(&k, second));
+    // B entered before A, as now: the queues keep their order.
+    if entered(&k, a) < entered(&k, b) {
+        (a, b) = (b, a);
+    }
+    let from = k.m.entered;
+    k.m.entered += 2;
+    for (id, at) in [(b, from), (a, from + 1)] {
+        let queued = crate::live(&mut k.m.scheds, id).queue.as_mut();
+        queued.expect("in a queue").entered = at;
+    }
+    k.m.event.entered_from = from;
+    k.m.event.changes = vec![a, b, a];
+    assert_eq!(k.m.check(), Ok(()));
+    // Listed once, before B, and entered after it: reported.
+    k.m.event.changes = vec![a, b];
+    assert_eq!(k.m.check(), Err("60: order of entry and the change list"));
+}

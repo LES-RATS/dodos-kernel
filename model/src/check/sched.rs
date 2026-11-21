@@ -264,9 +264,13 @@ impl Model {
             .filter(|&(at, _)| at >= event.entered_from)
             .collect();
         entered.sort();
+        // A context's place is its last in the list: an event that observes
+        // its changes twice (a `reply_recv` that moves a capability) lists
+        // it again when it enters again (pass 36, seed 2011 of the long
+        // property run).
         let positions: Option<Vec<usize>> = entered
             .iter()
-            .map(|(_, id)| event.changes.iter().position(|c| c == id))
+            .map(|(_, id)| event.changes.iter().rposition(|c| c == id))
             .collect();
         let ordered = positions.is_some_and(|p| p.is_sorted());
         ensure(ordered, "60: order of entry and the change list")?;
