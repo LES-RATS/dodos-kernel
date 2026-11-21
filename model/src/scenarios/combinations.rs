@@ -2190,15 +2190,18 @@ fn every_combination_of_recovery_states_is_reached() {
     }
 }
 
-// Found by the long run of pass 35 (all 858 seeds, at dcad8f6), not
-// minimized, the model not fixed: each replays its seed, which depends on
-// the exact draws of `Run` (a change of the generator moves it).
+// Found by the long run of pass 35 (all 858 seeds, at dcad8f6). Each
+// replays its seed, which depends on the exact draws of `Run` (a change of
+// the generator moves it); the directed scenario of each is in
+// `scenarios/pass37.rs`.
 //
-// Seed 605: node 0's recovery reserve makes progress 100,000 times at one
-// instant (`Model::reserve_step`'s bound): a step that never ends its work.
+// Seed 605: node 4's recovery reserve made progress 100,000 times at one
+// instant: its R2 counted as progress a removal that the busy request of
+// its core refused with nothing changed, while the core that request
+// waited for slept (pass 37,
+// `pass37::a_removal_of_r2_refused_by_the_busy_request_of_the_core_is_no_progress`).
 #[test]
-#[ignore = "pass 35: the reserve of seed 605 never goes quiet; not fixed"]
-fn seed_605_of_pass_35_the_reserve_makes_progress_for_ever() {
+fn seed_605_of_pass_35_a_removal_refused_by_a_busy_request_is_no_progress() {
     let _ = explore_one(605);
 }
 

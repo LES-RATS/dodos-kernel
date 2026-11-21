@@ -296,3 +296,66 @@ fn node_send_judges_gone_before_the_busy_of_a_full_grant_table() {
     k.m.table.grants[0] = (0..dodos_abi::GRANTS as u16).map(|g| (g, entry)).collect();
     gone_before_busy(k, send);
 }
+
+// Seed 605 of the long combination run (pass 35; drivers Kill, Retire,
+// Fresh): node 4 of cores 4 and 5, the holder of node 3's grant mapped in
+// its address space, deleted a table run at the instant node 3 became
+// fenced; the run's invalidation took the request of core 4 and waited for
+// core 5, asleep in a state that loses its context (its wake 200 µs away).
+// Its reserve's R2 then removed its remote root of node 3's grant: the
+// unmapping needs the request of the core, which is not free, so the
+// removal returned `again` with nothing changed (A node of several cores,
+// "the request ... is not free"), and R2 counted it as progress. The
+// reserve ran again at the same instant, 100,000 times: the clock never
+// reached core 5's wake. Not a protocol between nodes: one node's step
+// that claims progress where nothing moved, as the record left unmapping
+// that pass 24 fixed. The same here, with nodes 0, 1 and 2.
+#[test]
+fn a_removal_of_r2_refused_by_the_busy_request_of_the_core_is_no_progress() {
+    use super::pass17::kill;
+    use super::pass22::{GOT, granted_on, take};
+    use crate::system::Hardware;
+    use dodos_abi::{IDLE_FLAG_LOSES_CONTEXT, IDLE_METHOD_SBI, MEMORY_TAKE_RUN, Owner, Ownership};
+    const BLOCK: u32 = 160;
+    let mut m = granted_on(&machine(Arch::Riscv64, 4, &[&[0], &[1, 2], &[3]]));
+    m.settle();
+    // Core 2 of node 1 sleeps in a state that loses its context, with an
+    // exit latency of 200 µs.
+    let idle = Syscall::NodeIdle {
+        node: node_cap(1),
+        core: 2,
+        words: vec![
+            200_000,
+            100_000,
+            IDLE_METHOD_SBI | 0x8000_0000 << 32,
+            IDLE_FLAG_LOSES_CONTEXT,
+        ],
+    };
+    m.ok(1, idle);
+    assert_eq!(m.call(1, map_got(1 << 30)), DONE);
+    // Node 2 kills node 0; its reserve writes node 0 fenced.
+    m.supervisor(2, m.t[2]);
+    m.ok(2, kill(0));
+    assert!(m.step_until(|m| m.state(0) == MemberState::Fenced));
+    assert!(matches!(m.sys.hardware(2), Hardware::Asleep { .. }));
+    assert!(!m.sys.node(1).remotes.is_empty(), "R2 not run yet");
+    // At that instant node 1 takes a run and deletes it: the invalidation
+    // of the run takes core 1's request and asks the sleeping core 2.
+    let shift = u64::from(m.sys.canonical().geometry.chunk_shift());
+    let free = Ownership::free(Owner::Unclaimed).raw();
+    let owners = &m.sys.canonical().owners;
+    let chunk = owners.iter().position(|&w| w == free).expect("a chunk") as u64;
+    m.ok(1, take(MEMORY_TAKE_RUN, chunk << shift, shift, BLOCK));
+    // The removal step starts the invalidation and returns `again`.
+    let deleted = m.call(1, Syscall::CapDelete(s(BLOCK)));
+    assert_eq!(deleted, Err(Error::Again));
+    assert!(
+        m.sys.node(1).cores[0].request.is_some(),
+        "the request taken"
+    );
+    // The reserve's R2 waits for the request; core 2 wakes, answers, and
+    // R2 removes the remote root.
+    m.run(MS);
+    assert!(m.sys.node(1).remotes.is_empty());
+    assert_eq!(m.sys.node(1).object_at(m.t[1], s(GOT)), None);
+}

@@ -69,7 +69,16 @@ pub(super) fn map_got(address: u64) -> Syscall {
 /// Three nodes; node 0 sends node 1 one frame (slot `OBJ`) with `derive`;
 /// node 1 receives it in slot `GOT`. Settled unless `settle` is false.
 pub(super) fn granted(settle: bool) -> S {
-    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    let mut m = granted_on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    if settle {
+        m.settle();
+    }
+    m
+}
+
+/// On `machine`, node 0's send of one frame to node 1, not yet settled.
+pub(super) fn granted_on(machine: &crate::boot::Machine) -> S {
+    let mut m = S::on(machine);
     for node in [0, 1] {
         let reply = m.retype(node, ObjectKind::Reply, 0, REPLY);
         m.ok(node, reply);
@@ -90,9 +99,6 @@ pub(super) fn granted(settle: bool) -> S {
         doorbell: SlotAddr::NONE,
     };
     assert_eq!(m.call(0, call), WAITS);
-    if settle {
-        m.settle();
-    }
     m
 }
 

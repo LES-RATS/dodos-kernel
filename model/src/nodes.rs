@@ -1398,15 +1398,7 @@ impl Model {
                 .find(|(_, r)| r.node == node)
                 .map(|(&o, _)| o);
             let Some(object) = object else { break };
-            // A record left unmapping is completed by its request: until it
-            // answers, a removal step changes nothing, and is no progress
-            // (the reserve ran it again at the same instant for ever while
-            // another node's unit had the request, pass 24).
-            let waits = self
-                .caps
-                .values()
-                .any(|c| c.object == object && matches!(c.record, crate::Record::Unmapping(_)));
-            if waits {
+            if self.removal_waits(object) {
                 return any;
             }
             let root = self.objects[&object].root;
@@ -1489,6 +1481,21 @@ impl Model {
             any = true;
         }
         any
+    }
+
+    /// Whether a removal step of a remote object can change nothing now,
+    /// and so is no progress of the reserve: a record of it is left
+    /// unmapping, completed only by its request (the reserve ran the step
+    /// again at the same instant for ever while another node's unit had
+    /// the request, pass 24), or a record of it cannot begin its unmapping,
+    /// the request of the core or the unit request table being taken (seed
+    /// 605 of pass 35: the core's request waited for a core asleep, and the
+    /// clock never reached its wake).
+    fn removal_waits(&self, object: ObjId) -> bool {
+        self.caps.iter().any(|(&id, c)| {
+            c.object == object
+                && (matches!(c.record, crate::Record::Unmapping(_)) || self.unmap_refused(id))
+        })
     }
 
     /// Whether R2 to R4 of this node's reclaim of `node` are done: no

@@ -312,6 +312,9 @@ impl Model {
         let Record::Mapping(mapping) = self.caps[&cap].record else {
             return Ok(Unmapped::Done);
         };
+        if self.unmap_refused(cap) {
+            return Err(Error::Again);
+        }
         let space = mapping.space;
         // A dying aspace whose tag is invalidated on every core: its records
         // are emptied with their counts lowered at once.
@@ -324,9 +327,6 @@ impl Model {
                 self.empty_mapping(cap);
                 return Ok(Unmapped::Done);
             };
-            if self.unit_requests.iter().all(Option::is_some) {
-                return Err(Error::Again);
-            }
             let role = self.unit_role(self.iommus[&iommu].unit);
             self.clear_mapping(cap);
             let who = match waiter {
@@ -338,7 +338,6 @@ impl Model {
             self.unit_request(role, op, who, Some(cap))?;
             return Ok(Unmapped::Waits);
         }
-        self.request_free()?;
         let addresses = self.clear_mapping(cap).expect("a mapping");
         let flush = crate::cores::Flush::Range { space, addresses };
         match self.start_request(flush, crate::cores::Completes::Record(cap), waiter) {
@@ -348,6 +347,29 @@ impl Model {
             }
             crate::cores::Started::Asked => Ok(Unmapped::Waits),
             crate::cores::Started::InUse => unreachable!("judged free"),
+        }
+    }
+
+    /// Whether `begin_unmap` of a record returns `again` with nothing
+    /// changed: its invalidation needs the request of the core (other cores
+    /// may hold the translation) or an entry of the unit request table (an
+    /// iospace that serves devices), and that is not free (A node of
+    /// several cores; IOMMU). A removal step that meets it has made no
+    /// progress.
+    pub(crate) fn unmap_refused(&self, cap: CapId) -> bool {
+        let Record::Mapping(mapping) = self.caps[&cap].record else {
+            return false;
+        };
+        let space = mapping.space;
+        if self.aspaces[&space].flushed {
+            return false;
+        }
+        match self.iospaces.contains_key(&space) {
+            true => {
+                self.unit_of_space(space).is_some()
+                    && self.unit_requests.iter().all(Option::is_some)
+            }
+            false => self.request_free().is_err(),
         }
     }
 }

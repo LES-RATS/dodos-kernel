@@ -642,6 +642,11 @@ comes with its scenario (`gate/pass32_tests.rs`, `scenarios/pass32.rs`,
 - The table chunks' cycle of `combinations.rs` uses slots 600 to 604,
   above the frames of the grant pairs, so it runs on node 3 too; the 27
   seeds of `verify` then miss 437 combinations (448 before).
+- Seed 605 of the long run: R2 counted as progress a removal of a remote
+  root that the busy request of the core refused with nothing changed
+  (`Model::unmap_refused`, shared with `begin_unmap`); the reserve ran
+  again at one instant for ever while the core the request waited for
+  slept. A removal that meets it is no progress (`removal_waits`).
 - The scenarios are in `scenarios/pass37.rs`.
 
 ## Mutations shown equivalent
