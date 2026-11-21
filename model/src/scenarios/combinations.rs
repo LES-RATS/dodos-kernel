@@ -381,6 +381,10 @@ struct Forged {
     end: u64,
     refused: u64,
     action: usize,
+    /// The grant a forged `Release` (action 2) names: the granter reads
+    /// the holder's count when it consumes it, and frees the entry if the
+    /// count fell to 0 meanwhile, which is no fault.
+    grant: Option<u16>,
 }
 
 /// The death of a node, around which the triples are counted: any
@@ -629,6 +633,7 @@ impl Run {
             end,
             refused: self.m.sys.node(to).refused.0,
             action,
+            grant: None,
         });
     }
 
@@ -649,8 +654,11 @@ impl Run {
                 self.forged.push(forged);
                 continue;
             }
+            let freed = forged
+                .grant
+                .is_some_and(|g| !self.m.sys.canonical().grants[to as usize].contains_key(&g));
             assert!(
-                self.m.sys.node(to).refused.0 > forged.refused,
+                self.m.sys.node(to).refused.0 > forged.refused || freed,
                 "the forged message of action {} from node {} to node {to} was not refused",
                 forged.action,
                 forged.from
@@ -1777,6 +1785,9 @@ impl Run {
                     let body = Body::Release { grant, serial };
                     self.m.sys.inject(f, granter, Message { header, body });
                     self.forged(f, granter);
+                    if let Some(forged) = self.forged.last_mut() {
+                        forged.grant = Some(grant);
+                    }
                 }
             }
             // 3: forged `RevokeStep` naming a credit `to` does not have in
@@ -2175,6 +2186,27 @@ fn every_combination_of_recovery_states_is_reached() {
     if replayed().is_none() {
         assert!(missing.is_empty(), "never reached: {missing:#?}");
     }
+}
+
+// Found by the long run of pass 35 (all 858 seeds, at dcad8f6), not
+// minimized, the model not fixed: each replays its seed, which depends on
+// the exact draws of `Run` (a change of the generator moves it).
+//
+// Seed 605: node 0's recovery reserve makes progress 100,000 times at one
+// instant (`Model::reserve_step`'s bound): a step that never ends its work.
+#[test]
+#[ignore = "pass 35: the reserve of seed 605 never goes quiet; not fixed"]
+fn seed_605_of_pass_35_the_reserve_makes_progress_for_ever() {
+    let _ = explore_one(605);
+}
+
+// Seed 763: node 4's context fails rule 43 (its parameters and its state)
+// after its core 4 powered down: a throttled context whose replenishment
+// came due while the core slept deeper than the latency the rule allows.
+#[test]
+#[ignore = "pass 35: rule 43 after a power-down in seed 763; not fixed"]
+fn seed_763_of_pass_35_a_context_fails_rule_43_after_a_power_down() {
+    let _ = explore_one(763);
 }
 
 // Seed 867 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
