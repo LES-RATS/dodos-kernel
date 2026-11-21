@@ -197,6 +197,22 @@ impl Model {
             .any(|&c| self.table.core_beacons[c].vmx)
     }
 
+    /// The successor of a unit role whose holder is `holder`: the first real
+    /// live node after `holder` in cyclic index order whose fence class is the
+    /// highest among real live nodes. Phantom nodes hold no core and run no
+    /// kernel, so they never take a unit role (Roles, Phantom nodes).
+    fn unit_successor(&self, holder: u16) -> Option<u16> {
+        let n = self.table.nodes;
+        let live = |z: u16| self.table.member(z).state() == MemberState::Live && self.real(z);
+        let best = (0..n)
+            .filter(|&z| live(z))
+            .map(|z| self.table.member(z).class())
+            .max()?;
+        (1..=n)
+            .map(|step| (holder + step) % n)
+            .find(|&z| live(z) && self.table.member(z).class() == best)
+    }
+
     /// A seal hands every unit role this node holds to its successor;
     /// returns whether none is held or handing to it any more.
     pub(crate) fn hand_all_units(&mut self) -> bool {
@@ -225,13 +241,13 @@ impl Model {
             }
             // A failed unit's role is handed too, without step 2 (D-145).
             if word.state() == RoleState::Held && !self.handing.contains_key(&role) {
-                let Some(successor) = dodos_abi::successor(&self.table.members, me as usize) else {
+                let Some(successor) = self.unit_successor(me) else {
                     continue;
                 };
                 self.handing.insert(
                     role,
                     Handover {
-                        target: successor as u16,
+                        target: successor,
                         started: self.membership_now(),
                         caller: None,
                         failed: self.unit_failed(role),
@@ -335,9 +351,9 @@ impl Model {
         if let Some(unit) = self.table.units.get_mut(&role) {
             unit.mapped.remove(&self.node);
         }
-        // Step 4: the gate refuses if the target is no longer live; then
-        // this node maps the unit again and stays the holder.
-        if self.table.member(hand.target).state() != MemberState::Live {
+        // Step 4: the gate refuses if the target is no longer live (or is a
+        // phantom); then this node maps the unit again and stays the holder.
+        if self.table.member(hand.target).state() != MemberState::Live || !self.real(hand.target) {
             if let Some(unit) = self.table.units.get_mut(&role) {
                 unit.mapped.insert(self.node);
             }
@@ -404,8 +420,8 @@ impl Model {
             MemberState::Unfenced => record.begun(member.generation())? + FENCE_NS + SETTLE_NS,
             _ => return None,
         };
-        let successor = dodos_abi::successor(&self.table.members, judged as usize)?;
-        (successor == self.node as usize).then_some(at)
+        let successor = self.unit_successor(judged)?;
+        (successor == self.node).then_some(at)
     }
 
     /// Step 5 of a hand-over to this node, or a take-over after a death.

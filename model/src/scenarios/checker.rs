@@ -1220,7 +1220,21 @@ fn a_message_held_after_a_step_that_could_send_it_is_reported() {
 #[test]
 fn a_closed_observation_kept_after_a_step_is_reported() {
     let mut k = node2();
-    k.m.event.closed_kept = true;
+    let g = k.m.table.generation(0);
+    k.m.table.beacons[0]
+        .observations
+        .push(crate::table::Observation {
+            node: 0,
+            generation: g,
+            state: dodos_abi::MemberState::Starting,
+            resume: false,
+            watched: crate::table::Watched::Heartbeat {
+                core: 0,
+                heartbeat: 0,
+            },
+            at: 0,
+        });
+    k.m.event.observed_members = Some(k.m.table.members.clone());
     reported(
         &k,
         "OBSERVATION: a closed observation kept its slot after a step",

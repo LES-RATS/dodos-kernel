@@ -24,10 +24,19 @@ impl Model {
         // it can (D-146): a step of the reserve that had room for all of
         // them left none toward a current granter that can be written to,
         // as judged at that step.
-        ensure(
-            !self.event.closed_kept,
-            "OBSERVATION: a closed observation kept its slot after a step",
-        )?;
+        // D-147: an observation closed by a change of the observed node's
+        // state, generation or resume bit frees its slot at the next step
+        // that takes observations.
+        if let Some(members) = &self.event.observed_members {
+            let me = self.node as usize;
+            ensure(
+                self.table.beacons[me]
+                    .observations
+                    .iter()
+                    .all(|o| o.holds(members[o.node as usize])),
+                "OBSERVATION: a closed observation kept its slot after a step",
+            )?;
+        }
         ensure(
             !self.event.held_after_step,
             "HELD: a message held after a step of the reserve that could send it",

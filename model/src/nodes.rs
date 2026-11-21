@@ -900,11 +900,7 @@ impl Model {
                 }
             }
         }
-        let members = self.table.members.clone();
-        self.event.closed_kept = self.table.beacons[me]
-            .observations
-            .iter()
-            .any(|o| !o.holds(members[o.node as usize]));
+        self.event.observed_members = Some(members);
         let mut sealed_read = Vec::new();
         if swept {
             if matches!(

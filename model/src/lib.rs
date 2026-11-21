@@ -1066,9 +1066,10 @@ struct EventLog {
     /// A step of the recovery reserve in the event left a held message it
     /// could have sent (judged at the step: the granter's word and room).
     held_after_step: bool,
-    /// The node's observations, after a step that took them, kept one that
-    /// no longer holds (D-147: a closed one frees its slot).
-    closed_kept: bool,
+    /// The member words read by `observe_needed` in this event, if it ran
+    /// (D-147: a closed observation frees its slot at each step that takes
+    /// observations).
+    observed_members: Option<Vec<dodos_abi::Member>>,
     /// RISC-V: an arrival of a level line left its APLIC source enabled.
     arrival_enabled: bool,
 }
