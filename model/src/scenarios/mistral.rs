@@ -454,7 +454,10 @@ fn f14_one_interrupt_serves_at_most_sixteen_entries_of_a_user_ring() {
         m.sys.inject(1, 0, message);
     }
     let before = m.sys.canonical().beacons[0].consumed[1].1;
-    m.sys.fire(crate::system::Event::Ipi { node: 0, core: 0 });
+    m.sys.fire(crate::system::Event::Ipi {
+        node: 0,
+        position: 0,
+    });
     let after = m.sys.canonical().beacons[0].consumed[1].1;
     assert_eq!(after - before, dodos_abi::RING_USER_STEP);
     assert_eq!(dodos_abi::RING_USER_STEP, 16);

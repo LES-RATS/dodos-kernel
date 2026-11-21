@@ -526,8 +526,9 @@ impl Model {
         Ok(Output::Done)
     }
 
-    /// `entropy_read`: the four words are mixed into the node's generator,
-    /// which then fills ⌈length / 8⌉ words with `length` bytes.
+    /// `entropy_read`: the four words are mixed into the generator of the
+    /// core the call runs on, which then fills ⌈length / 8⌉ words with
+    /// `length` bytes.
     pub(crate) fn entropy_read(&mut self, thread: ObjId, length: u64, mix: [u64; 4]) -> Outcome {
         self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
         if length > ENTROPY_MAX_BYTES {
@@ -726,5 +727,6 @@ mod tests {
         while deleted == Err(Error::Again) {
             deleted = m.apply(boot, crate::Syscall::CapDelete(own(100)));
         }
+        assert_eq!(deleted, Ok(crate::Output::Done));
     }
 }

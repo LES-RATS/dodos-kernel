@@ -204,6 +204,15 @@ impl Model {
             if let Some(thread) = core.thread {
                 ensure(running.insert(thread), "46: a thread on two cores")?;
                 let marked = self.threads.get(&thread).is_none_or(|t| t.leaving);
+                let suspended = self.threads.get(&thread).is_some_and(|t| t.suspended);
+                let no_context = self
+                    .threads
+                    .get(&thread)
+                    .is_some_and(|t| t.lost && t.recorded.is_some());
+                ensure(
+                    !suspended || marked || (pending && no_context),
+                    "46: suspended thread running without leaving",
+                )?;
                 let aspace = self.threads.get(&thread).and_then(|t| t.aspace);
                 ensure(
                     pending || marked || aspace.is_some_and(|a| !self.marked(a)),

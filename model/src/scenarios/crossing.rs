@@ -111,7 +111,7 @@ fn node_send_delivers_to_the_first_waiting_receiver_with_the_remote_frames() {
     assert!(entry.answered && entry.use_index.is_some());
     assert_eq!(entry.state, GrantState::Live);
     // Its credit is free again.
-    assert_eq!(m.sys.node(0).peers[1].sends(), (0, 0));
+    assert_eq!(m.sys.node(0).peers[1].sends(), 0);
 }
 
 #[test]
@@ -305,7 +305,7 @@ fn a_send_answer_is_applied_whether_or_not_the_sending_thread_still_waits() {
             .values()
             .all(|e| e.answered && e.use_index.is_some())
     );
-    assert_eq!(m.sys.node(0).peers[1].sends(), (0, 0));
+    assert_eq!(m.sys.node(0).peers[1].sends(), 0);
 }
 
 #[test]
@@ -759,7 +759,7 @@ fn r0_ends_with_gone_the_wait_for_an_answer_of_a_node_accused_first() {
     m.settle();
     assert_eq!(m.woken(0), Some(&Err(Error::Gone)));
     // R0 freed the credit toward node 1.
-    assert_eq!(m.sys.node(0).peers[1].sends(), (0, 0));
+    assert_eq!(m.sys.node(0).peers[1].sends(), 0);
 }
 
 #[test]

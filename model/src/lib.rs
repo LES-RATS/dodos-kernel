@@ -385,9 +385,10 @@ pub enum Syscall {
     },
     TaskRevoke(SlotAddr),
     TaskRead(SlotAddr),
-    /// The memory_control, the kind (0 a run, 1 a device entry), the place
-    /// (a physical base or an entry's index), the size (the log2 of the
-    /// run's bytes, or 0), and the destination.
+    /// The memory_control, the kind (0 an ordinary run, 1 a device entry,
+    /// 2 a table run, D-154), the place (a physical base or an entry's
+    /// index), the size (the log2 of the run's bytes for kinds 0 and 2, or
+    /// 0 for kind 1), and the destination.
     MemoryTake {
         control: SlotAddr,
         kind: u64,

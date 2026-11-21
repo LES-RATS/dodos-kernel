@@ -61,10 +61,12 @@ pub enum Hardware {
 /// One event that can happen now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A core of a node takes its pending interrupts.
-    Ipi { node: u16, core: usize },
-    /// A core of a node takes its timer interrupt, due now.
-    Timer { node: u16, core: usize },
+    /// A core of a node takes its pending interrupts (`position` is its
+    /// index in that node's `cores`).
+    Ipi { node: u16, position: usize },
+    /// A core of a node takes its timer interrupt, due now (`position` is
+    /// its index in that node's `cores`).
+    Timer { node: u16, position: usize },
     /// The hardware carries out an action a node asked for.
     Action(usize),
     /// The park stub halts after a read that found no start request.
@@ -317,6 +319,10 @@ impl System {
             });
             if dead {
                 self.nodes[slot as usize] = None;
+            } else if slot != node
+                && let Some(other) = self.nodes[slot as usize].as_mut()
+            {
+                other.event.observed_members = None;
             }
         }
     }
@@ -333,25 +339,31 @@ impl System {
         let mut events = Vec::new();
         for (slot, model) in self.nodes.iter().enumerate() {
             let Some(model) = model else { continue };
-            for (core, _) in model.pending_ipis() {
+            for (position, _) in model.pending_ipis() {
                 let event = Event::Ipi {
                     node: slot as u16,
-                    core,
+                    position,
                 };
-                if !events.contains(&event) && !model.is_silent(core) && self.awake(model, core) {
+                if !events.contains(&event)
+                    && !model.is_silent(position)
+                    && self.awake(model, position)
+                {
                     events.push(event);
                 }
             }
-            for core in 0..model.core_count() {
-                if !model.is_silent(core) && model.due_now(core) && self.awake(model, core) {
+            for position in 0..model.core_count() {
+                if !model.is_silent(position)
+                    && model.due_now(position)
+                    && self.awake(model, position)
+                {
                     events.push(Event::Timer {
                         node: slot as u16,
-                        core,
+                        position,
                     });
                 }
-                let number = model.core_number(core);
+                let number = model.core_number(position);
                 if self.hardware[number] == Hardware::Running
-                    && model.sleep_state(core).is_some()
+                    && model.sleep_state(position).is_some()
                     && matches!(self.machine.arch, Arch::Aarch64 | Arch::Riscv64)
                 {
                     events.push(Event::Sleep { core: number });
@@ -559,12 +571,12 @@ impl System {
             return;
         }
         match event {
-            Event::Ipi { node, core } => {
-                self.model(node).take_interrupts(core);
+            Event::Ipi { node, position } => {
+                self.model(node).take_interrupts(position);
                 self.after(node);
             }
-            Event::Timer { node, core } => {
-                self.model(node).timer_interrupt(core);
+            Event::Timer { node, position } => {
+                self.model(node).timer_interrupt(position);
                 self.after(node);
             }
             Event::Action(index) => {
@@ -671,8 +683,8 @@ impl System {
                         .find(|&p| m.timer_of(p).is_some_and(|at| at <= self.now))
                         .map(|p| (slot as u16, p))
                 });
-                let Some((node, core)) = due else { break };
-                self.fire(Event::Timer { node, core });
+                let Some((node, position)) = due else { break };
+                self.fire(Event::Timer { node, position });
             }
             if self.stopped {
                 return;
@@ -912,15 +924,7 @@ impl System {
             // x86-64: the NMI. The node kernel's handler parks its core only
             // if the core's word carries the fence mark, and otherwise
             // returns and changes nothing (D-134: a late start wake is not
-            // a fence signal); the stop is sent only under a marked word,
-            // so this guards a future path that would reuse it.
-            (
-                Arch::X86_64,
-                Hardware::Running
-                | Hardware::Hung { nmi: true }
-                | Hardware::Entering
-                | Hardware::EntryStub { installed: true },
-            ) if !self.marked(core) => {}
+            // a fence signal).
             (Arch::X86_64, _) if !self.marked(core) => {}
             // The NMI: a kernel that can run its handler writes what it can
             // of the crash record, leaves VMX root operation if it is in it,
@@ -1249,7 +1253,9 @@ impl System {
             // first observations at instant 0; pass 38: its start entry).
             model.begin_fresh();
             self.nodes[node as usize] = Some(model);
-        } else if (0..self.model(node).core_count()).all(|p| self.model(node).is_silent(p)) {
+        } else if self.table().member(node).resuming()
+            && (0..self.model(node).core_count()).all(|p| self.model(node).is_silent(p))
+        {
             let readable = !self.table().resume_replacement[node as usize]
                 || self.machine.replacement_reads_sealed;
             self.model(node).begin_resume(readable);

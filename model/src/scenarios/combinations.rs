@@ -3375,11 +3375,11 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         loop {
             let ipi = crate::system::Event::Ipi {
                 node: sleeper,
-                core: 0,
+                position: 0,
             };
             let timer = crate::system::Event::Timer {
                 node: sleeper,
-                core: 0,
+                position: 0,
             };
             let evs = run.m.sys.events();
             if evs.contains(&ipi) {

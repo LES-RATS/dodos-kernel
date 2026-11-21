@@ -233,7 +233,7 @@ impl Model {
         // The state: the sends in flight to the node (two kept for a
         // capability with `manage`), the room in the user ring, the free
         // entries of the grant table.
-        let (in_flight, _) = self.peers[target as usize].sends();
+        let in_flight = self.peers[target as usize].sends();
         let limit = match manage {
             true => dodos_abi::SENDS_PER_PEER,
             false => dodos_abi::SENDS_PER_PEER - dodos_abi::SENDS_RESERVED_FOR_MANAGE,

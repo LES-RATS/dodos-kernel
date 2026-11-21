@@ -107,10 +107,12 @@ pub(crate) struct Starting {
 /// The fence repeats its stops every millisecond for a core not confirmed.
 pub(crate) const FENCE_RETRY_NS: u64 = 1_000_000;
 
-/// The round of the ARM64 fence: the x86-64 one, 11.2 ms (`NMI_GRACE_NS`,
-/// 10 ms and 200 µs), at the start of which the driver reads
-/// `AFFINITY_INFO` of each core not yet confirmed and signals those (The
-/// fence, ARM64, D-143).
+/// The round of the ARM64 and RISC-V cooperative fences: 11.2 ms (sized to
+/// the SDM x86-64 start-up round of `NMI_GRACE_NS` = 1 ms plus 10 ms INIT
+/// and 200 µs SIPI delays, whereas the model's x86-64 fence retries every
+/// `FENCE_RETRY_NS` = 1 ms), at the start of which the driver reads
+/// `AFFINITY_INFO` or `sbi_hart_get_status` of each core not yet confirmed
+/// and signals those (The fence, ARM64 / RISC-V, D-143).
 pub(crate) const FENCE_ROUND_ARM64_NS: u64 = 11_200_000;
 
 impl Model {
@@ -525,6 +527,8 @@ impl Model {
         if index >= NODE_WATCH_SLOTS {
             return Err(Error::Invalid);
         }
+        // Watch slots belong to the node (contract `node_watch`): any
+        // caller with `read` on its own node may unbind a slot with notify 0.
         let slot = &mut self.watchers[index as usize];
         if notify.is_some() && slot.is_some() {
             return Err(Error::Busy);
@@ -719,7 +723,8 @@ impl Model {
                         && beacon.heartbeat.0 == heartbeat
                         && now >= observation.at + self.table.stale_ns
                         && now - self.table.stale_ns > beacon.idle_until.0;
-                    let starting = member.state() == MemberState::Starting
+                    let starting = named
+                        && starting_node
                         && beacon.heartbeat.0 == heartbeat
                         && now >= observation.at + START_NS;
                     if stale || starting {
@@ -1730,8 +1735,9 @@ impl Model {
                     if let Some(grant) = next
                         && self.grant_still_counted(node, grant)
                     {
+                        *units += 1;
                         self.reclaims.get_mut(&node).expect("a reclaim").clear = Some(cursor);
-                        return any;
+                        return before;
                     }
                     match next {
                         Some(grant) => {
@@ -1785,9 +1791,10 @@ impl Model {
                                     == Some(dodos_abi::AttachState::Attached)
                             });
                             if still {
+                                *units += 1;
                                 self.reclaims.get_mut(&node).expect("a reclaim").clear =
                                     Some(cursor);
-                                return any;
+                                return before;
                             }
                             match (attached, entry) {
                                 (Some(key), _) => {
@@ -1959,7 +1966,7 @@ impl Model {
                     self.seal = Some(SealStep::Parking);
                     return true;
                 }
-                handed && quiet
+                false
             }
             SealStep::Parking => {
                 let others =
@@ -2270,13 +2277,7 @@ impl Model {
     /// has work that can progress (and its last step at this instant did),
     /// otherwise the next instant at which time makes some work possible.
     pub(crate) fn reserve_due(&self) -> Option<u64> {
-        if !self.table.member(self.node).writes()
-            && !self
-                .table
-                .member(self.node)
-                .state()
-                .eq(&MemberState::Starting)
-        {
+        if !self.table.member(self.node).writes() {
             return None;
         }
         if self.stalled != Some(self.now) && self.reserve_work() {

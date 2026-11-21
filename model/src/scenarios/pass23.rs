@@ -55,7 +55,10 @@ fn a_request_across_a_long_stop_is_late_only_on_the_clock_less_the_stopped_time(
     // The requesting core takes a timer interrupt at the release (a timer
     // whose instant the stop spanned falls due then): its request is past
     // `CORE_ANSWER_NS` on the hardware clock, not on membership's.
-    m.sys.fire(crate::system::Event::Timer { node: 1, core: 0 });
+    m.sys.fire(crate::system::Event::Timer {
+        node: 1,
+        position: 0,
+    });
     assert_eq!(m.sys.check(), Ok(()));
     assert!(!accused(&m, 1), "a stop is not the core's silence");
     m.run(answer / 2);

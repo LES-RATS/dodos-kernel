@@ -122,10 +122,7 @@ impl crate::Model {
         if self.width() == 1 {
             return;
         }
-        let gate = !self.table.writes.is_empty()
-            || !self.table.member_writes.is_empty()
-            || !self.table.role_writes.is_empty()
-            || *self.table.gated;
+        let gate = *self.table.gated;
         let waits = self.locks.steps.iter().any(|s| matches!(s, Step::Wait(_)));
         let lock_free = self.locks.lock_free && !self.locks.woke && !waits && !gate;
         let mut steps = Vec::new();

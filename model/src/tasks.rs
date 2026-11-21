@@ -172,6 +172,11 @@ impl Model {
     /// A step of `task_revoke` on one thread: its wait ends with `gone`, it
     /// is suspended and detached, keeping the marks of the task.
     pub(crate) fn stop(&mut self, thread: ObjId) {
+        debug_assert!(
+            !self.threads[&thread].leaving
+                && !self.running_core(thread).is_some_and(|c| c != *self.at),
+            "stop must not suspend a thread still running on another core"
+        );
         // A thread that waits for another node, a unit, its node's cores or
         // a hand-over is stopped when its call returns: its wait is not
         // ended.

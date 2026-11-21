@@ -690,6 +690,7 @@ impl Table {
         let before = self.members[node as usize];
         self.members[node as usize] = to;
         self.member_writes.push((node, writer, before, to));
+        self.gated.0 = true;
     }
 
     /// The gate writes a role word.
@@ -697,6 +698,7 @@ impl Table {
         let before = self.roles[role];
         self.roles[role] = to;
         self.role_writes.push((role, writer, before, to));
+        self.gated.0 = true;
     }
 
     /// The gate word of a chunk (G4).
@@ -935,6 +937,7 @@ impl Table {
         let write = self.journal(writer, Word::Chunk(chunk), before, after.raw());
         Arc::make_mut(&mut self.owners)[chunk as usize] = after.raw();
         self.writes.push(write);
+        self.gated.0 = true;
         true
     }
 
@@ -954,6 +957,7 @@ impl Table {
         let write = self.journal(writer, Word::Chunk(chunk), before, after.raw());
         Arc::make_mut(&mut self.owners)[chunk as usize] = after.raw();
         self.writes.push(write);
+        self.gated.0 = true;
     }
 
     /// The write gate on the ownership word of a device entry.
@@ -965,6 +969,7 @@ impl Table {
         let write = self.journal(writer, Word::Entry(index), before, entry.owner.raw());
         Arc::make_mut(&mut self.devices)[index] = entry;
         self.writes.push(write);
+        self.gated.0 = true;
         true
     }
 
@@ -986,6 +991,7 @@ impl Table {
             None => self.identifiers.remove(&key),
         };
         self.writes.push(write);
+        self.gated.0 = true;
     }
 
     /// The attach word of a device identifier, 0 if it is not listed.
@@ -1009,6 +1015,7 @@ impl Table {
             true => self.attach.remove(&key),
             false => self.attach.insert(key, after.raw()),
         };
+        self.gated.0 = true;
         true
     }
 
@@ -1047,5 +1054,6 @@ impl Table {
             None => self.lines.remove(&gsi),
         };
         self.writes.push(write);
+        self.gated.0 = true;
     }
 }

@@ -712,7 +712,7 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
                     waiter_destroyed += usize::from(waiting && deleted == Some(DONE));
                 }
                 2 => {
-                    let sends = m.sys.has(0) && m.sys.node(0).peers[1].sends().0 > 0;
+                    let sends = m.sys.has(0) && m.sys.node(0).peers[1].sends() > 0;
                     let killed = try_call(&mut m, 2, kill(1)) == Some(DONE);
                     in_flight_at_death += usize::from(sends && killed);
                 }
@@ -723,7 +723,7 @@ fn waiter_threads_that_wait_for_a_send_answer_are_destroyed_and_the_receiver_die
         // Liveness: no thread of node 0 waits for node 1, and no credit of
         // node 0 toward node 1 is in use.
         assert!(!waits_bounded(&m, 0), "seed {seed}");
-        assert_eq!(m.sys.node(0).peers[1].sends().0, 0, "seed {seed}");
+        assert_eq!(m.sys.node(0).peers[1].sends(), 0, "seed {seed}");
         assert_live(&m, seed, 3);
     }
     reached(

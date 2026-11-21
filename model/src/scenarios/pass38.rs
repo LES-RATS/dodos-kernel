@@ -18,7 +18,10 @@ use dodos_abi::Evidence;
 #[test]
 fn a_node_that_writes_sealed_fences_and_accuses_nothing_in_the_same_step() {
     let mut m = S::on(&machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]));
-    let step = Event::Timer { node: 1, core: 0 };
+    let step = Event::Timer {
+        node: 1,
+        position: 0,
+    };
     m.ok(0, seal(1));
     m.fail(3);
     assert!(m.sys.events().contains(&step));
@@ -284,7 +287,10 @@ fn a_sealing_node_answers_a_report_ask_that_reached_it_while_its_cores_park() {
         t.rings[holder as usize][2].kernel.produced != t.beacons[2].consumed[holder as usize].0
     };
     assert!(unread(&m));
-    let step = crate::system::Event::Timer { node: 2, core: 0 };
+    let step = crate::system::Event::Timer {
+        node: 2,
+        position: 0,
+    };
     let due = m.step_until(|m| m.sys.events().contains(&step));
     assert!(due && m.state(sealing) == MemberState::Sealing && unread(&m));
     m.sys.fire(step);

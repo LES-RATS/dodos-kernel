@@ -573,7 +573,10 @@ fn one_interrupt_serves_sixteen_entries_of_a_user_ring_not_sixteen_messages() {
         m.sys.inject(1, 0, send);
     }
     let start = m.sys.canonical().beacons[0].consumed[1].1;
-    m.sys.fire(crate::system::Event::Ipi { node: 0, core: 0 });
+    m.sys.fire(crate::system::Event::Ipi {
+        node: 0,
+        position: 0,
+    });
     let served = m.sys.canonical().beacons[0].consumed[1].1 - start;
     assert_eq!(served, dodos_abi::RING_USER_STEP);
 }

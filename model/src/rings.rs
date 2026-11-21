@@ -255,16 +255,9 @@ impl Peer {
             .map(|i| i as u8)
     }
 
-    /// The sends in flight, and those through a capability without
-    /// `manage`.
-    pub(crate) fn sends(&self) -> (usize, usize) {
-        let sends = self.credits[REQUESTS_PER_PEER..].iter().flatten();
-        let all: Vec<&Credit> = sends.collect();
-        let plain = all
-            .iter()
-            .filter(|c| matches!(c.completes, Completes::Send { manage: false, .. }))
-            .count();
-        (all.len(), plain)
+    /// The sends in flight.
+    pub(crate) fn sends(&self) -> usize {
+        self.credits[REQUESTS_PER_PEER..].iter().flatten().count()
     }
 }
 

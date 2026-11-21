@@ -983,10 +983,10 @@ impl Machine {
         let slots_ok = n >= 1 && n as usize <= NODES_MAX && n as usize <= self.cores.len();
         // Each IOMMU unit leaves every node slot at least one domain number
         // (Devices and shared hardware, domain numbers, D-134).
-        let domains_ok = self
-            .iommus
-            .iter()
-            .all(|u| u64::from(u.domains.saturating_sub(2)) / n.max(1) >= 1);
+        let domains_ok = self.iommus.iter().all(|u| {
+            u.domains <= u32::from(u16::MAX) + 1
+                && u64::from(u.domains.saturating_sub(2)) / n.max(1) >= 1
+        });
         // The layout leaves no core firmware booted in no node (Start-up
         // state: the kernel refuses to start if `BootNodes` "leaves the core
         // firmware booted in no node").

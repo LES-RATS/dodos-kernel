@@ -1146,7 +1146,19 @@ impl Model {
                     || self.unbind_one_irq(object)
                     || self.unwatch_one(object)
                     || self.undoorbell_one(object) => {}
-            // Destroying a task detaches its threads.
+            // Destroying a task detaches its threads; if the task was
+            // revoked, wait until any thread marked leaving (or still
+            // running on another core) has left (same rule as `task_revoke`,
+            // v2-B B-1).
+            ObjectKind::Task
+                if self.tasks[&object].revoked
+                    && self.tasks[&object].threads.iter().any(|t| {
+                        self.threads[t].leaving
+                            || self.running_core(*t).is_some_and(|c| c != *self.at)
+                    }) =>
+            {
+                return Undone::Wait;
+            }
             ObjectKind::Task if self.detach_one(object) => {}
             ObjectKind::Irq => return self.irq_removal(object),
             // IOMMU: the destruction of an iospace first detaches each of its

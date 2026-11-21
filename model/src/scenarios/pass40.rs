@@ -186,3 +186,117 @@ fn seal_hands_unit_role_past_phantom_to_real_successor() {
         "unit role must be handed to real node 0, not phantom node 2"
     );
 }
+
+// v2-B B-1: destroying a revoked task must wait while any of its threads is
+// still leaving another core, just as `task_revoke` does.
+#[test]
+fn destroying_revoked_task_waits_for_thread_leaving_other_core() {
+    let (mut k, other) = super::cores::two_threads(Arch::X86_64, 2);
+    k.ok(k.retype(ObjectKind::Task, 0, 310));
+    k.ok(Syscall::TaskAttach {
+        thread: s(300),
+        task: s(310),
+    });
+    assert_eq!(k.m.cores[1].thread, Some(other));
+    // First call sets `revoked` and marks `other` leaving on core 1.
+    assert_eq!(k.m.apply(k.t, Syscall::TaskRevoke(s(310))), Err(Error::Again));
+    assert!(k.m.threads[&other].leaving);
+    // Deleting the task before core 1 handles the leave IPI must return
+    // `Again` without suspending or detaching `other`.
+    assert_eq!(k.m.apply(k.t, Syscall::CapDelete(s(310))), Err(Error::Again));
+    assert_eq!(k.m.check(), Ok(()));
+    assert!(!k.m.threads[&other].suspended);
+    assert!(k.m.threads[&other].task.is_some());
+    // Once core 1 leaves `other`, deleting the task finishes cleanly.
+    k.interrupts();
+    k.ok(Syscall::CapDelete(s(310)));
+    assert_eq!(k.m.check(), Ok(()));
+}
+
+// v2-B B-4: `end_locks` uses the per-event `table.gated` flag rather than
+// the cross-event write journal, so an unchecked gate write does not cause a
+// subsequent non-gate syscall to record `Lock(Gate)`.
+#[test]
+fn unchecked_gate_write_does_not_mark_next_event_as_taking_gate_lock() {
+    let (mut k, _) = super::cores::two_threads(Arch::X86_64, 2);
+    // Perform a gate write without calling `k.m.check()` afterward.
+    let chunk = k
+        .m
+        .table
+        .owners
+        .iter()
+        .position(|&raw| {
+            dodos_abi::Ownership::from_raw(raw).is_some_and(|o| {
+                o.state() == dodos_abi::OwnState::Free && o.owner() == dodos_abi::Owner::Unclaimed
+            })
+        })
+        .expect("a free unclaimed chunk") as u64;
+    let base = chunk * k.m.table.geometry.chunk();
+    let take = Syscall::MemoryTake {
+        control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),
+        kind: dodos_abi::MEMORY_TAKE_RUN,
+        place: base,
+        size: k.m.table.geometry.chunk_shift() as u64,
+        destination: s(320),
+    };
+    assert_eq!(k.m.apply(k.t, take), DONE);
+    assert!(!k.m.table.writes.is_empty());
+    assert!(
+        k.m.locks
+            .steps
+            .contains(&crate::locks::Step::Lock(crate::locks::LockId::Gate))
+    );
+    // Next event makes no gate call: must NOT record `Lock(Gate)` even
+    // though `table.writes` was never cleared by `check()`.
+    assert_eq!(k.m.apply(k.t, Syscall::Yield), DONE);
+    assert!(
+        !k.m.locks
+            .steps
+            .contains(&crate::locks::Step::Lock(crate::locks::LockId::Gate)),
+        "Yield recorded Lock(Gate) from an earlier unchecked event"
+    );
+    assert_eq!(k.m.check(), Ok(()));
+}
+
+// v2-C #4: `take_over_due` must not allow immediate take-over when the fence
+// record does not confirm the judged generation.
+#[test]
+fn take_over_waits_when_fence_record_missing_for_fenced_holder() {
+    let mut m = S::on(&machine(Arch::X86_64, 2, &[&[0], &[1]]));
+    let unit_role = m
+        .sys
+        .node(0)
+        .table
+        .role_records
+        .iter()
+        .position(|r| r.kind == dodos_abi::RoleKind::Unit)
+        .expect("a unit role");
+    let holder = m.sys.role(unit_role).holder();
+    let other = 1 - holder;
+    // Mark `holder` Fenced at generation 1 without any matching fence record.
+    m.sys.edit_table(|t| {
+        t.members[usize::from(holder)] =
+            dodos_abi::Member::new(MemberState::Fenced, Evidence::None, other, 1).with_class(2);
+        t.fences[usize::from(holder)] = crate::table::FenceRecord::default();
+    });
+    // Advance well past `SETTLE_NS`: `other` must not take over without a
+    // matching confirmed fence record.
+    m.sys.advance(10 * MS);
+    assert_eq!(
+        m.sys.role(unit_role).holder(),
+        holder,
+        "unit role was taken over without a confirmed fence record"
+    );
+}
+
+// v2-C #7: boot refuses an IOMMU unit whose domain count exceeds u16 range.
+#[test]
+fn boot_refuses_iommu_with_more_than_65536_domains() {
+    let mut mach = machine(Arch::X86_64, 2, &[&[0], &[1]]);
+    mach.iommus[0].domains = 70_000;
+    assert_eq!(
+        crate::Model::boot(&mach).err(),
+        Some(crate::Refusal::MachineValues)
+    );
+}
+

@@ -413,10 +413,8 @@ impl Model {
         let record = &self.table.fences[judged as usize];
         let same = record.generation == member.generation();
         let at = match member.state() {
-            MemberState::Fenced | MemberState::Dead if same => {
-                record.confirmed.unwrap_or(0) + SETTLE_NS
-            }
-            MemberState::Fenced | MemberState::Dead => SETTLE_NS,
+            MemberState::Fenced | MemberState::Dead if same => record.confirmed? + SETTLE_NS,
+            MemberState::Fenced | MemberState::Dead => return None,
             MemberState::Unfenced => record.begun(member.generation())? + FENCE_NS + SETTLE_NS,
             _ => return None,
         };
