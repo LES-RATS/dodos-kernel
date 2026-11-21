@@ -3130,6 +3130,29 @@ fn module_frames_of_a_length_beyond_the_addresses_does_not_overflow() {
     assert!(frames.take(3).count() == 3);
     let frames = module_frames(u64::MAX - 4095, None, 4096, x86_64::GEOMETRY);
     assert_eq!(frames.count(), 1);
+    // Saturated end must be page-aligned so iterating to completion terminates
+    // without emitting zero-page frames (pass 40, v1-A #1).
+    let huge = Geometry {
+        page_shift: [52, 0, 0, 0],
+        entries: 512,
+        levels: 4,
+        user_end: 0,
+    };
+    let all: Vec<_> = module_frames(0, None, u64::MAX, huge).take(20).collect();
+    assert_eq!(all.len(), 8);
+    assert!(all.iter().all(|f| f.pages > 0));
+    assert_eq!(all.iter().map(|f| f.pages).sum::<u64>(), 4095);
+}
+
+#[test]
+fn core_transition_rejects_leaving_to_leaving_unusable() {
+    // Construct a valid-checksum Leaving word (state = 2, slot = 1, gen = 1).
+    let base = (CoreState::Leaving as u64) | (1u64 << 16) | (1u64 << 32);
+    let checked = |v: u64| v | ((v.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) << 4);
+    let leaving = CoreWord::from_raw(checked(base)).expect("valid checksum");
+    assert_eq!(leaving.state(), CoreState::Leaving);
+    let leaving_unusable = leaving.unusable();
+    assert_eq!(core_transition(leaving, leaving_unusable), None);
 }
 
 #[test]

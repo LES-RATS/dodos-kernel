@@ -1779,7 +1779,9 @@ pub const fn core_transition(from: CoreWord, to: CoreWord) -> Option<CoreTransit
         {
             Some(CoreTransition::Mark)
         }
-        (a, b) if a as u8 == b as u8 && named && mark.0 == mark.1 && !unusable.0 && unusable.1 => {
+        (Free, Free) | (Owned, Owned) | (Joining, Joining)
+            if named && mark.0 == mark.1 && !unusable.0 && unusable.1 =>
+        {
             Some(CoreTransition::Unusable)
         }
         _ => None,
@@ -2076,9 +2078,13 @@ pub const fn module_frames(
         phys,
         virt,
         offset: 0,
-        // Saturated: a length that passes the addresses gives frames up to
-        // the end of them, never an overflow (M2).
-        end: len.div_ceil(page).saturating_mul(page),
+        // Saturated down to the largest page multiple: a length that passes
+        // the addresses gives frames up to the end of them without overflowing
+        // or stalling on a partial trailing page (M2; pass 40, v1-A #1).
+        end: match len.div_ceil(page).checked_mul(page) {
+            Some(end) => end,
+            None => u64::MAX - (page - 1),
+        },
         geometry,
     }
 }
@@ -2619,16 +2625,18 @@ mod proofs {
     /// written, and D-158's resume takes an unmarked owned word to joining.
     #[kani::proof]
     fn the_core_word_check_accepts_exactly_the_rows() {
-        let (from, _, _, _, _) = any_named_word();
-        let to = match kani::any::<u8>() % 3 {
+        let any_word = || match kani::any::<u8>() % 4 {
             0 => CoreWord::free(kani::any()),
+            1 => {
+                let (slot, generation): (u16, u32) = (kani::any(), kani::any());
+                let flags = (if kani::any() { CORE_MARK } else { 0 })
+                    | (if kani::any() { CORE_UNUSABLE } else { 0 });
+                CoreWord::make(CoreState::Leaving, slot, generation, flags)
+            }
             _ => any_named_word().0,
         };
-        let from = if kani::any() {
-            CoreWord::free(kani::any())
-        } else {
-            from
-        };
+        let from = any_word();
+        let to = any_word();
         let Some(row) = core_transition(from, to) else {
             return;
         };
