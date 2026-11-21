@@ -131,7 +131,7 @@ fn r6_on_a_failed_unit_retires_every_handle_of_the_nodes_cores() {
     run(OldRules::default()).expect("the tables");
 }
 
-/// Node 1's `its_table` at page 12, device 1 mapped by the ITS.
+/// Node 1's `its_table` at page 8, device 1 mapped by the ITS.
 fn its_mapped(old: OldRules) -> Machine {
     let mut m = with(old);
     steps(
@@ -482,18 +482,27 @@ fn a_stale_free_list_link_is_never_followed() {
                 next: Some(1),
             },
             Op::TableFree { n: 0, page: 1 },
-            Op::Write {
-                n: 0,
-                page: 1,
-                value: 0xdead,
-            },
-            Op::Hook {
-                n: 0,
-                root: 2,
-                e0: 1,
-                child: 0,
-            },
         ],
+    )
+    .expect("setup");
+    // Page 1 lies in node 0's table floor (mapped read-only, D-154), so a
+    // kernel write to it must fault even after TableFree returns it to Data.
+    assert_eq!(
+        m.step(&Op::Write {
+            n: 0,
+            page: 1,
+            value: 0xdead,
+        }),
+        Err(Refused::Condition)
+    );
+    steps(
+        &mut m,
+        &[Op::Hook {
+            n: 0,
+            root: 2,
+            e0: 1,
+            child: 0,
+        }],
     )
     .expect("the stale link harms nothing");
     assert_eq!(m.gate.links.get(&0), None, "the hook clears its own link");

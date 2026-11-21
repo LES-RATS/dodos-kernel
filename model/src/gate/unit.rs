@@ -138,7 +138,7 @@ impl UnitGate {
             epoch: 0,
             failed: false,
             records: vec![[empty; UNIT_ENTRIES]; usize::from(nodes)],
-            gate_records: vec![[None, None]; usize::from(nodes)],
+            gate_records: vec![[const { None }; UNIT_ENTRIES]; usize::from(nodes)],
             services: Vec::new(),
             submissions: Vec::new(),
             domains: vec![None; usize::from(nodes)],
@@ -631,7 +631,7 @@ impl Machine {
                 record.state = RecordState::Void;
             }
         }
-        self.unit.gate_records[usize::from(n)] = [None, None];
+        self.unit.gate_records[usize::from(n)] = [const { None }; UNIT_ENTRIES];
     }
 
     /// The unit's caches: every context entry, kept until a completed

@@ -322,8 +322,21 @@ fn an_untagged_root_load_invalidates_the_cores_whole_tlb() {
     steps(&mut m, &[Op::Idle { n: 0, p: 1 }]);
     assert_eq!(cached(&m, 1), []);
     assert!(m.gate.nodes[0].idle.iter().all(|word| !word.owes));
-    // A root of another node, a root that is not live, another tag.
-    assert_eq!(m.step(&load0(1, 10)), Err(Refused::Condition));
+    // A live root of another node (node 1's page 8), a page that is not a live
+    // root (page 16), and a non-zero tag.
+    steps(
+        &mut m,
+        &[
+            Op::RetypeRoot { n: 1, page: 8 },
+            Op::Bind {
+                n: 1,
+                root: 8,
+                tag: 0,
+            },
+        ],
+    );
+    assert_eq!(m.gate.classes[8], Class::Root(RootState::Live));
+    assert_eq!(m.step(&load0(1, 8)), Err(Refused::Condition));
     assert_eq!(m.step(&load0(1, 16)), Err(Refused::Condition));
     let tagged = Op::Load {
         n: 0,
@@ -550,3 +563,18 @@ fn faulty_kernels_keep_g_on_untagged_machines() {
         "{switches} switches, {foreign} foreign"
     );
 }
+
+// Pass 40 (v2-D #4): sealing on an untagged machine loads the kernel root via
+// load_kernel_root, invalidating each core's TLB so no stale user translations
+// remain cached after seal.
+#[test]
+fn an_untagged_seal_invalidates_each_cores_tlb() {
+    let mut m = untagged(0, OldRules::default());
+    steps(&mut m, &[load0(1, A)]);
+    assert_eq!(cached(&m, 1), [((0, 0), 16)]);
+    steps(&mut m, &[Op::Seal { n: 0 }]);
+    assert_eq!(m.gate.members[0].state, NodeState::Sealed);
+    assert_eq!(cached(&m, 0), []);
+    assert_eq!(cached(&m, 1), []);
+}
+

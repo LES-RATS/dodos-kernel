@@ -30,9 +30,9 @@ impl DeviceEntry {
 }
 
 /// An access the gate executed (for the checker): the caller, its
-/// generation, the port, and the ownership word of the entry the port
+/// generation, the port, the entry index and ownership word the port
 /// table named then (or none), and the `platform` holder then.
-pub(crate) type Access = (u16, u32, u16, Option<Option<(u16, u32)>>, u16);
+pub(crate) type Access = (u16, u32, u16, Option<(usize, Option<(u16, u32)>)>, u16);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PortGate {
@@ -156,7 +156,7 @@ impl Machine {
             }
             None => require(self.ports.platform == n)?,
         }
-        let owner = named.map(|e| self.ports.owners[e]);
+        let owner = named.map(|e| (e, self.ports.owners[e]));
         self.ports
             .executed
             .push((n, g, port, owner, self.ports.platform));
@@ -168,18 +168,26 @@ impl Machine {
     /// of no entry by the `platform` holder; a port entry is never split
     /// (each still holds the ports the port table gives it).
     pub(super) fn check_ports(&self) -> Check {
-        for &(n, g, port, owner, platform) in &self.ports.executed {
-            match owner {
-                Some(owner) => ensure(
-                    owner == Some((n, g)),
-                    "PORT: an access on a port whose entry its node does not hold",
-                )?,
-                None => ensure(
-                    platform == n,
-                    "PORT: an access on a port of no entry by a node without platform",
-                )?,
+        for &(n, g, port, entry_owner, platform) in &self.ports.executed {
+            match entry_owner {
+                Some((entry, owner)) => {
+                    ensure(
+                        self.ports.table.get(&port) == Some(&entry)
+                            && self.ports.entries.get(entry).is_some_and(|e| e.holds_port(port)),
+                        "PORT: an access on a port whose entry does not hold it",
+                    )?;
+                    ensure(
+                        owner == Some((n, g)),
+                        "PORT: an access on a port whose entry its node does not hold",
+                    )?;
+                }
+                None => {
+                    ensure(
+                        !self.ports.table.contains_key(&port) && platform == n,
+                        "PORT: an access on a port of no entry by a node without platform",
+                    )?;
+                }
             }
-            let _ = port;
         }
         for (&port, &entry) in &self.ports.table {
             ensure(

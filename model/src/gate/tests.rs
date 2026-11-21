@@ -723,7 +723,6 @@ fn remove_spi_requires_writing_node_and_deactivates_active_line() {
 fn a_seal_raises_every_park_request_of_its_node() {
     let ops = [Op::Sealing { n: 1 }, Op::SealedCall { n: 1, p: 0 }];
     let mut m = Machine::new(2, 2, 8);
-    m.make_faulty_for_test(1);
     m.old = OldRules {
         park_requests_by_later_call: true,
         ..OldRules::default()
@@ -846,3 +845,45 @@ fn a_dead_granters_memory_is_not_reused_while_a_grantee_translates_it() {
         "node 0 dead under a counted leaf"
     );
 }
+
+// Pass 40 (v2-D #3): raise_park_requests refuses to run unless the node is in
+// NodeState::Sealing.
+#[test]
+fn raise_park_requests_requires_sealing() {
+    let mut m = Machine::new(2, 2, 8);
+    assert_eq!(m.raise_park_requests(1), Err(Refused::Condition));
+    assert_eq!(m.parks.park_requests, vec![0; 4]);
+    m.sealing(1).expect("sealing");
+    assert_eq!(m.raise_park_requests(1), Ok(()));
+    assert_eq!(m.parks.park_requests, vec![0, 0, 2, 2]);
+}
+
+// Pass 40 (v1-D #6, v2-D #6): check_ports rejects a recorded port access whose
+// port does not belong to the recorded device entry.
+#[test]
+fn check_ports_reports_mismatched_port_entry() {
+    let mut m = Machine::new(2, 2, 8);
+    m.take_entry(0, 1).expect("take port entry 1 (0x60..=0x63)");
+    m.port_io(0, 0x60).expect("port_io 0x60");
+    m.check().expect("valid port_io");
+    // Corrupt the recorded port to 0x70 (belongs to entry 2, not entry 1).
+    m.ports.executed[0].2 = 0x70;
+    assert_eq!(
+        m.check(),
+        Err("PORT: an access on a port whose entry does not hold it".into())
+    );
+}
+
+// Pass 40 (v1-D #15, v2-D #5): check_counts rejects a map count strictly above
+// needed on a chunk whose owner is not awaiting R6.
+#[test]
+fn check_counts_reports_leaked_map_count_on_live_chunk() {
+    let mut m = Machine::new(2, 2, 8);
+    m.check().expect("initial state");
+    m.gate.map_counts[1] = 1;
+    assert_eq!(
+        m.check(),
+        Err("COUNT: a map count above the leaves it holds".into())
+    );
+}
+

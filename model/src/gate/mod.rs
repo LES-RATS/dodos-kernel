@@ -237,7 +237,7 @@ pub(crate) enum Take {
 /// What pages leaving *data* become, in the call that turns them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
-    Table,
+    Table(u8),
     Root,
     IoRoot,
     Its { first: Page, k: u8 },
@@ -450,8 +450,6 @@ pub(crate) struct Machine {
     pub(crate) kernel: Kernel,
     /// Per physical core: its hardware caches.
     pub(crate) tlb: Vec<Tlb>,
-    /// The nodes whose kernel is faulty.
-    pub(crate) faulty: BTreeSet<u16>,
     /// The unit side's words.
     pub(crate) unit: unit::UnitGate,
     /// The unit's cache: (domain, entry) → page.
@@ -478,8 +476,7 @@ pub(crate) struct Machine {
     /// The ICRs the gates composed: the sending node, the target core's
     /// number and the vector (x86-64, G10).
     pub(crate) icr: Vec<(u16, usize, u8)>,
-    /// Memory reused since a translation could reach it: a page given
-    /// away or turned into a table (for the checker).
+    /// Total number of ordinary-memory chunks in this machine.
     pub(crate) chunks: u64,
 }
 
@@ -561,7 +558,6 @@ impl Machine {
             },
             kernel: Kernel::default(),
             tlb: vec![Tlb::default(); usize::from(nodes) * cores],
-            faulty: BTreeSet::new(),
             unit: unit::UnitGate::new(nodes),
             iotlb: BTreeMap::new(),
             parks: parks::ParkGate::new(nodes, cores),
@@ -579,7 +575,7 @@ impl Machine {
     /// `width` ASID bits, fewer than 2: its nodes run untagged (the tag
     /// table, untagged mode, D-158).
     pub(crate) fn untagged(mut self, width: u32) -> Self {
-        assert!(dodos_abi::tags_untagged(width), "a width with tags");
+        assert!(dodos_abi::tags_untagged(width), "an untagged width (< 2)");
         self.riscv = true;
         self.tag_width = width;
         for (node, layout) in self.gate.nodes.iter_mut().zip(&self.layout) {
@@ -613,12 +609,6 @@ impl Machine {
     /// The gate's own tag, if the width leaves it one (G7, D-155, D-158).
     pub(crate) fn gate_tag(&self) -> Option<usize> {
         dodos_abi::gate_tag(self.tag_width).map(|tag| tag as usize)
-    }
-
-    /// Node `n`'s kernel faulty (it skips what it likes; the gate model's
-    /// operations are open to every node anyway).
-    pub(crate) fn make_faulty_for_test(&mut self, n: u16) {
-        self.faulty.insert(n);
     }
 
     pub(crate) fn chunk_of(page: Page) -> u64 {

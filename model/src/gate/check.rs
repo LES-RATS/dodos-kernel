@@ -189,11 +189,10 @@ impl Machine {
             level: LEVELS - 1,
             hook: Hook::Loose,
         };
-        for (&table, &next) in &self.gate.links {
+        for &table in self.gate.links.keys() {
             let owner_runs = self.gate.members.iter().enumerate().any(|(n, m)| {
                 (m.state.writes() || m.state == NodeState::Sealed) && self.holds(n as u16, table)
             });
-            let _ = next;
             ensure(
                 !owner_runs || self.gate.classes[table as usize] == loose,
                 "LINK: a free-list link held by a table that is not loose",
@@ -359,7 +358,7 @@ impl Machine {
         // the gate word, cells Unit failed and Death; D-153, gap 37).
         for &(n, g, page) in &self.unit.kept {
             let m = self.gate.members[usize::from(n)];
-            if m.state.writes() && m.generation == g {
+            if (m.state.writes() || m.state == NodeState::Sealed) && m.generation == g {
                 needed[Self::chunk_of(page) as usize] += 1;
             }
         }
@@ -388,6 +387,19 @@ impl Machine {
                 self.gate.map_counts[chunk] >= needed[chunk],
                 "COUNT: a map count below the leaves it holds",
             )?;
+            let awaiting_r6 = match self.gate.owners[chunk] {
+                Owner::Taken { node, .. } | Owner::Floor { node } => matches!(
+                    self.gate.members[usize::from(node)].state,
+                    NodeState::Fencing | NodeState::Fenced
+                ),
+                Owner::Free { .. } => false,
+            };
+            if !awaiting_r6 {
+                ensure(
+                    self.gate.map_counts[chunk] == needed[chunk],
+                    "COUNT: a map count above the leaves it holds",
+                )?;
+            }
         }
         Ok(())
     }
@@ -420,7 +432,7 @@ impl Machine {
                     "G: a core walks a cached table that is no table of its node",
                 )?;
             }
-            let live = self.reachable(n, root);
+            let live = self.reachable(root);
             let mut counted: BTreeSet<Page> = BTreeSet::new();
             for request in &self.gate.nodes[usize::from(n)].requests {
                 if let Request::InUse { record, what, .. } = request {
@@ -557,7 +569,7 @@ impl Machine {
     }
 
     /// The leaves a walk from `root` reaches now.
-    fn reachable(&self, _n: u16, root: Page) -> BTreeMap<(usize, usize), (Page, bool)> {
+    fn reachable(&self, root: Page) -> BTreeMap<(usize, usize), (Page, bool)> {
         let mut out = BTreeMap::new();
         let Some(entries) = self.gate.tables.get(&root) else {
             return out;

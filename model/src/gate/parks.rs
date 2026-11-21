@@ -130,18 +130,20 @@ impl Machine {
         require(self.gate.members[usize::from(n)].state == NodeState::Live)?;
         self.gate.members[usize::from(n)].state = NodeState::Sealing;
         if !self.old.park_requests_by_later_call {
-            self.raise_park_requests(n);
+            self.raise_park_requests(n)?;
         }
         Ok(())
     }
 
     /// The old text's separate call that raises the park requests, which a
     /// faulty kernel may skip.
-    pub(crate) fn raise_park_requests(&mut self, n: u16) {
+    pub(crate) fn raise_park_requests(&mut self, n: u16) -> Gated {
+        require(self.gate.members[usize::from(n)].state == NodeState::Sealing)?;
         for p in 0..self.layout[usize::from(n)].cores.len() {
             let core = self.core(n, p);
             self.parks.park_requests[core] += 1;
         }
+        Ok(())
     }
 
     /// A core's own park call, which releases the gate lock after writing

@@ -467,10 +467,13 @@ impl Machine {
             Op::Give { n, p, chunk, to } => self.give(n, p, chunk, to),
             Op::DestroyBlock { n, p, chunk } => self.destroy_block(n, p, chunk),
             Op::Write { n, page, value } => {
-                // Only a data page its node holds is mapped writable in a
-                // kernel's view (G2): any other store faults.
+                // Only a data page in an ordinary (non-table) chunk its node
+                // holds is mapped writable in a kernel's view (G2, D-154): any
+                // other store faults.
                 require(
-                    self.holds(n, page)
+                    page < self.chunks * PAGES_PER_CHUNK
+                        && self.holds(n, page)
+                        && !self.gate.table_bits[Self::chunk_of(page) as usize]
                         && self.gate.classes.get(page as usize) == Some(&Class::Data),
                 )?;
                 self.kernel.data.insert(page, value);

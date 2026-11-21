@@ -73,6 +73,7 @@ fn q3_holders_that_are_requesters() {
     let ordered = report("Q3 serve before park", &start, BASE);
     assert!(ordered.healthy_wedge.is_none(), "a healthy machine wedged");
     assert!(ordered.slept);
+    assert_eq!(ordered.healthy_no_sleep, 0);
     let unordered = report(
         "Q3 park at once",
         &start,
@@ -81,7 +82,10 @@ fn q3_holders_that_are_requesters() {
             ..BASE
         },
     );
-    let _ = unordered;
+    assert!(
+        unordered.healthy_no_sleep > 0,
+        "parking before serving leaves healthy states that can no longer sleep"
+    );
 }
 
 #[test]
@@ -429,3 +433,16 @@ fn q5_a_pm1_write_that_sleeps_late() {
     );
     assert!(accepting.healthy_wedge.is_none() && accepting.isolation.is_none());
 }
+
+// Pass 40 (v2-D #9): watchdog_core selects the first core of the lowest *live*
+// node after S, skipping non-live (fencing) nodes.
+#[test]
+fn watchdog_core_skips_non_live_nodes() {
+    let mut s = State::new(3, 2, 1, &[]);
+    assert_eq!(s.watchdog_core(), Some(2)); // node 1, core 0
+    s.members[1].0 = Member::Fencing;
+    assert_eq!(s.watchdog_core(), Some(4)); // node 2, core 0
+    s.members[2].0 = Member::Fencing;
+    assert_eq!(s.watchdog_core(), None);
+}
+

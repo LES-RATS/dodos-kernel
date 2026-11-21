@@ -38,7 +38,7 @@ impl Machine {
     /// load like any other: the core's loaded root written first, then its
     /// whole TLB invalidated (D-158), so that it holds translations of the
     /// root it has loaded and of no other.
-    fn load_kernel_root(&mut self, n: u16, p: usize) {
+    pub(super) fn load_kernel_root(&mut self, n: u16, p: usize) {
         let kernel = self.layout[usize::from(n)].kernel_root;
         self.gate.nodes[usize::from(n)].loaded[p] = (kernel, 0);
         if self.is_untagged() && !self.old.untagged_load_keeps_the_tlb {
@@ -133,7 +133,7 @@ impl Machine {
         require(self.leaves_data(n, page))?;
         require((1..LEVELS).contains(&level))?;
         require(self.class(page)? == Class::Data)?;
-        self.apply_target(n, &[page], Target::Table);
+        self.apply_target(n, &[page], Target::Table(level));
         Ok(())
     }
 
@@ -170,8 +170,8 @@ impl Machine {
     pub(super) fn apply_target(&mut self, n: u16, pages: &[Page], target: Target) {
         for &page in pages {
             let after = match target {
-                Target::Table => Class::Table {
-                    level: LEVELS - 1,
+                Target::Table(level) => Class::Table {
+                    level,
                     hook: Hook::Loose,
                 },
                 Target::Root => Class::Root(RootState::Unbound),
@@ -186,7 +186,7 @@ impl Machine {
             }
             self.kernel.data.remove(&page);
             match target {
-                Target::Table | Target::IoRoot => {
+                Target::Table(_) | Target::IoRoot => {
                     self.gate.tables.insert(page, [Entry::Absent; ENTRIES]);
                 }
                 Target::Root => {

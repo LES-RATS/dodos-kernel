@@ -166,9 +166,9 @@ impl State {
         self.members.len()
     }
 
-    /// The first core of the watchdog node: the lowest node after *S*.
-    fn watchdog_core(&self) -> Option<usize> {
-        let node = (1..self.nodes()).next()?;
+    /// The first core of the watchdog node: the lowest live node after *S*.
+    pub(super) fn watchdog_core(&self) -> Option<usize> {
+        let node = (1..self.nodes()).find(|&n| self.live(n))?;
         self.cores.iter().position(|&(n, _)| n == node)
     }
 }

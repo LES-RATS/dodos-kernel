@@ -102,13 +102,14 @@ impl Machine {
         Ok(())
     }
 
-    /// **Fresh**: dead (*g*) → starting (*g* + 1). G13 writes 0 the class
-    /// bytes and the gate words of its floor; the kernel tables written
-    /// anew (the kernel table's leaves of the dead generation's runs gone);
-    /// the gate part zeroed: every core's loaded root the kernel's, the tag
-    /// table zeroed with entry 0 the kernel's root, every request *free*,
-    /// pending sets and idle words 0. Each core invalidates its whole TLB
-    /// as it enters.
+    /// **Fresh**: dead (*g*) → starting (*g* + 1) → live (collapsed into one
+    /// step in this small gate model, so `Starting` is transient). G13 writes
+    /// 0 the class bytes and the gate words of its floor; the kernel tables
+    /// written anew (the kernel table's leaves of the dead generation's runs
+    /// gone); the gate part zeroed: every core's loaded root the kernel's, the
+    /// tag table zeroed with entry 0 the kernel's root, every request *free*,
+    /// pending sets and idle words 0. Each core invalidates its whole TLB as
+    /// it enters.
     pub(crate) fn fresh(&mut self, n: u16) -> Gated {
         let member = self.gate.members[usize::from(n)];
         require(member.state == NodeState::Dead)?;
@@ -171,9 +172,12 @@ impl Machine {
 
     /// **Seal**: live → sealing → sealed. The seal completes its cores'
     /// requests before the park (the call refuses while one is in use);
-    /// each core's park call loads the kernel's root.
+    /// each core's park call loads the kernel's root (and invalidates the
+    /// core's TLB on an untagged machine, D-158).
     pub(crate) fn seal(&mut self, n: u16) -> Gated {
         require(self.gate.members[usize::from(n)].state == NodeState::Live)?;
+        let cores = self.layout[usize::from(n)].cores.len();
+        require(cores > 0)?;
         let node = &self.gate.nodes[usize::from(n)];
         require(node.requests.iter().all(|r| *r == Request::Free))?;
         // The seal waits for the answers to its records sent (the request
@@ -190,10 +194,8 @@ impl Machine {
             self.unit.epoch += 1;
         }
         self.sealing(n)?;
-        let kernel = self.layout[usize::from(n)].kernel_root;
-        let cores = self.layout[usize::from(n)].cores.len();
         for p in 0..cores {
-            self.gate.nodes[usize::from(n)].loaded[p] = (kernel, 0);
+            self.load_kernel_root(n, p);
             if p + 1 < cores {
                 self.park_call(n, p)?;
             }
@@ -201,10 +203,11 @@ impl Machine {
         self.sealed_call(n, cores - 1)
     }
 
-    /// **Resume**: sealed → starting (*g*), resume bit 1 → live; the
-    /// kernel's root at the entry stub; the gate part unchanged (its
-    /// requests all *free* since the seal). Each core invalidates its
-    /// whole TLB as it enters.
+    /// **Resume**: sealed → starting (*g*, resume bit 1) → live (collapsed
+    /// into one step in this small gate model, so `Starting` is transient);
+    /// the kernel's root at the entry stub; the gate part unchanged (its
+    /// requests all *free* since the seal). Each core invalidates its whole
+    /// TLB as it enters.
     pub(crate) fn resume(&mut self, n: u16) -> Gated {
         require(self.gate.members[usize::from(n)].state == NodeState::Sealed)?;
         // A resume needs `seal_parked` equal to the park request on every

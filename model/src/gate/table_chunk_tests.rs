@@ -598,34 +598,64 @@ fn explored(old: OldRules) -> Option<String> {
 // the tables (`faulty_kernels_keep_g_on_the_cpu_side`).
 #[test]
 fn the_faulty_exploration_finds_each_attack_of_pass_31() {
-    let olds = [
-        OldRules {
-            tables_in_ordinary_chunks: true,
-            ..OldRules::default()
-        },
-        OldRules {
-            leaves_into_table_chunks: true,
-            ..OldRules::default()
-        },
-        OldRules {
-            anchors_over_table_chunks: true,
-            ..OldRules::default()
-        },
-        OldRules {
-            table_chunks_mapped_writable: true,
-            ..OldRules::default()
-        },
-        OldRules {
-            gate_tag_bound: true,
-            ..OldRules::default()
-        },
-        OldRules {
-            any_vector_in_icr: true,
-            ..OldRules::default()
-        },
+    let olds: [(OldRules, &[&str]); 6] = [
+        (
+            OldRules {
+                tables_in_ordinary_chunks: true,
+                ..OldRules::default()
+            },
+            &["TABLE: a page that is not data in an ordinary chunk"],
+        ),
+        (
+            OldRules {
+                leaves_into_table_chunks: true,
+                ..OldRules::default()
+            },
+            &[
+                "TABLE: a table chunk counts a leaf",
+                "G: a translation reaches a table chunk",
+                "G: a device's translation reaches a table chunk",
+            ],
+        ),
+        (
+            OldRules {
+                anchors_over_table_chunks: true,
+                ..OldRules::default()
+            },
+            &["TABLE: a table chunk counts a grant's anchor"],
+        ),
+        (
+            OldRules {
+                table_chunks_mapped_writable: true,
+                ..OldRules::default()
+            },
+            &[
+                "KERNEL: a large leaf's permission is not its chunk's table bit",
+                "G: the kernel's own view writes a table chunk",
+                "G: the kernel's own view writes a page that is not data",
+            ],
+        ),
+        (
+            OldRules {
+                gate_tag_bound: true,
+                ..OldRules::default()
+            },
+            &["TAG: the gate's own tag bound to a root or loaded for one"],
+        ),
+        (
+            OldRules {
+                any_vector_in_icr: true,
+                ..OldRules::default()
+            },
+            &["G10: an ICR composed with a vector that is no inter-kernel vector"],
+        ),
     ];
-    for old in olds {
-        assert!(explored(old).is_some(), "{old:?} broke nothing");
+    for (old, expected) in olds {
+        let got = explored(old).unwrap_or_else(|| panic!("{old:?} broke nothing"));
+        assert!(
+            expected.contains(&got.as_str()),
+            "{old:?} broke unexpected rule {got:?}, expected one of {expected:?}"
+        );
     }
     assert_eq!(explored(OldRules::default()), None);
 }
