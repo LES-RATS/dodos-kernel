@@ -22,7 +22,7 @@ use dodos_abi::NodeMessage;
 /// node 1's faulty kernel writes a `Release` before it reads the `Revoke`,
 /// its leaf still counted, and node 0 pins the entry. Node 1 has not read
 /// the `Revoke` yet. Returns the grant and a second thread of node 0.
-fn pinned_with_its_revoke_in_flight() -> (S, u16, ObjId) {
+pub(super) fn pinned_with_its_revoke_in_flight() -> (S, u16, ObjId) {
     let mut m = granted(true);
     m.ok(0, super::place_first(0, 0));
     let second = m.thread_on(0, 300, 0);
@@ -43,12 +43,12 @@ fn pinned_with_its_revoke_in_flight() -> (S, u16, ObjId) {
     (m, grant, second)
 }
 
-fn state(m: &S, grant: u16) -> Option<GrantState> {
+pub(super) fn state(m: &S, grant: u16) -> Option<GrantState> {
     m.sys.canonical().grants[0].get(&grant).map(|e| e.state)
 }
 
 /// The credit (index, serial) of node 0's `Revoke` to node 1 still in use.
-fn revoke_in_flight(m: &S) -> Option<(u8, u32)> {
+pub(super) fn revoke_in_flight(m: &S) -> Option<(u8, u32)> {
     let credits = &m.sys.node(0).peers[1].credits;
     credits.iter().enumerate().find_map(|(i, c)| {
         c.as_ref()
@@ -58,7 +58,7 @@ fn revoke_in_flight(m: &S) -> Option<(u8, u32)> {
 }
 
 /// The count of node 1's use entry of the grant.
-fn count(m: &S) -> u64 {
+pub(super) fn count(m: &S) -> u64 {
     m.sys.canonical().uses[1].values().map(|u| u.leaves).sum()
 }
 
@@ -66,7 +66,7 @@ fn count(m: &S) -> u64 {
 /// (its remote capability is invalid once the grant is revoking, so no call
 /// does it), keeping its root and its use entry: the count, a gate word,
 /// falls to 0 without a `Release`.
-fn unmapped(m: &mut S) {
+pub(super) fn unmapped(m: &mut S) {
     let node = m.sys.node_mut(1);
     let mapped = node.caps.iter().find(|(_, c)| {
         node.remotes.contains_key(&c.object) && matches!(c.record, crate::Record::Mapping(_))

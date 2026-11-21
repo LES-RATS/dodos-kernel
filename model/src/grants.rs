@@ -708,15 +708,10 @@ impl Model {
             return Ok(true);
         }
         // A grant whose grantee is accused: `again`, with no message and no
-        // wait, until the grantee's generation is over (R3).
-        //
-        // CONTRACT-GAP 59 (Reclaim, R3, against Grants, release by the
-        // holder, D-165): R3 says a removal that reaches the anchor of a grant
-        // it pinned "returns `again` until" the grantee's generation is over,
-        // and D-165 that a pinned entry is judged again "whenever a removal
-        // step on X reaches its anchor", freed at a count of 0. Read here as
-        // R3 for a grantee that is accused (R3 pins only for one), D-165 for
-        // a grant pinned by a `RevokeStep` or a `Release` (D-142).
+        // wait, until the grantee's generation is over (R3), whoever pinned
+        // it and whatever the count reads: D-165's judgement by the count
+        // holds only while the grantee is starting, live, sealing or sealed
+        // (Grants, release by the holder, D-166, gap 59).
         let accused = matches!(
             self.table.member(entry.grantee).state(),
             MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced

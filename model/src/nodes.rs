@@ -2133,6 +2133,12 @@ impl Model {
             *units -= 1;
             any = true;
             live(&mut self.caps, root).dying = true;
+            // No record under the root maps or unmaps: each would count a
+            // leaf in the use entry, and a granting generation does not end
+            // while a holder that runs or is sealed counts one (G6, R6's
+            // proof, D-142). So an `again` here follows removals or woken
+            // waiters, never a step that changed nothing (pass 38: what
+            // `removal_waits` guards in R2, seed 605 of pass 35).
             if self.remove_root(root) != Ok(Output::Done) {
                 return true;
             }

@@ -124,3 +124,46 @@ fn a_node_started_afresh_with_a_marked_core_word_stays_starting_and_is_accused_s
     m.run(START_NS + SWEEP_NS + 250 * MS);
     assert_eq!(m.sys.member(1).evidence(), Evidence::Stale);
 }
+
+// Grants, release by the holder (D-166, gap 59): a pinned entry is judged
+// again by its count "while *Y* is starting, live, sealing or sealed; once
+// *Y* is accused (fencing, fenced or unfenced) R3 of Reclaim governs the
+// entry, whoever pinned it: a removal that reaches its anchor returns
+// `again` and the entry is freed only when *Y*'s generation is over,
+// whatever the count reads". Node 1's faulty `Release` pinned node 0's
+// grant, then node 1 lowered its count to 0; node 1 is then accused. The
+// removal that reaches the anchor returns `again`; the entry stays pinned.
+#[test]
+fn a_removal_that_reaches_a_pinned_grant_of_an_accused_grantee_whose_count_reads_0_is_again() {
+    use super::pass22::OBJ;
+    use super::pass37::{count, pinned_with_its_revoke_in_flight, revoke_in_flight, state};
+    use crate::rings::Body;
+    use crate::table::GrantState;
+    let (mut m, grant, second) = pinned_with_its_revoke_in_flight();
+    let credit = revoke_in_flight(&m).expect("in flight");
+    let step = super::pass22::forged(
+        &m,
+        dodos_abi::NodeMessage::RevokeStep,
+        1,
+        0,
+        Some(credit),
+        Body::RevokeStep { removed: false },
+    );
+    m.sys.inject(1, 0, step);
+    assert!(m.step_until(|m| revoke_in_flight(m).is_none()));
+    let serial = m.sys.canonical().grants[0][&grant].serial;
+    m.sys.undue_release(0, grant, serial);
+    super::pass37::unmapped(&mut m);
+    assert_eq!(state(&m, grant), Some(GrantState::Pinned));
+    assert_eq!(count(&m), 0);
+    let third = m.t[2];
+    m.supervisor(2, third);
+    m.ok(2, super::pass17::kill(1));
+    assert_eq!(m.state(1), MemberState::Fencing);
+    assert_eq!(
+        m.call_by(0, second, Syscall::CapRevoke(s(OBJ))),
+        Err(Error::Again)
+    );
+    assert_eq!(state(&m, grant), Some(GrantState::Pinned));
+    assert_eq!(count(&m), 0, "the count read 0");
+}
