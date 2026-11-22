@@ -416,7 +416,8 @@ fn exp_3b_cspace_over_max_stays_false_for_small_cspace_grow() {
 fn exp_3c_clear_step_again_stays_false_for_watermark_return_again() {
     let mut m = S::on(&machine(Arch::X86_64, 2, &[&[0, 1]]));
     let ut = untyped_slot(m.sys.node(0), m.t[0]);
-    m.ok(0, retype_from(ut, ObjectKind::Untyped, 4096, 149));
+    let page = m.sys.machine.geometry.page();
+    m.ok(0, retype_from(ut, ObjectKind::Untyped, page, 149));
     m.ok(0, retype_from(149, ObjectKind::Frame, 1, 150));
     m.ok(0, Syscall::CapDelete(s(150)));
     assert_eq!(
