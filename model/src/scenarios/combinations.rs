@@ -595,6 +595,17 @@ fn multi_page_seed(seed: u64) -> bool {
     seed < 286 && seed % 20 == 17
 }
 
+/// Offsets within each 286-seed architecture round reserved for bound-stress
+/// seeds (pass 43). Chosen disjoint from the 27 verify seeds (`seed % 33 == 0`
+/// and `2`), `multi_page_seed` (`seed < 286 && seed % 20 == 17`), `focus` seeds
+/// (`seed % 286 < FOCUS_SEEDS`), and named regression seeds (`0`, `286`, `605`,
+/// `763`, `1109`, `1434`, `277`).
+const BOUND_STRESS_OFFSETS: [u64; 4] = [113, 160, 207, 254];
+
+fn bound_stress_seed(seed: u64) -> bool {
+    seed < 858 && BOUND_STRESS_OFFSETS.contains(&(seed % 286))
+}
+
 impl Run {
     fn new(seed: u64) -> Self {
         Self::new_with_idle(seed, true)
@@ -620,6 +631,14 @@ impl Run {
         machine.membership.seal_ms = 30;
         machine.membership.stale_ms = 40;
         machine.membership.stuck_ms = if multi_page_seed(seed) { 30 } else { 40 };
+        if bound_stress_seed(seed) {
+            machine.floors.floor_node = 5 * machine.geometry.chunk();
+            match seed % 286 {
+                113 | 207 => machine.floors.reserves = dodos_abi::RESERVES_MAX,
+                160 | 254 => machine.floors.plain_roles = dodos_abi::ROLES_PLAIN_MAX - 1,
+                _ => {}
+            }
+        }
         let m = S::on(&machine);
         let splittable = m
             .sys
@@ -932,6 +951,602 @@ impl Run {
             assert_eq!(self.m.sys.node(0).items(IOMMU_ROLE).len(), 171);
             assert!(self.m.sys.canonical().units[&ioapic].lines.contains_key(&6));
         }
+        if bound_stress_seed(self.seed) {
+            self.stress_bounds();
+        }
+    }
+
+    /// Exercises contract boundaries and their refusal/wait paths on
+    /// `bound_stress_seed` runs (pass 43), keeping every slot at or above
+    /// `1000` so the setup of `PAIRS`, `DEVICES`, and `TBLOCK` is untouched.
+    fn stress_bounds(&mut self) {
+        // On ARM64 and RISC-V, lossy-sleeping cores take exit_latency to wake
+        // and finish the setup grants from `set_up_with`.
+        self.run(2 * MS);
+        let arch = self.m.sys.arch();
+        let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+        let offset = self.seed % 286;
+
+        // 1. NODE_WATCH_SLOTS (4) + 5th slot refused (Invalid).
+        for i in 0..dodos_abi::NODE_WATCH_SLOTS as u32 {
+            self.m
+                .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1000 + i));
+            self.m.ok(
+                0,
+                Syscall::NodeWatch {
+                    node: node_cap(0),
+                    index: u64::from(i),
+                    notify: s(1000 + i),
+                },
+            );
+        }
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1004));
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeWatch {
+                    node: node_cap(0),
+                    index: dodos_abi::NODE_WATCH_SLOTS,
+                    notify: s(1004),
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        self.m.ok(0, Syscall::CapDelete(s(1004)));
+
+        // 2. IDLE_STATES_MAX (15) + 16 states refused (Invalid).
+        let mut idle_words =
+            Vec::with_capacity(dodos_abi::IDLE_STATES_MAX * dodos_abi::IDLE_ENTRY_WORDS);
+        for i in 0..dodos_abi::IDLE_STATES_MAX as u64 {
+            let (method, flags) = match arch {
+                Arch::X86_64 => (dodos_abi::IDLE_METHOD_HALT, 0),
+                Arch::Aarch64 => (
+                    dodos_abi::IDLE_METHOD_PSCI | (((1u64 << 16) | i) << 32),
+                    dodos_abi::IDLE_FLAG_LOSES_CONTEXT,
+                ),
+                Arch::Riscv64 => (
+                    dodos_abi::IDLE_METHOD_SBI | ((0x8000_0000u64 | i) << 32),
+                    dodos_abi::IDLE_FLAG_LOSES_CONTEXT,
+                ),
+            };
+            idle_words.push((i + 1) * 10_000);
+            idle_words.push((i + 1) * 20_000);
+            idle_words.push(method);
+            idle_words.push(flags);
+        }
+        self.m.ok(
+            0,
+            Syscall::NodeIdle {
+                node: node_cap(0),
+                core: 0,
+                words: idle_words.clone(),
+            },
+        );
+        idle_words.extend_from_slice(&[200_000, 400_000, dodos_abi::IDLE_METHOD_HALT, 0]);
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeIdle {
+                    node: node_cap(0),
+                    core: 0,
+                    words: idle_words,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+
+        // 3. Recovery reserve admission refusal on core 0 (Error::Budget).
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Sched, 0, 1010));
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::SchedConfigure {
+                    sched: s(1010),
+                    node: node_cap(0),
+                    core: 0,
+                    budget: 64 * MS,
+                    period: 64 * MS,
+                    class: 1,
+                },
+            ),
+            Err(Error::Budget)
+        );
+        self.m.ok(0, Syscall::CapDelete(s(1010)));
+
+        // 4. DEBUG_WRITE_MAX (512 + 513 refused) and ENTROPY_MAX_BYTES (64 + 65 refused).
+        self.m.ok(
+            0,
+            Syscall::DebugWrite {
+                debug: s(dodos_abi::START_SLOT_DEBUG),
+                length: dodos_abi::DEBUG_WRITE_MAX,
+                words: vec![0; (dodos_abi::DEBUG_WRITE_MAX / 8) as usize],
+            },
+        );
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::DebugWrite {
+                    debug: s(dodos_abi::START_SLOT_DEBUG),
+                    length: dodos_abi::DEBUG_WRITE_MAX + 1,
+                    words: vec![0; (dodos_abi::DEBUG_WRITE_MAX / 8) as usize],
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        assert!(matches!(
+            self.m.call(
+                0,
+                Syscall::EntropyRead {
+                    length: dodos_abi::ENTROPY_MAX_BYTES,
+                    mix: [1, 2, 3, 4],
+                },
+            ),
+            Ok(Output::Bytes(_))
+        ));
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::EntropyRead {
+                    length: dodos_abi::ENTROPY_MAX_BYTES + 1,
+                    mix: [1, 2, 3, 4],
+                },
+            ),
+            Err(Error::Invalid)
+        );
+
+        // 5. MAX_WORDS (64 + 65 refused) and MAX_CAPS (5 refused) on NodeSend.
+        if let Some(rx2) = self.receivers[2]
+            && self.m.sys.node(2).runnable().contains(&rx2)
+        {
+            assert_eq!(
+                self.m.call_by(
+                    2,
+                    rx2,
+                    Syscall::Recv {
+                        endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+                        reply: s(REPLY),
+                        range: Range {
+                            first: s(1030),
+                            count: 0,
+                        },
+                        wait: 0,
+                    },
+                ),
+                WAITS
+            );
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::NodeSend {
+                        node: node_cap(2),
+                        message: Message {
+                            words: vec![0x43; dodos_abi::MAX_WORDS],
+                            ..Message::default()
+                        },
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                WAITS
+            );
+            self.run(2 * MS);
+        }
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeSend {
+                    node: node_cap(2),
+                    message: Message {
+                        words: vec![0; dodos_abi::MAX_WORDS + 1],
+                        ..Message::default()
+                    },
+                    doorbell: SlotAddr::NONE,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        let rights = Rights::READ.union(Rights::WRITE).bits();
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeSend {
+                    node: node_cap(2),
+                    message: Message {
+                        caps: vec![Transfer::Derive(s(PAIRS[0].obj), rights); 5],
+                        ..Message::default()
+                    },
+                    doorbell: SlotAddr::NONE,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+
+        // 6. CSPACE_MAX_SLOTS (2^20 + over-max refused) and REMOVAL_SLOTS (128 -> Again).
+        assert_eq!(
+            self.m.call(
+                0,
+                super::retype_from(
+                    ut0,
+                    ObjectKind::CSpace,
+                    u64::from(dodos_abi::CSPACE_MAX_SLOTS) + 1,
+                    1041,
+                ),
+            ),
+            Err(Error::Invalid)
+        );
+        self.m.ok(
+            0,
+            super::retype_from(
+                ut0,
+                ObjectKind::CSpace,
+                u64::from(dodos_abi::CSPACE_MAX_SLOTS),
+                1040,
+            ),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                self.m.call(
+                    0,
+                    Syscall::CSpaceGrow {
+                        cspace: s(1040),
+                        untyped: s(ut0),
+                    },
+                ),
+                Ok(Output::Slots(_))
+            ));
+        }
+        assert_eq!(
+            self.m.call(0, Syscall::CapDelete(s(1040))),
+            Err(Error::Again)
+        );
+        self.m.ok(0, Syscall::CapDelete(s(1040)));
+
+        // 7. TREE_DEPTH (64 + depth-65 refused), then revoke and delete.
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1300));
+        let mut cur_slot = 1300u32;
+        let mut cur_depth = {
+            let obj = self.m.sys.node(0).object_at(self.m.t[0], s(1300)).unwrap();
+            let root = self.m.sys.node(0).objects[&obj].root;
+            self.m.sys.node(0).depth(root)
+        };
+        let frame_rights = Rights::READ
+            .union(Rights::WRITE)
+            .union(Rights::DERIVE)
+            .bits();
+        while cur_depth < dodos_abi::TREE_DEPTH {
+            let next_slot = cur_slot + 1;
+            self.m.ok(
+                0,
+                Syscall::CapDerive {
+                    source: s(cur_slot),
+                    destination: s(next_slot),
+                    rights: frame_rights,
+                    badge: 0,
+                },
+            );
+            cur_slot = next_slot;
+            cur_depth += 1;
+        }
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::CapDerive {
+                    source: s(cur_slot),
+                    destination: s(cur_slot + 1),
+                    rights: frame_rights,
+                    badge: 0,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        while self.m.call(0, Syscall::CapRevoke(s(1300))) == Err(Error::Again) {}
+        self.m.ok(0, Syscall::CapDelete(s(1300)));
+
+        // 8. TIME_EVENT_STEP (16): arm 20 timers at the same deadline on node 0.
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1050));
+        let deadline = self.m.sys.now() + 2 * MS;
+        for i in 0..(dodos_abi::TIME_EVENT_STEP as u32 + 4) {
+            self.m
+                .ok(0, super::retype_from(ut0, ObjectKind::Timer, 0, 1051 + i));
+            assert!(matches!(
+                self.m.call(
+                    0,
+                    Syscall::TimerSet {
+                        timer: s(1051 + i),
+                        notify: s(1050),
+                        deadline,
+                        tolerance: 0,
+                    },
+                ),
+                Ok(Output::WasArmed(_))
+            ));
+        }
+        self.run(3 * MS);
+        for i in 0..(dodos_abi::TIME_EVENT_STEP as u32 + 4) {
+            self.m.ok(0, Syscall::CapDelete(s(1051 + i)));
+        }
+        self.m.ok(0, Syscall::CapDelete(s(1050)));
+
+        // 9. On x86-64 stress seeds: IOSPACE_MAX_DEVICES (16 + 17th Busy) and
+        // IRQ_TABLE_ENTRIES (192 + 193rd Busy) on node 0 -> 208 IOMMU items
+        // (8 ReportAsk pages on any IOMMU rebuild).
+        if arch == Arch::X86_64 {
+            let iommu = slots_of(self.m.sys.node(0), self.m.t[0], ObjectKind::Iommu)[0];
+            let ios = self.m.retype(0, ObjectKind::IoSpace, 0, 1020);
+            self.m.ok(0, ios);
+            for d in 0..dodos_abi::IOSPACE_MAX_DEVICES as u64 {
+                let call = Syscall::IoSpaceAttach {
+                    iommu: s(iommu),
+                    iospace: s(1020),
+                    device: 0x20 + d,
+                };
+                match self.m.call(0, call) {
+                    WAITS => {
+                        self.m.settle();
+                        assert_eq!(self.m.woken(0), Some(&DONE));
+                    }
+                    outcome => assert_eq!(outcome, DONE),
+                }
+            }
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::IoSpaceAttach {
+                        iommu: s(iommu),
+                        iospace: s(1020),
+                        device: 0x20 + dodos_abi::IOSPACE_MAX_DEVICES as u64,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            let entries = dodos_abi::x86_64::IRQ_TABLE_ENTRIES as u32;
+            for i in 0..entries {
+                let claim = Syscall::IrqClaim {
+                    control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                    source: IrqSource::msi(0, (i / 32) as u8, (i % 32) as u8, 0).raw(),
+                    core: 0,
+                    vector: u64::from(dodos_abi::x86_64::IRQ_VECTOR_FIRST) + u64::from(i),
+                    destination: s(1100 + i),
+                };
+                match self.m.call(0, claim) {
+                    WAITS => {
+                        self.m.settle();
+                        assert!(self.m.woken(0).is_some_and(Result::is_ok));
+                    }
+                    outcome => assert!(outcome.is_ok(), "MSI claim {i}: {outcome:?}"),
+                }
+            }
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::IrqClaim {
+                        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                        source: IrqSource::msi(0, 7, 0, 0).raw(),
+                        core: 0,
+                        vector: u64::from(dodos_abi::x86_64::IRQ_VECTOR_FIRST),
+                        destination: s(1100 + entries),
+                    },
+                ),
+                Err(Error::Busy)
+            );
+        }
+
+        // 10. Offset 113: SENDS_PER_PEER (8: 6 without manage, 7th Busy,
+        // 2 with manage, 9th Busy).
+        if offset == 113 {
+            self.m.ok(
+                0,
+                Syscall::SchedConfigure {
+                    sched: s(dodos_abi::START_SLOT_SCHED),
+                    node: node_cap(0),
+                    core: 0,
+                    budget: 50 * MS,
+                    period: 64 * MS,
+                    class: 1,
+                },
+            );
+            let no_manage = Rights::READ.union(Rights::WRITE).union(Rights::SEND).bits();
+            self.m.ok(
+                0,
+                Syscall::CapDerive {
+                    source: node_cap(1),
+                    destination: s(1500),
+                    rights: no_manage,
+                    badge: 0,
+                },
+            );
+            let mut workers = Vec::with_capacity(9);
+            for i in 0..9u32 {
+                let base = 1510 + 2 * i;
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Thread, 0, base));
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Sched, 0, base + 1));
+                self.m.ok(
+                    0,
+                    Syscall::ThreadConfigure {
+                        thread: s(base),
+                        cspace: s(dodos_abi::START_SLOT_CSPACE),
+                        aspace: s(dodos_abi::START_SLOT_ASPACE),
+                        fault: SlotAddr::NONE,
+                        page: SlotAddr::NONE,
+                    },
+                );
+                self.m.ok(
+                    0,
+                    Syscall::SchedConfigure {
+                        sched: s(base + 1),
+                        node: node_cap(0),
+                        core: 0,
+                        budget: dodos_abi::SCHED_MIN_BUDGET_NS,
+                        period: 100 * MS,
+                        class: 1,
+                    },
+                );
+                self.m.ok(
+                    0,
+                    Syscall::SchedBind {
+                        sched: s(base + 1),
+                        thread: s(base),
+                    },
+                );
+                self.m.ok(0, Syscall::ThreadResume(s(base)));
+                let tid = self.m.sys.node(0).object_at(self.m.t[0], s(base)).unwrap();
+                workers.push((tid, base));
+            }
+            let non_manage = dodos_abi::SENDS_PER_PEER - dodos_abi::SENDS_RESERVED_FOR_MANAGE;
+            for &(tid, _) in &workers[..non_manage] {
+                assert_eq!(
+                    self.m.call_by(
+                        0,
+                        tid,
+                        Syscall::NodeSend {
+                            node: s(1500),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    0,
+                    workers[non_manage].0,
+                    Syscall::NodeSend {
+                        node: s(1500),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            for &(tid, _) in &workers[non_manage..dodos_abi::SENDS_PER_PEER] {
+                assert_eq!(
+                    self.m.call_by(
+                        0,
+                        tid,
+                        Syscall::NodeSend {
+                            node: node_cap(1),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    0,
+                    workers[dodos_abi::SENDS_PER_PEER].0,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            self.run(2 * MS);
+            for &(_, base) in &workers {
+                self.m.ok(0, Syscall::CapDelete(s(base)));
+                self.m.ok(0, Syscall::CapDelete(s(base + 1)));
+            }
+            self.m.ok(0, Syscall::CapDelete(s(1500)));
+        }
+
+        // 11. Offset 207: 3 sealed nodes at once across one sweep
+        // (two-sealed-per-sweep cap), then resume cleanly before seal_ms.
+        if offset == 207 {
+            let target = self.m.sys.node(0).next_sweep.saturating_sub(5 * MS);
+            if self.m.sys.now() < target {
+                self.run(target - self.m.sys.now());
+            }
+            for n in [1u16, 2, 3] {
+                let _ = self.call(0, seal(n));
+            }
+            self.run(10 * MS);
+            for n in [1u16, 2, 3] {
+                if self.m.state(n) == MemberState::Sealed {
+                    let _ = self.call(0, resume(n));
+                }
+            }
+            self.run(2 * MS);
+        }
+
+        // 12. Offset 254: CORE_ANSWER_NS (10 ms) on WIDE (cores 4 & 5).
+        if offset == 254 {
+            let ut4 = super::untyped_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let tables4 = super::table_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let asp = self.m.retype(WIDE, ObjectKind::ASpace, 0, 1600);
+            self.m.ok(WIDE, asp);
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Frame, 1, 1601));
+            self.m.ok(
+                WIDE,
+                Syscall::ASpaceMap(crate::Map {
+                    space: s(1600),
+                    frame: s(1601),
+                    untyped: s(tables4),
+                    address: 0x2000_0000,
+                    first: 0,
+                    count: 1,
+                    rights: Rights::READ.bits(),
+                }),
+            );
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Thread, 0, 1602));
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Sched, 0, 1603));
+            self.m.ok(
+                WIDE,
+                Syscall::ThreadConfigure {
+                    thread: s(1602),
+                    cspace: s(dodos_abi::START_SLOT_CSPACE),
+                    aspace: s(1600),
+                    fault: SlotAddr::NONE,
+                    page: SlotAddr::NONE,
+                },
+            );
+            self.m.ok(
+                WIDE,
+                Syscall::SchedConfigure {
+                    sched: s(1603),
+                    node: node_cap(WIDE),
+                    core: u64::from(WIDE) + 1,
+                    budget: 50 * MS,
+                    period: 100 * MS,
+                    class: 1,
+                },
+            );
+            self.m.ok(
+                WIDE,
+                Syscall::SchedBind {
+                    sched: s(1603),
+                    thread: s(1602),
+                },
+            );
+            self.m.ok(WIDE, Syscall::ThreadResume(s(1602)));
+            self.run(500_000);
+            let generation = self.m.sys.member(WIDE).generation();
+            self.m.harm.harmed.insert((WIDE, generation));
+            self.m.sys.hang(usize::from(WIDE) + 1, true);
+            if arch == Arch::Aarch64 {
+                // ARM64 broadcasts TLB invalidations in hardware (`TLBI IS`),
+                // so a hung secondary core is caught by `watch_own_cores` after
+                // `STALE_NS` (`CrashReason::CoreSilent`).
+                let wait = self.m.sys.canonical().stale_ns + 40 * MS;
+                self.run(wait);
+            } else {
+                assert_eq!(self.m.call(WIDE, Syscall::ASpaceUnmap(s(1601))), WAITS);
+                self.run(40 * MS);
+            }
+        }
+
+        self.note();
     }
 
     /// The holder's receiver waits for up to four frames from `group`, and
