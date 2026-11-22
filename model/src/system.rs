@@ -604,6 +604,7 @@ impl System {
                     };
                 }
                 self.wake_from_sleep(core);
+                self.sync_sleep();
                 // The timer interrupt that woke the core is taken at once,
                 // late by the exit latency (Idle: "An interrupt wakes it");
                 // if `TIME_EVENT_STEP` left strictly-past due events from
@@ -737,6 +738,7 @@ impl System {
         {
             model.silence(position);
         }
+        self.sync_sleep();
     }
 
     /// A start's wake reaches a core late (a test's input). A core in the
@@ -753,6 +755,7 @@ impl System {
             (Arch::X86_64, _) => self.stop(core),
             (Arch::Aarch64 | Arch::Riscv64, _) => {}
         }
+        self.sync_sleep();
     }
 
     /// The debugger stub of a development image stops the machine for `ns`
@@ -1356,6 +1359,7 @@ impl System {
             return false;
         }
         self.park(core);
+        self.sync_sleep();
         true
     }
 
