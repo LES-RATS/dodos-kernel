@@ -720,14 +720,7 @@ fn r6_clear_step_removes_attach_words_before_clearing_page_classes() {
             .or_else(|| events.into_iter().next());
         if let Some(ev) = next {
             m.sys.fire(ev);
-            if !m
-                .sys
-                .events()
-                .iter()
-                .any(|e| matches!(e, Event::Timer { .. }))
-            {
-                assert_eq!(m.sys.check(), Ok(()));
-            }
+            assert_eq!(m.sys.check(), Ok(()));
         } else {
             let now = m.sys.now();
             let next_t = m
