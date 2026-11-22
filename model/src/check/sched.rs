@@ -22,9 +22,10 @@ impl Model {
     /// 43. a configured context has 10 µs ≤ budget ≤ period ≤ 2^36 ns (and
     ///     so do the parameters it waits to use), class 0 to 2, budget left
     ///     if and only if it is not throttled, and a replenishment instant
-    ///     after now unless it is dying or its core is silent; one that is
-    ///     not configured has nothing left, no deadline and is not
-    ///     throttled;
+    ///     at or after now (an instant equal to now waits for another timer
+    ///     interrupt after a `TIME_EVENT_STEP` cap or on another core) unless
+    ///     it is dying or its core is silent; one that is not configured has
+    ///     nothing left, no deadline and is not throttled;
     /// 44. a home and its context name each other; a lend names a live
     ///     reply object, a live context whose chain holds it once, and a
     ///     live receiver without an own context, which receives no other
@@ -36,8 +37,9 @@ impl Model {
     ///     has the reschedule interrupt pending; the thread it runs, while
     ///     not marked *leaving its core*, has an address space that is not
     ///     dying; no thread runs on two cores;
-    /// 47. an armed timer is listed once by its live notify and fires after
-    ///     now; a notify lists only the armed timers that name it.
+    /// 47. an armed timer is listed once by its live notify and fires at or
+    ///     after now (unless its core is silent, or sleeping within exit
+    ///     latency); a notify lists only the armed timers that name it.
     pub(super) fn check_sched(&self) -> Check {
         // A lend to a thread that does not exist is named by 44 (or an
         // earlier rule), never a panic of the check.
@@ -81,10 +83,14 @@ impl Model {
                     // seed 329 of pass 23's long run).
                     let silent = self.cores.get(sched.core).is_some_and(|c| c.silent);
                     // A replenishment on a sleeping core is taken at its
-                    // wake, up to the state's exit latency late (Idle).
+                    // wake, up to the state's exit latency late (Idle). A
+                    // replenishment due right at `now` may still wait for a
+                    // further timer interrupt after `TIME_EVENT_STEP` (16)
+                    // capped the previous interrupt, or on another core at
+                    // the same instant (pass 43).
                     let late = self.cores.get(sched.core).map_or(0, |c| c.asleep);
                     let due =
-                        |at: u64| at > self.now || late > 0 && at.saturating_add(late) >= self.now;
+                        |at: u64| at >= self.now || late > 0 && at.saturating_add(late) >= self.now;
                     let throttled =
                         silent || dying || sched.throttled.is_some_and(|(at, _)| due(at));
                     valid((sched.budget, sched.period))
@@ -232,10 +238,16 @@ impl Model {
                 .notifies
                 .get(&armed.notify)
                 .map(|notify| notify.timers.iter().filter(|&&timer| timer == id).count());
-            // A timer of a sleeping core is taken at its wake, up to the
-            // state's exit latency after its instant (Idle).
+            // A timer of a silent core takes no timer interrupt (as for 43);
+            // a timer of a sleeping core is taken at its wake, up to the
+            // state's exit latency after its instant (Idle); a timer due
+            // right at `now` may still wait for a further timer interrupt
+            // after `TIME_EVENT_STEP` (16) capped the previous interrupt, or
+            // on another core at the same instant (pass 43).
+            let silent = self.cores.get(armed.core).is_some_and(|c| c.silent);
             let late = self.cores.get(armed.core).map_or(0, |c| c.asleep);
-            let ahead = armed.instant > self.now
+            let ahead = silent
+                || armed.instant >= self.now
                 || late > 0 && armed.instant.saturating_add(late) >= self.now;
             ensure(listed == Some(1) && ahead, "47: armed timer")?;
         }

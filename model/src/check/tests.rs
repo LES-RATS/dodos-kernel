@@ -1946,6 +1946,24 @@ fn throttled_context_with_budget_left_is_reported() {
 }
 
 #[test]
+fn throttled_context_replenishment_strictly_in_the_past_is_still_reported() {
+    let broken = spoiled(|m, at| {
+        let context = first_context(m, at);
+        m.now = 1_000_000;
+        let past = m.now - 1;
+        let debt = dodos_abi::sched_debt(0, 1);
+        let sched = live(&mut m.scheds, context);
+        sched.remaining = 0;
+        sched.throttled = Some((past, debt));
+        if let Some(q) = sched.queue.as_mut() {
+            q.queue = Queue::Slack(sched.class);
+            q.key = past;
+        }
+    });
+    assert_eq!(broken, "43: parameters and state of a context");
+}
+
+#[test]
 fn context_that_names_no_home_while_queued_is_reported() {
     let broken = spoiled(|m, at| {
         let context = first_context(m, at);
@@ -2006,6 +2024,32 @@ fn armed_timer_its_notify_does_not_list_is_reported() {
         };
         m.apply(boot, set).unwrap();
         live(&mut m.notifies, at.notify).timers.clear();
+    });
+    assert_eq!(broken, "47: armed timer");
+}
+
+#[test]
+fn armed_timer_strictly_in_the_past_is_still_reported() {
+    let broken = spoiled(|m, at| {
+        let boot = at.ready;
+        let own = SlotAddr::own;
+        let retype = Syscall::UntypedRetype {
+            untyped: own(UNTYPED),
+            kind: ObjectKind::Timer,
+            size: 0,
+            page: 0,
+            memory: 0,
+            destination: own(60),
+        };
+        m.apply(boot, retype).unwrap();
+        let set = Syscall::TimerSet {
+            timer: own(60),
+            notify: own(NT),
+            deadline: 1_000_000,
+            tolerance: 0,
+        };
+        m.apply(boot, set).unwrap();
+        m.now = 1_000_001;
     });
     assert_eq!(broken, "47: armed timer");
 }
