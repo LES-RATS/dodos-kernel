@@ -839,6 +839,6 @@ fn checker_rejects_a_rebuild_without_deadline_or_past_stuck_ns() {
         .move_clock(saved.unwrap() + stuck + dodos_abi::RECOVERY_PERIOD_NS + 1);
     assert_eq!(
         m.sys.check(),
-        Err("REBUILD: a live holder waited past STUCK_NS for a rebuild Report".into())
+        Err("REBUILD: a holder waited past STUCK_NS for a rebuild Report".into())
     );
 }

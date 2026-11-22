@@ -491,3 +491,210 @@ fn checker_uses_last_report_for_rebuild_deadline_invariant() {
         .expect_err("stale last_report must fail REBUILD");
     assert!(err.contains("REBUILD:"), "unexpected error: {err}");
 }
+
+/// Finding 3 (part 1): a stale `ReportAsk` (wrong holder or epoch) arriving at
+/// a peer in `FaultyReport::Silent` is answered with an empty `Report`
+/// (`REPORT_END`) so its credit is freed, and is not recorded as swallowed.
+#[test]
+fn stale_report_ask_to_silent_node_is_answered_empty_and_not_swallowed() {
+    let mut m = three_with_both_roles_on_1(1);
+    m.sys.node_mut(0).faulty_report = FaultyReport::Silent;
+
+    // Node 2 does not hold `IOMMU_ROLE` (node 1 holds it), so a `ReportAsk`
+    // from node 2 with stale epoch is stale.
+    let stale_epoch = m.sys.role(IOMMU_ROLE).epoch().wrapping_add(5);
+    let credit = (0u8, 777u32);
+    m.sys.node_mut(2).peers[0].credits[0] = Some(Credit {
+        kind: NodeMessage::ReportAsk,
+        serial: credit.1,
+        completes: Completes::Report { role: IOMMU_ROLE },
+    });
+    let header = RingHeader::new(
+        NodeMessage::ReportAsk,
+        1,
+        (2, m.sys.member(2).generation()),
+        m.sys.member(0).generation(),
+        Some(credit),
+    );
+    let body = Body::ReportAsk {
+        role: IOMMU_ROLE as u16,
+        epoch: stale_epoch,
+        key: 0,
+    };
+    m.sys.inject(2, 0, crate::rings::Message { header, body });
+
+    m.run(20 * MS);
+    assert!(
+        m.sys.node(0).swallowed_asks.is_empty(),
+        "stale ReportAsk must not be swallowed by FaultyReport::Silent"
+    );
+    assert!(
+        m.sys.node(2).peers[0].credits[credit.0 as usize].is_none(),
+        "stale ReportAsk must be answered with empty Report to free its credit"
+    );
+}
+
+/// Finding 3 (part 2): `cleared_faulty` in `Model::check_irqs` exempts only
+/// lines actually cleared by a holder because of a recorded cut of that node,
+/// on that role, in that generation — not lines on an unaffected role and not
+/// lines claimed later on the cut role.
+#[test]
+fn cleared_faulty_exempts_only_lines_cleared_by_a_cut_on_that_role() {
+    let mut mach = machine(Arch::Riscv64, 4, &[&[0], &[1], &[2], &[3]]);
+    mach.membership.sweep_ms = 200;
+    mach.membership.stale_ms = 200;
+    mach.membership.stuck_ms = 40;
+    let mut m = S::on(&mach);
+    assert_eq!(m.sys.role(IOMMU_ROLE).holder(), 1);
+    assert_eq!(m.sys.role(IOAPIC_ROLE).holder(), 2);
+
+    // Node 0 attaches device 0x10 (on IOMMU_ROLE) and claims RISC-V line 5 (on
+    // IOAPIC_ROLE).
+    let iospace = m.retype(0, ObjectKind::IoSpace, 0, IOSPACE);
+    m.ok(0, iospace);
+    let iommu = slots_of(m.sys.node(0), m.t[0], ObjectKind::Iommu)[0];
+    let attach = Syscall::IoSpaceAttach {
+        iommu: s(iommu),
+        iospace: s(IOSPACE),
+        device: 0x10,
+    };
+    match m.call(0, attach) {
+        WAITS => {
+            m.settle();
+            assert_eq!(m.woken(0), Some(&DONE));
+        }
+        outcome => assert_eq!(outcome, DONE),
+    }
+    let claim_line = |m: &mut S, gsi: u32, vector: u64, slot: u32| {
+        let call = Syscall::IrqClaim {
+            control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+            source: IrqSource::line(gsi, false, false).raw(),
+            core: 0,
+            vector,
+            destination: s(slot),
+        };
+        match m.call(0, call) {
+            WAITS => {
+                m.settle();
+                assert!(m.woken(0).is_some_and(Result::is_ok));
+            }
+            outcome => assert!(outcome.is_ok(), "claim line {gsi}: {outcome:?}"),
+        }
+    };
+    claim_line(&mut m, 5, 48, 220);
+
+    // Cut node 0 on `IOMMU_ROLE` ONLY (kill holder 1 so node 2 rebuilds
+    // `IOMMU_ROLE` while `IOAPIC_ROLE` is not rebuilt).
+    m.sys.node_mut(0).faulty_report = FaultyReport::Silent;
+    kill_node(&mut m, 1);
+    m.run(120 * MS);
+    assert!(m.sys.node(2).rebuilds.is_empty());
+    assert!(
+        m.sys
+            .node(2)
+            .rebuild_cuts
+            .0
+            .iter()
+            .any(|&(r, p, _, _)| r == IOMMU_ROLE && p == 0)
+    );
+    assert!(m.sys.canonical().units[&IOAPIC_ROLE].cut_lines.is_empty());
+
+    // Corrupting line 5 on `IOAPIC_ROLE` must NOT be exempted by the cut on
+    // `IOMMU_ROLE`.
+    let saved_line = m.sys.canonical().units[&IOAPIC_ROLE].lines[&5];
+    let saved_aplic = m.sys.canonical().aplic[&5];
+    m.sys.edit_table(|t| {
+        t.units
+            .get_mut(&IOAPIC_ROLE)
+            .expect("ioapic")
+            .lines
+            .remove(&5);
+        t.aplic.get_mut(&5).expect("aplic 5").deactivate();
+    });
+    let err = m
+        .sys
+        .check()
+        .expect_err("cut on IOMMU_ROLE must not exempt IOAPIC_ROLE lines");
+    assert!(err.contains("SOURCECFG:"), "unexpected error: {err}");
+    m.sys.edit_table(|t| {
+        t.units
+            .get_mut(&IOAPIC_ROLE)
+            .expect("ioapic")
+            .lines
+            .insert(5, saved_line);
+        *t.aplic.get_mut(&5).expect("aplic 5") = saved_aplic;
+    });
+    assert_eq!(m.sys.check(), Ok(()));
+
+    // Now cut node 0 on `IOAPIC_ROLE` itself (kill holder 2 so node 3 rebuilds
+    // `IOAPIC_ROLE` and clears line 5). Line 5 is legitimately exempted.
+    kill_node(&mut m, 2);
+    m.run(120 * MS);
+    assert!(m.sys.node(3).rebuilds.is_empty());
+    assert!(
+        m.sys.canonical().units[&IOAPIC_ROLE].cut_lines.contains(&(
+            5,
+            0,
+            m.sys.member(0).generation()
+        )),
+        "line 5 cleared by IOAPIC_ROLE cut must be recorded in cut_lines"
+    );
+    assert!(!m.sys.canonical().aplic[&5].active);
+    assert_eq!(m.sys.check(), Ok(()));
+
+    // Node 0 now claims a second line (line 6) in the same generation. Line 6
+    // was NOT cleared by the earlier cut, so corrupting line 6 must still fail
+    // `SOURCECFG`.
+    m.sys.node_mut(0).faulty_report = FaultyReport::Normal;
+    claim_line(&mut m, 6, 49, 221);
+    assert!(m.sys.canonical().aplic[&6].active);
+    m.sys.edit_table(|t| {
+        t.units
+            .get_mut(&IOAPIC_ROLE)
+            .expect("ioapic")
+            .lines
+            .remove(&6);
+        t.aplic.get_mut(&6).expect("aplic 6").deactivate();
+    });
+    let err = m
+        .sys
+        .check()
+        .expect_err("earlier cut of line 5 must not exempt newly claimed line 6");
+    assert!(err.contains("SOURCECFG:"), "unexpected error: {err}");
+}
+
+/// Finding 4.3: the REBUILD deadline check in `System::check` also covers a
+/// sealing holder that is still running `rebuild_step` before handing its
+/// unit roles over (D-159).
+#[test]
+fn checker_rejects_a_sealing_holder_waiting_past_stuck_ns() {
+    let mut m = three_with_both_roles_on_1(1);
+    let stuck = m.sys.canonical().stuck_ns;
+    m.sys.node_mut(0).faulty_report = FaultyReport::Silent;
+
+    kill_node(&mut m, 1);
+    step_events(&mut m, 50 * MS, |m| {
+        m.sys
+            .node(2)
+            .rebuilds
+            .get(&IOMMU_ROLE)
+            .is_some_and(|r| r.node == 0 && r.asked.is_some() && r.asked_at.is_some())
+    });
+
+    // Begin sealing holder 2 while its rebuild of `IOMMU_ROLE` is active
+    // (D-159: sealing waits for the rebuild before handing over).
+    m.ok(0, super::pass17::seal(2));
+    step_events(&mut m, 5 * MS, |m| m.state(2) == MemberState::Sealing);
+    assert_eq!(m.state(2), MemberState::Sealing);
+    assert!(m.sys.node(2).rebuilds.contains_key(&IOMMU_ROLE));
+
+    let asked_at = m.sys.node(2).rebuilds[&IOMMU_ROLE]
+        .asked_at
+        .expect("asked_at");
+    m.sys
+        .move_clock(asked_at + stuck + dodos_abi::RECOVERY_PERIOD_NS + 1);
+    assert_eq!(
+        m.sys.check(),
+        Err("REBUILD: a holder waited past STUCK_NS for a rebuild Report".into())
+    );
+}

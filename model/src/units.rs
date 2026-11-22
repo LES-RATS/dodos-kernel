@@ -139,6 +139,10 @@ pub(crate) struct Rebuild {
     /// entries are kept without a report, even if they resume before the
     /// rebuild ends (the final review's verification of lot C, H11).
     pub(crate) sealed: std::collections::BTreeSet<u16>,
+    /// The `(peer, generation)` pairs whose report this rebuild cut early
+    /// (D-141, D-169), so lines cleared at completion are recorded in
+    /// `UnitState::cut_lines` only for those cuts.
+    pub(crate) cut: std::collections::BTreeSet<(u16, u32)>,
     /// The drain and the final invalidation of the whole unit: its
     /// submission, once made.
     pub(crate) closing: Option<(u64, u64)>,
@@ -564,6 +568,7 @@ impl Model {
                         false => line.deactivate(),
                     }
                 }
+                unit.cut_lines.retain(|&(l, _, _)| l != gsi);
                 match claimed {
                     true => {
                         unit.masked.remove(&gsi);

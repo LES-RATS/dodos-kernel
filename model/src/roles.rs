@@ -487,6 +487,7 @@ impl Model {
                 unit.entries.retain(|_, &mut (n, e)| !(n == node && e == g));
                 unit.remap.retain(|_, &mut (n, e)| !(n == node && e == g));
                 unit.lines.retain(|_, &mut (n, e)| !(n == node && e == g));
+                unit.cut_lines.retain(|&(_, n, e)| !(n == node && e == g));
                 continue;
             }
             if !matches!(
@@ -591,13 +592,12 @@ impl Model {
                 // `Report` is dropped and its credit freed in
                 // `report_received`.
                 let z = rebuild.node;
+                let g = self.table.generation(z);
                 self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
-                self.rebuild_cuts.0.push((
-                    role,
-                    z,
-                    self.table.generation(z),
-                    crate::units::RebuildCut::Deadline,
-                ));
+                self.rebuild_cuts
+                    .0
+                    .push((role, z, g, crate::units::RebuildCut::Deadline));
+                rebuild.cut.insert((z, g));
                 rebuild.asked = None;
                 rebuild.asked_at = None;
                 rebuild.node = z + 1;
@@ -653,13 +653,12 @@ impl Model {
                 rebuild.asked_at.get_or_insert(now);
                 let since = self.rebuild_wait_since(&rebuild).expect("asked_at set");
                 if !self.table.release && now >= since + self.table.stuck_ns {
+                    let g = self.table.generation(z);
                     self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
-                    self.rebuild_cuts.0.push((
-                        role,
-                        z,
-                        self.table.generation(z),
-                        crate::units::RebuildCut::Deadline,
-                    ));
+                    self.rebuild_cuts
+                        .0
+                        .push((role, z, g, crate::units::RebuildCut::Deadline));
+                    rebuild.cut.insert((z, g));
                     rebuild.asked = None;
                     rebuild.asked_at = None;
                     rebuild.node = z + 1;
@@ -691,13 +690,12 @@ impl Model {
                     rebuild.asked_at.get_or_insert(now);
                     let since = self.rebuild_wait_since(&rebuild).expect("asked_at set");
                     if !self.table.release && now >= since + self.table.stuck_ns {
+                        let g = self.table.generation(z);
                         self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
-                        self.rebuild_cuts.0.push((
-                            role,
-                            z,
-                            self.table.generation(z),
-                            crate::units::RebuildCut::Deadline,
-                        ));
+                        self.rebuild_cuts
+                            .0
+                            .push((role, z, g, crate::units::RebuildCut::Deadline));
+                        rebuild.cut.insert((z, g));
                         rebuild.asked = None;
                         rebuild.asked_at = None;
                         rebuild.node = z + 1;
@@ -756,12 +754,15 @@ impl Model {
             }
         }
         let lines: Vec<(u32, (u16, u32))> = unit.lines.iter().map(|(&l, &e)| (l, e)).collect();
-        for (line, (node, _)) in lines {
+        for (line, (node, g)) in lines {
             let claimed = reported
                 .iter()
                 .any(|&(z, i)| z == node && matches!(i, Item::Line(l, ..) if l == line));
             if !claimed && !sealed.contains(&node) {
                 unit.lines.remove(&line);
+                if rebuild.cut.contains(&(node, g)) {
+                    unit.cut_lines.insert((line, node, g));
+                }
             }
         }
         // RISC-V: the sources of the domain nobody claims made inactive,
@@ -826,6 +827,7 @@ impl Model {
                         let riscv = self.machine.arch == crate::Arch::Riscv64;
                         let unit = self.table.units.entry(role).or_default();
                         unit.lines.insert(gsi, (z, g));
+                        unit.cut_lines.retain(|&(l, _, _)| l != gsi);
                         // RISC-V masks a source by its enable, below.
                         match unmasked || riscv {
                             true => unit.masked.remove(&gsi),
@@ -1046,14 +1048,6 @@ impl Model {
         epoch: u32,
         key: u64,
     ) {
-        if self.faulty_report == crate::units::FaultyReport::Silent {
-            self.faulty_report_used = true;
-            if let Some((index, serial)) = credit {
-                self.swallowed_asks
-                    .insert((from, self.table.generation(from), index, serial));
-            }
-            return;
-        }
         let current = self.table.roles.get(role as usize).is_some_and(|w| {
             self.table.role_records[role as usize].kind == RoleKind::Unit
                 && w.state() == RoleState::Held
@@ -1068,8 +1062,14 @@ impl Model {
             let _ = self.write_message(from, body, None, credit);
             return;
         }
+        if self.faulty_report == crate::units::FaultyReport::Silent {
+            if let Some((index, serial)) = credit {
+                self.swallowed_asks
+                    .insert((from, self.table.generation(from), index, serial));
+            }
+            return;
+        }
         if self.faulty_report == crate::units::FaultyReport::BadItems {
-            self.faulty_report_used = true;
             // Full `Report`s (D-169 (3)) of items no node holds, with keys
             // that rise from the key asked.
             let governs = self.table.role_records[role as usize].governs;
@@ -1180,6 +1180,8 @@ impl Model {
         let rebuild = self.rebuilds.get_mut(&role).expect("a rebuild");
         if good {
             rebuild.items.extend(items.into_iter().map(|i| (from, i)));
+        } else {
+            rebuild.cut.insert(reporter);
         }
         rebuild.asked = None;
         rebuild.asked_at = None;

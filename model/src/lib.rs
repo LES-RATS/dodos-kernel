@@ -1199,10 +1199,6 @@ pub struct Model {
     rebuilds: BTreeMap<usize, units::Rebuild>,
     /// A test's input: faulty behaviour on `ReportAsk` (D-169).
     pub(crate) faulty_report: units::FaultyReport,
-    /// True once this generation actually acted on `FaultyReport::Silent` or
-    /// `FaultyReport::BadItems`, so a rebuild may legitimately clear this
-    /// node's own unit entries ("which costs only that node", D-169).
-    pub(crate) faulty_report_used: bool,
     /// A test's input: `(from, from_generation, credit_index, credit_serial)`
     /// of `ReportAsk` messages this node's faulty kernel consumed without
     /// answering (`FaultyReport::Silent`). Only those credits are exempted

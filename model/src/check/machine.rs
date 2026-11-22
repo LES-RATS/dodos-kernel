@@ -586,10 +586,10 @@ impl System {
                 "UNIT ROLE: a starting node holds a unit role",
             )?;
         }
-        // D-169: every in-flight `ReportAsk` records its wait start on
-        // membership time, and a live holder whose first core runs never
-        // waits past `STUCK_NS` (allowing one reserve period for sleep exit
-        // latency or clock-before-event checks).
+        // D-169, D-170: every in-flight `ReportAsk` records its wait start on
+        // membership time, and a live or sealing holder whose first core runs
+        // never waits past `STUCK_NS` (allowing one reserve period for sleep
+        // exit latency or clock-before-event checks).
         for (x, model) in self.models() {
             if self.faulty.contains(&x) {
                 continue;
@@ -600,7 +600,10 @@ impl System {
                     "REBUILD: an in-flight ReportAsk has no deadline recorded",
                 )?;
                 if !table.release
-                    && table.member(x).state() == MemberState::Live
+                    && matches!(
+                        table.member(x).state(),
+                        MemberState::Live | MemberState::Sealing
+                    )
                     && !model.is_silent(0)
                     && self.hardware(model.core_number(0)) == Hardware::Running
                     && model.lock_wait == 0
@@ -609,7 +612,7 @@ impl System {
                     ensure(
                         model.membership_now()
                             <= at + table.stuck_ns + dodos_abi::RECOVERY_PERIOD_NS,
-                        "REBUILD: a live holder waited past STUCK_NS for a rebuild Report",
+                        "REBUILD: a holder waited past STUCK_NS for a rebuild Report",
                     )?;
                 }
             }

@@ -203,6 +203,10 @@ pub(crate) struct UnitState {
     /// The lines whose entry a rebuild wrote masked, from the mask state
     /// of their report (D-139).
     pub(crate) masked: BTreeSet<u32>,
+    /// Lines `(gsi, node, generation)` cleared during a rebuild because that
+    /// rebuild recorded a cut of `(node, generation)` on this unit's role
+    /// (D-169); narrows `cleared_faulty` in `Model::check_irqs`.
+    pub(crate) cut_lines: BTreeSet<(u32, u16, u32)>,
     /// A test's input: the unit never confirms again.
     pub(crate) broken: bool,
     /// The serial of the next submission.

@@ -1244,6 +1244,8 @@ impl Model {
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
             unit.lines
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
+            unit.cut_lines
+                .retain(|&(_, n, g)| !(n == node && g == generation));
             let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
             if let Some(reclaim) = self.reclaims.get_mut(&node) {
                 reclaim.r1.insert(role, Some(serial));

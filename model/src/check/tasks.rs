@@ -96,18 +96,20 @@ impl Model {
                 .get(&irq.source.id())
                 .copied()
                 .unwrap_or_default();
-            // D-169: if this node's faulty kernel refused or sabotaged a
-            // rebuild report (`FaultyReport::Silent` or `BadItems`), the
-            // holder legitimately clears this node's claimed lines on the
-            // controller ("which costs only that node"). Healthy nodes never
-            // set `faulty_report_used`.
-            let cleared_faulty = self.faulty_report_used
-                && irq.source.is_line()
+            // D-169: if a holder cleared this specific line during a rebuild
+            // because of a recorded cut of this node's current generation on
+            // this line's controller role, exempt this line alone from the
+            // controller-side liveness checks ("which costs only that node").
+            let cleared_faulty = irq.source.is_line()
                 && self.ioapic_role(irq.source.id()).is_some_and(|role| {
-                    self.table
-                        .units
-                        .get(&role)
-                        .is_some_and(|u| !u.lines.contains_key(&irq.source.id()))
+                    self.table.units.get(&role).is_some_and(|u| {
+                        !u.lines.contains_key(&irq.source.id())
+                            && u.cut_lines.contains(&(
+                                irq.source.id(),
+                                self.node,
+                                self.table.generation(self.node),
+                            ))
+                    })
                 });
             let lost = riscv_level
                 && irq.state == IrqState::Armed
