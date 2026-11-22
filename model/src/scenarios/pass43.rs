@@ -844,59 +844,69 @@ fn node_send_64_words_4_grants_and_over_limit_refusals() {
 /// (`pending_releases = 36 > 32`); drain and verify bounded release flushing.
 #[test]
 fn pending_signals_and_pending_releases_both_exceed_32_step() {
-    let mut mach = machine(Arch::X86_64, 2, &[&[0], &[1]]);
+    let mut mach = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
     mach.floors.floor_node = 5 * mach.geometry.chunk();
     let mut m = S::on(&mach);
 
     let ut0 = untyped_slot(m.sys.node(0), m.t[0]);
-    let bell0 = retype_from(ut0, ObjectKind::Notify, 0, 120);
-    m.ok(0, bell0);
+    let ut2 = untyped_slot(m.sys.node(2), m.t[2]);
+    m.ok(0, retype_from(ut0, ObjectKind::Notify, 0, 120));
+    m.ok(2, retype_from(ut2, ObjectKind::Notify, 0, 120));
     let reply1 = m.retype(1, ObjectKind::Reply, 0, 120);
     m.ok(1, reply1);
     let rx1 = spawn_thread_min_budget(&mut m, 1, 130, 1);
 
-    // Grant 72 frames (18 batches of 4): 36 for signal + release test, 36 for filling
-    // the kernel ring to 30 before triggering 36 pending releases.
+    // Grant 72 frames from node 0 (slots 200..272 on node 1) and 48 frames from
+    // node 2 (slots 300..348 on node 1): enough to saturate user ring 1 -> 0
+    // (64 + 36 pending signals) and both kernel rings 1 -> 0 and 1 -> 2
+    // (30 + 18 pending releases each = 36 pending releases total).
     for i in 0..72u32 {
         m.ok(0, retype_from(ut0, ObjectKind::Frame, 1, 200 + i));
     }
-    for batch in 0..18u32 {
-        let first = batch * 4;
-        assert_eq!(
-            m.call_by(
-                1,
-                rx1,
-                Syscall::Recv {
-                    endpoint: s(START_SLOT_MAILBOX),
-                    reply: s(120),
-                    range: Range {
-                        first: s(200 + first),
-                        count: 4,
-                    },
-                    wait: 0,
-                },
-            ),
-            WAITS
-        );
-        assert_eq!(
-            m.call(
-                0,
-                Syscall::NodeSend {
-                    node: node_cap(1),
-                    message: Message {
-                        caps: (first..first + 4)
-                            .map(|i| Transfer::Derive(s(200 + i), frame_rights()))
-                            .collect(),
-                        ..Message::default()
-                    },
-                    doorbell: s(120),
-                },
-            ),
-            WAITS
-        );
-        m.settle();
-        assert_eq!(m.woken(0), Some(&Ok(Output::Sent { flags: 0 })));
+    for i in 0..48u32 {
+        m.ok(2, retype_from(ut2, ObjectKind::Frame, 1, 200 + i));
     }
+    let mut grant_batches = |granter: u16, count: u32, dst_base: u32| {
+        for batch in 0..(count / 4) {
+            let first = batch * 4;
+            assert_eq!(
+                m.call_by(
+                    1,
+                    rx1,
+                    Syscall::Recv {
+                        endpoint: s(START_SLOT_MAILBOX),
+                        reply: s(120),
+                        range: Range {
+                            first: s(dst_base + first),
+                            count: 4,
+                        },
+                        wait: 0,
+                    },
+                ),
+                WAITS
+            );
+            assert_eq!(
+                m.call(
+                    granter,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message {
+                            caps: (first..first + 4)
+                                .map(|i| Transfer::Derive(s(200 + i), frame_rights()))
+                                .collect(),
+                            ..Message::default()
+                        },
+                        doorbell: s(120),
+                    },
+                ),
+                WAITS
+            );
+            m.settle();
+            assert_eq!(m.woken(granter), Some(&Ok(Output::Sent { flags: 0 })));
+        }
+    };
+    grant_batches(0, 72, 200);
+    grant_batches(2, 48, 300);
 
     // Part A: fill user ring 1 -> 0 to 64 entries using 64 signals (1 entry each).
     for i in 0..RING_USER_ENTRIES as u32 {
@@ -906,42 +916,108 @@ fn pending_signals_and_pending_releases_both_exceed_32_step() {
     for i in 0..36u32 {
         m.ok(1, Syscall::GrantSignal(s(236 + i)));
     }
-    assert_eq!(
+    let pending_sig = |m: &S| {
         m.sys.canonical().uses[1]
             .values()
             .filter(|u| u.signal_pending)
-            .count(),
-        36
+            .count()
+    };
+    assert_eq!(pending_sig(&m), 36);
+    let ring_used = |m: &S, from: u16, to: u16, user: bool| {
+        let node = m.sys.node(from);
+        node.ring_of(from, to, user)
+            .produced
+            .saturating_sub(node.ring_consumed(to, user))
+    };
+    // Let node 0 drain user ring 1 -> 0 completely WITHOUT letting node 1 run
+    // its reserve step yet.
+    for _ in 0..500 {
+        if ring_used(&m, 1, 0, true) == 0 {
+            break;
+        }
+        let ev = m
+            .sys
+            .events()
+            .into_iter()
+            .find(|&ev| !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }));
+        if let Some(ev) = ev {
+            m.sys.fire(ev);
+            assert_eq!(m.sys.check(), Ok(()));
+        } else {
+            m.sys.move_clock(m.sys.now() + 100_000);
+        }
+    }
+    assert_eq!(ring_used(&m, 1, 0, true), 0);
+    assert_eq!(pending_sig(&m), 36);
+    // Run ONE reserve step on node 1: must flush exactly PENDING_STEP (32) and
+    // leave exactly 4 pending signals (fails if PENDING_STEP is raised to 1000).
+    m.sys.fire(Event::Timer {
+        node: 1,
+        position: 0,
+    });
+    assert_eq!(m.sys.check(), Ok(()));
+    m.sample_bounds();
+    assert_eq!(
+        pending_sig(&m),
+        36 - PENDING_STEP,
+        "one reserve step must flush exactly PENDING_STEP (32) pending signals, leaving 4"
     );
-    // Drain user ring and verify all 36 pending signals eventually flush cleanly.
+    // Drain the remaining 4 cleanly.
     m.run(30 * MS);
-    assert_eq!(
-        m.sys.canonical().uses[1]
-            .values()
-            .filter(|u| u.signal_pending)
-            .count(),
-        0
-    );
+    assert_eq!(pending_sig(&m), 0);
 
-    // Part B: delete 30 remote frames -> kernel ring 1 -> 0 hits 30 (answer reserve),
-    // then delete 36 more -> 36 `release_pending` (> PENDING_STEP = 32)!
-    for i in 0..66u32 {
+    // Part B: delete 48 remote frames from node 0 (30 fill kernel ring 1 -> 0 to
+    // answer reserve + 18 release_pending) and 48 remote frames from node 2 (30
+    // fill kernel ring 1 -> 2 + 18 release_pending) -> 36 release_pending total!
+    for i in 0..48u32 {
         m.ok(1, Syscall::CapDelete(s(200 + i)));
     }
-    let pending_rel = m.sys.canonical().uses[1]
-        .values()
-        .filter(|u| u.release_pending)
-        .count();
-    assert_eq!(pending_rel, 36);
-    assert!(pending_rel > PENDING_STEP);
-    m.run(50 * MS);
-    assert_eq!(
+    for i in 0..48u32 {
+        m.ok(1, Syscall::CapDelete(s(300 + i)));
+    }
+    let pending_rel = |m: &S| {
         m.sys.canonical().uses[1]
             .values()
             .filter(|u| u.release_pending)
-            .count(),
-        0
+            .count()
+    };
+    assert_eq!(pending_rel(&m), 36);
+    // Let nodes 0 and 2 drain kernel rings 1 -> 0 and 1 -> 2 completely WITHOUT
+    // letting node 1 run its reserve step yet (combined free capacity = 60 > 36).
+    for _ in 0..1_000 {
+        if ring_used(&m, 1, 0, false) == 0 && ring_used(&m, 1, 2, false) == 0 {
+            break;
+        }
+        let ev = m
+            .sys
+            .events()
+            .into_iter()
+            .find(|&ev| !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }));
+        if let Some(ev) = ev {
+            m.sys.fire(ev);
+            assert_eq!(m.sys.check(), Ok(()));
+        } else {
+            m.sys.move_clock(m.sys.now() + 100_000);
+        }
+    }
+    assert_eq!(ring_used(&m, 1, 0, false), 0);
+    assert_eq!(ring_used(&m, 1, 2, false), 0);
+    assert_eq!(pending_rel(&m), 36);
+    // Run ONE reserve step on node 1: must flush exactly PENDING_STEP (32) and
+    // leave exactly 4 pending releases (fails if PENDING_STEP is raised to 1000).
+    m.sys.fire(Event::Timer {
+        node: 1,
+        position: 0,
+    });
+    assert_eq!(m.sys.check(), Ok(()));
+    m.sample_bounds();
+    assert_eq!(
+        pending_rel(&m),
+        36 - PENDING_STEP,
+        "one reserve step must flush exactly PENDING_STEP (32) pending releases, leaving 4"
     );
+    m.run(50 * MS);
+    assert_eq!(pending_rel(&m), 0);
     assert!(m.bounds.max_pending_signals >= 36);
     assert!(m.bounds.max_pending_releases >= 36);
     assert!(m.bounds.pending_step_32);

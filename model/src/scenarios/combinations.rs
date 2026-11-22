@@ -1169,7 +1169,8 @@ impl Run {
                 super::retype_from(
                     ut0,
                     ObjectKind::CSpace,
-                    u64::from(dodos_abi::CSPACE_MAX_SLOTS) + 1,
+                    u64::from(dodos_abi::CSPACE_MAX_SLOTS)
+                        + u64::from(dodos_abi::CSPACE_SEGMENT_SLOTS),
                     1041,
                 ),
             ),
@@ -1244,10 +1245,13 @@ impl Run {
         while self.m.call(0, Syscall::CapRevoke(s(1300))) == Err(Error::Again) {}
         self.m.ok(0, Syscall::CapDelete(s(1300)));
 
-        // 8. TIME_EVENT_STEP (16): arm 20 timers at the same deadline on node 0.
+        // 8. TIME_EVENT_STEP (16): arm 20 timers at the same deadline on node 0
+        // and verify a single timer interrupt processes at most 16, leaving 4
+        // due with the hardware timer kept at `now`.
         self.m
             .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1050));
         let deadline = self.m.sys.now() + 2 * MS;
+        let mut timer_objs = Vec::with_capacity(dodos_abi::TIME_EVENT_STEP + 4);
         for i in 0..(dodos_abi::TIME_EVENT_STEP as u32 + 4) {
             self.m
                 .ok(0, super::retype_from(ut0, ObjectKind::Timer, 0, 1051 + i));
@@ -1263,8 +1267,54 @@ impl Run {
                 ),
                 Ok(Output::WasArmed(_))
             ));
+            let obj = self
+                .m
+                .sys
+                .node(0)
+                .object_at(self.m.t[0], s(1051 + i))
+                .expect("timer object");
+            timer_objs.push(obj);
         }
-        self.run(3 * MS);
+        // Advance up to just before `deadline`, then move clock to `deadline`
+        // and take exactly ONE timer interrupt on node 0 core 0.
+        if self.m.sys.now() < deadline - 1 {
+            let before = deadline - 1 - self.m.sys.now();
+            self.run(before);
+        }
+        self.m.sys.move_clock(deadline);
+        let armed_before = timer_objs
+            .iter()
+            .filter(|id| self.m.sys.node(0).timers.get(id).is_some_and(Option::is_some))
+            .count();
+        assert_eq!(armed_before, dodos_abi::TIME_EVENT_STEP + 4);
+        self.m.sys.fire(crate::system::Event::Timer {
+            node: 0,
+            position: 0,
+        });
+        assert_eq!(self.m.sys.check(), Ok(()));
+        self.m.sample_bounds();
+        let armed_after = timer_objs
+            .iter()
+            .filter(|id| self.m.sys.node(0).timers.get(id).is_some_and(Option::is_some))
+            .count();
+        assert!(
+            armed_after >= 4,
+            "one timer interrupt must fire at most TIME_EVENT_STEP (16) due events, leaving >= 4 timers armed (got {armed_after})"
+        );
+        assert_eq!(
+            self.m.sys.node(0).cores[0].hw_timer,
+            Some(deadline),
+            "hardware timer must stay at now while capped due events remain"
+        );
+        assert!(self.m.bounds.time_event_step_16);
+        self.run(1 * MS);
+        assert_eq!(
+            timer_objs
+                .iter()
+                .filter(|id| self.m.sys.node(0).timers.get(id).is_some_and(Option::is_some))
+                .count(),
+            0
+        );
         for i in 0..(dodos_abi::TIME_EVENT_STEP as u32 + 4) {
             self.m.ok(0, Syscall::CapDelete(s(1051 + i)));
         }
@@ -1461,20 +1511,101 @@ impl Run {
         // 11. Offset 207: 3 sealed nodes at once across one sweep
         // (two-sealed-per-sweep cap), then resume cleanly before seal_ms.
         if offset == 207 {
-            let target = self.m.sys.node(0).next_sweep.saturating_sub(5 * MS);
+            // Position ~5 ms before node 0's next sweep so all three nodes
+            // seal before the sweep and stay well under `seal_ns`.
+            let headroom = 5 * MS;
+            if self.m.sys.node(0).next_sweep <= self.m.sys.now() + headroom {
+                let past = self.m.sys.node(0).next_sweep.saturating_sub(self.m.sys.now()) + 1 * MS;
+                self.run(past);
+            }
+            let target = self.m.sys.node(0).next_sweep.saturating_sub(headroom);
             if self.m.sys.now() < target {
                 self.run(target - self.m.sys.now());
             }
+            let sweep_at = self.m.sys.node(0).next_sweep;
             for n in [1u16, 2, 3] {
-                let _ = self.call(0, seal(n));
+                assert_eq!(
+                    self.call(0, seal(n)),
+                    Some(DONE),
+                    "node 0 sealing node {n}"
+                );
             }
-            self.run(10 * MS);
-            for n in [1u16, 2, 3] {
-                if self.m.state(n) == MemberState::Sealed {
-                    let _ = self.call(0, resume(n));
+            for _ in 0..20 {
+                if [1u16, 2, 3]
+                    .iter()
+                    .all(|&n| self.m.state(n) == MemberState::Sealed)
+                {
+                    break;
                 }
+                self.run(500_000);
             }
-            self.run(2 * MS);
+            assert!(
+                self.m.sys.now() < sweep_at,
+                "all three nodes must seal before node 0's sweep at {sweep_at}"
+            );
+            for n in [1u16, 2, 3] {
+                assert_eq!(
+                    self.m.state(n),
+                    MemberState::Sealed,
+                    "node {n} must be sealed before the sweep"
+                );
+            }
+            let n_nodes = self.m.sys.machine.nodes() as u16;
+            let start = self.m.sys.node(0).seal_cursor % n_nodes;
+            let sealed_order: Vec<u16> = (1..=n_nodes)
+                .map(|step| (start + step) % n_nodes)
+                .filter(|&z| z != 0 && self.m.state(z) == MemberState::Sealed)
+                .collect();
+            assert_eq!(
+                sealed_order.len(),
+                3,
+                "expected 3 sealed peers before sweep, got {sealed_order:?}"
+            );
+            // Cross exactly one sweep on node 0.
+            let to_sweep = sweep_at.saturating_sub(self.m.sys.now()) + 1 * MS;
+            self.run(to_sweep);
+            assert!(
+                self.m.sys.node(0).next_sweep > sweep_at,
+                "node 0 sweep at {sweep_at} must have run"
+            );
+            assert_eq!(
+                self.m.sys.node(0).seal_cursor,
+                sealed_order[1],
+                "one sweep must read exactly two sealed nodes ({sealed_order:?}); cursor={}",
+                self.m.sys.node(0).seal_cursor
+            );
+            assert!(
+                self.m.bounds.sweep_2_sealed_capped,
+                "two-sealed-per-sweep cap must be recorded"
+            );
+            for n in [1u16, 2, 3] {
+                assert_eq!(
+                    self.m.state(n),
+                    MemberState::Sealed,
+                    "node {n} must remain sealed until resumed"
+                );
+                assert_eq!(
+                    self.call(0, resume(n)),
+                    Some(DONE),
+                    "node 0 resuming node {n}"
+                );
+            }
+            for _ in 0..20 {
+                if [1u16, 2, 3]
+                    .iter()
+                    .all(|&n| self.m.state(n) == MemberState::Live)
+                {
+                    break;
+                }
+                self.run(500_000);
+            }
+            for n in [1u16, 2, 3] {
+                assert_eq!(
+                    self.m.state(n),
+                    MemberState::Live,
+                    "node {n} must return to Live after resume"
+                );
+            }
         }
 
         // 12. Offset 254: CORE_ANSWER_NS (10 ms) on WIDE (cores 4 & 5).
