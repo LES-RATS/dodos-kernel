@@ -605,13 +605,25 @@ impl System {
                 }
                 self.wake_from_sleep(core);
                 // The timer interrupt that woke the core is taken at once,
-                // late by the exit latency (Idle: "An interrupt wakes it").
+                // late by the exit latency (Idle: "An interrupt wakes it");
+                // if `TIME_EVENT_STEP` left strictly-past due events from
+                // that wake, take the follow-up interrupts at once before
+                // anything else runs (Due events and the hardware timer).
                 if self.hardware[core] == Hardware::Running
                     && let Some((node, position)) = self.position_of(core)
                     && self.node(node).due_now(position)
                 {
-                    self.model(node).timer_interrupt(position);
-                    self.after(node);
+                    loop {
+                        self.model(node).timer_interrupt(position);
+                        self.after(node);
+                        let more = self.hardware[core] == Hardware::Running
+                            && self.has(node)
+                            && !self.node(node).is_silent(position)
+                            && self.node(node).has_due_past(position);
+                        if !more {
+                            break;
+                        }
+                    }
                 }
             }
         }

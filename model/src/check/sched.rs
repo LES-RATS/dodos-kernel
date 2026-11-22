@@ -84,13 +84,21 @@ impl Model {
                     let silent = self.cores.get(sched.core).is_some_and(|c| c.silent);
                     // A replenishment on a sleeping core is taken at its
                     // wake, up to the state's exit latency late (Idle). A
-                    // replenishment due right at `now` may still wait for a
-                    // further timer interrupt after `TIME_EVENT_STEP` (16)
-                    // capped the previous interrupt, or on another core at
-                    // the same instant (pass 43).
+                    // replenishment due at `now` is allowed only while that
+                    // core's hardware timer is set at or before `now` (e.g.
+                    // after `TIME_EVENT_STEP` capped the previous interrupt,
+                    // or before this core's timer interrupt at `now` runs).
                     let late = self.cores.get(sched.core).map_or(0, |c| c.asleep);
-                    let due =
-                        |at: u64| at >= self.now || late > 0 && at.saturating_add(late) >= self.now;
+                    let timer_due = self
+                        .cores
+                        .get(sched.core)
+                        .and_then(|c| c.hw_timer)
+                        .is_some_and(|t| t <= self.now);
+                    let due = |at: u64| {
+                        at > self.now
+                            || (at == self.now && timer_due)
+                            || late > 0 && at.saturating_add(late) >= self.now
+                    };
                     let throttled =
                         silent || dying || sched.throttled.is_some_and(|(at, _)| due(at));
                     valid((sched.budget, sched.period))
@@ -240,14 +248,20 @@ impl Model {
                 .map(|notify| notify.timers.iter().filter(|&&timer| timer == id).count());
             // A timer of a silent core takes no timer interrupt (as for 43);
             // a timer of a sleeping core is taken at its wake, up to the
-            // state's exit latency after its instant (Idle); a timer due
-            // right at `now` may still wait for a further timer interrupt
-            // after `TIME_EVENT_STEP` (16) capped the previous interrupt, or
-            // on another core at the same instant (pass 43).
+            // state's exit latency after its instant (Idle); a timer due at
+            // `now` is allowed only while that core's hardware timer is set at
+            // or before `now` (e.g. after `TIME_EVENT_STEP` capped the previous
+            // interrupt, or before this core's timer interrupt at `now` runs).
             let silent = self.cores.get(armed.core).is_some_and(|c| c.silent);
             let late = self.cores.get(armed.core).map_or(0, |c| c.asleep);
+            let timer_due = self
+                .cores
+                .get(armed.core)
+                .and_then(|c| c.hw_timer)
+                .is_some_and(|t| t <= self.now);
             let ahead = silent
-                || armed.instant >= self.now
+                || armed.instant > self.now
+                || (armed.instant == self.now && timer_due)
                 || late > 0 && armed.instant.saturating_add(late) >= self.now;
             ensure(listed == Some(1) && ahead, "47: armed timer")?;
         }

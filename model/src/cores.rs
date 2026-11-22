@@ -159,6 +159,10 @@ pub(crate) struct CorePart {
     /// Whether this core has not yet reached its first event of the current
     /// fresh start (D-171).
     pub(crate) awaiting_entry: bool,
+    /// The core's programmed hardware timer instant (Due events and the
+    /// hardware timer): set at event exit to the earliest future instant
+    /// (`> now`), or to `now` when `TIME_EVENT_STEP` leaves due events.
+    pub(crate) hw_timer: Option<u64>,
     /// The heartbeat of this core as the node's other cores last saw it
     /// move, and the instant they saw it (A node of several cores).
     pub(crate) watched: Ephemeral<(u64, u64)>,
@@ -948,6 +952,7 @@ impl Model {
             // left by a prior generation that died while busy causes
             // `watch_own_cores` or a peer's sweep to falsely accuse the idle
             // core after `STALE_NS`).
+            self.refresh_timer_on(position);
             self.beat_on(position);
         }
         // A fresh start: the core at position 0 built the start-up state, and

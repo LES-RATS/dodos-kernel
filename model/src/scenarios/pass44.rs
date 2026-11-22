@@ -211,3 +211,87 @@ fn d171_checker_rejects_early_core_silent_self_accusation_for_unentered_core() {
         .expect_err("checker must reject early CoreSilent self-accusation for un-entered core");
     assert!(err.contains("D-171"), "unexpected error message: {err}");
 }
+
+#[test]
+fn timer_set_at_now_fires_immediately_and_check_47_requires_hw_timer_at_now() {
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.ok(k.retype(ObjectKind::Notify, 0, 150));
+    k.ok(k.retype(ObjectKind::Timer, 0, 151));
+    let now = k.m.now;
+    let out = k.m.apply(
+        k.t,
+        Syscall::TimerSet {
+            timer: s(151),
+            notify: s(150),
+            deadline: now,
+            tolerance: 0,
+        },
+    );
+    assert_eq!(out, Ok(Output::WasArmed(0)));
+    assert_eq!(k.m.check(), Ok(()));
+    // Under the reviewer's mutation (`instant < self.now` in `Model::timer_set`),
+    // the timer stays armed at `now` while `hw_timer` is strictly after `now`,
+    // so `k.m.check()` fails with `Err("47: armed timer")`.
+    let timer = k.m.object_at(k.t, s(151)).expect("timer");
+    assert!(k.m.timers[&timer].is_none());
+}
+
+#[test]
+fn checks_43_and_47_reject_at_now_without_hardware_timer_due_at_now() {
+    // Check 47: an armed timer at `now` is accepted only while `hw_timer <= Some(now)`.
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.ok(k.retype(ObjectKind::Notify, 0, 150));
+    k.ok(k.retype(ObjectKind::Timer, 0, 151));
+    let deadline = k.m.now + 5 * MS;
+    assert_eq!(
+        k.call(
+            k.t,
+            Syscall::TimerSet {
+                timer: s(151),
+                notify: s(150),
+                deadline,
+                tolerance: 0,
+            },
+        ),
+        Ok(Output::WasArmed(0))
+    );
+    k.m.set_now(deadline);
+    // Hardware timer was programmed to `deadline == now`: accepted.
+    assert_eq!(k.m.cores[0].hw_timer, Some(deadline));
+    assert_eq!(k.m.check(), Ok(()));
+    // Clear or move hardware timer past `now`: check 47 must reject.
+    k.m.cores[0].hw_timer = Some(deadline + 1);
+    assert_eq!(k.m.check(), Err("47: armed timer".into()));
+    k.m.cores[0].hw_timer = None;
+    assert_eq!(k.m.check(), Err("47: armed timer".into()));
+
+    // Check 43: a throttled context at `now` is accepted only while `hw_timer <= Some(now)`.
+    let mut k2 = N::on(&one_node(Arch::X86_64, 1));
+    k2.place_first(0);
+    let context = k2.m.threads[&k2.t].home.expect("home context");
+    let now = k2.m.now;
+    {
+        let sched = k2.m.scheds.get_mut(&context).unwrap();
+        sched.remaining = 0;
+        sched.throttled = Some((now, dodos_abi::sched_debt(0, 1)));
+        let entered = sched.queue.map(|q| q.entered).unwrap_or(0);
+        sched.queue = Some(crate::Queued {
+            queue: crate::Queue::Slack(sched.class),
+            key: now,
+            entered,
+        });
+    }
+    k2.m.cores[0].running = Some((context, false));
+    k2.m.cores[0].hw_timer = Some(now);
+    assert_eq!(k2.m.check(), Ok(()));
+    k2.m.cores[0].hw_timer = Some(now + 1);
+    assert_eq!(
+        k2.m.check(),
+        Err("43: parameters and state of a context".into())
+    );
+    k2.m.cores[0].hw_timer = None;
+    assert_eq!(
+        k2.m.check(),
+        Err("43: parameters and state of a context".into())
+    );
+}

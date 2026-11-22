@@ -295,6 +295,7 @@ impl Model {
         // Wake-ups across cores: a context that should take another core
         // makes this core send that core the reschedule interrupt.
         self.reschedule_others();
+        self.program_timers();
         self.beat();
         self.end_locks();
     }
@@ -644,16 +645,10 @@ impl Model {
         request.map(|r| r.started + self.table.core_answer_ns + self.table.stopped_time)
     }
 
-    /// Due events and the hardware timer of a core: after the choice, the
-    /// earliest of the instant the running context's budget ends, the
-    /// first replenishment instant of its throttled queues, the first
-    /// firing instant of its timer queue, the due event of its invalidation
-    /// request (`CORE_ANSWER_NS` after its start), on the node's first core
-    /// the due step of its recovery reserve (`reserve_due`), and, while the
-    /// core runs a thread, its previous event + `STALE_NS` / 2, an event
-    /// that only beats (D-131). An idle core with nothing armed sets no
-    /// timer.
-    pub(crate) fn hardware(&self, core: usize) -> Option<u64> {
+    /// The earliest future instant (`> now`) of `core`'s local timers and
+    /// replenishments together with its running budget and heartbeat.
+    fn future_timer(&self, core: usize) -> Option<u64> {
+        let now = self.now;
         let part = &self.cores[core];
         let budget = part.running.and_then(|(context, ready)| {
             let sched = self.scheds.get(&context).filter(|_| ready)?;
@@ -663,27 +658,98 @@ impl Model {
             .scheds
             .values()
             .filter(|s| s.core == core)
-            .filter_map(|s| s.queue.and(s.throttled));
+            .filter_map(|s| s.queue.and(s.throttled))
+            .map(|(instant, _)| instant)
+            .filter(|&instant| instant > now);
         let fired = self
             .timers
             .values()
             .flatten()
-            .filter(|armed| armed.core == core)
+            .filter(|armed| armed.core == core && armed.instant > now)
             .map(|armed| armed.instant);
-        let answer = self.request_due(core);
         let beat = part
             .thread
             .map(|_| part.previous + self.table.stale_ns / 2)
             .filter(|_| self.table.stale_ns > 0);
+        replenished.chain(fired).chain(budget).chain(beat).min()
+    }
+
+    /// Whether `core` has any replenishment or armed timer at or before `now`.
+    fn has_due_at(&self, core: usize) -> bool {
+        let now = self.now;
+        let rep = self
+            .scheds
+            .values()
+            .filter(|s| s.core == core)
+            .filter_map(|s| s.queue.and(s.throttled))
+            .any(|(instant, _)| instant <= now);
+        let tmr = self
+            .timers
+            .values()
+            .flatten()
+            .any(|armed| armed.core == core && armed.instant <= now);
+        rep || tmr
+    }
+
+    /// Whether `core` has any replenishment or armed timer strictly before `now`.
+    pub(crate) fn has_due_past(&self, core: usize) -> bool {
+        let now = self.now;
+        let rep = self
+            .scheds
+            .values()
+            .filter(|s| s.core == core)
+            .filter_map(|s| s.queue.and(s.throttled))
+            .any(|(instant, _)| instant < now);
+        let tmr = self
+            .timers
+            .values()
+            .flatten()
+            .any(|armed| armed.core == core && armed.instant < now);
+        rep || tmr
+    }
+
+    /// Refreshes `core`'s hardware timer when it enters idle without running
+    /// `end()` (`core_entered`).
+    pub(crate) fn refresh_timer_on(&mut self, core: usize) {
+        let now = self.now;
+        let next = self.future_timer(core);
+        let keep_pending =
+            self.cores[core].hw_timer.is_some_and(|t| t <= now) && self.has_due_at(core);
+        self.cores[core].hw_timer = if keep_pending { Some(now) } else { next };
+    }
+
+    /// Programs each core's hardware timer at the exit of an event (Due events
+    /// and the hardware timer): if `TIME_EVENT_STEP` left due events on the
+    /// current core, its hardware timer is set to `now` so the next interrupt
+    /// comes at once; otherwise a non-timer event preserves an already-pending
+    /// timer (`<= now`) while due events remain, and programs only future
+    /// instants (`> now`) when none was pending.
+    fn program_timers(&mut self) {
+        let at = *self.at;
+        let now = self.now;
+        for core in 0..self.width() {
+            let next = self.future_timer(core);
+            let keep_pending = if core == at {
+                self.event.due_remaining
+                    || (!self.event.ran_due
+                        && self.cores[core].hw_timer.is_some_and(|t| t <= now)
+                        && self.has_due_at(core))
+            } else {
+                self.cores[core].hw_timer.is_some_and(|t| t <= now) && self.has_due_at(core)
+            };
+            self.cores[core].hw_timer = if keep_pending { Some(now) } else { next };
+        }
+    }
+
+    /// Due events and the hardware timer of a core: the core's programmed
+    /// hardware timer merged with its invalidation-request deadline and (on
+    /// core 0) the recovery reserve. An idle core with nothing armed sets no
+    /// timer.
+    pub(crate) fn hardware(&self, core: usize) -> Option<u64> {
+        let programmed = self.cores[core].hw_timer;
+        let answer = self.request_due(core);
         let reserve = (core == 0).then(|| self.reserve_due()).flatten();
-        let instants = replenished
-            .map(|(instant, _)| instant)
-            .chain(fired)
-            .chain(budget)
-            .chain(answer)
-            .chain(beat)
-            .chain(reserve);
-        instants.min()
+        [programmed, answer, reserve].into_iter().flatten().min()
     }
 
     /// Order inside an event, 2: a timer interrupt processes at most 16 due
@@ -693,6 +759,7 @@ impl Model {
     fn due(&mut self) {
         let now = self.now;
         let at = *self.at;
+        self.event.ran_due = true;
         // The due event of the core's invalidation request: a request not
         // complete `CORE_ANSWER_NS` after its start is a failure of the
         // node, which accuses itself (A node of several cores). While the
@@ -734,6 +801,9 @@ impl Model {
             }
         }
         due.sort();
+        // Contract (Due events and the hardware timer): if due events remain
+        // after `TIME_EVENT_STEP` (16), the hardware timer is set to `now`.
+        self.event.due_remaining = due.len() > TIME_EVENT_STEP;
         for (_, event) in due.into_iter().take(TIME_EVENT_STEP) {
             match event {
                 Due::Replenish(_, context) => {

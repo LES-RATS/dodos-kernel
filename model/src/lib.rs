@@ -1061,6 +1061,10 @@ struct EventLog {
     /// RISC-V: the APLIC sources whose `setipnum`, `setienum` or `clrienum`
     /// the event wrote (G9, D-146).
     aplic: Vec<u32>,
+    /// Whether `Model::due` ran in this event, and whether due events remained
+    /// after the `TIME_EVENT_STEP` (16) cap (Due events and the hardware timer).
+    ran_due: bool,
+    due_remaining: bool,
     /// The state of this node's member word at each accusation the event
     /// wrote (D-146: only a live or sealing node writes fencing).
     accusers: Vec<dodos_abi::MemberState>,
