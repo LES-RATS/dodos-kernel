@@ -333,6 +333,10 @@ struct Reach {
     refused: usize,
     /// Faulty action 9 written while `f`'s R4 for the node had not ended.
     early_acks: usize,
+    /// D-169 faulty peers cut during rebuilds: silent at `STUCK_NS`, bad items
+    /// at the item check.
+    silent_cuts: usize,
+    bad_item_cuts: usize,
     /// The seeds that reached each of `TABLE_STATES`.
     tables: [usize; TABLE_STATES.len()],
     pairs: Vec<Vec<usize>>,
@@ -351,6 +355,9 @@ struct Seen {
     refused: usize,
     /// Faulty action 9 written while `f`'s R4 for the node had not ended.
     early_acks: usize,
+    /// D-169 faulty peers cut during rebuilds.
+    silent_cuts: usize,
+    bad_item_cuts: usize,
     /// The states of D-154 to D-157 reached (`TABLE_STATES`).
     tables: BTreeSet<usize>,
 }
@@ -436,6 +443,8 @@ impl Reach {
             handed_failed: 0,
             refused: 0,
             early_acks: 0,
+            silent_cuts: 0,
+            bad_item_cuts: 0,
             tables: [0; TABLE_STATES.len()],
             pairs: square(),
             resume: square(),
@@ -459,6 +468,8 @@ impl Reach {
         }
         self.refused += seen.refused;
         self.early_acks += seen.early_acks;
+        self.silent_cuts += seen.silent_cuts;
+        self.bad_item_cuts += seen.bad_item_cuts;
         for &state in &seen.tables {
             self.tables[state] += 1;
         }
@@ -557,6 +568,14 @@ struct Run {
     faulty_node: u16,
     faulty_acts: usize,
     forged: Vec<Forged>,
+    /// The seed of this run, for failure messages.
+    seed: u64,
+    /// Generations in which `faulty_node` was put into D-169 faulty report
+    /// modes (`Silent`, `BadItems`).
+    faulty_silent: BTreeSet<(u16, u32)>,
+    faulty_bad_items: BTreeSet<(u16, u32)>,
+    /// Rebuild cuts already checked on each holder node.
+    cuts_checked: [usize; NODES as usize],
     /// The spaces of the table chunks' cycle that map their frame.
     mapped: BTreeSet<(u16, u32)>,
     /// The nodes no driver harms: in a focused run, those whose state one
@@ -616,6 +635,10 @@ impl Run {
             faulty_node,
             faulty_acts: 0,
             forged: Vec::new(),
+            seed,
+            faulty_silent: BTreeSet::new(),
+            faulty_bad_items: BTreeSet::new(),
+            cuts_checked: [0; NODES as usize],
             mapped: BTreeSet::new(),
             spared: BTreeSet::new(),
         };
@@ -681,8 +704,52 @@ impl Run {
         }
     }
 
+    /// D-169 healthy-node guarantee: check every new rebuild cut recorded on
+    /// every node and count faulty peer cuts (`Silent` and `BadItems`).
+    fn judge_rebuild_cuts(&mut self) {
+        for holder in 0..NODES {
+            if !self.m.sys.has(holder) {
+                self.cuts_checked[holder as usize] = 0;
+                continue;
+            }
+            let cuts = &self.m.sys.node(holder).rebuild_cuts.0;
+            if cuts.len() < self.cuts_checked[holder as usize] {
+                self.cuts_checked[holder as usize] = 0;
+            }
+            let start = self.cuts_checked[holder as usize];
+            for &(role, peer, generation, reason) in &cuts[start..] {
+                super::explore::assert_cut_explained(
+                    &self.m,
+                    self.seed,
+                    holder,
+                    role,
+                    peer,
+                    generation,
+                    reason,
+                    &self.faulty_silent,
+                    &self.faulty_bad_items,
+                );
+                match reason {
+                    crate::units::RebuildCut::Deadline
+                        if self.faulty_silent.contains(&(peer, generation)) =>
+                    {
+                        self.seen.silent_cuts += 1;
+                    }
+                    crate::units::RebuildCut::BadItem
+                        if self.faulty_bad_items.contains(&(peer, generation)) =>
+                    {
+                        self.seen.bad_item_cuts += 1;
+                    }
+                    _ => {}
+                }
+            }
+            self.cuts_checked[holder as usize] = cuts.len();
+        }
+    }
+
     fn note(&mut self) {
         self.judge_forged();
+        self.judge_rebuild_cuts();
         let table = self.m.sys.canonical();
         let fenced_held = (0..NODES).any(|x| {
             matches!(self.m.state(x), MemberState::Fenced | MemberState::Unfenced)
@@ -1815,7 +1882,23 @@ impl Run {
         }
         let table = self.m.sys.canonical();
         match self.faulty_acts % 10 {
-            0 => {}
+            // 0 (D-169): cycle the faulty node through the two rebuild-report
+            // faults (consuming `ReportAsk` without answering, and answering
+            // with strictly rising keys and bad items) and normal reporting.
+            0 => {
+                let mode = match (self.faulty_acts / 10) % 3 {
+                    1 => {
+                        self.faulty_silent.insert((f, fg));
+                        crate::units::FaultyReport::Silent
+                    }
+                    2 => {
+                        self.faulty_bad_items.insert((f, fg));
+                        crate::units::FaultyReport::BadItems
+                    }
+                    _ => crate::units::FaultyReport::Normal,
+                };
+                self.m.sys.node_mut(f).faulty_report = mode;
+            }
             // 1: forged sender slot in header (speaking in a third node's
             // name): refused by `to` (`header.sender != from`, D-141).
             1 if can_send(&self.m, f, to, false, 1) => {
@@ -2086,7 +2169,13 @@ impl Run {
             self.run_by(dodos_abi::START_NS + sweep, MS);
         }
         self.gap_21 = super::explore::sealing_holds_a_failed_unit(&self.m);
-        super::explore::assert_live(&self.m, seed, NODES);
+        super::explore::assert_live_allowing(
+            &self.m,
+            seed,
+            NODES,
+            &self.faulty_silent,
+            &self.faulty_bad_items,
+        );
     }
 }
 
@@ -2468,6 +2557,8 @@ fn missing(reach: &Reach, print: bool) -> Vec<String> {
         }
         eprintln!("seeds ending in gap 21: {}", reach.gap_21);
         eprintln!("seeds that hand a failed unit: {}", reach.handed_failed);
+        eprintln!("D-169 silent rebuild cuts: {}", reach.silent_cuts);
+        eprintln!("D-169 bad-item rebuild cuts: {}", reach.bad_item_cuts);
         for e in 0..EVENTS {
             eprintln!("event {:>26}: {}", NAMES[e], reach.events[e]);
         }
@@ -2530,6 +2621,14 @@ fn combined_recovery_states_between_nodes() {
         // Reached by one seed of the 27 (363): a floor of reachability, which
         // has no margin below it (the long run counts it over 858 seeds).
         assert!(reach.early_acks > 0, "no acknowledgement before R4 ended");
+        assert!(
+            reach.silent_cuts > 0,
+            "the seeds never cut a FaultyReport::Silent peer at STUCK_NS"
+        );
+        assert!(
+            reach.bad_item_cuts > 0,
+            "the seeds never cut a FaultyReport::BadItems peer at item check"
+        );
         for (state, &seeds) in TABLE_STATES.iter().zip(&reach.tables) {
             assert!(seeds > 0, "the seeds never reach {state}");
         }
@@ -2572,6 +2671,20 @@ fn every_combination_of_recovery_states_is_reached() {
     let mut reach = explore((first..first + count).collect());
     let missed = report(&reach);
     if replayed().is_none() {
+        eprintln!(
+            "D-169 faulty peer rebuild cuts: silent={}, bad_items={}",
+            reach.silent_cuts, reach.bad_item_cuts
+        );
+        if count >= 858 {
+            assert!(
+                reach.silent_cuts > 0,
+                "long run never cut a FaultyReport::Silent peer at STUCK_NS"
+            );
+            assert!(
+                reach.bad_item_cuts > 0,
+                "long run never cut a FaultyReport::BadItems peer at item check"
+            );
+        }
         // Each combination the seeds missed, by its focused runs.
         eprintln!("missed by the seeds: {missed:#?}");
         focus_missing(&mut reach, &missed);

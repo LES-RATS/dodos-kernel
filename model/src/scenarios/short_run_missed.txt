@@ -18,6 +18,7 @@ pair + accused stuck + release crossing revoke
 pair + accused stuck + release pending
 pair + accused stuck + signal pending
 pair + accused stuck + first thread before live
+pair + accused retire + role handing
 pair + accused retire + holder's death mid-hand
 pair + accused retire + grant unanswered
 pair + accused retire + release crossing revoke

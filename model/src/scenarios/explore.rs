@@ -111,10 +111,26 @@ pub(super) fn waits_bounded(m: &S, node: u16) -> bool {
 }
 
 /// The liveness every exploration ends with, once its machine is quiet
-/// (pass 26): no node accused that a harm does not explain (`Harm`), and no
-/// live node whose thread waits for another node, a unit or its cores.
+/// (pass 26): no node accused that a harm does not explain (`Harm`), no
+/// healthy node whose rebuild report was cut (D-169), and no live node
+/// whose thread waits for another node, a unit or its cores.
 #[track_caller]
 pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
+    let none = std::collections::BTreeSet::new();
+    assert_live_allowing(m, seed, nodes, &none, &none);
+}
+
+/// `assert_live`, additionally allowing D-169 cuts of peer generations that
+/// the exploration explicitly put into `FaultyReport::Silent` or
+/// `FaultyReport::BadItems`.
+#[track_caller]
+pub(super) fn assert_live_allowing(
+    m: &S,
+    seed: u64,
+    nodes: u16,
+    faulty_silent: &std::collections::BTreeSet<(u16, u32)>,
+    faulty_bad_items: &std::collections::BTreeSet<(u16, u32)>,
+) {
     for n in 0..nodes {
         let member = m.sys.member(n);
         let state = member.state();
@@ -128,6 +144,21 @@ pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
             m.harm.harmed,
             m.harm.sealed
         );
+        if m.sys.has(n) {
+            for &(role, peer, generation, reason) in &m.sys.node(n).rebuild_cuts.0 {
+                assert_cut_explained(
+                    m,
+                    seed,
+                    n,
+                    role,
+                    peer,
+                    generation,
+                    reason,
+                    faulty_silent,
+                    faulty_bad_items,
+                );
+            }
+        }
         if state == MemberState::Live && waits_bounded(m, n) {
             let node = m.sys.node(n);
             let waits: Vec<_> = node.threads.values().map(|t| t.wait.clone()).collect();
@@ -142,6 +173,46 @@ pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
             );
         }
     }
+}
+
+/// D-169 healthy-node guarantee: no healthy node's rebuild report is ever
+/// ended by the `STUCK_NS` deadline, by an item check, or as malformed.
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub(super) fn assert_cut_explained(
+    m: &S,
+    seed: u64,
+    holder: u16,
+    role: usize,
+    peer: u16,
+    generation: u32,
+    reason: crate::units::RebuildCut,
+    faulty_silent: &std::collections::BTreeSet<(u16, u32)>,
+    faulty_bad_items: &std::collections::BTreeSet<(u16, u32)>,
+) {
+    let at = (peer, generation);
+    let orphan =
+        m.harm.starts.get(&at).is_some_and(|starter| {
+            m.harm.harmed.contains(starter) || m.harm.sealed.contains(starter)
+        });
+    let explained = match reason {
+        crate::units::RebuildCut::Deadline => {
+            faulty_silent.contains(&at) || m.harm.harmed.contains(&at) || orphan
+        }
+        crate::units::RebuildCut::BadItem => faulty_bad_items.contains(&at),
+        crate::units::RebuildCut::Malformed => false,
+    };
+    assert!(
+        explained,
+        "seed {seed}: healthy node ({peer}, gen {generation}) cut on role {role} by holder \
+         {holder} ({reason:?}) at {} ns; member={:?}, harmed={:?}, sealed={:?}, starts={:?}, \
+         faulty_silent={faulty_silent:?}, faulty_bad_items={faulty_bad_items:?}",
+        m.sys.now(),
+        m.sys.member(peer),
+        m.harm.harmed,
+        m.harm.sealed,
+        m.harm.starts,
+    );
 }
 
 /// A failed unit's role held by a sealing node: the state of gap 21 of
