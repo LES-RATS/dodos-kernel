@@ -25,7 +25,7 @@
 use super::pass17::kill;
 use super::units::{DEVICE, IOAPIC_ROLE, IOMMU_ROLE, attached, three};
 use super::*;
-use crate::rings::{Body, Item, Target};
+use crate::rings::{Body, Item};
 use crate::table::RingEntry;
 use crate::units::{FaultyReport, RebuildCut};
 use dodos_abi::{Evidence, IrqSource, NodeMessage, REPORT_END, RingHeader, TraceCode};
@@ -475,6 +475,9 @@ fn a_late_report_after_the_deadline_is_dropped_and_its_credit_freed() {
 /// D-169: a `Report` with one bad item among good ones (tested for a device,
 /// a handle, and a line) refuses the whole `Report` (trace code 11), ends that
 /// node's report immediately without further asks, and clears its claims.
+/// The edited `Report` keeps its next key *end*: a next key with fewer than
+/// 28 items would be refused as malformed before any item is checked
+/// (D-169 (3)).
 #[test]
 fn a_report_with_one_bad_item_among_good_ones_ends_the_report_and_clears_its_claims() {
     // Part A: valid device + bad device (owned by node 3) on IOMMU rebuild.
@@ -505,12 +508,11 @@ fn a_report_with_one_bad_item_among_good_ones_ends_the_report_and_clears_its_cla
                 for at in start..ring.produced {
                     let idx = (at % ring.entries.len() as u64) as usize;
                     if let Some(RingEntry::Message(msg)) = &mut ring.entries[idx]
-                        && let Body::Report { next, items } = &mut msg.body
+                        && let Body::Report { items, .. } = &mut msg.body
                         && !edited
                         && !items.is_empty()
                     {
                         items.push(Item::Device(0x11, root3));
-                        *next = Item::Device(0x12, 0).key();
                         edited = true;
                     }
                 }
@@ -569,14 +571,13 @@ fn a_report_with_one_bad_item_among_good_ones_ends_the_report_and_clears_its_cla
                 for at in start..ring.produced {
                     let idx = (at % ring.entries.len() as u64) as usize;
                     if let Some(RingEntry::Message(msg)) = &mut ring.entries[idx]
-                        && let Body::Report { next, items } = &mut msg.body
+                        && let Body::Report { items, .. } = &mut msg.body
                         && !edited
                         && !items.is_empty()
                     {
                         // Handle belonging to core 3 (node 3), not node 0.
                         let bad_handle = (3 * dodos_abi::x86_64::IRQ_TABLE_ENTRIES) as u32;
                         items.push(Item::Handle(bad_handle));
-                        *next = Item::Handle(bad_handle + 1).key();
                         edited = true;
                     }
                 }
@@ -656,12 +657,11 @@ fn a_report_with_one_bad_item_among_good_ones_ends_the_report_and_clears_its_cla
                 for at in start..ring.produced {
                     let idx = (at % ring.entries.len() as u64) as usize;
                     if let Some(RingEntry::Message(msg)) = &mut ring.entries[idx]
-                        && let Body::Report { next, items } = &mut msg.body
+                        && let Body::Report { items, .. } = &mut msg.body
                         && !edited
                         && items.iter().any(|i| matches!(i, Item::Line(5, ..)))
                     {
                         items.push(Item::Line(6, false, false, target0, true));
-                        *next = Item::Line(7, false, false, Target::Masked, false).key();
                         edited = true;
                     }
                 }

@@ -1054,32 +1054,25 @@ impl Model {
         }
         if self.faulty_report == crate::units::FaultyReport::BadItems {
             self.faulty_report_used = true;
-            let bad: Vec<Item> = match self.table.role_records[role as usize].governs {
-                dodos_abi::Governs::IommuUnit => vec![
-                    Item::Device(0xfffe, 0),
-                    Item::Device(0xffff, 0),
-                    Item::Handle(0xffff_fffe),
-                    Item::Handle(0xffff_ffff),
-                ],
-                dodos_abi::Governs::IoApic => vec![
-                    Item::Line(
-                        0xffff_fffe,
-                        false,
-                        false,
-                        crate::rings::Target::Masked,
-                        false,
-                    ),
-                    Item::Line(
-                        0xffff_ffff,
-                        false,
-                        false,
-                        crate::rings::Target::Masked,
-                        false,
-                    ),
-                ],
-                _ => Vec::new(),
+            // Full `Report`s (D-169 (3)) of items no node holds, with keys
+            // that rise from the key asked.
+            let governs = self.table.role_records[role as usize].governs;
+            let bad = |i: u32| match governs {
+                dodos_abi::Governs::IommuUnit => Some(Item::Handle(0xffff_ff00 + i)),
+                dodos_abi::Governs::IoApic => Some(Item::Line(
+                    0xffff_ff00 + i,
+                    false,
+                    false,
+                    crate::rings::Target::Masked,
+                    false,
+                )),
+                _ => None,
             };
-            let sent: Vec<Item> = bad.into_iter().filter(|i| i.key() >= key).take(2).collect();
+            let sent: Vec<Item> = (0..=255)
+                .filter_map(bad)
+                .filter(|i| i.key() >= key)
+                .take(REPORT_ITEMS)
+                .collect();
             let next = sent
                 .last()
                 .map_or(REPORT_END, |i| i.key().saturating_add(1));
@@ -1134,8 +1127,8 @@ impl Model {
         };
         // The holder takes a `Report` only if it holds at most 28 items
         // whose keys rise strictly from the key asked, a next key (unless
-        // end) above the last of them, and every item passes the check of
-        // its kind (D-141, D-169); otherwise it traces code 11, refuses the
+        // end) above the last of them and with 28 items, and every item
+        // passes the check of its kind (D-141, D-169); otherwise it traces code 11, refuses the
         // whole `Report`, and treats that node's report as ended.
         let asked = rebuild.key;
         let mut last = None;
@@ -1145,22 +1138,12 @@ impl Model {
             last = Some(key);
             above
         });
-        // CONTRACT-GAP 63: Roles (*The reports are pulled*, D-169) states
-        // that a rebuild asks each node at most `ceil(items / 28) + 1` times,
-        // "a faulty node included, since every item taken is an entry its
-        // words give it", yet the take condition requires only `count <= 28`,
-        // keys rising strictly from `asked`, `next` (unless *end*) above the
-        // last item, and every item passing its kind check. Does a non-final
-        // `Report` (`next != REPORT_END`) have to carry 28 items (or at least
-        // 1 item)? As written, a faulty node can answer with 0 items and
-        // `next = asked + 1` (unbounded asks; also exercised by
-        // `verify13::a_report_asked_from_a_key_takes_the_item_of_that_key`),
-        // or with 1 valid item per `Report` (`items + 1` asks instead of
-        // `ceil(items / 28) + 1`). Reading closest to the text: keep the
-        // stated take condition (`next == REPORT_END || last.map_or(next >
-        // asked, |l| next > l)`) without adding an unstated `items.len() ==
-        // REPORT_ITEMS` check.
-        let advances = next == REPORT_END || last.map_or(next > asked, |l| next > l);
+        // A `Report` that is not the last carries 28 items: a healthy node
+        // puts in as many as fit, and 28 always fit (D-169 (3), gap 63 of
+        // pass 41: with one item or none at a time a faulty node was asked
+        // once per item, or for ever).
+        let advances =
+            next == REPORT_END || (items.len() == REPORT_ITEMS && last.is_some_and(|l| next > l));
         let reporter = (from, self.table.generation(from));
         let structural = items.len() <= REPORT_ITEMS && rising && advances;
         let allowed = items

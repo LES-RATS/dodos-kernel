@@ -389,14 +389,13 @@ fn a_report_of_29_items_is_refused_and_traced() {
     assert!(report_refusals(&m, 2) > 0);
 }
 
-// Finding 18 (own-08). The next key of a `Report` is the key of the next
-// item, so the item a node reports first when asked from it has that key:
-// it is taken (Roles, the reports are pulled).
+// Finding 18 (own-08) under D-169 (3). A `Report` that is not the last
+// must carry 28 items: one that names its first item as the next key and
+// carries none, as finding 18 allowed, is now refused, traced, and ends that
+// node's report, so what it would have claimed is cleared.
 #[test]
-fn a_report_asked_from_a_key_takes_the_item_of_that_key() {
+fn a_report_that_is_not_the_last_with_no_item_is_refused() {
     let baseline = report_refusals(&rebuild_with(|_, _| {}), 2);
-    // Node 0's first `Report` names its first item as the next key and
-    // carries no item; the second, unedited, begins with that item.
     let mut edited = false;
     let m = rebuild_with(|next, items| {
         if !edited && !items.is_empty() {
@@ -406,16 +405,29 @@ fn a_report_asked_from_a_key_takes_the_item_of_that_key() {
         }
     });
     assert!(edited);
-    // No refusal: the item is taken (the audit's D-8a F13 read the
-    // comparison as vacuous at a baseline of 0, which is the point).
     assert_eq!(baseline, 0);
-    assert_eq!(report_refusals(&m, 2), baseline);
+    assert_eq!(report_refusals(&m, 2), baseline + 1);
     assert!(
-        m.sys.canonical().units[&super::units::IOMMU_ROLE]
+        !m.sys.canonical().units[&super::units::IOMMU_ROLE]
             .entries
             .contains_key(&(super::units::DEVICE as u16)),
-        "the item reported at the next key was not taken by the rebuild"
+        "the refused node's device was kept by the rebuild"
     );
+}
+
+// D-169 (3). One item at a time with a next key above it: refused, since a
+// faulty node answering so would be asked once per item.
+#[test]
+fn a_report_that_is_not_the_last_with_one_item_is_refused() {
+    let mut edited = false;
+    let m = rebuild_with(|next, items| {
+        if !edited && items.len() == 1 && *next == dodos_abi::REPORT_END {
+            *next = items[0].key() + 1;
+            edited = true;
+        }
+    });
+    assert!(edited);
+    assert_eq!(report_refusals(&m, 2), 1);
 }
 
 // Finding 19 (own-09). A reported device whose identifier word names
