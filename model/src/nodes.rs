@@ -2331,6 +2331,12 @@ impl Model {
         for hand in self.handing.values() {
             membership.push(hand.started + dodos_abi::IOMMU_WAIT_NS);
         }
+        if !self.table.release
+            && let Some(since) = self.start_entered
+            && self.cores.iter().any(|c| c.awaiting_entry)
+        {
+            membership.push(since.saturating_add(START_NS));
+        }
         let stopped = self.table.stopped_time;
         instants.extend(membership.into_iter().map(|at| at.saturating_add(stopped)));
         // The reserve is a context of period 10 ms: its next step comes at

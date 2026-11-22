@@ -1229,6 +1229,9 @@ pub struct Model {
     seal: Option<nodes::SealStep>,
     ready: bool,
     resuming: bool,
+    /// The membership-clock instant of the node's first core entry in the
+    /// current fresh start (D-171).
+    pub(crate) start_entered: Option<u64>,
     /// The member words as this node last saw them when it wrote sealed:
     /// at its resume, a generation that ended since gets R0, R2 and R3.
     sealed_view: Vec<dodos_abi::Member>,

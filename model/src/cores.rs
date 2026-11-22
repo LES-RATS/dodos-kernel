@@ -156,6 +156,9 @@ pub(crate) struct CorePart {
     pub(crate) kernel_tlb: BTreeSet<u64>,
     /// A core that stopped answering (a test's input): it takes no event.
     pub(crate) silent: bool,
+    /// Whether this core has not yet reached its first event of the current
+    /// fresh start (D-171).
+    pub(crate) awaiting_entry: bool,
     /// The heartbeat of this core as the node's other cores last saw it
     /// move, and the instant they saw it (A node of several cores).
     pub(crate) watched: Ephemeral<(u64, u64)>,
@@ -710,6 +713,15 @@ impl Model {
         let (now, stale, at) = (self.membership_now(), self.table.stale_ns, *self.at);
         let mut silent = false;
         for position in (0..self.width()).filter(|&p| p != at) {
+            if self.cores[position].awaiting_entry {
+                // D-171: a core of the node that has not reached its first
+                // event of the current start is judged on `START_NS` from
+                // the node's first event of that start, in place of `STALE_NS`.
+                if let Some(since) = self.start_entered {
+                    silent |= now >= since.saturating_add(dodos_abi::START_NS);
+                }
+                continue;
+            }
             let number = self.cores[position].number as usize;
             let beacon = &self.table.core_beacons[number];
             let (heartbeat, idle_until) = (beacon.heartbeat.0, beacon.idle_until.0);
@@ -860,8 +872,10 @@ impl Model {
     pub(crate) fn begin_fresh(&mut self) {
         self.skip_rings();
         self.ready = false;
+        self.start_entered = None;
         for core in &mut self.cores {
             core.silent = true;
+            core.awaiting_entry = true;
         }
     }
 
@@ -875,8 +889,13 @@ impl Model {
         let Some(position) = self.position(number as u64) else {
             return;
         };
+        let fresh = !self.resuming;
+        if fresh && self.start_entered.is_none() {
+            self.start_entered = Some(self.membership_now());
+        }
         let part = &mut self.cores[position];
         part.silent = false;
+        part.awaiting_entry = false;
         part.tlb.clear();
         part.kernel_tlb.clear();
         part.cached.0 = (u64::MAX, None);
@@ -890,7 +909,7 @@ impl Model {
         // kernel that starts on the core counts those of the earlier
         // kernels as reported already (pass 25: invariant 91 failed after
         // a fresh start).
-        if !self.resuming {
+        if fresh {
             self.cores[position].reported = self.table.crash.areas[number].suppressed;
         }
         let generation = self.table.generation(self.node);
@@ -931,7 +950,6 @@ impl Model {
             // core after `STALE_NS`).
             self.beat_on(position);
         }
-        let fresh = !self.resuming;
         // A fresh start: the core at position 0 built the start-up state, and
         // the first thread runs from then on, on the cores that entered,
         // before the node is live (Cores, `node_start`: "the first thread
@@ -987,6 +1005,7 @@ impl Model {
     pub(crate) fn begin_resume(&mut self, readable: bool) {
         self.ready = false;
         self.resuming = true;
+        self.start_entered = None;
         self.seal = None;
         for aspace in self.aspaces.values_mut() {
             aspace.cores = 0;

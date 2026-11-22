@@ -408,6 +408,37 @@ impl Model {
                 )?;
             }
         }
+        // D-171: a node never accuses itself of a core that has not reached its
+        // first event of the current start before `START_NS` after the node's
+        // first event of that start.
+        if let Some(since) = self.start_entered
+            && self.membership_now() < since.saturating_add(dodos_abi::START_NS)
+            && self.cores.iter().any(|c| c.awaiting_entry)
+            && let Some((reason, generation, panicker)) =
+                self.table.beacons[self.node as usize].panic
+            && generation == self.table.generation(self.node)
+            && reason == dodos_abi::CrashReason::CoreSilent as u64
+        {
+            let now = self.membership_now();
+            let stale = self.table.stale_ns;
+            let late_request = self.cores.iter().any(|c| {
+                c.request
+                    .as_ref()
+                    .is_some_and(|r| r.started.saturating_add(self.table.core_answer_ns) <= now)
+            });
+            let stale_entered = self.cores.iter().any(|c| {
+                !c.awaiting_entry
+                    && c.number != panicker
+                    && c.watched.0.1 != 0
+                    && now >= c.watched.0.1.saturating_add(stale)
+                    && now.saturating_sub(stale)
+                        > self.table.core_beacons[c.number as usize].idle_until.0
+            });
+            ensure(
+                late_request || stale_entered,
+                "D-171: node accused itself of an un-entered core before START_NS",
+            )?;
+        }
         Ok(())
     }
 
