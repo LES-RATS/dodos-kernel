@@ -39,19 +39,25 @@ pub(crate) enum Attach {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Member {
     Live,
+    Sealing,
     Fenced,
     Dead,
 }
 
 /// Where a core of *X* is: in its program (which call, at which word
-/// access), done, or stopped by the fence.
+/// access), done, parked by the seal's own park call without returning, or
+/// stopped by the fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Pc {
     /// The attach, at access `k`.
     Attach(u8),
     /// The release, at access `k`.
     Release(u8),
+    /// The seal's park call, at access `k` (D-168 (3)).
+    SealPark(u8),
     Done,
+    /// Stopped by the seal's park call without returning (D-168 (3)).
+    Parked,
     Stopped(u8, bool),
 }
 
@@ -75,10 +81,11 @@ pub(crate) struct State {
     pub(crate) cache: [bool; 2],
     /// *H*'s service of the entry (serial, words), completed or not.
     pub(crate) service: Option<(u8, Words, bool)>,
-    /// *X*'s cores, its gate lock (the core holding it), its member word,
-    /// and R1's walk for it.
+    /// *X*'s cores, its gate lock (the core holding it), its `seal_parked`
+    /// words (one per core), its member word, and R1's walk for it.
     pub(crate) cores: [Pc; 2],
     pub(crate) lock: Option<usize>,
+    pub(crate) seal_parked: [bool; 2],
     pub(crate) member: Member,
     pub(crate) r1_done: bool,
 }
@@ -96,6 +103,10 @@ pub(crate) enum Step {
     Accept,
     Complete,
     Answer,
+    /// *X* finishes sealing once core 0 wrote `seal_parked` and parked and
+    /// core 1 finished its in-flight call, then resumes so core 1 makes a
+    /// gate call (D-168 (3)).
+    Resume,
     Fence,
     R1,
     R6,
@@ -119,13 +130,35 @@ impl State {
             service: None,
             cores: [Pc::Attach(0), Pc::Attach(0)],
             lock: None,
+            seal_parked: [false; 2],
             member: Member::Live,
             r1_done: false,
         }
     }
 
+    /// Node *X* is sealing: core 0 executes the seal's park call while core 1
+    /// runs `other` (either racing with core 0 on a gate call during the seal,
+    /// or already done and waiting for the resume); once core 0 has written
+    /// `seal_parked` and stopped and core 1 is done, `Step::Resume` resumes
+    /// *X* and core 1 makes a gate call (D-168 (3)).
+    pub(crate) fn sealing(other: Pc) -> Self {
+        let mut s = Self::new();
+        s.member = Member::Sealing;
+        s.cores = [Pc::SealPark(0), other];
+        s
+    }
+
     fn runs(&self, c: usize) -> bool {
-        self.member == Member::Live && matches!(self.cores[c], Pc::Attach(_) | Pc::Release(_))
+        match self.member {
+            Member::Live => matches!(self.cores[c], Pc::Attach(_) | Pc::Release(_)),
+            Member::Sealing => {
+                matches!(
+                    self.cores[c],
+                    Pc::Attach(_) | Pc::Release(_) | Pc::SealPark(_)
+                )
+            }
+            Member::Fenced | Member::Dead => false,
+        }
     }
 
     pub(crate) fn steps(&self, v: Variant) -> Vec<Step> {
@@ -136,7 +169,10 @@ impl State {
             }
             // A call's first access takes the lock; a core finding it held
             // by the other spins (no step).
-            let at_entry = matches!(self.cores[c], Pc::Attach(0) | Pc::Release(0));
+            let at_entry = matches!(
+                self.cores[c],
+                Pc::Attach(0) | Pc::Release(0) | Pc::SealPark(0)
+            );
             let blocked = v.lock && at_entry && self.lock.is_some_and(|h| h != c);
             if !blocked {
                 out.push(Step::X(c));
@@ -151,7 +187,16 @@ impl State {
         if self.service.is_some_and(|(_, _, done)| done) {
             out.push(Step::Answer);
         }
-        if self.member == Member::Live {
+        if self.member == Member::Sealing
+            && self.seal_parked[0]
+            && self.cores[0] == Pc::Parked
+            && self.cores[1] == Pc::Done
+            && self.record != Record::Open
+            && self.service.is_none()
+        {
+            out.push(Step::Resume);
+        }
+        if matches!(self.member, Member::Live | Member::Sealing) {
             out.push(Step::Fence);
         }
         if self.member == Member::Fenced && !self.r1_done {
@@ -179,13 +224,14 @@ impl State {
             s.cores[c] = next;
         };
         match self.cores[c] {
-            Pc::Attach(0) | Pc::Release(0) => {
+            Pc::Attach(0) | Pc::Release(0) | Pc::SealPark(0) => {
                 if v.lock {
                     self.lock = Some(c);
                 }
                 self.cores[c] = match self.cores[c] {
                     Pc::Attach(_) => Pc::Attach(1),
-                    _ => Pc::Release(1),
+                    Pc::Release(_) => Pc::Release(1),
+                    _ => Pc::SealPark(1),
                 };
             }
             // The attach: the checks (attach word 0; the entry neither open
@@ -241,6 +287,16 @@ impl State {
                     end(self, Pc::Release(0));
                 }
             }
+            // The seal's park call (Gate words, "The park request, `parked`,
+            // `seal_parked` and the start request", D-168 (3)): while sealing,
+            // write `seal_parked`, release the gate lock, and stop the core
+            // without returning.
+            Pc::SealPark(1) => {
+                if self.member == Member::Sealing {
+                    self.seal_parked[c] = true;
+                }
+                end(self, Pc::Parked);
+            }
             _ => {}
         }
     }
@@ -278,11 +334,21 @@ impl State {
                     self.record = Record::Done;
                 }
             }
+            Step::Resume => {
+                // The node sealed once core 0 wrote `seal_parked` and parked,
+                // and now resumes: core 1 makes a gate call on the resumed
+                // node while core 0 stays done.
+                self.member = Member::Live;
+                self.seal_parked = [false; 2];
+                self.cores = [Pc::Done, Pc::Attach(0)];
+            }
             Step::Fence => {
                 self.member = Member::Fenced;
                 for pc in self.cores.iter_mut() {
-                    if let Pc::Attach(k) | Pc::Release(k) = *pc {
-                        *pc = Pc::Stopped(k, matches!(*pc, Pc::Attach(_)));
+                    match *pc {
+                        Pc::Attach(k) => *pc = Pc::Stopped(k, true),
+                        Pc::Release(k) | Pc::SealPark(k) => *pc = Pc::Stopped(k, false),
+                        Pc::Done | Pc::Parked | Pc::Stopped(_, _) => {}
                     }
                 }
             }
@@ -333,7 +399,7 @@ impl State {
             }
         }
         if self.record == Record::Open
-            && self.member == Member::Live
+            && matches!(self.member, Member::Live | Member::Sealing)
             && self.gate_record.map(|(_, w)| w) != self.words
         {
             return Err("RECORD: an open record's words are not its opener's");
@@ -341,8 +407,8 @@ impl State {
         // Between `Attach(2)` (attach word written *pinned*) and `Attach(3)`
         // (root's count raised) the count lags by one; a fence may stop a core
         // there, and R6 clears both at *dead*. Outside that window — across
-        // live, fenced (R1 writes *detached*, keeping the count) and dead —
-        // the root's count must equal the non-zero attach words.
+        // live, sealing, fenced (R1 writes *detached*, keeping the count) and
+        // dead — the root's count must equal the non-zero attach words.
         let mid_live = self.cores.iter().any(|pc| matches!(pc, Pc::Attach(3)));
         let mid_stopped = self.member == Member::Fenced
             && self
@@ -361,9 +427,14 @@ impl State {
             return Err("R1: a dead node's device still translated");
         }
         let inside = (0..2)
-            .filter(|&c| matches!(self.cores[c], Pc::Attach(1..) | Pc::Release(1..)))
+            .filter(|&c| {
+                matches!(
+                    self.cores[c],
+                    Pc::Attach(1..) | Pc::Release(1..) | Pc::SealPark(1..)
+                )
+            })
             .count();
-        if v.lock && self.member == Member::Live && inside > 1 {
+        if v.lock && matches!(self.member, Member::Live | Member::Sealing) && inside > 1 {
             return Err("LOCK: two cores of a node inside gate calls at once");
         }
         Ok(())
@@ -375,15 +446,21 @@ impl State {
 pub(crate) struct Findings {
     pub(crate) states: usize,
     pub(crate) broken: Option<(&'static str, Vec<Step>)>,
-    /// A state from which nothing moves, with a core of a live *X* still in
-    /// its program.
+    /// A state from which nothing moves, with a core of a live or sealing *X*
+    /// still in its program (or waiting to resume).
     pub(crate) wedge: Option<Vec<Step>>,
+    /// Whether `Step::Resume` was reached during the exploration.
+    pub(crate) resumed: bool,
 }
 
 pub(crate) fn explore(v: Variant) -> Findings {
+    explore_from(State::new(), v)
+}
+
+pub(crate) fn explore_from(start: State, v: Variant) -> Findings {
     let mut seen = BTreeSet::new();
     let mut findings = Findings::default();
-    let mut stack = vec![(State::new(), Vec::new())];
+    let mut stack = vec![(start, Vec::new())];
     while let Some((state, path)) = stack.pop() {
         if !seen.insert(state.clone()) {
             continue;
@@ -400,15 +477,27 @@ pub(crate) fn explore(v: Variant) -> Findings {
             .copied()
             .filter(|s| !matches!(s, Step::Fence | Step::Fill))
             .collect();
-        let pending = state.member == Member::Live
-            && state
+        let pending = match state.member {
+            Member::Live => state
                 .cores
                 .iter()
-                .any(|pc| matches!(pc, Pc::Attach(_) | Pc::Release(_)));
+                .any(|pc| matches!(pc, Pc::Attach(_) | Pc::Release(_))),
+            Member::Sealing => {
+                state
+                    .cores
+                    .iter()
+                    .any(|pc| matches!(pc, Pc::Attach(_) | Pc::Release(_) | Pc::SealPark(_)))
+                    || (state.seal_parked[0] && state.cores[1] == Pc::Done)
+            }
+            Member::Fenced | Member::Dead => false,
+        };
         if moving.is_empty() && pending && findings.wedge.is_none() {
             findings.wedge = Some(path.clone());
         }
         for step in steps {
+            if step == Step::Resume {
+                findings.resumed = true;
+            }
             let mut next = state.clone();
             next.take(step, v);
             let mut p = path.clone();
@@ -449,69 +538,33 @@ mod tests {
         );
     }
 
-    // D-168 (3): the seal's park call acquires the gate lock, writes
-    // `seal_parked`, and releases the gate lock before stopping the core
-    // without returning. If the lock were left held, the resumed node's first
-    // gate call would spin forever on the lock.
+    // D-168 (3): while the node is sealing, core 0's seal park call takes the
+    // gate lock at its first access (blocked while core 1 holds it), writes
+    // `seal_parked`, releases the gate lock, and stops without returning; the
+    // node then resumes and core 1 makes a gate call. Every interleaving ends
+    // without a wedge and without a broken rule.
     #[test]
     fn seal_park_releases_the_gate_lock_before_stopping_the_core() {
-        let run = |release_on_park: bool| -> Findings {
-            // Core 0 entered the seal's park call (taking the gate lock),
-            // wrote `seal_parked`, and parked; if `release_on_park` is true
-            // (D-168), it released the lock before stopping. The node then
-            // resumed and core 1 runs its first gate call (core 0 already
-            // done).
-            let mut start = State::new();
-            start.lock = if release_on_park { None } else { Some(0) };
-            start.cores = [Pc::Done, Pc::Attach(0)];
-            let v = Variant { lock: true };
-            let mut seen = BTreeSet::new();
-            let mut findings = Findings::default();
-            let mut stack = vec![(start, Vec::new())];
-            while let Some((state, path)) = stack.pop() {
-                if !seen.insert(state.clone()) {
-                    continue;
-                }
-                findings.states += 1;
-                if let Err(rule) = state.check(v)
-                    && findings.broken.is_none()
-                {
-                    findings.broken = Some((rule, path.clone()));
-                }
-                let steps = state.steps(v);
-                let moving: Vec<Step> = steps
-                    .iter()
-                    .copied()
-                    .filter(|s| !matches!(s, Step::Fence | Step::Fill))
-                    .collect();
-                let pending = state.member == Member::Live
-                    && state
-                        .cores
-                        .iter()
-                        .any(|pc| matches!(pc, Pc::Attach(_) | Pc::Release(_)));
-                if moving.is_empty() && pending && findings.wedge.is_none() {
-                    findings.wedge = Some(path.clone());
-                }
-                for step in steps {
-                    let mut next = state.clone();
-                    next.take(step, v);
-                    let mut p = path.clone();
-                    p.push(step);
-                    stack.push((next, p));
-                }
-            }
-            findings
-        };
+        let v = Variant { lock: true };
 
-        let ok = run(true);
-        assert_eq!(ok.broken, None, "{ok:?}");
-        assert_eq!(ok.wedge, None, "{ok:?}");
+        // 1. Core 0 parks for seal, then the node resumes and core 1 makes its
+        // first gate call (attaching and releasing its device). Removing the
+        // lock release from `Pc::SealPark(1)` wedges core 1 right after
+        // `Step::Resume`.
+        let quiet = explore_from(State::sealing(Pc::Done), v);
+        assert_eq!(quiet.broken, None, "{quiet:?}");
+        assert_eq!(quiet.wedge, None, "{quiet:?}");
+        assert!(quiet.resumed, "never reached Step::Resume");
+        assert!(quiet.states > 20, "{} states", quiet.states);
 
-        let wedged = run(false);
-        assert!(
-            wedged.wedge.is_some(),
-            "leaving the gate lock held in park must wedge the resumed node's first gate call"
-        );
+        // 2. Core 0's `SealPark` races with core 1's in-flight gate call while
+        // sealing (testing mutual exclusion on the gate lock in both orders),
+        // then resumes and core 1 makes a post-resume gate call.
+        let racing = explore_from(State::sealing(Pc::Attach(0)), v);
+        assert_eq!(racing.broken, None, "{racing:?}");
+        assert_eq!(racing.wedge, None, "{racing:?}");
+        assert!(racing.resumed, "never reached Step::Resume while racing");
+        assert!(racing.states > 100, "{} states", racing.states);
     }
 
     // Pass 40 (v1-D #2): `Step::R1` writes *detached* (keeping `root_count`
