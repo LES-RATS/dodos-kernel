@@ -546,21 +546,45 @@ impl Model {
             }
             return true;
         }
+        let mut progressed = false;
         if rebuild.asked.is_some() {
             // A node accused during the rebuild is skipped; one that sealed
             // before it answered is then treated as sealed, as one whose
             // turn finds it sealed (Roles: "a node that seals during the
             // rebuild [...] is then treated as sealed", D-167): its entries
             // are kept even if it resumes before the rebuild ends.
-            if self.table.writes(rebuild.node) {
+            if !self.table.writes(rebuild.node) {
+                if self.table.member(rebuild.node).state() == MemberState::Sealed {
+                    rebuild.sealed.insert(rebuild.node);
+                }
+                rebuild.asked = None;
+                rebuild.asked_at = None;
+                rebuild.node += 1;
+                rebuild.key = 0;
+                progressed = true;
+            } else if rebuild.asked_at.is_some_and(|at| {
+                !self.table.release && self.membership_now() >= at + self.table.stuck_ns
+            }) {
+                // D-169: no `Report` within `STUCK_NS` of the ask ends that
+                // node's report as a malformed one (trace code 11, claims
+                // cleared), and the cursor moves on; any late `Report` is
+                // dropped and its credit freed in `report_received`.
+                let z = rebuild.node;
+                self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
+                self.rebuild_cuts.0.push((
+                    role,
+                    z,
+                    self.table.generation(z),
+                    crate::units::RebuildCut::Deadline,
+                ));
+                rebuild.asked = None;
+                rebuild.asked_at = None;
+                rebuild.node = z + 1;
+                rebuild.key = 0;
+                progressed = true;
+            } else {
                 return false;
             }
-            if self.table.member(rebuild.node).state() == MemberState::Sealed {
-                rebuild.sealed.insert(rebuild.node);
-            }
-            rebuild.asked = None;
-            rebuild.node += 1;
-            rebuild.key = 0;
         }
         // The next node to ask: starting, live or sealing; a sealed node is
         // not asked (its entries are kept by the memory's owner); this node
@@ -571,6 +595,8 @@ impl Model {
                 let items = self.items(role);
                 rebuild.items.extend(items.into_iter().map(|i| (z, i)));
                 rebuild.node += 1;
+                rebuild.asked_at = None;
+                progressed = true;
                 continue;
             }
             if !self.table.writes(z) {
@@ -578,21 +604,48 @@ impl Model {
                     rebuild.sealed.insert(z);
                 }
                 rebuild.node += 1;
+                rebuild.asked_at = None;
+                progressed = true;
                 continue;
+            }
+            // A node starting afresh is not asked until its word leaves
+            // `Starting` (D-144, D-147); `START_NS` bounds its start, not
+            // the rebuild's `STUCK_NS` ask deadline.
+            let member = self.table.member(z);
+            if member.state() == MemberState::Starting && !member.resuming() {
+                self.rebuilds.insert(role, rebuild);
+                return progressed;
             }
             // At most one `ReportAsk` in flight to each node, whatever the
             // number of units rebuilt (Roles): an ask a rebuild abandoned,
-            // when the node it asked was accused or sealed, is in flight
-            // until its answer is consumed (pass 26: a second ask went to
-            // a node that resumed with the first one unanswered).
+            // when the node it asked was accused, sealed or cut at
+            // `STUCK_NS`, is in flight until its answer is consumed (pass
+            // 26, D-169).
             let busy = self.peers[z as usize]
                 .credits
                 .iter()
                 .flatten()
                 .any(|c| c.kind == dodos_abi::NodeMessage::ReportAsk);
+            let now = self.membership_now();
             if busy {
+                let since = *rebuild.asked_at.get_or_insert(now);
+                if !self.table.release && now >= since + self.table.stuck_ns {
+                    self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
+                    self.rebuild_cuts.0.push((
+                        role,
+                        z,
+                        self.table.generation(z),
+                        crate::units::RebuildCut::Deadline,
+                    ));
+                    rebuild.asked = None;
+                    rebuild.asked_at = None;
+                    rebuild.node = z + 1;
+                    rebuild.key = 0;
+                    progressed = true;
+                    continue;
+                }
                 self.rebuilds.insert(role, rebuild);
-                return false;
+                return progressed;
             }
             let body = Body::ReportAsk {
                 role: role as u16,
@@ -600,12 +653,44 @@ impl Model {
                 key: rebuild.key,
             };
             let asked = self.write_message(z, body, Some(Completes::Report { role }), None);
-            rebuild.asked = asked.ok().flatten();
-            self.rebuilds.insert(role, rebuild);
-            // An ask that found no room or no credit is no progress, so a
-            // step does not spend its units on it (the final review's
-            // verification of lot C, H14).
-            return asked.is_ok();
+            match asked {
+                Ok(credit) => {
+                    rebuild.asked = credit;
+                    rebuild.asked_at = Some(now);
+                    self.rebuilds.insert(role, rebuild);
+                    return true;
+                }
+                Err(crate::rings::Full::Credit | crate::rings::Full::Ring) => {
+                    // D-169: waiting because no request credit (or ring
+                    // room) toward `z` is free also expires at `STUCK_NS`
+                    // from when the cursor reached `z`.
+                    let since = *rebuild.asked_at.get_or_insert(now);
+                    if !self.table.release && now >= since + self.table.stuck_ns {
+                        self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
+                        self.rebuild_cuts.0.push((
+                            role,
+                            z,
+                            self.table.generation(z),
+                            crate::units::RebuildCut::Deadline,
+                        ));
+                        rebuild.asked = None;
+                        rebuild.asked_at = None;
+                        rebuild.node = z + 1;
+                        rebuild.key = 0;
+                        progressed = true;
+                        continue;
+                    }
+                    self.rebuilds.insert(role, rebuild);
+                    // An ask that found no room or no credit is no progress,
+                    // so a step does not spend its units on it (the final
+                    // review's verification of lot C, H14).
+                    return progressed;
+                }
+                Err(_) => {
+                    self.rebuilds.insert(role, rebuild);
+                    return progressed;
+                }
+            }
         }
         // Every report is in: keep the entries that match, rewrite those
         // that differ, keep without a report the entries of a sealed node,
@@ -760,15 +845,12 @@ impl Model {
         true
     }
 
-    /// A rebuild's check of a reported device: its attach word reads
-    /// *attached* with the root (D-137), and its identifier word names the
-    /// reporter with its generation, the check of operation 1 (D-141: a
-    /// faulty node could report another node's device under a domain number
-    /// of its own range). A device whose attach is in flight is in no header
-    /// and no report; its kept attach is served once the rebuild ends (the
-    /// attach word against every event, D-139).
-    pub(crate) fn rebuilt_attach(
-        &mut self,
+    /// A rebuild's check of a reported device without side effects: its
+    /// attach word reads *attached* with the root (D-137), and its
+    /// identifier word names the reporter with its generation, the check of
+    /// operation 1 (D-141, D-169).
+    pub(crate) fn rebuilt_attach_ok(
+        &self,
         role: usize,
         device: u16,
         root: u64,
@@ -785,12 +867,59 @@ impl Model {
                     && w.generation() == generation
             })
         });
-        let good =
-            owned && word.root() == root && word.state() == Some(dodos_abi::AttachState::Attached);
+        owned && word.root() == root && word.state() == Some(dodos_abi::AttachState::Attached)
+    }
+
+    /// A rebuild's check of a reported device: its attach word reads
+    /// *attached* with the root (D-137), and its identifier word names the
+    /// reporter with its generation, the check of operation 1 (D-141: a
+    /// faulty node could report another node's device under a domain number
+    /// of its own range). A device whose attach is in flight is in no header
+    /// and no report; its kept attach is served once the rebuild ends (the
+    /// attach word against every event, D-139).
+    pub(crate) fn rebuilt_attach(
+        &mut self,
+        role: usize,
+        device: u16,
+        root: u64,
+        reporter: (u16, u32),
+    ) -> bool {
+        let good = self.rebuilt_attach_ok(role, device, root, reporter);
         if !good {
-            self.refuse_trace(reporter, dodos_abi::NodeMessage::Report, device);
+            self.refuse_trace(reporter.0, dodos_abi::NodeMessage::Report, device);
         }
         good
+    }
+
+    /// A rebuild's check of one reported item against the words of its kind
+    /// (Roles, take-over after a death and *The reports are pulled*, D-169):
+    /// operation 1 for a context entry, the check of its request for a
+    /// handle or a line.
+    pub(crate) fn item_allowed(&self, role: usize, item: Item, reporter: (u16, u32)) -> bool {
+        match item {
+            Item::Device(device, root) => self.rebuilt_attach_ok(role, device, root, reporter),
+            Item::Handle(handle) => u16::try_from(handle).is_ok_and(|handle| {
+                self.operands_allowed(
+                    role,
+                    crate::rings::UnitOp::InterruptCache { handle },
+                    reporter,
+                )
+            }),
+            Item::Line(gsi, level, low, target, _) => {
+                self.ioapic_role(gsi) == Some(role)
+                    && self.operands_allowed(
+                        role,
+                        crate::rings::UnitOp::Redirection {
+                            gsi,
+                            claimed: true,
+                            level,
+                            low,
+                            target,
+                        },
+                        reporter,
+                    )
+            }
+        }
     }
 
     /// The requests kept during a rebuild are served, first.
@@ -892,6 +1021,13 @@ impl Model {
         epoch: u32,
         key: u64,
     ) {
+        if self.faulty_report == crate::units::FaultyReport::Silent {
+            if let Some((index, serial)) = credit {
+                self.swallowed_asks
+                    .insert((from, self.table.generation(from), index, serial));
+            }
+            return;
+        }
         let current = self.table.roles.get(role as usize).is_some_and(|w| {
             self.table.role_records[role as usize].kind == RoleKind::Unit
                 && w.state() == RoleState::Held
@@ -903,6 +1039,40 @@ impl Model {
                 next: REPORT_END,
                 items: Vec::new(),
             };
+            let _ = self.write_message(from, body, None, credit);
+            return;
+        }
+        if self.faulty_report == crate::units::FaultyReport::BadItems {
+            let bad: Vec<Item> = match self.table.role_records[role as usize].governs {
+                dodos_abi::Governs::IommuUnit => vec![
+                    Item::Device(0xfffe, 0),
+                    Item::Device(0xffff, 0),
+                    Item::Handle(0xffff_fffe),
+                    Item::Handle(0xffff_ffff),
+                ],
+                dodos_abi::Governs::IoApic => vec![
+                    Item::Line(
+                        0xffff_fffe,
+                        false,
+                        false,
+                        crate::rings::Target::Masked,
+                        false,
+                    ),
+                    Item::Line(
+                        0xffff_ffff,
+                        false,
+                        false,
+                        crate::rings::Target::Masked,
+                        false,
+                    ),
+                ],
+                _ => Vec::new(),
+            };
+            let sent: Vec<Item> = bad.into_iter().filter(|i| i.key() >= key).take(2).collect();
+            let next = sent
+                .last()
+                .map_or(REPORT_END, |i| i.key().saturating_add(1));
+            let body = Body::Report { next, items: sent };
             let _ = self.write_message(from, body, None, credit);
             return;
         }
@@ -941,9 +1111,9 @@ impl Model {
             return;
         };
         // A report for any ask other than the one the cursor currently waits
-        // on (e.g. a node passed over as accused or sealed, or an ask from
-        // an earlier epoch) frees its credit and moves nothing (pass 26,
-        // D-167).
+        // on (e.g. a node passed over as accused, sealed, or cut at
+        // `STUCK_NS`, or an ask from an earlier epoch) frees its credit and
+        // moves nothing (pass 26, D-167, D-169).
         let Some(rebuild) = self
             .rebuilds
             .get(&role)
@@ -952,10 +1122,10 @@ impl Model {
             return;
         };
         // The holder takes a `Report` only if it holds at most 28 items
-        // whose keys rise strictly from the key asked, and a next key, unless
-        // end, above the last of them; otherwise it traces it and treats
-        // that node's report as ended (D-141: a next key that did not
-        // advance kept the rebuild asking for ever).
+        // whose keys rise strictly from the key asked, a next key (unless
+        // end) above the last of them, and every item passes the check of
+        // its kind (D-141, D-169); otherwise it traces code 11, refuses the
+        // whole `Report`, and treats that node's report as ended.
         let asked = rebuild.key;
         let mut last = None;
         let rising = items.iter().all(|item| {
@@ -965,15 +1135,26 @@ impl Model {
             above
         });
         let advances = next == REPORT_END || last.map_or(next > asked, |l| next > l);
-        let good = items.len() <= REPORT_ITEMS && rising && advances;
+        let reporter = (from, self.table.generation(from));
+        let structural = items.len() <= REPORT_ITEMS && rising && advances;
+        let allowed = items
+            .iter()
+            .all(|&item| self.item_allowed(role, item, reporter));
+        let good = structural && allowed;
         if !good {
             self.refuse_trace(from, dodos_abi::NodeMessage::Report, role as u16);
+            let reason = match structural {
+                false => crate::units::RebuildCut::Malformed,
+                true => crate::units::RebuildCut::BadItem,
+            };
+            self.rebuild_cuts.0.push((role, from, reporter.1, reason));
         }
         let rebuild = self.rebuilds.get_mut(&role).expect("a rebuild");
         if good {
             rebuild.items.extend(items.into_iter().map(|i| (from, i)));
         }
         rebuild.asked = None;
+        rebuild.asked_at = None;
         match next {
             key if good && key != REPORT_END => rebuild.key = key,
             _ => {

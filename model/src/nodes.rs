@@ -2302,7 +2302,16 @@ impl Model {
         membership.extend(self.unit_deadline());
         let me = self.node as usize;
         for o in &self.table.beacons[me].observations {
-            membership.push(o.at + self.table.stale_ns.min(self.table.stuck_ns));
+            let wait = match o.watched {
+                crate::table::Watched::Heartbeat { .. } => self.table.stale_ns,
+                crate::table::Watched::Ring { .. } => self.table.stuck_ns,
+            };
+            membership.push(o.at + wait);
+        }
+        for rebuild in self.rebuilds.values() {
+            if let Some(at) = rebuild.asked_at {
+                membership.push(at + self.table.stuck_ns);
+            }
         }
         for node in 0..self.table.nodes {
             let record = &self.table.fences[node as usize];

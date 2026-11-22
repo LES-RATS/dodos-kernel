@@ -1197,6 +1197,17 @@ pub struct Model {
     unit_requests: Vec<Option<units::UnitEntry>>,
     unit_service: BTreeMap<(u16, u8), units::Served>,
     rebuilds: BTreeMap<usize, units::Rebuild>,
+    /// A test's input: faulty behaviour on `ReportAsk` (D-169).
+    pub(crate) faulty_report: units::FaultyReport,
+    /// A test's input: `(from, from_generation, credit_index, credit_serial)`
+    /// of `ReportAsk` messages this node's faulty kernel consumed without
+    /// answering (`FaultyReport::Silent`). Only those credits are exempted
+    /// from CREDIT in `System::check`, so every other credit and peer stays
+    /// judged.
+    pub(crate) swallowed_asks: BTreeSet<(u16, u32, u8, u32)>,
+    /// Rebuild reports ended early by D-141/D-169:
+    /// `(role, peer, peer_generation, reason)`.
+    pub(crate) rebuild_cuts: Ephemeral<Vec<(usize, u16, u32, units::RebuildCut)>>,
     /// Cores: the fences this node drives, its reclaim of each node, what
     /// it asks of the machine (stops, starts, interrupts to other nodes),
     /// its watch slots, the member and role words it last processed, the

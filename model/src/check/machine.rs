@@ -508,8 +508,22 @@ impl System {
                         Completes::Revoke { grant } => self.released(y, x, grant),
                         _ => false,
                     };
+                    // A faulty peer acting `FaultyReport::Silent` consumed
+                    // this `ReportAsk` without answering (D-169): only that
+                    // exact credit is exempted, so every other credit and
+                    // peer remains judged.
+                    let swallowed = matches!(credit.completes, Completes::Report { .. })
+                        && self.models().any(|(slot, m)| {
+                            slot == y
+                                && m.swallowed_asks.contains(&(
+                                    x,
+                                    table.generation(x),
+                                    index as u8,
+                                    credit.serial,
+                                ))
+                        });
                     ensure(
-                        request || answer || kept || released,
+                        request || answer || kept || released || swallowed,
                         "CREDIT: a credit in use with neither its request nor its answer in flight",
                     )?;
                 }
@@ -571,6 +585,34 @@ impl System {
                 named.is_none_or(|n| table.member(n).state() != MemberState::Starting),
                 "UNIT ROLE: a starting node holds a unit role",
             )?;
+        }
+        // D-169: every in-flight `ReportAsk` records its wait start on
+        // membership time, and a live holder whose first core runs never
+        // waits past `STUCK_NS` (allowing one reserve period for sleep exit
+        // latency or clock-before-event checks).
+        for (x, model) in self.models() {
+            if self.faulty.contains(&x) {
+                continue;
+            }
+            for rebuild in model.rebuilds.values() {
+                ensure(
+                    rebuild.asked.is_none() || rebuild.asked_at.is_some(),
+                    "REBUILD: an in-flight ReportAsk has no deadline recorded",
+                )?;
+                if !table.release
+                    && table.member(x).state() == MemberState::Live
+                    && !model.is_silent(0)
+                    && self.hardware(model.core_number(0)) == Hardware::Running
+                    && model.lock_wait == 0
+                    && let Some(at) = rebuild.asked_at
+                {
+                    ensure(
+                        model.membership_now()
+                            <= at + table.stuck_ns + dodos_abi::RECOVERY_PERIOD_NS,
+                        "REBUILD: a live holder waited past STUCK_NS for a rebuild Report",
+                    )?;
+                }
+            }
         }
         Ok(())
     }

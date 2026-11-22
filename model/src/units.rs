@@ -94,9 +94,34 @@ pub(crate) struct Served {
     pub(crate) submitted: Option<(u64, u64)>,
 }
 
+/// A test's input: how a faulty node answers a `ReportAsk` (D-169).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FaultyReport {
+    /// Normal kernel behaviour.
+    #[default]
+    Normal,
+    /// Consumes the `ReportAsk` and never answers.
+    Silent,
+    /// Answers with strictly rising keys and items that fail their kind check.
+    BadItems,
+}
+
+/// Why a rebuild ended a node's report early (D-141, D-169).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebuildCut {
+    /// No `Report` arrived within `STUCK_NS` of the ask or of reaching the
+    /// node while no request credit toward it was free.
+    Deadline,
+    /// A `Report` carried an item that failed the check of its kind.
+    BadItem,
+    /// A `Report` failed the structural checks (count > 28, keys not rising,
+    /// or `next` not advancing).
+    Malformed,
+}
+
 /// The cursor of a rebuild of a unit role this node took over (Roles):
 /// the node it asks and the key from which it asks, whether an ask is in
-/// flight, and the items reported so far.
+/// flight, when the wait on this node began, and the items reported so far.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Rebuild {
     pub(crate) node: u16,
@@ -104,6 +129,11 @@ pub(crate) struct Rebuild {
     /// The credit `(index, serial)` of the `ReportAsk` the cursor currently
     /// waits on, if one is in flight (D-167).
     pub(crate) asked: Option<(u8, u32)>,
+    /// The instant on the clock less the stopped time when the current ask
+    /// was sent, or when the cursor reached `node` while no request credit
+    /// toward it was free (D-169): if no `Report` arrives within `STUCK_NS`,
+    /// `node`'s report is ended and the cursor moves on.
+    pub(crate) asked_at: Option<u64>,
     pub(crate) items: Vec<(u16, crate::rings::Item)>,
     /// The nodes the rebuild passed over because they were sealed: their
     /// entries are kept without a report, even if they resume before the
