@@ -342,10 +342,10 @@ fn a_silent_node_with_two_concurrent_rebuilds_is_cut_by_both_within_stuck_ns() {
     step_events(&mut m, 3 * stuck + 60 * MS, |m| {
         let cuts = &m.sys.node(2).rebuild_cuts.0;
         while cut_times.len() < cuts.len() {
-            let (role, peer, _, reason) = cuts[cut_times.len()];
-            assert_eq!(peer, 0);
-            assert_eq!(reason, RebuildCut::Deadline);
-            cut_times.push((role, m.sys.node(2).membership_now()));
+            let cut = cuts[cut_times.len()];
+            assert_eq!(cut.peer, 0);
+            assert_eq!(cut.reason, RebuildCut::Deadline);
+            cut_times.push((cut.role, m.sys.node(2).membership_now()));
         }
         cut_times.len() >= 2 && m.sys.node(2).rebuilds.is_empty()
     });
@@ -405,7 +405,7 @@ fn a_late_report_restarts_a_waiting_rebuilds_stuck_ns_wait() {
     step_events(&mut m, stuck + 5 * MS, |m| {
         m.sys.node(2).rebuild_cuts.0.len() == 1
     });
-    assert_eq!(m.sys.node(2).rebuild_cuts.0[0].0, IOMMU_ROLE);
+    assert_eq!(m.sys.node(2).rebuild_cuts.0[0].role, IOMMU_ROLE);
     assert_eq!(m.sys.node(2).rebuilds[&IOAPIC_ROLE].node, 0);
 
     // Advance to `t0 + 50 ms`, hold all 16 request credits toward node 0 after
@@ -595,7 +595,7 @@ fn cleared_faulty_exempts_only_lines_cleared_by_a_cut_on_that_role() {
             .rebuild_cuts
             .0
             .iter()
-            .any(|&(r, p, _, _)| r == IOMMU_ROLE && p == 0)
+            .any(|cut| cut.role == IOMMU_ROLE && cut.peer == 0)
     );
     assert!(m.sys.canonical().units[&IOAPIC_ROLE].cut_lines.is_empty());
 
@@ -697,4 +697,98 @@ fn checker_rejects_a_sealing_holder_waiting_past_stuck_ns() {
         m.sys.check(),
         Err("REBUILD: a holder waited past STUCK_NS for a rebuild Report".into())
     );
+}
+
+/// Finding 4.1: cycling `faulty_report` from `BadItems` or `Silent` back to
+/// `Normal` within the same peer generation must not excuse a later cut on a
+/// different ask while the peer is reporting normally.
+#[test]
+fn cut_after_peer_returns_to_normal_is_not_excused_by_earlier_faulty_ask() {
+    // Part A: `BadItems` -> `Normal` in the same generation of node 0.
+    {
+        let mut m = three_with_both_roles_on_1(1);
+        m.sys.node_mut(0).faulty_report = FaultyReport::BadItems;
+        kill_node(&mut m, 1);
+        step_events(&mut m, 120 * MS, |m| {
+            m.sys
+                .node(2)
+                .rebuild_cuts
+                .0
+                .iter()
+                .any(|c| c.peer == 0 && c.reason == RebuildCut::BadItem)
+        });
+        let first_cut = *m
+            .sys
+            .node(2)
+            .rebuild_cuts
+            .0
+            .iter()
+            .find(|c| c.peer == 0 && c.reason == RebuildCut::BadItem)
+            .expect("BadItem cut recorded");
+        assert_eq!(
+            super::explore::assert_cut_explained(&m, 0, 2, first_cut),
+            Some(FaultyReport::BadItems)
+        );
+
+        // Node 0 returns to `Normal` in the same generation; a later cut on a
+        // different ask credit must be rejected even though `(0, gen)` once
+        // handled an ask in `BadItems`.
+        m.sys.node_mut(0).faulty_report = FaultyReport::Normal;
+        let (idx, ser) = first_cut.credit.expect("credit recorded on BadItem cut");
+        let later_normal_cut = crate::units::RebuildCutRecord {
+            credit: Some((idx, ser + 1)),
+            ..first_cut
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::explore::assert_cut_explained(&m, 0, 2, later_normal_cut);
+        }));
+        assert!(
+            panic.is_err(),
+            "earlier BadItems ask must not excuse a later cut on a normal ask"
+        );
+    }
+
+    // Part B: `Silent` -> `Normal` in the same generation of node 0.
+    {
+        let mut m = three_with_both_roles_on_1(1);
+        let stuck = m.sys.canonical().stuck_ns;
+        m.sys.node_mut(0).faulty_report = FaultyReport::Silent;
+        kill_node(&mut m, 1);
+        step_events(&mut m, stuck + 80 * MS, |m| {
+            m.sys
+                .node(2)
+                .rebuild_cuts
+                .0
+                .iter()
+                .any(|c| c.peer == 0 && c.reason == RebuildCut::Deadline)
+        });
+        let silent_cut = *m
+            .sys
+            .node(2)
+            .rebuild_cuts
+            .0
+            .iter()
+            .find(|c| c.peer == 0 && c.reason == RebuildCut::Deadline)
+            .expect("Deadline cut recorded");
+        assert_eq!(
+            super::explore::assert_cut_explained(&m, 0, 2, silent_cut),
+            Some(FaultyReport::Silent)
+        );
+
+        // Node 0 returns to `Normal` in the same generation; a later Deadline
+        // cut on a different ask credit must be rejected.
+        m.sys.node_mut(0).faulty_report = FaultyReport::Normal;
+        let (idx, ser) = silent_cut.credit.expect("credit recorded on Deadline cut");
+        let later_normal_cut = crate::units::RebuildCutRecord {
+            credit: Some((idx, ser + 1)),
+            ..silent_cut
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::explore::assert_cut_explained(&m, 0, 2, later_normal_cut);
+        }));
+        assert!(
+            panic.is_err(),
+            "earlier Silent ask must not excuse a later cut on a normal ask"
+        );
+    }
 }

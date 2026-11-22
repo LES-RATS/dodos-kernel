@@ -1350,6 +1350,7 @@ impl Machine {
                 .collect(),
             member_writes: Default::default(),
             fence_trace: Default::default(),
+            faulty_asks: Default::default(),
             gated: Default::default(),
             role_writes: Default::default(),
             owners: std::sync::Arc::new(layout.owners.clone()),

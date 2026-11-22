@@ -594,9 +594,13 @@ impl Model {
                 let z = rebuild.node;
                 let g = self.table.generation(z);
                 self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
-                self.rebuild_cuts
-                    .0
-                    .push((role, z, g, crate::units::RebuildCut::Deadline));
+                self.rebuild_cuts.0.push(crate::units::RebuildCutRecord {
+                    role,
+                    peer: z,
+                    generation: g,
+                    reason: crate::units::RebuildCut::Deadline,
+                    credit: Some((index, serial)),
+                });
                 rebuild.cut.insert((z, g));
                 rebuild.asked = None;
                 rebuild.asked_at = None;
@@ -643,21 +647,30 @@ impl Model {
             // when the node it asked was accused, sealed or cut at
             // `STUCK_NS`, is in flight until its answer is consumed (pass
             // 26, D-169).
-            let busy = self.peers[z as usize]
-                .credits
-                .iter()
-                .flatten()
-                .any(|c| c.kind == dodos_abi::NodeMessage::ReportAsk);
+            let blocking =
+                self.peers[z as usize]
+                    .credits
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, slot)| {
+                        slot.as_ref()
+                            .filter(|c| c.kind == dodos_abi::NodeMessage::ReportAsk)
+                            .map(|c| (i as u8, c.serial))
+                    });
             let now = self.membership_now();
-            if busy {
+            if let Some(blocking) = blocking {
                 rebuild.asked_at.get_or_insert(now);
                 let since = self.rebuild_wait_since(&rebuild).expect("asked_at set");
                 if !self.table.release && now >= since + self.table.stuck_ns {
                     let g = self.table.generation(z);
                     self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
-                    self.rebuild_cuts
-                        .0
-                        .push((role, z, g, crate::units::RebuildCut::Deadline));
+                    self.rebuild_cuts.0.push(crate::units::RebuildCutRecord {
+                        role,
+                        peer: z,
+                        generation: g,
+                        reason: crate::units::RebuildCut::Deadline,
+                        credit: Some(blocking),
+                    });
                     rebuild.cut.insert((z, g));
                     rebuild.asked = None;
                     rebuild.asked_at = None;
@@ -692,9 +705,13 @@ impl Model {
                     if !self.table.release && now >= since + self.table.stuck_ns {
                         let g = self.table.generation(z);
                         self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
-                        self.rebuild_cuts
-                            .0
-                            .push((role, z, g, crate::units::RebuildCut::Deadline));
+                        self.rebuild_cuts.0.push(crate::units::RebuildCutRecord {
+                            role,
+                            peer: z,
+                            generation: g,
+                            reason: crate::units::RebuildCut::Deadline,
+                            credit: None,
+                        });
                         rebuild.cut.insert((z, g));
                         rebuild.asked = None;
                         rebuild.asked_at = None;
@@ -1064,12 +1081,37 @@ impl Model {
         }
         if self.faulty_report == crate::units::FaultyReport::Silent {
             if let Some((index, serial)) = credit {
+                let holder_gen = self.table.generation(from);
                 self.swallowed_asks
-                    .insert((from, self.table.generation(from), index, serial));
+                    .insert((from, holder_gen, index, serial));
+                self.table.faulty_asks.0.insert(
+                    crate::units::ReportAskId {
+                        peer: self.node,
+                        peer_gen: self.table.generation(self.node),
+                        holder: from,
+                        holder_gen,
+                        index,
+                        serial,
+                    },
+                    crate::units::FaultyReport::Silent,
+                );
             }
             return;
         }
         if self.faulty_report == crate::units::FaultyReport::BadItems {
+            if let Some((index, serial)) = credit {
+                self.table.faulty_asks.0.insert(
+                    crate::units::ReportAskId {
+                        peer: self.node,
+                        peer_gen: self.table.generation(self.node),
+                        holder: from,
+                        holder_gen: self.table.generation(from),
+                        index,
+                        serial,
+                    },
+                    crate::units::FaultyReport::BadItems,
+                );
+            }
             // Full `Report`s (D-169 (3)) of items no node holds, with keys
             // that rise from the key asked.
             let governs = self.table.role_records[role as usize].governs;
@@ -1175,7 +1217,13 @@ impl Model {
                 false => crate::units::RebuildCut::Malformed,
                 true => crate::units::RebuildCut::BadItem,
             };
-            self.rebuild_cuts.0.push((role, from, reporter.1, reason));
+            self.rebuild_cuts.0.push(crate::units::RebuildCutRecord {
+                role,
+                peer: from,
+                generation: reporter.1,
+                reason,
+                credit: Some((index, serial)),
+            });
         }
         let rebuild = self.rebuilds.get_mut(&role).expect("a rebuild");
         if good {

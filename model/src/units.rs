@@ -119,6 +119,31 @@ pub(crate) enum RebuildCut {
     Malformed,
 }
 
+/// Identifies one `ReportAsk` handled by a peer (D-169): the peer and its
+/// generation, the asking holder and its generation, and the request credit
+/// `(index, serial)` that carried the ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ReportAskId {
+    pub(crate) peer: u16,
+    pub(crate) peer_gen: u32,
+    pub(crate) holder: u16,
+    pub(crate) holder_gen: u32,
+    pub(crate) index: u8,
+    pub(crate) serial: u32,
+}
+
+/// One rebuild cut recorded by a holder (D-141, D-169): the role, the peer
+/// and its generation, the reason, and the request credit `(index, serial)`
+/// of the `ReportAsk` the cut waited on or answered (if any).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RebuildCutRecord {
+    pub(crate) role: usize,
+    pub(crate) peer: u16,
+    pub(crate) generation: u32,
+    pub(crate) reason: RebuildCut,
+    pub(crate) credit: Option<(u8, u32)>,
+}
+
 /// The cursor of a rebuild of a unit role this node took over (Roles):
 /// the node it asks and the key from which it asks, whether an ask is in
 /// flight, when the wait on this node began, and the items reported so far.

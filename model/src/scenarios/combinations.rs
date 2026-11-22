@@ -570,12 +570,9 @@ struct Run {
     forged: Vec<Forged>,
     /// The seed of this run, for failure messages.
     seed: u64,
-    /// Generations in which `faulty_node` was put into D-169 faulty report
-    /// modes (`Silent`, `BadItems`).
-    faulty_silent: BTreeSet<(u16, u32)>,
-    faulty_bad_items: BTreeSet<(u16, u32)>,
-    /// Rebuild cuts already checked on each holder node.
-    cuts_checked: [usize; NODES as usize],
+    /// `(generation, checked_len)` of `rebuild_cuts` already checked on each
+    /// holder slot; reset whenever the slot's generation changes (D-169).
+    cuts_checked: [(u32, usize); NODES as usize],
     /// The spaces of the table chunks' cycle that map their frame.
     mapped: BTreeSet<(u16, u32)>,
     /// The nodes no driver harms: in a focused run, those whose state one
@@ -647,9 +644,7 @@ impl Run {
             faulty_acts: 0,
             forged: Vec::new(),
             seed,
-            faulty_silent: BTreeSet::new(),
-            faulty_bad_items: BTreeSet::new(),
-            cuts_checked: [0; NODES as usize],
+            cuts_checked: [(0, 0); NODES as usize],
             mapped: BTreeSet::new(),
             spared: BTreeSet::new(),
         };
@@ -720,41 +715,35 @@ impl Run {
     fn judge_rebuild_cuts(&mut self) {
         for holder in 0..NODES {
             if !self.m.sys.has(holder) {
-                self.cuts_checked[holder as usize] = 0;
+                self.cuts_checked[holder as usize] = (0, 0);
                 continue;
             }
-            let cuts = &self.m.sys.node(holder).rebuild_cuts.0;
-            if cuts.len() < self.cuts_checked[holder as usize] {
-                self.cuts_checked[holder as usize] = 0;
+            let holder_gen = self.m.sys.node(holder).generation_built();
+            let entry = &mut self.cuts_checked[holder as usize];
+            if entry.0 != holder_gen {
+                *entry = (holder_gen, 0);
             }
-            let start = self.cuts_checked[holder as usize];
-            for &(role, peer, generation, reason) in &cuts[start..] {
-                super::explore::assert_cut_explained(
-                    &self.m,
-                    self.seed,
-                    holder,
-                    role,
-                    peer,
-                    generation,
-                    reason,
-                    &self.faulty_silent,
-                    &self.faulty_bad_items,
-                );
-                match reason {
-                    crate::units::RebuildCut::Deadline
-                        if self.faulty_silent.contains(&(peer, generation)) =>
-                    {
+            let start = entry.1;
+            let cuts = &self.m.sys.node(holder).rebuild_cuts.0;
+            for &cut in &cuts[start..] {
+                let faulty = super::explore::assert_cut_explained(&self.m, self.seed, holder, cut);
+                match (cut.reason, faulty) {
+                    (
+                        crate::units::RebuildCut::Deadline,
+                        Some(crate::units::FaultyReport::Silent),
+                    ) => {
                         self.seen.silent_cuts += 1;
                     }
-                    crate::units::RebuildCut::BadItem
-                        if self.faulty_bad_items.contains(&(peer, generation)) =>
-                    {
+                    (
+                        crate::units::RebuildCut::BadItem,
+                        Some(crate::units::FaultyReport::BadItems),
+                    ) => {
                         self.seen.bad_item_cuts += 1;
                     }
                     _ => {}
                 }
             }
-            self.cuts_checked[holder as usize] = cuts.len();
+            self.cuts_checked[holder as usize] = (holder_gen, cuts.len());
         }
     }
 
@@ -2157,14 +2146,8 @@ impl Run {
             // with strictly rising keys and bad items) and normal reporting.
             0 => {
                 let mode = match (self.faulty_acts / 10) % 3 {
-                    1 => {
-                        self.faulty_silent.insert((f, fg));
-                        crate::units::FaultyReport::Silent
-                    }
-                    2 => {
-                        self.faulty_bad_items.insert((f, fg));
-                        crate::units::FaultyReport::BadItems
-                    }
+                    1 => crate::units::FaultyReport::Silent,
+                    2 => crate::units::FaultyReport::BadItems,
                     _ => crate::units::FaultyReport::Normal,
                 };
                 self.m.sys.node_mut(f).faulty_report = mode;
@@ -2439,13 +2422,7 @@ impl Run {
             self.run_by(dodos_abi::START_NS + sweep, MS);
         }
         self.gap_21 = super::explore::sealing_holds_a_failed_unit(&self.m);
-        super::explore::assert_live_allowing(
-            &self.m,
-            seed,
-            NODES,
-            &self.faulty_silent,
-            &self.faulty_bad_items,
-        );
+        super::explore::assert_live(&self.m, seed, NODES);
     }
 }
 
@@ -3956,4 +3933,85 @@ fn directed_combinations_sample() {
             "directed scenario did not record {name}"
         );
     }
+}
+
+/// Finding 4.2: `judge_rebuild_cuts` must reset its checked cursor on the
+/// holder's generation, not only when `rebuild_cuts.len()` shrinks; otherwise
+/// a holder that restarts and records as many cuts before the next judgement
+/// skips them.
+#[test]
+fn judge_rebuild_cuts_resets_when_holder_restarts_with_same_cut_count() {
+    let mut run = Run::new(0);
+    let holder: u16 = 3;
+    let peer: u16 = 0;
+    let g1 = run.m.sys.node(holder).generation_built();
+    let peer_gen = run.m.sys.member(peer).generation();
+
+    // Record one explained cut on `holder` in generation `g1` and judge it so
+    // `cuts_checked[holder]` advances to `(g1, 1)`.
+    run.m.sys.edit_table(|t| {
+        t.faulty_asks.0.insert(
+            crate::units::ReportAskId {
+                peer,
+                peer_gen,
+                holder,
+                holder_gen: g1,
+                index: 0,
+                serial: 1,
+            },
+            crate::units::FaultyReport::Silent,
+        );
+    });
+    run.m
+        .sys
+        .node_mut(holder)
+        .rebuild_cuts
+        .0
+        .push(crate::units::RebuildCutRecord {
+            role: IOMMU_ROLE,
+            peer,
+            generation: peer_gen,
+            reason: crate::units::RebuildCut::Deadline,
+            credit: Some((0, 1)),
+        });
+    run.judge_rebuild_cuts();
+    assert_eq!(run.cuts_checked[holder as usize], (g1, 1));
+
+    // Kill `holder`, let it be reclaimed, and start it afresh in generation
+    // `g1 + 1` without calling `judge_rebuild_cuts` while it is absent.
+    run.m.supervisor(0, run.m.t[0]);
+    run.m.ok(0, kill(holder));
+    run.m.run_by(200 * MS, MS);
+    assert_eq!(run.m.state(holder), MemberState::Dead);
+    run.m.ok(0, fresh(holder, 1 << holder));
+    run.m.run_by(200 * MS, MS);
+    assert_eq!(run.m.state(holder), MemberState::Live);
+    let g2 = run.m.sys.node(holder).generation_built();
+    assert_eq!(g2, g1 + 1);
+    assert_eq!(run.cuts_checked[holder as usize], (g1, 1));
+
+    // Record one unexplained cut of healthy node 0 in generation `g2` (same
+    // length `1` as `g1`, so a length-only check would skip index 0).
+    let peer_gen2 = run.m.sys.member(peer).generation();
+    run.m
+        .sys
+        .node_mut(holder)
+        .rebuild_cuts
+        .0
+        .push(crate::units::RebuildCutRecord {
+            role: IOMMU_ROLE,
+            peer,
+            generation: peer_gen2,
+            reason: crate::units::RebuildCut::Deadline,
+            credit: None,
+        });
+    assert_eq!(run.m.sys.node(holder).rebuild_cuts.0.len(), 1);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run.judge_rebuild_cuts();
+    }));
+    assert!(
+        panic.is_err(),
+        "judge_rebuild_cuts skipped a generation-2 cut whose count matched generation 1"
+    );
 }

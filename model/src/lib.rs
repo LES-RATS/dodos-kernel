@@ -1205,9 +1205,8 @@ pub struct Model {
     /// from CREDIT in `System::check`, so every other credit and peer stays
     /// judged.
     pub(crate) swallowed_asks: BTreeSet<(u16, u32, u8, u32)>,
-    /// Rebuild reports ended early by D-141/D-169:
-    /// `(role, peer, peer_generation, reason)`.
-    pub(crate) rebuild_cuts: Ephemeral<Vec<(usize, u16, u32, units::RebuildCut)>>,
+    /// Rebuild reports ended early by D-141/D-169.
+    pub(crate) rebuild_cuts: Ephemeral<Vec<units::RebuildCutRecord>>,
     /// Cores: the fences this node drives, its reclaim of each node, what
     /// it asks of the machine (stops, starts, interrupts to other nodes),
     /// its watch slots, the member and role words it last processed, the

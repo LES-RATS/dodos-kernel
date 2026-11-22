@@ -116,21 +116,6 @@ pub(super) fn waits_bounded(m: &S, node: u16) -> bool {
 /// whose thread waits for another node, a unit or its cores.
 #[track_caller]
 pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
-    let none = std::collections::BTreeSet::new();
-    assert_live_allowing(m, seed, nodes, &none, &none);
-}
-
-/// `assert_live`, additionally allowing D-169 cuts of peer generations that
-/// the exploration explicitly put into `FaultyReport::Silent` or
-/// `FaultyReport::BadItems`.
-#[track_caller]
-pub(super) fn assert_live_allowing(
-    m: &S,
-    seed: u64,
-    nodes: u16,
-    faulty_silent: &std::collections::BTreeSet<(u16, u32)>,
-    faulty_bad_items: &std::collections::BTreeSet<(u16, u32)>,
-) {
     for n in 0..nodes {
         let member = m.sys.member(n);
         let state = member.state();
@@ -145,18 +130,8 @@ pub(super) fn assert_live_allowing(
             m.harm.sealed
         );
         if m.sys.has(n) {
-            for &(role, peer, generation, reason) in &m.sys.node(n).rebuild_cuts.0 {
-                assert_cut_explained(
-                    m,
-                    seed,
-                    n,
-                    role,
-                    peer,
-                    generation,
-                    reason,
-                    faulty_silent,
-                    faulty_bad_items,
-                );
+            for &cut in &m.sys.node(n).rebuild_cuts.0 {
+                let _ = assert_cut_explained(m, seed, n, cut);
             }
         }
         if state == MemberState::Live && waits_bounded(m, n) {
@@ -177,42 +152,62 @@ pub(super) fn assert_live_allowing(
 
 /// D-169 healthy-node guarantee: no healthy node's rebuild report is ever
 /// ended by the `STUCK_NS` deadline, by an item check, or as malformed.
-#[allow(clippy::too_many_arguments)]
+/// Returns the `FaultyReport` mode under which the peer handled the ask that
+/// produced the cut, if any.
 #[track_caller]
 pub(super) fn assert_cut_explained(
     m: &S,
     seed: u64,
     holder: u16,
-    role: usize,
-    peer: u16,
-    generation: u32,
-    reason: crate::units::RebuildCut,
-    faulty_silent: &std::collections::BTreeSet<(u16, u32)>,
-    faulty_bad_items: &std::collections::BTreeSet<(u16, u32)>,
-) {
-    let at = (peer, generation);
+    cut: crate::units::RebuildCutRecord,
+) -> Option<crate::units::FaultyReport> {
+    let at = (cut.peer, cut.generation);
+    let holder_gen = m.sys.node(holder).generation_built();
+    let faulty = cut.credit.and_then(|(index, serial)| {
+        m.sys
+            .canonical()
+            .faulty_asks
+            .0
+            .get(&crate::units::ReportAskId {
+                peer: cut.peer,
+                peer_gen: cut.generation,
+                holder,
+                holder_gen,
+                index,
+                serial,
+            })
+            .copied()
+    });
     let orphan =
         m.harm.starts.get(&at).is_some_and(|starter| {
             m.harm.harmed.contains(starter) || m.harm.sealed.contains(starter)
         });
-    let explained = match reason {
+    let explained = match cut.reason {
         crate::units::RebuildCut::Deadline => {
-            faulty_silent.contains(&at) || m.harm.harmed.contains(&at) || orphan
+            faulty == Some(crate::units::FaultyReport::Silent)
+                || m.harm.harmed.contains(&at)
+                || orphan
         }
-        crate::units::RebuildCut::BadItem => faulty_bad_items.contains(&at),
+        crate::units::RebuildCut::BadItem => faulty == Some(crate::units::FaultyReport::BadItems),
         crate::units::RebuildCut::Malformed => false,
     };
     assert!(
         explained,
-        "seed {seed}: healthy node ({peer}, gen {generation}) cut on role {role} by holder \
-         {holder} ({reason:?}) at {} ns; member={:?}, harmed={:?}, sealed={:?}, starts={:?}, \
-         faulty_silent={faulty_silent:?}, faulty_bad_items={faulty_bad_items:?}",
+        "seed {seed}: healthy node ({}, gen {}) cut on role {} by holder {holder} \
+         (gen {holder_gen}, {:?}, credit {:?}) at {} ns; member={:?}, harmed={:?}, sealed={:?}, \
+         starts={:?}, faulty={faulty:?}",
+        cut.peer,
+        cut.generation,
+        cut.role,
+        cut.reason,
+        cut.credit,
         m.sys.now(),
-        m.sys.member(peer),
+        m.sys.member(cut.peer),
         m.harm.harmed,
         m.harm.sealed,
         m.harm.starts,
     );
+    faulty
 }
 
 /// A failed unit's role held by a sealing node: the state of gap 21 of

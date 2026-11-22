@@ -537,6 +537,12 @@ pub(crate) struct Table {
     /// made (The fence: "the driver raises p's park request, then marks p's
     /// word, then stops p").
     pub(crate) fence_trace: crate::Ephemeral<Vec<FenceStep>>,
+    /// Test record: for each `ReportAsk` handled while `faulty_report !=
+    /// Normal`, the `FaultyReport` mode active when that ask was handled
+    /// (D-169). Kept on `Table` so cut judgement can check the exact ask even
+    /// after the peer cycles back to `Normal` or dies.
+    pub(crate) faulty_asks:
+        crate::Ephemeral<BTreeMap<crate::units::ReportAskId, crate::units::FaultyReport>>,
 }
 
 /// One step of the fence on a physical core, as the trace records it.

@@ -190,16 +190,9 @@ fn a_silent_node_is_cut_at_stuck_ns_and_the_rebuild_ends() {
         report_refusals(&m, 2) > refusals_before,
         "cutting silent node 0 wrote no trace code 11"
     );
-    assert!(
-        m.sys
-            .node(2)
-            .rebuild_cuts
-            .0
-            .iter()
-            .any(|&(role, peer, _, reason)| {
-                role == IOMMU_ROLE && peer == 0 && reason == RebuildCut::Deadline
-            })
-    );
+    assert!(m.sys.node(2).rebuild_cuts.0.iter().any(|cut| {
+        cut.role == IOMMU_ROLE && cut.peer == 0 && cut.reason == RebuildCut::Deadline
+    }));
     // Silent node 0's context entry is cleared; healthy node 3's is kept.
     let entries = &m.sys.canonical().units[&IOMMU_ROLE].entries;
     assert!(
@@ -211,14 +204,7 @@ fn a_silent_node_is_cut_at_stuck_ns_and_the_rebuild_ends() {
         "healthy node 3's context entry was lost"
     );
     // Healthy node 3 was never cut.
-    assert!(
-        !m.sys
-            .node(2)
-            .rebuild_cuts
-            .0
-            .iter()
-            .any(|&(_, peer, _, _)| peer == 3)
-    );
+    assert!(!m.sys.node(2).rebuild_cuts.0.iter().any(|cut| cut.peer == 3));
 }
 
 /// D-169: the rebuild deadline judges on the clock less the stopped time, as
@@ -343,7 +329,7 @@ fn a_rebuild_waiting_with_no_free_credit_cuts_at_stuck_ns() {
         .rebuild_cuts
         .0
         .iter()
-        .filter(|&&(_, peer, _, reason)| peer == 0 && reason == RebuildCut::Deadline)
+        .filter(|cut| cut.peer == 0 && cut.reason == RebuildCut::Deadline)
         .count();
     assert_eq!(
         deadline_cuts, 2,
@@ -529,9 +515,9 @@ fn a_report_with_one_bad_item_among_good_ones_ends_the_report_and_clears_its_cla
                 .rebuild_cuts
                 .0
                 .iter()
-                .any(|&(r, p, _, reason)| r == IOMMU_ROLE
-                    && p == 0
-                    && reason == RebuildCut::BadItem)
+                .any(|cut| cut.role == IOMMU_ROLE
+                    && cut.peer == 0
+                    && cut.reason == RebuildCut::BadItem)
         );
         let entries = &m.sys.canonical().units[&IOMMU_ROLE].entries;
         assert!(
@@ -727,9 +713,9 @@ fn a_faulty_bad_items_peer_is_cut_on_first_ask_and_multi_page_report_meets_bound
                 .rebuild_cuts
                 .0
                 .iter()
-                .any(|&(r, p, _, reason)| r == IOMMU_ROLE
-                    && p == 0
-                    && reason == RebuildCut::BadItem)
+                .any(|cut| cut.role == IOMMU_ROLE
+                    && cut.peer == 0
+                    && cut.reason == RebuildCut::BadItem)
         );
         assert!(
             !m.sys.canonical().units[&IOMMU_ROLE]
