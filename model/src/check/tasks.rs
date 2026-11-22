@@ -96,9 +96,23 @@ impl Model {
                 .get(&irq.source.id())
                 .copied()
                 .unwrap_or_default();
+            // D-169: if this node's faulty kernel refused or sabotaged a
+            // rebuild report (`FaultyReport::Silent` or `BadItems`), the
+            // holder legitimately clears this node's claimed lines on the
+            // controller ("which costs only that node"). Healthy nodes never
+            // set `faulty_report_used`.
+            let cleared_faulty = self.faulty_report_used
+                && irq.source.is_line()
+                && self.ioapic_role(irq.source.id()).is_some_and(|role| {
+                    self.table
+                        .units
+                        .get(&role)
+                        .is_some_and(|u| !u.lines.contains_key(&irq.source.id()))
+                });
             let lost = riscv_level
                 && irq.state == IrqState::Armed
                 && !self.line_masked(irq.source)
+                && !cleared_faulty
                 && line.high
                 && line.sent == 0;
             ensure(
@@ -113,6 +127,7 @@ impl Model {
                     || !irq.source.is_line()
                     || irq.removing
                     || self.line_asking(irq.source.id())
+                    || cleared_faulty
                     || line.active,
                 "SOURCECFG: a claimed line's APLIC source inactive",
             )?;
@@ -134,6 +149,7 @@ impl Model {
                     || !irq.source.is_line()
                     || !irq.source.level()
                     || irq.removing
+                    || cleared_faulty
                     || !self.line_masked(irq.source),
                 "LINE MASK: a claimed, live level line masked at its controller",
             )?;

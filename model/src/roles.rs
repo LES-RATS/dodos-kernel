@@ -1031,6 +1031,7 @@ impl Model {
         key: u64,
     ) {
         if self.faulty_report == crate::units::FaultyReport::Silent {
+            self.faulty_report_used = true;
             if let Some((index, serial)) = credit {
                 self.swallowed_asks
                     .insert((from, self.table.generation(from), index, serial));
@@ -1052,6 +1053,7 @@ impl Model {
             return;
         }
         if self.faulty_report == crate::units::FaultyReport::BadItems {
+            self.faulty_report_used = true;
             let bad: Vec<Item> = match self.table.role_records[role as usize].governs {
                 dodos_abi::Governs::IommuUnit => vec![
                     Item::Device(0xfffe, 0),
