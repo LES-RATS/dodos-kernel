@@ -604,7 +604,7 @@ impl System {
                     && !model.is_silent(0)
                     && self.hardware(model.core_number(0)) == Hardware::Running
                     && model.lock_wait == 0
-                    && let Some(at) = rebuild.asked_at
+                    && let Some(at) = model.rebuild_wait_since(rebuild)
                 {
                     ensure(
                         model.membership_now()

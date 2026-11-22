@@ -512,6 +512,18 @@ impl Model {
         }
     }
 
+    /// The instant on membership time from which a rebuild's `STUCK_NS` wait
+    /// runs (D-170): the latest of the ask (or when the cursor reached the
+    /// node while blocked) and the last `Report` consumed from that node.
+    pub(crate) fn rebuild_wait_since(&self, rebuild: &Rebuild) -> Option<u64> {
+        let at = rebuild.asked_at?;
+        let last = self
+            .peers
+            .get(rebuild.node as usize)
+            .and_then(|peer| peer.last_report);
+        Some(last.map_or(at, |report| at.max(report)))
+    }
+
     /// One step of a rebuild: the drain, then the reports pulled node by
     /// node in index order (at most one `ReportAsk` in flight to each
     /// node), then the comparison, the invalidation of the whole unit, and
@@ -570,13 +582,14 @@ impl Model {
                 rebuild.node += 1;
                 rebuild.key = 0;
                 progressed = true;
-            } else if rebuild.asked_at.is_some_and(|at| {
+            } else if self.rebuild_wait_since(&rebuild).is_some_and(|at| {
                 !self.table.release && self.membership_now() >= at + self.table.stuck_ns
             }) {
-                // D-169: no `Report` within `STUCK_NS` of the ask ends that
-                // node's report as a malformed one (trace code 11, claims
-                // cleared), and the cursor moves on; any late `Report` is
-                // dropped and its credit freed in `report_received`.
+                // D-169, D-170: no `Report` within `STUCK_NS` of the wait
+                // start ends that node's report as a malformed one (trace
+                // code 11, claims cleared), and the cursor moves on; any late
+                // `Report` is dropped and its credit freed in
+                // `report_received`.
                 let z = rebuild.node;
                 self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
                 self.rebuild_cuts.0.push((
@@ -637,7 +650,8 @@ impl Model {
                 .any(|c| c.kind == dodos_abi::NodeMessage::ReportAsk);
             let now = self.membership_now();
             if busy {
-                let since = *rebuild.asked_at.get_or_insert(now);
+                rebuild.asked_at.get_or_insert(now);
+                let since = self.rebuild_wait_since(&rebuild).expect("asked_at set");
                 if !self.table.release && now >= since + self.table.stuck_ns {
                     self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
                     self.rebuild_cuts.0.push((
@@ -670,10 +684,12 @@ impl Model {
                     return true;
                 }
                 Err(crate::rings::Full::Credit | crate::rings::Full::Ring) => {
-                    // D-169: waiting because no request credit (or ring
-                    // room) toward `z` is free also expires at `STUCK_NS`
-                    // from when the cursor reached `z`.
-                    let since = *rebuild.asked_at.get_or_insert(now);
+                    // D-169, D-170: waiting because no request credit (or
+                    // ring room) toward `z` is free also expires at
+                    // `STUCK_NS` from the latest of when the cursor reached
+                    // `z` and the last `Report` consumed from `z`.
+                    rebuild.asked_at.get_or_insert(now);
+                    let since = self.rebuild_wait_since(&rebuild).expect("asked_at set");
                     if !self.table.release && now >= since + self.table.stuck_ns {
                         self.refuse_trace(z, dodos_abi::NodeMessage::Report, role as u16);
                         self.rebuild_cuts.0.push((
@@ -1114,6 +1130,9 @@ impl Model {
         let Completes::Report { role } = taken.completes else {
             return;
         };
+        // D-170: any `Report` consumed from `from` (taken or dropped as late)
+        // restarts every rebuild's `STUCK_NS` wait toward `from`.
+        self.peers[from as usize].last_report = Some(self.membership_now());
         // A report for any ask other than the one the cursor currently waits
         // on (e.g. a node passed over as accused, sealed, or cut at
         // `STUCK_NS`, or an ask from an earlier epoch) frees its credit and

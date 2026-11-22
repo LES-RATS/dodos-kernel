@@ -2309,7 +2309,7 @@ impl Model {
             membership.push(o.at + wait);
         }
         for rebuild in self.rebuilds.values() {
-            if let Some(at) = rebuild.asked_at {
+            if let Some(at) = self.rebuild_wait_since(rebuild) {
                 membership.push(at + self.table.stuck_ns);
             }
         }

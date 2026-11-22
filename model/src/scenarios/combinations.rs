@@ -583,6 +583,17 @@ struct Run {
     spared: BTreeSet<u16>,
 }
 
+/// Seeds whose x86-64 machine gives healthy node 0 a multi-page IOMMU report
+/// (170 MSI remapping handles = 7 pages at 28 items/page) plus an IOAPIC line,
+/// places both `IOMMU_ROLE` and `IOAPIC_ROLE` on node 1, sets `stuck_ms = 30`,
+/// and paces node 0's `ReportAsk` replies at 7 ms (< `RECOVERY_PERIOD_NS`) per
+/// page during concurrent rebuilds so one node's multi-page report exceeds
+/// `STUCK_NS` (D-170). Disjoint from the 27 verify seeds (`seed % 33 == 0`,
+/// `2`) and named regression seeds.
+fn multi_page_seed(seed: u64) -> bool {
+    seed < 286 && seed % 20 == 17
+}
+
 impl Run {
     fn new(seed: u64) -> Self {
         Self::new_with_idle(seed, true)
@@ -607,7 +618,7 @@ impl Run {
         machine.membership.sweep_ms = 100;
         machine.membership.seal_ms = 30;
         machine.membership.stale_ms = 40;
-        machine.membership.stuck_ms = 40;
+        machine.membership.stuck_ms = if multi_page_seed(seed) { 30 } else { 40 };
         let m = S::on(&machine);
         let splittable = m
             .sys
@@ -866,6 +877,67 @@ impl Run {
             let _ = self.call(pair.holder, map);
         }
         self.m.settle();
+        if multi_page_seed(self.seed) {
+            // Put both IOMMU_ROLE and IOAPIC_ROLE on node 1, and give healthy
+            // node 0 170 MSI remapping handles (7 IOMMU report pages) plus
+            // IOAPIC line 6 so a take-over of node 1 rebuilds both roles
+            // concurrently against a multi-page peer (D-170).
+            let ioapic = super::units::IOAPIC_ROLE;
+            let holder = self.m.sys.role(ioapic).holder();
+            if holder != 1 {
+                let roles = slots_of(
+                    self.m.sys.node(holder),
+                    self.m.t[holder as usize],
+                    ObjectKind::Role,
+                );
+                let hand = Syscall::RoleHand {
+                    role: s(roles[ioapic]),
+                    node: node_cap(1),
+                };
+                let _ = self.call(holder, hand);
+                self.m.settle();
+            }
+            for i in 0..170u32 {
+                let claim = Syscall::IrqClaim {
+                    control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                    source: IrqSource::msi(0, (i / 32) as u8, (i % 32) as u8, 0).raw(),
+                    core: 0,
+                    vector: u64::from(48 + i),
+                    destination: s(220 + i),
+                };
+                match self.m.call(0, claim) {
+                    WAITS => {
+                        self.m.settle();
+                        assert!(
+                            self.m.woken(0).is_some_and(Result::is_ok),
+                            "MSI claim {i}: {:?}",
+                            self.m.woken(0)
+                        );
+                    }
+                    outcome => assert!(outcome.is_ok(), "MSI claim {i}: {outcome:?}"),
+                }
+            }
+            let line_claim = Syscall::IrqClaim {
+                control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                source: IrqSource::line(6, false, false).raw(),
+                core: 0,
+                vector: 219,
+                destination: s(391),
+            };
+            match self.m.call(0, line_claim) {
+                WAITS => {
+                    self.m.settle();
+                    assert!(
+                        self.m.woken(0).is_some_and(Result::is_ok),
+                        "line 6 claim: {:?}",
+                        self.m.woken(0)
+                    );
+                }
+                outcome => assert!(outcome.is_ok(), "line 6 claim: {outcome:?}"),
+            }
+            assert_eq!(self.m.sys.node(0).items(IOMMU_ROLE).len(), 171);
+            assert!(self.m.sys.canonical().units[&ioapic].lines.contains_key(&6));
+        }
     }
 
     /// The holder's receiver waits for up to four frames from `group`, and
@@ -1034,11 +1106,186 @@ impl Run {
             self.m.sys.fire(event);
             assert_eq!(self.m.sys.check(), Ok(()), "after {event:?}");
             self.note();
+            if multi_page_seed(self.seed) {
+                self.pace_multi_page();
+            }
         }
         if deferred.is_none() && self.rng.below(2) == 0 {
             let ns = 1 + self.rng.below(3_000_000) as u64;
             self.run(ns);
         }
+    }
+
+    /// On `multi_page_seed` runs, when a holder is concurrently rebuilding two
+    /// or more unit roles and has a `ReportAsk` in flight to healthy node 0,
+    /// pace each page answer at 7 ms (< `RECOVERY_PERIOD_NS`) instead of
+    /// letting `advance()` settle all 7 pages at 0 ns, so the multi-page
+    /// exchange spans more than `STUCK_NS` (D-170).
+    fn pace_multi_page(&mut self) {
+        if !multi_page_seed(self.seed) || !self.healthy(0) {
+            return;
+        }
+        let is_node_0 = |sys: &crate::System, e: crate::system::Event| match e {
+            crate::system::Event::Ipi { node: 0, .. }
+            | crate::system::Event::Timer { node: 0, .. } => true,
+            crate::system::Event::Action(i) => {
+                sys.actions()[i].1 == crate::nodes::HwAction::Ring { node: 0 }
+            }
+            _ => false,
+        };
+        let mut paced = 0usize;
+        while paced < 16 && !self.m.sys.stopped && self.healthy(0) {
+            if !self.m.sys.has(0)
+                || !self.m.sys.node(0).rebuilds.is_empty()
+                || !self.m.sys.node(0).fences.is_empty()
+            {
+                break;
+            }
+            let concurrent_ask = (0..NODES).any(|h| {
+                self.m.sys.has(h)
+                    && self.m.sys.node(h).rebuilds.len() >= 2
+                    && self
+                        .m
+                        .sys
+                        .node(h)
+                        .rebuilds
+                        .values()
+                        .any(|r| r.node == 0 && r.asked.is_some())
+            });
+            if !concurrent_ask {
+                break;
+            }
+            let target = self.m.sys.now() + 7 * MS;
+            while self.m.sys.now() < target && !self.m.sys.stopped {
+                let events = self.m.sys.events();
+                let next_event = events
+                    .iter()
+                    .copied()
+                    .find(|&e| {
+                        matches!(e, crate::system::Event::Timer { .. })
+                            && !is_node_0(&self.m.sys, e)
+                    })
+                    .or_else(|| events.iter().copied().find(|&e| !is_node_0(&self.m.sys, e)));
+                match next_event {
+                    Some(event) => {
+                        self.m.sys.fire(event);
+                        if !self.m.sys.events().iter().any(|&e| {
+                            matches!(e, crate::system::Event::Timer { .. })
+                                && !is_node_0(&self.m.sys, e)
+                        }) {
+                            assert_eq!(self.m.sys.check(), Ok(()));
+                            self.note();
+                        }
+                    }
+                    None => {
+                        let next_timer = self
+                            .m
+                            .sys
+                            .models()
+                            .filter(|&(slot, _)| slot != 0)
+                            .filter_map(|(_, n)| n.next_timer())
+                            .map(|(at, _)| at)
+                            .min();
+                        let step_to = next_timer.map_or(target, |t| t.min(target));
+                        self.m.sys.move_clock(step_to.max(self.m.sys.now() + 1));
+                    }
+                }
+            }
+            // Deliver node 0's ring interrupt / timer so node 0 answers this
+            // page within 7 ms (< RECOVERY_PERIOD_NS = 10 ms).
+            for _ in 0..8 {
+                let ev = self
+                    .m
+                    .sys
+                    .events()
+                    .into_iter()
+                    .find(|&e| is_node_0(&self.m.sys, e));
+                let Some(ev) = ev else { break };
+                self.m.sys.fire(ev);
+                if !self
+                    .m
+                    .sys
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, crate::system::Event::Timer { .. }))
+                {
+                    assert_eq!(self.m.sys.check(), Ok(()));
+                    self.note();
+                }
+            }
+            // Let the holder consume node 0's `Report` and issue its next ask.
+            for _ in 0..16 {
+                let ev = self
+                    .m
+                    .sys
+                    .events()
+                    .into_iter()
+                    .find(|&e| !is_node_0(&self.m.sys, e));
+                let Some(ev) = ev else { break };
+                self.m.sys.fire(ev);
+                if !self
+                    .m
+                    .sys
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, crate::system::Event::Timer { .. }))
+                {
+                    assert_eq!(self.m.sys.check(), Ok(()));
+                    self.note();
+                }
+            }
+            paced += 1;
+        }
+    }
+
+    /// Event-by-event `advance` for `multi_page_seed` runs so `pace_multi_page`
+    /// intercepts concurrent multi-page `ReportAsk` exchanges before `settle`
+    /// collapses them to 0 ns.
+    fn advance_paced(&mut self, to: u64) {
+        let mut guard = 0usize;
+        while !self.m.sys.stopped && guard < 20_000 {
+            guard += 1;
+            self.pace_multi_page();
+            if self.m.sys.stopped {
+                return;
+            }
+            let events = self.m.sys.events();
+            if let Some(ev) = events
+                .iter()
+                .copied()
+                .find(|e| matches!(e, crate::system::Event::Timer { .. }))
+                .or_else(|| events.first().copied())
+            {
+                self.m.sys.fire(ev);
+                if !self
+                    .m
+                    .sys
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, crate::system::Event::Timer { .. }))
+                {
+                    assert_eq!(self.m.sys.check(), Ok(()));
+                    self.note();
+                }
+                continue;
+            }
+            let next = self
+                .m
+                .sys
+                .models()
+                .filter_map(|(_, n)| n.next_timer())
+                .map(|(at, _)| at)
+                .min()
+                .filter(|&at| at <= to);
+            let Some(at) = next else {
+                break;
+            };
+            self.m.sys.move_clock(at.max(self.m.sys.now()));
+        }
+        if !self.m.sys.stopped && self.m.sys.now() < to {
+            self.m.sys.move_clock(to);
+        }
+        self.pace_multi_page();
     }
 
     /// Time passes `ns`, checked and probed every `step`.
@@ -1047,7 +1294,11 @@ impl Run {
         let to = self.m.sys.now() + ns;
         while self.m.sys.now() < to && !self.m.sys.stopped {
             let at = (self.m.sys.now() + step).min(to);
-            self.m.sys.advance(at);
+            if multi_page_seed(self.seed) {
+                self.advance_paced(at);
+            } else {
+                self.m.sys.advance(at);
+            }
             assert_eq!(self.m.sys.check(), Ok(()));
             self.note();
         }
@@ -1590,6 +1841,25 @@ impl Run {
         let holder = word.holder();
         if word.state() != RoleState::Held || holder >= NODES || !self.m.sys.has(holder) {
             return false;
+        }
+        if multi_page_seed(self.seed) {
+            let ioapic = super::units::IOAPIC_ROLE;
+            let io_word = self.m.sys.role(ioapic);
+            let io_holder = io_word.holder();
+            if io_word.state() == RoleState::Held
+                && io_holder != holder
+                && io_holder < NODES
+                && self.m.sys.has(io_holder)
+                && self.healthy(holder)
+            {
+                let t = self.m.t[io_holder as usize];
+                let roles = slots_of(self.m.sys.node(io_holder), t, ObjectKind::Role);
+                let io_hand = Syscall::RoleHand {
+                    role: s(roles[ioapic]),
+                    node: node_cap(holder),
+                };
+                return self.call(io_holder, io_hand).is_some();
+            }
         }
         let Some(target) = self.live_other(holder) else {
             return false;
@@ -2766,6 +3036,15 @@ fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
 #[test]
 fn a_late_report_of_a_node_passed_over_moves_no_rebuild() {
     let _ = explore_one(1109);
+}
+
+// Seed 277 of pass 42 (D-170): healthy node 0 answers a 7-page IOMMU report
+// at 7 ms/page (> 30 ms `STUCK_NS`) while holder 2 concurrently rebuilds
+// `IOAPIC_ROLE`. Without D-170, `IOAPIC_ROLE` cuts healthy node 0 with
+// `RebuildCut::Deadline` and fails `assert_cut_explained`.
+#[test]
+fn seed_277_of_pass_42_multi_page_rebuild_does_not_cut_healthy_node() {
+    let _ = explore_one(277);
 }
 
 // Review of passes 37 and 38, finding 6: `before_live` executes the first

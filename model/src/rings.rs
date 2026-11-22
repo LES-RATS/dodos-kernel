@@ -233,6 +233,9 @@ pub(crate) struct Credit {
 pub(crate) struct Peer {
     pub(crate) credits: Vec<Option<Credit>>,
     pub(crate) serial: u32,
+    /// Instant on membership time when this node last consumed a `Report`
+    /// from this peer (taken or dropped as late, D-170).
+    pub(crate) last_report: Option<u64>,
 }
 
 impl Peer {
@@ -240,6 +243,7 @@ impl Peer {
         Self {
             credits: vec![None; REQUESTS_PER_PEER + SENDS_PER_PEER],
             serial: 0,
+            last_report: None,
         }
     }
 
