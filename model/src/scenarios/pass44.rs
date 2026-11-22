@@ -295,3 +295,66 @@ fn checks_43_and_47_reject_at_now_without_hardware_timer_due_at_now() {
         Err("43: parameters and state of a context".into())
     );
 }
+
+#[test]
+fn exp_1c_nonzero_asleep_on_awake_core_fails_system_check() {
+    let mut m = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1, 2]]));
+    let ut1 = untyped_slot(m.sys.node(1), m.t[1]);
+    let tables1 = table_slot(m.sys.node(1), m.t[1]);
+    m.ok(1, m.retype(1, ObjectKind::ASpace, 0, 150));
+    m.ok(1, retype_from(ut1, ObjectKind::Frame, 1, 151));
+    m.ok(
+        1,
+        Syscall::ASpaceMap(crate::Map {
+            space: s(150),
+            frame: s(151),
+            untyped: s(tables1),
+            address: 0x1000_0000,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        }),
+    );
+    m.ok(1, retype_from(ut1, ObjectKind::Thread, 0, 160));
+    m.ok(1, retype_from(ut1, ObjectKind::Sched, 0, 161));
+    m.ok(
+        1,
+        Syscall::ThreadConfigure {
+            thread: s(160),
+            cspace: s(START_SLOT_CSPACE),
+            aspace: s(150),
+            fault: SlotAddr::NONE,
+            page: SlotAddr::NONE,
+        },
+    );
+    m.ok(
+        1,
+        Syscall::SchedConfigure {
+            sched: s(161),
+            node: node_cap(1),
+            core: 2,
+            budget: 5 * MS,
+            period: 10 * MS,
+            class: 1,
+        },
+    );
+    m.ok(
+        1,
+        Syscall::SchedBind {
+            sched: s(161),
+            thread: s(160),
+        },
+    );
+    m.ok(1, Syscall::ThreadResume(s(160)));
+    m.run(2 * MS);
+    m.sys.hang(2, false);
+    assert_eq!(m.call(1, Syscall::ASpaceUnmap(s(151))), WAITS);
+    let due =
+        m.sys.node(1).cores[0].request.as_ref().unwrap().started + m.sys.canonical().core_answer_ns;
+    m.sys.move_clock(due + 5 * MS);
+    m.sys.node_mut(1).cores[0].asleep = 10 * MS;
+    assert_eq!(
+        m.sys.check(),
+        Err("SLEEP: core.asleep disagrees with the hardware sleep state".into())
+    );
+}

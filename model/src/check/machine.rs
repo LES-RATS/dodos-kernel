@@ -246,6 +246,18 @@ impl System {
                 });
                 ensure(!runs, "SLEEP: a core asleep runs a thread of its node")?;
             }
+            let expected_asleep = match self.hardware(core) {
+                Hardware::Suspending { latency, .. } | Hardware::Asleep { latency, .. } => latency,
+                _ => 0,
+            };
+            let asleep_matches = self.models().all(|(_, m)| {
+                m.position(core as u64)
+                    .is_none_or(|p| m.cores[p].asleep == expected_asleep)
+            });
+            ensure(
+                asleep_matches,
+                "SLEEP: core.asleep disagrees with the hardware sleep state",
+            )?;
             if self.hardware(core) != Hardware::Running {
                 continue;
             }
