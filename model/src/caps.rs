@@ -232,7 +232,7 @@ impl Model {
             return Err(Error::Denied);
         }
         // Order of checks, step 3: the depth checks come last.
-        self.fits(place.space, parent, Placing::Derived)?;
+        self.check_fits(place.space, parent, Placing::Derived)?;
         self.vacant(place)?;
         let badge = if kept != 0 { kept } else { badge };
         self.derive(parent, rights, badge, place);
@@ -247,7 +247,7 @@ impl Model {
     ) -> Outcome {
         let cap = self.cap(thread, source, Rights::WRITE)?;
         let place = self.destination(thread, destination)?;
-        self.fits(place.space, cap, Placing::Moved)?;
+        self.check_fits(place.space, cap, Placing::Moved)?;
         // State, `busy` first: the root capability of an untyped that has a
         // descendant (`cap_move`, D-131).
         if self.root_with_copies(cap) {
@@ -337,7 +337,21 @@ impl Model {
             _ => Ok(0),
         };
         let geometry = self.machine.geometry;
-        let (bytes, align, frame) = footprint(kind, size, source, geometry, thread)?;
+        let (bytes, align, frame) = match footprint(kind, size, source, geometry, thread) {
+            Ok(v) => v,
+            Err(e) => {
+                #[cfg(test)]
+                if e == Error::Invalid
+                    && kind == ObjectKind::CSpace
+                    && source == Source::Ordinary
+                    && size.size > u64::from(CSPACE_MAX_SLOTS)
+                    && size.size.is_multiple_of(u64::from(CSPACE_SEGMENT_SLOTS))
+                {
+                    self.bound_hits.0.cspace_over_max_refused = true;
+                }
+                return Err(e);
+            }
+        };
         // Order of checks, step 3 (D-154): for an `aspace` or an `iospace`
         // the size argument is the slot address of a table untyped with
         // `write`, checked here as a capability argument: slot, kind, the
@@ -347,7 +361,7 @@ impl Model {
             true => Some(self.table_untyped(thread_of, size.size)?),
             false => None,
         };
-        self.fits(place.space, parent, Placing::Retyped(kind))?;
+        self.check_fits(place.space, parent, Placing::Retyped(kind))?;
         self.vacant(place)?;
         // Rules of `untyped_retype` (D-154): a state check after `no_slot`:
         // `again` with nothing changed while the watermark of either
@@ -442,6 +456,10 @@ impl Model {
         }
         let CSpace { max, slots, .. } = &self.cspaces[&space];
         if slots.len() >= *max as usize {
+            #[cfg(test)]
+            if *max >= CSPACE_MAX_SLOTS {
+                self.bound_hits.0.cspace_over_max_refused = true;
+            }
             return Err(Error::NoSlot);
         }
         // Rules of `untyped_retype`: a segment is 8 KB, aligned on its
@@ -521,6 +539,37 @@ impl Model {
             .ok_or(Error::Invalid)
     }
 
+    /// Calls `fits` and, in test builds, records `tree_depth_65_refused` only
+    /// when a valid placement fails specifically because `depth > TREE_DEPTH`.
+    pub(crate) fn check_fits(
+        &mut self,
+        space: ObjId,
+        source: CapId,
+        placing: Placing,
+    ) -> Result<(), Error> {
+        let res = self.fits(space, source, placing);
+        #[cfg(test)]
+        if res == Err(Error::Invalid) {
+            let own = self.objects[&space].root;
+            let kind = self.objects[&self.caps[&source].object].kind;
+            let moved_root = self.rooted(source).is_some() && source != own;
+            let (kind, root, depth) = match placing {
+                Placing::Moved => (kind, moved_root, self.depth(source)),
+                Placing::Derived => (kind, false, self.depth(source) + 1),
+                Placing::Retyped(kind) => (kind, true, self.depth(source) + 1),
+            };
+            let deep_enough = match kind {
+                ObjectKind::Untyped | ObjectKind::MemoryControl => depth >= self.depth(own),
+                ObjectKind::CSpace if root => depth > self.depth(own),
+                _ => true,
+            };
+            if deep_enough && depth > TREE_DEPTH {
+                self.bound_hits.0.tree_depth_65_refused = true;
+            }
+        }
+        res
+    }
+
     /// Rules of `untyped_retype`: memory is taken at a watermark that only
     /// moves up, aligned. `no_memory` if it does not fit; then the memory
     /// from the watermark to the end of the new object must be clear: the
@@ -561,6 +610,10 @@ impl Model {
             untyped.zero.push((untyped.clean, reached));
             untyped.clean = reached;
             if reached < end {
+                #[cfg(test)]
+                {
+                    self.bound_hits.0.clear_step_again = true;
+                }
                 return Err(Error::Again);
             }
         }
@@ -836,10 +889,20 @@ impl Model {
                 },
             };
             if steps == 0 {
+                #[cfg(test)]
+                {
+                    self.bound_hits.0.removal_32_again = true;
+                }
                 return Err(Error::Again);
             }
             steps -= 1;
-            let next = self.next_removed(start, &mut slots).ok_or(Error::Again)?;
+            let Some(next) = self.next_removed(start, &mut slots) else {
+                #[cfg(test)]
+                {
+                    self.bound_hits.0.removal_128_slots_again = true;
+                }
+                return Err(Error::Again);
+            };
             if let Some(waiter) = self.waiter(next) {
                 // The derivation tree: destroying an object wakes every
                 // thread that waits on it, with `gone`. IPC: threads that
@@ -863,10 +926,22 @@ impl Model {
             // and the step returns `again`; a capability whose record is
             // unmapping is not removed until it is empty.
             match self.caps[&next].record {
-                Record::Unmapping(_) => return Err(Error::Again),
+                Record::Unmapping(_) => {
+                    #[cfg(test)]
+                    {
+                        self.bound_hits.0.removal_unmapping_stop = true;
+                    }
+                    return Err(Error::Again);
+                }
                 Record::Mapping(_) => match self.begin_unmap(next, None) {
                     Ok(crate::memory::Unmapped::Done) => {}
-                    _ => return Err(Error::Again),
+                    _ => {
+                        #[cfg(test)]
+                        if matches!(self.caps[&next].record, Record::Unmapping(_)) {
+                            self.bound_hits.0.removal_unmapping_stop = true;
+                        }
+                        return Err(Error::Again);
+                    }
                 },
                 _ => {}
             }

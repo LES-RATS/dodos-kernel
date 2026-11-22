@@ -358,3 +358,321 @@ fn exp_1c_nonzero_asleep_on_awake_core_fails_system_check() {
         Err("SLEEP: core.asleep disagrees with the hardware sleep state".into())
     );
 }
+
+#[test]
+fn exp_3a_recovery_period_waited_stays_false_before_period() {
+    let mut m = S::two();
+    m.sys.move_clock(1_000);
+    m.supervisor(0, m.t[0]);
+    m.ok(0, kill(1));
+    m.sys.settle(1);
+    m.sample_bounds();
+    assert!(m.sys.now() < dodos_abi::RECOVERY_PERIOD_NS);
+    assert!(!m.bounds.recovery_period_waited);
+}
+
+#[test]
+fn exp_3b_cspace_over_max_stays_false_for_small_cspace_grow() {
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.ok(k.retype(ObjectKind::CSpace, 256, 152));
+    assert_eq!(
+        k.call(
+            k.t,
+            Syscall::CSpaceGrow {
+                cspace: s(152),
+                untyped: s(k.ut),
+            },
+        ),
+        Ok(Output::Slots(128))
+    );
+    assert_eq!(
+        k.call(
+            k.t,
+            Syscall::CSpaceGrow {
+                cspace: s(152),
+                untyped: s(k.ut),
+            },
+        ),
+        Ok(Output::Slots(256))
+    );
+    assert_eq!(
+        k.call(
+            k.t,
+            Syscall::CSpaceGrow {
+                cspace: s(152),
+                untyped: s(k.ut),
+            },
+        ),
+        Err(Error::NoSlot)
+    );
+    assert!(!k.bounds.cspace_over_max_refused);
+    // Also a non-aligned size > CSPACE_MAX_SLOTS fails alignment, not max bound.
+    k.no(
+        k.retype(
+            ObjectKind::CSpace,
+            u64::from(dodos_abi::CSPACE_MAX_SLOTS) + 1,
+            153,
+        ),
+        Error::Invalid,
+    );
+    assert!(!k.bounds.cspace_over_max_refused);
+}
+
+#[test]
+fn exp_3c_clear_step_again_stays_false_for_watermark_return_again() {
+    let mut m = S::on(&machine(Arch::X86_64, 2, &[&[0, 1]]));
+    let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    m.ok(0, retype_from(ut, ObjectKind::Untyped, 4096, 149));
+    m.ok(0, retype_from(149, ObjectKind::Frame, 1, 150));
+    m.ok(0, Syscall::CapDelete(s(150)));
+    assert_eq!(
+        m.call(0, retype_from(149, ObjectKind::Notify, 0, 151)),
+        Err(Error::Again)
+    );
+    assert!(!m.bounds.clear_step_again);
+}
+
+#[test]
+fn exp_3d_tree_depth_65_stays_false_for_unrelated_invalid() {
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.ok(k.retype(ObjectKind::Frame, 1, 150));
+    let mut cur = 150u32;
+    let rights = Rights::READ
+        .union(Rights::WRITE)
+        .union(Rights::DERIVE)
+        .union(Rights::GRANT)
+        .bits();
+    for _ in 2..dodos_abi::TREE_DEPTH {
+        k.ok(Syscall::CapDerive {
+            source: s(cur),
+            destination: s(cur + 1),
+            rights,
+            badge: 0,
+        });
+        cur += 1;
+    }
+    // Invalid syscall at depth 1 (Frame retype of 0 pages) must not set tree_depth_65_refused.
+    k.no(retype_from(k.ut, ObjectKind::Frame, 0, 290), Error::Invalid);
+    assert!(!k.bounds.tree_depth_65_refused);
+}
+
+#[test]
+fn exp_3e_sweep_2_sealed_capped_stays_false_without_sweep() {
+    let mut mach = machine(Arch::X86_64, 4, &[&[0], &[1], &[2], &[3]]);
+    mach.membership.sweep_ms = 100;
+    mach.membership.seal_ms = 1000;
+    let mut m = S::on(&mach);
+    m.run(105 * MS);
+    assert!(!m.bounds.sweep_2_sealed_capped);
+    for n in [1u16, 2, 3] {
+        m.ok(0, super::pass17::seal(n));
+    }
+    m.run(5 * MS);
+    assert!(!m.bounds.sweep_2_sealed_capped);
+}
+
+#[test]
+fn exp_3f_stale_starting_accused_stays_false_when_live_node_accused() {
+    let mut mach = machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]);
+    mach.membership.stale_ms = 40;
+    mach.membership.sweep_ms = 100;
+    let mut m = S::on(&mach);
+    m.supervisor(0, m.t[0]);
+    m.ok(0, kill(1));
+    m.ok(0, kill(2));
+    m.run(40 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    assert_eq!(m.state(2), MemberState::Dead);
+    m.ok(0, fresh(2, 0b100));
+    m.ok(0, fresh(1, 0b010));
+    for _ in 0..500 {
+        if m.state(1) == MemberState::Live {
+            break;
+        }
+        if let Some(ev) = m
+            .sys
+            .events()
+            .into_iter()
+            .find(|&ev| !is_core2_start(&m.sys, ev))
+        {
+            m.sys.fire(ev);
+        } else {
+            m.sys.move_clock(m.sys.now() + 500_000);
+        }
+    }
+    assert_eq!(m.state(1), MemberState::Live);
+    assert_eq!(m.state(2), MemberState::Starting);
+    assert!(!m.bounds.stale_starting_accused);
+    m.sys.hang(1, false);
+    let target = m.sys.now() + 150 * MS;
+    while m.sys.now() < target {
+        if let Some(ev) = m
+            .sys
+            .events()
+            .into_iter()
+            .find(|&ev| !is_core2_start(&m.sys, ev))
+        {
+            m.sys.fire(ev);
+        } else {
+            m.sys.move_clock((m.sys.now() + 500_000).min(target));
+        }
+        if m.state(1) == MemberState::Fencing {
+            break;
+        }
+    }
+    assert_eq!(m.state(1), MemberState::Fencing);
+    assert_eq!(m.state(2), MemberState::Starting);
+    let _ = m.call(0, Syscall::Yield);
+    assert!(!m.bounds.stale_starting_accused);
+    assert!(m.bounds.stale_accused);
+}
+
+#[test]
+fn item_7_removal_32_credits_17th_and_kernel_ring_reserve_stay_false_on_unrelated_paths() {
+    // 1. CapDelete returning Again due to REMOVAL_SLOTS (256-slot CSpace) must set
+    //    removal_128_slots_again but NOT removal_32_again.
+    let mut k = N::on(&one_node(Arch::X86_64, 1));
+    k.ok(k.retype(ObjectKind::CSpace, 256, 152));
+    assert_eq!(
+        k.call(
+            k.t,
+            Syscall::CSpaceGrow {
+                cspace: s(152),
+                untyped: s(k.ut),
+            },
+        ),
+        Ok(Output::Slots(128))
+    );
+    assert_eq!(
+        k.call(
+            k.t,
+            Syscall::CSpaceGrow {
+                cspace: s(152),
+                untyped: s(k.ut),
+            },
+        ),
+        Ok(Output::Slots(256))
+    );
+    k.no(Syscall::CapDelete(s(152)), Error::Again);
+    assert!(k.bounds.removal_128_slots_again);
+    assert!(!k.bounds.removal_32_again);
+    assert!(!k.bounds.req_credit_17th_refused);
+    assert!(!k.bounds.kernel_ring_hit_reserve);
+
+    // 2. CapDelete returning Again due to Record::Unmapping (multi-core TLB wait)
+    //    must set removal_unmapping_stop but NOT removal_32_again.
+    let mut m = S::on(&machine(Arch::X86_64, 2, &[&[0, 1]]));
+    let ut = untyped_slot(m.sys.node(0), m.t[0]);
+    let tables = table_slot(m.sys.node(0), m.t[0]);
+    m.ok(0, m.retype(0, ObjectKind::ASpace, 0, 150));
+    m.ok(0, retype_from(ut, ObjectKind::Frame, 1, 151));
+    m.ok(
+        0,
+        Syscall::ASpaceMap(crate::Map {
+            space: s(150),
+            frame: s(151),
+            untyped: s(tables),
+            address: 0x1000_0000,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        }),
+    );
+    m.ok(0, retype_from(ut, ObjectKind::Thread, 0, 160));
+    m.ok(0, retype_from(ut, ObjectKind::Sched, 0, 161));
+    m.ok(
+        0,
+        Syscall::ThreadConfigure {
+            thread: s(160),
+            cspace: s(START_SLOT_CSPACE),
+            aspace: s(150),
+            fault: SlotAddr::NONE,
+            page: SlotAddr::NONE,
+        },
+    );
+    m.ok(
+        0,
+        Syscall::SchedConfigure {
+            sched: s(161),
+            node: node_cap(0),
+            core: 1,
+            budget: 5 * MS,
+            period: 10 * MS,
+            class: 1,
+        },
+    );
+    m.ok(
+        0,
+        Syscall::SchedBind {
+            sched: s(161),
+            thread: s(160),
+        },
+    );
+    m.ok(0, Syscall::ThreadResume(s(160)));
+    m.run(2 * MS);
+    assert_eq!(m.call(0, Syscall::CapDelete(s(151))), Err(Error::Again));
+    assert!(m.bounds.removal_unmapping_stop);
+    assert!(!m.bounds.removal_32_again);
+    assert!(!m.bounds.req_credit_17th_refused);
+    assert!(!m.bounds.kernel_ring_hit_reserve);
+    assert!(!m.bounds.core_answer_timeout);
+}
+
+#[test]
+fn recovery_period_waited_after_full_10ms_stall_on_arm64_fence() {
+    let mut mach = machine(Arch::Aarch64, 2, &[&[0], &[1]]);
+    mach.membership.sweep_ms = 100;
+    let mut m = S::on(&mach);
+    m.supervisor(0, m.t[0]);
+    m.sys.hang(1, false);
+    m.ok(0, kill(1));
+    // Suspend node 0's thread so core 0 has no shorter scheduling timer than
+    // RECOVERY_PERIOD_NS (10 ms), while the ARM64 fence round is 11.2 ms.
+    m.ok(0, Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)));
+    assert!(!m.bounds.recovery_period_waited);
+    m.run_by(20 * MS, 20 * MS);
+    assert!(m.bounds.recovery_period_waited);
+}
+
+#[test]
+fn hang_sleeping_core_clears_asleep_and_passes_check() {
+    let mach = machine(Arch::Aarch64, 2, &[&[0], &[1]]);
+    let mut m = S::on(&mach);
+    // Register one lossy PSCI idle state on node 1 and suspend its thread so core 1 sleeps.
+    let method = dodos_abi::IDLE_METHOD_PSCI | ((1u64 << 16) << 32);
+    let entry: [u64; 4] = [200_000, 400_000, method, dodos_abi::IDLE_FLAG_LOSES_CONTEXT];
+    m.ok(
+        1,
+        Syscall::NodeIdle {
+            node: node_cap(1),
+            core: 1,
+            words: entry.to_vec(),
+        },
+    );
+    m.ok(1, Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)));
+    // Advance until core 1 enters Hardware::Asleep (or Suspending) with asleep > 0.
+    for _ in 0..200 {
+        if m.sys.node(1).cores[0].asleep > 0 {
+            break;
+        }
+        let events = m.sys.events();
+        let next = events
+            .iter()
+            .copied()
+            .find(|e| matches!(e, Event::Sleep { core: 1 } | Event::PowerDown { core: 1 }))
+            .or_else(|| events.into_iter().next());
+        if let Some(ev) = next {
+            m.sys.fire(ev);
+            assert_eq!(m.sys.check(), Ok(()));
+        } else {
+            m.sys.move_clock(m.sys.now() + 500_000);
+        }
+    }
+    assert!(m.sys.node(1).cores[0].asleep > 0);
+    // Hanging the sleeping core must clear core.asleep and keep System::check() clean
+    // (previously failed on seeds 660 and 693).
+    m.hang(1, false);
+    assert_eq!(m.sys.node(1).cores[0].asleep, 0);
+}
+
+

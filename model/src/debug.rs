@@ -362,6 +362,10 @@ impl Model {
     ) -> Outcome {
         self.object(thread, debug, ObjectKind::Debug, Rights::WRITE)?;
         if length > DEBUG_WRITE_MAX {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.debug_write_over_512_refused = true;
+            }
             return Err(Error::Invalid);
         }
         let needed = length.div_ceil(8) as usize;
@@ -520,7 +524,7 @@ impl Model {
         if new.first() < range.first() || new.last() > range.last() {
             return Err(Error::Invalid);
         }
-        self.fits(place.space, parent, crate::caps::Placing::Derived)?;
+        self.check_fits(place.space, parent, crate::caps::Placing::Derived)?;
         self.vacant(place)?;
         self.derive(parent, rights, new.raw(), place);
         Ok(Output::Done)
@@ -532,6 +536,10 @@ impl Model {
     pub(crate) fn entropy_read(&mut self, thread: ObjId, length: u64, mix: [u64; 4]) -> Outcome {
         self.addressed_space(thread, SlotAddr::NONE, Rights::READ)?;
         if length > ENTROPY_MAX_BYTES {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.entropy_over_64_refused = true;
+            }
             return Err(Error::Invalid);
         }
         let words = length.div_ceil(8) as usize;

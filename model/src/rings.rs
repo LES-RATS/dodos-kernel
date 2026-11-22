@@ -338,13 +338,34 @@ impl Model {
             return Err(Full::Starting);
         }
         if !self.ring_room(to, kind, entries) {
+            #[cfg(test)]
+            {
+                let user = kind.ring() == dodos_abi::Ring::User;
+                if user {
+                    self.bound_hits.0.user_ring_full = true;
+                } else if !kind.is_answer() {
+                    self.bound_hits.0.kernel_ring_hit_reserve = true;
+                    if self.recovery_in_progress(Some(to)) {
+                        self.bound_hits.0.kernel_ring_hit_reserve_in_recovery = true;
+                    }
+                }
+            }
             return Err(Full::Ring);
         }
         let user = kind.ring() == dodos_abi::Ring::User;
         let credit = match completes {
             Some(completes) => {
                 let peer = &mut self.peers[to as usize];
-                let index = peer.free(kind == NodeMessage::Send).ok_or(Full::Credit)?;
+                let Some(index) = peer.free(kind == NodeMessage::Send) else {
+                    #[cfg(test)]
+                    if kind != NodeMessage::Send {
+                        self.bound_hits.0.req_credit_17th_refused = true;
+                        if self.recovery_in_progress(Some(to)) {
+                            self.bound_hits.0.req_credit_17th_in_recovery = true;
+                        }
+                    }
+                    return Err(Full::Credit);
+                };
                 peer.serial = (peer.serial + 1) & dodos_abi::CREDIT_SERIAL_MASK;
                 let serial = peer.serial;
                 peer.credits[index as usize] = Some(Credit {
@@ -373,6 +394,30 @@ impl Model {
             ring.set(at + i, RingEntry::Continued);
         }
         ring.produced += entries;
+        #[cfg(test)]
+        {
+            let produced = ring.produced;
+            let used = produced.wrapping_sub(self.consumed(self.node, to, user));
+            if user {
+                if used == RING_USER_ENTRIES {
+                    self.bound_hits.0.user_ring_full = true;
+                }
+            } else {
+                let in_rec = self.recovery_in_progress(Some(to));
+                if used > RING_KERNEL_ENTRIES - RING_ANSWER_RESERVE {
+                    self.bound_hits.0.kernel_ring_used_reserve = true;
+                    if in_rec {
+                        self.bound_hits.0.kernel_ring_used_reserve_in_recovery = true;
+                    }
+                }
+                if used == RING_KERNEL_ENTRIES {
+                    self.bound_hits.0.kernel_ring_full = true;
+                    if in_rec {
+                        self.bound_hits.0.kernel_ring_full_in_recovery = true;
+                    }
+                }
+            }
+        }
         if was_empty {
             self.hw_out.push(crate::nodes::HwAction::Ring { node: to });
         }
@@ -676,7 +721,12 @@ impl Model {
             }
         }
         let produced = self.ring_of(from, me, user).produced;
-        produced.wrapping_sub(self.consumed(from, me, user))
+        let remaining = produced.wrapping_sub(self.consumed(from, me, user));
+        #[cfg(test)]
+        if user && remaining > 0 {
+            self.bound_hits.0.user_ring_step_16 = true;
+        }
+        remaining
     }
 
     fn set_consumed(&mut self, from: u16, user: bool, at: u64) {
@@ -868,6 +918,24 @@ impl Model {
         let uses: Vec<u16> = self.table.uses[me].keys().copied().collect();
         for index in uses {
             if sent >= PENDING_STEP {
+                #[cfg(test)]
+                {
+                    let more_pending = self.table.uses[me]
+                        .values()
+                        .any(|u| u.release_pending || u.signal_pending);
+                    if more_pending {
+                        self.bound_hits.0.pending_step_32 = true;
+                        self.bound_hits.0.pending_step_capped = true;
+                        let in_rec = self.recovery_in_progress(None)
+                            || self.table.uses[me]
+                                .values()
+                                .filter(|u| u.release_pending || u.signal_pending)
+                                .any(|u| self.recovery_in_progress(Some(u.granter)));
+                        if in_rec {
+                            self.bound_hits.0.pending_step_32_in_recovery = true;
+                        }
+                    }
+                }
                 return;
             }
             let Some(entry) = self.table.uses[me].get(&index).copied() else {
@@ -888,6 +956,12 @@ impl Model {
                         | MemberState::Sealed
                 );
             if entry.release_pending {
+                #[cfg(test)]
+                if self.bound_hits.0.pending_step_capped
+                    && (!current || self.recovery_in_progress(Some(entry.granter)))
+                {
+                    self.bound_hits.0.pending_step_32_in_recovery = true;
+                }
                 if !current {
                     self.free_use(index);
                     continue;
@@ -914,12 +988,22 @@ impl Model {
                         | MemberState::Sealed
                 );
             if entry.signal_pending && over {
+                #[cfg(test)]
+                if self.bound_hits.0.pending_step_capped {
+                    self.bound_hits.0.pending_step_32_in_recovery = true;
+                }
                 if let Some(used) = self.table.uses[me].get_mut(&index) {
                     used.signal_pending = false;
                 }
                 continue;
             }
             if entry.signal_pending && current {
+                #[cfg(test)]
+                if self.bound_hits.0.pending_step_capped
+                    && self.recovery_in_progress(Some(entry.granter))
+                {
+                    self.bound_hits.0.pending_step_32_in_recovery = true;
+                }
                 let body = Body::Signal {
                     grant: entry.grant,
                     serial: entry.serial,
@@ -931,6 +1015,10 @@ impl Model {
                     sent += 1;
                 }
             }
+        }
+        #[cfg(test)]
+        {
+            self.bound_hits.0.pending_step_capped = false;
         }
     }
 

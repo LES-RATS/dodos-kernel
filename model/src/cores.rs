@@ -721,8 +721,14 @@ impl Model {
                 // D-171: a core of the node that has not reached its first
                 // event of the current start is judged on `START_NS` from
                 // the node's first event of that start, in place of `STALE_NS`.
-                if let Some(since) = self.start_entered {
-                    silent |= now >= since.saturating_add(dodos_abi::START_NS);
+                if let Some(since) = self.start_entered
+                    && now >= since.saturating_add(dodos_abi::START_NS)
+                {
+                    #[cfg(test)]
+                    {
+                        self.bound_hits.0.start_timeout = true;
+                    }
+                    silent = true;
                 }
                 continue;
             }

@@ -4,7 +4,7 @@
 //! is about. The harness drives a whole machine (`System`) or one node
 //! alone (`Model`), and every step is followed by the whole check.
 
-mod bounds;
+pub(crate) mod bounds;
 mod checker;
 mod combinations;
 mod cores;

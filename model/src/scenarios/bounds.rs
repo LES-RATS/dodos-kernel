@@ -1,18 +1,17 @@
-//! Harness instrumentation for contract bounds (pass 43).
+//! Harness instrumentation for contract bounds (passes 43–44).
 //!
-//! Measures the highest value reached and whether the refusal/wait/boundary
-//! path was taken for each bound of `kernel-interface.md`. Lives strictly in
-//! the test harness: no model logic is altered.
+//! Measures the highest value reached, whether the exact refusal/wait/boundary
+//! path was taken, and (for cross-node pressure rows) whether the bound was
+//! reached while a recovery involving a node concerned was in progress.
+//! Lives strictly in the test build: no model semantics are altered.
 
 use crate::rings::Body;
 use crate::system::System;
 use crate::table::{RingEntry, Table};
-use crate::{Model, Outcome, Record, Syscall};
+use crate::{Model, Outcome, Syscall};
 use dodos_abi::{
-    CrashReason, Error, Evidence, IDLE_ENTRY_WORDS, IDLE_STATES_MAX, IOSPACE_MAX_DEVICES, MAX_CAPS,
-    MAX_WORDS, MemberState, NODE_WATCH_SLOTS, OBSERVATIONS_MAX, PENDING_STEP, REPORT_END,
-    REQUESTS_PER_PEER, RING_ANSWER_RESERVE, RING_KERNEL_ENTRIES, RING_USER_ENTRIES, RING_USER_STEP,
-    RoleKind, SENDS_PER_PEER, SENDS_RESERVED_FOR_MANAGE, TIME_EVENT_STEP,
+    MAX_CAPS, MAX_WORDS, MemberState, REPORT_END, REQUESTS_PER_PEER, RING_KERNEL_ENTRIES,
+    RING_USER_ENTRIES, RoleKind,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,6 +67,69 @@ pub(crate) fn record_scenario(bounds: &Bounds) {
 pub(crate) fn scenario_snapshot() -> Bounds {
     let lock = SCENARIO_BOUNDS.get_or_init(|| Mutex::new(Bounds::default()));
     lock.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Exact bound-path hits recorded on a `Model` at the exact branch that
+/// enforced each bound (stored inside `Ephemeral<BoundHits>` so model
+/// equality and semantics are untouched).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BoundHits {
+    pub(crate) stale_accused: bool,
+    pub(crate) stale_starting_accused: bool,
+    pub(crate) stuck_accused: bool,
+    pub(crate) sweep_fired: bool,
+    pub(crate) settle_waited: bool,
+    pub(crate) start_timeout: bool,
+    pub(crate) start_retried: bool,
+    pub(crate) seal_accused: bool,
+    pub(crate) core_answer_timeout: bool,
+    pub(crate) recovery_period_waited: bool,
+    pub(crate) admission_refused: bool,
+    pub(crate) watch_slot_5th_refused: bool,
+    pub(crate) idle_16th_refused: bool,
+    pub(crate) obs_9th_dropped: bool,
+    pub(crate) kernel_ring_hit_reserve: bool,
+    pub(crate) kernel_ring_used_reserve: bool,
+    pub(crate) kernel_ring_full: bool,
+    pub(crate) user_ring_full: bool,
+    pub(crate) req_credit_17th_refused: bool,
+    pub(crate) send_credit_7th_no_manage_refused: bool,
+    pub(crate) send_credit_9th_refused: bool,
+    pub(crate) unit_requests_65th_refused: bool,
+    pub(crate) irq_193rd_refused: bool,
+    pub(crate) removal_32_again: bool,
+    pub(crate) removal_unmapping_stop: bool,
+    pub(crate) removal_128_slots_again: bool,
+    pub(crate) cspace_over_max_refused: bool,
+    pub(crate) sched_debt_forgiven: bool,
+    pub(crate) sweep_2_sealed_capped: bool,
+    pub(crate) msg_words_over_64_refused: bool,
+    pub(crate) send_grants_over_4_refused: bool,
+    pub(crate) user_ring_step_16: bool,
+    pub(crate) pending_step_32: bool,
+    pub(crate) iospace_17th_refused: bool,
+    pub(crate) tree_depth_65_refused: bool,
+    pub(crate) grants_full_refused: bool,
+    pub(crate) uses_full_dropped: bool,
+    pub(crate) max_due_events: usize,
+    pub(crate) time_event_step_16: bool,
+    pub(crate) clear_step_again: bool,
+    pub(crate) debug_write_over_512_refused: bool,
+    pub(crate) entropy_over_64_refused: bool,
+    pub(crate) map_count_max_refused: bool,
+
+    // Reached while a recovery (death, fence, seal, fresh start, or rebuild)
+    // involving a node concerned was in progress at the exact instant of the hit.
+    pub(crate) kernel_ring_hit_reserve_in_recovery: bool,
+    pub(crate) kernel_ring_used_reserve_in_recovery: bool,
+    pub(crate) kernel_ring_full_in_recovery: bool,
+    pub(crate) req_credit_17th_in_recovery: bool,
+    pub(crate) unit_requests_65th_in_recovery: bool,
+    pub(crate) grants_full_in_recovery: bool,
+    pub(crate) uses_dropped_in_recovery: bool,
+    pub(crate) pending_step_32_in_recovery: bool,
+    pub(crate) pending_step_capped: bool,
+    pub(crate) time_event_step_16_in_recovery: bool,
 }
 
 /// Per-`System` cursor so each ring message is scanned at most once and
@@ -178,6 +240,17 @@ pub(crate) struct Bounds {
     pub(crate) max_entropy_bytes: u64,
     pub(crate) entropy_over_64_refused: bool,
     pub(crate) map_count_max_refused: bool,
+
+    // Reached during recovery (Section 6)
+    pub(crate) kernel_ring_hit_reserve_in_recovery: bool,
+    pub(crate) kernel_ring_used_reserve_in_recovery: bool,
+    pub(crate) kernel_ring_full_in_recovery: bool,
+    pub(crate) req_credit_17th_in_recovery: bool,
+    pub(crate) unit_requests_65th_in_recovery: bool,
+    pub(crate) grants_full_in_recovery: bool,
+    pub(crate) uses_dropped_in_recovery: bool,
+    pub(crate) pending_step_32_in_recovery: bool,
+    pub(crate) time_event_step_16_in_recovery: bool,
 }
 
 impl Bounds {
@@ -266,19 +339,79 @@ impl Bounds {
         self.max_entropy_bytes = self.max_entropy_bytes.max(o.max_entropy_bytes);
         self.entropy_over_64_refused |= o.entropy_over_64_refused;
         self.map_count_max_refused |= o.map_count_max_refused;
+        self.kernel_ring_hit_reserve_in_recovery |= o.kernel_ring_hit_reserve_in_recovery;
+        self.kernel_ring_used_reserve_in_recovery |= o.kernel_ring_used_reserve_in_recovery;
+        self.kernel_ring_full_in_recovery |= o.kernel_ring_full_in_recovery;
+        self.req_credit_17th_in_recovery |= o.req_credit_17th_in_recovery;
+        self.unit_requests_65th_in_recovery |= o.unit_requests_65th_in_recovery;
+        self.grants_full_in_recovery |= o.grants_full_in_recovery;
+        self.uses_dropped_in_recovery |= o.uses_dropped_in_recovery;
+        self.pending_step_32_in_recovery |= o.pending_step_32_in_recovery;
+        self.time_event_step_16_in_recovery |= o.time_event_step_16_in_recovery;
+    }
+
+    fn merge_hits(&mut self, h: &BoundHits) {
+        self.stale_accused |= h.stale_accused;
+        self.stale_starting_accused |= h.stale_starting_accused;
+        self.stuck_accused |= h.stuck_accused;
+        self.sweep_fired |= h.sweep_fired;
+        self.settle_waited |= h.settle_waited;
+        self.start_timeout |= h.start_timeout;
+        self.start_retried |= h.start_retried;
+        self.seal_accused |= h.seal_accused;
+        self.core_answer_timeout |= h.core_answer_timeout;
+        self.recovery_period_waited |= h.recovery_period_waited;
+        self.admission_refused |= h.admission_refused;
+        self.watch_slot_5th_refused |= h.watch_slot_5th_refused;
+        self.idle_16th_refused |= h.idle_16th_refused;
+        self.obs_9th_dropped |= h.obs_9th_dropped;
+        self.kernel_ring_hit_reserve |= h.kernel_ring_hit_reserve;
+        self.kernel_ring_used_reserve |= h.kernel_ring_used_reserve;
+        self.kernel_ring_full |= h.kernel_ring_full;
+        self.user_ring_full |= h.user_ring_full;
+        self.req_credit_17th_refused |= h.req_credit_17th_refused;
+        self.send_credit_7th_no_manage_refused |= h.send_credit_7th_no_manage_refused;
+        self.send_credit_9th_refused |= h.send_credit_9th_refused;
+        self.unit_requests_65th_refused |= h.unit_requests_65th_refused;
+        self.irq_193rd_refused |= h.irq_193rd_refused;
+        self.removal_32_again |= h.removal_32_again;
+        self.removal_unmapping_stop |= h.removal_unmapping_stop;
+        self.removal_128_slots_again |= h.removal_128_slots_again;
+        self.cspace_over_max_refused |= h.cspace_over_max_refused;
+        self.sched_debt_forgiven |= h.sched_debt_forgiven;
+        self.sweep_2_sealed_capped |= h.sweep_2_sealed_capped;
+        self.msg_words_over_64_refused |= h.msg_words_over_64_refused;
+        self.send_grants_over_4_refused |= h.send_grants_over_4_refused;
+        self.user_ring_step_16 |= h.user_ring_step_16;
+        self.pending_step_32 |= h.pending_step_32;
+        self.iospace_17th_refused |= h.iospace_17th_refused;
+        self.tree_depth_65_refused |= h.tree_depth_65_refused;
+        self.grants_full_refused |= h.grants_full_refused;
+        self.uses_full_dropped |= h.uses_full_dropped;
+        self.max_due_timers = self.max_due_timers.max(h.max_due_events);
+        self.time_event_step_16 |= h.time_event_step_16;
+        self.clear_step_again |= h.clear_step_again;
+        self.debug_write_over_512_refused |= h.debug_write_over_512_refused;
+        self.entropy_over_64_refused |= h.entropy_over_64_refused;
+        self.map_count_max_refused |= h.map_count_max_refused;
+        self.kernel_ring_hit_reserve_in_recovery |= h.kernel_ring_hit_reserve_in_recovery;
+        self.kernel_ring_used_reserve_in_recovery |= h.kernel_ring_used_reserve_in_recovery;
+        self.kernel_ring_full_in_recovery |= h.kernel_ring_full_in_recovery;
+        self.req_credit_17th_in_recovery |= h.req_credit_17th_in_recovery;
+        self.unit_requests_65th_in_recovery |= h.unit_requests_65th_in_recovery;
+        self.grants_full_in_recovery |= h.grants_full_in_recovery;
+        self.uses_dropped_in_recovery |= h.uses_dropped_in_recovery;
+        self.pending_step_32_in_recovery |= h.pending_step_32_in_recovery;
+        self.time_event_step_16_in_recovery |= h.time_event_step_16_in_recovery;
     }
 
     /// Samples one `Model` (standalone or part of a `System`) cheaply.
     pub(crate) fn sample_model(&mut self, node: &Model) {
+        self.merge_hits(&node.bound_hits.0);
         self.max_nodes = self.max_nodes.max(usize::from(node.table.nodes));
         self.max_cores_per_node = self.max_cores_per_node.max(node.cores.len());
         let me = usize::from(node.node);
         if me < node.table.beacons.len() {
-            if let Some((reason, _, _)) = node.table.beacons[me].panic
-                && reason == CrashReason::CoreSilent as u64
-            {
-                self.core_answer_timeout = true;
-            }
             self.max_observations = self
                 .max_observations
                 .max(node.table.beacons[me].observations.len());
@@ -301,21 +434,7 @@ impl Bounds {
         let ur = node.unit_requests.iter().filter(|e| e.is_some()).count();
         self.max_unit_requests = self.max_unit_requests.max(ur);
         self.max_unit_service = self.max_unit_service.max(node.unit_service.len());
-        if node.steps_at.0 > 0 {
-            self.recovery_period_waited = true;
-        }
-        if node.next_sweep > node.table.sweep_ns {
-            self.sweep_fired = true;
-        }
-        for start in node.starts.values() {
-            if start.last > start.since {
-                self.start_retried = true;
-            }
-            if node.membership_now() >= start.since + dodos_abi::START_NS {
-                self.start_timeout = true;
-            }
-        }
-        for (peer_idx, peer) in node.peers.iter().enumerate() {
+        for peer in &node.peers {
             let req = peer.credits[..REQUESTS_PER_PEER]
                 .iter()
                 .filter(|c| c.is_some())
@@ -326,20 +445,6 @@ impl Bounds {
                 .count();
             self.max_req_credits = self.max_req_credits.max(req);
             self.max_send_credits = self.max_send_credits.max(snd);
-            if req == REQUESTS_PER_PEER {
-                let p = peer_idx as u16;
-                let wants_unit = node.unit_requests.iter().flatten().any(|e| {
-                    matches!(e.stage, crate::units::Stage::Queued)
-                        && node.table.roles[e.role].holder() == p
-                });
-                let wants_ask = node
-                    .rebuilds
-                    .values()
-                    .any(|r| r.node == p && r.asked.is_none() && r.closing.is_none());
-                if wants_unit || wants_ask {
-                    self.req_credit_17th_refused = true;
-                }
-            }
         }
         for &cut in &node.rebuild_cuts.0 {
             match cut.reason {
@@ -358,11 +463,8 @@ impl Bounds {
         for devs in node.iospaces.values() {
             self.max_iospace_devices = self.max_iospace_devices.max(devs.len());
         }
-        for (&cap_id, cap) in &node.caps {
+        for &cap_id in node.caps.keys() {
             self.max_tree_depth = self.max_tree_depth.max(node.depth(cap_id));
-            if matches!(cap.record, Record::Unmapping(_)) {
-                self.removal_unmapping_stop = true;
-            }
         }
         self.max_walk = self.max_walk.max(node.longest_walk);
         for cs in node.cspaces.values() {
@@ -372,20 +474,7 @@ impl Bounds {
         for sched in node.scheds.values() {
             if let Some((_, debt)) = sched.throttled {
                 self.max_sched_debt = self.max_sched_debt.max(debt.budgets);
-                if debt.forgiven {
-                    self.sched_debt_forgiven = true;
-                }
             }
-        }
-        let due_timers = node
-            .timers
-            .values()
-            .flatten()
-            .filter(|a| a.instant <= node.now)
-            .count();
-        self.max_due_timers = self.max_due_timers.max(due_timers);
-        if due_timers > TIME_EVENT_STEP {
-            self.time_event_step_16 = true;
         }
     }
 
@@ -419,31 +508,9 @@ impl Bounds {
         for node_idx in 0..n {
             let member = table.members[node_idx];
             match member.state() {
-                MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced => {
-                    match member.evidence() {
-                        Evidence::Stale => self.stale_accused = true,
-                        Evidence::Stuck => self.stuck_accused = true,
-                        Evidence::Seal => self.seal_accused = true,
-                        _ => {}
-                    }
-                    if member.state() == MemberState::Unfenced {
-                        self.fence_timeout_unfenced = true;
-                    }
-                    if member.state() == MemberState::Fenced
-                        && let Some(confirmed) = table.fences[node_idx].confirmed
-                        && table.fences[node_idx].generation == member.generation()
-                        && sys.now() < confirmed + dodos_abi::SETTLE_NS
-                    {
-                        self.settle_waited = true;
-                    }
-                }
+                MemberState::Unfenced => self.fence_timeout_unfenced = true,
                 MemberState::Sealed => sealed_count += 1,
                 _ => {}
-            }
-            if let Some((reason, _, _)) = table.beacons[node_idx].panic
-                && reason == CrashReason::CoreSilent as u64
-            {
-                self.core_answer_timeout = true;
             }
             let obs = table.beacons[node_idx].observations.len();
             self.max_observations = self.max_observations.max(obs);
@@ -461,36 +528,6 @@ impl Bounds {
                 .count();
             self.max_pending_signals = self.max_pending_signals.max(pending_sig);
             self.max_pending_releases = self.max_pending_releases.max(pending_rel);
-            if pending_sig > PENDING_STEP || pending_rel > PENDING_STEP {
-                self.pending_step_32 = true;
-            }
-            if pending_sig > 0 {
-                // Signal pending is set when user ring is full or target is starting fresh.
-                for u in table.uses[node_idx].values().filter(|u| u.signal_pending) {
-                    let g = usize::from(u.granter);
-                    let used = table.rings[node_idx][g]
-                        .user
-                        .produced
-                        .wrapping_sub(table.beacons[g].consumed[node_idx].1);
-                    if used == RING_USER_ENTRIES {
-                        self.user_ring_full = true;
-                    }
-                }
-            }
-            if pending_rel > 0 {
-                for u in table.uses[node_idx].values().filter(|u| u.release_pending) {
-                    let g = usize::from(u.granter);
-                    let used = table.rings[node_idx][g]
-                        .kernel
-                        .produced
-                        .wrapping_sub(table.beacons[g].consumed[node_idx].0);
-                    if used <= RING_KERNEL_ENTRIES
-                        && used + 1 + RING_ANSWER_RESERVE > RING_KERNEL_ENTRIES
-                    {
-                        self.kernel_ring_hit_reserve = true;
-                    }
-                }
-            }
         }
         self.max_sealed_nodes = self.max_sealed_nodes.max(sealed_count);
         for area in &table.crash.areas {
@@ -499,89 +536,13 @@ impl Bounds {
             }
         }
 
-        // Scan rings and observe usage + new messages.
+        // Scan rings for high-water marks and report/ask messages.
         self.sample_rings(sys, table, scan);
 
         // Sample each live/present node model.
-        for (id, node) in sys.models() {
+        for (_, node) in sys.models() {
             self.sample_model(node);
-            // Detect 2-sealed-per-sweep cap: sweep ran while >= 3 other nodes are sealed.
-            if sealed_count >= 3 && node.next_sweep > table.sweep_ns {
-                let others_sealed = (0..n)
-                    .filter(|&z| {
-                        z != usize::from(id) && table.members[z].state() == MemberState::Sealed
-                    })
-                    .count();
-                if others_sealed >= 3 {
-                    self.sweep_2_sealed_capped = true;
-                }
-            }
-            // Detect 9th observation dropped: observations full (8) and needed() wants another.
-            let me = usize::from(id);
-            if table.beacons[me].observations.len() >= OBSERVATIONS_MAX
-                && table.writes(id)
-                && self.wants_extra_observation(node, table)
-            {
-                self.obs_9th_dropped = true;
-            }
         }
-    }
-
-    fn wants_extra_observation(&self, node: &Model, table: &Table) -> bool {
-        let me = usize::from(node.node);
-        let obs = &table.beacons[me].observations;
-        for z in 0..table.nodes {
-            if z == node.node || !table.writes(z) {
-                continue;
-            }
-            let member = table.members[usize::from(z)];
-            let g = member.generation();
-            let used_k = table.rings[me][usize::from(z)]
-                .kernel
-                .produced
-                .wrapping_sub(table.beacons[usize::from(z)].consumed[me].0);
-            let used_u = table.rings[me][usize::from(z)]
-                .user
-                .produced
-                .wrapping_sub(table.beacons[usize::from(z)].consumed[me].1);
-            if used_k > 0 && used_k <= RING_KERNEL_ENTRIES {
-                let has = obs.iter().any(|o| {
-                    o.node == z
-                        && o.holds(member)
-                        && matches!(o.watched, crate::table::Watched::Ring { user: false, .. })
-                });
-                if !has {
-                    return true;
-                }
-            }
-            if used_u > 0 && used_u <= RING_USER_ENTRIES {
-                let has = obs.iter().any(|o| {
-                    o.node == z
-                        && o.holds(member)
-                        && matches!(o.watched, crate::table::Watched::Ring { user: true, .. })
-                });
-                if !has {
-                    return true;
-                }
-            }
-            let waiting = node.peers[usize::from(z)]
-                .credits
-                .iter()
-                .any(Option::is_some);
-            if waiting {
-                for core in table.cores_of(z, g) {
-                    let has = obs.iter().any(|o| {
-                        o.node == z
-                            && o.holds(member)
-                            && matches!(o.watched, crate::table::Watched::Heartbeat { core: c, .. } if c == core)
-                    });
-                    if !has {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     fn sample_rings(&mut self, sys: &System, table: &Table, scan: &mut RingScan) {
@@ -596,37 +557,10 @@ impl Bounds {
                 let k_used = pair.kernel.produced.wrapping_sub(consumed.0);
                 if k_used <= RING_KERNEL_ENTRIES {
                     self.max_kernel_ring_used = self.max_kernel_ring_used.max(k_used);
-                    if k_used > RING_KERNEL_ENTRIES - RING_ANSWER_RESERVE {
-                        self.kernel_ring_used_reserve = true;
-                    }
-                    if k_used >= RING_KERNEL_ENTRIES - RING_ANSWER_RESERVE && sys.has(from as u16) {
-                        let sender = sys.node(from as u16);
-                        let p = to as u16;
-                        let wants_unit = sender.unit_requests.iter().flatten().any(|e| {
-                            matches!(e.stage, crate::units::Stage::Queued)
-                                && table.roles[e.role].holder() == p
-                        });
-                        let wants_ask = sender
-                            .rebuilds
-                            .values()
-                            .any(|r| r.node == p && r.asked.is_none() && r.closing.is_none());
-                        if wants_unit || wants_ask {
-                            self.kernel_ring_hit_reserve = true;
-                        }
-                    }
-                    if k_used == RING_KERNEL_ENTRIES {
-                        self.kernel_ring_full = true;
-                    }
                 }
                 let u_used = pair.user.produced.wrapping_sub(consumed.1);
                 if u_used <= RING_USER_ENTRIES {
                     self.max_user_ring_used = self.max_user_ring_used.max(u_used);
-                    if u_used > RING_USER_STEP {
-                        self.user_ring_step_16 = true;
-                    }
-                    if u_used == RING_USER_ENTRIES {
-                        self.user_ring_full = true;
-                    }
                 }
 
                 // Scan newly produced kernel ring messages.
@@ -665,15 +599,6 @@ impl Bounds {
                                         self.max_rebuild_asks_per_node =
                                             self.max_rebuild_asks_per_node.max(*count);
                                     }
-                                    Body::RevokeStep { removed: false } => {
-                                        self.removal_32_again = true;
-                                    }
-                                    Body::SendAnswer { dropped: true, .. } => {
-                                        // Check if dropped because uses table was full.
-                                        if table.uses[from].len() >= dodos_abi::GRANTS {
-                                            self.uses_full_dropped = true;
-                                        }
-                                    }
                                     _ => {}
                                 }
                             }
@@ -711,52 +636,22 @@ impl Bounds {
     }
 }
 
-/// Small `Copy` summary of a `Syscall` extracted before `apply` consumes it.
+/// Small `Copy` summary of a `Syscall` extracted before `apply` consumes it
+/// (only used to record accepted high-water marks; refusals are recorded
+/// directly inside `Model::bound_hits` at the exact check).
 #[derive(Clone, Copy)]
 pub(crate) enum CallMeta {
-    NodeWatch {
-        index: u64,
-    },
-    NodeIdle {
-        words: usize,
-    },
-    NodeSend {
-        node: dodos_abi::SlotAddr,
-        words: usize,
-        caps: usize,
-    },
-    LocalMsg {
-        words: usize,
-    },
-    Removal,
-    UntypedRetype {
-        kind: dodos_abi::ObjectKind,
-        size: u64,
-    },
-    CapDerive,
-    CSpaceGrow,
-    IoSpaceAttach,
-    UnitCall {
-        irq_claim: bool,
-    },
-    SchedConfigure,
-    DebugWrite {
-        len: u64,
-    },
-    EntropyRead {
-        bytes: u64,
-    },
-    ASpaceMap,
+    NodeSend { words: usize, caps: usize },
+    LocalMsg { words: usize },
+    DebugWrite { len: u64 },
+    EntropyRead { bytes: u64 },
     Other,
 }
 
 impl CallMeta {
     pub(crate) fn of(call: &Syscall) -> Self {
         match call {
-            Syscall::NodeWatch { index, .. } => Self::NodeWatch { index: *index },
-            Syscall::NodeIdle { words, .. } => Self::NodeIdle { words: words.len() },
-            Syscall::NodeSend { node, message, .. } => Self::NodeSend {
-                node: *node,
+            Syscall::NodeSend { message, .. } => Self::NodeSend {
                 words: message.words.len(),
                 caps: message.caps.len(),
             },
@@ -765,226 +660,33 @@ impl CallMeta {
             | Syscall::ReplyRecv { message, .. } => Self::LocalMsg {
                 words: message.words.len(),
             },
-            Syscall::CapDelete(_) | Syscall::CapRevoke(_) => Self::Removal,
-            Syscall::UntypedRetype { kind, size, .. } => Self::UntypedRetype {
-                kind: *kind,
-                size: *size,
-            },
-            Syscall::CapDerive { .. } => Self::CapDerive,
-            Syscall::CSpaceGrow { .. } => Self::CSpaceGrow,
-            Syscall::IoSpaceAttach { .. } => Self::IoSpaceAttach,
-            Syscall::IoSpaceMap(_) | Syscall::IoSpaceUnmap(_) => {
-                Self::UnitCall { irq_claim: false }
-            }
-            Syscall::IrqClaim { .. } => Self::UnitCall { irq_claim: true },
-            Syscall::SchedConfigure { .. } => Self::SchedConfigure,
             Syscall::DebugWrite { length, .. } => Self::DebugWrite { len: *length },
             Syscall::EntropyRead { length, .. } => Self::EntropyRead { bytes: *length },
-            Syscall::ASpaceMap(_) => Self::ASpaceMap,
             _ => Self::Other,
         }
     }
 }
 
 impl Bounds {
-    /// Samples a syscall and its outcome (refusal and boundary paths).
+    /// Samples high-water marks of accepted syscalls and merges exact model hits.
     pub(crate) fn sample_call(&mut self, model: &Model, call: CallMeta, outcome: &Outcome) {
-        match call {
-            CallMeta::NodeWatch { index } => {
-                if index >= NODE_WATCH_SLOTS && *outcome == Err(Error::Invalid) {
-                    self.watch_slot_5th_refused = true;
-                }
-            }
-            CallMeta::NodeIdle { words } => {
-                if words > IDLE_STATES_MAX * IDLE_ENTRY_WORDS && *outcome == Err(Error::Invalid) {
-                    self.idle_16th_refused = true;
-                }
-            }
-            CallMeta::NodeSend { node, words, caps } => {
-                if words > MAX_WORDS && *outcome == Err(Error::Invalid) {
-                    self.msg_words_over_64_refused = true;
-                } else if outcome.is_ok() {
+        self.merge_hits(&model.bound_hits.0);
+        if outcome.is_ok() {
+            match call {
+                CallMeta::NodeSend { words, caps } => {
                     self.max_msg_words = self.max_msg_words.max(words);
                     self.max_send_grants = self.max_send_grants.max(caps);
                 }
-                if caps > MAX_CAPS && *outcome == Err(Error::Invalid) {
-                    self.send_grants_over_4_refused = true;
-                }
-                if *outcome == Err(Error::Busy) {
-                    if model.table.grants[usize::from(model.node)].len() + caps > dodos_abi::GRANTS
-                    {
-                        self.grants_full_refused = true;
-                    }
-                    let target = node
-                        .index()
-                        .checked_sub(dodos_abi::START_SLOT_FIRST)
-                        .filter(|&i| (i as usize) < model.peers.len())
-                        .map(|i| i as u16)
-                        .or_else(|| {
-                            model.cspaces.values().find_map(|cs| {
-                                match cs.slots.get(node.index() as usize)? {
-                                    crate::Slot::Full(cid) => {
-                                        let obj = model.caps.get(cid)?.object;
-                                        model.nodes.get(&obj).copied()
-                                    }
-                                    _ => None,
-                                }
-                            })
-                        });
-                    if let Some(target_idx) = target {
-                        let sends = model.peers[usize::from(target_idx)].sends();
-                        if sends >= SENDS_PER_PEER {
-                            self.send_credit_9th_refused = true;
-                        } else if sends >= SENDS_PER_PEER - SENDS_RESERVED_FOR_MANAGE {
-                            self.send_credit_7th_no_manage_refused = true;
-                        }
-                        let used = model
-                            .ring_of(model.node, target_idx, true)
-                            .produced
-                            .wrapping_sub(model.consumed(model.node, target_idx, true));
-                        let need = dodos_abi::message_entries(3 + caps + words) as u64;
-                        if used <= RING_USER_ENTRIES && used + need > RING_USER_ENTRIES {
-                            self.user_ring_full = true;
-                        }
-                    }
-                }
-            }
-            CallMeta::LocalMsg { words } => {
-                if words > MAX_WORDS && *outcome == Err(Error::Invalid) {
-                    self.msg_words_over_64_refused = true;
-                } else if outcome.is_ok() {
+                CallMeta::LocalMsg { words } => {
                     self.max_msg_words = self.max_msg_words.max(words);
                 }
-            }
-            CallMeta::Removal => {
-                if *outcome == Err(Error::Again) {
-                    self.removal_32_again = true;
-                    if model.cspaces.values().any(|cs| {
-                        cs.sweep
-                            .as_ref()
-                            .is_some_and(|s| s.next >= dodos_abi::REMOVAL_SLOTS)
-                    }) {
-                        self.removal_128_slots_again = true;
-                    }
-                    if model
-                        .peers
-                        .iter()
-                        .any(|p| p.credits[..REQUESTS_PER_PEER].iter().all(Option::is_some))
-                    {
-                        self.req_credit_17th_refused = true;
-                    }
-                }
-            }
-            CallMeta::UntypedRetype { kind, size } => {
-                if *outcome == Err(Error::Again) {
-                    self.clear_step_again = true;
-                }
-                if kind == dodos_abi::ObjectKind::CSpace
-                    && size > u64::from(dodos_abi::CSPACE_MAX_SLOTS)
-                    && *outcome == Err(Error::Invalid)
-                {
-                    self.cspace_over_max_refused = true;
-                }
-                if *outcome == Err(Error::Invalid)
-                    && model
-                        .caps
-                        .keys()
-                        .any(|&id| model.depth(id) >= dodos_abi::TREE_DEPTH)
-                {
-                    self.tree_depth_65_refused = true;
-                }
-            }
-            CallMeta::CapDerive => {
-                if *outcome == Err(Error::Invalid)
-                    && model
-                        .caps
-                        .keys()
-                        .any(|&id| model.depth(id) >= dodos_abi::TREE_DEPTH)
-                {
-                    self.tree_depth_65_refused = true;
-                }
-            }
-            CallMeta::CSpaceGrow => {
-                if *outcome == Err(Error::NoSlot)
-                    || *outcome == Err(Error::Busy)
-                    || (*outcome == Err(Error::Invalid)
-                        && model
-                            .cspaces
-                            .values()
-                            .any(|cs| cs.slots.len() >= cs.max as usize))
-                {
-                    self.cspace_over_max_refused = true;
-                }
-            }
-            CallMeta::IoSpaceAttach => {
-                if *outcome == Err(Error::Busy)
-                    && model
-                        .iospaces
-                        .values()
-                        .any(|d| d.len() >= IOSPACE_MAX_DEVICES)
-                {
-                    self.iospace_17th_refused = true;
-                }
-                if matches!(*outcome, Err(Error::Busy | Error::Again))
-                    && model.unit_requests.iter().all(Option::is_some)
-                {
-                    self.unit_requests_65th_refused = true;
-                }
-            }
-            CallMeta::UnitCall { irq_claim } => {
-                if matches!(*outcome, Err(Error::Busy | Error::Again))
-                    && model.unit_requests.iter().all(Option::is_some)
-                {
-                    self.unit_requests_65th_refused = true;
-                }
-                if *outcome == Err(Error::Busy)
-                    && irq_claim
-                    && model.irqs.values().filter(|i| !i.removing).count()
-                        >= dodos_abi::x86_64::IRQ_TABLE_ENTRIES
-                {
-                    self.irq_193rd_refused = true;
-                }
-            }
-            CallMeta::SchedConfigure => {
-                if *outcome == Err(Error::Budget) {
-                    self.admission_refused = true;
-                }
-            }
-            CallMeta::DebugWrite { len } => {
-                if len > dodos_abi::DEBUG_WRITE_MAX && *outcome == Err(Error::Invalid) {
-                    self.debug_write_over_512_refused = true;
-                } else if outcome.is_ok() {
+                CallMeta::DebugWrite { len } => {
                     self.max_debug_write = self.max_debug_write.max(len);
                 }
-            }
-            CallMeta::EntropyRead { bytes } => {
-                if bytes > dodos_abi::ENTROPY_MAX_BYTES && *outcome == Err(Error::Invalid) {
-                    self.entropy_over_64_refused = true;
-                } else if outcome.is_ok() {
+                CallMeta::EntropyRead { bytes } => {
                     self.max_entropy_bytes = self.max_entropy_bytes.max(bytes);
                 }
-            }
-            CallMeta::ASpaceMap => {
-                if *outcome == Err(Error::Busy)
-                    && model.table.gate_words.iter().any(|&w| {
-                        dodos_abi::GateWord::from_raw(w).is_some_and(|g| {
-                            u64::from(g.map_count()) >= model.machine.map_count_max
-                        })
-                    })
-                {
-                    self.map_count_max_refused = true;
-                }
-            }
-            CallMeta::Other => {}
-        }
-        // Also check if a starting node was accused stale (START_NS).
-        for m in &model.table.members {
-            if m.state() == MemberState::Fencing && m.evidence() == Evidence::Stale {
-                let g = m.generation();
-                if model.starts.values().any(|s| s.generation == g) {
-                    self.stale_starting_accused = true;
-                    self.start_timeout = true;
-                }
+                CallMeta::Other => {}
             }
         }
     }
@@ -992,218 +694,237 @@ impl Bounds {
     pub(crate) fn print(&self, label: &str) {
         let yn = |b: bool| if b { "yes" } else { "NO" };
         eprintln!("\n=== Contract bounds coverage ({label}) ===");
-        eprintln!("| Bound | Contract | Max reached | Refusal / boundary path |");
-        eprintln!("|---|---|---|---|");
         eprintln!(
-            "| NODES_MAX | 1024 | {} | — (scaled down in harness) |",
+            "| Bound | Contract | Max reached | Refusal / boundary path | Reached during a recovery |"
+        );
+        eprintln!("|---|---|---|---|---|");
+        eprintln!(
+            "| NODES_MAX | 1024 | {} | — (scaled down in harness) | — |",
             self.max_nodes
         );
         eprintln!(
-            "| CORES_PER_KERNEL_MAX | 64 | {} | — (scaled down in harness) |",
+            "| CORES_PER_KERNEL_MAX | 64 | {} | — (scaled down in harness) | — |",
             self.max_cores_per_node
         );
         eprintln!(
-            "| STALE_NS | 100 ms (10..1000 ms) | — | accused stale={}, starting={} |",
+            "| STALE_NS | 100 ms (10..1000 ms) | — | accused stale={}, starting={} | — |",
             yn(self.stale_accused),
             yn(self.stale_starting_accused)
         );
         eprintln!(
-            "| STUCK_NS | 100 ms (10..1000 ms) | — | accused stuck={}, rebuild_cut={} |",
+            "| STUCK_NS | 100 ms (10..1000 ms) | — | accused stuck={}, rebuild_cut={} | — |",
             yn(self.stuck_accused),
             yn(self.rebuild_stuck_cut)
         );
         eprintln!(
-            "| SWEEP_NS | 1 s (100 ms..60 s) | — | sweep_fired={} |",
+            "| SWEEP_NS | 1 s (100 ms..60 s) | — | sweep_fired={} | — |",
             yn(self.sweep_fired)
         );
         eprintln!(
-            "| FENCE_NS | 30 ms (23..1000 ms) | — | unfenced_at_timeout={} |",
+            "| FENCE_NS | 30 ms (23..1000 ms) | — | unfenced_at_timeout={} | — |",
             yn(self.fence_timeout_unfenced)
         );
         eprintln!(
-            "| SETTLE_NS | 1 ms | — | settle_waited={} |",
+            "| SETTLE_NS | 1 ms | — | settle_waited={} | — |",
             yn(self.settle_waited)
         );
         eprintln!(
-            "| START_NS | 1 s | — | start_timeout={} |",
+            "| START_NS | 1 s | — | start_timeout={} | — |",
             yn(self.start_timeout)
         );
         eprintln!(
-            "| START_RETRY_NS | 1 ms | — | start_retried={} |",
+            "| START_RETRY_NS | 1 ms | — | start_retried={} | — |",
             yn(self.start_retried)
         );
         eprintln!(
-            "| SEAL_NS | 1 s (10 ms..60 s) | — | accused_seal={} |",
+            "| SEAL_NS | 1 s (10 ms..60 s) | — | accused_seal={} | — |",
             yn(self.seal_accused)
         );
         eprintln!(
-            "| CORE_ANSWER_NS | 10 ms (1..100 ms) | — | core_silent_panic={} |",
+            "| CORE_ANSWER_NS | 10 ms (1..100 ms) | — | core_answer_timeout={} | — |",
             yn(self.core_answer_timeout)
         );
         eprintln!(
-            "| Recovery reserve | 1/64, 10 ms | admitted={:#x} | period_waited={}, admission_refused={} |",
+            "| Recovery reserve | 1/64, 10 ms | admitted={:#x} | period_waited={}, admission_refused={} | — |",
             self.max_core0_admitted,
             yn(self.recovery_period_waited),
             yn(self.admission_refused)
         );
         eprintln!(
-            "| NODE_WATCH_SLOTS | 4 | {} | 5th_refused={} |",
+            "| NODE_WATCH_SLOTS | 4 | {} | 5th_refused={} | — |",
             self.max_watch_slots,
             yn(self.watch_slot_5th_refused)
         );
         eprintln!(
-            "| IDLE_STATES_MAX | 15 | {} | 16th_refused={} |",
+            "| IDLE_STATES_MAX | 15 | {} | 16th_refused={} | — |",
             self.max_idle_states,
             yn(self.idle_16th_refused)
         );
         eprintln!(
-            "| OBSERVATIONS_MAX | 8 | {} | 9th_dropped={} |",
+            "| OBSERVATIONS_MAX | 8 | {} | 9th_dropped={} | — |",
             self.max_observations,
             yn(self.obs_9th_dropped)
         );
-        eprintln!("| RESERVES_MAX | 8 (min 2) | {} | — |", self.max_reserves);
-        eprintln!("| ROLES_PLAIN_MAX | 64 | {} | — |", self.max_plain_roles);
         eprintln!(
-            "| RING_KERNEL_ENTRIES | 64 | {} | hit_reserve={}, used_reserve={}, full={} |",
+            "| RESERVES_MAX | 8 (min 2) | {} | — | — |",
+            self.max_reserves
+        );
+        eprintln!(
+            "| ROLES_PLAIN_MAX | 64 | {} | — | — |",
+            self.max_plain_roles
+        );
+        eprintln!(
+            "| RING_KERNEL_ENTRIES | 64 | {} | hit_reserve={}, used_reserve={}, full={} | hit={}, used={}, full={} |",
             self.max_kernel_ring_used,
             yn(self.kernel_ring_hit_reserve),
             yn(self.kernel_ring_used_reserve),
-            yn(self.kernel_ring_full)
+            yn(self.kernel_ring_full),
+            yn(self.kernel_ring_hit_reserve_in_recovery),
+            yn(self.kernel_ring_used_reserve_in_recovery),
+            yn(self.kernel_ring_full_in_recovery)
         );
         eprintln!(
-            "| RING_USER_ENTRIES | 64 | {} | full={} |",
+            "| RING_USER_ENTRIES | 64 | {} | full={} | — |",
             self.max_user_ring_used,
             yn(self.user_ring_full)
         );
         eprintln!(
-            "| REQUESTS_PER_PEER | 16 | {} | 17th_refused={} |",
+            "| REQUESTS_PER_PEER | 16 | {} | 17th_refused={} | {} |",
             self.max_req_credits,
-            yn(self.req_credit_17th_refused)
+            yn(self.req_credit_17th_refused),
+            yn(self.req_credit_17th_in_recovery)
         );
         eprintln!(
-            "| SENDS_PER_PEER | 8 (6 no-manage) | {} | 7th_no_manage={}, 9th_refused={} |",
+            "| SENDS_PER_PEER | 8 (6 no-manage) | {} | 7th_no_manage={}, 9th_refused={} | — |",
             self.max_send_credits,
             yn(self.send_credit_7th_no_manage_refused),
             yn(self.send_credit_9th_refused)
         );
         eprintln!(
-            "| UNIT_REQUESTS | 64 | {} (service={}) | 65th_refused={} |",
+            "| UNIT_REQUESTS | 64 | {} (service={}) | 65th_refused={} | {} |",
             self.max_unit_requests,
             self.max_unit_service,
-            yn(self.unit_requests_65th_refused)
+            yn(self.unit_requests_65th_refused),
+            yn(self.unit_requests_65th_in_recovery)
         );
         eprintln!(
-            "| RING_ANSWER_RESERVE | 34 | k_used={} | hit_reserve={}, used_reserve={} |",
+            "| RING_ANSWER_RESERVE | 34 | k_used={} | hit_reserve={}, used_reserve={} | hit={}, used={} |",
             self.max_kernel_ring_used,
             yn(self.kernel_ring_hit_reserve),
-            yn(self.kernel_ring_used_reserve)
+            yn(self.kernel_ring_used_reserve),
+            yn(self.kernel_ring_hit_reserve_in_recovery),
+            yn(self.kernel_ring_used_reserve_in_recovery)
         );
         eprintln!(
-            "| Report items / entries | 28 / 11 | {} / {} | 28_and_more={}, bad_rejected={} |",
+            "| Report items / entries | 28 / 11 | {} / {} | 28_and_more={}, bad_rejected={} | — |",
             self.max_report_items,
             self.max_ring_msg_entries,
             yn(self.report_28_more),
             yn(self.report_bad_rejected)
         );
         eprintln!(
-            "| IRQ_TABLE_ENTRIES / asks | 192 / 8 | handles={}, asks={} | 193rd_refused={} |",
+            "| IRQ_TABLE_ENTRIES / asks | 192 / 8 | handles={}, asks={} | 193rd_refused={} | — |",
             self.max_node_handles,
             self.max_rebuild_asks_per_node,
             yn(self.irq_193rd_refused)
         );
         eprintln!(
-            "| REMOVAL_STEP / unmapping | 32 / 1 | — | step_32_again={}, unmapping_stop={} |",
+            "| REMOVAL_STEP / unmapping | 32 / 1 | — | step_32_again={}, unmapping_stop={} | — |",
             yn(self.removal_32_again),
             yn(self.removal_unmapping_stop)
         );
         eprintln!(
-            "| REMOVAL_SLOTS | 128 | — | slots_128_again={} |",
+            "| REMOVAL_SLOTS | 128 | — | slots_128_again={} | — |",
             yn(self.removal_128_slots_again)
         );
         eprintln!(
-            "| CSPACE_MAX_SLOTS | 2^20 (1048576) | max={}, grown={} | over_max_refused={} |",
+            "| CSPACE_MAX_SLOTS | 2^20 (1048576) | max={}, grown={} | over_max_refused={} | — |",
             self.max_cspace_slots,
             self.max_cspace_grown_slots,
             yn(self.cspace_over_max_refused)
         );
         eprintln!(
-            "| SCHED_MAX_DEBT | 2^26 (67108864) | {} | forgiven={} |",
+            "| SCHED_MAX_DEBT | 2^26 (67108864) | {} | forgiven={} | — |",
             self.max_sched_debt,
             yn(self.sched_debt_forgiven)
         );
         eprintln!(
-            "| Two sealed per sweep | 2 | sealed_at_once={} | capped_at_2={} |",
+            "| Two sealed per sweep | 2 | sealed_at_once={} | capped_at_2={} | — |",
             self.max_sealed_nodes,
             yn(self.sweep_2_sealed_capped)
         );
         eprintln!(
-            "| MAX_WORDS | 64 | {} | over_64_refused={} |",
+            "| MAX_WORDS | 64 | {} | over_64_refused={} | — |",
             self.max_msg_words,
             yn(self.msg_words_over_64_refused)
         );
         eprintln!(
-            "| MAX_CAPS / SEND_GRANTS_MAX | 4 | {} | over_4_refused={} |",
+            "| MAX_CAPS / SEND_GRANTS_MAX | 4 | {} | over_4_refused={} | — |",
             self.max_send_grants,
             yn(self.send_grants_over_4_refused)
         );
         eprintln!(
-            "| RING_USER_STEP | 16 | u_used={} | over_16_step={} |",
+            "| RING_USER_STEP | 16 | u_used={} | over_16_step={} | — |",
             self.max_user_ring_used,
             yn(self.user_ring_step_16)
         );
         eprintln!(
-            "| PENDING_STEP | 32 | sig={}, rel={} | over_32_step={} |",
+            "| PENDING_STEP | 32 | sig={}, rel={} | over_32_step={} | {} |",
             self.max_pending_signals,
             self.max_pending_releases,
-            yn(self.pending_step_32)
+            yn(self.pending_step_32),
+            yn(self.pending_step_32_in_recovery)
         );
         eprintln!(
-            "| IOSPACE_MAX_DEVICES | 16 | {} | 17th_refused={} |",
+            "| IOSPACE_MAX_DEVICES | 16 | {} | 17th_refused={} | — |",
             self.max_iospace_devices,
             yn(self.iospace_17th_refused)
         );
         eprintln!(
-            "| IOMMU_WAIT_NS | 10 ms | — | unit_failed={} |",
+            "| IOMMU_WAIT_NS | 10 ms | — | unit_failed={} | — |",
             yn(self.iommu_wait_timeout)
         );
         eprintln!(
-            "| TREE_DEPTH / LONGEST_WALK | 64 / 191 | {} / {} | depth_65_refused={} |",
+            "| TREE_DEPTH / LONGEST_WALK | 64 / 191 | {} / {} | depth_65_refused={} | — |",
             self.max_tree_depth,
             self.max_walk,
             yn(self.tree_depth_65_refused)
         );
         eprintln!(
-            "| GRANTS (grant/use table) | 4096 | grants={}, uses={} | grants_full={}, uses_dropped={} |",
+            "| GRANTS (grant/use table) | 4096 | grants={}, uses={} | grants_full={}, uses_dropped={} | grants={}, uses={} |",
             self.max_grants,
             self.max_uses,
             yn(self.grants_full_refused),
-            yn(self.uses_full_dropped)
+            yn(self.uses_full_dropped),
+            yn(self.grants_full_in_recovery),
+            yn(self.uses_dropped_in_recovery)
         );
         eprintln!(
-            "| TIME_EVENT_STEP | 16 | due={} | over_16_step={} |",
+            "| TIME_EVENT_STEP | 16 | due={} | over_16_step={} | {} |",
             self.max_due_timers,
-            yn(self.time_event_step_16)
+            yn(self.time_event_step_16),
+            yn(self.time_event_step_16_in_recovery)
         );
         eprintln!(
-            "| CLEAR_STEP_BYTES | 65536 | — | again={} |",
+            "| CLEAR_STEP_BYTES | 65536 | — | again={} | — |",
             yn(self.clear_step_again)
         );
         eprintln!(
-            "| DEBUG_WRITE_MAX | 512 | {} | over_512_refused={} |",
+            "| DEBUG_WRITE_MAX | 512 | {} | over_512_refused={} | — |",
             self.max_debug_write,
             yn(self.debug_write_over_512_refused)
         );
         eprintln!(
-            "| TRACE_BURST | 16 / 1 ms | — | suppressed={} |",
+            "| TRACE_BURST | 16 / 1 ms | — | suppressed={} | — |",
             yn(self.trace_burst_suppressed)
         );
         eprintln!(
-            "| ENTROPY_MAX_BYTES | 64 | {} | over_64_refused={} |",
+            "| ENTROPY_MAX_BYTES | 64 | {} | over_64_refused={} | — |",
             self.max_entropy_bytes,
             yn(self.entropy_over_64_refused)
         );
         eprintln!(
-            "| MAP_COUNT_MAX | u32::MAX | — | refused={} |",
+            "| MAP_COUNT_MAX | 2^32-1 | — | max_refused={} | — |",
             yn(self.map_count_max_refused)
         );
     }

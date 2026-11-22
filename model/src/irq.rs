@@ -101,12 +101,22 @@ impl Model {
             return Err(Error::Unsupported);
         }
         // The depth checks come last.
-        self.fits(place.space, cap, Placing::Retyped(ObjectKind::Irq))?;
+        self.check_fits(place.space, cap, Placing::Retyped(ObjectKind::Irq))?;
         // The state: the vector claimed, a line whose input is claimed, then
         // the destination.
         let claimed =
             |vector_or_line: &dyn Fn(&Irq) -> bool| self.irqs.values().any(vector_or_line);
         if claimed(&|irq| irq.core == position && irq.vector == vector) {
+            #[cfg(test)]
+            if self
+                .irqs
+                .values()
+                .filter(|irq| irq.core == position)
+                .count()
+                >= dodos_abi::x86_64::IRQ_TABLE_ENTRIES
+            {
+                self.bound_hits.0.irq_193rd_refused = true;
+            }
             return Err(Error::Busy);
         }
         // A vector whose bit is set in the core's retired word, in the
@@ -161,7 +171,7 @@ impl Model {
             .then(|| self.ioapic_role(source.id()))
             .flatten();
         let role = units.first().copied().or(ioapic);
-        if role.is_some() && self.unit_requests.iter().all(Option::is_some) {
+        if role.is_some() && self.unit_requests_full() {
             return Err(Error::Again);
         }
         // The new `irq` is idle, with pending 0; its root capability is a
@@ -544,7 +554,7 @@ impl Model {
         let Some(role) = self.ioapic_role(gsi) else {
             return Undone::Nothing;
         };
-        if self.unit_requests.iter().all(Option::is_some) {
+        if self.unit_requests_full() {
             return Undone::Wait;
         }
         self.unbind_irq(irq);
@@ -607,7 +617,7 @@ impl Model {
         // (Interrupts, the irq; D-150: the shortcut of a node that held
         // every unit skipped the claim that must end first and the
         // retirement at a failed unit).
-        if self.unit_requests.iter().all(Option::is_some) {
+        if self.unit_requests_full() {
             return Undone::Wait;
         }
         self.unbind_irq(irq);
@@ -673,7 +683,7 @@ impl Model {
         };
         // A request also when this node holds every role concerned, as
         // for an MSI (D-150).
-        if self.unit_requests.iter().all(Option::is_some) {
+        if self.unit_requests_full() {
             return Undone::Wait;
         }
         for &unit in &units {

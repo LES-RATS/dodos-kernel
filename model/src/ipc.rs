@@ -129,7 +129,7 @@ impl Model {
         message: Message,
         range: Range,
     ) -> Outcome {
-        message.check_header(self.has_page(thread))?;
+        self.check_message_header(thread, &message)?;
         let caps = self.listed(thread, &message.caps)?;
         let window = self.window(thread, range)?;
         self.movable(&caps)?;
@@ -191,7 +191,7 @@ impl Model {
         // IPC: `send` on the reply object, then as `recv` with it.
         let rights = message.rights().union(Rights::RECV);
         let reply = self.object(thread, reply, ObjectKind::Reply, rights)?;
-        message.check_header(self.has_page(thread))?;
+        self.check_message_header(thread, &message)?;
         let caps = self.listed(thread, &message.caps)?;
         let endpoint = self.object(thread, endpoint, ObjectKind::Endpoint, Rights::RECV)?;
         let window = self.window(thread, range)?;
@@ -231,7 +231,7 @@ impl Model {
         message: Message,
     ) -> Outcome {
         // IPC: a reply carries badge 0, the badge of every reply capability.
-        message.check_header(self.has_page(thread))?;
+        self.check_message_header(thread, &message)?;
         let caps = self.listed(thread, &message.caps)?;
         self.movable(&caps)?;
         let parcel = Parcel::new(thread, message, badge);
@@ -355,7 +355,7 @@ impl Model {
     /// Transfer of capabilities: the checks of the list of a message, made
     /// when the call is made and again at delivery, against what the slots
     /// of the sender hold then.
-    fn listed(&self, sender: ObjId, transfers: &[Transfer]) -> Result<Vec<Listed>, Error> {
+    fn listed(&mut self, sender: ObjId, transfers: &[Transfer]) -> Result<Vec<Listed>, Error> {
         let mut caps: Vec<Listed> = Vec::new();
         for transfer in transfers {
             let listed = match *transfer {
@@ -387,6 +387,10 @@ impl Model {
                 Listed::Derive(cap, _) => self.depth(cap) >= TREE_DEPTH,
             };
             if twice || too_deep {
+                #[cfg(test)]
+                if !twice && too_deep {
+                    self.bound_hits.0.tree_depth_65_refused = true;
+                }
                 return Err(Error::Invalid);
             }
             caps.push(listed);
@@ -537,6 +541,7 @@ impl Model {
                 .for_each(|word| *word = 0);
         }
         let index = |i: usize| window.first as usize + i;
+        let listed_raw = self.listed(parcel.sender, &parcel.caps).ok();
         let empty = |index: usize| {
             // Removal ends: a range in a dying or destroyed space takes
             // nothing.
@@ -558,9 +563,7 @@ impl Model {
             };
             self.fits(window.cspace, listed.cap(), placing).is_ok()
         };
-        let listed = self
-            .listed(parcel.sender, &parcel.caps)
-            .ok()
+        let listed = listed_raw
             .filter(|caps| self.movable(caps).is_ok())
             .filter(|caps| caps.is_empty() || !lost)
             .filter(|caps| {

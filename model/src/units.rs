@@ -247,6 +247,7 @@ impl Model {
     ) -> Result<usize, Error> {
         let free = self.unit_requests.iter().position(Option::is_none);
         let Some(index) = free else {
+            let _ = self.unit_requests_full();
             return Err(Error::Again);
         };
         self.unit_order += 1;

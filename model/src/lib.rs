@@ -1275,6 +1275,8 @@ pub struct Model {
     applied: Ephemeral<Vec<(dodos_abi::RingHeader, dodos_abi::Member)>>,
     steps_at: Ephemeral<u64>,
     steps_now: Ephemeral<u64>,
+    #[cfg(test)]
+    pub(crate) bound_hits: Ephemeral<crate::scenarios::bounds::BoundHits>,
     built: u32,
     /// IOMMU: counts of leaves whose invalidation a failed unit never
     /// confirmed, which are never lowered (IOMMU): by chunk, and by entry
@@ -2054,5 +2056,83 @@ impl Model {
         }
         woken.outcome = Some(outcome);
         self.observe();
+    }
+
+    /// Checks a message header and records exact `MAX_WORDS` / `MAX_CAPS`
+    /// refusal hits in test builds.
+    pub(crate) fn check_message_header(
+        &mut self,
+        thread: ObjId,
+        message: &Message,
+    ) -> Result<(), Error> {
+        let res = message.check_header(self.has_page(thread));
+        #[cfg(test)]
+        if res == Err(Error::Invalid) {
+            if message.words.len() > dodos_abi::MAX_WORDS {
+                self.bound_hits.0.msg_words_over_64_refused = true;
+            }
+            if message.caps.len() > dodos_abi::MAX_CAPS {
+                self.bound_hits.0.send_grants_over_4_refused = true;
+            }
+        }
+        res
+    }
+
+    /// Checks whether the unit request table is full, recording the exact
+    /// 65th-request refusal hit (and recovery overlap) in test builds.
+    pub(crate) fn unit_requests_full(&mut self) -> bool {
+        let full = self.unit_requests.iter().all(Option::is_some);
+        #[cfg(test)]
+        if full {
+            self.bound_hits.0.unit_requests_65th_refused = true;
+            let in_rec = self.recovery_in_progress(None)
+                || self.unit_requests.iter().flatten().any(|e| {
+                    let word = self.table.roles[e.role];
+                    self.recovery_in_progress(Some(word.holder()))
+                        || (word.state() == dodos_abi::RoleState::Handing
+                            && self.recovery_in_progress(Some(word.target())))
+                });
+            if in_rec {
+                self.bound_hits.0.unit_requests_65th_in_recovery = true;
+            }
+        }
+        full
+    }
+
+    /// Whether a death, fence, seal, fresh start, or rebuild involving this
+    /// node (or `peer`, when named) is in progress right now.
+    #[cfg(test)]
+    pub(crate) fn recovery_in_progress(&self, peer: Option<u16>) -> bool {
+        let node_recovering = |z: u16| {
+            let m = self.table.member(z);
+            let st = m.state();
+            matches!(
+                st,
+                dodos_abi::MemberState::Fencing
+                    | dodos_abi::MemberState::Fenced
+                    | dodos_abi::MemberState::Unfenced
+                    | dodos_abi::MemberState::Sealing
+                    | dodos_abi::MemberState::Sealed
+                    | dodos_abi::MemberState::Starting
+            ) || self.reclaims.contains_key(&z)
+                || self.fences.contains_key(&z)
+                || self.rebuilds.values().any(|r| r.node == z)
+                || self.starts.values().any(|s| s.node == z)
+                || self.table.roles.iter().any(|w| {
+                    w.state() == dodos_abi::RoleState::Handing
+                        && (w.holder() == z || w.target() == z)
+                })
+        };
+        if node_recovering(self.node)
+            || self.seal.is_some()
+            || !self.rebuilds.is_empty()
+            || !self.reclaims.is_empty()
+            || !self.fences.is_empty()
+            || !self.starts.is_empty()
+            || !self.handing.is_empty()
+        {
+            return true;
+        }
+        peer.is_some_and(node_recovering)
     }
 }

@@ -132,6 +132,14 @@ impl Model {
 
     /// A timer interrupt on a core: an event that processes its due events.
     pub(crate) fn timer_interrupt(&mut self, core: usize) {
+        #[cfg(test)]
+        if core == 0
+            && let Some(stalled_at) = self.stalled
+            && self.now >= stalled_at + dodos_abi::RECOVERY_PERIOD_NS
+            && self.reserve_work()
+        {
+            self.bound_hits.0.recovery_period_waited = true;
+        }
         *self.last_event = None;
         let entry = self.begin_on(core);
         self.due();
@@ -597,6 +605,10 @@ impl Model {
             (sched.budget, sched.period) = (budget, period);
         }
         let n = debt.budgets;
+        #[cfg(test)]
+        if debt.forgiven {
+            self.bound_hits.0.sched_debt_forgiven = true;
+        }
         sched.remaining = match debt.forgiven {
             true => sched.budget as i64,
             false => sched.remaining.saturating_add((n * sched.budget) as i64),
@@ -772,9 +784,15 @@ impl Model {
                 .as_ref()
                 .is_some_and(|r| r.started + self.table.core_answer_ns <= self.membership_now());
         if late {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.core_answer_timeout = true;
+            }
             self.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
         }
         self.watch_own_cores();
+        #[cfg(test)]
+        let recovery_coincides = at == 0 && self.core0_recovery_due_now();
         // The recovery reserve runs on the node's first core.
         if at == 0 {
             self.reserve_step();
@@ -803,14 +821,32 @@ impl Model {
         due.sort();
         // Contract (Due events and the hardware timer): if due events remain
         // after `TIME_EVENT_STEP` (16), the hardware timer is set to `now`.
+        #[cfg(test)]
+        let total_due = due.len();
+        #[cfg(test)]
+        let mut processed = 0usize;
         self.event.due_remaining = due.len() > TIME_EVENT_STEP;
         for (_, event) in due.into_iter().take(TIME_EVENT_STEP) {
+            #[cfg(test)]
+            {
+                processed += 1;
+            }
             match event {
                 Due::Replenish(_, context) => {
                     let debt = self.scheds[&context].throttled.expect("throttled").1;
                     self.replenish(context, debt);
                 }
                 Due::Fire(timer) => self.fire(timer),
+            }
+        }
+        #[cfg(test)]
+        {
+            self.bound_hits.0.max_due_events = self.bound_hits.0.max_due_events.max(total_due);
+            if total_due > processed {
+                self.bound_hits.0.time_event_step_16 = true;
+                if recovery_coincides {
+                    self.bound_hits.0.time_event_step_16_in_recovery = true;
+                }
             }
         }
     }
@@ -911,6 +947,10 @@ impl Model {
         let kept = if placed == target { before } else { 0 };
         let sum = self.cores[target].admitted - kept + bandwidth(budget, period);
         if sum > ADMISSION_WHOLE_CORE {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.admission_refused = true;
+            }
             return Err(Error::Budget);
         }
         self.cores[placed].admitted -= before;

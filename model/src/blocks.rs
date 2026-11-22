@@ -69,7 +69,7 @@ impl Model {
         }
         // The depth checks: one deeper than the memory_control capability,
         // and an untyped only in a space whose root is not deeper.
-        self.fits(at.space, parent, Placing::Retyped(ObjectKind::Untyped))?;
+        self.check_fits(at.space, parent, Placing::Retyped(ObjectKind::Untyped))?;
         // 4. The state: a word that fails its check, is taken by the
         // current generation of this node, or has an owner the rules of
         // taking refuse, is `busy`; an unused entry is `busy`; then the

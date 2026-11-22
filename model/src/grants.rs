@@ -173,7 +173,7 @@ impl Model {
         // The header, as for `send`: read right after the capability the
         // call acts on, before any other capability argument (Order of
         // checks, step 2; pass 35: it was read after the doorbell).
-        message.check_header(self.has_page(thread))?;
+        self.check_message_header(thread, &message)?;
         // The doorbell, if not 0: slot, kind notify, `send`; a notify of the
         // caller's node.
         let bell = match doorbell.is_none() {
@@ -210,6 +210,10 @@ impl Model {
             // A capability at depth 64 cannot be derived: its anchor would
             // be deeper than the tree allows (D-141).
             if self.depth(cap) >= dodos_abi::TREE_DEPTH {
+                #[cfg(test)]
+                {
+                    self.bound_hits.0.tree_depth_65_refused = true;
+                }
                 return Err(Error::Invalid);
             }
             listed.push((cap, rights));
@@ -239,6 +243,14 @@ impl Model {
             false => dodos_abi::SENDS_PER_PEER - dodos_abi::SENDS_RESERVED_FOR_MANAGE,
         };
         if in_flight >= limit {
+            #[cfg(test)]
+            {
+                if manage {
+                    self.bound_hits.0.send_credit_9th_refused = true;
+                } else {
+                    self.bound_hits.0.send_credit_7th_no_manage_refused = true;
+                }
+            }
             return Err(Error::Busy);
         }
         let header = Header::new(message.label, message.words.len(), listed.len(), 0)?;
@@ -254,6 +266,10 @@ impl Model {
             words: message.words.clone(),
         };
         if !self.ring_room(target, dodos_abi::NodeMessage::Send, probe.entries()) {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.user_ring_full = true;
+            }
             return Err(Error::Busy);
         }
         let me = self.node as usize;
@@ -266,6 +282,13 @@ impl Model {
             .take(SEND_GRANTS_MAX)
             .collect();
         if free.len() < listed.len() {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.grants_full_refused = true;
+                if self.recovery_in_progress(Some(target)) {
+                    self.bound_hits.0.grants_full_in_recovery = true;
+                }
+            }
             return Err(Error::Busy);
         }
         // Effect: the gate writes one grant entry per frame, then the
@@ -451,6 +474,13 @@ impl Model {
         let uses_free = (0..GRANTS as u16)
             .filter(|u| !self.table.uses[me].contains_key(u))
             .count();
+        #[cfg(test)]
+        if !grants.is_empty() && room && uses_free < grants.len() {
+            self.bound_hits.0.uses_full_dropped = true;
+            if self.recovery_in_progress(Some(from)) {
+                self.bound_hits.0.uses_dropped_in_recovery = true;
+            }
+        }
         let accepted = room && uses_free >= grants.len();
         let mut uses = vec![None; grants.len()];
         if accepted {

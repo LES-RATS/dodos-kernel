@@ -65,33 +65,43 @@ impl Model {
         if word.state() != RoleState::Vacant {
             let names = [word.holder(), word.target()];
             let now = self.membership_now();
-            let blocking = names
-                .iter()
-                .filter(|&&n| (n as usize) < self.table.members.len())
-                .any(|&n| {
-                    let member = self.table.member(n);
-                    // Starting, live, sealing, sealed or fencing, for every
-                    // role (D-161: fencing for a plain role too).
-                    let alive = matches!(
-                        member.state(),
-                        MemberState::Starting
-                            | MemberState::Live
-                            | MemberState::Sealing
-                            | MemberState::Sealed
-                            | MemberState::Fencing
-                    );
-                    let fenced =
-                        matches!(member.state(), MemberState::Fenced | MemberState::Unfenced);
-                    // A plain role moves from an unfenced holder only once
-                    // `FENCE_NS` + `SETTLE_NS` have passed since the first
-                    // fence action (Roles, kinds of role, D-161).
-                    let unsettled = member.state() == MemberState::Unfenced
-                        && self.table.fences[n as usize]
-                            .begun(member.generation())
-                            .is_none_or(|begun| now < begun + FENCE_NS + SETTLE_NS);
-                    alive || (fenced && (record.kind == RoleKind::Reserve || unsettled))
-                });
-            if blocking {
+            let mut blocked_alive_or_reserve = false;
+            let mut blocked_unsettled = false;
+            for &n in &names {
+                if (n as usize) >= self.table.members.len() {
+                    continue;
+                }
+                let member = self.table.member(n);
+                // Starting, live, sealing, sealed or fencing, for every
+                // role (D-161: fencing for a plain role too).
+                let alive = matches!(
+                    member.state(),
+                    MemberState::Starting
+                        | MemberState::Live
+                        | MemberState::Sealing
+                        | MemberState::Sealed
+                        | MemberState::Fencing
+                );
+                let fenced =
+                    matches!(member.state(), MemberState::Fenced | MemberState::Unfenced);
+                // A plain role moves from an unfenced holder only once
+                // `FENCE_NS` + `SETTLE_NS` have passed since the first
+                // fence action (Roles, kinds of role, D-161).
+                let unsettled = member.state() == MemberState::Unfenced
+                    && self.table.fences[n as usize]
+                        .begun(member.generation())
+                        .is_none_or(|begun| now < begun + FENCE_NS + SETTLE_NS);
+                if alive || (fenced && record.kind == RoleKind::Reserve) {
+                    blocked_alive_or_reserve = true;
+                } else if fenced && unsettled {
+                    blocked_unsettled = true;
+                }
+            }
+            if blocked_alive_or_reserve || blocked_unsettled {
+                #[cfg(test)]
+                if !blocked_alive_or_reserve && blocked_unsettled {
+                    self.bound_hits.0.settle_waited = true;
+                }
                 return Err(Error::Busy);
             }
         }
@@ -443,6 +453,10 @@ impl Model {
             return false;
         };
         if self.membership_now() < at {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.settle_waited = true;
+            }
             return false;
         }
         // Take-over: held (S, e + 1), the unit mapped, then rebuilt from the

@@ -325,6 +325,11 @@ impl Model {
             return Ok(Unmapped::Done);
         };
         if self.unmap_refused(cap) {
+            if self.iospaces.contains_key(&mapping.space)
+                && self.unit_of_space(mapping.space).is_some()
+            {
+                let _ = self.unit_requests_full();
+            }
             return Err(Error::Again);
         }
         let space = mapping.space;
@@ -612,6 +617,10 @@ impl Model {
                 Target::Nothing => false,
             };
         if overflow {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.map_count_max_refused = true;
+            }
             return Err(Error::Busy);
         }
         let aspace = &self.aspaces[&space];
@@ -646,7 +655,7 @@ impl Model {
         // request table is full (D-141).
         let asks =
             self.machine.caching_mode && self.iospaces.get(&space).is_some_and(|s| !s.is_empty());
-        if asks && self.unit_requests.iter().all(Option::is_some) {
+        if asks && self.unit_requests_full() {
             return Err(Error::Again);
         }
         // The barrier's dependency: bit X of `maps_of` is set through the
@@ -950,7 +959,7 @@ impl Model {
             if unit.detaching.contains(&device) {
                 return Err(Error::Busy);
             }
-            if self.unit_requests.iter().all(Option::is_some) {
+            if self.unit_requests_full() {
                 return Err(Error::Again);
             }
             let domain = self.domains.get(&from).copied().unwrap_or(0);
@@ -999,6 +1008,10 @@ impl Model {
             return Err(Error::Busy);
         }
         if usize::from(self.table.attached_to(root)) >= IOSPACE_MAX_DEVICES {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.iospace_17th_refused = true;
+            }
             return Err(Error::Busy);
         }
         // A domain number for the iospace on that unit, taken from this
@@ -1010,7 +1023,7 @@ impl Model {
         };
         // A call that finds no free entry of the unit request table returns
         // `again` with nothing changed.
-        if self.unit_requests.iter().all(Option::is_some) {
+        if self.unit_requests_full() {
             return Err(Error::Again);
         }
         let taken = dodos_abi::Ownership::taken(
@@ -1061,7 +1074,7 @@ impl Model {
             self.detach_local(iommu, device);
             return Ok(());
         }
-        if self.unit_requests.iter().all(Option::is_some) {
+        if self.unit_requests_full() {
             return Err(Error::Again);
         }
         let iospace = self.iommus[&iommu].attached[&device];

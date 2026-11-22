@@ -955,10 +955,14 @@ fn pending_signals_and_pending_releases_both_exceed_32_step() {
 #[test]
 fn cspace_max_slots_removal_128_slots_and_32_units() {
     let mut k = N::on(&one_node(Arch::X86_64, 1));
-    // CSpace with max = CSPACE_MAX_SLOTS succeeds; + 1 is Invalid.
+    // CSpace with max = CSPACE_MAX_SLOTS succeeds; + CSPACE_SEGMENT_SLOTS is Invalid.
     k.ok(k.retype(ObjectKind::CSpace, u64::from(CSPACE_MAX_SLOTS), 150));
     k.no(
-        k.retype(ObjectKind::CSpace, u64::from(CSPACE_MAX_SLOTS) + 1, 151),
+        k.retype(
+            ObjectKind::CSpace,
+            u64::from(CSPACE_MAX_SLOTS) + u64::from(dodos_abi::CSPACE_SEGMENT_SLOTS),
+            151,
+        ),
         Error::Invalid,
     );
 
@@ -1369,11 +1373,17 @@ fn time_event_step_16_debug_entropy_map_count_and_sched_debt() {
     // next ASpaceMap returns Busy, then restore.
     k.ok(k.retype(ObjectKind::ASpace, 0, 190));
     k.ok(k.retype(ObjectKind::Frame, 1, 191));
+    k.ok(Syscall::CapDerive {
+        source: s(191),
+        destination: s(192),
+        rights: Rights::READ.bits(),
+        badge: 0,
+    });
     let tables = k.tables();
-    let map_at = |addr: u64| {
+    let map_cap_at = |frame: u32, addr: u64| {
         Syscall::ASpaceMap(Map {
             space: s(190),
-            frame: s(191),
+            frame: s(frame),
             untyped: s(tables),
             address: addr,
             first: 0,
@@ -1381,12 +1391,13 @@ fn time_event_step_16_debug_entropy_map_count_and_sched_debt() {
             rights: Rights::READ.bits(),
         })
     };
-    k.ok(map_at(0x1000_0000));
+    k.ok(map_cap_at(191, 0x1000_0000));
     let frame_obj = k.m.object_at(k.t, s(191)).unwrap();
     let chunk = k.m.frames[&frame_obj].base / k.m.geometry().chunk();
     k.m.machine.map_count_max = k.m.table.map_count(chunk);
-    k.no(map_at(0x1010_0000), Error::Busy);
+    k.no(map_cap_at(192, 0x1010_0000), Error::Busy);
     k.m.machine.map_count_max = dodos_abi::MAP_COUNT_MAX;
+    k.ok(map_cap_at(192, 0x1010_0000));
     assert_eq!(k.m.check(), Ok(()));
 
     // SCHED_MAX_DEBT (2^26): charge SCHED_MAX_DEBT + 1 budgets and sample before
@@ -1414,8 +1425,14 @@ fn time_event_step_16_debug_entropy_map_count_and_sched_debt() {
     k.m.timer_interrupt(0);
     assert_eq!(k.m.check(), Ok(()));
     k.bounds.sample_model(&k.m);
-    let (_, debt) = k.m.scheds[&sched_obj].throttled.expect("throttled");
+    let (instant, debt) = k.m.scheds[&sched_obj].throttled.expect("throttled");
     assert_eq!((debt.budgets, debt.forgiven), (SCHED_MAX_DEBT, true));
+    k.m.set_now(instant);
+    k.m.timer_interrupt(0);
+    assert_eq!(k.m.check(), Ok(()));
+    assert_eq!(k.m.scheds[&sched_obj].throttled, None);
+    assert_eq!(k.m.scheds[&sched_obj].remaining, b as i64);
+    k.bounds.sample_model(&k.m);
 
     assert!(k.bounds.time_event_step_16);
     assert_eq!(k.bounds.max_debug_write, DEBUG_WRITE_MAX);

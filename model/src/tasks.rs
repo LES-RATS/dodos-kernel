@@ -165,7 +165,13 @@ impl Model {
         }
         match self.tasks[&task].threads.is_empty() {
             true => Ok(Output::Done),
-            false => Err(Error::Again),
+            false => {
+                #[cfg(test)]
+                {
+                    self.bound_hits.0.removal_32_again = true;
+                }
+                Err(Error::Again)
+            }
         }
     }
 

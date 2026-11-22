@@ -474,7 +474,19 @@ impl Model {
         words: &[u64],
     ) -> Outcome {
         let position = self.own_core(thread, node, core)?;
-        let table = idle_table(words, &self.machine)?;
+        let table = match idle_table(words, &self.machine) {
+            Ok(table) => table,
+            Err(e) => {
+                #[cfg(test)]
+                if e == Error::Invalid
+                    && words.len().is_multiple_of(IDLE_ENTRY_WORDS)
+                    && words.len() > IDLE_STATES_MAX * IDLE_ENTRY_WORDS
+                {
+                    self.bound_hits.0.idle_16th_refused = true;
+                }
+                return Err(e);
+            }
+        };
         self.cores[position].idle_table = table;
         Ok(Output::Done)
     }
@@ -525,6 +537,10 @@ impl Model {
             }
         };
         if index >= NODE_WATCH_SLOTS {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.watch_slot_5th_refused = true;
+            }
             return Err(Error::Invalid);
         }
         // Watch slots belong to the node (contract `node_watch`): any
@@ -545,6 +561,25 @@ impl Model {
         let accuser = self.table.member(self.node).state();
         self.event.accusers.push(accuser);
         let member = self.table.member(node);
+        #[cfg(test)]
+        match evidence {
+            Evidence::Stale => {
+                if member.state() == MemberState::Starting {
+                    self.bound_hits.0.stale_starting_accused = true;
+                    self.bound_hits.0.start_timeout = true;
+                } else {
+                    self.bound_hits.0.stale_accused = true;
+                }
+            }
+            Evidence::Stuck => {
+                self.bound_hits.0.stuck_accused = true;
+                if member.state() == MemberState::Starting {
+                    self.bound_hits.0.start_timeout = true;
+                }
+            }
+            Evidence::Seal => self.bound_hits.0.seal_accused = true,
+            _ => {}
+        }
         let fencing = Member::new(
             MemberState::Fencing,
             evidence,
@@ -809,11 +844,16 @@ impl Model {
             return Vec::new();
         }
         let start = self.seal_cursor % n;
-        let read: Vec<u16> = (1..=n)
+        let sealed = (1..=n)
             .map(|step| (start + step) % n)
-            .filter(|&z| z != self.node && self.table.member(z).state() == MemberState::Sealed)
-            .take(2)
-            .collect();
+            .filter(|&z| z != self.node && self.table.member(z).state() == MemberState::Sealed);
+        #[cfg(test)]
+        let total_sealed = sealed.clone().count();
+        let read: Vec<u16> = sealed.take(2).collect();
+        #[cfg(test)]
+        if total_sealed > read.len() {
+            self.bound_hits.0.sweep_2_sealed_capped = true;
+        }
         if let Some(&last) = read.last() {
             self.seal_cursor = last;
         }
@@ -902,12 +942,21 @@ impl Model {
                         at: now,
                     });
                     changed = true;
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.bound_hits.0.obs_9th_dropped = true;
+                    }
                 }
             }
         }
         self.event.observed_members = Some(members);
         let mut sealed_read = Vec::new();
         if swept {
+            #[cfg(test)]
+            {
+                self.bound_hits.0.sweep_fired = true;
+            }
             if matches!(
                 self.table.member(self.node).state(),
                 MemberState::Live | MemberState::Sealing
@@ -1844,6 +1893,10 @@ impl Model {
                         false => 0,
                     };
                     if !self.park_confirmed(core) || self.membership_now() < last + SETTLE_NS {
+                        #[cfg(test)]
+                        if self.park_confirmed(core) && self.membership_now() < last + SETTLE_NS {
+                            self.bound_hits.0.settle_waited = true;
+                        }
                         self.reclaims.entry(node).or_default().clear = Some(cursor);
                         *units += 1;
                         return before;
@@ -2240,12 +2293,26 @@ impl Model {
         for core in cores {
             let start = self.starts[&core];
             if self.start_over(core, &start) {
+                #[cfg(test)]
+                {
+                    let member = self.table.member(start.node);
+                    let current = member.state() == MemberState::Starting
+                        && member.generation() == start.generation;
+                    let confirmed = self.table.core_beacons[core].started == start.request;
+                    if current && !confirmed && now >= start.since + START_NS {
+                        self.bound_hits.0.start_timeout = true;
+                    }
+                }
                 self.starts.remove(&core);
                 any = true;
                 continue;
             }
             if start.last != 0 && now < start.last + START_RETRY_NS {
                 continue;
+            }
+            #[cfg(test)]
+            if start.last != 0 {
+                self.bound_hits.0.start_retried = true;
             }
             self.table.start_requests[core] = start.request;
             self.hw_out.push(HwAction::Start { core });
@@ -2396,6 +2463,24 @@ impl Model {
     /// roles; the starts, the fences, the units, the pending messages (at
     /// most `PENDING_STEP`) and the observations take a bounded amount
     /// beside them (O15).
+    /// Whether a sweep, fence round, start retry/timeout, rebuild `STUCK_NS`,
+    /// or active recovery involving this node coincides with `self.now` on core 0.
+    #[cfg(test)]
+    pub(crate) fn core0_recovery_due_now(&self) -> bool {
+        let mnow = self.membership_now();
+        let sweep_due = self.now >= self.next_sweep && self.others_exist();
+        let fence_due = self
+            .fences
+            .iter()
+            .any(|(&n, f)| mnow >= f.last + self.fence_round(n, f.generation));
+        let start_due = self.starts.iter().any(|(&c, s)| self.start_due(c, s));
+        let rebuild_stuck_due = self.rebuilds.values().any(|r| {
+            self.rebuild_wait_since(r)
+                .is_some_and(|at| mnow >= at + self.table.stuck_ns)
+        });
+        sweep_due || fence_due || start_due || rebuild_stuck_due || self.recovery_in_progress(None)
+    }
+
     pub(crate) fn reserve_step(&mut self) {
         let mut units = REMOVAL_STEP;
         let seen = self.seen.clone();
