@@ -810,29 +810,42 @@ impl Bounds {
                 if caps > MAX_CAPS && *outcome == Err(Error::Invalid) {
                     self.send_grants_over_4_refused = true;
                 }
-                if *outcome == Err(Error::Busy)
-                    && let Some(target_idx) = node
-                        .index()
-                        .checked_sub(dodos_abi::START_SLOT_FIRST)
-                        .filter(|&i| (i as usize) < model.peers.len())
-                {
-                    let sends = model.peers[target_idx as usize].sends();
-                    if sends >= SENDS_PER_PEER {
-                        self.send_credit_9th_refused = true;
-                    } else if sends >= SENDS_PER_PEER - SENDS_RESERVED_FOR_MANAGE {
-                        self.send_credit_7th_no_manage_refused = true;
-                    }
-                    let used = model
-                        .ring_of(model.node, target_idx as u16, true)
-                        .produced
-                        .wrapping_sub(model.consumed(model.node, target_idx as u16, true));
-                    let need = dodos_abi::message_entries(3 + caps + words) as u64;
-                    if used <= RING_USER_ENTRIES && used + need > RING_USER_ENTRIES {
-                        self.user_ring_full = true;
-                    }
+                if *outcome == Err(Error::Busy) {
                     if model.table.grants[usize::from(model.node)].len() + caps > dodos_abi::GRANTS
                     {
                         self.grants_full_refused = true;
+                    }
+                    let target = node
+                        .index()
+                        .checked_sub(dodos_abi::START_SLOT_FIRST)
+                        .filter(|&i| (i as usize) < model.peers.len())
+                        .map(|i| i as u16)
+                        .or_else(|| {
+                            model.cspaces.values().find_map(|cs| {
+                                match cs.slots.get(node.index() as usize)? {
+                                    crate::Slot::Full(cid) => {
+                                        let obj = model.caps.get(cid)?.object;
+                                        model.nodes.get(&obj).copied()
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        });
+                    if let Some(target_idx) = target {
+                        let sends = model.peers[usize::from(target_idx)].sends();
+                        if sends >= SENDS_PER_PEER {
+                            self.send_credit_9th_refused = true;
+                        } else if sends >= SENDS_PER_PEER - SENDS_RESERVED_FOR_MANAGE {
+                            self.send_credit_7th_no_manage_refused = true;
+                        }
+                        let used = model
+                            .ring_of(model.node, target_idx, true)
+                            .produced
+                            .wrapping_sub(model.consumed(model.node, target_idx, true));
+                        let need = dodos_abi::message_entries(3 + caps + words) as u64;
+                        if used <= RING_USER_ENTRIES && used + need > RING_USER_ENTRIES {
+                            self.user_ring_full = true;
+                        }
                     }
                 }
             }
@@ -892,7 +905,8 @@ impl Bounds {
                 }
             }
             CallMeta::CSpaceGrow => {
-                if *outcome == Err(Error::Busy)
+                if *outcome == Err(Error::NoSlot)
+                    || *outcome == Err(Error::Busy)
                     || (*outcome == Err(Error::Invalid)
                         && model
                             .cspaces
@@ -932,7 +946,7 @@ impl Bounds {
                 }
             }
             CallMeta::SchedConfigure => {
-                if *outcome == Err(Error::Busy) {
+                if *outcome == Err(Error::Budget) {
                     self.admission_refused = true;
                 }
             }
