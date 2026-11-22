@@ -233,6 +233,10 @@ pub struct Machine {
     /// smaller so that a mapping made in steps is reached on a machine
     /// whose frames touch at most *E* chunks.
     pub gate_chunks: u64,
+    /// The capacity of each node's grant and use tables: `GRANTS` (4,096);
+    /// combination stress seeds may scale it down so full tables and
+    /// overflow refusals/drops are reached during recovery.
+    pub grants_max: usize,
 }
 
 /// The second geometry of the tests (D-121): a page of 16 KB with *E* =
@@ -426,6 +430,7 @@ impl Machine {
             processor_entropy: true,
             map_count_max: dodos_abi::MAP_COUNT_MAX,
             gate_chunks: u64::from(geometry.entries),
+            grants_max: dodos_abi::GRANTS,
         }
     }
 

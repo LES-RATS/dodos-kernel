@@ -13,7 +13,7 @@ use crate::{
     Slot, Transfer, Wait, live,
 };
 use dodos_abi::{
-    Error, GRANTS, Header, MemberState, ObjectKind, Rights, SEND_GRANTS_MAX, SlotAddr,
+    Error, Header, MemberState, ObjectKind, Rights, SEND_GRANTS_MAX, SlotAddr,
 };
 
 /// A remote object on its holder: the grant its capabilities name.
@@ -62,7 +62,7 @@ impl Model {
     /// The kernel space of a node: the anchors of its grants, one slot per
     /// entry of its grant table, made at start-up from no untyped.
     pub(crate) fn build_kernel_space(&mut self) {
-        let slots = (anchor_index(GRANTS as u16) as u64 + 1)
+        let slots = (anchor_index(self.machine.grants_max as u16) as u64 + 1)
             .next_multiple_of(u64::from(dodos_abi::CSPACE_SEGMENT_SLOTS));
         let space = ObjId(self.next_id);
         let root_place = Place {
@@ -106,7 +106,7 @@ impl Model {
     pub(crate) fn grant_of(&self, cap: CapId) -> Option<u16> {
         let place = self.caps[&cap].place;
         let index = place.index.checked_sub(1)?;
-        (Some(place.space) == self.kernel_space && (index as usize) < GRANTS)
+        (Some(place.space) == self.kernel_space && (index as usize) < self.machine.grants_max)
             .then_some(index as u16)
     }
 
@@ -277,7 +277,7 @@ impl Model {
         // held by nobody keeps its entry used (Grants, release by the
         // holder), and the anchor a `RevokeStep` leaves stays until the
         // removal step's next call removes it (Revocation).
-        let free: Vec<u16> = (0..GRANTS as u16)
+        let free: Vec<u16> = (0..self.machine.grants_max as u16)
             .filter(|&g| !self.table.grants[me].contains_key(&g) && self.anchor(g).is_none())
             .take(SEND_GRANTS_MAX)
             .collect();
@@ -471,7 +471,7 @@ impl Model {
                     space.and_then(|s| s.slots.get(window.first as usize + i)) == Some(&Slot::Empty)
                 })
         };
-        let uses_free = (0..GRANTS as u16)
+        let uses_free = (0..self.machine.grants_max as u16)
             .filter(|u| !self.table.uses[me].contains_key(u))
             .count();
         #[cfg(test)]
@@ -526,7 +526,7 @@ impl Model {
     /// gate writes the use entry. Returns the use index.
     fn place_remote(&mut self, granter: u16, granted: Granted, place: Place) -> u16 {
         let me = self.node as usize;
-        let use_entry = (0..GRANTS as u16)
+        let use_entry = (0..self.machine.grants_max as u16)
             .find(|u| !self.table.uses[me].contains_key(u))
             .expect("checked");
         let id = ObjId(self.next_id);

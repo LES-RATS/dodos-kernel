@@ -606,15 +606,43 @@ fn bound_stress_seed(seed: u64) -> bool {
     seed < 858 && BOUND_STRESS_OFFSETS.contains(&(seed % 286))
 }
 
+/// Offsets within each 286-seed architecture round reserved for pass 44
+/// cross-node recovery pressure seeds (15 seeds across all 3 architectures):
+/// - `71`: full kernel ring (64 entries, 34-entry answer reserve) + 16 open
+///   request credits + 64 `unit_requests` during holder recovery / rebuild /
+///   seal+resume / `RoleHand`;
+/// - `104`: full configured grant/use tables (`grants_max = 128`, 4x
+///   `REMOVAL_STEP`) + refusal/drop during borrower & granter death, reclaim,
+///   and fresh start;
+/// - `148`: >32 `signal_pending` / `release_pending` (`PENDING_STEP`)
+///   interrupted mid-flush by holder seal+resume and granter death+fresh start;
+/// - `181`: >=16 due events (`TIME_EVENT_STEP`) coinciding on core 0 with
+///   `next_sweep` and a `Fence` round timer;
+/// - `225`: 3 cores on `WIDE` (`[4, 5, 6]`), staggered fresh-start entry
+///   (D-171), 3-core TLB shootdown with 3rd core hung, and `MAP_COUNT_MAX`
+///   on a remote grant reclaimed by R6.
+/// Disjoint from verify seeds (`seed % 33 == 0` and `2`), `multi_page_seed`
+/// (`seed < 286 && seed % 20 == 17`), `focus` seeds (`seed % 286 < 6`),
+/// `BOUND_STRESS_OFFSETS`, and named regression seeds (`0`, `286`, `605`,
+/// `763`, `1109`, `1434`, `277`).
+const RECOVERY_PRESSURE_OFFSETS: [u64; 5] = [71, 104, 148, 181, 225];
+
+fn recovery_pressure_seed(seed: u64) -> bool {
+    seed < 858 && RECOVERY_PRESSURE_OFFSETS.contains(&(seed % 286))
+}
+
 impl Run {
     fn new(seed: u64) -> Self {
         Self::new_with_idle(seed, true)
     }
 
     fn new_with_idle(seed: u64, configure_idle: bool) -> Self {
-        // Five nodes, the last of two cores; the architecture by round.
+        let wide_three = recovery_pressure_seed(seed) && seed % 286 == 225;
+        // Five nodes, the last of two cores (three on offset 225); the
+        // architecture by round.
         let cores: Vec<Vec<usize>> = (0..NODES as usize)
             .map(|c| match c as u16 == WIDE {
+                true if wide_three => vec![c, c + 1, c + 2],
                 true => vec![c, c + 1],
                 false => vec![c],
             })
@@ -626,7 +654,8 @@ impl Run {
         // the steps of a seed (Numbers: `SWEEP_NS` from 100 ms, `SEAL_NS`
         // and `STALE_NS` from 10 ms; `STUCK_NS` above the reserve's period
         // and `CORE_ANSWER_NS`).
-        let mut machine = machine(arch, NODES as usize + 1, &layout);
+        let total_cores = NODES as usize + if wide_three { 2 } else { 1 };
+        let mut machine = machine(arch, total_cores, &layout);
         machine.membership.sweep_ms = 100;
         machine.membership.seal_ms = 30;
         machine.membership.stale_ms = 40;
@@ -636,6 +665,21 @@ impl Run {
             match seed % 286 {
                 113 | 207 => machine.floors.reserves = dodos_abi::RESERVES_MAX,
                 160 | 254 => machine.floors.plain_roles = dodos_abi::ROLES_PLAIN_MAX - 1,
+                _ => {}
+            }
+        }
+        if recovery_pressure_seed(seed) {
+            machine.floors.floor_node = 6 * machine.geometry.chunk();
+            match seed % 286 {
+                71 => {
+                    machine.iommus.push(crate::boot::IommuUnit {
+                        segment: 1,
+                        domains: 256,
+                    });
+                }
+                104 => {
+                    machine.grants_max = 128;
+                }
                 _ => {}
             }
         }
@@ -832,9 +876,10 @@ impl Run {
             Arch::Riscv64 if configure_idle => Some(dodos_abi::IDLE_METHOD_SBI | 0x8000_0000 << 32),
             _ => None,
         };
+        let wide_cores = m.sys.machine.cores.len() - usize::from(WIDE);
         for node in 0..NODES {
             let cores: Vec<u64> = match node == WIDE {
-                true => vec![u64::from(node), u64::from(node) + 1],
+                true => (0..wide_cores as u64).map(|k| u64::from(node) + k).collect(),
                 false => vec![u64::from(node)],
             };
             for core in cores.into_iter().filter(|_| lossy.is_some()) {
@@ -953,6 +998,9 @@ impl Run {
         }
         if bound_stress_seed(self.seed) {
             self.stress_bounds();
+        }
+        if recovery_pressure_seed(self.seed) {
+            self.stress_recovery_pressure();
         }
     }
 
@@ -1680,6 +1728,1060 @@ impl Run {
         self.note();
     }
 
+    /// Pass 44 (Section 6): exercises cross-node boundaries **while a recovery
+    /// is under way** (full kernel ring + 34-entry answer reserve + 16 request
+    /// credits + 64 `unit_requests`, full configured grant/use tables with
+    /// refusal/drop across borrower & granter death/reclaim/fresh start,
+    /// `PENDING_STEP` >32 signals/releases interrupted mid-flush by seal+resume
+    /// and granter death+fresh start, `TIME_EVENT_STEP` >=16 coinciding with
+    /// sweep and fence timers on core 0, and 3-core `WIDE` staggered start /
+    /// 3-core TLB hang / `MAP_COUNT_MAX` on a remote grant reclaimed by R6).
+    /// Every single event runs `self.m.sys.check()`, `sample_bounds()`, and
+    /// `self.note()`.
+    fn stress_recovery_pressure(&mut self) {
+        use crate::system::Event;
+        use dodos_abi::{
+            Header, PENDING_STEP, REQUESTS_PER_PEER, RING_ANSWER_RESERVE, RING_KERNEL_ENTRIES,
+            RING_USER_ENTRIES, SCHED_MIN_BUDGET_NS, SENDS_PER_PEER, SENDS_RESERVED_FOR_MANAGE,
+            START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_IRQ_CONTROL, START_SLOT_MAILBOX,
+            TIME_EVENT_STEP, UNIT_REQUESTS,
+        };
+
+        self.run(2 * MS);
+        let offset = self.seed % 286;
+        let arch = self.m.sys.arch();
+        let frame_rights = || {
+            Rights::READ.bits() | Rights::WRITE.bits() | Rights::SEND.bits() | Rights::DERIVE.bits()
+        };
+
+        let spawn_worker = |m: &mut S, node: u16, base: u32, core: u64, aspace: u32| -> ObjId {
+            let start_sched = m
+                .sys
+                .node(node)
+                .object_at(m.t[node as usize], s(dodos_abi::START_SLOT_SCHED))
+                .expect("start sched");
+            if m.sys.node(node).scheds[&start_sched].budget > 2 * MS {
+                let c0 = m.sys.node(node).core_number(0) as u64;
+                m.ok(
+                    node,
+                    Syscall::SchedConfigure {
+                        sched: s(dodos_abi::START_SLOT_SCHED),
+                        node: node_cap(node),
+                        core: c0,
+                        budget: MS,
+                        period: 10 * MS,
+                        class: 1,
+                    },
+                );
+            }
+            let ut = super::untyped_slot(m.sys.node(node), m.t[node as usize]);
+            m.ok(node, super::retype_from(ut, ObjectKind::Thread, 0, base));
+            m.ok(node, super::retype_from(ut, ObjectKind::Sched, 0, base + 1));
+            m.ok(
+                node,
+                Syscall::ThreadConfigure {
+                    thread: s(base),
+                    cspace: s(START_SLOT_CSPACE),
+                    aspace: s(aspace),
+                    fault: SlotAddr::NONE,
+                    page: SlotAddr::NONE,
+                },
+            );
+            m.ok(
+                node,
+                Syscall::SchedConfigure {
+                    sched: s(base + 1),
+                    node: node_cap(node),
+                    core,
+                    budget: SCHED_MIN_BUDGET_NS,
+                    period: 100 * MS,
+                    class: 1,
+                },
+            );
+            m.ok(
+                node,
+                Syscall::SchedBind {
+                    sched: s(base + 1),
+                    thread: s(base),
+                },
+            );
+            m.ok(node, Syscall::ThreadResume(s(base)));
+            m.sys.node(node).object_at(m.t[node as usize], s(base)).unwrap()
+        };
+        let ring_used = |m: &S, from: u16, to: u16, user: bool| -> u64 {
+            let node = m.sys.node(from);
+            node.ring_of(from, to, user)
+                .produced
+                .wrapping_sub(node.ring_consumed(to, user))
+        };
+        let is_ring_for = |sys: &crate::system::System, ev: Event, node: u16| -> bool {
+            matches!(ev, Event::Action(i) if sys.actions()[i].1 == crate::nodes::HwAction::Ring { node })
+        };
+        let wait_state = |run: &mut Self, node: u16, want: MemberState, max_ms: u64| {
+            let limit = run.m.sys.now() + max_ms * MS;
+            while run.m.sys.now() < limit && run.m.state(node) != want {
+                run.run(1 * MS);
+            }
+            assert_eq!(
+                run.m.state(node),
+                want,
+                "node {node} must reach {want:?} within {max_ms} ms"
+            );
+        };
+        let grant_batches = |run: &mut Self,
+                             granter: u16,
+                             holder: u16,
+                             rx: ObjId,
+                             reply_slot: u32,
+                             src_base: u32,
+                             dst_base: u32,
+                             count: u32,
+                             doorbell: SlotAddr| {
+            let mut done = 0u32;
+            while done < count {
+                let batch = (count - done).min(4);
+                assert_eq!(
+                    run.m.call_by(
+                        holder,
+                        rx,
+                        Syscall::Recv {
+                            endpoint: s(START_SLOT_MAILBOX),
+                            reply: s(reply_slot),
+                            range: Range {
+                                first: s(dst_base + done),
+                                count: batch,
+                            },
+                            wait: 0,
+                        },
+                    ),
+                    WAITS
+                );
+                assert_eq!(
+                    run.m.call(
+                        granter,
+                        Syscall::NodeSend {
+                            node: node_cap(holder),
+                            message: Message {
+                                caps: (done..done + batch)
+                                    .map(|i| Transfer::Derive(s(src_base + i), frame_rights()))
+                                    .collect(),
+                                ..Message::default()
+                            },
+                            doorbell,
+                        },
+                    ),
+                    WAITS
+                );
+                for _ in 0..50 {
+                    if run.m.woken(granter).is_some() {
+                        break;
+                    }
+                    run.run(100_000);
+                }
+                assert_eq!(
+                    run.m.woken(granter),
+                    Some(&Ok(Output::Sent { flags: 0 })),
+                    "grant batch {granter}->{holder} at {done}"
+                );
+                done += batch;
+            }
+        };
+
+        // =====================================================================
+        // Offset 71: Full kernel ring (64 entries, 34-entry answer reserve) +
+        // 16 open request credits + 17th refused + 64 `unit_requests` + 65th
+        // refused DURING multi-page rebuild, holder seal+resume, and RoleHand.
+        // =====================================================================
+        if offset == 71 {
+            let iommu0 = IOMMU_ROLE;
+            let iommu1 = 1usize;
+            assert_eq!(self.m.sys.role(iommu0).holder(), 1);
+            // Hand IOMMU 1 to node 2 so killing node 2 makes node 3 take over
+            // IOMMU 1 and ask node 1 for a 28-item (11-entry) multi-page Report.
+            let h1 = self.m.sys.role(iommu1).holder();
+            if h1 != 2 {
+                let roles = slots_of(self.m.sys.node(h1), self.m.t[h1 as usize], ObjectKind::Role);
+                assert_eq!(
+                    self.call(
+                        h1,
+                        Syscall::RoleHand {
+                            role: s(roles[iommu1]),
+                            node: node_cap(2),
+                        },
+                    ),
+                    Some(WAITS)
+                );
+                self.run(30 * MS);
+            }
+            assert_eq!(self.m.sys.role(iommu1).holder(), 2);
+
+            // Give node 1 29 MSI handles on segment 1 (IOMMU 1) so node 3's
+            // ReportAsk triggers a full 28-item (11-entry) multi-page Report.
+            for i in 0..29u32 {
+                let claim = Syscall::IrqClaim {
+                    control: s(START_SLOT_IRQ_CONTROL),
+                    source: IrqSource::msi(1, 0, (i % 32) as u8, 0).raw(),
+                    core: 1,
+                    vector: u64::from(48 + i),
+                    destination: s(1000 + i),
+                };
+                if self.m.call(1, claim) == WAITS {
+                    self.run(15 * MS);
+                    assert!(matches!(self.m.woken(1), Some(Ok(Output::Msi { .. }))));
+                }
+            }
+            assert_eq!(self.m.sys.node(1).items(iommu1).len(), 29);
+
+            // Set up 32 grants 3 -> 1.
+            let reply1 = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1);
+            let rx1 = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            let ut3 = super::untyped_slot(self.m.sys.node(3), self.m.t[3]);
+            for i in 0..32u32 {
+                self.m
+                    .ok(3, super::retype_from(ut3, ObjectKind::Frame, 1, 1100 + i));
+            }
+            grant_batches(self, 3, 1, rx1, 1059, 1100, 1100, 32, SlotAddr::NONE);
+
+            // Attach device 0x12 to node 3's IoSpace on IOMMU 0 (holder = 1),
+            // map 65 frames, and spawn 65 worker threads + 9 NodeSend workers.
+            let ios3 = self.m.retype(3, ObjectKind::IoSpace, 0, IOSPACE);
+            self.m.ok(3, ios3);
+            let attach3 = attach_call(&self.m, 3, 0x12, true);
+            if self.m.call(3, attach3) == WAITS {
+                self.run(20 * MS);
+                assert_eq!(self.m.woken(3), Some(&DONE));
+            }
+            let tables3 = super::table_slot(self.m.sys.node(3), self.m.t[3]);
+            let mut unit_threads = Vec::with_capacity(UNIT_REQUESTS + 1);
+            for i in 0..(UNIT_REQUESTS as u32 + 1) {
+                let fslot = 1200 + i;
+                self.m
+                    .ok(3, super::retype_from(ut3, ObjectKind::Frame, 1, fslot));
+                self.m.ok(
+                    3,
+                    Syscall::IoSpaceMap(crate::Map {
+                        space: s(IOSPACE),
+                        frame: s(fslot),
+                        untyped: s(tables3),
+                        address: 0x1000_0000 + (u64::from(i) + 1) * 0x10_0000,
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                );
+                let tid = spawn_worker(&mut self.m, 3, 1300 + 2 * i, 3, START_SLOT_ASPACE);
+                unit_threads.push((tid, fslot));
+            }
+            // Non-manage capability to node 1 in slot 1055 + 9 send workers.
+            self.m.ok(
+                3,
+                Syscall::CapDerive {
+                    source: node_cap(1),
+                    destination: s(1055),
+                    rights: Rights::SEND.bits(),
+                    badge: 0,
+                },
+            );
+            let mut send_threads = Vec::with_capacity(SENDS_PER_PEER + 1);
+            for i in 0..(SENDS_PER_PEER as u32 + 1) {
+                send_threads.push(spawn_worker(
+                    &mut self.m,
+                    3,
+                    1500 + 2 * i,
+                    3,
+                    START_SLOT_ASPACE,
+                ));
+            }
+            self.run(2 * MS);
+
+            // Kill node 2 -> node 3 takes over IOMMU 1 and sends ReportAsk to
+            // node 1. Hold back node 1's ring consumption once ReportAsk is sent.
+            assert_eq!(self.call(0, kill(2)), Some(DONE));
+            let mut ask_sent = false;
+            for _ in 0..8_000 {
+                if self.m.sys.role(iommu1).holder() == 3
+                    && self
+                        .m
+                        .sys
+                        .node(3)
+                        .rebuilds
+                        .get(&iommu1)
+                        .is_some_and(|r| r.node == 1 && r.asked.is_some())
+                {
+                    ask_sent = true;
+                    break;
+                }
+                let events = self.m.sys.events();
+                let allowed = |&ev: &Event| {
+                    !(self.m.sys.role(iommu1).holder() == 3 && is_ring_for(&self.m.sys, ev, 1))
+                };
+                let ev = events
+                    .iter()
+                    .copied()
+                    .find(|ev| matches!(ev, Event::Timer { .. }) && allowed(ev))
+                    .or_else(|| events.into_iter().find(allowed));
+                match ev {
+                    Some(ev) => {
+                        self.m.sys.fire(ev);
+                        if !self
+                            .m
+                            .sys
+                            .events()
+                            .iter()
+                            .any(|e| matches!(e, Event::Timer { .. }))
+                        {
+                            assert_eq!(self.m.sys.check(), Ok(()));
+                            self.m.sample_bounds();
+                            self.note();
+                        }
+                    }
+                    None => {
+                        let now = self.m.sys.now();
+                        let next = self
+                            .m
+                            .sys
+                            .models()
+                            .filter_map(|(_, n)| n.next_timer())
+                            .map(|(at, _)| at)
+                            .filter(|&at| at > now)
+                            .min();
+                        let at = next.map_or(now + 1_000_000, |t| t.min(now + 1_000_000));
+                        self.m.sys.move_clock(at);
+                    }
+                }
+            }
+            assert!(ask_sent, "node 3 must send ReportAsk to node 1 during rebuild");
+
+            // Step 1: Node 1 deletes 32 remote frames -> 30 Releases fill kernel
+            // ring 1 -> 3 to the 34-entry answer reserve; 31st & 32nd hit reserve.
+            for i in 0..32u32 {
+                self.m.ok(1, Syscall::CapDelete(s(1100 + i)));
+            }
+            assert_eq!(
+                ring_used(&self.m, 1, 3, false),
+                RING_KERNEL_ENTRIES - RING_ANSWER_RESERVE
+            );
+
+            // Step 2: Node 3 submits 64 IoSpaceUnmap unit requests (first 15 fill
+            // REQUESTS_PER_PEER = 16 alongside ReportAsk; 16th hits 17th-credit
+            // cap; all 64 fill unit_requests), then 65th returns Busy!
+            for &(tid, fslot) in &unit_threads[..UNIT_REQUESTS] {
+                assert_eq!(self.m.call_by(3, tid, Syscall::IoSpaceUnmap(s(fslot))), WAITS);
+            }
+            assert_eq!(
+                self.m.call_by(
+                    3,
+                    unit_threads[UNIT_REQUESTS].0,
+                    Syscall::IoSpaceUnmap(s(unit_threads[UNIT_REQUESTS].1)),
+                ),
+                Err(Error::Again)
+            );
+            assert_eq!(
+                self.m.sys.node(3).peers[1].credits[..REQUESTS_PER_PEER]
+                    .iter()
+                    .filter(|c| c.is_some())
+                    .count(),
+                REQUESTS_PER_PEER
+            );
+
+            // Step 3: Node 3 submits 8 NodeSends (6 without manage + 7th Busy,
+            // 2 with manage + 9th Busy).
+            let non_manage = SENDS_PER_PEER - SENDS_RESERVED_FOR_MANAGE;
+            for &tid in &send_threads[..non_manage] {
+                assert_eq!(
+                    self.m.call_by(
+                        3,
+                        tid,
+                        Syscall::NodeSend {
+                            node: s(1055),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    3,
+                    send_threads[non_manage],
+                    Syscall::NodeSend {
+                        node: s(1055),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            for &tid in &send_threads[non_manage..SENDS_PER_PEER] {
+                assert_eq!(
+                    self.m.call_by(
+                        3,
+                        tid,
+                        Syscall::NodeSend {
+                            node: node_cap(1),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    3,
+                    send_threads[SENDS_PER_PEER],
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+
+            // Step 4: Let node 1 answer all 24 open messages WITHOUT letting
+            // node 3 consume kernel ring 1 -> 3: 30 + 15 + 11 + 8 = 64 entries!
+            for _ in 0..5_000 {
+                let ev = self.m.sys.events().into_iter().find(|&ev| {
+                    !is_ring_for(&self.m.sys, ev, 3)
+                        && !matches!(ev, Event::Ipi { node: 3, .. } | Event::Timer { node: 3, .. })
+                });
+                let Some(ev) = ev else { break };
+                self.m.sys.fire(ev);
+                assert_eq!(self.m.sys.check(), Ok(()));
+                self.m.sample_bounds();
+                self.note();
+            }
+            assert_eq!(
+                ring_used(&self.m, 1, 3, false),
+                RING_KERNEL_ENTRIES,
+                "kernel ring 1 -> 3 must reach exact 64/64 during rebuild"
+            );
+
+            // Step 5: While kernel ring 1 -> 3 is saturated at 64 entries and
+            // 49 unit_requests + page 2 of rebuild remain pending, seal node 1,
+            // resume it, and also exercise RoleHand on IOMMU 0 while draining.
+            assert_eq!(self.call(0, seal(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Sealed, 60);
+            assert_eq!(self.call(0, resume(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 60);
+            let roles1 = slots_of(self.m.sys.node(1), self.m.t[1], ObjectKind::Role);
+            let _ = self.call(
+                1,
+                Syscall::RoleHand {
+                    role: s(roles1[iommu0]),
+                    node: node_cap(0),
+                },
+            );
+            self.run(100 * MS);
+            assert_eq!(ring_used(&self.m, 1, 3, false), 0);
+            assert!(self.m.sys.node(3).rebuilds.is_empty());
+
+            // Fresh-start dead node 2 so the random phase starts with all 5 live.
+            wait_state(self, 2, MemberState::Dead, 100);
+            assert_eq!(self.call(0, fresh(2, 1 << 2)), Some(DONE));
+            wait_state(self, 2, MemberState::Live, 150);
+            self.m.restarted(2);
+
+            self.m.sample_bounds();
+            assert!(self.m.bounds.kernel_ring_hit_reserve_in_recovery);
+            assert!(self.m.bounds.kernel_ring_used_reserve_in_recovery);
+            assert!(self.m.bounds.kernel_ring_full_in_recovery);
+            assert!(self.m.bounds.req_credit_17th_in_recovery);
+            assert!(self.m.bounds.unit_requests_65th_in_recovery);
+        }
+
+        // =====================================================================
+        // Offset 104: Full configured grant & use tables (`grants_max = 128`,
+        // 4x `REMOVAL_STEP`) + refusal/drop DURING granter/borrower death,
+        // fence, multi-step R2/R3/R5/R6 reclaim, and concurrent fresh start.
+        // =====================================================================
+        if offset == 104 {
+            let max = self.m.sys.machine.grants_max as u32;
+            assert_eq!(max, 128);
+
+            // Sub-phase A: fill grants[0] to 128 (1 existing from PAIRS[0] +
+            // 127 new to node 1), map 16 in node 1's aspace, kill node 3 so
+            // node 0 is in recovery, trigger 129th grant Busy refusal, then
+            // kill borrower node 1 and fresh-start both during/after reclaim.
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            for i in 0..(max + 4) {
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1200 + i));
+            }
+            let reply1 = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1);
+            let rx1 = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            let existing = self.m.sys.canonical().grants[0].len() as u32;
+            let to_fill = max - existing;
+            grant_batches(self, 0, 1, rx1, 1059, 1200, 1200, to_fill, SlotAddr::NONE);
+            assert_eq!(self.m.sys.canonical().grants[0].len(), max as usize);
+            for i in 0..16u32 {
+                self.m.ok(
+                    1,
+                    Syscall::ASpaceMap(crate::Map {
+                        space: s(START_SLOT_ASPACE),
+                        frame: s(1200 + i),
+                        untyped: SlotAddr::NONE,
+                        address: 0x3000_0000 + u64::from(i) * 0x1000,
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                );
+            }
+
+            // Kill node 3 so node 0 is fencing/reclaiming node 3 (in recovery).
+            assert_eq!(self.call(0, kill(3)), Some(DONE));
+            // 129th grant from node 0 to live node 1 must be refused (Busy)
+            // while node 0 is in recovery -> grants_full_in_recovery!
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message {
+                            caps: vec![Transfer::Derive(s(1200 + max), frame_rights())],
+                            ..Message::default()
+                        },
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            self.m.sample_bounds();
+            assert!(self.m.bounds.grants_full_refused);
+            assert!(self.m.bounds.grants_full_in_recovery);
+
+            // Kill borrower node 1 while grants[0] == 128 (16 mapped in node 1):
+            // R2/R3/R5/R6 must reclaim all 127 grants across 4 REMOVAL_STEP
+            // chunks, with node 1 and node 3 fresh-starting once Dead.
+            assert_eq!(self.call(0, kill(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(1, 1 << 1)), Some(DONE));
+            wait_state(self, 3, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(3, 1 << 3)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 150);
+            wait_state(self, 3, MemberState::Live, 150);
+            self.m.restarted(1);
+            self.m.restarted(3);
+            self.run(30 * MS);
+            assert_eq!(self.m.sys.canonical().uses[1].len(), 0);
+
+            // Sub-phase B: fill uses[1] to 128 (96 from node 0 + 32 from node 2),
+            // map 16 of node 0's remote frames, put node 1 into recovery (kill
+            // node 3), send 1 more frame -> SendAnswer { dropped: true }
+            // (uses_dropped_in_recovery!), then kill granter node 0 and fresh-
+            // start node 0 while node 1 runs R2/R3/R5/R6 across 4 chunks!
+            let reply1b = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1b);
+            let rx1b = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            let ut2 = super::untyped_slot(self.m.sys.node(2), self.m.t[2]);
+            for i in 0..32u32 {
+                self.m
+                    .ok(2, super::retype_from(ut2, ObjectKind::Frame, 1, 1200 + i));
+            }
+            grant_batches(self, 0, 1, rx1b, 1059, 1200, 1200, 96, SlotAddr::NONE);
+            grant_batches(self, 2, 1, rx1b, 1059, 1200, 1300, 32, SlotAddr::NONE);
+            assert_eq!(self.m.sys.canonical().uses[1].len(), max as usize);
+            for i in 0..16u32 {
+                self.m.ok(
+                    1,
+                    Syscall::ASpaceMap(crate::Map {
+                        space: s(START_SLOT_ASPACE),
+                        frame: s(1200 + i),
+                        untyped: SlotAddr::NONE,
+                        address: 0x3000_0000 + u64::from(i) * 0x1000,
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                );
+            }
+
+            // Kill node 3 (by node 1) so node 1 is in recovery while uses[1] == 128.
+            assert_eq!(self.call(1, kill(3)), Some(DONE));
+            assert_eq!(
+                self.m.call_by(
+                    1,
+                    rx1b,
+                    Syscall::Recv {
+                        endpoint: s(START_SLOT_MAILBOX),
+                        reply: s(1059),
+                        range: Range {
+                            first: s(1400),
+                            count: 1,
+                        },
+                        wait: 0,
+                    },
+                ),
+                WAITS
+            );
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message {
+                            caps: vec![Transfer::Derive(s(1200 + 96), frame_rights())],
+                            ..Message::default()
+                        },
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                WAITS
+            );
+            for _ in 0..50 {
+                if self.m.woken(0).is_some() {
+                    break;
+                }
+                self.run(100_000);
+            }
+            assert_eq!(
+                self.m.woken(0),
+                Some(&Ok(Output::Sent {
+                    flags: Header::FLAG_CAPS_DROPPED,
+                }))
+            );
+            self.m.sample_bounds();
+            assert!(self.m.bounds.uses_full_dropped);
+            assert!(self.m.bounds.uses_dropped_in_recovery);
+
+            // Now kill granter node 0 while node 1 holds 96 grants from node 0
+            // (16 mapped) + 32 from node 2; fresh-start node 0 & node 3 once Dead.
+            assert_eq!(self.call(1, kill(0)), Some(DONE));
+            wait_state(self, 0, MemberState::Dead, 150);
+            assert_eq!(self.call(1, fresh(0, 1)), Some(DONE));
+            wait_state(self, 3, MemberState::Dead, 150);
+            assert_eq!(self.call(1, fresh(3, 1 << 3)), Some(DONE));
+            wait_state(self, 0, MemberState::Live, 150);
+            wait_state(self, 3, MemberState::Live, 150);
+            self.m.restarted(0);
+            self.m.restarted(3);
+            self.run(30 * MS);
+            // Node 1's 96 uses from dead node 0(g) are reclaimed; 32 from live node 2 remain.
+            assert_eq!(self.m.sys.canonical().uses[1].len(), 32);
+        }
+
+        // =====================================================================
+        // Offset 148: `PENDING_STEP` (32) >32 pending signals interrupted
+        // mid-flush by holder seal+resume AND >32 pending releases interrupted
+        // mid-flush by granter death+fresh start.
+        // =====================================================================
+        if offset == 148 {
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            let ut2 = super::untyped_slot(self.m.sys.node(2), self.m.t[2]);
+            for i in 0..72u32 {
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1200 + i));
+            }
+            for i in 0..48u32 {
+                self.m
+                    .ok(2, super::retype_from(ut2, ObjectKind::Frame, 1, 1200 + i));
+            }
+            let reply1 = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1);
+            let rx1 = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            grant_batches(self, 0, 1, rx1, 1059, 1200, 1200, 72, s(BELL));
+            grant_batches(self, 2, 1, rx1, 1059, 1200, 1300, 48, SlotAddr::NONE);
+
+            // Part A: 64 signals fill user ring 1 -> 0 + 36 signal_pending.
+            for i in 0..RING_USER_ENTRIES as u32 {
+                self.m.ok(1, Syscall::GrantSignal(s(1200 + i)));
+            }
+            for i in 0..36u32 {
+                self.m.ok(1, Syscall::GrantSignal(s(1236 + i)));
+            }
+            let pending_sig = |m: &S| {
+                m.sys.canonical().uses[1]
+                    .values()
+                    .filter(|u| u.signal_pending)
+                    .count()
+            };
+            assert_eq!(pending_sig(&self.m), 36);
+            // Let node 0 drain user ring 1 -> 0 without running node 1's reserve.
+            for _ in 0..500 {
+                if ring_used(&self.m, 1, 0, true) == 0 {
+                    break;
+                }
+                let ev = self.m.sys.events().into_iter().find(|&ev| {
+                    !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. })
+                });
+                match ev {
+                    Some(ev) => {
+                        self.m.sys.fire(ev);
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                    None => self.m.sys.move_clock(self.m.sys.now() + 100_000),
+                }
+            }
+            assert_eq!(ring_used(&self.m, 1, 0, true), 0);
+            // ONE reserve step on node 1 flushes 32 and leaves 4 pending signals.
+            self.m.sys.fire(Event::Timer {
+                node: 1,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.sample_bounds();
+            self.note();
+            assert_eq!(pending_sig(&self.m), 36 - PENDING_STEP);
+            // Interrupt mid-flush with holder seal + resume!
+            assert_eq!(self.call(2, seal(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Sealed, 60);
+            assert_eq!(self.call(2, resume(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 60);
+            self.run(20 * MS);
+            assert_eq!(pending_sig(&self.m), 0);
+
+            // Part B: delete 48 from node 0 (30 ring + 18 pending) and 48 from
+            // node 2 (30 ring + 18 pending) -> 36 release_pending!
+            for i in 0..48u32 {
+                self.m.ok(1, Syscall::CapDelete(s(1200 + i)));
+            }
+            for i in 0..48u32 {
+                self.m.ok(1, Syscall::CapDelete(s(1300 + i)));
+            }
+            let pending_rel = |m: &S| {
+                m.sys.canonical().uses[1]
+                    .values()
+                    .filter(|u| u.release_pending)
+                    .count()
+            };
+            assert_eq!(pending_rel(&self.m), 36);
+            // Let nodes 0 and 2 drain kernel rings 1 -> 0 and 1 -> 2 without
+            // running node 1's reserve step.
+            for _ in 0..1_000 {
+                if ring_used(&self.m, 1, 0, false) == 0 && ring_used(&self.m, 1, 2, false) == 0 {
+                    break;
+                }
+                let ev = self.m.sys.events().into_iter().find(|&ev| {
+                    !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. })
+                });
+                match ev {
+                    Some(ev) => {
+                        self.m.sys.fire(ev);
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                    None => self.m.sys.move_clock(self.m.sys.now() + 100_000),
+                }
+            }
+            assert_eq!(ring_used(&self.m, 1, 0, false), 0);
+            assert_eq!(ring_used(&self.m, 1, 2, false), 0);
+            // Put recovery under way (kill node 3) right before the 32-step flush
+            // so `pending_step_32_in_recovery` hits during an active recovery.
+            assert_eq!(self.call(0, kill(3)), Some(DONE));
+            // ONE reserve step flushes 32 and leaves 4 release_pending (all to node 2).
+            self.m.sys.fire(Event::Timer {
+                node: 1,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.sample_bounds();
+            self.note();
+            assert_eq!(pending_rel(&self.m), 36 - PENDING_STEP);
+            // Interrupt mid-flush with granter node 2 death + fence + fresh start!
+            assert_eq!(self.call(0, kill(2)), Some(DONE));
+            wait_state(self, 2, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(2, 1 << 2)), Some(DONE));
+            wait_state(self, 3, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(3, 1 << 3)), Some(DONE));
+            wait_state(self, 2, MemberState::Live, 150);
+            wait_state(self, 3, MemberState::Live, 150);
+            self.m.restarted(2);
+            self.m.restarted(3);
+            self.run(20 * MS);
+            assert_eq!(pending_rel(&self.m), 0);
+            self.m.sample_bounds();
+            assert!(self.m.bounds.pending_step_32);
+            assert!(self.m.bounds.pending_step_32_in_recovery);
+        }
+
+        // =====================================================================
+        // Offset 181: `TIME_EVENT_STEP` (16) >= 16 due user timers on core 0 at
+        // the EXACT same instant as `next_sweep` AND a `Fence` round timer.
+        // =====================================================================
+        if offset == 181 {
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            for i in 0..20u32 {
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Timer, 0, 1100 + i));
+            }
+            // Coincidence A: exact `next_sweep` instant on core 0.
+            if self.m.sys.node(0).next_sweep <= self.m.sys.now() + 2 * MS {
+                let past = self.m.sys.node(0).next_sweep.saturating_sub(self.m.sys.now()) + 1 * MS;
+                self.run(past);
+            }
+            let sweep_at = self.m.sys.node(0).next_sweep;
+            for i in 0..20u32 {
+                assert!(self
+                    .m
+                    .call(
+                        0,
+                        Syscall::TimerSet {
+                            timer: s(1100 + i),
+                            notify: s(BELL),
+                            deadline: sweep_at,
+                            tolerance: 0,
+                        },
+                    )
+                    .is_ok());
+            }
+            self.run(sweep_at - 1 - self.m.sys.now());
+            self.m.sys.move_clock(sweep_at);
+            self.m.sys.fire(Event::Timer {
+                node: 0,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.sample_bounds();
+            self.note();
+            let armed_after = self
+                .m
+                .sys
+                .node(0)
+                .timers
+                .values()
+                .filter(|t| t.is_some())
+                .count();
+            assert!(
+                armed_after >= 20 - TIME_EVENT_STEP,
+                "TIME_EVENT_STEP cap at sweep_at must leave >= 4 timers armed, got {armed_after}"
+            );
+            assert_eq!(self.m.sys.node(0).cores[0].hw_timer, Some(sweep_at));
+            assert!(self.m.bounds.time_event_step_16);
+            assert!(self.m.bounds.time_event_step_16_in_recovery);
+            self.run(2 * MS);
+
+            // Coincidence B: exact `Fence` round instant on core 0 while fencing node 1.
+            assert_eq!(self.call(0, kill(1)), Some(DONE));
+            if let Some(fence) = self.m.sys.node(0).fences.get(&1).copied() {
+                let fence_round_ns = self.m.sys.node(0).fence_round(1, fence.generation);
+                let fence_at = if fence.last == 0 {
+                    self.m.sys.now() + 2 * MS
+                } else {
+                    fence.last + fence_round_ns
+                };
+                if fence_at > self.m.sys.now() + 1 {
+                    for i in 0..20u32 {
+                        assert!(self
+                            .m
+                            .call(
+                                0,
+                                Syscall::TimerSet {
+                                    timer: s(1100 + i),
+                                    notify: s(BELL),
+                                    deadline: fence_at,
+                                    tolerance: 0,
+                                },
+                            )
+                            .is_ok());
+                    }
+                    self.run(fence_at - 1 - self.m.sys.now());
+                    if self.m.state(0) == MemberState::Live {
+                        self.m.sys.move_clock(fence_at);
+                        self.m.sys.fire(Event::Timer {
+                            node: 0,
+                            position: 0,
+                        });
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                }
+            }
+            wait_state(self, 1, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(1, 1 << 1)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 150);
+            self.m.restarted(1);
+        }
+
+        // =====================================================================
+        // Offset 225: 3 cores on `WIDE` (`[4, 5, 6]`), staggered fresh-start
+        // entry (D-171), 3-core TLB shootdown with 3rd core hung, and
+        // `MAP_COUNT_MAX` on a remote grant reclaimed by R6.
+        // =====================================================================
+        if offset == 225 {
+            assert_eq!(self.m.sys.machine.cores.len(), usize::from(NODES) + 2);
+            // Sub-phase A: 3-core staggered fresh-start entry (D-171):
+            // core 4 enters first, core 5 enters after STALE_NS + 5 ms, core 6
+            // enters after STALE_NS + 10 ms (all < START_NS). No self-accusation!
+            assert_eq!(self.call(0, kill(WIDE)), Some(DONE));
+            wait_state(self, WIDE, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(WIDE, 0b111 << WIDE)), Some(DONE));
+            let stale_ns = self.m.sys.canonical().stale_ns;
+            let mut first_entry: Option<u64> = None;
+            for _ in 0..20_000 {
+                if self.m.state(WIDE) == MemberState::Live {
+                    break;
+                }
+                if first_entry.is_none()
+                    && self.m.sys.has(WIDE)
+                    && self.m.sys.node(WIDE).is_ready()
+                {
+                    first_entry = Some(self.m.sys.now());
+                }
+                let now = self.m.sys.now();
+                let hold_c5 = first_entry.is_none_or(|t0| now < t0 + stale_ns + 5 * MS);
+                let hold_c6 = first_entry.is_none_or(|t0| now < t0 + stale_ns + 10 * MS);
+                let held = |sys: &crate::system::System, ev: Event| -> bool {
+                    match ev {
+                        Event::EntryStep { core } => {
+                            (core == 5 && hold_c5) || (core == 6 && hold_c6)
+                        }
+                        Event::Action(i) => matches!(
+                            sys.actions()[i].1,
+                            crate::nodes::HwAction::Start { core, .. }
+                                if (core == 5 && hold_c5) || (core == 6 && hold_c6)
+                        ),
+                        _ => false,
+                    }
+                };
+                let events = self.m.sys.events();
+                let ev = events
+                    .iter()
+                    .copied()
+                    .find(|&ev| matches!(ev, Event::Timer { .. }) && !held(&self.m.sys, ev))
+                    .or_else(|| events.into_iter().find(|&ev| !held(&self.m.sys, ev)));
+                if let Some(ev) = ev {
+                    self.m.sys.fire(ev);
+                    if !self
+                        .m
+                        .sys
+                        .events()
+                        .iter()
+                        .any(|e| matches!(e, Event::Timer { .. }))
+                    {
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                } else {
+                    let now = self.m.sys.now();
+                    let next = self
+                        .m
+                        .sys
+                        .models()
+                        .filter_map(|(_, n)| n.next_timer())
+                        .map(|(at, _)| at)
+                        .filter(|&at| at > now)
+                        .min();
+                    let at = next.map_or(now + 500_000, |t| t.min(now + 500_000));
+                    self.m.sys.move_clock(at);
+                }
+            }
+            assert_eq!(
+                self.m.state(WIDE),
+                MemberState::Live,
+                "3-core staggered fresh start must reach Live without false self-accusation (D-171)"
+            );
+            self.m.restarted(WIDE);
+
+            // Sub-phase B: 3-core TLB shootdown with core 5 alive and core 6 hung.
+            let ut4 = super::untyped_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let tables4 = super::table_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let asp = self
+                .m
+                .retype(WIDE, ObjectKind::ASpace, u64::from(tables4), 1600);
+            self.m.ok(WIDE, asp);
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Frame, 1, 1601));
+            self.m.ok(
+                WIDE,
+                Syscall::ASpaceMap(crate::Map {
+                    space: s(1600),
+                    frame: s(1601),
+                    untyped: s(tables4),
+                    address: 0x2000_0000,
+                    first: 0,
+                    count: 1,
+                    rights: Rights::READ.bits(),
+                }),
+            );
+            let _w5 = spawn_worker(&mut self.m, WIDE, 1602, u64::from(WIDE) + 1, 1600);
+            let _w6 = spawn_worker(&mut self.m, WIDE, 1604, u64::from(WIDE) + 2, 1600);
+            self.run(500_000);
+            let generation = self.m.sys.member(WIDE).generation();
+            self.m.harm.harmed.insert((WIDE, generation));
+            self.m.sys.hang(usize::from(WIDE) + 2, true);
+            if arch == Arch::Aarch64 {
+                let wait = self.m.sys.canonical().stale_ns + 40 * MS;
+                self.run(wait);
+            } else {
+                assert_eq!(self.m.call(WIDE, Syscall::ASpaceUnmap(s(1601))), WAITS);
+                self.run(40 * MS);
+            }
+            wait_state(self, WIDE, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(WIDE, 0b111 << WIDE)), Some(DONE));
+            wait_state(self, WIDE, MemberState::Live, 150);
+            self.m.restarted(WIDE);
+
+            // Sub-phase C: `MAP_COUNT_MAX` refusal on a local chunk, followed
+            // by owner death and `R6` clear.
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            self.m
+                .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1700));
+            self.m.ok(
+                0,
+                Syscall::CapDerive {
+                    source: s(1700),
+                    destination: s(1701),
+                    rights: frame_rights(),
+                    badge: 0,
+                },
+            );
+            self.m.ok(
+                0,
+                Syscall::ASpaceMap(crate::Map {
+                    space: s(START_SLOT_ASPACE),
+                    frame: s(1700),
+                    untyped: SlotAddr::NONE,
+                    address: 0x3500_0000,
+                    first: 0,
+                    count: 1,
+                    rights: Rights::READ.bits(),
+                }),
+            );
+            let frame_obj = self.m.sys.node(0).object_at(self.m.t[0], s(1700)).unwrap();
+            let base_phys = self.m.sys.node(0).frame_base(frame_obj);
+            let chunk = base_phys / self.m.sys.machine.geometry.chunk();
+            let cur_count = self.m.sys.canonical().map_count(chunk);
+            self.m.sys.node_mut(0).machine.map_count_max = cur_count;
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::ASpaceMap(crate::Map {
+                        space: s(START_SLOT_ASPACE),
+                        frame: s(1701),
+                        untyped: SlotAddr::NONE,
+                        address: 0x3500_1000,
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                ),
+                Err(Error::Busy)
+            );
+            self.m.sys.node_mut(0).machine.map_count_max = dodos_abi::MAP_COUNT_MAX;
+            self.m.sample_bounds();
+            assert!(self.m.bounds.map_count_max_refused);
+            // Kill owner node 0 so R6 clears its mapped chunk gate word.
+            assert_eq!(self.call(1, kill(0)), Some(DONE));
+            wait_state(self, 0, MemberState::Dead, 150);
+            assert_eq!(self.call(1, fresh(0, 1)), Some(DONE));
+            wait_state(self, 0, MemberState::Live, 150);
+            self.m.restarted(0);
+            self.run(20 * MS);
+        }
+
+        self.note();
+    }
+
     /// The holder's receiver waits for up to four frames from `group`, and
     /// the granting node sends them, with its doorbell.
     fn grant(&mut self, pair: Pair, group: u32) {
@@ -2220,8 +3322,9 @@ impl Run {
                 } else if wide {
                     self.late_start = 3 + self.rng.below(6) as u32;
                 }
+                let wide_cores = self.m.sys.machine.cores.len() - usize::from(WIDE);
                 let mask = match wide {
-                    true => 0b11 << target,
+                    true => ((1u64 << wide_cores) - 1) << target,
                     false => 1 << target,
                 };
                 if self.call(actor, fresh(target, mask)) == Some(DONE) {
