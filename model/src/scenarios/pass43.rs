@@ -1499,3 +1499,72 @@ fn core_answer_timeout_self_accusation_reclaimed_by_peer() {
     );
     assert!(m.bounds.core_answer_timeout);
 }
+
+/// Regression for pass 43 (seed 254): a secondary core that previously died
+/// while running a thread (leaving `idle_until == 0` in its core beacon) must
+/// publish its new `heartbeat` and `idle_until` when a fresh generation enters
+/// idle on that core; otherwise `watch_own_cores` falsely accuses the healthy
+/// node with `CrashReason::CoreSilent` after `STALE_NS`.
+#[test]
+fn reused_secondary_core_entering_idle_publishes_beacon_and_is_not_falsely_accused() {
+    let mut mach = machine(Arch::X86_64, 3, &[&[0], &[1, 2]]);
+    mach.membership.stale_ms = 40;
+    mach.membership.sweep_ms = 100;
+    let mut m = S::on(&mach);
+
+    // Run a thread on secondary core 2 so `core_beacons[2].idle_until` becomes 0.
+    let ut1 = untyped_slot(m.sys.node(1), m.t[1]);
+    m.ok(1, retype_from(ut1, ObjectKind::Thread, 0, 160));
+    m.ok(1, retype_from(ut1, ObjectKind::Sched, 0, 161));
+    m.ok(
+        1,
+        Syscall::ThreadConfigure {
+            thread: s(160),
+            cspace: s(START_SLOT_CSPACE),
+            aspace: s(dodos_abi::START_SLOT_ASPACE),
+            fault: SlotAddr::NONE,
+            page: SlotAddr::NONE,
+        },
+    );
+    m.ok(
+        1,
+        Syscall::SchedConfigure {
+            sched: s(161),
+            node: node_cap(1),
+            core: 2,
+            budget: 50 * MS,
+            period: 100 * MS,
+            class: 1,
+        },
+    );
+    m.ok(
+        1,
+        Syscall::SchedBind {
+            sched: s(161),
+            thread: s(160),
+        },
+    );
+    m.ok(1, Syscall::ThreadResume(s(160)));
+    m.run(2 * MS);
+    assert_eq!(m.sys.canonical().core_beacons[2].idle_until.0, 0);
+
+    // Kill node 1 while core 2 is busy, wait until Dead, then fresh-start node 1
+    // on the same cores (1 and 2) with core 2 idle.
+    m.supervisor(0, m.t[0]);
+    m.ok(0, kill(1));
+    m.run(40 * MS);
+    assert_eq!(m.state(1), MemberState::Dead);
+    m.ok(0, super::pass17::fresh(1, 0b110));
+    m.run(20 * MS);
+    assert_eq!(m.state(1), MemberState::Live);
+    assert_eq!(
+        m.sys.canonical().core_beacons[2].idle_until.0,
+        u64::MAX,
+        "reused idle secondary core must publish idle_until = u64::MAX on entry"
+    );
+
+    // Advance well past STALE_NS and sweep: healthy node 1 must stay Live.
+    m.run(150 * MS);
+    assert_eq!(m.state(1), MemberState::Live);
+    assert_eq!(m.sys.canonical().beacons[1].panic, None);
+}

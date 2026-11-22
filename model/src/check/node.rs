@@ -368,10 +368,14 @@ impl Model {
             });
             ensure(waits, "TLB: the thread of a request waits for another")?;
             let panicked = self.table.beacons[self.node as usize].panic.is_some();
+            // A requesting core sleeping in an idle state takes its
+            // `CORE_ANSWER_NS` due event at its wake, up to its exit latency
+            // (`core.asleep`) after the deadline (Idle; pass 43, seed 826).
+            let due = request.started.saturating_add(self.table.core_answer_ns);
+            let within = self.membership_now() < due
+                || (core.asleep > 0 && self.membership_now() <= due.saturating_add(core.asleep));
             ensure(
-                panicked
-                    || self.membership_now() < request.started + self.table.core_answer_ns
-                    || core.silent,
+                panicked || within || core.silent,
                 "CORE_ANSWER_NS: a request older than the bound on a node that did not accuse itself",
             )?;
         }

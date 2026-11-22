@@ -163,6 +163,24 @@ fn a_request_older_than_core_answer_ns_on_a_node_that_did_not_accuse_itself_is_r
 }
 
 #[test]
+fn a_request_on_a_sleeping_core_is_allowed_up_to_exit_latency_and_reported_beyond() {
+    let mut k = node2();
+    k.m.cores[0].request = Some(request(0b10, 0, 0));
+    k.m.cores[0].request_state = crate::cores::RequestState::InUse;
+    k.m.cores[0].asleep = 200_000;
+    k.m.cores[1].pending.insert(0);
+    // At CORE_ANSWER_NS + exit_latency the sleeping core is still waking.
+    k.m.set_now(dodos_abi::CORE_ANSWER_NS + 200_000);
+    assert_eq!(k.m.check(), Ok(()));
+    // Strictly past CORE_ANSWER_NS + exit_latency must still be reported.
+    k.m.set_now(dodos_abi::CORE_ANSWER_NS + 200_001);
+    reported(
+        &k,
+        "CORE_ANSWER_NS: a request older than the bound on a node that did not accuse itself",
+    );
+}
+
+#[test]
 fn a_pending_bit_that_names_no_request_is_reported() {
     let mut k = node2();
     k.m.cores[1].pending.insert(0);

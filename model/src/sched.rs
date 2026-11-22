@@ -326,6 +326,15 @@ impl Model {
         beacon.ran = (node, generation);
     }
 
+    /// Writes `at`'s core beacon (`heartbeat`, `idle_until`, `ran`), restoring
+    /// the current core cursor afterward.
+    pub(crate) fn beat_on(&mut self, at: usize) {
+        let prev = *self.at;
+        *self.at = at;
+        self.beat();
+        *self.at = prev;
+    }
+
     /// After an event on one core, every other core whose choice the event
     /// changed is sent the reschedule interrupt: it is idle and a context
     /// placed on it became eligible, or a context placed on it should

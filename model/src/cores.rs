@@ -923,6 +923,13 @@ impl Model {
                 self.replenish(context, debt);
             }
             self.end(entry);
+        } else {
+            // A core entering idle on a reused physical core must publish its
+            // new `heartbeat` and `idle_until` (otherwise an `idle_until` of 0
+            // left by a prior generation that died while busy causes
+            // `watch_own_cores` or a peer's sweep to falsely accuse the idle
+            // core after `STALE_NS`).
+            self.beat_on(position);
         }
         let fresh = !self.resuming;
         // A fresh start: the core at position 0 built the start-up state, and
