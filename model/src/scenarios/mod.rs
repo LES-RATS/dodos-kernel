@@ -362,22 +362,40 @@ pub(crate) struct Harm {
     /// Each start or resume that succeeded: the node and generation
     /// started, and its starter with its generation.
     pub(crate) starts: std::collections::BTreeMap<(u16, u32), (u16, u32)>,
+    /// Each `(node, generation)` observed in `MemberState::Live`.
+    pub(crate) ever_live: std::collections::BTreeSet<(u16, u32)>,
 }
 
 impl Harm {
     /// Whether the accusation of `node` in `member` is one a harm explains:
     /// the node harmed in that generation, or sealed and accused with
     /// evidence seal.
-    pub(crate) fn accepts(&self, node: u16, member: dodos_abi::Member) -> bool {
+    pub(crate) fn accepts(
+        &self,
+        node: u16,
+        member: dodos_abi::Member,
+        panic: Option<(u64, u32, u32)>,
+    ) -> bool {
         let at = (node, member.generation());
         // A start or a resume whose starter was harmed or sealed may never
         // end: nobody wakes its cores again (a sealing node drives no
         // start), and it is accused stale or stuck at `START_NS` (D-137,
-        // D-144).
+        // D-144), or—for a fresh start that never became live—accuses itself
+        // with `CrashReason::CoreSilent` at `START_NS` when an un-entered
+        // core never enters (D-171).
         let orphan = self
             .starts
             .get(&at)
             .is_some_and(|starter| self.harmed.contains(starter) || self.sealed.contains(starter));
+        let orphan_core_silent = orphan
+            && !self.ever_live.contains(&at)
+            && member.evidence() == dodos_abi::Evidence::SelfReported
+            && matches!(
+                panic,
+                Some((reason, generation, _))
+                    if reason == dodos_abi::CrashReason::CoreSilent as u64
+                        && generation == member.generation()
+            );
         self.harmed.contains(&at)
             || self.sealed.contains(&at) && member.evidence() == dodos_abi::Evidence::Seal
             || orphan
@@ -385,6 +403,7 @@ impl Harm {
                     member.evidence(),
                     dodos_abi::Evidence::Stale | dodos_abi::Evidence::Stuck
                 )
+            || orphan_core_silent
     }
 }
 
@@ -405,6 +424,12 @@ impl S {
     }
 
     pub(crate) fn sample_bounds(&mut self) {
+        let table = self.sys.canonical();
+        for (n, &member) in table.members.iter().enumerate() {
+            if member.state() == dodos_abi::MemberState::Live {
+                self.harm.ever_live.insert((n as u16, member.generation()));
+            }
+        }
         self.bounds.sample_system(&self.sys, &mut self.scan);
     }
 

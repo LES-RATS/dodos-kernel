@@ -123,9 +123,10 @@ pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
             state,
             MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced | MemberState::Dead
         );
+        let panic = m.sys.canonical().beacons[n as usize].panic;
         assert!(
-            !down || m.harm.accepts(n, member),
-            "seed {seed}: node {n} accused unharmed: {member:?}, harmed {:?}, sealed {:?}",
+            !down || m.harm.accepts(n, member, panic),
+            "seed {seed}: node {n} accused unharmed: {member:?}, panic {panic:?}, harmed {:?}, sealed {:?}",
             m.harm.harmed,
             m.harm.sealed
         );
