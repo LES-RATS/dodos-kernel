@@ -12,9 +12,7 @@ use crate::{
     Cap, CapId, Delivery, Frame, Message, Model, ObjId, Object, Outcome, Output, Place, Record,
     Slot, Transfer, Wait, live,
 };
-use dodos_abi::{
-    Error, Header, MemberState, ObjectKind, Rights, SEND_GRANTS_MAX, SlotAddr,
-};
+use dodos_abi::{Error, Header, MemberState, ObjectKind, Rights, SEND_GRANTS_MAX, SlotAddr};
 
 /// A remote object on its holder: the grant its capabilities name.
 #[derive(Clone, Copy, Debug, PartialEq)]

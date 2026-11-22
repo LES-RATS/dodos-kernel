@@ -935,11 +935,12 @@ fn pending_signals_and_pending_releases_both_exceed_32_step() {
         if ring_used(&m, 1, 0, true) == 0 {
             break;
         }
-        let ev = m
-            .sys
-            .events()
-            .into_iter()
-            .find(|&ev| !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }));
+        let ev = m.sys.events().into_iter().find(|&ev| {
+            !matches!(
+                ev,
+                Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+            )
+        });
         if let Some(ev) = ev {
             m.sys.fire(ev);
             assert_eq!(m.sys.check(), Ok(()));
@@ -988,11 +989,12 @@ fn pending_signals_and_pending_releases_both_exceed_32_step() {
         if ring_used(&m, 1, 0, false) == 0 && ring_used(&m, 1, 2, false) == 0 {
             break;
         }
-        let ev = m
-            .sys
-            .events()
-            .into_iter()
-            .find(|&ev| !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }));
+        let ev = m.sys.events().into_iter().find(|&ev| {
+            !matches!(
+                ev,
+                Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+            )
+        });
         if let Some(ev) = ev {
             m.sys.fire(ev);
             assert_eq!(m.sys.check(), Ok(()));

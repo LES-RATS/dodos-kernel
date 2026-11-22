@@ -82,8 +82,7 @@ impl Model {
                         | MemberState::Sealed
                         | MemberState::Fencing
                 );
-                let fenced =
-                    matches!(member.state(), MemberState::Fenced | MemberState::Unfenced);
+                let fenced = matches!(member.state(), MemberState::Fenced | MemberState::Unfenced);
                 // A plain role moves from an unfenced holder only once
                 // `FENCE_NS` + `SETTLE_NS` have passed since the first
                 // fence action (Roles, kinds of role, D-161).

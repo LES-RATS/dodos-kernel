@@ -879,7 +879,9 @@ impl Run {
         let wide_cores = m.sys.machine.cores.len() - usize::from(WIDE);
         for node in 0..NODES {
             let cores: Vec<u64> = match node == WIDE {
-                true => (0..wide_cores as u64).map(|k| u64::from(node) + k).collect(),
+                true => (0..wide_cores as u64)
+                    .map(|k| u64::from(node) + k)
+                    .collect(),
                 false => vec![u64::from(node)],
             };
             for core in cores.into_iter().filter(|_| lossy.is_some()) {
@@ -1332,7 +1334,14 @@ impl Run {
         self.m.sys.move_clock(deadline);
         let armed_before = timer_objs
             .iter()
-            .filter(|id| self.m.sys.node(0).timers.get(id).is_some_and(Option::is_some))
+            .filter(|id| {
+                self.m
+                    .sys
+                    .node(0)
+                    .timers
+                    .get(id)
+                    .is_some_and(Option::is_some)
+            })
             .count();
         assert_eq!(armed_before, dodos_abi::TIME_EVENT_STEP + 4);
         self.m.sys.fire(crate::system::Event::Timer {
@@ -1343,7 +1352,14 @@ impl Run {
         self.m.sample_bounds();
         let armed_after = timer_objs
             .iter()
-            .filter(|id| self.m.sys.node(0).timers.get(id).is_some_and(Option::is_some))
+            .filter(|id| {
+                self.m
+                    .sys
+                    .node(0)
+                    .timers
+                    .get(id)
+                    .is_some_and(Option::is_some)
+            })
             .count();
         assert!(
             armed_after >= 4,
@@ -1359,7 +1375,13 @@ impl Run {
         assert_eq!(
             timer_objs
                 .iter()
-                .filter(|id| self.m.sys.node(0).timers.get(id).is_some_and(Option::is_some))
+                .filter(|id| self
+                    .m
+                    .sys
+                    .node(0)
+                    .timers
+                    .get(id)
+                    .is_some_and(Option::is_some))
                 .count(),
             0
         );
@@ -1563,7 +1585,13 @@ impl Run {
             // seal before the sweep and stay well under `seal_ns`.
             let headroom = 5 * MS;
             if self.m.sys.node(0).next_sweep <= self.m.sys.now() + headroom {
-                let past = self.m.sys.node(0).next_sweep.saturating_sub(self.m.sys.now()) + 1 * MS;
+                let past = self
+                    .m
+                    .sys
+                    .node(0)
+                    .next_sweep
+                    .saturating_sub(self.m.sys.now())
+                    + 1 * MS;
                 self.run(past);
             }
             let target = self.m.sys.node(0).next_sweep.saturating_sub(headroom);
@@ -1572,11 +1600,7 @@ impl Run {
             }
             let sweep_at = self.m.sys.node(0).next_sweep;
             for n in [1u16, 2, 3] {
-                assert_eq!(
-                    self.call(0, seal(n)),
-                    Some(DONE),
-                    "node 0 sealing node {n}"
-                );
+                assert_eq!(self.call(0, seal(n)), Some(DONE), "node 0 sealing node {n}");
             }
             for _ in 0..20 {
                 if [1u16, 2, 3]
@@ -1806,7 +1830,10 @@ impl Run {
                 },
             );
             m.ok(node, Syscall::ThreadResume(s(base)));
-            m.sys.node(node).object_at(m.t[node as usize], s(base)).unwrap()
+            m.sys
+                .node(node)
+                .object_at(m.t[node as usize], s(base))
+                .unwrap()
         };
         let ring_used = |m: &S, from: u16, to: u16, user: bool| -> u64 {
             let node = m.sys.node(from);
@@ -2051,7 +2078,10 @@ impl Run {
                     }
                 }
             }
-            assert!(ask_sent, "node 3 must send ReportAsk to node 1 during rebuild");
+            assert!(
+                ask_sent,
+                "node 3 must send ReportAsk to node 1 during rebuild"
+            );
 
             // Step 1: Node 1 deletes 32 remote frames -> 30 Releases fill kernel
             // ring 1 -> 3 to the 34-entry answer reserve; 31st & 32nd hit reserve.
@@ -2067,7 +2097,10 @@ impl Run {
             // REQUESTS_PER_PEER = 16 alongside ReportAsk; 16th hits 17th-credit
             // cap; all 64 fill unit_requests), then 65th returns Busy!
             for &(tid, fslot) in &unit_threads[..UNIT_REQUESTS] {
-                assert_eq!(self.m.call_by(3, tid, Syscall::IoSpaceUnmap(s(fslot))), WAITS);
+                assert_eq!(
+                    self.m.call_by(3, tid, Syscall::IoSpaceUnmap(s(fslot))),
+                    WAITS
+                );
             }
             assert_eq!(
                 self.m.call_by(
@@ -2146,7 +2179,10 @@ impl Run {
             for _ in 0..5_000 {
                 let ev = self.m.sys.events().into_iter().find(|&ev| {
                     !is_ring_for(&self.m.sys, ev, 3)
-                        && !matches!(ev, Event::Ipi { node: 3, .. } | Event::Timer { node: 3, .. })
+                        && !matches!(
+                            ev,
+                            Event::Ipi { node: 3, .. } | Event::Timer { node: 3, .. }
+                        )
                 });
                 let Some(ev) = ev else { break };
                 self.m.sys.fire(ev);
@@ -2407,7 +2443,10 @@ impl Run {
                     break;
                 }
                 let ev = self.m.sys.events().into_iter().find(|&ev| {
-                    !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. })
+                    !matches!(
+                        ev,
+                        Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+                    )
                 });
                 match ev {
                     Some(ev) => {
@@ -2459,7 +2498,10 @@ impl Run {
                     break;
                 }
                 let ev = self.m.sys.events().into_iter().find(|&ev| {
-                    !matches!(ev, Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. })
+                    !matches!(
+                        ev,
+                        Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+                    )
                 });
                 match ev {
                     Some(ev) => {
@@ -2514,23 +2556,30 @@ impl Run {
             }
             // Coincidence A: exact `next_sweep` instant on core 0.
             if self.m.sys.node(0).next_sweep <= self.m.sys.now() + 2 * MS {
-                let past = self.m.sys.node(0).next_sweep.saturating_sub(self.m.sys.now()) + 1 * MS;
+                let past = self
+                    .m
+                    .sys
+                    .node(0)
+                    .next_sweep
+                    .saturating_sub(self.m.sys.now())
+                    + 1 * MS;
                 self.run(past);
             }
             let sweep_at = self.m.sys.node(0).next_sweep;
             for i in 0..20u32 {
-                assert!(self
-                    .m
-                    .call(
-                        0,
-                        Syscall::TimerSet {
-                            timer: s(1100 + i),
-                            notify: s(BELL),
-                            deadline: sweep_at,
-                            tolerance: 0,
-                        },
-                    )
-                    .is_ok());
+                assert!(
+                    self.m
+                        .call(
+                            0,
+                            Syscall::TimerSet {
+                                timer: s(1100 + i),
+                                notify: s(BELL),
+                                deadline: sweep_at,
+                                tolerance: 0,
+                            },
+                        )
+                        .is_ok()
+                );
             }
             self.run(sweep_at - 1 - self.m.sys.now());
             self.m.sys.move_clock(sweep_at);
@@ -2569,18 +2618,19 @@ impl Run {
                 };
                 if fence_at > self.m.sys.now() + 1 {
                     for i in 0..20u32 {
-                        assert!(self
-                            .m
-                            .call(
-                                0,
-                                Syscall::TimerSet {
-                                    timer: s(1100 + i),
-                                    notify: s(BELL),
-                                    deadline: fence_at,
-                                    tolerance: 0,
-                                },
-                            )
-                            .is_ok());
+                        assert!(
+                            self.m
+                                .call(
+                                    0,
+                                    Syscall::TimerSet {
+                                        timer: s(1100 + i),
+                                        notify: s(BELL),
+                                        deadline: fence_at,
+                                        tolerance: 0,
+                                    },
+                                )
+                                .is_ok()
+                        );
                     }
                     self.run(fence_at - 1 - self.m.sys.now());
                     if self.m.state(0) == MemberState::Live {
@@ -2620,9 +2670,7 @@ impl Run {
                 if self.m.state(WIDE) == MemberState::Live {
                     break;
                 }
-                if first_entry.is_none()
-                    && self.m.sys.has(WIDE)
-                    && self.m.sys.node(WIDE).is_ready()
+                if first_entry.is_none() && self.m.sys.has(WIDE) && self.m.sys.node(WIDE).is_ready()
                 {
                     first_entry = Some(self.m.sys.now());
                 }
