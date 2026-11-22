@@ -343,6 +343,7 @@ struct Reach {
     resume: Vec<Vec<usize>>,
     death: Vec<Vec<usize>>,
     events: Vec<usize>,
+    bounds: super::bounds::Bounds,
 }
 
 /// What one seed reached.
@@ -360,6 +361,7 @@ struct Seen {
     bad_item_cuts: usize,
     /// The states of D-154 to D-157 reached (`TABLE_STATES`).
     tables: BTreeSet<usize>,
+    bounds: super::bounds::Bounds,
 }
 
 /// The states of the table chunks' cycle and of the gate's defence of
@@ -450,6 +452,7 @@ impl Reach {
             resume: square(),
             death: square(),
             events: vec![0; EVENTS],
+            bounds: super::bounds::Bounds::default(),
         }
     }
 
@@ -473,6 +476,7 @@ impl Reach {
         for &state in &seen.tables {
             self.tables[state] += 1;
         }
+        self.bounds.merge(&seen.bounds);
     }
 }
 
@@ -748,6 +752,7 @@ impl Run {
     }
 
     fn note(&mut self) {
+        self.m.sample_bounds();
         self.judge_forged();
         self.judge_rebuild_cuts();
         let table = self.m.sys.canonical();
@@ -2468,6 +2473,8 @@ fn explore_one(seed: u64) -> (Seen, [bool; 2]) {
             run.step();
         }
         run.liveness(seed);
+        run.m.sample_bounds();
+        run.seen.bounds = run.m.bounds.clone();
         (run.seen, [run.gap_21, run.handed_failed])
     });
     explored.unwrap_or_else(|panic| {
@@ -2596,6 +2603,8 @@ fn focus(events: [usize; 3], seed: u64) -> Seen {
             }
         }
         run.liveness(seed);
+        run.m.sample_bounds();
+        run.seen.bounds = run.m.bounds.clone();
         run.seen
     });
     explored.unwrap_or_else(|panic| {
@@ -2950,6 +2959,7 @@ fn every_combination_of_recovery_states_is_reached() {
             eprintln!("reached now, to take off `long_run_not_reached.txt`: {reached:#?}");
         }
         assert!(lost.is_empty(), "never reached, and not listed: {lost:#?}");
+        reach.bounds.print("long combination run");
     }
 }
 
@@ -3820,6 +3830,8 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         "directed_combination({events:?}) did not have all bits set at once: mask={mask:#x}, wanted={all:#x}"
     );
     run.liveness(seed);
+    run.m.sample_bounds();
+    run.seen.bounds = run.m.bounds.clone();
     run.seen
 }
 
@@ -3902,14 +3914,17 @@ fn directed_combinations_reach_all_74() {
         "death + signal pending + first thread before live",
         "death + mid-attach + first thread before live",
     ];
+    let mut bounds = super::bounds::Bounds::default();
     for name in list {
         let events = combination(name);
         let seen = directed_combination(events);
+        bounds.merge(&seen.bounds);
         assert!(
             reaches(&seen, name),
             "directed scenario did not record {name}"
         );
     }
+    bounds.print("directed 74");
 }
 
 #[test]

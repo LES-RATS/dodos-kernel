@@ -4,6 +4,7 @@
 //! is about. The harness drives a whole machine (`System`) or one node
 //! alone (`Model`), and every step is followed by the whole check.
 
+mod bounds;
 mod checker;
 mod combinations;
 mod cores;
@@ -191,6 +192,15 @@ pub(crate) struct N {
     pub(crate) m: Model,
     pub(crate) t: ObjId,
     pub(crate) ut: u32,
+    pub(crate) bounds: bounds::Bounds,
+    pub(crate) _active: bounds::Active,
+}
+
+impl Drop for N {
+    fn drop(&mut self) {
+        self.bounds.sample_model(&self.m);
+        bounds::record_scenario(&self.bounds);
+    }
 }
 
 impl N {
@@ -200,15 +210,26 @@ impl N {
         // says so, so that a state between two events can be seen.
         m.manual = true;
         let ut = untyped_slot(&m, t);
-        let n = Self { m, t, ut };
+        let mut bounds = bounds::Bounds::default();
+        bounds.sample_model(&m);
+        let n = Self {
+            m,
+            t,
+            ut,
+            bounds,
+            _active: bounds::Active::enter(),
+        };
         assert_eq!(n.m.check(), Ok(()));
         n
     }
 
     #[track_caller]
     pub(crate) fn call(&mut self, thread: ObjId, call: Syscall) -> Outcome {
+        let meta = bounds::CallMeta::of(&call);
         let outcome = self.m.apply(thread, call);
         assert_eq!(self.m.check(), Ok(()));
+        self.bounds.sample_call(&self.m, meta, &outcome);
+        self.bounds.sample_model(&self.m);
         outcome
     }
 
@@ -246,6 +267,7 @@ impl N {
         while let Some(&(core, _)) = self.m.pending_ipis().first() {
             self.m.take_interrupts(core);
             assert_eq!(self.m.check(), Ok(()));
+            self.bounds.sample_model(&self.m);
         }
     }
 
@@ -315,6 +337,16 @@ pub(crate) struct S {
     pub(crate) sys: System,
     pub(crate) t: Vec<ObjId>,
     pub(crate) harm: Harm,
+    pub(crate) bounds: bounds::Bounds,
+    scan: bounds::RingScan,
+    _active: bounds::Active,
+}
+
+impl Drop for S {
+    fn drop(&mut self) {
+        self.sample_bounds();
+        bounds::record_scenario(&self.bounds);
+    }
 }
 
 /// The nodes a test harmed, each with the generation harmed: killed or a
@@ -357,13 +389,21 @@ impl Harm {
 impl S {
     pub(crate) fn on(machine: &Machine) -> Self {
         let (sys, t) = System::boot(machine).expect("the machine boots");
-        let s = Self {
+        let mut s = Self {
             sys,
             t,
             harm: Harm::default(),
+            bounds: bounds::Bounds::default(),
+            scan: bounds::RingScan::default(),
+            _active: bounds::Active::enter(),
         };
         assert_eq!(s.sys.check(), Ok(()));
+        s.sample_bounds();
         s
+    }
+
+    pub(crate) fn sample_bounds(&mut self) {
+        self.bounds.sample_system(&self.sys, &mut self.scan);
     }
 
     /// The reference machine: two nodes of one core each.
@@ -379,6 +419,7 @@ impl S {
 
     #[track_caller]
     pub(crate) fn call_by(&mut self, node: u16, thread: ObjId, call: Syscall) -> Outcome {
+        let meta = bounds::CallMeta::of(&call);
         // A stop of a node that succeeds is a harm (kill, retire) or a seal.
         let stop = match call {
             Syscall::NodeStop {
@@ -400,6 +441,10 @@ impl S {
         let starter = (node, self.sys.member(node).generation());
         let outcome = self.sys.apply(node, thread, call);
         assert_eq!(self.sys.check(), Ok(()));
+        if self.sys.has(node) {
+            self.bounds.sample_call(self.sys.node(node), meta, &outcome);
+        }
+        self.sample_bounds();
         if let (Some(target), DONE) = (started, outcome.clone()) {
             let started = (target, self.sys.member(target).generation());
             self.harm.starts.insert(started, starter);
@@ -424,6 +469,7 @@ impl S {
         let model = self.sys.node(node).clone();
         claim_a_reserve(&model, thread, |call| self.sys.apply(node, thread, call));
         assert_eq!(self.sys.check(), Ok(()));
+        self.sample_bounds();
     }
 
     /// A core hangs (`System::hang`), a harm of the node it runs.
@@ -435,6 +481,7 @@ impl S {
         }
         self.sys.hang(core, nmi);
         assert_eq!(self.sys.check(), Ok(()));
+        self.sample_bounds();
     }
 
     /// A node finds a failure in itself (`System::fail`), a harm.
@@ -444,6 +491,7 @@ impl S {
         self.harm.harmed.insert((node, generation));
         self.sys.fail(node, 0);
         assert_eq!(self.sys.check(), Ok(()));
+        self.sample_bounds();
     }
 
     #[track_caller]
@@ -489,6 +537,7 @@ impl S {
     pub(crate) fn settle(&mut self) {
         self.sys.settle(100_000);
         assert_eq!(self.sys.check(), Ok(()));
+        self.sample_bounds();
     }
 
     /// Time passes `ns`, checked every 100 µs.
@@ -506,6 +555,7 @@ impl S {
             let at = (self.sys.now() + step).min(to);
             self.sys.advance(at);
             assert_eq!(self.sys.check(), Ok(()));
+            self.sample_bounds();
         }
     }
 
@@ -526,6 +576,7 @@ impl S {
                 }
             }
             assert_eq!(self.sys.check(), Ok(()));
+            self.sample_bounds();
         }
         until(self)
     }
@@ -545,6 +596,7 @@ impl S {
             }
             self.sys.fire(event);
             assert_eq!(self.sys.check(), Ok(()), "after {event:?}");
+            self.sample_bounds();
         }
     }
 
@@ -562,5 +614,15 @@ impl S {
             .sys
             .node(node)
             .object_at_start(dodos_abi::START_SLOT_THREAD);
+    }
+}
+
+/// Prints the bounds accumulated across all scenario tests when `DODOS_BOUNDS`
+/// is set.
+#[test]
+fn zzz_scenario_bounds_summary() {
+    if std::env::var("DODOS_BOUNDS").is_ok() {
+        bounds::wait_for_active();
+        bounds::scenario_snapshot().print("scenario tests (lib)");
     }
 }

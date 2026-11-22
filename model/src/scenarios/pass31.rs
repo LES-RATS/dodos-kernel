@@ -880,6 +880,8 @@ fn an_its_table_of_a_size_or_place_no_retype_makes_is_reported() {
         m: k.m.clone(),
         t: k.t,
         ut: k.ut,
+        bounds: super::bounds::Bounds::default(),
+        _active: super::bounds::Active::enter(),
     };
     odd.m.its_tables.insert(its, (first, 3));
     assert_eq!(
