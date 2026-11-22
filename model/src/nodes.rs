@@ -1720,63 +1720,12 @@ impl Model {
             *units -= 1;
             any = true;
             match cursor.phase {
-                // Chunks taken by its generation, and its floor: map counts
-                // 0, page classes data; a reserve's chunk of a role it holds
-                // becomes free with the reserve's code.
+                // Its grant entries: free, the serial grows. Done before
+                // chunks and device entries so gate-word grant counts drop
+                // with their entries (G4) and a still-counted grant stops
+                // the walk before any gate word or page class is cleared
+                // (Gate words, D-149).
                 0 => {
-                    if cursor.index >= self.table.owners.len() {
-                        cursor = Clear { phase: 1, index: 0 };
-                        continue;
-                    }
-                    let chunk = cursor.index as u64;
-                    cursor.index += 1;
-                    let at = chunk << shift;
-                    let floor = self.table.floors[node as usize]
-                        .iter()
-                        .any(|&(s, e)| s <= at && at < e);
-                    let raw = self.table.owners[chunk as usize];
-                    let word = dodos_abi::Ownership::from_raw(raw);
-                    let taken = word.is_some_and(|w| {
-                        w.state() == dodos_abi::OwnState::Taken
-                            && w.generation() == g
-                            && (w.owner() == dodos_abi::Owner::Node(node)
-                                || matches!(w.owner(), dodos_abi::Owner::Reserve(j) if self.table.holds_reserve(node, j)))
-                    });
-                    // R6 (D-154): the whole gate word, its counts and its
-                    // table bit, floor chunks included, ordinary and table.
-                    if taken || floor {
-                        self.table.clear_gate_word(chunk);
-                        let pages = self.table.geometry.chunk() / self.table.geometry.page();
-                        let first = at / self.table.geometry.page();
-                        for page in first..first + pages {
-                            self.table.set_class(page, None);
-                        }
-                    }
-                    if let Some(w) = word.filter(|_| taken)
-                        && let dodos_abi::Owner::Reserve(j) = w.owner()
-                    {
-                        let free = dodos_abi::Ownership::free(dodos_abi::Owner::Reserve(j));
-                        self.table.write_owner_cleared(self.node, chunk, raw, free);
-                    }
-                }
-                // Device entries taken by its generation: leaf count 0.
-                1 => {
-                    if cursor.index >= self.table.devices.len() {
-                        cursor = Clear { phase: 2, index: 0 };
-                        continue;
-                    }
-                    let index = cursor.index;
-                    cursor.index += 1;
-                    let owner = self.table.devices[index].owner;
-                    if owner.state() == dodos_abi::OwnState::Taken
-                        && owner.owner() == dodos_abi::Owner::Node(node)
-                        && owner.generation() == g
-                    {
-                        std::sync::Arc::make_mut(&mut self.table.device_leaves)[index] = 0;
-                    }
-                }
-                // Its grant entries: free, the serial grows.
-                2 => {
                     let next = self.table.grants[node as usize].keys().next().copied();
                     // R6's proof (D-149): an entry is freed only once the
                     // grantee's use entry at the recorded index counts no
@@ -1799,12 +1748,15 @@ impl Model {
                             self.table.serials[node as usize]
                                 .insert(grant, crate::grants::next_serial(entry.serial));
                         }
-                        None => cursor = Clear { phase: 3, index: 0 },
+                        None => cursor = Clear { phase: 1, index: 0 },
                     }
                 }
                 // Its use entries: free; then the line words its generation
-                // took: free, unclaimed (Interrupts, D-135).
-                3 => {
+                // took: free, unclaimed (Interrupts, D-135); then attach
+                // words (before chunks clear page classes: Check 88, Gate
+                // words D-154); then the entries of its cores' interrupt
+                // tables (before core words are freed).
+                1 => {
                     let next = self.table.uses[node as usize].keys().next().copied();
                     let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), g).raw();
                     let line = self.table.lines.iter().find(|&(_, &raw)| raw == taken);
@@ -1872,10 +1824,67 @@ impl Model {
                                                 .extend(crate::irq::handles_of_core(core as u64));
                                         }
                                     }
-                                    cursor = Clear { phase: 4, index: 0 }
+                                    cursor = Clear { phase: 2, index: 0 }
                                 }
                             }
                         }
+                    }
+                }
+                // Chunks taken by its generation, and its floor: map counts
+                // 0, page classes data; a reserve's chunk of a role it holds
+                // becomes free with the reserve's code. Reached only once no
+                // attach word of the generation remains (Gate words, D-154;
+                // Check 88).
+                2 => {
+                    if cursor.index >= self.table.owners.len() {
+                        cursor = Clear { phase: 3, index: 0 };
+                        continue;
+                    }
+                    let chunk = cursor.index as u64;
+                    cursor.index += 1;
+                    let at = chunk << shift;
+                    let floor = self.table.floors[node as usize]
+                        .iter()
+                        .any(|&(s, e)| s <= at && at < e);
+                    let raw = self.table.owners[chunk as usize];
+                    let word = dodos_abi::Ownership::from_raw(raw);
+                    let taken = word.is_some_and(|w| {
+                        w.state() == dodos_abi::OwnState::Taken
+                            && w.generation() == g
+                            && (w.owner() == dodos_abi::Owner::Node(node)
+                                || matches!(w.owner(), dodos_abi::Owner::Reserve(j) if self.table.holds_reserve(node, j)))
+                    });
+                    // R6 (D-154): the whole gate word, its counts and its
+                    // table bit, floor chunks included, ordinary and table.
+                    if taken || floor {
+                        self.table.clear_gate_word(chunk);
+                        let pages = self.table.geometry.chunk() / self.table.geometry.page();
+                        let first = at / self.table.geometry.page();
+                        for page in first..first + pages {
+                            self.table.set_class(page, None);
+                        }
+                    }
+                    if let Some(w) = word.filter(|_| taken)
+                        && let dodos_abi::Owner::Reserve(j) = w.owner()
+                    {
+                        let free = dodos_abi::Ownership::free(dodos_abi::Owner::Reserve(j));
+                        self.table.write_owner_cleared(self.node, chunk, raw, free);
+                    }
+                }
+                // Device entries taken by its generation: leaf count 0.
+                3 => {
+                    if cursor.index >= self.table.devices.len() {
+                        cursor = Clear { phase: 4, index: 0 };
+                        continue;
+                    }
+                    let index = cursor.index;
+                    cursor.index += 1;
+                    let owner = self.table.devices[index].owner;
+                    if owner.state() == dodos_abi::OwnState::Taken
+                        && owner.owner() == dodos_abi::Owner::Node(node)
+                        && owner.generation() == g
+                    {
+                        std::sync::Arc::make_mut(&mut self.table.device_leaves)[index] = 0;
                     }
                 }
                 // Every core word that names its generation: free, keeping

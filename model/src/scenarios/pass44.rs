@@ -675,4 +675,72 @@ fn hang_sleeping_core_clears_asleep_and_passes_check() {
     assert_eq!(m.sys.node(1).cores[0].asleep, 0);
 }
 
+#[test]
+fn r6_clear_step_removes_attach_words_before_clearing_page_classes() {
+    // Regression test for Fault 3 (caught on seed 71): when `table.owners.len() >= REMOVAL_STEP`
+    // (32), a 32-unit R6 `clear_step` splits across multiple recovery steps. Clearing chunks and
+    // page classes before removing detached attach words leaves an attach word pointing at a
+    // cleared IoSpace root page, failing Check 88 (`88: an attach word with no identifier word
+    // or root beside it`).
+    let mach = machine(Arch::X86_64, 2, &[&[0], &[1]]);
+    let mut m = S::on(&mach);
+    assert!(
+        m.sys.canonical().owners.len() > dodos_abi::REMOVAL_STEP,
+        "test requires > REMOVAL_STEP chunks so R6 spans multiple steps"
+    );
+    m.supervisor(0, m.t[0]);
+    let iommu1 = slots_of(m.sys.node(1), m.t[1], ObjectKind::Iommu)[0];
+    let ios1 = m.retype(1, ObjectKind::IoSpace, 0, 150);
+    m.ok(1, ios1);
+    let attach = Syscall::IoSpaceAttach {
+        iommu: s(iommu1),
+        iospace: s(150),
+        device: 0x10,
+    };
+    match m.call(1, attach) {
+        WAITS => {
+            m.settle();
+            assert_eq!(m.woken(1), Some(&DONE));
+        }
+        outcome => assert_eq!(outcome, DONE),
+    }
+    assert!(m.sys.canonical().attach.contains_key(&0x10));
 
+    // Kill node 1 and advance one event at a time, running full System::check() after every step.
+    m.ok(0, kill(1));
+    for _ in 0..2_000 {
+        if m.state(1) == MemberState::Dead {
+            break;
+        }
+        let events = m.sys.events();
+        let next = events
+            .iter()
+            .copied()
+            .find(|e| matches!(e, Event::Timer { .. }))
+            .or_else(|| events.into_iter().next());
+        if let Some(ev) = next {
+            m.sys.fire(ev);
+            if !m
+                .sys
+                .events()
+                .iter()
+                .any(|e| matches!(e, Event::Timer { .. }))
+            {
+                assert_eq!(m.sys.check(), Ok(()));
+            }
+        } else {
+            let now = m.sys.now();
+            let next_t = m
+                .sys
+                .models()
+                .filter_map(|(_, n)| n.next_timer())
+                .map(|(at, _)| at)
+                .filter(|&at| at > now)
+                .min()
+                .unwrap_or(now + 100_000);
+            m.sys.move_clock(next_t);
+        }
+    }
+    assert_eq!(m.state(1), MemberState::Dead);
+    assert!(!m.sys.canonical().attach.contains_key(&0x10));
+}
