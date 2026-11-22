@@ -911,8 +911,9 @@ impl Model {
     /// The other kernel messages wait in state that already exists until
     /// there is room beyond the reserve: the releases and signals pending
     /// in the use entries, sent in the order of the use table, at most 32
-    /// per event.
-    pub(crate) fn send_pending(&mut self) {
+    /// per event. Returns `(sent, capped)`, where `capped` is true when
+    /// the step stopped at `PENDING_STEP`.
+    pub(crate) fn send_pending(&mut self) -> (usize, bool) {
         let me = self.node as usize;
         let mut sent = 0;
         let uses: Vec<u16> = self.table.uses[me].keys().copied().collect();
@@ -936,7 +937,7 @@ impl Model {
                         }
                     }
                 }
-                return;
+                return (sent, true);
             }
             let Some(entry) = self.table.uses[me].get(&index).copied() else {
                 continue;
@@ -1020,19 +1021,18 @@ impl Model {
         {
             self.bound_hits.0.pending_step_capped = false;
         }
+        (sent, false)
     }
 
-    /// Whether, with no more than `PENDING_STEP` messages held, one is held
-    /// toward a current granter that can be written to and has room: what
-    /// `send_pending` sends (D-146).
+    /// Whether a pending message is still held toward a current granter that
+    /// can be written to and has room: what an uncapped `send_pending` step
+    /// must have sent (D-146).
     pub(crate) fn held_sendable(&self) -> bool {
         let me = self.node as usize;
-        let pending: Vec<_> = self.table.uses[me]
+        self.table.uses[me]
             .values()
             .filter(|u| u.release_pending || u.signal_pending)
-            .collect();
-        pending.len() <= PENDING_STEP
-            && pending.into_iter().any(|used| {
+            .any(|used| {
                 let member = self.table.member(used.granter);
                 let writable = member.generation() == used.generation
                     && (matches!(

@@ -2513,8 +2513,9 @@ impl Model {
             progressed |= self.unit_step();
             progressed |= self.serve_kernel_rings(&mut units);
             progressed |= self.roles_step(&mut units);
-            self.send_pending();
-            self.event.held_after_step = self.held_sendable();
+            let (sent, capped) = self.send_pending();
+            progressed |= sent > 0;
+            self.event.held_after_step = !capped && self.held_sendable();
             let (observed, sealed_read) = self.observe_needed();
             progressed |= observed;
             progressed |= self.accuse_with_evidence(&sealed_read);
