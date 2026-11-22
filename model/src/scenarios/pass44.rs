@@ -261,9 +261,9 @@ fn checks_43_and_47_reject_at_now_without_hardware_timer_due_at_now() {
     assert_eq!(k.m.check(), Ok(()));
     // Clear or move hardware timer past `now`: check 47 must reject.
     k.m.cores[0].hw_timer = Some(deadline + 1);
-    assert_eq!(k.m.check(), Err("47: armed timer".into()));
+    assert_eq!(k.m.check(), Err("47: armed timer"));
     k.m.cores[0].hw_timer = None;
-    assert_eq!(k.m.check(), Err("47: armed timer".into()));
+    assert_eq!(k.m.check(), Err("47: armed timer"));
 
     // Check 43: a throttled context at `now` is accepted only while `hw_timer <= Some(now)`.
     let mut k2 = N::on(&one_node(Arch::X86_64, 1));
@@ -285,15 +285,9 @@ fn checks_43_and_47_reject_at_now_without_hardware_timer_due_at_now() {
     k2.m.cores[0].hw_timer = Some(now);
     assert_eq!(k2.m.check(), Ok(()));
     k2.m.cores[0].hw_timer = Some(now + 1);
-    assert_eq!(
-        k2.m.check(),
-        Err("43: parameters and state of a context".into())
-    );
+    assert_eq!(k2.m.check(), Err("43: parameters and state of a context"));
     k2.m.cores[0].hw_timer = None;
-    assert_eq!(
-        k2.m.check(),
-        Err("43: parameters and state of a context".into())
-    );
+    assert_eq!(k2.m.check(), Err("43: parameters and state of a context"));
 }
 
 #[test]
@@ -436,20 +430,18 @@ fn exp_3c_clear_step_again_stays_false_for_watermark_return_again() {
 fn exp_3d_tree_depth_65_stays_false_for_unrelated_invalid() {
     let mut k = N::on(&one_node(Arch::X86_64, 1));
     k.ok(k.retype(ObjectKind::Frame, 1, 150));
-    let mut cur = 150u32;
     let rights = Rights::READ
         .union(Rights::WRITE)
         .union(Rights::DERIVE)
         .union(Rights::GRANT)
         .bits();
-    for _ in 2..dodos_abi::TREE_DEPTH {
+    for cur in 150u32..150u32 + (dodos_abi::TREE_DEPTH as u32 - 2) {
         k.ok(Syscall::CapDerive {
             source: s(cur),
             destination: s(cur + 1),
             rights,
             badge: 0,
         });
-        cur += 1;
     }
     // Invalid syscall at depth 1 (Frame retype of 0 pages) must not set tree_depth_65_refused.
     k.no(retype_from(k.ut, ObjectKind::Frame, 0, 290), Error::Invalid);

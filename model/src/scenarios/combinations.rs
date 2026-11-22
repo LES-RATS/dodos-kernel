@@ -620,7 +620,8 @@ fn bound_stress_seed(seed: u64) -> bool {
 ///   `next_sweep` and a `Fence` round timer;
 /// - `225`: 3 cores on `WIDE` (`[4, 5, 6]`), staggered fresh-start entry
 ///   (D-171), 3-core TLB shootdown with 3rd core hung, and `MAP_COUNT_MAX`
-///   on a remote grant reclaimed by R6.
+///   on a local chunk reclaimed by R6.
+///
 /// Disjoint from verify seeds (`seed % 33 == 0` and `2`), `multi_page_seed`
 /// (`seed < 286 && seed % 20 == 17`), `focus` seeds (`seed % 286 < 6`),
 /// `BOUND_STRESS_OFFSETS`, and named regression seeds (`0`, `286`, `605`,
@@ -1371,7 +1372,7 @@ impl Run {
             "hardware timer must stay at now while capped due events remain"
         );
         assert!(self.m.bounds.time_event_step_16);
-        self.run(1 * MS);
+        self.run(MS);
         assert_eq!(
             timer_objs
                 .iter()
@@ -1591,7 +1592,7 @@ impl Run {
                     .node(0)
                     .next_sweep
                     .saturating_sub(self.m.sys.now())
-                    + 1 * MS;
+                    + MS;
                 self.run(past);
             }
             let target = self.m.sys.node(0).next_sweep.saturating_sub(headroom);
@@ -1634,7 +1635,7 @@ impl Run {
                 "expected 3 sealed peers before sweep, got {sealed_order:?}"
             );
             // Cross exactly one sweep on node 0.
-            let to_sweep = sweep_at.saturating_sub(self.m.sys.now()) + 1 * MS;
+            let to_sweep = sweep_at.saturating_sub(self.m.sys.now()) + MS;
             self.run(to_sweep);
             assert!(
                 self.m.sys.node(0).next_sweep > sweep_at,
@@ -1847,7 +1848,7 @@ impl Run {
         let wait_state = |run: &mut Self, node: u16, want: MemberState, max_ms: u64| {
             let limit = run.m.sys.now() + max_ms * MS;
             while run.m.sys.now() < limit && run.m.state(node) != want {
-                run.run(1 * MS);
+                run.run(MS);
             }
             assert_eq!(
                 run.m.state(node),
@@ -2562,7 +2563,7 @@ impl Run {
                     .node(0)
                     .next_sweep
                     .saturating_sub(self.m.sys.now())
-                    + 1 * MS;
+                    + MS;
                 self.run(past);
             }
             let sweep_at = self.m.sys.node(0).next_sweep;
