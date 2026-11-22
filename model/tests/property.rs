@@ -3247,8 +3247,19 @@ fn a_dying_memory_control_is_counted() {
 /// The long run, outside `verify`: `DODOS_PROPERTY_SEEDS` seeds (2,000 if
 /// unset) from `DODOS_PROPERTY_FIRST` (the first seed after the `SEEDS` of
 /// `verify` if unset), as many at once as the machine has cores, every
-/// invariant checked after every call; the seeds that fail are named. Run
-/// with
+/// invariant checked after every call; the seeds that fail are named.
+///
+/// Scope: `many_seeds` drives a single node kernel alone (`Model::boot` on
+/// node 0, with phantom peer slots). It checks single-node syscalls,
+/// capability trees, memory and untyped rules, address spaces, local IPC,
+/// notifications, timers, and scheduling. It checks nothing between nodes:
+/// no peer rings, no cross-node grants or releases, no accusations, fences
+/// or reclaims, no role hand-overs, no unit rebuilds (`ReportAsk`/`Report`),
+/// and no seal, resume, or fresh-start transitions. Multi-node interactions
+/// and rebuilds are checked by `scenarios::combinations` and the multi-node
+/// scenarios in `model/src/scenarios/`.
+///
+/// Run with
 /// `cargo test --release -p dodos-model --test property many_seeds --
 /// --ignored`.
 #[test]
