@@ -377,7 +377,13 @@ impl Model {
 
     /// The credit of this node toward `peer` at `index`, if in use with
     /// `serial` and for `kind`.
-    fn credit_in_use(&self, peer: u16, index: u8, serial: u32, kind: NodeMessage) -> bool {
+    pub(crate) fn credit_in_use(
+        &self,
+        peer: u16,
+        index: u8,
+        serial: u32,
+        kind: NodeMessage,
+    ) -> bool {
         let credit = self.peers[peer as usize].credits.get(index as usize);
         credit.is_some_and(|c| {
             c.as_ref()

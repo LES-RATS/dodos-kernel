@@ -547,13 +547,21 @@ impl Model {
             return true;
         }
         let mut progressed = false;
-        if rebuild.asked.is_some() {
-            // A node accused during the rebuild is skipped; one that sealed
-            // before it answered is then treated as sealed, as one whose
-            // turn finds it sealed (Roles: "a node that seals during the
-            // rebuild [...] is then treated as sealed", D-167): its entries
-            // are kept even if it resumes before the rebuild ends.
-            if !self.table.writes(rebuild.node) {
+        if let Some((index, serial)) = rebuild.asked {
+            // A node accused during the rebuild is skipped (including if it
+            // was already restarted afresh after R0 wiped our credit toward
+            // its old generation); one that sealed before it answered is then
+            // treated as sealed, as one whose turn finds it sealed (Roles: "a
+            // node that seals during the rebuild [...] is then treated as
+            // sealed", D-167): its entries are kept even if it resumes before
+            // the rebuild ends.
+            let live_ask = self.credit_in_use(
+                rebuild.node,
+                index,
+                serial,
+                dodos_abi::NodeMessage::ReportAsk,
+            );
+            if !self.table.writes(rebuild.node) || !live_ask {
                 if self.table.member(rebuild.node).state() == MemberState::Sealed {
                     rebuild.sealed.insert(rebuild.node);
                 }
@@ -613,6 +621,7 @@ impl Model {
             // the rebuild's `STUCK_NS` ask deadline.
             let member = self.table.member(z);
             if member.state() == MemberState::Starting && !member.resuming() {
+                rebuild.asked_at = None;
                 self.rebuilds.insert(role, rebuild);
                 return progressed;
             }
@@ -1134,6 +1143,21 @@ impl Model {
             last = Some(key);
             above
         });
+        // CONTRACT-GAP 63: Roles (*The reports are pulled*, D-169) states
+        // that a rebuild asks each node at most `ceil(items / 28) + 1` times,
+        // "a faulty node included, since every item taken is an entry its
+        // words give it", yet the take condition requires only `count <= 28`,
+        // keys rising strictly from `asked`, `next` (unless *end*) above the
+        // last item, and every item passing its kind check. Does a non-final
+        // `Report` (`next != REPORT_END`) have to carry 28 items (or at least
+        // 1 item)? As written, a faulty node can answer with 0 items and
+        // `next = asked + 1` (unbounded asks; also exercised by
+        // `verify13::a_report_asked_from_a_key_takes_the_item_of_that_key`),
+        // or with 1 valid item per `Report` (`items + 1` asks instead of
+        // `ceil(items / 28) + 1`). Reading closest to the text: keep the
+        // stated take condition (`next == REPORT_END || last.map_or(next >
+        // asked, |l| next > l)`) without adding an unstated `items.len() ==
+        // REPORT_ITEMS` check.
         let advances = next == REPORT_END || last.map_or(next > asked, |l| next > l);
         let reporter = (from, self.table.generation(from));
         let structural = items.len() <= REPORT_ITEMS && rising && advances;
