@@ -2519,12 +2519,12 @@ impl Model {
     /// roles; the starts, the fences, the units, the pending messages (at
     /// most `PENDING_STEP`) and the observations take a bounded amount
     /// beside them (O15).
-    /// Whether a sweep, fence round, start retry/timeout, rebuild `STUCK_NS`,
-    /// or active recovery involving this node coincides with `self.now` on core 0.
+    /// Whether a fence round, start retry/timeout, rebuild `STUCK_NS`, or
+    /// active recovery (death, fence, seal, fresh start, or rebuild) involving
+    /// this node coincides with `self.now` on core 0.
     #[cfg(test)]
     pub(crate) fn core0_recovery_due_now(&self) -> bool {
         let mnow = self.membership_now();
-        let sweep_due = self.now >= self.next_sweep && self.others_exist();
         let fence_due = self
             .fences
             .iter()
@@ -2534,7 +2534,7 @@ impl Model {
             self.rebuild_wait_since(r)
                 .is_some_and(|at| mnow >= at + self.table.stuck_ns)
         });
-        sweep_due || fence_due || start_due || rebuild_stuck_due || self.recovery_in_progress(None)
+        fence_due || start_due || rebuild_stuck_due || self.recovery_in_progress(None)
     }
 
     pub(crate) fn reserve_step(&mut self) {

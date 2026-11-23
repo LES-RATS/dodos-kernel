@@ -781,11 +781,14 @@ impl Model {
         }
         self.watch_own_cores();
         #[cfg(test)]
-        let recovery_coincides = at == 0 && self.core0_recovery_due_now();
+        let recovery_coincides_before = at == 0 && self.core0_recovery_due_now();
         // The recovery reserve runs on the node's first core.
         if at == 0 {
             self.reserve_step();
         }
+        #[cfg(test)]
+        let recovery_coincides =
+            recovery_coincides_before || (at == 0 && self.core0_recovery_due_now());
         let mut due: Vec<((u64, u64, u64), Due)> = Vec::new();
         for (&id, sched) in &self.scheds {
             if sched.core != at {

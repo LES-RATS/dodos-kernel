@@ -128,7 +128,6 @@ pub(crate) struct BoundHits {
     pub(crate) grants_full_in_recovery: bool,
     pub(crate) uses_dropped_in_recovery: bool,
     pub(crate) pending_step_32_in_recovery: bool,
-    pub(crate) pending_step_capped: bool,
     pub(crate) time_event_step_16_in_recovery: bool,
 }
 

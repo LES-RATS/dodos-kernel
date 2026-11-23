@@ -1769,7 +1769,7 @@ impl Run {
             Header, PENDING_STEP, REQUESTS_PER_PEER, RING_ANSWER_RESERVE, RING_KERNEL_ENTRIES,
             RING_USER_ENTRIES, SCHED_MIN_BUDGET_NS, SENDS_PER_PEER, SENDS_RESERVED_FOR_MANAGE,
             START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_IRQ_CONTROL, START_SLOT_MAILBOX,
-            TIME_EVENT_STEP, UNIT_REQUESTS,
+            UNIT_REQUESTS,
         };
 
         self.run(2 * MS);
@@ -2555,7 +2555,10 @@ impl Run {
                 self.m
                     .ok(0, super::retype_from(ut0, ObjectKind::Timer, 0, 1100 + i));
             }
-            // Coincidence A: exact `next_sweep` instant on core 0.
+            // Coincidence A: exact `next_sweep` instant on core 0 (healthy;
+            // must hit `time_event_step_16` without latching
+            // `time_event_step_16_in_recovery`).
+            let in_rec_before_a = self.m.bounds.time_event_step_16_in_recovery;
             if self.m.sys.node(0).next_sweep <= self.m.sys.now() + 2 * MS {
                 let past = self
                     .m
@@ -2584,6 +2587,7 @@ impl Run {
             }
             self.run(sweep_at - 1 - self.m.sys.now());
             self.m.sys.move_clock(sweep_at);
+            let a_healthy = !self.m.sys.node(0).core0_recovery_due_now();
             self.m.sys.fire(Event::Timer {
                 node: 0,
                 position: 0,
@@ -2600,52 +2604,114 @@ impl Run {
                 .filter(|t| t.is_some())
                 .count();
             assert!(
-                armed_after >= 20 - TIME_EVENT_STEP,
+                armed_after >= 20 - 16,
                 "TIME_EVENT_STEP cap at sweep_at must leave >= 4 timers armed, got {armed_after}"
             );
+            assert_eq!(self.m.sys.node(0).event.due_taken, 16);
             assert_eq!(self.m.sys.node(0).cores[0].hw_timer, Some(sweep_at));
             assert!(self.m.bounds.time_event_step_16);
-            assert!(self.m.bounds.time_event_step_16_in_recovery);
+            if a_healthy {
+                assert_eq!(
+                    self.m.bounds.time_event_step_16_in_recovery, in_rec_before_a,
+                    "healthy sweep must not latch time_event_step_16_in_recovery"
+                );
+            }
             self.run(2 * MS);
 
-            // Coincidence B: exact `Fence` round instant on core 0 while fencing node 1.
+            // Coincidence B: exact `Fence` round instant on core 0 while
+            // fencing node 1 (an active recovery). Deleting Coincidence A must
+            // still leave `time_event_step_16_in_recovery` reached, and
+            // raising `TIME_EVENT_STEP` from 16 to 17 must fail here.
             assert_eq!(self.call(0, kill(1)), Some(DONE));
-            if let Some(fence) = self.m.sys.node(0).fences.get(&1).copied() {
-                let fence_round_ns = self.m.sys.node(0).fence_round(1, fence.generation);
-                let fence_at = if fence.last == 0 {
-                    self.m.sys.now() + 2 * MS
-                } else {
-                    fence.last + fence_round_ns
-                };
-                if fence_at > self.m.sys.now() + 1 {
-                    for i in 0..20u32 {
-                        assert!(
-                            self.m
-                                .call(
-                                    0,
-                                    Syscall::TimerSet {
-                                        timer: s(1100 + i),
-                                        notify: s(BELL),
-                                        deadline: fence_at,
-                                        tolerance: 0,
-                                    },
-                                )
-                                .is_ok()
-                        );
-                    }
-                    self.run(fence_at - 1 - self.m.sys.now());
-                    if self.m.state(0) == MemberState::Live {
-                        self.m.sys.move_clock(fence_at);
-                        self.m.sys.fire(Event::Timer {
-                            node: 0,
-                            position: 0,
-                        });
-                        assert_eq!(self.m.sys.check(), Ok(()));
-                        self.m.sample_bounds();
-                        self.note();
-                    }
-                }
+            let fence = *self
+                .m
+                .sys
+                .node(0)
+                .fences
+                .get(&1)
+                .expect("node 0 fencing node 1 after kill(1)");
+            let fence_round_ns = self.m.sys.node(0).fence_round(1, fence.generation);
+            let fence_at = if fence.last == 0 {
+                self.m.sys.now() + 2 * MS
+            } else {
+                fence.last + fence_round_ns
+            };
+            assert!(
+                fence_at > self.m.sys.now() + 1,
+                "fence_at ({fence_at}) must be in the future (now={})",
+                self.m.sys.now()
+            );
+            for i in 0..20u32 {
+                assert!(
+                    self.m
+                        .call(
+                            0,
+                            Syscall::TimerSet {
+                                timer: s(1100 + i),
+                                notify: s(BELL),
+                                deadline: fence_at,
+                                tolerance: 0,
+                            },
+                        )
+                        .is_ok()
+                );
             }
+            self.run(fence_at - 1 - self.m.sys.now());
+            assert_eq!(self.m.state(0), MemberState::Live);
+            self.m.sys.move_clock(fence_at);
+            assert!(
+                self.m.sys.node(0).core0_recovery_due_now(),
+                "node 0 must be in recovery at fence_at"
+            );
+            let armed_before_b = self
+                .m
+                .sys
+                .node(0)
+                .timers
+                .values()
+                .filter(|t| t.is_some())
+                .count();
+            assert_eq!(armed_before_b, 20);
+            let replenishments_due_b = self
+                .m
+                .sys
+                .node(0)
+                .scheds
+                .values()
+                .filter(|sc| {
+                    sc.core == 0
+                        && sc.queue.is_some()
+                        && sc.throttled.is_some_and(|(instant, _)| instant <= fence_at)
+                })
+                .count();
+            self.m.sys.fire(Event::Timer {
+                node: 0,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            let armed_after_b = self
+                .m
+                .sys
+                .node(0)
+                .timers
+                .values()
+                .filter(|t| t.is_some())
+                .count();
+            let expected_armed_b = armed_before_b - (16usize.saturating_sub(replenishments_due_b));
+            assert_eq!(
+                self.m.sys.node(0).event.due_taken,
+                16,
+                "TIME_EVENT_STEP cap of 16 must hold during fence recovery"
+            );
+            assert_eq!(
+                armed_after_b, expected_armed_b,
+                "TIME_EVENT_STEP cap of 16 at fence_at must leave {expected_armed_b} timers armed, got {armed_after_b}"
+            );
+            assert_eq!(self.m.sys.node(0).cores[0].hw_timer, Some(fence_at));
+            self.m.sample_bounds();
+            self.note();
+            assert!(self.m.bounds.time_event_step_16);
+            assert!(self.m.bounds.time_event_step_16_in_recovery);
             wait_state(self, 1, MemberState::Dead, 150);
             assert_eq!(self.call(0, fresh(1, 1 << 1)), Some(DONE));
             wait_state(self, 1, MemberState::Live, 150);

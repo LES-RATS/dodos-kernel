@@ -2124,10 +2124,6 @@ impl Model {
                 || self.fences.contains_key(&z)
                 || self.rebuilds.values().any(|r| r.node == z)
                 || self.starts.values().any(|s| s.node == z)
-                || self.table.roles.iter().any(|w| {
-                    w.state() == dodos_abi::RoleState::Handing
-                        && (w.holder() == z || w.target() == z)
-                })
         };
         if node_recovering(self.node)
             || self.seal.is_some()
@@ -2135,7 +2131,6 @@ impl Model {
             || !self.reclaims.is_empty()
             || !self.fences.is_empty()
             || !self.starts.is_empty()
-            || !self.handing.is_empty()
         {
             return true;
         }

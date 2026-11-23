@@ -917,6 +917,8 @@ impl Model {
         let me = self.node as usize;
         let mut sent = 0;
         let uses: Vec<u16> = self.table.uses[me].keys().copied().collect();
+        #[cfg(test)]
+        let mut step_saw_recovery = false;
         for index in uses {
             if sent >= PENDING_STEP {
                 #[cfg(test)]
@@ -926,12 +928,22 @@ impl Model {
                         .any(|u| u.release_pending || u.signal_pending);
                     if more_pending {
                         self.bound_hits.0.pending_step_32 = true;
-                        self.bound_hits.0.pending_step_capped = true;
-                        let in_rec = self.recovery_in_progress(None)
+                        let in_rec = step_saw_recovery
+                            || self.recovery_in_progress(None)
                             || self.table.uses[me]
                                 .values()
                                 .filter(|u| u.release_pending || u.signal_pending)
-                                .any(|u| self.recovery_in_progress(Some(u.granter)));
+                                .any(|u| {
+                                    let current = self.table.generation(u.granter) == u.generation
+                                        && matches!(
+                                            self.table.member(u.granter).state(),
+                                            MemberState::Starting
+                                                | MemberState::Live
+                                                | MemberState::Sealing
+                                                | MemberState::Sealed
+                                        );
+                                    !current || self.recovery_in_progress(Some(u.granter))
+                                });
                         if in_rec {
                             self.bound_hits.0.pending_step_32_in_recovery = true;
                         }
@@ -958,10 +970,8 @@ impl Model {
                 );
             if entry.release_pending {
                 #[cfg(test)]
-                if self.bound_hits.0.pending_step_capped
-                    && (!current || self.recovery_in_progress(Some(entry.granter)))
-                {
-                    self.bound_hits.0.pending_step_32_in_recovery = true;
+                if !current || self.recovery_in_progress(Some(entry.granter)) {
+                    step_saw_recovery = true;
                 }
                 if !current {
                     self.free_use(index);
@@ -990,8 +1000,8 @@ impl Model {
                 );
             if entry.signal_pending && over {
                 #[cfg(test)]
-                if self.bound_hits.0.pending_step_capped {
-                    self.bound_hits.0.pending_step_32_in_recovery = true;
+                {
+                    step_saw_recovery = true;
                 }
                 if let Some(used) = self.table.uses[me].get_mut(&index) {
                     used.signal_pending = false;
@@ -1000,10 +1010,8 @@ impl Model {
             }
             if entry.signal_pending && current {
                 #[cfg(test)]
-                if self.bound_hits.0.pending_step_capped
-                    && self.recovery_in_progress(Some(entry.granter))
-                {
-                    self.bound_hits.0.pending_step_32_in_recovery = true;
+                if self.recovery_in_progress(Some(entry.granter)) {
+                    step_saw_recovery = true;
                 }
                 let body = Body::Signal {
                     grant: entry.grant,
@@ -1016,10 +1024,6 @@ impl Model {
                     sent += 1;
                 }
             }
-        }
-        #[cfg(test)]
-        {
-            self.bound_hits.0.pending_step_capped = false;
         }
         (sent, false)
     }

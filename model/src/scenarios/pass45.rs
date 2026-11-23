@@ -544,3 +544,174 @@ fn harm_accepts_coresilent_only_for_d171_orphaned_fresh_start() {
     );
     assert!(m4.harm.accepts(1, acc4, panic4, m4.sys.canonical()));
 }
+
+// ---------------------------------------------------------------------------
+// 5. Recovery counters (findings 4 and 5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn healthy_sweep_does_not_set_time_event_step_16_in_recovery() {
+    let mut m = S::two();
+    if m.sys.node(0).next_sweep <= m.sys.now() + 2 * MS {
+        let past = m.sys.node(0).next_sweep.saturating_sub(m.sys.now()) + MS;
+        m.run(past);
+    }
+    m.ok(0, m.retype(0, ObjectKind::Notify, 0, 150));
+    for i in 0..17u32 {
+        m.ok(0, m.retype(0, ObjectKind::Timer, 0, 160 + i));
+    }
+    let sweep_at = m.sys.node(0).next_sweep;
+    for i in 0..17u32 {
+        assert_eq!(
+            m.call(
+                0,
+                Syscall::TimerSet {
+                    timer: s(160 + i),
+                    notify: s(150),
+                    deadline: sweep_at,
+                    tolerance: 0,
+                },
+            ),
+            Ok(Output::WasArmed(0))
+        );
+    }
+    m.run(sweep_at - m.sys.now() - 1);
+    m.sys.move_clock(sweep_at);
+    assert!(!m.sys.node(0).recovery_in_progress(None));
+    assert!(!m.sys.node(0).core0_recovery_due_now());
+    m.sys.fire(Event::Timer {
+        node: 0,
+        position: 0,
+    });
+    assert_eq!(m.sys.check(), Ok(()));
+    m.sample_bounds();
+    assert!(m.bounds.time_event_step_16);
+    assert!(!m.bounds.time_event_step_16_in_recovery);
+}
+
+#[test]
+fn planned_role_hand_and_stale_pending_step_not_counted_as_recovery() {
+    // Part A (review44_repro_5): planned RoleHand of a unit role on healthy
+    // Live nodes must NOT count as `recovery_in_progress`.
+    let mut m = super::units::three();
+    let unit = super::units::role_slot(&m, 1, super::units::IOMMU_ROLE);
+    assert!(!m.sys.node(1).recovery_in_progress(None));
+    assert!(!m.sys.node(2).recovery_in_progress(Some(1)));
+    assert_eq!(
+        m.call(
+            1,
+            Syscall::RoleHand {
+                role: unit,
+                node: node_cap(2),
+            },
+        ),
+        WAITS
+    );
+    assert!(!m.sys.node(1).recovery_in_progress(None));
+    assert!(m.step_until(
+        |m| m.sys.role(super::units::IOMMU_ROLE).state() == dodos_abi::RoleState::Handing
+    ));
+    assert!(!m.sys.node(1).recovery_in_progress(None));
+    assert!(!m.sys.node(2).recovery_in_progress(Some(1)));
+
+    // Part B (review44_repro_5): an earlier non-recovery flush that hit
+    // PENDING_STEP must NOT cause a later 1-message recovery flush to latch
+    // `pending_step_32_in_recovery`.
+    let mut m2 = S::on(&machine(Arch::X86_64, 3, &[&[0], &[1], &[2]]));
+    m2.supervisor(2, m2.t[2]);
+    let ut0 = untyped_slot(m2.sys.node(0), m2.t[0]);
+    for i in 0..72u32 {
+        m2.ok(0, retype_from(ut0, ObjectKind::Frame, 1, 200 + i));
+    }
+    let reply1 = m2.retype(1, ObjectKind::Reply, 0, 150);
+    m2.ok(1, reply1);
+    m2.ok(1, place_first(1, 1));
+    let rx1 = m2.thread_on(1, 160, 1);
+    let rights = Rights::READ.union(Rights::SEND).bits();
+    for batch in 0..(72u32 / 4) {
+        let first = batch * 4;
+        assert_eq!(
+            m2.call_by(
+                1,
+                rx1,
+                Syscall::Recv {
+                    endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+                    reply: s(150),
+                    range: crate::Range {
+                        first: s(200 + first),
+                        count: 4,
+                    },
+                    wait: 0,
+                },
+            ),
+            WAITS
+        );
+        assert_eq!(
+            m2.call(
+                0,
+                Syscall::NodeSend {
+                    node: node_cap(1),
+                    message: crate::Message {
+                        caps: (first..first + 4)
+                            .map(|i| crate::Transfer::Derive(s(200 + i), rights))
+                            .collect(),
+                        ..crate::Message::default()
+                    },
+                    doorbell: SlotAddr::NONE,
+                },
+            ),
+            WAITS
+        );
+        m2.settle();
+        assert_eq!(m2.woken(0), Some(&Ok(Output::Sent { flags: 0 })));
+    }
+    for i in 0..dodos_abi::RING_USER_ENTRIES as u32 {
+        m2.ok(1, Syscall::GrantSignal(s(200 + i)));
+    }
+    for i in 0..33u32 {
+        m2.ok(1, Syscall::GrantSignal(s(236 + i)));
+    }
+    let ring_used = |m: &S| {
+        m.sys
+            .node(1)
+            .ring_of(1, 0, true)
+            .produced
+            .wrapping_sub(m.sys.node(1).ring_consumed(0, true))
+    };
+    for _ in 0..500 {
+        if ring_used(&m2) == 0 {
+            break;
+        }
+        let ev = m2.sys.events().into_iter().find(|&ev| {
+            !matches!(
+                ev,
+                Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+            )
+        });
+        match ev {
+            Some(ev) => m2.sys.fire(ev),
+            None => m2.sys.move_clock(m2.sys.now() + 100_000),
+        }
+    }
+    assert_eq!(ring_used(&m2), 0);
+    let rdue = m2.sys.node(1).reserve_due().expect("reserve due");
+    m2.sys.move_clock(rdue);
+    m2.sys.fire(Event::Timer {
+        node: 1,
+        position: 0,
+    });
+    assert_eq!(m2.sys.check(), Ok(()));
+    m2.sample_bounds();
+    assert!(m2.bounds.pending_step_32);
+    assert!(!m2.bounds.pending_step_32_in_recovery);
+    assert_eq!(
+        m2.sys.canonical().uses[1]
+            .values()
+            .filter(|u| u.signal_pending)
+            .count(),
+        1
+    );
+    m2.ok(2, seal(0));
+    m2.run(12 * MS);
+    assert!(!m2.bounds.pending_step_32_in_recovery);
+}
