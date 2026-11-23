@@ -5084,6 +5084,27 @@ fn directed_combination(events: [usize; 3]) -> Seen {
         assert!(probe(&run.m, run.splittable) & (1 << GIVEN) != 0);
     }
 
+    // 2a. If SPLIT is wanted, node 1 takes a free device entry larger than a
+    // page and splits it, as `Run::memory` does (pass 47: no step made it,
+    // and the combination was reached only while the seeds reached it).
+    if has(SPLIT) {
+        let table = run.m.sys.canonical();
+        let page = table.geometry.page().trailing_zeros();
+        let index = table
+            .devices
+            .iter()
+            .position(|e| e.is_used() && e.log2() > page && e.owner.state() == OwnState::Free)
+            .expect("a free device entry larger than a page");
+        let take = super::pass22::take(1, index as u64, 0, ENTRY);
+        assert_eq!(run.call(1, take), Some(DONE));
+        let split = Syscall::MemorySplit {
+            control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),
+            untyped: s(ENTRY),
+        };
+        assert!(matches!(run.call(1, split), Some(Ok(Output::Index(_)))));
+        assert!(probe(&run.m, run.splittable) & (1 << SPLIT) != 0);
+    }
+
     // 2b. If MID_ATTACH is wanted, detach node 2's device (0x10) now and settle
     // so step 15 can launch an attach that stays in `unit_requests` at the
     // snapshot instant.
@@ -6011,6 +6032,17 @@ fn judge_rebuild_cuts_resets_when_holder_restarts_with_same_cut_count() {
 #[test]
 fn directed_line_moving_with_a_hand_death_claims_on_a_node_that_does_not_hand() {
     let name = "resume + holder's death mid-hand + line moving";
+    let seen = directed_combination(combination(name));
+    assert!(reaches(&seen, name));
+}
+
+// The long run of pass 47: no step of `directed_combination` split a device
+// entry, so this combination failed its final probe once the seeds stopped
+// reaching it (a fault of the harness, present at pass 46, reached once
+// the drain of every node's due events changed the seeds' paths).
+#[test]
+fn directed_resume_with_a_hand_death_splits_an_entry() {
+    let name = "resume + holder's death mid-hand + entry split";
     let seen = directed_combination(combination(name));
     assert!(reaches(&seen, name));
 }
