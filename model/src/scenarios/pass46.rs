@@ -15,7 +15,7 @@ const WRITE_52: &str = "52: write of an ownership word";
 
 /// Node 0 of two arms 17 timers at one instant; at that instant one timer
 /// interrupt takes 16 of them and leaves its core draining.
-fn draining(m: &mut S) {
+pub(super) fn draining(m: &mut S) {
     m.ok(0, m.retype(0, ObjectKind::Notify, 0, 150));
     for i in 0..17u32 {
         m.ok(0, m.retype(0, ObjectKind::Timer, 0, 160 + i));
@@ -131,7 +131,7 @@ fn checker_rejects_a_call_while_a_core_of_its_node_drains() {
     let _ = m.sys.node_mut(0).apply(thread, Syscall::CapInspect(s(150)));
     assert_eq!(
         m.sys.check(),
-        Err("node 0: 47: a call ran while a core of the node was draining due events".into())
+        Err("node 0: 47: a call ran while a core had a due event left".into())
     );
 }
 

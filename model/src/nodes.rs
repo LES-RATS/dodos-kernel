@@ -2420,6 +2420,35 @@ impl Model {
             return Some(self.now);
         }
         let now = self.now;
+        // The reserve is a context of period 10 ms: its next step comes at
+        // the latest one period after its last one, an instant that does
+        // not move with the clock.
+        let period = (self.steps_at.0 + RECOVERY_PERIOD_NS).max(now);
+        self.reserve_instants()
+            .into_iter()
+            .filter(|&at| at > now)
+            .min()
+            .map(|at| at.min(period))
+    }
+
+    /// Whether a due event of the first core's timer queue armed by the
+    /// recovery reserve (the sweep, a fence's timed wait, a start's retry,
+    /// a wait of membership: The sweep, D-117 point 1) came due after the
+    /// reserve's last step and the reserve takes a step now. The rest of
+    /// the reserve's work is a scheduling context's (The recovery
+    /// reserve), not a due event: a call may come before it.
+    pub(crate) fn reserve_timer_due(&self) -> bool {
+        let (last, now) = (self.steps_at.0, self.now);
+        self.reserve_due().is_some_and(|at| at <= now)
+            && self
+                .reserve_instants()
+                .into_iter()
+                .any(|at| last < at && at <= now)
+    }
+
+    /// The instants, on the monotonic clock, at which time makes some work
+    /// of the reserve possible.
+    fn reserve_instants(&self) -> Vec<u64> {
         let mut instants: Vec<u64> = Vec::new();
         if self.others_exist() {
             instants.push(self.next_sweep);
@@ -2473,15 +2502,7 @@ impl Model {
         }
         let stopped = self.table.stopped_time;
         instants.extend(membership.into_iter().map(|at| at.saturating_add(stopped)));
-        // The reserve is a context of period 10 ms: its next step comes at
-        // the latest one period after its last one, an instant that does
-        // not move with the clock.
-        let period = (self.steps_at.0 + RECOVERY_PERIOD_NS).max(now);
         instants
-            .into_iter()
-            .filter(|&at| at > now)
-            .min()
-            .map(|at| at.min(period))
     }
 
     /// Whether another node slot exists that runs (the sweep has someone to

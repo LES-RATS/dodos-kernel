@@ -848,6 +848,20 @@ impl Model {
         crate::nodes::loses_context(entry[2], &self.machine).then_some(entry[0])
     }
 
+    /// The cores that take events and have a due event at or before `now`
+    /// left (Due events and the hardware timer): a replenishment or a timer
+    /// of their queues, the `CORE_ANSWER_NS` due event of their request not
+    /// yet taken (TLB: "arms a due event of its timer queue"), and on the
+    /// first core the due events the recovery reserve armed.
+    pub(crate) fn due_cores(&self) -> impl Iterator<Item = usize> + '_ {
+        let panicked = self.table.beacons[self.node as usize].panic.is_some();
+        (0..self.core_count()).filter(move |&p| {
+            let answer = !panicked && self.request_due(p).is_some_and(|at| at <= self.now);
+            let reserve = p == 0 && self.reserve_timer_due();
+            !self.is_silent(p) && (self.timer_draining(p) || answer || reserve)
+        })
+    }
+
     /// Whether a core's timer is due at the current instant.
     pub(crate) fn due_now(&self, core: usize) -> bool {
         self.hardware(core).is_some_and(|at| at <= self.now)

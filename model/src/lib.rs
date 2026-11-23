@@ -698,6 +698,15 @@ struct ASpace {
     units: std::collections::BTreeSet<usize>,
 }
 
+/// Whether every due event of the machine was taken before a call began
+/// (Due events and the hardware timer: "the reference model processes every
+/// due event at its instant before any call at that instant").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DueAtCall {
+    Taken,
+    Left,
+}
+
 /// The change that unhooked a table from an address space or iospace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnhookedBy {
@@ -1071,9 +1080,10 @@ struct EventLog {
     due_total: usize,
     due_taken: usize,
     due_remaining: bool,
-    /// Whether a core of this node was draining due timer events when a call
-    /// began (`Model::apply`; Due events and the hardware timer).
-    call_while_draining: bool,
+    /// Whether a core of any node had a due instant at or before `now` left
+    /// when a call began (`System::apply`; Due events and the hardware
+    /// timer).
+    call_while_due: bool,
     /// The state of this node's member word at each accusation the event
     /// wrote (D-146: only a live or sealing node writes fencing).
     accusers: Vec<dodos_abi::MemberState>,
@@ -1551,7 +1561,23 @@ impl Model {
     ///
     /// The call is an event of the core the thread's events run on: the
     /// core that runs it, else the core of its context.
+    ///
+    /// Alone, outside `System`, the node's due events are taken when its
+    /// driver moves the clock (`advance`, `settle`), never before a call;
+    /// what it cannot leave unnoticed is a call between the timer
+    /// interrupts of a core that `TIME_EVENT_STEP` capped (check 47).
     pub fn apply(&mut self, thread: ObjId, call: Syscall) -> Outcome {
+        let draining = (0..self.width()).any(|c| !self.cores[c].silent && self.timer_draining(c));
+        let left = match draining {
+            true => DueAtCall::Left,
+            false => DueAtCall::Taken,
+        };
+        self.apply_after(thread, call, left)
+    }
+
+    /// Applies one call, `left` saying whether a core of any node of the
+    /// machine still had a due instant when it began (`System::apply`).
+    pub(crate) fn apply_after(&mut self, thread: ObjId, call: Syscall, left: DueAtCall) -> Outcome {
         assert!(self.runnable().contains(&thread), "{thread:?} cannot run");
         let kind = match call {
             Syscall::CapDelete(_) | Syscall::CapRevoke(_) => sched::EventKind::Removal,
@@ -1561,10 +1587,8 @@ impl Model {
         *self.last_event = Some((kind, 0));
         let core = self.core_of(thread);
         assert!(!self.cores[core].silent, "core {core} does not answer");
-        let draining = (0..self.width())
-            .any(|c| !self.cores[c].silent && self.cores[c].asleep == 0 && self.timer_draining(c));
         let entry = self.begin_on(core);
-        self.event.call_while_draining = draining;
+        self.event.call_while_due = left == DueAtCall::Left;
         self.locks.lock_free = matches!(call, Syscall::Signal(_));
         let outcome = self.made(thread, call);
         self.end(entry);

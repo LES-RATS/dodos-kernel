@@ -13,7 +13,7 @@
 
 use crate::boot::{Layout, Machine};
 use crate::nodes::HwAction;
-use crate::{Arch, Model, ObjId, Outcome, Refusal, Syscall};
+use crate::{Arch, DueAtCall, Model, ObjId, Outcome, Refusal, Syscall};
 use dodos_abi::{CoreState, CoreWord, Member, MemberState};
 
 /// The state of a physical core, as the hardware has it.
@@ -330,18 +330,12 @@ impl System {
     /// One call made by a thread of a node, on the core that runs it.
     pub fn apply(&mut self, node: u16, thread: ObjId, call: Syscall) -> Outcome {
         // Determinism: the reference model processes every due event at its
-        // instant before any call at that instant (Due events and the hardware
-        // timer). Drain any core whose capped timer interrupt left due events.
+        // instant before any call at that instant (Due events and the
+        // hardware timer), on every node: each core that takes its
+        // interrupts and has a due instant (`Model::due_now`) takes its
+        // timer interrupts until none is due.
         while !self.stopped {
-            let draining = self.nodes.iter().enumerate().find_map(|(slot, model)| {
-                let model = model.as_ref()?;
-                (0..model.core_count())
-                    .find(|&p| {
-                        !model.is_silent(p) && model.timer_draining(p) && self.awake(model, p)
-                    })
-                    .map(|p| (slot as u16, p))
-            });
-            let Some((slot, position)) = draining else {
+            let Some((slot, position)) = self.due_core() else {
                 break;
             };
             self.fire(Event::Timer {
@@ -349,9 +343,25 @@ impl System {
                 position,
             });
         }
-        let outcome = self.model(node).apply(thread, call);
+        let left = match self.due_core() {
+            Some(_) => DueAtCall::Left,
+            None => DueAtCall::Taken,
+        };
+        let outcome = self.model(node).apply_after(thread, call, left);
         self.after(node);
         outcome
+    }
+
+    /// The first core of any node that takes its interrupts and has a due
+    /// instant at or before `now`.
+    fn due_core(&self) -> Option<(u16, usize)> {
+        self.nodes.iter().enumerate().find_map(|(slot, model)| {
+            let model = model.as_ref()?;
+            model
+                .due_cores()
+                .find(|&p| self.awake(model, p))
+                .map(|p| (slot as u16, p))
+        })
     }
 
     /// The events that can happen now, in a fixed order.
