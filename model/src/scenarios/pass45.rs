@@ -275,7 +275,7 @@ fn capped_timer_interrupt_offers_only_timer_on_draining_core() {
             node: 0,
             position: 0
         }),
-        "draining core must offer only Event::Timer, got {events:?}"
+        "draining core must not offer Event::Ipi before due events drain, got {events:?}"
     );
     assert!(
         events.contains(&Event::Ipi {
@@ -297,6 +297,118 @@ fn capped_timer_interrupt_offers_only_timer_on_draining_core() {
         position: 0
     }));
     assert_eq!(m.sys.check(), Ok(()));
+}
+
+#[test]
+fn draining_core_drains_before_call_offers_action_and_withholds_sleep() {
+    // 1. A call through `System::apply` drains a core's due events first; a
+    // raw `Model::apply` while a core of the node is draining is rejected by
+    // the checker.
+    let mut m = S::two();
+    m.ok(0, m.retype(0, ObjectKind::Notify, 0, 150));
+    for i in 0..17u32 {
+        m.ok(0, m.retype(0, ObjectKind::Timer, 0, 160 + i));
+    }
+    let deadline = m.sys.now() + 5 * MS;
+    for i in 0..17u32 {
+        assert_eq!(
+            m.call(
+                0,
+                Syscall::TimerSet {
+                    timer: s(160 + i),
+                    notify: s(150),
+                    deadline,
+                    tolerance: 0,
+                },
+            ),
+            Ok(Output::WasArmed(0))
+        );
+    }
+    m.run(deadline - m.sys.now() - 1);
+    // Queue a cross-node hardware action at `deadline - 1` before moving the
+    // clock to `deadline` so `Event::Action(0)` is in flight while node 0
+    // core 0 drains at `deadline`.
+    assert_eq!(
+        m.call(
+            1,
+            Syscall::NodeSend {
+                node: node_cap(0),
+                message: crate::Message::default(),
+                doorbell: SlotAddr::NONE,
+            },
+        ),
+        WAITS
+    );
+    m.sys.move_clock(deadline);
+    m.sys.fire(Event::Timer {
+        node: 0,
+        position: 0,
+    });
+    assert!(m.sys.node(0).timer_draining(0));
+    assert_eq!(m.sys.node(0).timers.values().flatten().count(), 1);
+
+    // An `Event::Action` (a pending hardware action in `System::actions`)
+    // remains offered while core 0 is draining.
+    assert!(
+        m.sys.events().contains(&Event::Action(0)),
+        "Event::Action must still be offered while a core is draining"
+    );
+    m.sys.fire(Event::Action(0));
+    assert!(m.sys.node(0).timer_draining(0));
+
+    // A call through `System::apply` drains node 0's remaining due timer
+    // before the call enters the kernel.
+    assert!(m.call(0, Syscall::CapInspect(s(150))).is_ok());
+    assert!(!m.sys.node(0).timer_draining(0));
+    assert_eq!(m.sys.node(0).timers.values().flatten().count(), 0);
+    assert_eq!(m.sys.check(), Ok(()));
+
+    // Re-enter the draining state and check two things:
+    // (a) `Event::Sleep` is withheld on a draining idle core (`!timer_draining`),
+    // (b) a raw `Model::apply` bypassing `System::apply` is rejected by check.
+    let mut m_arm = S::on(&machine(Arch::Aarch64, 2, &[&[0], &[1]]));
+    m_arm.ok(0, m_arm.retype(0, ObjectKind::Notify, 0, 150));
+    for i in 0..17u32 {
+        m_arm.ok(0, m_arm.retype(0, ObjectKind::Timer, 0, 160 + i));
+    }
+    let dl = m_arm.sys.now() + 5 * MS;
+    for i in 0..17u32 {
+        assert_eq!(
+            m_arm.call(
+                0,
+                Syscall::TimerSet {
+                    timer: s(160 + i),
+                    notify: s(150),
+                    deadline: dl,
+                    tolerance: 0,
+                },
+            ),
+            Ok(Output::WasArmed(0))
+        );
+    }
+    m_arm.run(dl - m_arm.sys.now() - 1);
+    m_arm.sys.move_clock(dl);
+    m_arm.sys.fire(Event::Timer {
+        node: 0,
+        position: 0,
+    });
+    assert!(m_arm.sys.node(0).timer_draining(0));
+    // Make core 0 idle (`running == None`) while still draining; `Event::Sleep`
+    // must NOT be offered until the draining follow-up timer has run.
+    let running = m_arm.sys.node_mut(0).cores[0].running.take();
+    assert!(
+        !m_arm.sys.events().contains(&Event::Sleep { core: 0 }),
+        "draining core must not offer Event::Sleep"
+    );
+    m_arm.sys.node_mut(0).cores[0].running = running;
+
+    // Directly applying a call on the `Model` while draining violates check 47.
+    let t0 = m_arm.t[0];
+    let _ = m_arm.sys.node_mut(0).apply(t0, Syscall::CapInspect(s(150)));
+    assert_eq!(
+        m_arm.sys.check(),
+        Err("node 0: 47: a call ran while a core of the node was draining due events".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------------

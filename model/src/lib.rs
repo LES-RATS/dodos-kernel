@@ -1071,6 +1071,9 @@ struct EventLog {
     due_total: usize,
     due_taken: usize,
     due_remaining: bool,
+    /// Whether a core of this node was draining due timer events when a call
+    /// began (`Model::apply`; Due events and the hardware timer).
+    call_while_draining: bool,
     /// The state of this node's member word at each accusation the event
     /// wrote (D-146: only a live or sealing node writes fencing).
     accusers: Vec<dodos_abi::MemberState>,
@@ -1558,7 +1561,10 @@ impl Model {
         *self.last_event = Some((kind, 0));
         let core = self.core_of(thread);
         assert!(!self.cores[core].silent, "core {core} does not answer");
+        let draining = (0..self.width())
+            .any(|c| !self.cores[c].silent && self.cores[c].asleep == 0 && self.timer_draining(c));
         let entry = self.begin_on(core);
+        self.event.call_while_draining = draining;
         self.locks.lock_free = matches!(call, Syscall::Signal(_));
         let outcome = self.made(thread, call);
         self.end(entry);

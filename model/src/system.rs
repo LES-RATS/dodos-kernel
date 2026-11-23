@@ -329,6 +329,26 @@ impl System {
 
     /// One call made by a thread of a node, on the core that runs it.
     pub fn apply(&mut self, node: u16, thread: ObjId, call: Syscall) -> Outcome {
+        // Determinism: the reference model processes every due event at its
+        // instant before any call at that instant (Due events and the hardware
+        // timer). Drain any core whose capped timer interrupt left due events.
+        while !self.stopped {
+            let draining = self.nodes.iter().enumerate().find_map(|(slot, model)| {
+                let model = model.as_ref()?;
+                (0..model.core_count())
+                    .find(|&p| {
+                        !model.is_silent(p) && model.timer_draining(p) && self.awake(model, p)
+                    })
+                    .map(|p| (slot as u16, p))
+            });
+            let Some((slot, position)) = draining else {
+                break;
+            };
+            self.fire(Event::Timer {
+                node: slot,
+                position,
+            });
+        }
         let outcome = self.model(node).apply(thread, call);
         self.after(node);
         outcome
@@ -364,7 +384,6 @@ impl System {
                 }
                 let number = model.core_number(position);
                 if self.hardware[number] == Hardware::Running
-                    && !model.timer_draining(position)
                     && model.sleep_state(position).is_some()
                     && matches!(self.machine.arch, Arch::Aarch64 | Arch::Riscv64)
                 {
@@ -372,7 +391,13 @@ impl System {
                 }
             }
         }
-        // A park waiting for its roused core to wake is not a step.
+        // `Event::Action` stays offered on a draining core: `HwAction::Park`
+        // follows a decision of the node to stop that core (it fails or seals;
+        // its due events are no longer taken, or are taken at the resume), and
+        // `HwAction::Stop` is the fence of another node, which the core does
+        // not choose. `EntryStep`, `StubHalt`, `CpuOff` and `PowerDown` are
+        // steps of a core that runs no kernel code. A park waiting for its
+        // roused core to wake is not a step.
         let waits = |action: &HwAction| matches!(*action, HwAction::Park { core } if self.roused(core) == Some(true));
         events.extend(
             (0..self.actions.len())

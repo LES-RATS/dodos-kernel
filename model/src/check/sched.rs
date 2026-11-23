@@ -371,6 +371,10 @@ impl Model {
                 )?;
             }
         }
+        ensure(
+            !event.call_while_draining,
+            "47: a call ran while a core of the node was draining due events",
+        )?;
         Ok(())
     }
 }
