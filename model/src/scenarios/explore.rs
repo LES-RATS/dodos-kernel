@@ -104,23 +104,44 @@ pub(super) fn quiet(m: &mut S) {
     assert_no_stalled_r6(m);
 }
 
-/// Once the barrier holds and the run is quiet, no fenced node's R6 may stay
-/// held back by a line word, an attach word, or a grant counted only by nodes
-/// that are not themselves frozen in recovery (pass 46, finding 7).
+/// Once the run is quiet, no node is left in recovery by work nobody will
+/// do (pass 46, finding 7; pass 47):
+/// - a fencing node whose driver is a live or sealing node that takes
+///   events: the fence ends, fenced or unfenced, by `FENCE_NS` (D-117
+///   point 1), well inside a quiet run;
+/// - a fenced node whose barrier holds on a live node (whatever its first
+///   core) and whose R6 is held back, unless only by grants whose count
+///   the grantee's use entry keeps for a failed IOMMU unit: the counts its
+///   unmappings left when the unit answered *failed* (`frozen_uses`,
+///   `Model::freeze_unmapping`), which are never lowered (IOMMU, D-142).
+///   A line word, an attach word, or a count R2 would lower has no writer
+///   left.
 #[track_caller]
 pub(super) fn assert_no_stalled_r6(m: &S) {
     let table = m.sys.canonical();
     for x in 0..table.nodes {
         let member = table.member(x);
+        let g = member.generation();
+        if member.state() == MemberState::Fencing {
+            let driver = member.driver();
+            let drives = driver != x
+                && m.sys.has(driver)
+                && table.member(driver).writes()
+                && matches!(m.state(driver), MemberState::Live | MemberState::Sealing)
+                && (0..m.sys.node(driver).core_count()).any(|p| !m.sys.node(driver).is_silent(p));
+            assert!(
+                !drives,
+                "node {x} (gen {g}) left fencing after quiet by its driver {driver}"
+            );
+            continue;
+        }
         if member.state() != MemberState::Fenced {
             continue;
         }
-        let g = member.generation();
         let driver = (0..table.nodes).find(|&n| {
             n != x
                 && m.sys.has(n)
                 && m.state(n) == MemberState::Live
-                && !m.sys.node(n).is_silent(0)
                 && m.sys.node(n).barrier_holds(x)
         });
         let Some(driver) = driver else {
@@ -129,12 +150,6 @@ pub(super) fn assert_no_stalled_r6(m: &S) {
         if !m.sys.node(driver).r6_held_back(x, g) {
             continue;
         }
-        // The only legitimate reason R6 can stay held back after the barrier
-        // holds in a quiet machine is a grant of `(x, g)` whose grantee is
-        // itself frozen (`Fencing`, `Fenced`, or `Unfenced`) with a leaf count
-        // kept by a failed IOMMU unit (D-142, D-149). A line word or attach
-        // word still naming `(x, g)`, or a grant counted by a live/sealing/dead
-        // grantee, has no remaining writer and is a liveness failure.
         let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(x), g).raw();
         let lined = table.lines.values().any(|&raw| raw == taken);
         let attached = table.attach.iter().any(|(key, &raw)| {
@@ -142,30 +157,33 @@ pub(super) fn assert_no_stalled_r6(m: &S) {
                 && dodos_abi::AttachWord::from_raw(raw).and_then(dodos_abi::AttachWord::state)
                     == Some(dodos_abi::AttachState::Attached)
         });
-        let frozen_grantee = table.grants[x as usize].values().any(|entry| {
-            let held = matches!(
-                entry.state,
-                crate::table::GrantState::Live
-                    | crate::table::GrantState::Revoking
-                    | crate::table::GrantState::Pinned
-            );
-            let counted = entry
-                .use_index
-                .filter(|_| held)
-                .and_then(|idx| table.uses[entry.grantee as usize].get(&idx))
-                .is_some_and(|u| u.granter == x && u.serial == entry.serial && u.leaves > 0);
-            counted
-                && matches!(
-                    table.member(entry.grantee).state(),
-                    MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
+        // Each grant of `(x, g)` still counted, with whether a failed unit
+        // keeps its whole count.
+        let counted: Vec<(u16, bool)> = table.grants[x as usize]
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    crate::table::GrantState::Live
+                        | crate::table::GrantState::Revoking
+                        | crate::table::GrantState::Pinned
                 )
-        });
+            })
+            .filter_map(|entry| {
+                let index = entry.use_index?;
+                let used = table.uses[entry.grantee as usize].get(&index)?;
+                let names = used.granter == x && used.serial == entry.serial && used.leaves > 0;
+                let kept = m.sys.has(entry.grantee)
+                    && m.sys.node(entry.grantee).frozen_uses.get(&index) == Some(&used.leaves);
+                names.then_some((entry.grantee, kept))
+            })
+            .collect();
+        let kept = !counted.is_empty() && counted.iter().all(|&(_, kept)| kept);
         assert!(
-            !lined && !attached && frozen_grantee,
+            !lined && !attached && kept,
             "node {x} (gen {g}) left Fenced after quiet with barrier holding on \
              node {driver} and R6 held back by a word nobody will free (lined={lined}, \
-             attached={attached}, lines={:?})",
-            table.lines,
+             attached={attached}, counted grants (grantee, kept by a failed unit)={counted:?})",
         );
     }
 }
