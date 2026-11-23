@@ -58,7 +58,11 @@ impl Model {
 
     /// Interrupts:
     /// 51. the vectors of the claimed entries are claimable and distinct, and
-    ///     so are the inputs of the claimed lines; an entry is idle if and
+    ///     so are the inputs of the lines claimed by entries that are not
+    ///     removing (a removal's masking with *release* frees the line word,
+    ///     and the line may be claimed again while the dying entry waits for
+    ///     its invalidations: `irq_claim` is `busy` on the word alone, D-135,
+    ///     D-150); an entry is idle if and
     ///     only if it is bound to no notify, its notify is live and lists it
     ///     once, and a notify lists only the entries bound to it; a level
     ///     source has nothing pending.
@@ -71,7 +75,7 @@ impl Model {
                 claimable && vectors.insert(irq.vector),
                 "51: vector of an irq",
             )?;
-            let line = !irq.source.is_line() || lines.insert(irq.source.id());
+            let line = !irq.source.is_line() || irq.removing || lines.insert(irq.source.id());
             ensure(line, "51: line of an irq")?;
             let idle = (irq.state == IrqState::Idle) == irq.notify.is_none();
             let listed = irq.notify.is_none_or(|(notify, _)| {

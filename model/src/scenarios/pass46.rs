@@ -277,6 +277,43 @@ fn the_holders_own_removal_frees_the_line_word_in_its_masking_call() {
     remove_210(&mut m, holder);
 }
 
+/// Once the holder's gate freed the line word in the masking call, the
+/// line may be claimed again, by the same node too, while the dying irq
+/// waits for its invalidation: `irq_claim` is `busy` on the word alone
+/// (D-135, D-150; seeds 340, 975, 1114 and 1991 of `many_seeds`).
+#[test]
+fn a_released_line_may_be_claimed_again_before_its_removal_ends() {
+    let mut m = three();
+    let holder = m.sys.role(IOAPIC_ROLE).holder();
+    assert!(matches!(
+        claim_line(&mut m, holder, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+    let _ = m.call(holder, Syscall::CapDelete(s(210)));
+    assert!(!m.sys.canonical().lines.contains_key(&5));
+    let dying = |m: &S| {
+        let irqs = &m.sys.node(holder).irqs;
+        irqs.values().any(|i| i.source.id() == 5 && i.removing)
+    };
+    assert!(dying(&m), "the removal waits for its invalidation");
+    let claim = Syscall::IrqClaim {
+        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+        source: dodos_abi::IrqSource::line(5, false, false).raw(),
+        core: u64::from(holder),
+        vector: 49,
+        destination: s(211),
+    };
+    if m.call(holder, claim) == WAITS {
+        m.run(2 * MS);
+    }
+    assert!(dying(&m));
+    let generation = m.sys.canonical().generation(holder);
+    let taken = Ownership::taken(Owner::Node(holder), generation);
+    assert_eq!(m.sys.canonical().line_word(5), taken);
+    remove_210(&mut m, holder);
+    assert_eq!(m.sys.canonical().line_word(5), taken);
+}
+
 #[test]
 fn checker_rejects_a_line_word_freed_by_its_owner() {
     let (mut m, _, claimant, _) = line_of_a_non_holder();
