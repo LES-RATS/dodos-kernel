@@ -165,15 +165,46 @@ fn an_action_stays_offered_on_a_draining_core() {
 }
 
 /// An idle ARM64 core that drains does not go to sleep before its due
-/// events.
+/// events; once they are taken, it may.
 #[test]
 fn a_draining_core_does_not_sleep() {
     let mut m = S::on(&machine(Arch::Aarch64, 2, &[&[0], &[1]]));
-    draining(&mut m);
-    let running = m.sys.node_mut(0).cores[0].running.take();
+    let method = dodos_abi::IDLE_METHOD_PSCI | ((1u64 << 16) << 32);
+    let entry = [200_000, 400_000, method, dodos_abi::IDLE_FLAG_LOSES_CONTEXT];
+    let idle = Syscall::NodeIdle {
+        node: node_cap(0),
+        core: 0,
+        words: entry.to_vec(),
+    };
+    m.ok(0, idle);
+    m.ok(0, m.retype(0, ObjectKind::Notify, 0, 150));
+    for i in 0..17u32 {
+        m.ok(0, m.retype(0, ObjectKind::Timer, 0, 160 + i));
+    }
+    let deadline = m.sys.now() + 5 * MS;
+    for i in 0..17u32 {
+        let set = Syscall::TimerSet {
+            timer: s(160 + i),
+            notify: s(150),
+            deadline,
+            tolerance: 0,
+        };
+        assert_eq!(m.call(0, set), Ok(Output::WasArmed(0)));
+    }
+    m.ok(0, Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)));
+    m.sys.move_clock(deadline);
+    let timer = Event::Timer {
+        node: 0,
+        position: 0,
+    };
+    m.sys.fire(timer);
+    assert!(m.sys.node(0).timer_draining(0));
     let events = m.sys.events();
-    m.sys.node_mut(0).cores[0].running = running;
     assert!(!events.contains(&Event::Sleep { core: 0 }), "{events:?}");
+    m.sys.fire(timer);
+    assert!(!m.sys.node(0).timer_draining(0));
+    let events = m.sys.events();
+    assert!(events.contains(&Event::Sleep { core: 0 }), "{events:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -393,36 +424,39 @@ fn the_successors_r1_at_the_take_over_frees_the_line_word_before_r5() {
 /// whose cores all entered records nothing at `START_NS`.
 #[test]
 fn a_start_timeout_needs_a_core_awaiting_entry() {
-    let mut m = starting_two_cores();
-    let g = m.sys.member(1).generation();
-    m.sys.node_mut(1).start_entered = Some(0);
-    for core in &mut m.sys.node_mut(1).cores {
-        core.awaiting_entry = false;
-    }
-    m.sys.move_clock(m.sys.now() + dodos_abi::START_NS + MS);
-    m.sys
-        .node_mut(1)
-        .accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
-    let records = &m.sys.canonical().start_timeout_accusations.0;
-    assert!(!records.contains(&(1, g)), "{records:?}");
+    assert!(start_timeout_recorded(|_| {}));
+    let entered = |node: &mut Model| {
+        for core in &mut node.cores {
+            core.awaiting_entry = false;
+        }
+    };
+    assert!(!start_timeout_recorded(entered));
 }
 
 /// D-171's record needs more than one core. The state is forced: a node
 /// of one core has entered it, so no core awaits entry.
 #[test]
 fn a_start_timeout_needs_more_than_one_core() {
+    let one_core = |node: &mut Model| {
+        node.cores.truncate(1);
+        node.cores[0].awaiting_entry = true;
+        assert_eq!(node.width(), 1);
+    };
+    assert!(!start_timeout_recorded(one_core));
+}
+
+/// Whether node 1, starting fresh on two cores, its first core entered,
+/// changed by `change`, records a start timeout when it accuses itself
+/// `CoreSilent` past `START_NS` from that entry.
+fn start_timeout_recorded(change: impl FnOnce(&mut Model)) -> bool {
     let mut m = starting_two_cores();
     let g = m.sys.member(1).generation();
-    m.sys.node_mut(1).cores.truncate(1);
-    m.sys.node_mut(1).cores[0].awaiting_entry = true;
     m.sys.node_mut(1).start_entered = Some(0);
-    assert_eq!(m.sys.node(1).width(), 1);
+    change(m.sys.node_mut(1));
     m.sys.move_clock(m.sys.now() + dodos_abi::START_NS + MS);
-    m.sys
-        .node_mut(1)
-        .accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
-    let records = &m.sys.canonical().start_timeout_accusations.0;
-    assert!(!records.contains(&(1, g)), "{records:?}");
+    let node = m.sys.node_mut(1);
+    node.accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
+    node.table.start_timeout_accusations.0.contains(&(1, g))
 }
 
 /// Node 1 of two cores (machine of three) started fresh by node 0, still
