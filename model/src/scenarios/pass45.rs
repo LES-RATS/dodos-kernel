@@ -308,3 +308,68 @@ fn capped_timer_interrupt_offers_only_timer_on_draining_core() {
     }));
     assert_eq!(m.sys.check(), Ok(()));
 }
+
+// ---------------------------------------------------------------------------
+// 3. Checker blind spots (finding 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn silent_running_owned_core_rejected_by_check() {
+    let mut m = S::two();
+    m.ok(1, m.retype(1, ObjectKind::Notify, 0, 150));
+    m.ok(1, m.retype(1, ObjectKind::Timer, 0, 151));
+    let deadline = m.sys.now() + MS;
+    assert_eq!(
+        m.call(
+            1,
+            Syscall::TimerSet {
+                timer: s(151),
+                notify: s(150),
+                deadline,
+                tolerance: 0,
+            },
+        ),
+        Ok(Output::WasArmed(0))
+    );
+    m.sys.move_clock(deadline + 500 * MS);
+    m.sys.node_mut(1).cores[0].silent = true;
+    assert_eq!(m.sys.hardware(1), crate::system::Hardware::Running);
+    assert_eq!(
+        m.sys.check(),
+        Err("SILENT: a running owned core is marked silent without parking".to_string())
+    );
+}
+
+#[test]
+fn timer_interrupt_due_step_checked_by_event_log() {
+    let mut m = S::two();
+    m.ok(0, m.retype(0, ObjectKind::Notify, 0, 150));
+    for i in 0..17u32 {
+        m.ok(0, m.retype(0, ObjectKind::Timer, 0, 160 + i));
+    }
+    let deadline = m.sys.now() + 5 * MS;
+    for i in 0..17u32 {
+        assert_eq!(
+            m.call(
+                0,
+                Syscall::TimerSet {
+                    timer: s(160 + i),
+                    notify: s(150),
+                    deadline,
+                    tolerance: 0,
+                },
+            ),
+            Ok(Output::WasArmed(0))
+        );
+    }
+    m.run(deadline - m.sys.now() - 1);
+    m.sys.move_clock(deadline);
+    m.sys.fire(Event::Timer {
+        node: 0,
+        position: 0,
+    });
+    // Under mutation `.take(TIME_EVENT_STEP)` -> `.take(1)` in `Model::due`,
+    // `System::check()` must fail here.
+    assert_eq!(m.sys.check(), Ok(()));
+    assert_eq!(m.sys.node(0).timers.values().flatten().count(), 1);
+}

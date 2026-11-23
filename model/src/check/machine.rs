@@ -284,6 +284,34 @@ impl System {
                 member.generation() == generation && member.state() != MemberState::Dead,
                 "P3: a core executes a dead node or a generation that is over",
             )?;
+            // Cross-check on the `silent` exemption of checks 43 and 47:
+            // a core whose hardware is `Running` and whose core word is
+            // `Owned` by its running node (once entered) is not silent,
+            // except while a self-park (`HwAction::Park`) is in flight for
+            // it (seal parking or panic/stop parking before the hardware
+            // park action fires).
+            let parking = self
+                .actions()
+                .iter()
+                .any(|&(_, a)| a == crate::nodes::HwAction::Park { core });
+            if word.state() == CoreState::Owned
+                && self.running_node(slot)
+                && !self.faulty.contains(&slot)
+                && !parking
+            {
+                let silent = self
+                    .models()
+                    .find(|&(n, _)| n == slot)
+                    .and_then(|(_, m)| {
+                        m.position(core as u64)
+                            .map(|p| !m.cores[p].awaiting_entry && m.is_silent(p))
+                    })
+                    .unwrap_or(false);
+                ensure(
+                    !silent,
+                    "SILENT: a running owned core is marked silent without parking",
+                )?;
+            }
         }
         Ok(())
     }

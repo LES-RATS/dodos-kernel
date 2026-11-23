@@ -340,6 +340,37 @@ impl Model {
         let mut raisers: Vec<ObjId> = event.raised.iter().map(|&(t, _)| t).collect();
         raisers.sort();
         let once = raisers.windows(2).all(|pair| pair[0] != pair[1]);
-        ensure(once, "64: a second fault in one event")
+        ensure(once, "64: a second fault in one event")?;
+        if event.ran_due {
+            let expected = event.due_total.min(dodos_abi::TIME_EVENT_STEP);
+            ensure(
+                event.due_taken == expected,
+                "47: timer interrupt did not process min(due, TIME_EVENT_STEP) due events",
+            )?;
+            ensure(
+                event.due_remaining == (event.due_total > dodos_abi::TIME_EVENT_STEP),
+                "47: timer interrupt due_remaining disagrees with due count",
+            )?;
+            if !event.due_remaining {
+                let core = event.due_core;
+                let at = event.due_at;
+                let left_rep = self
+                    .scheds
+                    .values()
+                    .filter(|s| s.core == core)
+                    .filter_map(|s| s.queue.and(s.throttled))
+                    .any(|(instant, _)| instant <= at);
+                let left_tmr = self
+                    .timers
+                    .values()
+                    .flatten()
+                    .any(|armed| armed.core == core && armed.instant <= at);
+                ensure(
+                    !left_rep && !left_tmr,
+                    "47: uncapped timer interrupt left due events unprocessed",
+                )?;
+            }
+        }
+        Ok(())
     }
 }

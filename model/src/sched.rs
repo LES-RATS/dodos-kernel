@@ -810,16 +810,14 @@ impl Model {
         due.sort();
         // Contract (Due events and the hardware timer): if due events remain
         // after `TIME_EVENT_STEP` (16), the hardware timer is set to `now`.
-        #[cfg(test)]
         let total_due = due.len();
-        #[cfg(test)]
         let mut processed = 0usize;
-        self.event.due_remaining = due.len() > TIME_EVENT_STEP;
+        self.event.due_core = at;
+        self.event.due_at = now;
+        self.event.due_total = total_due;
+        self.event.due_remaining = total_due > TIME_EVENT_STEP;
         for (_, event) in due.into_iter().take(TIME_EVENT_STEP) {
-            #[cfg(test)]
-            {
-                processed += 1;
-            }
+            processed += 1;
             match event {
                 Due::Replenish(_, context) => {
                     let debt = self.scheds[&context].throttled.expect("throttled").1;
@@ -828,6 +826,7 @@ impl Model {
                 Due::Fire(timer) => self.fire(timer),
             }
         }
+        self.event.due_taken = processed;
         #[cfg(test)]
         {
             self.bound_hits.0.max_due_events = self.bound_hits.0.max_due_events.max(total_due);
