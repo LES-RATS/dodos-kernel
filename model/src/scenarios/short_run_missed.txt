@@ -242,13 +242,13 @@ resume + sealed + role handing
 resume + sealed + holder's death mid-hand
 resume + sealed + grant unanswered
 resume + sealed + revoking
+resume + sealed + release
 resume + sealed + release crossing revoke
 resume + sealed + release pending
 resume + sealed + signal pending
 resume + sealed + entry split
 resume + sealed + device detached
 resume + sealed + mid-attach
-resume + sealed + line moving
 resume + sealed + wake from sleep
 resume + sealed + first thread before live
 resume + fresh start + role handing
