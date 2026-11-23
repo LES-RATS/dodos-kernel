@@ -8,6 +8,7 @@ pair + accused self + accused retire
 pair + accused self + holder's death mid-hand
 pair + accused self + release pending
 pair + accused self + first thread before live
+pair + accused stale + accused retire
 pair + accused stale + release pending
 pair + accused stale + signal pending
 pair + accused stuck + accused retire
@@ -18,6 +19,7 @@ pair + accused stuck + release crossing revoke
 pair + accused stuck + release pending
 pair + accused stuck + signal pending
 pair + accused stuck + first thread before live
+pair + accused retire + unfenced
 pair + accused retire + role handing
 pair + accused retire + holder's death mid-hand
 pair + accused retire + grant unanswered
@@ -31,15 +33,14 @@ pair + accused seal + release crossing revoke
 pair + accused seal + release pending
 pair + accused seal + signal pending
 pair + accused seal + mid-attach
-pair + accused seal + first thread before live
 pair + fenced + release pending
 pair + fenced + first thread before live
-pair + unfenced + holder's death mid-hand
 pair + unfenced + grant unanswered
 pair + unfenced + revoking
 pair + unfenced + release crossing revoke
 pair + unfenced + release pending
 pair + unfenced + signal pending
+pair + sealed + first thread before live
 pair + resume + holder's death mid-hand
 pair + resume + grant unanswered
 pair + resume + revoking
@@ -68,9 +69,7 @@ pair + holder's death mid-hand + release crossing revoke
 pair + holder's death mid-hand + release pending
 pair + holder's death mid-hand + signal pending
 pair + holder's death mid-hand + chunk given
-pair + holder's death mid-hand + device detached
 pair + holder's death mid-hand + mid-attach
-pair + holder's death mid-hand + wake from sleep
 pair + holder's death mid-hand + first thread before live
 pair + grant unanswered + release crossing revoke
 pair + grant unanswered + release pending
@@ -99,11 +98,14 @@ pair + signal pending + line moving
 pair + signal pending + wake from sleep
 pair + signal pending + first thread before live
 pair + device detached + first thread before live
+pair + mid-attach + wake from sleep
 pair + mid-attach + first thread before live
 pair + wake from sleep + first thread before live
+resume + accused kill + accused stale
 resume + accused kill + accused stuck
 resume + accused kill + accused retire
 resume + accused kill + accused seal
+resume + accused kill + unfenced
 resume + accused kill + fresh start
 resume + accused kill + role handing
 resume + accused kill + holder's death mid-hand
@@ -113,6 +115,7 @@ resume + accused kill + release
 resume + accused kill + release crossing revoke
 resume + accused kill + release pending
 resume + accused kill + signal pending
+resume + accused kill + entry split
 resume + accused kill + device detached
 resume + accused kill + mid-attach
 resume + accused kill + wake from sleep
@@ -137,9 +140,10 @@ resume + accused self + first thread before live
 resume + accused stale + accused stuck
 resume + accused stale + accused retire
 resume + accused stale + accused seal
+resume + accused stale + fenced
 resume + accused stale + sealed
 resume + accused stale + fresh start
-resume + accused stale + failed unit
+resume + accused stale + role handing
 resume + accused stale + holder's death mid-hand
 resume + accused stale + grant unanswered
 resume + accused stale + revoking
@@ -147,7 +151,7 @@ resume + accused stale + release
 resume + accused stale + release crossing revoke
 resume + accused stale + release pending
 resume + accused stale + signal pending
-resume + accused stale + chunk given
+resume + accused stale + device attached
 resume + accused stale + device detached
 resume + accused stale + mid-attach
 resume + accused stale + wake from sleep
@@ -211,6 +215,7 @@ resume + accused seal + device detached
 resume + accused seal + mid-attach
 resume + accused seal + wake from sleep
 resume + accused seal + first thread before live
+resume + fenced + unfenced
 resume + fenced + role handing
 resume + fenced + holder's death mid-hand
 resume + fenced + grant unanswered
@@ -220,11 +225,12 @@ resume + fenced + release pending
 resume + fenced + signal pending
 resume + fenced + device detached
 resume + fenced + mid-attach
+resume + fenced + line moving
 resume + fenced + wake from sleep
 resume + fenced + first thread before live
 resume + unfenced + sealed
 resume + unfenced + fresh start
-resume + unfenced + failed unit
+resume + unfenced + role handing
 resume + unfenced + holder's death mid-hand
 resume + unfenced + grant unanswered
 resume + unfenced + revoking
@@ -232,7 +238,7 @@ resume + unfenced + release
 resume + unfenced + release crossing revoke
 resume + unfenced + release pending
 resume + unfenced + signal pending
-resume + unfenced + chunk given
+resume + unfenced + device attached
 resume + unfenced + device detached
 resume + unfenced + mid-attach
 resume + unfenced + wake from sleep
@@ -283,8 +289,10 @@ resume + role handing + release crossing revoke
 resume + role handing + release pending
 resume + role handing + signal pending
 resume + role handing + chunk given
+resume + role handing + entry split
 resume + role handing + device detached
 resume + role handing + mid-attach
+resume + role handing + line moving
 resume + role handing + wake from sleep
 resume + role handing + first thread before live
 resume + holder's death mid-hand + grant unanswered
@@ -378,6 +386,8 @@ resume + line moving + wake from sleep
 resume + line moving + first thread before live
 resume + wake from sleep + first thread before live
 death + sealed + release pending
+death + sealed + first thread before live
+death + resume + role handing
 death + resume + holder's death mid-hand
 death + resume + grant unanswered
 death + resume + revoking
@@ -388,6 +398,7 @@ death + resume + device detached
 death + resume + mid-attach
 death + resume + wake from sleep
 death + resume + first thread before live
+death + fresh start + role handing
 death + fresh start + holder's death mid-hand
 death + fresh start + grant unanswered
 death + fresh start + revoking
@@ -403,13 +414,11 @@ death + failed unit + release crossing revoke
 death + failed unit + release pending
 death + failed unit + signal pending
 death + failed unit + mid-attach
-death + failed unit + first thread before live
 death + role handing + grant unanswered
 death + role handing + revoking
 death + role handing + release crossing revoke
 death + role handing + release pending
 death + role handing + signal pending
-death + role handing + wake from sleep
 death + role handing + first thread before live
 death + holder's death mid-hand + grant unanswered
 death + holder's death mid-hand + revoking
@@ -418,9 +427,7 @@ death + holder's death mid-hand + release crossing revoke
 death + holder's death mid-hand + release pending
 death + holder's death mid-hand + signal pending
 death + holder's death mid-hand + chunk given
-death + holder's death mid-hand + device detached
 death + holder's death mid-hand + mid-attach
-death + holder's death mid-hand + wake from sleep
 death + holder's death mid-hand + first thread before live
 death + grant unanswered + release crossing revoke
 death + grant unanswered + release pending
@@ -457,6 +464,7 @@ death + signal pending + mid-attach
 death + signal pending + line moving
 death + signal pending + wake from sleep
 death + signal pending + first thread before live
+death + device attached + first thread before live
 death + device detached + first thread before live
 death + mid-attach + wake from sleep
 death + mid-attach + first thread before live
