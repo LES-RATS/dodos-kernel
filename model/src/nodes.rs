@@ -1295,6 +1295,31 @@ impl Model {
                 .retain(|_, &mut (n, g)| !(n == node && g == generation));
             unit.cut_lines
                 .retain(|&(_, n, g)| !(n == node && g == generation));
+            // R1 of a controller holder masks every line whose line word
+            // `node`'s generation took on that controller and writes the line
+            // word *free*, unclaimed, in the same call (Reclaim, R1; D-150).
+            if self.table.role_records[role].governs == dodos_abi::Governs::IoApic {
+                let taken =
+                    dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation).raw();
+                let freed: Vec<u32> = self
+                    .table
+                    .lines
+                    .iter()
+                    .filter(|&(&gsi, &raw)| raw == taken && self.ioapic_role(gsi) == Some(role))
+                    .map(|(&gsi, _)| gsi)
+                    .collect();
+                for gsi in freed {
+                    if let Some(unit) = self.table.units.get_mut(&role) {
+                        unit.masked.remove(&gsi);
+                    }
+                    if self.machine.arch == crate::Arch::Riscv64
+                        && let Some(line) = self.table.aplic.get_mut(&gsi)
+                    {
+                        line.deactivate();
+                    }
+                    self.table.write_line(self.node, gsi, None);
+                }
+            }
             let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
             if let Some(reclaim) = self.reclaims.get_mut(&node) {
                 reclaim.r1.insert(role, Some(serial));
@@ -1393,7 +1418,7 @@ impl Model {
             })
     }
 
-    /// What holds R6 back for `node`'s generation `g` (D-149).
+    /// What holds R6 back for `node`'s generation `g` (D-149, D-150).
     pub(crate) fn r6_held_back(&self, node: u16, g: u32) -> bool {
         let counted = self.table.grants[node as usize]
             .keys()
@@ -1404,7 +1429,8 @@ impl Model {
                 && dodos_abi::AttachWord::from_raw(raw).and_then(dodos_abi::AttachWord::state)
                     == Some(dodos_abi::AttachState::Attached)
         });
-        counted || attached
+        let lined = self.table.lines.values().any(|&raw| raw == taken);
+        counted || attached || lined
     }
 
     /// The attach words beside identifier words `node`'s generation took,
@@ -1751,11 +1777,12 @@ impl Model {
                         None => cursor = Clear { phase: 1, index: 0 },
                     }
                 }
-                // Its use entries: free; then the line words its generation
-                // took: free, unclaimed (Interrupts, D-135); then attach
-                // words (before chunks clear page classes: Check 88, Gate
-                // words D-154); then the entries of its cores' interrupt
-                // tables (before core words are freed).
+                // Its use entries: free; then verify no line word still names
+                // its generation (R1 of the controller holder frees line words,
+                // R6 stops at one that still names it: Reclaim, R6; D-150);
+                // then attach words (before chunks clear page classes: Check
+                // 88, Gate words D-154); then the entries of its cores'
+                // interrupt tables (before core words are freed).
                 1 => {
                     let next = self.table.uses[node as usize].keys().next().copied();
                     let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), g).raw();
@@ -1764,7 +1791,11 @@ impl Model {
                         (Some(index), _) => {
                             self.table.uses[node as usize].remove(&index);
                         }
-                        (None, Some(gsi)) => self.table.write_line(self.node, gsi, None),
+                        (None, Some(_)) => {
+                            *units += 1;
+                            self.reclaims.get_mut(&node).expect("a reclaim").clear = Some(cursor);
+                            return before;
+                        }
                         (None, None) => {
                             // Then the attach words beside the identifier
                             // words its generation took: 0, the barrier

@@ -1300,6 +1300,11 @@ impl Machine {
             table_floors: layout.table_floors.clone(),
             reserves: layout.reserves.clone(),
             role_records: layout.roles.clone(),
+            ioapics: self
+                .ioapics
+                .iter()
+                .map(|io| (io.first_gsi, io.inputs))
+                .collect(),
             kept: self.kept_ranges(layout.image, layout.crash_len, &layout.unit_tables),
             none: std::sync::Arc::new(layout.none.iter().copied().collect()),
             fence,

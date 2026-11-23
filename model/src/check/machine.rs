@@ -676,6 +676,8 @@ impl System {
                         == Some(dodos_abi::AttachState::Attached)
             });
             ensure(!attached, "R6: a dead generation's device still attached")?;
+            let lined = table.lines.values().any(|&raw| raw == taken);
+            ensure(!lined, "R6: a dead generation's line word still taken")?;
         }
         Ok(())
     }

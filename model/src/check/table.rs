@@ -72,25 +72,30 @@ fn judge_write(write: &crate::table::WordWrite) -> Check {
                         dodos_abi::MemberState::Fenced | dodos_abi::MemberState::Dead
                     ) && m.generation() == g
                 });
-            // An identifier word is detached to free, unclaimed, and so is a
-            // line word, also by R6 when the generation that took it is over
-            // (Interrupts, D-135).
+            // An identifier word is detached to free, unclaimed by its owner.
+            // A line word is freed by its owner on removal, or by its
+            // controller holder in R1 for an accused node before R5
+            // acknowledges it; R6 never frees a line word (D-150).
             let word = write.word;
             let identifier = matches!(
                 word,
                 crate::table::Word::Identifier(_) | crate::table::Word::Line(_)
             );
-            let line_cleared = matches!(word, crate::table::Word::Line(_))
+            let line_r1 = matches!(word, crate::table::Word::Line(_))
                 && state == 2
                 && after_owner == 0xFFFF
+                && write.holds
+                && !write.acked
                 && write.owner.is_some_and(|m| {
                     matches!(
                         m.state(),
-                        dodos_abi::MemberState::Fenced | dodos_abi::MemberState::Dead
+                        dodos_abi::MemberState::Fencing
+                            | dodos_abi::MemberState::Fenced
+                            | dodos_abi::MemberState::Unfenced
                     ) && m.generation() == g
                 });
             let freed = held && (!identifier || after_owner == 0xFFFF);
-            ensure_write(freed || claimed || cleared || line_cleared)
+            ensure_write(freed || claimed || cleared || line_r1)
         }
         _ => ensure_write(false),
     }

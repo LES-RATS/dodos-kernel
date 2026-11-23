@@ -394,6 +394,9 @@ pub(crate) struct WordWrite {
     pub(crate) owner: Option<Member>,
     pub(crate) holds: bool,
     pub(crate) holder: Option<Member>,
+    /// Whether the writer's beacon already acknowledged the word's owner
+    /// generation (distinguishes R1 from R6 on a line word, D-150).
+    pub(crate) acked: bool,
     /// Whether the writer's member word let its gate write (starting,
     /// live or sealing), read before the write.
     pub(crate) writes: bool,
@@ -418,6 +421,9 @@ pub(crate) struct Table {
     /// The ranges of each reserve.
     pub(crate) reserves: Vec<Vec<(u64, u64)>>,
     pub(crate) role_records: Vec<RoleRecord>,
+    /// Each interrupt controller's `(first_gsi, inputs)` range, indexed by
+    /// `RoleRecord::object` for `Governs::IoApic`.
+    pub(crate) ioapics: Vec<(u32, u32)>,
     /// The global read-only set: the kept ranges, the kept image, the crash
     /// areas and the feedback tables (G, class 3).
     pub(crate) kept: Vec<(u64, u64)>,
@@ -890,6 +896,27 @@ impl Table {
         word.may_take(node, self.generation(node), owner, holds)
     }
 
+    /// Whether `node` holds the controller role (`Governs::IoApic`) that
+    /// serves `gsi`.
+    pub(crate) fn holds_line_controller(&self, node: u16, gsi: u32) -> bool {
+        let Some(index) = self
+            .ioapics
+            .iter()
+            .position(|&(first, inputs)| first <= gsi && gsi < first.saturating_add(inputs))
+        else {
+            return false;
+        };
+        self.role_records
+            .iter()
+            .zip(&self.roles)
+            .find(|(record, _)| {
+                record.kind == RoleKind::Unit
+                    && record.governs == Governs::IoApic
+                    && usize::from(record.object) == index
+            })
+            .is_some_and(|(_, word)| word.state() == RoleState::Held && word.holder() == node)
+    }
+
     /// The record of a write of `word` by `writer`, with what its gate read.
     pub(crate) fn journal(&self, writer: u16, word: Word, before: u64, after: u64) -> WordWrite {
         let read = Ownership::from_raw(before);
@@ -909,13 +936,28 @@ impl Table {
                 .filter(|(_, word)| word.state() != RoleState::Vacant)
                 .and_then(|(_, word)| self.members.get(word.holder() as usize).copied())
         });
+        let holds = match word {
+            Word::Line(gsi) => self.holds_line_controller(writer, gsi),
+            _ => reserve.is_some_and(|j| self.holds_reserve(writer, j)),
+        };
+        let acked = read
+            .and_then(|w| match w.owner() {
+                Owner::Node(o) if o < self.nodes => self
+                    .beacons
+                    .get(writer as usize)
+                    .and_then(|b| b.acked.get(o as usize))
+                    .map(|&a| a == w.generation()),
+                _ => None,
+            })
+            .unwrap_or(false);
         WordWrite {
             word,
             writer,
             generation: self.generation(writer),
             owner,
-            holds: reserve.is_some_and(|j| self.holds_reserve(writer, j)),
+            holds,
             holder,
+            acked,
             writes: self.member(writer).writes(),
             before,
             after,
@@ -1049,8 +1091,8 @@ impl Table {
     }
 
     /// The write gate on a line word: *taken* by the writer's generation,
-    /// or `None` for *free*, unclaimed; also R6's clearing of a word that a
-    /// generation that is over took, to its cleared value.
+    /// or `None` for *free*, unclaimed (on removal by the owner, or by the
+    /// controller holder in R1 for an accused node, D-150).
     pub(crate) fn write_line(&mut self, writer: u16, gsi: u32, after: Option<Ownership>) {
         if !self.member(writer).writes() {
             return;
