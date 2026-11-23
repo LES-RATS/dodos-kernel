@@ -1314,7 +1314,12 @@ impl Model {
             // R1 of a controller holder masks every line whose line word
             // `node`'s generation took on that controller and writes the line
             // word *free*, unclaimed, in the same call (Reclaim, R1; D-150).
-            if self.table.role_records[role].governs == dodos_abi::Governs::IoApic {
+            if matches!(
+                self.table.role_records[role].governs,
+                dodos_abi::Governs::IoApic
+                    | dodos_abi::Governs::GicDistributor
+                    | dodos_abi::Governs::Aplic
+            ) {
                 let taken =
                     dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation).raw();
                 let freed: Vec<u32> = self

@@ -228,6 +228,62 @@ fn r1_controller_holder_frees_line_word_on_holder_death_and_takeover() {
     assert!(!m.sys.canonical().lines.contains_key(&5));
 }
 
+#[test]
+fn arm64_gic_distributor_and_riscv_aplic_roles_free_line_words() {
+    for (arch, expected_governs) in [
+        (Arch::Aarch64, dodos_abi::Governs::GicDistributor),
+        (Arch::Riscv64, dodos_abi::Governs::Aplic),
+    ] {
+        let mut m = S::on(&machine(arch, 3, &[&[0], &[1], &[2]]));
+        let role = m
+            .sys
+            .node(0)
+            .ioapic_role(5)
+            .expect("line controller role for GSI 5");
+        assert_eq!(
+            m.sys.canonical().role_records[role].governs,
+            expected_governs,
+            "{arch:?} must boot its line controller role with {expected_governs:?}"
+        );
+        let holder = m.sys.role(role).holder();
+        let others: Vec<u16> = (0..3).filter(|&n| n != holder).collect();
+        let (a, b) = (others[0], others[1]);
+
+        // 1. Non-holder `a` claims line 5 and removes it: the holder of the
+        // GicDistributor/Aplic role frees the line word through its gate when
+        // serving the masking operation 5 with *release*.
+        assert!(matches!(
+            super::pass18::claim_line(&mut m, a, 5, 210),
+            Ok(Output::Msi { .. })
+        ));
+        assert!(m.sys.canonical().lines.contains_key(&5));
+        let mut outcome = Err(Error::Again);
+        for _ in 0..8 {
+            m.settle();
+            outcome = m.call(a, Syscall::CapDelete(s(210)));
+            if outcome != Err(Error::Again) {
+                break;
+            }
+        }
+        assert_eq!(outcome, DONE, "{arch:?}");
+        assert!(!m.sys.canonical().lines.contains_key(&5), "{arch:?}");
+
+        // 2. Non-holder `a` claims line 5 and is killed: the holder of the
+        // GicDistributor/Aplic role frees the line word in R1, and R6
+        // completes `a` to Dead.
+        assert!(matches!(
+            super::pass18::claim_line(&mut m, a, 5, 210),
+            Ok(Output::Msi { .. })
+        ));
+        assert!(m.sys.canonical().lines.contains_key(&5));
+        m.supervisor(b, m.t[b as usize]);
+        m.ok(b, kill(a));
+        m.run(80 * MS);
+        assert_eq!(m.state(a), MemberState::Dead, "{arch:?}");
+        assert!(!m.sys.canonical().lines.contains_key(&5), "{arch:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. Capped timer interrupts run before anything else on that core (finding 1)
 // ---------------------------------------------------------------------------

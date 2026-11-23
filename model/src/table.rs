@@ -913,8 +913,8 @@ impl Table {
         word.may_take(node, self.generation(node), owner, holds)
     }
 
-    /// Whether `node` holds the controller role (`Governs::IoApic`) that
-    /// serves `gsi`.
+    /// Whether `node` holds the line controller role (`Governs::IoApic`,
+    /// `Governs::GicDistributor` or `Governs::Aplic`) that serves `gsi`.
     pub(crate) fn holds_line_controller(&self, node: u16, gsi: u32) -> bool {
         let Some(index) = self
             .ioapics
@@ -928,7 +928,10 @@ impl Table {
             .zip(&self.roles)
             .find(|(record, _)| {
                 record.kind == RoleKind::Unit
-                    && record.governs == Governs::IoApic
+                    && matches!(
+                        record.governs,
+                        Governs::IoApic | Governs::GicDistributor | Governs::Aplic
+                    )
                     && usize::from(record.object) == index
             })
             .is_some_and(|(_, word)| word.state() == RoleState::Held && word.holder() == node)

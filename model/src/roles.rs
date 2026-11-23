@@ -1028,7 +1028,9 @@ impl Model {
                         .then_some(Item::Handle(u32::from(handle)))
                 }))
                 .collect(),
-            dodos_abi::Governs::IoApic => self
+            dodos_abi::Governs::IoApic
+            | dodos_abi::Governs::GicDistributor
+            | dodos_abi::Governs::Aplic => self
                 .irqs
                 .values()
                 .filter(|irq| {
@@ -1132,7 +1134,9 @@ impl Model {
             let governs = self.table.role_records[role as usize].governs;
             let bad = |i: u32| match governs {
                 dodos_abi::Governs::IommuUnit => Some(Item::Handle(0xffff_ff00 + i)),
-                dodos_abi::Governs::IoApic => Some(Item::Line(
+                dodos_abi::Governs::IoApic
+                | dodos_abi::Governs::GicDistributor
+                | dodos_abi::Governs::Aplic => Some(Item::Line(
                     0xffff_ff00 + i,
                     false,
                     false,

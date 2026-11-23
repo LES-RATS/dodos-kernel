@@ -187,7 +187,8 @@ impl Model {
             .expect("a unit role per IOMMU unit")
     }
 
-    /// The unit role of the IOAPIC that serves a global system interrupt.
+    /// The unit role of the line controller (IOAPIC, GIC distributor or
+    /// APLIC) that serves a global system interrupt.
     pub(crate) fn ioapic_role(&self, gsi: u32) -> Option<usize> {
         let index = self
             .machine
@@ -196,7 +197,12 @@ impl Model {
             .position(|io| io.first_gsi <= gsi && gsi < io.first_gsi + io.inputs)?;
         self.table.role_records.iter().position(|r| {
             r.kind == dodos_abi::RoleKind::Unit
-                && r.governs == dodos_abi::Governs::IoApic
+                && matches!(
+                    r.governs,
+                    dodos_abi::Governs::IoApic
+                        | dodos_abi::Governs::GicDistributor
+                        | dodos_abi::Governs::Aplic
+                )
                 && usize::from(r.object) == index
         })
     }
@@ -364,11 +370,13 @@ impl Model {
         };
         let state = self.table.units.get(&role);
         // The holder serves an operation only on a unit of its kind:
-        // operations 1 to 4 on an IOMMU unit, 5 on an IOAPIC (D-141).
+        // operations 1 to 4 on an IOMMU unit, 5 on a line controller (D-141).
         let iommu_op = !matches!(op, UnitOp::Redirection { .. });
         let kind_fits = match record.governs {
             dodos_abi::Governs::IommuUnit => iommu_op,
-            dodos_abi::Governs::IoApic => !iommu_op,
+            dodos_abi::Governs::IoApic
+            | dodos_abi::Governs::GicDistributor
+            | dodos_abi::Governs::Aplic => !iommu_op,
             _ => false,
         };
         if !kind_fits {

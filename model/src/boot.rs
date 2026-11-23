@@ -1191,9 +1191,14 @@ impl Machine {
             governs,
             object: object as u16,
         };
+        let line_governs = match self.arch {
+            Arch::X86_64 => Governs::IoApic,
+            Arch::Aarch64 => Governs::GicDistributor,
+            Arch::Riscv64 => Governs::Aplic,
+        };
         let mut roles: Vec<RoleRecord> = (0..self.iommus.len())
             .map(|i| unit(Governs::IommuUnit, i))
-            .chain((0..self.ioapics.len()).map(|i| unit(Governs::IoApic, i)))
+            .chain((0..self.ioapics.len()).map(|i| unit(line_governs, i)))
             .collect();
         if self.console {
             roles.push(unit(Governs::Console, 0));
@@ -1348,7 +1353,13 @@ impl Machine {
                 .enumerate()
                 .filter(|(_, (record, _))| {
                     record.kind == RoleKind::Unit
-                        && matches!(record.governs, Governs::IommuUnit | Governs::IoApic)
+                        && matches!(
+                            record.governs,
+                            Governs::IommuUnit
+                                | Governs::IoApic
+                                | Governs::GicDistributor
+                                | Governs::Aplic
+                        )
                 })
                 .map(|(role, (_, word))| {
                     let unit = crate::table::UnitState {
