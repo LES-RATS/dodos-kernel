@@ -11,7 +11,7 @@ use crate::system::Event;
 use crate::table::{LineFree, Word};
 use dodos_abi::{MemberState, Owner, Ownership};
 
-const WRITE_52: &str = "52: write of an ownership word";
+pub(super) const WRITE_52: &str = "52: write of an ownership word";
 
 /// Node 0 of two arms 17 timers at one instant; at that instant one timer
 /// interrupt takes 16 of them and leaves its core draining.
@@ -42,7 +42,7 @@ pub(super) fn draining(m: &mut S) {
 
 /// The member word of `node` made *fencing*, self-reported, in its current
 /// generation.
-fn fencing(m: &mut S, node: u16) -> u32 {
+pub(super) fn fencing(m: &mut S, node: u16) -> u32 {
     let g = m.sys.canonical().generation(node);
     let member = dodos_abi::Member::new(
         MemberState::Fencing,
@@ -56,7 +56,7 @@ fn fencing(m: &mut S, node: u16) -> u32 {
 
 /// Three nodes, line 5 claimed by a node that does not hold the IOAPIC's
 /// role: the holder, the claimant and the third node.
-fn line_of_a_non_holder() -> (S, u16, u16, u16) {
+pub(super) fn line_of_a_non_holder() -> (S, u16, u16, u16) {
     let mut m = three();
     let holder = m.sys.role(IOAPIC_ROLE).holder();
     let others: Vec<u16> = (0..3).filter(|&n| n != holder).collect();

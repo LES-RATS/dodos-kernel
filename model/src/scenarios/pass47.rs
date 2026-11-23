@@ -1,9 +1,13 @@
 //! Pass 47: review of pass 46 (every due event of every node before a
 //! call, the tests that survived their mutations, the liveness check).
 
-use super::pass46::draining;
+use super::pass46::{WRITE_52, draining, fencing, line_of_a_non_holder};
+use super::units::IOAPIC_ROLE;
 use super::*;
 use crate::cores::{Completes, Flush, Request, RequestState};
+use crate::rings::{Target, UnitOp};
+use crate::table::{LineFree, Word};
+use dodos_abi::{Owner, Ownership};
 
 // ---------------------------------------------------------------------------
 // 1. Every due event before any call, on every node (findings 1, 5, 6)
@@ -57,4 +61,123 @@ fn a_call_takes_the_sweep_of_another_node_first() {
     assert!(m.sys.node(0).reserve_timer_due());
     assert_eq!(m.call(1, Syscall::Yield), DONE);
     assert!(m.sys.node(0).next_sweep > sweep);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Tests that survived their mutations (findings 2, 3, 4)
+// ---------------------------------------------------------------------------
+
+/// The claimant's line word 5 written free by `writer`, journaled with
+/// `line_free`, judged by the writer's checks.
+fn free_line_5(m: &S, writer: u16, line_free: LineFree) -> Result<(), &'static str> {
+    let mut sys = m.sys.clone();
+    sys.edit_table(|t| {
+        let taken = t.lines[&5];
+        let unclaimed = Ownership::free(Owner::Unclaimed).raw();
+        let mut write = t.journal(writer, Word::Line(5), taken, unclaimed);
+        write.line_free = Some(line_free);
+        t.lines.remove(&5);
+        t.writes.push(write);
+    });
+    sys.node(writer).check()
+}
+
+/// Finding 2: the holder kept the reclaim record of an older generation of
+/// the claimant, with no R1 recorded on the IOAPIC's role. Accused again,
+/// the claimant's line word is freed by an R1 that does not walk for its
+/// current generation: refused.
+#[test]
+fn checker_rejects_an_r1_line_free_on_a_reclaim_record_of_an_older_generation() {
+    let (mut m, holder, claimant, _) = line_of_a_non_holder();
+    let g = fencing(&mut m, claimant);
+    let stale = crate::nodes::Reclaim {
+        generation: g - 1,
+        isolated: true,
+        ..Default::default()
+    };
+    let model = m.sys.node_mut(holder);
+    model.reclaims.insert(claimant, stale);
+    model.r1(claimant, g);
+    assert!(!model.table.lines.contains_key(&5));
+    let write = model.table.writes.iter().find(|w| w.word == Word::Line(5));
+    assert_eq!(
+        write.and_then(|w| w.line_free),
+        Some(LineFree::R1 { walking: false })
+    );
+    assert_eq!(m.sys.node(holder).check(), Err(WRITE_52));
+}
+
+/// Finding 3: the holder's free of a line word after it acknowledged the
+/// claimant's generation (R6: "R6 frees no line word"), journaled as a
+/// walking R1, is refused by the acknowledgement alone.
+#[test]
+fn checker_rejects_a_line_free_journaled_as_r1_after_the_holders_acknowledgement() {
+    let (mut m, holder, claimant, _) = line_of_a_non_holder();
+    let g = m.sys.canonical().generation(claimant);
+    let fenced = dodos_abi::Member::new(
+        dodos_abi::MemberState::Fenced,
+        dodos_abi::Evidence::SelfReported,
+        dodos_abi::DRIVER_NONE,
+        g,
+    );
+    m.sys.edit_table(|t| t.members[claimant as usize] = fenced);
+    let walking = LineFree::R1 { walking: true };
+    assert_eq!(free_line_5(&m, holder, walking), Ok(()));
+    m.sys
+        .edit_table(|t| t.beacons[holder as usize].acked[claimant as usize] = g);
+    assert_eq!(free_line_5(&m, holder, walking), Err(WRITE_52));
+}
+
+/// The assistant's mutation B: a release free journaled by a node that does
+/// not hold the controller is refused; the holder's is lawful.
+#[test]
+fn checker_rejects_a_release_free_by_a_node_that_does_not_hold_the_controller() {
+    let (m, holder, claimant, third) = line_of_a_non_holder();
+    let release = LineFree::Release {
+        requester: claimant,
+        generation: m.sys.canonical().generation(claimant),
+    };
+    assert_eq!(free_line_5(&m, holder, release), Ok(()));
+    assert_eq!(free_line_5(&m, third, release), Err(WRITE_52));
+}
+
+/// Finding 4: a line irq that is not removing holds its line word
+/// (invariant 96); its word read free is refused.
+#[test]
+fn a_line_irq_not_removing_whose_word_is_free_is_reported() {
+    let (mut m, _, claimant, _) = line_of_a_non_holder();
+    assert_eq!(m.sys.node(claimant).check(), Ok(()));
+    let model = m.sys.node_mut(claimant);
+    assert!(
+        model
+            .irqs
+            .values()
+            .any(|irq| irq.source.is_line() && !irq.removing)
+    );
+    model.table.lines.remove(&5);
+    assert_eq!(
+        m.sys.node(claimant).check(),
+        Err("96: line words and claimed lines")
+    );
+}
+
+/// The assistant's mutation C: operation 5 claimed carries *release* 0
+/// (bit 35 is masked only); the holder refuses a claimed release on the
+/// requester's own line, which it serves with *release* 0.
+#[test]
+fn the_holder_refuses_a_release_on_a_claimed_entry() {
+    let (m, holder, claimant, _) = line_of_a_non_holder();
+    let model = m.sys.node(holder);
+    let g = m.sys.canonical().generation(claimant);
+    let apic = model.machine.core_list()[claimant as usize].hw_id as u32;
+    let claimed = |release| UnitOp::Redirection {
+        gsi: 5,
+        claimed: true,
+        release,
+        level: false,
+        low: false,
+        target: Target::Direct { vector: 48, apic },
+    };
+    assert!(model.operands_allowed(IOAPIC_ROLE, claimed(false), (claimant, g)));
+    assert!(!model.operands_allowed(IOAPIC_ROLE, claimed(true), (claimant, g)));
 }
