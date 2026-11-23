@@ -253,6 +253,31 @@ fn checker_rejects_a_line_word_freed_by_its_owner() {
     assert_eq!(m.sys.node(claimant).check(), Err(WRITE_52));
 }
 
+/// The holder's free in a masking call with *release* names the requester
+/// the word names: a request of another node frees nothing.
+#[test]
+fn checker_rejects_a_release_free_for_another_requester() {
+    let (m, holder, claimant, third) = line_of_a_non_holder();
+    let free_for = |requester: u16| {
+        let mut sys = m.sys.clone();
+        sys.edit_table(|t| {
+            let taken = t.lines[&5];
+            let unclaimed = Ownership::free(Owner::Unclaimed).raw();
+            let mut write = t.journal(holder, Word::Line(5), taken, unclaimed);
+            let generation = t.generation(requester);
+            write.line_free = Some(LineFree::Release {
+                requester,
+                generation,
+            });
+            t.lines.remove(&5);
+            t.writes.push(write);
+        });
+        sys.node(holder).check()
+    };
+    assert_eq!(free_for(claimant), Ok(()));
+    assert_eq!(free_for(third), Err(WRITE_52));
+}
+
 // ---------------------------------------------------------------------------
 // 4. R1's free of a line word (finding 3)
 // ---------------------------------------------------------------------------
