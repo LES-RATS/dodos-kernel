@@ -346,6 +346,7 @@ impl System {
                 };
                 if !events.contains(&event)
                     && !model.is_silent(position)
+                    && !model.timer_draining(position)
                     && self.awake(model, position)
                 {
                     events.push(event);
@@ -363,6 +364,7 @@ impl System {
                 }
                 let number = model.core_number(position);
                 if self.hardware[number] == Hardware::Running
+                    && !model.timer_draining(position)
                     && model.sleep_state(position).is_some()
                     && matches!(self.machine.arch, Arch::Aarch64 | Arch::Riscv64)
                 {
@@ -607,9 +609,9 @@ impl System {
                 self.sync_sleep();
                 // The timer interrupt that woke the core is taken at once,
                 // late by the exit latency (Idle: "An interrupt wakes it");
-                // if `TIME_EVENT_STEP` left strictly-past due events from
-                // that wake, take the follow-up interrupts at once before
-                // anything else runs (Due events and the hardware timer).
+                // if `TIME_EVENT_STEP` left due events at or before `now`,
+                // take the follow-up interrupts at once before anything else
+                // runs (Due events and the hardware timer).
                 if self.hardware[core] == Hardware::Running
                     && let Some((node, position)) = self.position_of(core)
                     && self.node(node).due_now(position)
@@ -620,7 +622,7 @@ impl System {
                         let more = self.hardware[core] == Hardware::Running
                             && self.has(node)
                             && !self.node(node).is_silent(position)
-                            && self.node(node).has_due_past(position);
+                            && self.node(node).has_due_at(position);
                         if !more {
                             break;
                         }

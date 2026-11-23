@@ -687,7 +687,7 @@ impl Model {
     }
 
     /// Whether `core` has any replenishment or armed timer at or before `now`.
-    fn has_due_at(&self, core: usize) -> bool {
+    pub(crate) fn has_due_at(&self, core: usize) -> bool {
         let now = self.now;
         let rep = self
             .scheds
@@ -703,21 +703,10 @@ impl Model {
         rep || tmr
     }
 
-    /// Whether `core` has any replenishment or armed timer strictly before `now`.
-    pub(crate) fn has_due_past(&self, core: usize) -> bool {
-        let now = self.now;
-        let rep = self
-            .scheds
-            .values()
-            .filter(|s| s.core == core)
-            .filter_map(|s| s.queue.and(s.throttled))
-            .any(|(instant, _)| instant < now);
-        let tmr = self
-            .timers
-            .values()
-            .flatten()
-            .any(|armed| armed.core == core && armed.instant < now);
-        rep || tmr
+    /// Whether `core`'s hardware timer is set at or before `now` with due
+    /// events remaining (Due events and the hardware timer).
+    pub(crate) fn timer_draining(&self, core: usize) -> bool {
+        self.cores[core].hw_timer.is_some_and(|at| at <= self.now) && self.has_due_at(core)
     }
 
     /// Refreshes `core`'s hardware timer when it enters idle without running
