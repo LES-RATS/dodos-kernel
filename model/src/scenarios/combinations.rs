@@ -5320,12 +5320,20 @@ fn directed_combination(events: [usize; 3]) -> Seen {
     // 8a-3. If LINE is wanted, claim GSI 5 on a live liner and step until
     // `UnitOp::Redirection` is in `unit_requests` (`probe` has `LINE` set)
     // before step 9c (`RELEASE_PENDING`) runs synchronously on node 4.
+    // The holder of the IOMMU role is no liner when step 9 hands that role
+    // (its thread waits for its claim): another node claims if neither of
+    // `LINERS` may.
     if has(LINE) {
         let ioapic_holder = run.m.sys.role(super::units::IOAPIC_ROLE).holder();
+        let hander = (has(HANDING) || has(HAND_DEATH)).then(|| run.m.sys.role(IOMMU_ROLE).holder());
         let liner = LINERS
             .into_iter()
+            .chain(0..NODES)
             .find(|&n| {
-                run.m.state(n) == MemberState::Live && Some(n) != resume_node && n != ioapic_holder
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && n != ioapic_holder
+                    && Some(n) != hander
             })
             .expect("a liner that does not hold IOAPIC_ROLE");
         let claim = Syscall::IrqClaim {
@@ -5993,4 +6001,16 @@ fn judge_rebuild_cuts_resets_when_holder_restarts_with_same_cut_count() {
         panic.is_err(),
         "judge_rebuild_cuts skipped a generation-2 cut whose count matched generation 1"
     );
+}
+
+// The long run of pass 46: the directed scenario of this combination chose
+// the IOMMU role's holder to claim the line, and step 9 found its thread
+// waiting for the claim when that holder had to hand the role (a fault of
+// the harness, present at pass 45, reached once the seeds stopped reaching
+// the combination).
+#[test]
+fn directed_line_moving_with_a_hand_death_claims_on_a_node_that_does_not_hand() {
+    let name = "resume + holder's death mid-hand + line moving";
+    let seen = directed_combination(combination(name));
+    assert!(reaches(&seen, name));
 }
