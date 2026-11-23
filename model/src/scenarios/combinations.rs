@@ -1,0 +1,6048 @@
+//! A seeded exploration of the combined recovery states between nodes
+//! (pass 25): the rare events of the contract between nodes, steered so
+//! that they are in progress together. Five nodes of one core; two grants
+//! (node 0 to node 2, mapped in an iospace behind the IOMMU unit, and
+//! node 3 to node 4, mapped in an address space), each with a doorbell;
+//! a device attached by nodes 2 and 4; a line that nodes 1 and 3 claim in
+//! turn; a chunk that nodes 1 and 3 give each other and a device entry
+//! node 1 splits; the IOMMU role handed between nodes; and every node
+//! accused by each kind of evidence, fenced or left unfenced, sealed and
+//! resumed, started again. The whole check runs after every step, as in
+//! `explore.rs`.
+//!
+//! After every step the exploration notes which events are in progress
+//! (`probe`), and counts the seeds that reach each pair of them, each
+//! triple of a resume and two others, and each triple of a death and two
+//! others (`Reach`). In the long run (`#[ignore]`, `--release`), each
+//! combination no seed reaches gets focused runs (`focus`, pass 38), and
+//! one that they miss too fails the test, unless `IMPOSSIBLE` shows from
+//! the contract that it cannot happen or `NOT_REACHED_YET` lists it; a
+//! driver outside the seed's triple acts now and then (`VISIT`). The 27
+//! seeds of `verify` reach
+//! about half of them, and fail if they miss one they reached when
+//! measured (`MISSED_BY_THE_SEEDS`, the list of those missed). Then the
+//! machine runs until it is quiet, and its liveness is asserted: no node is
+//! accused that was not harmed (killed, failed, hung, retired or sealed past
+//! `SEAL_NS`), and no wait of a live node for another node, a unit or its
+//! cores is left.
+//!
+//! `DODOS_SEED=<n>` replays one seed with its actions printed;
+//! `DODOS_COUNTS` prints the table of combinations.
+
+use super::explore::{refresh, replayed, say, try_call};
+use super::pass17::{fresh, kill, resume, seal};
+use super::units::{IOMMU_ROLE, IOSPACE};
+use super::*;
+use crate::rings::{Body, UnitOp};
+use crate::system::Hardware;
+use crate::table::{GrantState, RingEntry, Table};
+use crate::{Message, Range, Transfer};
+use dodos_abi::{
+    AttachState, AttachWord, Evidence, IrqSource, Member, NODE_STOP_RETIRE, OwnState, Owner,
+    Ownership, RoleState,
+};
+use std::collections::BTreeSet;
+
+const NODES: u16 = 5;
+const REPLY: u32 = 100;
+const BELL: u32 = 102;
+const BLOCK: u32 = 160;
+const ENTRY: u32 = 170;
+const IRQ: u32 = 210;
+const RECEIVER: u32 = 300;
+/// The slots of the table chunks' cycle (`Run::tables`): a table run, a
+/// child table untyped cut from it, an `aspace` and an `iospace` on that
+/// child, and a frame to map under them; above the frames of `PAIRS`
+/// (node 3's 400 to 431, node 4's 500 to 531), so the cycle runs on every
+/// node (pass 37: until gap 57 was settled they overlapped node 3's
+/// frames on purpose).
+const TBLOCK: u32 = 600;
+const TCHILD: u32 = 601;
+const TASPACE: u32 = 602;
+const TIOSPACE: u32 = 603;
+const TFRAME: u32 = 604;
+const STEPS: usize = 120;
+
+/// A grant between two nodes: the granting node and its frames from
+/// `obj`, the holder and the slots it receives them in from `got`, and
+/// whether the holder maps the first in its iospace (else in its address
+/// space).
+#[derive(Clone, Copy)]
+struct Pair {
+    granter: u16,
+    holder: u16,
+    io: bool,
+    obj: u32,
+    got: u32,
+    frames: u32,
+}
+
+/// Node 0 grants node 2 one frame, mapped behind the IOMMU unit; node 3
+/// grants node 4 32 frames, so that their releases at once fill the
+/// kernel ring to node 3 (64 entries, 34 kept for answers).
+const PAIRS: [Pair; 2] = [
+    Pair {
+        granter: 0,
+        holder: 2,
+        io: true,
+        obj: 101,
+        got: 110,
+        frames: 1,
+    },
+    Pair {
+        granter: 3,
+        holder: 4,
+        io: false,
+        obj: 400,
+        got: 500,
+        frames: 32,
+    },
+];
+/// The nodes that attach a device, each its own.
+const DEVICES: [(u16, u64); 2] = [(2, 0x10), (4, 0x11)];
+/// The nodes that claim the line in turn, and its GSI.
+const LINERS: [u16; 2] = [1, 3];
+const GSI: u32 = 5;
+
+/// The events, each a state in progress somewhere on the machine.
+const KILLED: usize = 0;
+const SELF: usize = 1;
+const STALE: usize = 2;
+const STUCK: usize = 3;
+const RETIRED: usize = 4;
+const SEAL_LATE: usize = 5;
+const FENCED: usize = 6;
+const UNFENCED: usize = 7;
+const SEALED: usize = 8;
+const RESUME: usize = 9;
+const FRESH: usize = 10;
+const FAILED_UNIT: usize = 11;
+const HANDING: usize = 12;
+const HAND_DEATH: usize = 13;
+const UNANSWERED: usize = 14;
+const REVOKING: usize = 15;
+const RELEASE: usize = 16;
+const CROSSING: usize = 17;
+const RELEASE_PENDING: usize = 18;
+const SIGNAL_PENDING: usize = 19;
+const GIVEN: usize = 20;
+const SPLIT: usize = 21;
+const ATTACHED: usize = 22;
+const DETACHED: usize = 23;
+const MID_ATTACH: usize = 24;
+const LINE: usize = 25;
+/// A core waking from a sleep that lost its context (pass 28).
+const WAKE: usize = 26;
+/// A node starting afresh whose first thread runs before it is live
+/// (pass 28).
+const PRE_LIVE: usize = 27;
+const EVENTS: usize = 28;
+/// The node of two cores, whose start can leave its second core out for a
+/// while: the window before live.
+const WIDE: u16 = 4;
+/// The architectures, one per round of the 286 triples of drivers.
+const ARCHES: [Arch; 3] = [Arch::X86_64, Arch::Aarch64, Arch::Riscv64];
+
+const NAMES: [&str; EVENTS] = [
+    "accused kill",
+    "accused self",
+    "accused stale",
+    "accused stuck",
+    "accused retire",
+    "accused seal",
+    "fenced",
+    "unfenced",
+    "sealed",
+    "resume",
+    "fresh start",
+    "failed unit",
+    "role handing",
+    "holder's death mid-hand",
+    "grant unanswered",
+    "revoking",
+    "release",
+    "release crossing revoke",
+    "release pending",
+    "signal pending",
+    "chunk given",
+    "entry split",
+    "device attached",
+    "device detached",
+    "mid-attach",
+    "line moving",
+    "wake from sleep",
+    "first thread before live",
+];
+
+/// The accusations: a node fencing, fenced or unfenced.
+fn accused(state: MemberState) -> bool {
+    matches!(
+        state,
+        MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
+    )
+}
+
+/// The messages of the kernel ring from `from` to `to` not yet consumed.
+fn waiting(table: &Table, from: u16, to: u16) -> impl Iterator<Item = &Body> {
+    let ring = &table.rings[from as usize][to as usize].kernel;
+    let start = table.beacons[to as usize].consumed[from as usize].0;
+    (start..ring.produced).filter_map(|at| match ring.at(at) {
+        Some(RingEntry::Message(message)) => Some(&message.body),
+        _ => None,
+    })
+}
+
+/// A `Release` of grant `grant` of `granter` from its holder, in flight or
+/// pending in the holder's use entry.
+fn releasing(table: &Table, granter: u16, holder: u16, grant: u16) -> bool {
+    let sent = waiting(table, holder, granter)
+        .any(|b| matches!(b, Body::Release { grant: g, .. } if *g == grant));
+    let pending = table.uses[holder as usize]
+        .values()
+        .any(|u| u.granter == granter && u.grant == grant && u.release_pending);
+    sent || pending
+}
+
+/// The events in progress now, as a mask.
+fn probe(m: &S, splittable: usize) -> u32 {
+    let mut at = 0u32;
+    let mut set = |event: usize, holds: bool| {
+        if holds {
+            at |= 1 << event;
+        }
+    };
+    let table = m.sys.canonical();
+    for n in 0..NODES {
+        let member = m.sys.member(n);
+        let state = member.state();
+        if accused(state) {
+            let kind = match member.evidence() {
+                Evidence::Kill => Some(KILLED),
+                Evidence::SelfReported => Some(SELF),
+                Evidence::Stale => Some(STALE),
+                Evidence::Stuck => Some(STUCK),
+                Evidence::Retire => Some(RETIRED),
+                Evidence::Seal => Some(SEAL_LATE),
+                Evidence::None => None,
+            };
+            if let Some(kind) = kind {
+                set(kind, true);
+            }
+        }
+        set(FENCED, state == MemberState::Fenced);
+        set(UNFENCED, state == MemberState::Unfenced);
+        set(
+            SEALED,
+            matches!(state, MemberState::Sealing | MemberState::Sealed),
+        );
+        // A resume from the write of starting with the resume bit to live
+        // (D-144), a fresh start from its write of starting.
+        if state == MemberState::Starting {
+            set(RESUME, member.resuming());
+            set(FRESH, !member.resuming());
+            // Its first thread runs before it is live (pass 28).
+            set(
+                PRE_LIVE,
+                !member.resuming()
+                    && m.sys.has(n)
+                    && m.sys.node(n).generation_built() == member.generation()
+                    && m.sys.node(n).is_ready(),
+            );
+        }
+        if m.sys.has(n) {
+            let node = m.sys.node(n);
+            for entry in node.unit_requests.iter().flatten() {
+                set(MID_ATTACH, matches!(entry.op, UnitOp::Attach { .. }));
+                set(LINE, matches!(entry.op, UnitOp::Redirection { .. }));
+            }
+            set(LINE, node.irqs.values().any(|i| i.removing));
+            set(
+                DETACHED,
+                node.iommus.values().any(|u| !u.detaching.is_empty()),
+            );
+        }
+    }
+    // A core on its way out of a sleep that lost its context.
+    set(
+        WAKE,
+        (0..m.sys.core_count()).any(|core| {
+            matches!(
+                m.sys.hardware(core),
+                Hardware::Asleep { wake: Some(_), .. } | Hardware::Suspending { roused: true, .. }
+            )
+        }),
+    );
+    let word = m.sys.role(IOMMU_ROLE);
+    set(FAILED_UNIT, word.failed());
+    if word.state() == RoleState::Handing {
+        set(HANDING, true);
+        let dying = |n: u16| accused(m.state(n)) || m.state(n) == MemberState::Dead;
+        set(HAND_DEATH, dying(word.holder()) || dying(word.target()));
+    }
+    for granter in 0..NODES {
+        for (&grant, entry) in &table.grants[granter as usize] {
+            set(
+                UNANSWERED,
+                entry.state == GrantState::Live && !entry.answered,
+            );
+            if entry.state == GrantState::Revoking {
+                set(REVOKING, true);
+                set(CROSSING, releasing(table, granter, entry.grantee, grant));
+            }
+        }
+        for holder in 0..NODES {
+            let sent = waiting(table, holder, granter).any(|b| matches!(b, Body::Release { .. }));
+            set(RELEASE, sent);
+        }
+    }
+    for uses in &table.uses {
+        for u in uses.values() {
+            set(RELEASE, u.release_pending);
+            set(RELEASE_PENDING, u.release_pending);
+            set(SIGNAL_PENDING, u.signal_pending);
+        }
+    }
+    let given = |&w: &u64| {
+        Ownership::from_raw(w)
+            .is_some_and(|o| o.state() == OwnState::Free && matches!(o.owner(), Owner::Node(_)))
+    };
+    set(GIVEN, table.owners.iter().any(given));
+    set(
+        SPLIT,
+        table.devices.iter().filter(|e| e.is_used()).count() > splittable,
+    );
+    for &raw in table.attach.values() {
+        match AttachWord::from_raw(raw).and_then(AttachWord::state) {
+            Some(AttachState::Attached) => set(ATTACHED, true),
+            Some(AttachState::Detached) => set(DETACHED, true),
+            Some(AttachState::Pinned) => set(MID_ATTACH, true),
+            None => {}
+        }
+    }
+    at
+}
+
+/// The seeds that reach each combination, summed over the seeds.
+struct Reach {
+    /// The seeds that ended with a failed unit's role held by a sealing
+    /// node (gap 21 of pass 26), and those that saw a failed unit's role
+    /// handed (D-145).
+    gap_21: usize,
+    handed_failed: usize,
+    /// The forged messages of a faulty node seen refused by their receiver.
+    refused: usize,
+    /// Faulty action 9 written while `f`'s R4 for the node had not ended.
+    early_acks: usize,
+    /// D-169 faulty peers cut during rebuilds: silent at `STUCK_NS`, bad items
+    /// at the item check.
+    silent_cuts: usize,
+    bad_item_cuts: usize,
+    /// The seeds that reached each of `TABLE_STATES`.
+    tables: [usize; TABLE_STATES.len()],
+    pairs: Vec<Vec<usize>>,
+    resume: Vec<Vec<usize>>,
+    death: Vec<Vec<usize>>,
+    events: Vec<usize>,
+    bounds: super::bounds::Bounds,
+}
+
+/// What one seed reached.
+#[derive(Default)]
+struct Seen {
+    pairs: BTreeSet<(usize, usize)>,
+    resume: BTreeSet<(usize, usize)>,
+    death: BTreeSet<(usize, usize)>,
+    events: BTreeSet<usize>,
+    refused: usize,
+    /// Faulty action 9 written while `f`'s R4 for the node had not ended.
+    early_acks: usize,
+    /// D-169 faulty peers cut during rebuilds.
+    silent_cuts: usize,
+    bad_item_cuts: usize,
+    /// The states of D-154 to D-157 reached (`TABLE_STATES`).
+    tables: BTreeSet<usize>,
+    bounds: super::bounds::Bounds,
+}
+
+/// The states of the table chunks' cycle and of the gate's defence of
+/// them, which the long and the short runs must reach (pass 35: the audits
+/// of lot 8 found the explorations never reached D-154 to D-157).
+const TABLE_STATES: [&str; 11] = [
+    "a table run taken",
+    "a child table untyped cut",
+    "an aspace on a child table untyped",
+    "an iospace on a child table untyped",
+    "a frame mapped under an aspace's table untyped",
+    "a frame mapped under an iospace's table untyped",
+    "an aspace destroyed with its mapping",
+    "an iospace destroyed with its mapping",
+    "a table run given or destroyed",
+    "a node fenced while another holds its grants",
+    "a faulty gate refused toward a table run it holds",
+];
+
+/// A forged message a faulty node wrote, to be refused by its receiver:
+/// once the receiver's consumer passes it, with the same generation, its
+/// count of refusals is above the one read at the write (the audit of lot
+/// 8a, F6: the comments said "refused" and nothing asserted it).
+struct Forged {
+    from: u16,
+    to: u16,
+    generation: u32,
+    user: bool,
+    end: u64,
+    refused: u64,
+    action: usize,
+    /// The grant a forged `Release` (action 2) names: the granter reads
+    /// the holder's count when it consumes it, and frees the entry if the
+    /// count fell to 0 meanwhile, which is no fault.
+    grant: Option<u16>,
+}
+
+/// The death of a node, around which the triples are counted: any
+/// accusation. Its two others are among the events that are not an
+/// accusation's evidence or outcome.
+const DEATH_OTHERS: std::ops::Range<usize> = SEALED..EVENTS;
+const DEATHS: [usize; 6] = [KILLED, SELF, STALE, STUCK, RETIRED, SEAL_LATE];
+
+impl Seen {
+    fn note(&mut self, mask: u32) {
+        let on: Vec<usize> = (0..EVENTS).filter(|&e| mask & 1 << e != 0).collect();
+        for (i, &a) in on.iter().enumerate() {
+            self.events.insert(a);
+            for &b in &on[i + 1..] {
+                self.pairs.insert((a, b));
+            }
+        }
+        if mask & 1 << RESUME != 0 {
+            let others: Vec<usize> = on.iter().copied().filter(|&e| e != RESUME).collect();
+            for (i, &a) in others.iter().enumerate() {
+                for &b in &others[i + 1..] {
+                    self.resume.insert((a, b));
+                }
+            }
+        }
+        if DEATHS.iter().any(|&d| mask & 1 << d != 0) {
+            let others: Vec<usize> = on
+                .iter()
+                .copied()
+                .filter(|e| DEATH_OTHERS.contains(e))
+                .collect();
+            for (i, &a) in others.iter().enumerate() {
+                for &b in &others[i + 1..] {
+                    self.death.insert((a, b));
+                }
+            }
+        }
+    }
+}
+
+impl Reach {
+    fn new() -> Self {
+        let square = || vec![vec![0; EVENTS]; EVENTS];
+        Self {
+            gap_21: 0,
+            handed_failed: 0,
+            refused: 0,
+            early_acks: 0,
+            silent_cuts: 0,
+            bad_item_cuts: 0,
+            tables: [0; TABLE_STATES.len()],
+            pairs: square(),
+            resume: square(),
+            death: square(),
+            events: vec![0; EVENTS],
+            bounds: super::bounds::Bounds::default(),
+        }
+    }
+
+    fn add(&mut self, seen: &Seen) {
+        for &(a, b) in &seen.pairs {
+            self.pairs[a][b] += 1;
+        }
+        for &(a, b) in &seen.resume {
+            self.resume[a][b] += 1;
+        }
+        for &(a, b) in &seen.death {
+            self.death[a][b] += 1;
+        }
+        for &e in &seen.events {
+            self.events[e] += 1;
+        }
+        self.refused += seen.refused;
+        self.early_acks += seen.early_acks;
+        self.silent_cuts += seen.silent_cuts;
+        self.bad_item_cuts += seen.bad_item_cuts;
+        for &state in &seen.tables {
+            self.tables[state] += 1;
+        }
+        self.bounds.merge(&seen.bounds);
+    }
+}
+
+/// What steers a seed toward a rare state. Each seed takes three, every
+/// triple of them in turn (`drivers`), beside the random actions of every
+/// part of the machine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Driver {
+    Kill,
+    Fail,
+    Stale,
+    Stuck,
+    Retire,
+    /// A node sealed and left past `SEAL_NS`, which nobody resumes.
+    SealLate,
+    /// The bootstrap core hangs where no stop reaches it.
+    Unfence,
+    /// A node sealed and resumed, again and again.
+    Resume,
+    /// A node killed and started afresh.
+    Fresh,
+    FailUnit,
+    /// The IOMMU role handed, and its holder or target killed meanwhile.
+    HandDeath,
+    /// The 32 frames of the second pair released at once.
+    ReleasePending,
+    /// The user ring to a granting node flooded with signals.
+    SignalPending,
+}
+
+const DRIVERS: [Driver; 13] = [
+    Driver::Kill,
+    Driver::Fail,
+    Driver::Stale,
+    Driver::Stuck,
+    Driver::Retire,
+    Driver::SealLate,
+    Driver::Unfence,
+    Driver::Resume,
+    Driver::Fresh,
+    Driver::FailUnit,
+    Driver::HandDeath,
+    Driver::ReleasePending,
+    Driver::SignalPending,
+];
+
+/// One step in so many drives a driver outside the seed's triple.
+const VISIT: usize = 16;
+
+/// The drivers of a seed: the triples of `DRIVERS` in turn.
+fn drivers(seed: u64) -> [Driver; 3] {
+    let n = DRIVERS.len();
+    let triples: Vec<[Driver; 3]> = (0..n)
+        .flat_map(|a| (a + 1..n).flat_map(move |b| (b + 1..n).map(move |c| [a, b, c])))
+        .map(|[a, b, c]| [DRIVERS[a], DRIVERS[b], DRIVERS[c]])
+        .collect();
+    triples[seed as usize % triples.len()]
+}
+
+/// The exploration of one seed.
+struct Run {
+    m: S,
+    rng: Rng,
+    seen: Seen,
+    drivers: [Driver; 3],
+    /// The used entries of the device table at start.
+    splittable: usize,
+    /// The receiving thread of each holder.
+    receivers: Vec<Option<ObjId>>,
+    /// The drivers done once: the unit broken, the bootstrap core hung, a
+    /// node sealed past `SEAL_NS`.
+    once: BTreeSet<usize>,
+    /// The node sealed past `SEAL_NS`, which nobody resumes, and the
+    /// granting node a driver keeps sealed until it acts again.
+    late: Option<u16>,
+    kept: Option<u16>,
+    /// The member words last printed by a replay.
+    members: Vec<Member>,
+    /// The run ended in the state of gap 21 of pass 26, and saw a failed
+    /// unit's role handed.
+    gap_21: bool,
+    handed_failed: bool,
+    /// A node whose events are held back, and for how many more churns.
+    deferred: Option<(u16, u32)>,
+    /// ARM64 and RISC-V: the start of the wide node's second core held
+    /// back for so many churns, so that its first thread runs before it is
+    /// live.
+    late_start: u32,
+    /// A node whose kernel also acts as a faulty kernel in this seed: it
+    /// attempts gate writes that the gate must refuse and writes forged
+    /// messages, sender slots, credits and beacon words that other nodes'
+    /// gates and recovery reserves must refuse or withstand.
+    faulty_node: u16,
+    faulty_acts: usize,
+    forged: Vec<Forged>,
+    /// The seed of this run, for failure messages.
+    seed: u64,
+    /// `(generation, checked_len)` of `rebuild_cuts` already checked on each
+    /// holder slot; reset whenever the slot's generation changes (D-169).
+    cuts_checked: [(u32, usize); NODES as usize],
+    /// The spaces of the table chunks' cycle that map their frame.
+    mapped: BTreeSet<(u16, u32)>,
+    /// The nodes no driver harms: in a focused run, those whose state one
+    /// of its events needs (a release pending needs nodes 3 and 4).
+    spared: BTreeSet<u16>,
+}
+
+/// Seeds whose x86-64 machine gives healthy node 0 a multi-page IOMMU report
+/// (170 MSI remapping handles = 7 pages at 28 items/page) plus an IOAPIC line,
+/// places both `IOMMU_ROLE` and `IOAPIC_ROLE` on node 1, sets `stuck_ms = 30`,
+/// and paces node 0's `ReportAsk` replies at 7 ms (< `RECOVERY_PERIOD_NS`) per
+/// page during concurrent rebuilds so one node's multi-page report exceeds
+/// `STUCK_NS` (D-170). Disjoint from the 27 verify seeds (`seed % 33 == 0`,
+/// `2`) and named regression seeds.
+fn multi_page_seed(seed: u64) -> bool {
+    seed < 286 && seed % 20 == 17
+}
+
+/// Offsets within each 286-seed architecture round reserved for bound-stress
+/// seeds (pass 43). Chosen disjoint from the 27 verify seeds (`seed % 33 == 0`
+/// and `2`), `multi_page_seed` (`seed < 286 && seed % 20 == 17`), `focus` seeds
+/// (`seed % 286 < FOCUS_SEEDS`), and named regression seeds (`0`, `286`, `605`,
+/// `763`, `1109`, `1434`, `277`).
+const BOUND_STRESS_OFFSETS: [u64; 4] = [113, 160, 207, 254];
+
+fn bound_stress_seed(seed: u64) -> bool {
+    seed < 858 && BOUND_STRESS_OFFSETS.contains(&(seed % 286))
+}
+
+/// Offsets within each 286-seed architecture round reserved for pass 44
+/// cross-node recovery pressure seeds (15 seeds across all 3 architectures):
+/// - `71`: full kernel ring (64 entries, 34-entry answer reserve) + 16 open
+///   request credits + 64 `unit_requests` during holder recovery / rebuild /
+///   seal+resume / `RoleHand`;
+/// - `104`: full configured grant/use tables (`grants_max = 128`, 4x
+///   `REMOVAL_STEP`) + refusal/drop during borrower & granter death, reclaim,
+///   and fresh start;
+/// - `148`: >32 `signal_pending` / `release_pending` (`PENDING_STEP`)
+///   interrupted mid-flush by holder seal+resume and granter death+fresh start;
+/// - `181`: >=16 due events (`TIME_EVENT_STEP`) coinciding on core 0 with
+///   `next_sweep` and a `Fence` round timer;
+/// - `225`: 3 cores on `WIDE` (`[4, 5, 6]`), staggered fresh-start entry
+///   (D-171), 3-core TLB shootdown with 3rd core hung, and `MAP_COUNT_MAX`
+///   on a local chunk reclaimed by R6.
+///
+/// Disjoint from verify seeds (`seed % 33 == 0` and `2`), `multi_page_seed`
+/// (`seed < 286 && seed % 20 == 17`), `focus` seeds (`seed % 286 < 6`),
+/// `BOUND_STRESS_OFFSETS`, and named regression seeds (`0`, `286`, `605`,
+/// `763`, `1109`, `1434`, `277`).
+const RECOVERY_PRESSURE_OFFSETS: [u64; 5] = [71, 104, 148, 181, 225];
+
+fn recovery_pressure_seed(seed: u64) -> bool {
+    seed < 858 && RECOVERY_PRESSURE_OFFSETS.contains(&(seed % 286))
+}
+
+impl Run {
+    fn new(seed: u64) -> Self {
+        Self::new_with_idle(seed, true)
+    }
+
+    fn new_with_idle(seed: u64, configure_idle: bool) -> Self {
+        let wide_three = recovery_pressure_seed(seed) && seed % 286 == 225;
+        // Five nodes, the last of two cores (three on offset 225); the
+        // architecture by round.
+        let cores: Vec<Vec<usize>> = (0..NODES as usize)
+            .map(|c| match c as u16 == WIDE {
+                true if wide_three => vec![c, c + 1, c + 2],
+                true => vec![c, c + 1],
+                false => vec![c],
+            })
+            .collect();
+        let layout: Vec<&[usize]> = cores.iter().map(Vec::as_slice).collect();
+        let arch = ARCHES[(seed / 286) as usize % ARCHES.len()];
+        // The times of membership at the low end of their ranges, so that a
+        // seal outlives `SEAL_NS` and a silent core is found stale within
+        // the steps of a seed (Numbers: `SWEEP_NS` from 100 ms, `SEAL_NS`
+        // and `STALE_NS` from 10 ms; `STUCK_NS` above the reserve's period
+        // and `CORE_ANSWER_NS`).
+        let total_cores = NODES as usize + if wide_three { 2 } else { 1 };
+        let mut machine = machine(arch, total_cores, &layout);
+        machine.membership.sweep_ms = 100;
+        machine.membership.seal_ms = 30;
+        machine.membership.stale_ms = 40;
+        machine.membership.stuck_ms = if multi_page_seed(seed) { 30 } else { 40 };
+        if bound_stress_seed(seed) {
+            machine.floors.floor_node = 5 * machine.geometry.chunk();
+            match seed % 286 {
+                113 | 207 => machine.floors.reserves = dodos_abi::RESERVES_MAX,
+                160 | 254 => machine.floors.plain_roles = dodos_abi::ROLES_PLAIN_MAX - 1,
+                _ => {}
+            }
+        }
+        if recovery_pressure_seed(seed) {
+            machine.floors.floor_node = 6 * machine.geometry.chunk();
+            match seed % 286 {
+                71 => {
+                    machine.iommus.push(crate::boot::IommuUnit {
+                        segment: 1,
+                        domains: 256,
+                    });
+                }
+                104 => {
+                    machine.grants_max = 128;
+                }
+                _ => {}
+            }
+        }
+        let m = S::on(&machine);
+        let splittable = m
+            .sys
+            .canonical()
+            .devices
+            .iter()
+            .filter(|e| e.is_used())
+            .count();
+        let faulty_node = (seed % u64::from(NODES)) as u16;
+        let mut run = Self {
+            m,
+            rng: Rng(seed + 701),
+            seen: Seen::default(),
+            drivers: drivers(seed),
+            splittable,
+            receivers: vec![None; NODES as usize],
+            once: BTreeSet::new(),
+            late: None,
+            kept: None,
+            members: Vec::new(),
+            gap_21: false,
+            handed_failed: false,
+            deferred: None,
+            late_start: 0,
+            faulty_node,
+            faulty_acts: 0,
+            forged: Vec::new(),
+            seed,
+            cuts_checked: [(0, 0); NODES as usize],
+            mapped: BTreeSet::new(),
+            spared: BTreeSet::new(),
+        };
+        say(format_args!(
+            "drivers {:?}, faulty node {}",
+            run.drivers, run.faulty_node
+        ));
+        run.set_up_with(configure_idle);
+        run
+    }
+
+    /// The message just written by `from` on a ring toward `to` is forged:
+    /// noted, with `to`'s count of refusals.
+    fn forged(&mut self, from: u16, to: u16) {
+        let pair = &self.m.sys.canonical().rings[from as usize][to as usize];
+        // Actions 6 and 8 write on the user ring, the others on the kernel
+        // ring.
+        let action = self.faulty_acts % 10;
+        let user = matches!(action, 6 | 8);
+        let end = match user {
+            true => pair.user.produced,
+            false => pair.kernel.produced,
+        };
+        self.forged.push(Forged {
+            from,
+            to,
+            generation: self.m.sys.member(to).generation(),
+            user,
+            end,
+            refused: self.m.sys.node(to).refused.0,
+            action,
+            grant: None,
+        });
+    }
+
+    /// Each forged message its receiver consumed is refused.
+    fn judge_forged(&mut self) {
+        for forged in std::mem::take(&mut self.forged) {
+            let to = forged.to;
+            let same = self.m.sys.has(to)
+                && self.m.sys.member(to).generation() == forged.generation
+                && self.m.sys.canonical().writes(to);
+            if !same {
+                continue;
+            }
+            let consumed =
+                self.m.sys.canonical().beacons[to as usize].consumed[forged.from as usize];
+            let consumed = if forged.user { consumed.1 } else { consumed.0 };
+            if consumed.wrapping_sub(forged.end) >= 1 << 63 {
+                self.forged.push(forged);
+                continue;
+            }
+            let freed = forged
+                .grant
+                .is_some_and(|g| !self.m.sys.canonical().grants[to as usize].contains_key(&g));
+            assert!(
+                self.m.sys.node(to).refused.0 > forged.refused || freed,
+                "the forged message of action {} from node {} to node {to} was not refused",
+                forged.action,
+                forged.from
+            );
+            self.seen.refused += 1;
+        }
+    }
+
+    /// D-169 healthy-node guarantee: check every new rebuild cut recorded on
+    /// every node and count faulty peer cuts (`Silent` and `BadItems`).
+    fn judge_rebuild_cuts(&mut self) {
+        for holder in 0..NODES {
+            if !self.m.sys.has(holder) {
+                self.cuts_checked[holder as usize] = (0, 0);
+                continue;
+            }
+            let holder_gen = self.m.sys.node(holder).generation_built();
+            let entry = &mut self.cuts_checked[holder as usize];
+            if entry.0 != holder_gen {
+                *entry = (holder_gen, 0);
+            }
+            let start = entry.1;
+            let cuts = &self.m.sys.node(holder).rebuild_cuts.0;
+            for &cut in &cuts[start..] {
+                let faulty = super::explore::assert_cut_explained(&self.m, self.seed, holder, cut);
+                match (cut.reason, faulty) {
+                    (
+                        crate::units::RebuildCut::Deadline,
+                        Some(crate::units::FaultyReport::Silent),
+                    ) => {
+                        self.seen.silent_cuts += 1;
+                    }
+                    (
+                        crate::units::RebuildCut::BadItem,
+                        Some(crate::units::FaultyReport::BadItems),
+                    ) => {
+                        self.seen.bad_item_cuts += 1;
+                    }
+                    _ => {}
+                }
+            }
+            self.cuts_checked[holder as usize] = (holder_gen, cuts.len());
+        }
+    }
+
+    fn note(&mut self) {
+        self.m.sample_bounds();
+        self.judge_forged();
+        self.judge_rebuild_cuts();
+        let table = self.m.sys.canonical();
+        let fenced_held = (0..NODES).any(|x| {
+            matches!(self.m.state(x), MemberState::Fenced | MemberState::Unfenced)
+                && (0..NODES)
+                    .any(|y| y != x && table.uses[y as usize].values().any(|u| u.granter == x))
+        });
+        if fenced_held {
+            self.seen.tables.insert(9);
+        }
+        if replayed().is_some() {
+            self.print_members();
+        }
+        let mask = probe(&self.m, self.splittable);
+        self.seen.note(mask);
+        let word = self.m.sys.role(IOMMU_ROLE);
+        self.handed_failed |= word.failed() && word.state() == RoleState::Handing;
+    }
+
+    /// A replay prints every change of a member word, and for a new
+    /// accusation the observations its driver held of the node.
+    fn print_members(&mut self) {
+        let members: Vec<Member> = (0..NODES).map(|n| self.m.sys.member(n)).collect();
+        if members == self.members {
+            return;
+        }
+        let table = self.m.sys.canonical();
+        for (n, member) in members.iter().enumerate() {
+            let was = self.members.get(n).map(|m| accused(m.state()));
+            if accused(member.state()) && was == Some(false) {
+                let beacons = table.beacons.get(usize::from(member.driver()));
+                let held =
+                    beacons.map(|b| b.observations.iter().filter(|o| usize::from(o.node) == n));
+                let observations: Vec<_> = held.into_iter().flatten().collect();
+                eprintln!(
+                    "  node {n} accused by {}: {observations:?}",
+                    member.driver()
+                );
+            }
+        }
+        eprintln!("{} members {members:?}", self.m.sys.now());
+        self.members = members;
+    }
+
+    fn call(&mut self, node: u16, call: Syscall) -> Option<Outcome> {
+        let outcome = try_call(&mut self.m, node, call);
+        self.note();
+        outcome
+    }
+
+    fn set_up_with(&mut self, configure_idle: bool) {
+        let m = &mut self.m;
+        // ARM64 and RISC-V: every core idles in a state that loses its
+        // context (`node_idle`, D-143, D-146).
+        let lossy = match m.sys.arch() {
+            Arch::Aarch64 if configure_idle => Some(dodos_abi::IDLE_METHOD_PSCI | 1 << 16 << 32),
+            Arch::Riscv64 if configure_idle => Some(dodos_abi::IDLE_METHOD_SBI | 0x8000_0000 << 32),
+            _ => None,
+        };
+        let wide_cores = m.sys.machine.cores.len() - usize::from(WIDE);
+        for node in 0..NODES {
+            let cores: Vec<u64> = match node == WIDE {
+                true => (0..wide_cores as u64)
+                    .map(|k| u64::from(node) + k)
+                    .collect(),
+                false => vec![u64::from(node)],
+            };
+            for core in cores.into_iter().filter(|_| lossy.is_some()) {
+                let idle = Syscall::NodeIdle {
+                    node: node_cap(node),
+                    core,
+                    words: vec![
+                        200_000,
+                        100_000,
+                        lossy.expect("a lossy state"),
+                        dodos_abi::IDLE_FLAG_LOSES_CONTEXT,
+                    ],
+                };
+                m.ok(node, idle);
+            }
+        }
+        for (node, device) in DEVICES {
+            let iospace = m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
+            m.ok(node, iospace);
+            let call = attach_call(m, node, device, true);
+            // Every seed starts with the device attached (the audit of lot
+            // 8a, F15: a failed attach went unnoticed).
+            match m.call(node, call) {
+                WAITS => {
+                    m.run(30 * MS);
+                    assert_eq!(m.woken(node), Some(&DONE), "the attach of node {node}");
+                }
+                outcome => assert_eq!(outcome, DONE, "the attach of node {node}"),
+            }
+        }
+        for pair in PAIRS {
+            let reply = m.retype(pair.holder, ObjectKind::Reply, 0, REPLY);
+            m.ok(pair.holder, reply);
+            for i in 0..pair.frames {
+                let frame = m.retype(pair.granter, ObjectKind::Frame, 1, pair.obj + i);
+                m.ok(pair.granter, frame);
+            }
+            let bell = m.retype(pair.granter, ObjectKind::Notify, 0, BELL);
+            m.ok(pair.granter, bell);
+            let holder = pair.holder;
+            m.ok(holder, super::place_first(holder, u64::from(holder)));
+            let receiver = m.thread_on(holder, RECEIVER, u64::from(holder));
+            self.receivers[holder as usize] = Some(receiver);
+        }
+        for pair in PAIRS {
+            for group in 0..pair.frames.div_ceil(4) {
+                self.grant(pair, group);
+                self.m.settle();
+            }
+        }
+        for pair in PAIRS {
+            let map = map_call(&self.m, pair);
+            let _ = self.call(pair.holder, map);
+        }
+        self.m.settle();
+        if multi_page_seed(self.seed) {
+            // Put both IOMMU_ROLE and IOAPIC_ROLE on node 1, and give healthy
+            // node 0 170 MSI remapping handles (7 IOMMU report pages) plus
+            // IOAPIC line 6 so a take-over of node 1 rebuilds both roles
+            // concurrently against a multi-page peer (D-170).
+            let ioapic = super::units::IOAPIC_ROLE;
+            let holder = self.m.sys.role(ioapic).holder();
+            if holder != 1 {
+                let roles = slots_of(
+                    self.m.sys.node(holder),
+                    self.m.t[holder as usize],
+                    ObjectKind::Role,
+                );
+                let hand = Syscall::RoleHand {
+                    role: s(roles[ioapic]),
+                    node: node_cap(1),
+                };
+                let _ = self.call(holder, hand);
+                self.m.settle();
+            }
+            for i in 0..170u32 {
+                let claim = Syscall::IrqClaim {
+                    control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                    source: IrqSource::msi(0, (i / 32) as u8, (i % 32) as u8, 0).raw(),
+                    core: 0,
+                    vector: u64::from(48 + i),
+                    destination: s(220 + i),
+                };
+                match self.m.call(0, claim) {
+                    WAITS => {
+                        self.m.settle();
+                        assert!(
+                            self.m.woken(0).is_some_and(Result::is_ok),
+                            "MSI claim {i}: {:?}",
+                            self.m.woken(0)
+                        );
+                    }
+                    outcome => assert!(outcome.is_ok(), "MSI claim {i}: {outcome:?}"),
+                }
+            }
+            let line_claim = Syscall::IrqClaim {
+                control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                source: IrqSource::line(6, false, false).raw(),
+                core: 0,
+                vector: 219,
+                destination: s(391),
+            };
+            match self.m.call(0, line_claim) {
+                WAITS => {
+                    self.m.settle();
+                    assert!(
+                        self.m.woken(0).is_some_and(Result::is_ok),
+                        "line 6 claim: {:?}",
+                        self.m.woken(0)
+                    );
+                }
+                outcome => assert!(outcome.is_ok(), "line 6 claim: {outcome:?}"),
+            }
+            assert_eq!(self.m.sys.node(0).items(IOMMU_ROLE).len(), 171);
+            assert!(self.m.sys.canonical().units[&ioapic].lines.contains_key(&6));
+        }
+        if bound_stress_seed(self.seed) {
+            self.stress_bounds();
+        }
+        if recovery_pressure_seed(self.seed) {
+            self.stress_recovery_pressure();
+        }
+    }
+
+    /// Exercises contract boundaries and their refusal/wait paths on
+    /// `bound_stress_seed` runs (pass 43), keeping every slot at or above
+    /// `1000` so the setup of `PAIRS`, `DEVICES`, and `TBLOCK` is untouched.
+    fn stress_bounds(&mut self) {
+        // On ARM64 and RISC-V, lossy-sleeping cores take exit_latency to wake
+        // and finish the setup grants from `set_up_with`.
+        self.run(2 * MS);
+        let arch = self.m.sys.arch();
+        let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+        let offset = self.seed % 286;
+
+        // 1. NODE_WATCH_SLOTS (4) + 5th slot refused (Invalid).
+        for i in 0..dodos_abi::NODE_WATCH_SLOTS as u32 {
+            self.m
+                .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1000 + i));
+            self.m.ok(
+                0,
+                Syscall::NodeWatch {
+                    node: node_cap(0),
+                    index: u64::from(i),
+                    notify: s(1000 + i),
+                },
+            );
+        }
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1004));
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeWatch {
+                    node: node_cap(0),
+                    index: dodos_abi::NODE_WATCH_SLOTS,
+                    notify: s(1004),
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        self.m.ok(0, Syscall::CapDelete(s(1004)));
+
+        // 2. IDLE_STATES_MAX (15) + 16 states refused (Invalid).
+        let mut idle_words =
+            Vec::with_capacity(dodos_abi::IDLE_STATES_MAX * dodos_abi::IDLE_ENTRY_WORDS);
+        for i in 0..dodos_abi::IDLE_STATES_MAX as u64 {
+            let (method, flags) = match arch {
+                Arch::X86_64 => (dodos_abi::IDLE_METHOD_HALT, 0),
+                Arch::Aarch64 => (
+                    dodos_abi::IDLE_METHOD_PSCI | (((1u64 << 16) | i) << 32),
+                    dodos_abi::IDLE_FLAG_LOSES_CONTEXT,
+                ),
+                Arch::Riscv64 => (
+                    dodos_abi::IDLE_METHOD_SBI | ((0x8000_0000u64 | i) << 32),
+                    dodos_abi::IDLE_FLAG_LOSES_CONTEXT,
+                ),
+            };
+            idle_words.push((i + 1) * 10_000);
+            idle_words.push((i + 1) * 20_000);
+            idle_words.push(method);
+            idle_words.push(flags);
+        }
+        self.m.ok(
+            0,
+            Syscall::NodeIdle {
+                node: node_cap(0),
+                core: 0,
+                words: idle_words.clone(),
+            },
+        );
+        idle_words.extend_from_slice(&[200_000, 400_000, dodos_abi::IDLE_METHOD_HALT, 0]);
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeIdle {
+                    node: node_cap(0),
+                    core: 0,
+                    words: idle_words,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+
+        // 3. Recovery reserve admission refusal on core 0 (Error::Budget).
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Sched, 0, 1010));
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::SchedConfigure {
+                    sched: s(1010),
+                    node: node_cap(0),
+                    core: 0,
+                    budget: 64 * MS,
+                    period: 64 * MS,
+                    class: 1,
+                },
+            ),
+            Err(Error::Budget)
+        );
+        self.m.ok(0, Syscall::CapDelete(s(1010)));
+
+        // 4. DEBUG_WRITE_MAX (512 + 513 refused) and ENTROPY_MAX_BYTES (64 + 65 refused).
+        self.m.ok(
+            0,
+            Syscall::DebugWrite {
+                debug: s(dodos_abi::START_SLOT_DEBUG),
+                length: dodos_abi::DEBUG_WRITE_MAX,
+                words: vec![0; (dodos_abi::DEBUG_WRITE_MAX / 8) as usize],
+            },
+        );
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::DebugWrite {
+                    debug: s(dodos_abi::START_SLOT_DEBUG),
+                    length: dodos_abi::DEBUG_WRITE_MAX + 1,
+                    words: vec![0; (dodos_abi::DEBUG_WRITE_MAX / 8) as usize],
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        assert!(matches!(
+            self.m.call(
+                0,
+                Syscall::EntropyRead {
+                    length: dodos_abi::ENTROPY_MAX_BYTES,
+                    mix: [1, 2, 3, 4],
+                },
+            ),
+            Ok(Output::Bytes(_))
+        ));
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::EntropyRead {
+                    length: dodos_abi::ENTROPY_MAX_BYTES + 1,
+                    mix: [1, 2, 3, 4],
+                },
+            ),
+            Err(Error::Invalid)
+        );
+
+        // 5. MAX_WORDS (64 + 65 refused) and MAX_CAPS (5 refused) on NodeSend.
+        if let Some(rx2) = self.receivers[2]
+            && self.m.sys.node(2).runnable().contains(&rx2)
+        {
+            assert_eq!(
+                self.m.call_by(
+                    2,
+                    rx2,
+                    Syscall::Recv {
+                        endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+                        reply: s(REPLY),
+                        range: Range {
+                            first: s(1030),
+                            count: 0,
+                        },
+                        wait: 0,
+                    },
+                ),
+                WAITS
+            );
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::NodeSend {
+                        node: node_cap(2),
+                        message: Message {
+                            words: vec![0x43; dodos_abi::MAX_WORDS],
+                            ..Message::default()
+                        },
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                WAITS
+            );
+            self.run(2 * MS);
+        }
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeSend {
+                    node: node_cap(2),
+                    message: Message {
+                        words: vec![0; dodos_abi::MAX_WORDS + 1],
+                        ..Message::default()
+                    },
+                    doorbell: SlotAddr::NONE,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        let rights = Rights::READ.union(Rights::WRITE).bits();
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::NodeSend {
+                    node: node_cap(2),
+                    message: Message {
+                        caps: vec![Transfer::Derive(s(PAIRS[0].obj), rights); 5],
+                        ..Message::default()
+                    },
+                    doorbell: SlotAddr::NONE,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+
+        // 6. CSPACE_MAX_SLOTS (2^20 + over-max refused) and REMOVAL_SLOTS (128 -> Again).
+        assert_eq!(
+            self.m.call(
+                0,
+                super::retype_from(
+                    ut0,
+                    ObjectKind::CSpace,
+                    u64::from(dodos_abi::CSPACE_MAX_SLOTS)
+                        + u64::from(dodos_abi::CSPACE_SEGMENT_SLOTS),
+                    1041,
+                ),
+            ),
+            Err(Error::Invalid)
+        );
+        self.m.ok(
+            0,
+            super::retype_from(
+                ut0,
+                ObjectKind::CSpace,
+                u64::from(dodos_abi::CSPACE_MAX_SLOTS),
+                1040,
+            ),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                self.m.call(
+                    0,
+                    Syscall::CSpaceGrow {
+                        cspace: s(1040),
+                        untyped: s(ut0),
+                    },
+                ),
+                Ok(Output::Slots(_))
+            ));
+        }
+        assert_eq!(
+            self.m.call(0, Syscall::CapDelete(s(1040))),
+            Err(Error::Again)
+        );
+        self.m.ok(0, Syscall::CapDelete(s(1040)));
+
+        // 7. TREE_DEPTH (64 + depth-65 refused), then revoke and delete.
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1300));
+        let mut cur_slot = 1300u32;
+        let mut cur_depth = {
+            let obj = self.m.sys.node(0).object_at(self.m.t[0], s(1300)).unwrap();
+            let root = self.m.sys.node(0).objects[&obj].root;
+            self.m.sys.node(0).depth(root)
+        };
+        let frame_rights = Rights::READ
+            .union(Rights::WRITE)
+            .union(Rights::DERIVE)
+            .bits();
+        while cur_depth < dodos_abi::TREE_DEPTH {
+            let next_slot = cur_slot + 1;
+            self.m.ok(
+                0,
+                Syscall::CapDerive {
+                    source: s(cur_slot),
+                    destination: s(next_slot),
+                    rights: frame_rights,
+                    badge: 0,
+                },
+            );
+            cur_slot = next_slot;
+            cur_depth += 1;
+        }
+        assert_eq!(
+            self.m.call(
+                0,
+                Syscall::CapDerive {
+                    source: s(cur_slot),
+                    destination: s(cur_slot + 1),
+                    rights: frame_rights,
+                    badge: 0,
+                },
+            ),
+            Err(Error::Invalid)
+        );
+        while self.m.call(0, Syscall::CapRevoke(s(1300))) == Err(Error::Again) {}
+        self.m.ok(0, Syscall::CapDelete(s(1300)));
+
+        // 8. TIME_EVENT_STEP (16): arm 20 timers at the same deadline on node 0
+        // and verify a single timer interrupt processes at most 16, leaving 4
+        // due with the hardware timer kept at `now`.
+        self.m
+            .ok(0, super::retype_from(ut0, ObjectKind::Notify, 0, 1050));
+        let deadline = self.m.sys.now() + 2 * MS;
+        let mut timer_objs = Vec::with_capacity(dodos_abi::TIME_EVENT_STEP + 4);
+        for i in 0..(dodos_abi::TIME_EVENT_STEP as u32 + 4) {
+            self.m
+                .ok(0, super::retype_from(ut0, ObjectKind::Timer, 0, 1051 + i));
+            assert!(matches!(
+                self.m.call(
+                    0,
+                    Syscall::TimerSet {
+                        timer: s(1051 + i),
+                        notify: s(1050),
+                        deadline,
+                        tolerance: 0,
+                    },
+                ),
+                Ok(Output::WasArmed(_))
+            ));
+            let obj = self
+                .m
+                .sys
+                .node(0)
+                .object_at(self.m.t[0], s(1051 + i))
+                .expect("timer object");
+            timer_objs.push(obj);
+        }
+        // Advance up to just before `deadline`, then move clock to `deadline`
+        // and take exactly ONE timer interrupt on node 0 core 0.
+        if self.m.sys.now() < deadline - 1 {
+            let before = deadline - 1 - self.m.sys.now();
+            self.run(before);
+        }
+        self.m.sys.move_clock(deadline);
+        let armed_before = timer_objs
+            .iter()
+            .filter(|id| {
+                self.m
+                    .sys
+                    .node(0)
+                    .timers
+                    .get(id)
+                    .is_some_and(Option::is_some)
+            })
+            .count();
+        assert_eq!(armed_before, dodos_abi::TIME_EVENT_STEP + 4);
+        self.m.sys.fire(crate::system::Event::Timer {
+            node: 0,
+            position: 0,
+        });
+        assert_eq!(self.m.sys.check(), Ok(()));
+        self.m.sample_bounds();
+        let armed_after = timer_objs
+            .iter()
+            .filter(|id| {
+                self.m
+                    .sys
+                    .node(0)
+                    .timers
+                    .get(id)
+                    .is_some_and(Option::is_some)
+            })
+            .count();
+        assert!(
+            armed_after >= 4,
+            "one timer interrupt must fire at most TIME_EVENT_STEP (16) due events, leaving >= 4 timers armed (got {armed_after})"
+        );
+        assert_eq!(
+            self.m.sys.node(0).cores[0].hw_timer,
+            Some(deadline),
+            "hardware timer must stay at now while capped due events remain"
+        );
+        assert!(self.m.bounds.time_event_step_16);
+        self.run(MS);
+        assert_eq!(
+            timer_objs
+                .iter()
+                .filter(|id| self
+                    .m
+                    .sys
+                    .node(0)
+                    .timers
+                    .get(id)
+                    .is_some_and(Option::is_some))
+                .count(),
+            0
+        );
+        for i in 0..(dodos_abi::TIME_EVENT_STEP as u32 + 4) {
+            self.m.ok(0, Syscall::CapDelete(s(1051 + i)));
+        }
+        self.m.ok(0, Syscall::CapDelete(s(1050)));
+
+        // 9. On x86-64 stress seeds: IOSPACE_MAX_DEVICES (16 + 17th Busy) and
+        // IRQ_TABLE_ENTRIES (192 + 193rd Busy) on node 0 -> 208 IOMMU items
+        // (8 ReportAsk pages on any IOMMU rebuild).
+        if arch == Arch::X86_64 {
+            let iommu = slots_of(self.m.sys.node(0), self.m.t[0], ObjectKind::Iommu)[0];
+            let ios = self.m.retype(0, ObjectKind::IoSpace, 0, 1020);
+            self.m.ok(0, ios);
+            for d in 0..dodos_abi::IOSPACE_MAX_DEVICES as u64 {
+                let call = Syscall::IoSpaceAttach {
+                    iommu: s(iommu),
+                    iospace: s(1020),
+                    device: 0x20 + d,
+                };
+                match self.m.call(0, call) {
+                    WAITS => {
+                        self.m.settle();
+                        assert_eq!(self.m.woken(0), Some(&DONE));
+                    }
+                    outcome => assert_eq!(outcome, DONE),
+                }
+            }
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::IoSpaceAttach {
+                        iommu: s(iommu),
+                        iospace: s(1020),
+                        device: 0x20 + dodos_abi::IOSPACE_MAX_DEVICES as u64,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            let entries = dodos_abi::x86_64::IRQ_TABLE_ENTRIES as u32;
+            for i in 0..entries {
+                let claim = Syscall::IrqClaim {
+                    control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                    source: IrqSource::msi(0, (i / 32) as u8, (i % 32) as u8, 0).raw(),
+                    core: 0,
+                    vector: u64::from(dodos_abi::x86_64::IRQ_VECTOR_FIRST) + u64::from(i),
+                    destination: s(1100 + i),
+                };
+                match self.m.call(0, claim) {
+                    WAITS => {
+                        self.m.settle();
+                        assert!(self.m.woken(0).is_some_and(Result::is_ok));
+                    }
+                    outcome => assert!(outcome.is_ok(), "MSI claim {i}: {outcome:?}"),
+                }
+            }
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::IrqClaim {
+                        control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                        source: IrqSource::msi(0, 7, 0, 0).raw(),
+                        core: 0,
+                        vector: u64::from(dodos_abi::x86_64::IRQ_VECTOR_FIRST),
+                        destination: s(1100 + entries),
+                    },
+                ),
+                Err(Error::Busy)
+            );
+        }
+
+        // 10. Offset 113: SENDS_PER_PEER (8: 6 without manage, 7th Busy,
+        // 2 with manage, 9th Busy).
+        if offset == 113 {
+            self.m.ok(
+                0,
+                Syscall::SchedConfigure {
+                    sched: s(dodos_abi::START_SLOT_SCHED),
+                    node: node_cap(0),
+                    core: 0,
+                    budget: 50 * MS,
+                    period: 64 * MS,
+                    class: 1,
+                },
+            );
+            let no_manage = Rights::READ.union(Rights::WRITE).union(Rights::SEND).bits();
+            self.m.ok(
+                0,
+                Syscall::CapDerive {
+                    source: node_cap(1),
+                    destination: s(1500),
+                    rights: no_manage,
+                    badge: 0,
+                },
+            );
+            let mut workers = Vec::with_capacity(9);
+            for i in 0..9u32 {
+                let base = 1510 + 2 * i;
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Thread, 0, base));
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Sched, 0, base + 1));
+                self.m.ok(
+                    0,
+                    Syscall::ThreadConfigure {
+                        thread: s(base),
+                        cspace: s(dodos_abi::START_SLOT_CSPACE),
+                        aspace: s(dodos_abi::START_SLOT_ASPACE),
+                        fault: SlotAddr::NONE,
+                        page: SlotAddr::NONE,
+                    },
+                );
+                self.m.ok(
+                    0,
+                    Syscall::SchedConfigure {
+                        sched: s(base + 1),
+                        node: node_cap(0),
+                        core: 0,
+                        budget: dodos_abi::SCHED_MIN_BUDGET_NS,
+                        period: 100 * MS,
+                        class: 1,
+                    },
+                );
+                self.m.ok(
+                    0,
+                    Syscall::SchedBind {
+                        sched: s(base + 1),
+                        thread: s(base),
+                    },
+                );
+                self.m.ok(0, Syscall::ThreadResume(s(base)));
+                let tid = self.m.sys.node(0).object_at(self.m.t[0], s(base)).unwrap();
+                workers.push((tid, base));
+            }
+            let non_manage = dodos_abi::SENDS_PER_PEER - dodos_abi::SENDS_RESERVED_FOR_MANAGE;
+            for &(tid, _) in &workers[..non_manage] {
+                assert_eq!(
+                    self.m.call_by(
+                        0,
+                        tid,
+                        Syscall::NodeSend {
+                            node: s(1500),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    0,
+                    workers[non_manage].0,
+                    Syscall::NodeSend {
+                        node: s(1500),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            for &(tid, _) in &workers[non_manage..dodos_abi::SENDS_PER_PEER] {
+                assert_eq!(
+                    self.m.call_by(
+                        0,
+                        tid,
+                        Syscall::NodeSend {
+                            node: node_cap(1),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    0,
+                    workers[dodos_abi::SENDS_PER_PEER].0,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            self.run(2 * MS);
+            for &(_, base) in &workers {
+                self.m.ok(0, Syscall::CapDelete(s(base)));
+                self.m.ok(0, Syscall::CapDelete(s(base + 1)));
+            }
+            self.m.ok(0, Syscall::CapDelete(s(1500)));
+        }
+
+        // 11. Offset 207: 3 sealed nodes at once across one sweep
+        // (two-sealed-per-sweep cap), then resume cleanly before seal_ms.
+        if offset == 207 {
+            // Position ~5 ms before node 0's next sweep so all three nodes
+            // seal before the sweep and stay well under `seal_ns`.
+            let headroom = 5 * MS;
+            if self.m.sys.node(0).next_sweep <= self.m.sys.now() + headroom {
+                let past = self
+                    .m
+                    .sys
+                    .node(0)
+                    .next_sweep
+                    .saturating_sub(self.m.sys.now())
+                    + MS;
+                self.run(past);
+            }
+            let target = self.m.sys.node(0).next_sweep.saturating_sub(headroom);
+            if self.m.sys.now() < target {
+                self.run(target - self.m.sys.now());
+            }
+            let sweep_at = self.m.sys.node(0).next_sweep;
+            for n in [1u16, 2, 3] {
+                assert_eq!(self.call(0, seal(n)), Some(DONE), "node 0 sealing node {n}");
+            }
+            for _ in 0..20 {
+                if [1u16, 2, 3]
+                    .iter()
+                    .all(|&n| self.m.state(n) == MemberState::Sealed)
+                {
+                    break;
+                }
+                self.run(500_000);
+            }
+            assert!(
+                self.m.sys.now() < sweep_at,
+                "all three nodes must seal before node 0's sweep at {sweep_at}"
+            );
+            for n in [1u16, 2, 3] {
+                assert_eq!(
+                    self.m.state(n),
+                    MemberState::Sealed,
+                    "node {n} must be sealed before the sweep"
+                );
+            }
+            let n_nodes = self.m.sys.machine.nodes() as u16;
+            let start = self.m.sys.node(0).seal_cursor % n_nodes;
+            let sealed_order: Vec<u16> = (1..=n_nodes)
+                .map(|step| (start + step) % n_nodes)
+                .filter(|&z| z != 0 && self.m.state(z) == MemberState::Sealed)
+                .collect();
+            assert_eq!(
+                sealed_order.len(),
+                3,
+                "expected 3 sealed peers before sweep, got {sealed_order:?}"
+            );
+            // Cross exactly one sweep on node 0.
+            let to_sweep = sweep_at.saturating_sub(self.m.sys.now()) + MS;
+            self.run(to_sweep);
+            assert!(
+                self.m.sys.node(0).next_sweep > sweep_at,
+                "node 0 sweep at {sweep_at} must have run"
+            );
+            assert_eq!(
+                self.m.sys.node(0).seal_cursor,
+                sealed_order[1],
+                "one sweep must read exactly two sealed nodes ({sealed_order:?}); cursor={}",
+                self.m.sys.node(0).seal_cursor
+            );
+            assert!(
+                self.m.bounds.sweep_2_sealed_capped,
+                "two-sealed-per-sweep cap must be recorded"
+            );
+            for n in [1u16, 2, 3] {
+                assert_eq!(
+                    self.m.state(n),
+                    MemberState::Sealed,
+                    "node {n} must remain sealed until resumed"
+                );
+                assert_eq!(
+                    self.call(0, resume(n)),
+                    Some(DONE),
+                    "node 0 resuming node {n}"
+                );
+            }
+            for _ in 0..20 {
+                if [1u16, 2, 3]
+                    .iter()
+                    .all(|&n| self.m.state(n) == MemberState::Live)
+                {
+                    break;
+                }
+                self.run(500_000);
+            }
+            for n in [1u16, 2, 3] {
+                assert_eq!(
+                    self.m.state(n),
+                    MemberState::Live,
+                    "node {n} must return to Live after resume"
+                );
+            }
+        }
+
+        // 12. Offset 254: CORE_ANSWER_NS (10 ms) on WIDE (cores 4 & 5).
+        if offset == 254 {
+            let ut4 = super::untyped_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let tables4 = super::table_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let asp = self.m.retype(WIDE, ObjectKind::ASpace, 0, 1600);
+            self.m.ok(WIDE, asp);
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Frame, 1, 1601));
+            self.m.ok(
+                WIDE,
+                Syscall::ASpaceMap(crate::Map {
+                    space: s(1600),
+                    frame: s(1601),
+                    untyped: s(tables4),
+                    address: 0x2000_0000,
+                    first: 0,
+                    count: 1,
+                    rights: Rights::READ.bits(),
+                }),
+            );
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Thread, 0, 1602));
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Sched, 0, 1603));
+            self.m.ok(
+                WIDE,
+                Syscall::ThreadConfigure {
+                    thread: s(1602),
+                    cspace: s(dodos_abi::START_SLOT_CSPACE),
+                    aspace: s(1600),
+                    fault: SlotAddr::NONE,
+                    page: SlotAddr::NONE,
+                },
+            );
+            self.m.ok(
+                WIDE,
+                Syscall::SchedConfigure {
+                    sched: s(1603),
+                    node: node_cap(WIDE),
+                    core: u64::from(WIDE) + 1,
+                    budget: 50 * MS,
+                    period: 100 * MS,
+                    class: 1,
+                },
+            );
+            self.m.ok(
+                WIDE,
+                Syscall::SchedBind {
+                    sched: s(1603),
+                    thread: s(1602),
+                },
+            );
+            self.m.ok(WIDE, Syscall::ThreadResume(s(1602)));
+            self.run(500_000);
+            let generation = self.m.sys.member(WIDE).generation();
+            self.m.harm.harmed.insert((WIDE, generation));
+            self.m.sys.hang(usize::from(WIDE) + 1, true);
+            if arch == Arch::Aarch64 {
+                // ARM64 broadcasts TLB invalidations in hardware (`TLBI IS`),
+                // so a hung secondary core is caught by `watch_own_cores` after
+                // `STALE_NS` (`CrashReason::CoreSilent`).
+                let wait = self.m.sys.canonical().stale_ns + 40 * MS;
+                self.run(wait);
+            } else {
+                assert_eq!(self.m.call(WIDE, Syscall::ASpaceUnmap(s(1601))), WAITS);
+                self.run(40 * MS);
+            }
+        }
+
+        self.note();
+    }
+
+    /// Pass 44 (Section 6): exercises cross-node boundaries **while a recovery
+    /// is under way** (full kernel ring + 34-entry answer reserve + 16 request
+    /// credits + 64 `unit_requests`, full configured grant/use tables with
+    /// refusal/drop across borrower & granter death/reclaim/fresh start,
+    /// `PENDING_STEP` >32 signals/releases interrupted mid-flush by seal+resume
+    /// and granter death+fresh start, `TIME_EVENT_STEP` >=16 coinciding with
+    /// sweep and fence timers on core 0, and 3-core `WIDE` staggered start /
+    /// 3-core TLB hang / `MAP_COUNT_MAX` on a remote grant reclaimed by R6).
+    /// Every single event runs `self.m.sys.check()`, `sample_bounds()`, and
+    /// `self.note()`.
+    fn stress_recovery_pressure(&mut self) {
+        use crate::system::Event;
+        use dodos_abi::{
+            Header, PENDING_STEP, REQUESTS_PER_PEER, RING_ANSWER_RESERVE, RING_KERNEL_ENTRIES,
+            RING_USER_ENTRIES, SCHED_MIN_BUDGET_NS, SENDS_PER_PEER, SENDS_RESERVED_FOR_MANAGE,
+            START_SLOT_ASPACE, START_SLOT_CSPACE, START_SLOT_IRQ_CONTROL, START_SLOT_MAILBOX,
+            UNIT_REQUESTS,
+        };
+
+        self.run(2 * MS);
+        let offset = self.seed % 286;
+        let arch = self.m.sys.arch();
+        let frame_rights = || {
+            Rights::READ.bits() | Rights::WRITE.bits() | Rights::SEND.bits() | Rights::DERIVE.bits()
+        };
+
+        let spawn_worker = |m: &mut S, node: u16, base: u32, core: u64, aspace: u32| -> ObjId {
+            let start_sched = m
+                .sys
+                .node(node)
+                .object_at(m.t[node as usize], s(dodos_abi::START_SLOT_SCHED))
+                .expect("start sched");
+            if m.sys.node(node).scheds[&start_sched].budget > 2 * MS {
+                let c0 = m.sys.node(node).core_number(0) as u64;
+                m.ok(
+                    node,
+                    Syscall::SchedConfigure {
+                        sched: s(dodos_abi::START_SLOT_SCHED),
+                        node: node_cap(node),
+                        core: c0,
+                        budget: MS,
+                        period: 10 * MS,
+                        class: 1,
+                    },
+                );
+            }
+            let ut = super::untyped_slot(m.sys.node(node), m.t[node as usize]);
+            m.ok(node, super::retype_from(ut, ObjectKind::Thread, 0, base));
+            m.ok(node, super::retype_from(ut, ObjectKind::Sched, 0, base + 1));
+            m.ok(
+                node,
+                Syscall::ThreadConfigure {
+                    thread: s(base),
+                    cspace: s(START_SLOT_CSPACE),
+                    aspace: s(aspace),
+                    fault: SlotAddr::NONE,
+                    page: SlotAddr::NONE,
+                },
+            );
+            m.ok(
+                node,
+                Syscall::SchedConfigure {
+                    sched: s(base + 1),
+                    node: node_cap(node),
+                    core,
+                    budget: SCHED_MIN_BUDGET_NS,
+                    period: 100 * MS,
+                    class: 1,
+                },
+            );
+            m.ok(
+                node,
+                Syscall::SchedBind {
+                    sched: s(base + 1),
+                    thread: s(base),
+                },
+            );
+            m.ok(node, Syscall::ThreadResume(s(base)));
+            m.sys
+                .node(node)
+                .object_at(m.t[node as usize], s(base))
+                .unwrap()
+        };
+        let ring_used = |m: &S, from: u16, to: u16, user: bool| -> u64 {
+            let node = m.sys.node(from);
+            node.ring_of(from, to, user)
+                .produced
+                .wrapping_sub(node.ring_consumed(to, user))
+        };
+        let is_ring_for = |sys: &crate::system::System, ev: Event, node: u16| -> bool {
+            matches!(ev, Event::Action(i) if sys.actions()[i].1 == crate::nodes::HwAction::Ring { node })
+        };
+        let wait_state = |run: &mut Self, node: u16, want: MemberState, max_ms: u64| {
+            let limit = run.m.sys.now() + max_ms * MS;
+            while run.m.sys.now() < limit && run.m.state(node) != want {
+                run.run(MS);
+            }
+            assert_eq!(
+                run.m.state(node),
+                want,
+                "node {node} must reach {want:?} within {max_ms} ms"
+            );
+        };
+        let grant_batches = |run: &mut Self,
+                             granter: u16,
+                             holder: u16,
+                             rx: ObjId,
+                             reply_slot: u32,
+                             src_base: u32,
+                             dst_base: u32,
+                             count: u32,
+                             doorbell: SlotAddr| {
+            let mut done = 0u32;
+            while done < count {
+                let batch = (count - done).min(4);
+                assert_eq!(
+                    run.m.call_by(
+                        holder,
+                        rx,
+                        Syscall::Recv {
+                            endpoint: s(START_SLOT_MAILBOX),
+                            reply: s(reply_slot),
+                            range: Range {
+                                first: s(dst_base + done),
+                                count: batch,
+                            },
+                            wait: 0,
+                        },
+                    ),
+                    WAITS
+                );
+                assert_eq!(
+                    run.m.call(
+                        granter,
+                        Syscall::NodeSend {
+                            node: node_cap(holder),
+                            message: Message {
+                                caps: (done..done + batch)
+                                    .map(|i| Transfer::Derive(s(src_base + i), frame_rights()))
+                                    .collect(),
+                                ..Message::default()
+                            },
+                            doorbell,
+                        },
+                    ),
+                    WAITS
+                );
+                for _ in 0..50 {
+                    if run.m.woken(granter).is_some() {
+                        break;
+                    }
+                    run.run(100_000);
+                }
+                assert_eq!(
+                    run.m.woken(granter),
+                    Some(&Ok(Output::Sent { flags: 0 })),
+                    "grant batch {granter}->{holder} at {done}"
+                );
+                done += batch;
+            }
+        };
+
+        // =====================================================================
+        // Offset 71: Full kernel ring (64 entries, 34-entry answer reserve) +
+        // 16 open request credits + 17th refused + 64 `unit_requests` + 65th
+        // refused DURING multi-page rebuild, holder seal+resume, and RoleHand.
+        // =====================================================================
+        if offset == 71 {
+            let iommu0 = IOMMU_ROLE;
+            let iommu1 = 1usize;
+            assert_eq!(self.m.sys.role(iommu0).holder(), 1);
+            // Hand IOMMU 1 to node 2 so killing node 2 makes node 3 take over
+            // IOMMU 1 and ask node 1 for a 28-item (11-entry) multi-page Report.
+            let h1 = self.m.sys.role(iommu1).holder();
+            if h1 != 2 {
+                let roles = slots_of(self.m.sys.node(h1), self.m.t[h1 as usize], ObjectKind::Role);
+                assert_eq!(
+                    self.call(
+                        h1,
+                        Syscall::RoleHand {
+                            role: s(roles[iommu1]),
+                            node: node_cap(2),
+                        },
+                    ),
+                    Some(WAITS)
+                );
+                self.run(30 * MS);
+            }
+            assert_eq!(self.m.sys.role(iommu1).holder(), 2);
+
+            // Give node 1 29 MSI handles on segment 1 (IOMMU 1) so node 3's
+            // ReportAsk triggers a full 28-item (11-entry) multi-page Report.
+            for i in 0..29u32 {
+                let claim = Syscall::IrqClaim {
+                    control: s(START_SLOT_IRQ_CONTROL),
+                    source: IrqSource::msi(1, 0, (i % 32) as u8, 0).raw(),
+                    core: 1,
+                    vector: u64::from(48 + i),
+                    destination: s(1000 + i),
+                };
+                if self.m.call(1, claim) == WAITS {
+                    self.run(15 * MS);
+                    assert!(matches!(self.m.woken(1), Some(Ok(Output::Msi { .. }))));
+                }
+            }
+            assert_eq!(self.m.sys.node(1).items(iommu1).len(), 29);
+
+            // Set up 32 grants 3 -> 1.
+            let reply1 = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1);
+            let rx1 = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            let ut3 = super::untyped_slot(self.m.sys.node(3), self.m.t[3]);
+            for i in 0..32u32 {
+                self.m
+                    .ok(3, super::retype_from(ut3, ObjectKind::Frame, 1, 1100 + i));
+            }
+            grant_batches(self, 3, 1, rx1, 1059, 1100, 1100, 32, SlotAddr::NONE);
+
+            // Attach device 0x12 to node 3's IoSpace on IOMMU 0 (holder = 1),
+            // map 65 frames, and spawn 65 worker threads + 9 NodeSend workers.
+            let ios3 = self.m.retype(3, ObjectKind::IoSpace, 0, IOSPACE);
+            self.m.ok(3, ios3);
+            let attach3 = attach_call(&self.m, 3, 0x12, true);
+            if self.m.call(3, attach3) == WAITS {
+                self.run(20 * MS);
+                assert_eq!(self.m.woken(3), Some(&DONE));
+            }
+            let tables3 = super::table_slot(self.m.sys.node(3), self.m.t[3]);
+            let mut unit_threads = Vec::with_capacity(UNIT_REQUESTS + 1);
+            for i in 0..(UNIT_REQUESTS as u32 + 1) {
+                let fslot = 1200 + i;
+                self.m
+                    .ok(3, super::retype_from(ut3, ObjectKind::Frame, 1, fslot));
+                self.m.ok(
+                    3,
+                    Syscall::IoSpaceMap(crate::Map {
+                        space: s(IOSPACE),
+                        frame: s(fslot),
+                        untyped: s(tables3),
+                        address: 0x1000_0000 + (u64::from(i) + 1) * 0x10_0000,
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                );
+                let tid = spawn_worker(&mut self.m, 3, 1300 + 2 * i, 3, START_SLOT_ASPACE);
+                unit_threads.push((tid, fslot));
+            }
+            // Non-manage capability to node 1 in slot 1055 + 9 send workers.
+            self.m.ok(
+                3,
+                Syscall::CapDerive {
+                    source: node_cap(1),
+                    destination: s(1055),
+                    rights: Rights::SEND.bits(),
+                    badge: 0,
+                },
+            );
+            let mut send_threads = Vec::with_capacity(SENDS_PER_PEER + 1);
+            for i in 0..(SENDS_PER_PEER as u32 + 1) {
+                send_threads.push(spawn_worker(
+                    &mut self.m,
+                    3,
+                    1500 + 2 * i,
+                    3,
+                    START_SLOT_ASPACE,
+                ));
+            }
+            self.run(2 * MS);
+
+            // Kill node 2 -> node 3 takes over IOMMU 1 and sends ReportAsk to
+            // node 1. Hold back node 1's ring consumption once ReportAsk is sent.
+            assert_eq!(self.call(0, kill(2)), Some(DONE));
+            let mut ask_sent = false;
+            for _ in 0..8_000 {
+                if self.m.sys.role(iommu1).holder() == 3
+                    && self
+                        .m
+                        .sys
+                        .node(3)
+                        .rebuilds
+                        .get(&iommu1)
+                        .is_some_and(|r| r.node == 1 && r.asked.is_some())
+                {
+                    ask_sent = true;
+                    break;
+                }
+                let events = self.m.sys.events();
+                let allowed = |&ev: &Event| {
+                    !(self.m.sys.role(iommu1).holder() == 3 && is_ring_for(&self.m.sys, ev, 1))
+                };
+                let ev = events
+                    .iter()
+                    .copied()
+                    .find(|ev| matches!(ev, Event::Timer { .. }) && allowed(ev))
+                    .or_else(|| events.into_iter().find(allowed));
+                match ev {
+                    Some(ev) => {
+                        self.m.sys.fire(ev);
+                        if !self
+                            .m
+                            .sys
+                            .events()
+                            .iter()
+                            .any(|e| matches!(e, Event::Timer { .. }))
+                        {
+                            assert_eq!(self.m.sys.check(), Ok(()));
+                            self.m.sample_bounds();
+                            self.note();
+                        }
+                    }
+                    None => {
+                        let now = self.m.sys.now();
+                        let next = self
+                            .m
+                            .sys
+                            .models()
+                            .filter_map(|(_, n)| n.next_timer())
+                            .map(|(at, _)| at)
+                            .filter(|&at| at > now)
+                            .min();
+                        let at = next.map_or(now + 1_000_000, |t| t.min(now + 1_000_000));
+                        self.m.sys.move_clock(at);
+                    }
+                }
+            }
+            assert!(
+                ask_sent,
+                "node 3 must send ReportAsk to node 1 during rebuild"
+            );
+
+            // Step 1: Node 1 deletes 32 remote frames -> 30 Releases fill kernel
+            // ring 1 -> 3 to the 34-entry answer reserve; 31st & 32nd hit reserve.
+            for i in 0..32u32 {
+                self.m.ok(1, Syscall::CapDelete(s(1100 + i)));
+            }
+            assert_eq!(
+                ring_used(&self.m, 1, 3, false),
+                RING_KERNEL_ENTRIES - RING_ANSWER_RESERVE
+            );
+
+            // Step 2: Node 3 submits 64 IoSpaceUnmap unit requests (first 15 fill
+            // REQUESTS_PER_PEER = 16 alongside ReportAsk; 16th hits 17th-credit
+            // cap; all 64 fill unit_requests), then 65th returns Busy!
+            for &(tid, fslot) in &unit_threads[..UNIT_REQUESTS] {
+                assert_eq!(
+                    self.m.call_by(3, tid, Syscall::IoSpaceUnmap(s(fslot))),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    3,
+                    unit_threads[UNIT_REQUESTS].0,
+                    Syscall::IoSpaceUnmap(s(unit_threads[UNIT_REQUESTS].1)),
+                ),
+                Err(Error::Again)
+            );
+            assert_eq!(
+                self.m.sys.node(3).peers[1].credits[..REQUESTS_PER_PEER]
+                    .iter()
+                    .filter(|c| c.is_some())
+                    .count(),
+                REQUESTS_PER_PEER
+            );
+
+            // Step 3: Node 3 submits 8 NodeSends (6 without manage + 7th Busy,
+            // 2 with manage + 9th Busy).
+            let non_manage = SENDS_PER_PEER - SENDS_RESERVED_FOR_MANAGE;
+            for &tid in &send_threads[..non_manage] {
+                assert_eq!(
+                    self.m.call_by(
+                        3,
+                        tid,
+                        Syscall::NodeSend {
+                            node: s(1055),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    3,
+                    send_threads[non_manage],
+                    Syscall::NodeSend {
+                        node: s(1055),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            for &tid in &send_threads[non_manage..SENDS_PER_PEER] {
+                assert_eq!(
+                    self.m.call_by(
+                        3,
+                        tid,
+                        Syscall::NodeSend {
+                            node: node_cap(1),
+                            message: Message::default(),
+                            doorbell: SlotAddr::NONE,
+                        },
+                    ),
+                    WAITS
+                );
+            }
+            assert_eq!(
+                self.m.call_by(
+                    3,
+                    send_threads[SENDS_PER_PEER],
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message::default(),
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+
+            // Step 4: Let node 1 answer all 24 open messages WITHOUT letting
+            // node 3 consume kernel ring 1 -> 3: 30 + 15 + 11 + 8 = 64 entries!
+            for _ in 0..5_000 {
+                let ev = self.m.sys.events().into_iter().find(|&ev| {
+                    !is_ring_for(&self.m.sys, ev, 3)
+                        && !matches!(
+                            ev,
+                            Event::Ipi { node: 3, .. } | Event::Timer { node: 3, .. }
+                        )
+                });
+                let Some(ev) = ev else { break };
+                self.m.sys.fire(ev);
+                assert_eq!(self.m.sys.check(), Ok(()));
+                self.m.sample_bounds();
+                self.note();
+            }
+            assert_eq!(
+                ring_used(&self.m, 1, 3, false),
+                RING_KERNEL_ENTRIES,
+                "kernel ring 1 -> 3 must reach exact 64/64 during rebuild"
+            );
+
+            // Step 5: While kernel ring 1 -> 3 is saturated at 64 entries and
+            // 49 unit_requests + page 2 of rebuild remain pending, seal node 1,
+            // resume it, and also exercise RoleHand on IOMMU 0 while draining.
+            assert_eq!(self.call(0, seal(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Sealed, 60);
+            assert_eq!(self.call(0, resume(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 60);
+            let roles1 = slots_of(self.m.sys.node(1), self.m.t[1], ObjectKind::Role);
+            let _ = self.call(
+                1,
+                Syscall::RoleHand {
+                    role: s(roles1[iommu0]),
+                    node: node_cap(0),
+                },
+            );
+            self.run(100 * MS);
+            assert_eq!(ring_used(&self.m, 1, 3, false), 0);
+            assert!(self.m.sys.node(3).rebuilds.is_empty());
+
+            // Fresh-start dead node 2 so the random phase starts with all 5 live.
+            wait_state(self, 2, MemberState::Dead, 100);
+            assert_eq!(self.call(0, fresh(2, 1 << 2)), Some(DONE));
+            wait_state(self, 2, MemberState::Live, 150);
+            self.m.restarted(2);
+
+            self.m.sample_bounds();
+            assert!(self.m.bounds.kernel_ring_hit_reserve_in_recovery);
+            assert!(self.m.bounds.kernel_ring_used_reserve_in_recovery);
+            assert!(self.m.bounds.kernel_ring_full_in_recovery);
+            assert!(self.m.bounds.req_credit_17th_in_recovery);
+            assert!(self.m.bounds.unit_requests_65th_in_recovery);
+        }
+
+        // =====================================================================
+        // Offset 104: Full configured grant & use tables (`grants_max = 128`,
+        // 4x `REMOVAL_STEP`) + refusal/drop DURING granter/borrower death,
+        // fence, multi-step R2/R3/R5/R6 reclaim, and concurrent fresh start.
+        // =====================================================================
+        if offset == 104 {
+            let max = self.m.sys.machine.grants_max as u32;
+            assert_eq!(max, 128);
+
+            // Sub-phase A: fill grants[0] to 128 (1 existing from PAIRS[0] +
+            // 127 new to node 1), map 16 in node 1's aspace, kill node 3 so
+            // node 0 is in recovery, trigger 129th grant Busy refusal, then
+            // kill borrower node 1 and fresh-start both during/after reclaim.
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            for i in 0..(max + 4) {
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1200 + i));
+            }
+            let reply1 = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1);
+            let rx1 = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            let existing = self.m.sys.canonical().grants[0].len() as u32;
+            let to_fill = max - existing;
+            grant_batches(self, 0, 1, rx1, 1059, 1200, 1200, to_fill, SlotAddr::NONE);
+            assert_eq!(self.m.sys.canonical().grants[0].len(), max as usize);
+            for i in 0..16u32 {
+                self.m.ok(
+                    1,
+                    Syscall::ASpaceMap(crate::Map {
+                        space: s(START_SLOT_ASPACE),
+                        frame: s(1200 + i),
+                        untyped: SlotAddr::NONE,
+                        address: 0x3000_0000 + u64::from(i) * self.m.sys.machine.geometry.page(),
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                );
+            }
+
+            // Kill node 3 so node 0 is fencing/reclaiming node 3 (in recovery).
+            assert_eq!(self.call(0, kill(3)), Some(DONE));
+            // 129th grant from node 0 to live node 1 must be refused (Busy)
+            // while node 0 is in recovery -> grants_full_in_recovery!
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message {
+                            caps: vec![Transfer::Derive(s(1200 + max), frame_rights())],
+                            ..Message::default()
+                        },
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                Err(Error::Busy)
+            );
+            self.m.sample_bounds();
+            assert!(self.m.bounds.grants_full_refused);
+            assert!(self.m.bounds.grants_full_in_recovery);
+
+            // Kill borrower node 1 while grants[0] == 128 (16 mapped in node 1):
+            // R2/R3/R5/R6 must reclaim all 127 grants across 4 REMOVAL_STEP
+            // chunks, with node 1 and node 3 fresh-starting once Dead.
+            assert_eq!(self.call(0, kill(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(1, 1 << 1)), Some(DONE));
+            wait_state(self, 3, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(3, 1 << 3)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 150);
+            wait_state(self, 3, MemberState::Live, 150);
+            self.m.restarted(1);
+            self.m.restarted(3);
+            self.run(30 * MS);
+            assert_eq!(self.m.sys.canonical().uses[1].len(), 0);
+
+            // Sub-phase B: fill uses[1] to 128 (96 from node 0 + 32 from node 2),
+            // map 16 of node 0's remote frames, put node 1 into recovery (kill
+            // node 3), send 1 more frame -> SendAnswer { dropped: true }
+            // (uses_dropped_in_recovery!), then kill granter node 0 and fresh-
+            // start node 0 while node 1 runs R2/R3/R5/R6 across 4 chunks!
+            let reply1b = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1b);
+            let rx1b = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            let ut2 = super::untyped_slot(self.m.sys.node(2), self.m.t[2]);
+            for i in 0..32u32 {
+                self.m
+                    .ok(2, super::retype_from(ut2, ObjectKind::Frame, 1, 1200 + i));
+            }
+            grant_batches(self, 0, 1, rx1b, 1059, 1200, 1200, 96, SlotAddr::NONE);
+            grant_batches(self, 2, 1, rx1b, 1059, 1200, 1300, 32, SlotAddr::NONE);
+            assert_eq!(self.m.sys.canonical().uses[1].len(), max as usize);
+            for i in 0..16u32 {
+                self.m.ok(
+                    1,
+                    Syscall::ASpaceMap(crate::Map {
+                        space: s(START_SLOT_ASPACE),
+                        frame: s(1200 + i),
+                        untyped: SlotAddr::NONE,
+                        address: 0x3000_0000 + u64::from(i) * self.m.sys.machine.geometry.page(),
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                );
+            }
+
+            // Kill node 3 (by node 1) so node 1 is in recovery while uses[1] == 128.
+            assert_eq!(self.call(1, kill(3)), Some(DONE));
+            assert_eq!(
+                self.m.call_by(
+                    1,
+                    rx1b,
+                    Syscall::Recv {
+                        endpoint: s(START_SLOT_MAILBOX),
+                        reply: s(1059),
+                        range: Range {
+                            first: s(1400),
+                            count: 1,
+                        },
+                        wait: 0,
+                    },
+                ),
+                WAITS
+            );
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::NodeSend {
+                        node: node_cap(1),
+                        message: Message {
+                            caps: vec![Transfer::Derive(s(1200 + 96), frame_rights())],
+                            ..Message::default()
+                        },
+                        doorbell: SlotAddr::NONE,
+                    },
+                ),
+                WAITS
+            );
+            for _ in 0..50 {
+                if self.m.woken(0).is_some() {
+                    break;
+                }
+                self.run(100_000);
+            }
+            assert_eq!(
+                self.m.woken(0),
+                Some(&Ok(Output::Sent {
+                    flags: Header::FLAG_CAPS_DROPPED,
+                }))
+            );
+            self.m.sample_bounds();
+            assert!(self.m.bounds.uses_full_dropped);
+            assert!(self.m.bounds.uses_dropped_in_recovery);
+
+            // Now kill granter node 0 while node 1 holds 96 grants from node 0
+            // (16 mapped) + 32 from node 2; fresh-start node 0 & node 3 once Dead.
+            assert_eq!(self.call(1, kill(0)), Some(DONE));
+            wait_state(self, 0, MemberState::Dead, 150);
+            assert_eq!(self.call(1, fresh(0, 1)), Some(DONE));
+            wait_state(self, 3, MemberState::Dead, 150);
+            assert_eq!(self.call(1, fresh(3, 1 << 3)), Some(DONE));
+            wait_state(self, 0, MemberState::Live, 150);
+            wait_state(self, 3, MemberState::Live, 150);
+            self.m.restarted(0);
+            self.m.restarted(3);
+            self.run(30 * MS);
+            // Node 1's 96 uses from dead node 0(g) are reclaimed; 32 from live node 2 remain.
+            assert_eq!(self.m.sys.canonical().uses[1].len(), 32);
+        }
+
+        // =====================================================================
+        // Offset 148: `PENDING_STEP` (32) >32 pending signals interrupted
+        // mid-flush by holder seal+resume AND >32 pending releases interrupted
+        // mid-flush by granter death+fresh start.
+        // =====================================================================
+        if offset == 148 {
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            let ut2 = super::untyped_slot(self.m.sys.node(2), self.m.t[2]);
+            for i in 0..72u32 {
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1200 + i));
+            }
+            for i in 0..48u32 {
+                self.m
+                    .ok(2, super::retype_from(ut2, ObjectKind::Frame, 1, 1200 + i));
+            }
+            let reply1 = self.m.retype(1, ObjectKind::Reply, 0, 1059);
+            self.m.ok(1, reply1);
+            let rx1 = spawn_worker(&mut self.m, 1, 1060, 1, START_SLOT_ASPACE);
+            grant_batches(self, 0, 1, rx1, 1059, 1200, 1200, 72, s(BELL));
+            grant_batches(self, 2, 1, rx1, 1059, 1200, 1300, 48, SlotAddr::NONE);
+
+            // Part A: 64 signals fill user ring 1 -> 0 + 36 signal_pending.
+            for i in 0..RING_USER_ENTRIES as u32 {
+                self.m.ok(1, Syscall::GrantSignal(s(1200 + i)));
+            }
+            for i in 0..36u32 {
+                self.m.ok(1, Syscall::GrantSignal(s(1236 + i)));
+            }
+            let pending_sig = |m: &S| {
+                m.sys.canonical().uses[1]
+                    .values()
+                    .filter(|u| u.signal_pending)
+                    .count()
+            };
+            assert_eq!(pending_sig(&self.m), 36);
+            // Let node 0 drain user ring 1 -> 0 without running node 1's reserve.
+            for _ in 0..500 {
+                if ring_used(&self.m, 1, 0, true) == 0 {
+                    break;
+                }
+                let ev = self.m.sys.events().into_iter().find(|&ev| {
+                    !matches!(
+                        ev,
+                        Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+                    )
+                });
+                match ev {
+                    Some(ev) => {
+                        self.m.sys.fire(ev);
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                    None => self.m.sys.move_clock(self.m.sys.now() + 100_000),
+                }
+            }
+            assert_eq!(ring_used(&self.m, 1, 0, true), 0);
+            // ONE reserve step on node 1 flushes 32 and leaves 4 pending signals.
+            self.m.sys.fire(Event::Timer {
+                node: 1,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.sample_bounds();
+            self.note();
+            assert_eq!(pending_sig(&self.m), 36 - PENDING_STEP);
+            // Interrupt mid-flush with holder seal + resume!
+            assert_eq!(self.call(2, seal(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Sealed, 60);
+            assert_eq!(self.call(2, resume(1)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 60);
+            self.run(20 * MS);
+            assert_eq!(pending_sig(&self.m), 0);
+
+            // Part B: delete 48 from node 0 (30 ring + 18 pending) and 48 from
+            // node 2 (30 ring + 18 pending) -> 36 release_pending!
+            for i in 0..48u32 {
+                self.m.ok(1, Syscall::CapDelete(s(1200 + i)));
+            }
+            for i in 0..48u32 {
+                self.m.ok(1, Syscall::CapDelete(s(1300 + i)));
+            }
+            let pending_rel = |m: &S| {
+                m.sys.canonical().uses[1]
+                    .values()
+                    .filter(|u| u.release_pending)
+                    .count()
+            };
+            assert_eq!(pending_rel(&self.m), 36);
+            // Let nodes 0 and 2 drain kernel rings 1 -> 0 and 1 -> 2 without
+            // running node 1's reserve step.
+            for _ in 0..1_000 {
+                if ring_used(&self.m, 1, 0, false) == 0 && ring_used(&self.m, 1, 2, false) == 0 {
+                    break;
+                }
+                let ev = self.m.sys.events().into_iter().find(|&ev| {
+                    !matches!(
+                        ev,
+                        Event::Timer { node: 1, .. } | Event::Ipi { node: 1, .. }
+                    )
+                });
+                match ev {
+                    Some(ev) => {
+                        self.m.sys.fire(ev);
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                    None => self.m.sys.move_clock(self.m.sys.now() + 100_000),
+                }
+            }
+            assert_eq!(ring_used(&self.m, 1, 0, false), 0);
+            assert_eq!(ring_used(&self.m, 1, 2, false), 0);
+            // Put recovery under way (kill node 3) right before the 32-step flush
+            // so `pending_step_32_in_recovery` hits during an active recovery.
+            assert_eq!(self.call(0, kill(3)), Some(DONE));
+            // ONE reserve step flushes 32 and leaves 4 release_pending (all to node 2).
+            self.m.sys.fire(Event::Timer {
+                node: 1,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.sample_bounds();
+            self.note();
+            assert_eq!(pending_rel(&self.m), 36 - PENDING_STEP);
+            // Interrupt mid-flush with granter node 2 death + fence + fresh start!
+            assert_eq!(self.call(0, kill(2)), Some(DONE));
+            wait_state(self, 2, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(2, 1 << 2)), Some(DONE));
+            wait_state(self, 3, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(3, 1 << 3)), Some(DONE));
+            wait_state(self, 2, MemberState::Live, 150);
+            wait_state(self, 3, MemberState::Live, 150);
+            self.m.restarted(2);
+            self.m.restarted(3);
+            self.run(20 * MS);
+            assert_eq!(pending_rel(&self.m), 0);
+            self.m.sample_bounds();
+            assert!(self.m.bounds.pending_step_32);
+            assert!(self.m.bounds.pending_step_32_in_recovery);
+        }
+
+        // =====================================================================
+        // Offset 181: `TIME_EVENT_STEP` (16) >= 16 due user timers on core 0 at
+        // the EXACT same instant as `next_sweep` AND a `Fence` round timer.
+        // =====================================================================
+        if offset == 181 {
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            for i in 0..20u32 {
+                self.m
+                    .ok(0, super::retype_from(ut0, ObjectKind::Timer, 0, 1100 + i));
+            }
+            // Coincidence A: exact `next_sweep` instant on core 0 (healthy;
+            // must hit `time_event_step_16` without latching
+            // `time_event_step_16_in_recovery`).
+            let in_rec_before_a = self.m.bounds.time_event_step_16_in_recovery;
+            if self.m.sys.node(0).next_sweep <= self.m.sys.now() + 2 * MS {
+                let past = self
+                    .m
+                    .sys
+                    .node(0)
+                    .next_sweep
+                    .saturating_sub(self.m.sys.now())
+                    + MS;
+                self.run(past);
+            }
+            let sweep_at = self.m.sys.node(0).next_sweep;
+            for i in 0..20u32 {
+                assert!(
+                    self.m
+                        .call(
+                            0,
+                            Syscall::TimerSet {
+                                timer: s(1100 + i),
+                                notify: s(BELL),
+                                deadline: sweep_at,
+                                tolerance: 0,
+                            },
+                        )
+                        .is_ok()
+                );
+            }
+            self.run(sweep_at - 1 - self.m.sys.now());
+            self.m.sys.move_clock(sweep_at);
+            let a_healthy = !self.m.sys.node(0).core0_recovery_due_now();
+            self.m.sys.fire(Event::Timer {
+                node: 0,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.m.sample_bounds();
+            self.note();
+            let armed_after = self
+                .m
+                .sys
+                .node(0)
+                .timers
+                .values()
+                .filter(|t| t.is_some())
+                .count();
+            assert!(
+                armed_after >= 20 - 16,
+                "TIME_EVENT_STEP cap at sweep_at must leave >= 4 timers armed, got {armed_after}"
+            );
+            assert_eq!(self.m.sys.node(0).event.due_taken, 16);
+            assert_eq!(self.m.sys.node(0).cores[0].hw_timer, Some(sweep_at));
+            assert!(self.m.bounds.time_event_step_16);
+            if a_healthy {
+                assert_eq!(
+                    self.m.bounds.time_event_step_16_in_recovery, in_rec_before_a,
+                    "healthy sweep must not latch time_event_step_16_in_recovery"
+                );
+            }
+            self.run(2 * MS);
+
+            // Coincidence B: exact `Fence` round instant on core 0 while
+            // fencing node 1 (an active recovery). Deleting Coincidence A must
+            // still leave `time_event_step_16_in_recovery` reached, and
+            // raising `TIME_EVENT_STEP` from 16 to 17 must fail here.
+            assert_eq!(self.call(0, kill(1)), Some(DONE));
+            let fence = *self
+                .m
+                .sys
+                .node(0)
+                .fences
+                .get(&1)
+                .expect("node 0 fencing node 1 after kill(1)");
+            let fence_round_ns = self.m.sys.node(0).fence_round(1, fence.generation);
+            let fence_at = if fence.last == 0 {
+                self.m.sys.now() + 2 * MS
+            } else {
+                fence.last + fence_round_ns
+            };
+            assert!(
+                fence_at > self.m.sys.now() + 1,
+                "fence_at ({fence_at}) must be in the future (now={})",
+                self.m.sys.now()
+            );
+            for i in 0..20u32 {
+                assert!(
+                    self.m
+                        .call(
+                            0,
+                            Syscall::TimerSet {
+                                timer: s(1100 + i),
+                                notify: s(BELL),
+                                deadline: fence_at,
+                                tolerance: 0,
+                            },
+                        )
+                        .is_ok()
+                );
+            }
+            self.run(fence_at - 1 - self.m.sys.now());
+            assert_eq!(self.m.state(0), MemberState::Live);
+            self.m.sys.move_clock(fence_at);
+            assert!(
+                self.m.sys.node(0).core0_recovery_due_now(),
+                "node 0 must be in recovery at fence_at"
+            );
+            let armed_before_b = self
+                .m
+                .sys
+                .node(0)
+                .timers
+                .values()
+                .filter(|t| t.is_some())
+                .count();
+            assert_eq!(armed_before_b, 20);
+            let replenishments_due_b = self
+                .m
+                .sys
+                .node(0)
+                .scheds
+                .values()
+                .filter(|sc| {
+                    sc.core == 0
+                        && sc.queue.is_some()
+                        && sc.throttled.is_some_and(|(instant, _)| instant <= fence_at)
+                })
+                .count();
+            self.m.sys.fire(Event::Timer {
+                node: 0,
+                position: 0,
+            });
+            assert_eq!(self.m.sys.check(), Ok(()));
+            let armed_after_b = self
+                .m
+                .sys
+                .node(0)
+                .timers
+                .values()
+                .filter(|t| t.is_some())
+                .count();
+            let expected_armed_b = armed_before_b - (16usize.saturating_sub(replenishments_due_b));
+            assert_eq!(
+                self.m.sys.node(0).event.due_taken,
+                16,
+                "TIME_EVENT_STEP cap of 16 must hold during fence recovery"
+            );
+            assert_eq!(
+                armed_after_b, expected_armed_b,
+                "TIME_EVENT_STEP cap of 16 at fence_at must leave {expected_armed_b} timers armed, got {armed_after_b}"
+            );
+            assert_eq!(self.m.sys.node(0).cores[0].hw_timer, Some(fence_at));
+            self.m.sample_bounds();
+            self.note();
+            assert!(self.m.bounds.time_event_step_16);
+            assert!(self.m.bounds.time_event_step_16_in_recovery);
+            wait_state(self, 1, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(1, 1 << 1)), Some(DONE));
+            wait_state(self, 1, MemberState::Live, 150);
+            self.m.restarted(1);
+        }
+
+        // =====================================================================
+        // Offset 225: 3 cores on `WIDE` (`[4, 5, 6]`), staggered fresh-start
+        // entry (D-171), 3-core TLB shootdown with 3rd core hung, and
+        // `MAP_COUNT_MAX` on a remote grant reclaimed by R6.
+        // =====================================================================
+        if offset == 225 {
+            assert_eq!(self.m.sys.machine.cores.len(), usize::from(NODES) + 2);
+            // Sub-phase A: 3-core staggered fresh-start entry (D-171):
+            // core 4 enters first, core 5 enters after STALE_NS + 5 ms, core 6
+            // enters after STALE_NS + 10 ms (all < START_NS). No self-accusation!
+            assert_eq!(self.call(0, kill(WIDE)), Some(DONE));
+            wait_state(self, WIDE, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(WIDE, 0b111 << WIDE)), Some(DONE));
+            let stale_ns = self.m.sys.canonical().stale_ns;
+            let mut first_entry: Option<u64> = None;
+            for _ in 0..20_000 {
+                if self.m.state(WIDE) == MemberState::Live {
+                    break;
+                }
+                if first_entry.is_none() && self.m.sys.has(WIDE) && self.m.sys.node(WIDE).is_ready()
+                {
+                    first_entry = Some(self.m.sys.now());
+                }
+                let now = self.m.sys.now();
+                let hold_c5 = first_entry.is_none_or(|t0| now < t0 + stale_ns + 5 * MS);
+                let hold_c6 = first_entry.is_none_or(|t0| now < t0 + stale_ns + 10 * MS);
+                let held = |sys: &crate::system::System, ev: Event| -> bool {
+                    match ev {
+                        Event::EntryStep { core } => {
+                            (core == 5 && hold_c5) || (core == 6 && hold_c6)
+                        }
+                        Event::Action(i) => matches!(
+                            sys.actions()[i].1,
+                            crate::nodes::HwAction::Start { core, .. }
+                                if (core == 5 && hold_c5) || (core == 6 && hold_c6)
+                        ),
+                        _ => false,
+                    }
+                };
+                let events = self.m.sys.events();
+                let ev = events
+                    .iter()
+                    .copied()
+                    .find(|&ev| matches!(ev, Event::Timer { .. }) && !held(&self.m.sys, ev))
+                    .or_else(|| events.into_iter().find(|&ev| !held(&self.m.sys, ev)));
+                if let Some(ev) = ev {
+                    self.m.sys.fire(ev);
+                    if !self
+                        .m
+                        .sys
+                        .events()
+                        .iter()
+                        .any(|e| matches!(e, Event::Timer { .. }))
+                    {
+                        assert_eq!(self.m.sys.check(), Ok(()));
+                        self.m.sample_bounds();
+                        self.note();
+                    }
+                } else {
+                    let now = self.m.sys.now();
+                    let next = self
+                        .m
+                        .sys
+                        .models()
+                        .filter_map(|(_, n)| n.next_timer())
+                        .map(|(at, _)| at)
+                        .filter(|&at| at > now)
+                        .min();
+                    let at = next.map_or(now + 500_000, |t| t.min(now + 500_000));
+                    self.m.sys.move_clock(at);
+                }
+            }
+            assert_eq!(
+                self.m.state(WIDE),
+                MemberState::Live,
+                "3-core staggered fresh start must reach Live without false self-accusation (D-171)"
+            );
+            self.m.restarted(WIDE);
+
+            // Sub-phase B: 3-core TLB shootdown with core 5 alive and core 6 hung.
+            let ut4 = super::untyped_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let tables4 = super::table_slot(self.m.sys.node(WIDE), self.m.t[WIDE as usize]);
+            let asp = self
+                .m
+                .retype(WIDE, ObjectKind::ASpace, u64::from(tables4), 1600);
+            self.m.ok(WIDE, asp);
+            self.m
+                .ok(WIDE, super::retype_from(ut4, ObjectKind::Frame, 1, 1601));
+            self.m.ok(
+                WIDE,
+                Syscall::ASpaceMap(crate::Map {
+                    space: s(1600),
+                    frame: s(1601),
+                    untyped: s(tables4),
+                    address: 0x2000_0000,
+                    first: 0,
+                    count: 1,
+                    rights: Rights::READ.bits(),
+                }),
+            );
+            let _w5 = spawn_worker(&mut self.m, WIDE, 1602, u64::from(WIDE) + 1, 1600);
+            let _w6 = spawn_worker(&mut self.m, WIDE, 1604, u64::from(WIDE) + 2, 1600);
+            self.run(500_000);
+            let generation = self.m.sys.member(WIDE).generation();
+            self.m.harm.harmed.insert((WIDE, generation));
+            self.m.sys.hang(usize::from(WIDE) + 2, true);
+            if arch == Arch::Aarch64 {
+                let wait = self.m.sys.canonical().stale_ns + 40 * MS;
+                self.run(wait);
+            } else {
+                assert_eq!(self.m.call(WIDE, Syscall::ASpaceUnmap(s(1601))), WAITS);
+                self.run(40 * MS);
+            }
+            wait_state(self, WIDE, MemberState::Dead, 150);
+            assert_eq!(self.call(0, fresh(WIDE, 0b111 << WIDE)), Some(DONE));
+            wait_state(self, WIDE, MemberState::Live, 150);
+            self.m.restarted(WIDE);
+
+            // Sub-phase C: `MAP_COUNT_MAX` refusal on a local chunk, followed
+            // by owner death and `R6` clear.
+            let ut0 = super::untyped_slot(self.m.sys.node(0), self.m.t[0]);
+            self.m
+                .ok(0, super::retype_from(ut0, ObjectKind::Frame, 1, 1700));
+            self.m.ok(
+                0,
+                Syscall::CapDerive {
+                    source: s(1700),
+                    destination: s(1701),
+                    rights: frame_rights(),
+                    badge: 0,
+                },
+            );
+            self.m.ok(
+                0,
+                Syscall::ASpaceMap(crate::Map {
+                    space: s(START_SLOT_ASPACE),
+                    frame: s(1700),
+                    untyped: SlotAddr::NONE,
+                    address: 0x3500_0000,
+                    first: 0,
+                    count: 1,
+                    rights: Rights::READ.bits(),
+                }),
+            );
+            let frame_obj = self.m.sys.node(0).object_at(self.m.t[0], s(1700)).unwrap();
+            let base_phys = self.m.sys.node(0).frame_base(frame_obj);
+            let chunk = base_phys / self.m.sys.machine.geometry.chunk();
+            let cur_count = self.m.sys.canonical().map_count(chunk);
+            self.m.sys.node_mut(0).machine.map_count_max = cur_count;
+            assert_eq!(
+                self.m.call(
+                    0,
+                    Syscall::ASpaceMap(crate::Map {
+                        space: s(START_SLOT_ASPACE),
+                        frame: s(1701),
+                        untyped: SlotAddr::NONE,
+                        address: 0x3500_0000 + self.m.sys.machine.geometry.page(),
+                        first: 0,
+                        count: 1,
+                        rights: Rights::READ.bits(),
+                    }),
+                ),
+                Err(Error::Busy)
+            );
+            self.m.sys.node_mut(0).machine.map_count_max = dodos_abi::MAP_COUNT_MAX;
+            self.m.sample_bounds();
+            assert!(self.m.bounds.map_count_max_refused);
+            // Kill owner node 0 so R6 clears its mapped chunk gate word.
+            assert_eq!(self.call(1, kill(0)), Some(DONE));
+            wait_state(self, 0, MemberState::Dead, 150);
+            assert_eq!(self.call(1, fresh(0, 1)), Some(DONE));
+            wait_state(self, 0, MemberState::Live, 150);
+            self.m.restarted(0);
+            self.run(20 * MS);
+        }
+
+        self.note();
+    }
+
+    /// The holder's receiver waits for up to four frames from `group`, and
+    /// the granting node sends them, with its doorbell.
+    fn grant(&mut self, pair: Pair, group: u32) {
+        if self.receive(pair, group) {
+            self.send(pair, group);
+        }
+    }
+
+    /// The frames of a group: the first and how many.
+    fn group(pair: Pair, group: u32) -> (u32, u32) {
+        let first = 4 * group;
+        (first, (pair.frames - first).min(4))
+    }
+
+    /// The holder's receiver waits for the frames of `group` in their
+    /// slots, if it can and they are empty; whether it waits.
+    fn receive(&mut self, pair: Pair, group: u32) -> bool {
+        let holder = pair.holder;
+        let Some(receiver) = self.receivers[holder as usize] else {
+            return false;
+        };
+        let (first, count) = Self::group(pair, group);
+        let m = &self.m;
+        let t = m.t[holder as usize];
+        let ready = m.sys.has(holder)
+            && m.state(holder) == MemberState::Live
+            && m.sys.node(holder).threads.contains_key(&receiver)
+            && m.sys.node(holder).runnable().contains(&receiver)
+            && !m
+                .sys
+                .node(holder)
+                .is_silent(m.sys.node(holder).core_of(receiver))
+            && (first..first + count)
+                .all(|i| m.sys.node(holder).object_at(t, s(pair.got + i)).is_none());
+        if !ready {
+            return false;
+        }
+        let recv = Syscall::Recv {
+            endpoint: s(dodos_abi::START_SLOT_MAILBOX),
+            reply: s(REPLY),
+            range: Range {
+                first: s(pair.got + first),
+                count,
+            },
+            wait: 0,
+        };
+        say(format_args!("{} node {holder}: receive", self.m.sys.now()));
+        let _ = self.m.call_by(holder, receiver, recv);
+        self.note();
+        true
+    }
+
+    /// The granting node sends the frames of `group`, with its doorbell.
+    fn send(&mut self, pair: Pair, group: u32) {
+        let (first, count) = Self::group(pair, group);
+        let rights = Rights::READ.union(Rights::WRITE).union(Rights::SEND).bits();
+        let send = Syscall::NodeSend {
+            node: node_cap(pair.holder),
+            message: Message {
+                caps: (first..first + count)
+                    .map(|i| Transfer::Derive(s(pair.obj + i), rights))
+                    .collect(),
+                ..Message::default()
+            },
+            doorbell: s(BELL),
+        };
+        let _ = self.call(pair.granter, send);
+    }
+
+    /// The granting node a driver kept sealed is resumed.
+    fn release_kept(&mut self) {
+        if let Some(node) = self.kept.take()
+            && self.m.state(node) == MemberState::Sealed
+            && let Some(actor) = self.live_other(node)
+        {
+            let _ = self.call(actor, resume(node));
+        }
+    }
+
+    /// The frames of a group released by the holder, then granted again.
+    fn regrant(&mut self, pair: Pair, group: u32) {
+        let (first, count) = Self::group(pair, group);
+        for i in first..first + count {
+            let _ = self.call(pair.holder, Syscall::CapDelete(s(pair.got + i)));
+        }
+        self.grant(pair, group);
+    }
+
+    /// Every frame of a pair the holder does not hold granted again, one
+    /// message of four at a time, each delivered before the next.
+    fn grant_all(&mut self, pair: Pair) {
+        let holds = |run: &Self, i: u32| {
+            run.m.sys.has(pair.holder)
+                && run
+                    .m
+                    .sys
+                    .node(pair.holder)
+                    .object_at(run.m.t[pair.holder as usize], s(pair.got + i))
+                    .is_some()
+        };
+        // A group whose frames are not all held is granted again whole, its
+        // frames still held released first (pass 38: a group was judged by
+        // its first frame, so one with another frame released was never
+        // granted again, and the release pending never came back).
+        for group in 0..pair.frames.div_ceil(4) {
+            let (first, count) = Self::group(pair, group);
+            let all = |run: &Self| (first..first + count).all(|i| holds(run, i));
+            if all(self) {
+                continue;
+            }
+            match (first..first + count).any(|i| holds(self, i)) {
+                true => self.regrant(pair, group),
+                false => self.grant(pair, group),
+            }
+            for _ in 0..8 {
+                if all(self) {
+                    break;
+                }
+                self.churn();
+            }
+        }
+    }
+
+    /// Events at the current instant, each followed by the check and the
+    /// probe, then time moves by up to 3 ms.
+    fn churn(&mut self) {
+        // A node whose events are held back: none of its interrupts or
+        // timers is chosen, and time does not move, for a few steps (the
+        // generator chooses which event happens now).
+        let deferred = self
+            .deferred
+            .filter(|&(_, steps)| steps > 0)
+            .map(|(n, _)| n);
+        if let Some((node, steps)) = self.deferred {
+            self.deferred = (steps > 1).then_some((node, steps - 1));
+        }
+        let late = self.late_start > 0;
+        self.late_start = self.late_start.saturating_sub(1);
+        let second = WIDE as usize + 1;
+        for _ in 0..self.rng.below(12) {
+            let events: Vec<_> = self
+                .m
+                .sys
+                .events()
+                .into_iter()
+                .filter(|e| {
+                    !matches!(e, crate::system::Event::Ipi { node, .. }
+                        | crate::system::Event::Timer { node, .. } if Some(*node) == deferred)
+                })
+                .filter(|e| {
+                    let crate::system::Event::Action(i) = *e else {
+                        return true;
+                    };
+                    !late
+                        || self.m.sys.actions()[i].1
+                            != crate::nodes::HwAction::Start { core: second }
+                })
+                .collect();
+            if events.is_empty() || self.m.sys.stopped {
+                break;
+            }
+            let event = events[self.rng.below(events.len())];
+            say(format_args!("{} event {event:?}", self.m.sys.now()));
+            self.m.sys.fire(event);
+            assert_eq!(self.m.sys.check(), Ok(()), "after {event:?}");
+            self.note();
+            if multi_page_seed(self.seed) {
+                self.pace_multi_page();
+            }
+        }
+        if deferred.is_none() && self.rng.below(2) == 0 {
+            let ns = 1 + self.rng.below(3_000_000) as u64;
+            self.run(ns);
+        }
+    }
+
+    /// On `multi_page_seed` runs, when a holder is concurrently rebuilding two
+    /// or more unit roles and has a `ReportAsk` in flight to healthy node 0,
+    /// pace each page answer at 7 ms (< `RECOVERY_PERIOD_NS`) instead of
+    /// letting `advance()` settle all 7 pages at 0 ns, so the multi-page
+    /// exchange spans more than `STUCK_NS` (D-170).
+    fn pace_multi_page(&mut self) {
+        if !multi_page_seed(self.seed) || !self.healthy(0) {
+            return;
+        }
+        let is_node_0 = |sys: &crate::System, e: crate::system::Event| match e {
+            crate::system::Event::Ipi { node: 0, .. }
+            | crate::system::Event::Timer { node: 0, .. } => true,
+            crate::system::Event::Action(i) => {
+                sys.actions()[i].1 == crate::nodes::HwAction::Ring { node: 0 }
+            }
+            _ => false,
+        };
+        let mut paced = 0usize;
+        while paced < 16 && !self.m.sys.stopped && self.healthy(0) {
+            if !self.m.sys.has(0)
+                || !self.m.sys.node(0).rebuilds.is_empty()
+                || !self.m.sys.node(0).fences.is_empty()
+            {
+                break;
+            }
+            let concurrent_ask = (0..NODES).any(|h| {
+                self.m.sys.has(h)
+                    && self.m.sys.node(h).rebuilds.len() >= 2
+                    && self
+                        .m
+                        .sys
+                        .node(h)
+                        .rebuilds
+                        .values()
+                        .any(|r| r.node == 0 && r.asked.is_some())
+            });
+            if !concurrent_ask {
+                break;
+            }
+            let target = self.m.sys.now() + 7 * MS;
+            while self.m.sys.now() < target && !self.m.sys.stopped {
+                let events = self.m.sys.events();
+                let next_event = events
+                    .iter()
+                    .copied()
+                    .find(|&e| {
+                        matches!(e, crate::system::Event::Timer { .. })
+                            && !is_node_0(&self.m.sys, e)
+                    })
+                    .or_else(|| events.iter().copied().find(|&e| !is_node_0(&self.m.sys, e)));
+                match next_event {
+                    Some(event) => {
+                        self.m.sys.fire(event);
+                        if !self.m.sys.events().iter().any(|&e| {
+                            matches!(e, crate::system::Event::Timer { .. })
+                                && !is_node_0(&self.m.sys, e)
+                        }) {
+                            assert_eq!(self.m.sys.check(), Ok(()));
+                            self.note();
+                        }
+                    }
+                    None => {
+                        let next_timer = self
+                            .m
+                            .sys
+                            .models()
+                            .filter(|&(slot, _)| slot != 0)
+                            .filter_map(|(_, n)| n.next_timer())
+                            .map(|(at, _)| at)
+                            .min();
+                        let step_to = next_timer.map_or(target, |t| t.min(target));
+                        self.m.sys.move_clock(step_to.max(self.m.sys.now() + 1));
+                    }
+                }
+            }
+            // Deliver node 0's ring interrupt / timer so node 0 answers this
+            // page within 7 ms (< RECOVERY_PERIOD_NS = 10 ms).
+            for _ in 0..8 {
+                let ev = self
+                    .m
+                    .sys
+                    .events()
+                    .into_iter()
+                    .find(|&e| is_node_0(&self.m.sys, e));
+                let Some(ev) = ev else { break };
+                self.m.sys.fire(ev);
+                if !self
+                    .m
+                    .sys
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, crate::system::Event::Timer { .. }))
+                {
+                    assert_eq!(self.m.sys.check(), Ok(()));
+                    self.note();
+                }
+            }
+            // Let the holder consume node 0's `Report` and issue its next ask.
+            for _ in 0..16 {
+                let ev = self
+                    .m
+                    .sys
+                    .events()
+                    .into_iter()
+                    .find(|&e| !is_node_0(&self.m.sys, e));
+                let Some(ev) = ev else { break };
+                self.m.sys.fire(ev);
+                if !self
+                    .m
+                    .sys
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, crate::system::Event::Timer { .. }))
+                {
+                    assert_eq!(self.m.sys.check(), Ok(()));
+                    self.note();
+                }
+            }
+            paced += 1;
+        }
+    }
+
+    /// Event-by-event `advance` for `multi_page_seed` runs so `pace_multi_page`
+    /// intercepts concurrent multi-page `ReportAsk` exchanges before `settle`
+    /// collapses them to 0 ns.
+    fn advance_paced(&mut self, to: u64) {
+        let mut guard = 0usize;
+        while !self.m.sys.stopped && guard < 20_000 {
+            guard += 1;
+            self.pace_multi_page();
+            if self.m.sys.stopped {
+                return;
+            }
+            let events = self.m.sys.events();
+            if let Some(ev) = events
+                .iter()
+                .copied()
+                .find(|e| matches!(e, crate::system::Event::Timer { .. }))
+                .or_else(|| events.first().copied())
+            {
+                self.m.sys.fire(ev);
+                if !self
+                    .m
+                    .sys
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, crate::system::Event::Timer { .. }))
+                {
+                    assert_eq!(self.m.sys.check(), Ok(()));
+                    self.note();
+                }
+                continue;
+            }
+            let next = self
+                .m
+                .sys
+                .models()
+                .filter_map(|(_, n)| n.next_timer())
+                .map(|(at, _)| at)
+                .min()
+                .filter(|&at| at <= to);
+            let Some(at) = next else {
+                break;
+            };
+            self.m.sys.move_clock(at.max(self.m.sys.now()));
+        }
+        if !self.m.sys.stopped && self.m.sys.now() < to {
+            self.m.sys.move_clock(to);
+        }
+        self.pace_multi_page();
+    }
+
+    /// Time passes `ns`, checked and probed every `step`.
+    fn run_by(&mut self, ns: u64, step: u64) {
+        say(format_args!("{} run {ns}", self.m.sys.now()));
+        let to = self.m.sys.now() + ns;
+        while self.m.sys.now() < to && !self.m.sys.stopped {
+            let at = (self.m.sys.now() + step).min(to);
+            if multi_page_seed(self.seed) {
+                self.advance_paced(at);
+            } else {
+                self.m.sys.advance(at);
+            }
+            assert_eq!(self.m.sys.check(), Ok(()));
+            self.note();
+        }
+    }
+
+    /// Time passes `ns`, checked and probed every 100 µs.
+    fn run(&mut self, ns: u64) {
+        self.run_by(ns, 100_000);
+    }
+
+    /// Whether a node is live and unharmed in its generation.
+    fn healthy(&self, n: u16) -> bool {
+        let member = self.m.sys.member(n);
+        member.state() == MemberState::Live
+            && !self.m.harm.harmed.contains(&(n, member.generation()))
+    }
+
+    /// A node in `state`, chosen by the generator.
+    fn any_in(&mut self, state: MemberState) -> Option<u16> {
+        let nodes: Vec<u16> = (0..NODES).filter(|&n| self.m.state(n) == state).collect();
+        (!nodes.is_empty()).then(|| nodes[self.rng.below(nodes.len())])
+    }
+
+    /// A healthy node other than `not`, chosen by the generator.
+    fn live_other(&mut self, not: u16) -> Option<u16> {
+        let live: Vec<u16> = (0..NODES)
+            .filter(|&n| n != not && self.healthy(n))
+            .collect();
+        (!live.is_empty()).then(|| live[self.rng.below(live.len())])
+    }
+
+    /// Whether one more node may be harmed: at most three of the five are
+    /// harmed or not live at once, so that two healthy nodes are left to
+    /// recover them.
+    fn may_harm(&self) -> bool {
+        (0..NODES).filter(|&n| !self.healthy(n)).count() < 3
+    }
+
+    /// A healthy node to harm and a healthy node to act on it.
+    fn victim(&mut self) -> Option<(u16, u16)> {
+        if !self.may_harm() {
+            return None;
+        }
+        let healthy: Vec<u16> = (0..NODES)
+            .filter(|&n| self.healthy(n) && !self.spared.contains(&n))
+            .collect();
+        if healthy.is_empty() {
+            return None;
+        }
+        let victim = healthy[self.rng.below(healthy.len())];
+        let actor = self.live_other(victim)?;
+        Some((victim, actor))
+    }
+
+    fn kill(&mut self) {
+        if let Some((victim, actor)) = self.victim() {
+            let _ = self.call(actor, kill(victim));
+        }
+    }
+
+    fn fail(&mut self) {
+        if let Some((victim, _)) = self.victim() {
+            say(format_args!("{} node {victim} fails", self.m.sys.now()));
+            self.m.fail(victim);
+            self.note();
+        }
+    }
+
+    /// A core hangs; `nmi` whether its kernel can still run the fence's
+    /// handler (on the bootstrap core, without it, no stop reaches it).
+    fn hang(&mut self, victim: u16, nmi: bool) {
+        let core = victim as usize;
+        say(format_args!(
+            "{} hang core {core} nmi {nmi}",
+            self.m.sys.now()
+        ));
+        self.m.hang(core, nmi);
+        self.note();
+    }
+
+    /// Stuck: the node's first thread suspends itself, so that its core
+    /// is idle once its other threads wait; the core hangs, and a message
+    /// waits in its ring.
+    fn stuck(&mut self) {
+        let Some((victim, actor)) = self.victim() else {
+            return;
+        };
+        let suspend = Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD));
+        let _ = self.call(victim, suspend);
+        if self.m.state(victim) == MemberState::Live
+            && self.m.sys.node(victim).runnable().is_empty()
+        {
+            self.hang(victim, false);
+            let send = Syscall::NodeSend {
+                node: node_cap(victim),
+                message: Message::default(),
+                doorbell: SlotAddr::NONE,
+            };
+            let _ = self.call(actor, send);
+        }
+    }
+
+    fn retire(&mut self) {
+        if let Some((victim, actor)) = self.victim() {
+            let retire = Syscall::NodeStop {
+                node: node_cap(victim),
+                mode: NODE_STOP_RETIRE,
+                core: u64::from(victim),
+            };
+            let _ = self.call(actor, retire);
+        }
+    }
+
+    fn seal(&mut self) -> Option<u16> {
+        let (victim, _) = self.victim()?;
+        self.seal_node(victim)
+    }
+
+    /// `node` sealed by a healthy node, if it is healthy and one more node
+    /// may be harmed.
+    fn seal_node(&mut self, victim: u16) -> Option<u16> {
+        if !self.healthy(victim) || !self.may_harm() {
+            return None;
+        }
+        let actor = self.live_other(victim)?;
+        (self.call(actor, seal(victim)) == Some(DONE)).then_some(victim)
+    }
+
+    /// A healthy node sealed, then resumed as soon as it is sealed.
+    fn quick_resume(&mut self) {
+        let Some((victim, _)) = self.victim() else {
+            return;
+        };
+        if self.seal_node(victim).is_none() {
+            return;
+        }
+        for _ in 0..10 {
+            if self.m.state(victim) == MemberState::Sealed {
+                break;
+            }
+            self.churn();
+        }
+        self.recover(MemberState::Sealed);
+    }
+
+    /// A sealed node resumed, or a dead one started afresh, by a live
+    /// node.
+    fn recover(&mut self, state: MemberState) {
+        let (late, kept) = (self.late, self.kept);
+        let protected = move |n: u16| Some(n) == late || Some(n) == kept;
+        if let Some(target) = self.any_in(state).filter(|&n| !protected(n)) {
+            self.recover_node(target, state);
+        }
+    }
+
+    /// `target`, in `state`, resumed or started afresh by a live node.
+    fn recover_node(&mut self, target: u16, state: MemberState) {
+        let Some(actor) = self.live_other(target) else {
+            return;
+        };
+        match state {
+            // The resume's first wake lost, so that it lasts a retry.
+            MemberState::Sealed => {
+                if matches!(self.m.sys.hardware(target as usize), Hardware::Stub { .. }) {
+                    self.m.sys.set_window(target as usize);
+                }
+                let _ = self.call(actor, resume(target));
+            }
+            _ => {
+                // The wake of the start lost once, so that the start lasts
+                // a retry (`START_RETRY_NS`); for the wide node, the wake of
+                // its second core, so that its first thread runs before it
+                // is live (on ARM64 and RISC-V, `CPU_ON` and
+                // `sbi_hart_start` held back a few steps).
+                let wide = target == WIDE;
+                let late = target as usize + usize::from(wide);
+                if matches!(self.m.sys.hardware(late), Hardware::Stub { .. }) {
+                    self.m.sys.set_window(late);
+                } else if wide {
+                    self.late_start = 3 + self.rng.below(6) as u32;
+                }
+                let wide_cores = self.m.sys.machine.cores.len() - usize::from(WIDE);
+                let mask = match wide {
+                    true => ((1u64 << wide_cores) - 1) << target,
+                    false => 1 << target,
+                };
+                if self.call(actor, fresh(target, mask)) == Some(DONE) {
+                    self.receivers[target as usize] = None;
+                    // A grant between two other nodes during the start.
+                    let pair = PAIRS[self.rng.below(PAIRS.len())];
+                    self.regrant(pair, 0);
+                    if wide {
+                        let _ = self.before_live(target);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wide node's first thread, once its node is built and before
+    /// it is live, sends to a live node and waits for the answer (pass 28:
+    /// the window before live, interleaved with the rest).
+    fn before_live(&mut self, node: u16) -> Option<Outcome> {
+        let built = |run: &Self| {
+            let member = run.m.sys.member(node);
+            member.state() == MemberState::Starting
+                && run.m.sys.has(node)
+                && run.m.sys.node(node).generation_built() == member.generation()
+                && run.m.sys.node(node).is_ready()
+        };
+        for _ in 0..8 {
+            if built(self) || self.m.state(node) != MemberState::Starting {
+                break;
+            }
+            self.churn();
+        }
+        if !built(self) {
+            return None;
+        }
+        self.m.restarted(node);
+        let thread = self.m.t[node as usize];
+        if !self.m.sys.node(node).runnable().contains(&thread) {
+            return None;
+        }
+        let core = self.m.sys.node(node).core_of(thread);
+        if self.m.sys.node(node).is_silent(core) {
+            return None;
+        }
+        let peer = self.live_other(node)?;
+        let send = Syscall::NodeSend {
+            node: node_cap(peer),
+            message: Message::default(),
+            doorbell: SlotAddr::NONE,
+        };
+        say(format_args!(
+            "{} node {node}: send before live",
+            self.m.sys.now()
+        ));
+        let outcome = self.m.call(node, send);
+        say(format_args!("  -> {outcome:?}"));
+        self.note();
+        Some(outcome)
+    }
+
+    fn drive(&mut self, driver: Driver) {
+        let first = |run: &mut Self| run.once.insert(driver as usize);
+        match driver {
+            Driver::Kill => self.kill(),
+            Driver::Fail => self.fail(),
+            Driver::Stale => {
+                if let Some((victim, _)) = self.victim() {
+                    self.hang(victim, true);
+                }
+            }
+            Driver::Stuck => self.stuck(),
+            Driver::Retire => self.retire(),
+            // Sealed, then time passes until the node is accused with
+            // evidence seal (within `SEAL_NS` + `SWEEP_NS`).
+            // The driver is spent only by a seal that happened (the audit
+            // of lot 8a, F5).
+            Driver::SealLate => {
+                if !self.once.contains(&(driver as usize))
+                    && let Some(node) = self.seal()
+                {
+                    first(self);
+                    self.late = Some(node);
+                    let table = self.m.sys.canonical();
+                    let end = self.m.sys.now() + table.seal_ns + table.sweep_ns;
+                    while self.m.sys.now() < end && !accused(self.m.state(node)) {
+                        self.run_by(5 * MS, 5 * MS);
+                    }
+                }
+            }
+            // In VMX root operation, where INIT is blocked (D-149: the
+            // bootstrap core is stopped by INIT like the others).
+            Driver::Unfence => {
+                if self.healthy(0) && self.may_harm() && first(self) {
+                    self.m.sys.set_vmx(0, true);
+                    self.hang(0, false);
+                }
+            }
+            // A holder sealed over what it holds, its granting node killed
+            // one time in two meanwhile, then resumed: the resume's R2 has
+            // remote capabilities to remove (Grants, "Generations").
+            // One time in two the holder first releases its first frames
+            // and waits for them again, and the granting node sends them
+            // just before the seal: the grant is unanswered through the
+            // seal and the resume.
+            Driver::Resume => match self.any_in(MemberState::Sealed) {
+                Some(_) => self.recover(MemberState::Sealed),
+                None => {
+                    let pair = PAIRS[self.rng.below(PAIRS.len())];
+                    // Sent while the holder is live, and sealed before it
+                    // serves its user ring.
+                    if self.rng.below(2) == 0 {
+                        self.regrant(pair, 0);
+                    }
+                    let sealed = self.seal_node(pair.holder).is_some();
+                    let resume_now = self.rng.below(2) == 0;
+                    if sealed
+                        && self.rng.below(2) == 0
+                        && self.healthy(pair.granter)
+                        && self.may_harm()
+                        && let Some(actor) = self.live_other(pair.granter)
+                    {
+                        let _ = self.call(actor, kill(pair.granter));
+                    }
+                    // One time in two resumed as soon as it is sealed; one
+                    // time in three of those, under a rebuild: the IOMMU
+                    // unit's holder killed, and the resume at its fence,
+                    // so that its successor's rebuild asks the resuming
+                    // node for its report (D-144).
+                    if sealed && resume_now {
+                        let holder = pair.holder;
+                        for _ in 0..10 {
+                            if self.m.state(holder) == MemberState::Sealed {
+                                break;
+                            }
+                            self.churn();
+                        }
+                        let unit = self.m.sys.role(IOMMU_ROLE).holder();
+                        if self.rng.below(3) == 0
+                            && unit < NODES
+                            && self.healthy(unit)
+                            && self.may_harm()
+                            && let Some(actor) = self.live_other(unit)
+                        {
+                            let _ = self.call(actor, kill(unit));
+                            for _ in 0..20 {
+                                if self.m.state(unit) != MemberState::Fencing {
+                                    break;
+                                }
+                                self.churn();
+                            }
+                        }
+                        self.recover(MemberState::Sealed);
+                    }
+                }
+            },
+            Driver::Fresh => match self.any_in(MemberState::Dead) {
+                Some(_) => self.recover(MemberState::Dead),
+                None => self.kill(),
+            },
+            Driver::FailUnit => {
+                if first(self) {
+                    say(format_args!("{} unit fails", self.m.sys.now()));
+                    self.m.sys.break_unit(IOMMU_ROLE);
+                    self.note();
+                }
+            }
+            // Handed, and once the word reads handing, its holder or its
+            // target killed.
+            Driver::HandDeath => {
+                if self.hand() {
+                    let handing = |m: &S| m.sys.role(IOMMU_ROLE).state() != RoleState::Held;
+                    for _ in 0..20 {
+                        if handing(&self.m) {
+                            break;
+                        }
+                        self.churn();
+                    }
+                }
+                let word = self.m.sys.role(IOMMU_ROLE);
+                if word.state() == RoleState::Handing {
+                    let victim = match self.rng.below(2) {
+                        0 => word.holder(),
+                        _ => word.target(),
+                    };
+                    if victim < NODES
+                        && self.may_harm()
+                        && self.healthy(victim)
+                        && !self.spared.contains(&victim)
+                        && let Some(actor) = self.live_other(victim)
+                    {
+                        let _ = self.call(actor, kill(victim));
+                    }
+                }
+            }
+            Driver::ReleasePending => {
+                self.release_kept();
+                self.release_all(false);
+            }
+            Driver::SignalPending => {
+                let pair = PAIRS[self.rng.below(PAIRS.len())];
+                self.release_kept();
+                self.grant_all(pair);
+                if self.rng.below(2) == 0 && self.seal_node(pair.granter).is_some() {
+                    self.kept = Some(pair.granter);
+                }
+                for _ in 0..70 {
+                    let signal = Syscall::GrantSignal(s(pair.got));
+                    if self.call(pair.holder, signal) != Some(DONE) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The 32 frames of the second pair released at once (granted first
+    /// if some are not held), the granting node sealed before, and kept
+    /// so, if `sealed` or one time in two, so that the ring stays full and
+    /// the release pending.
+    fn release_all(&mut self, sealed: bool) {
+        let pair = PAIRS[1];
+        let held = |run: &Self| {
+            let node = run
+                .m
+                .sys
+                .has(pair.holder)
+                .then(|| run.m.sys.node(pair.holder));
+            let t = run.m.t[pair.holder as usize];
+            (0..pair.frames)
+                .filter(|&i| node.is_some_and(|n| n.object_at(t, s(pair.got + i)).is_some()))
+                .count() as u32
+        };
+        // Granted first if some are not held, then released in the same
+        // turn (pass 38: the release waited for the driver's next turn, and
+        // was pending in 31 seeds of 858).
+        if held(self) != pair.frames {
+            self.grant_all(pair);
+        }
+        if held(self) != pair.frames {
+            return;
+        }
+        // A focused run seals it whatever the harm already done (it is
+        // spared, and resumed by the run).
+        let seal_it = |run: &mut Self| match sealed {
+            true => {
+                run.healthy(pair.granter)
+                    && run
+                        .live_other(pair.granter)
+                        .is_some_and(|actor| run.call(actor, seal(pair.granter)) == Some(DONE))
+            }
+            false => run.seal_node(pair.granter).is_some(),
+        };
+        if (sealed || self.rng.below(2) == 0) && seal_it(self) {
+            self.kept = Some(pair.granter);
+        }
+        // The first frame last: the holder maps it, and its removal can
+        // wait for an invalidation, its thread then making no more calls
+        // (pass 38: it went first, and the release was pending in 55 seeds
+        // of 858).
+        for i in (0..pair.frames).rev() {
+            let _ = self.call(pair.holder, Syscall::CapDelete(s(pair.got + i)));
+        }
+        // The holder's events held back, so that its release stays pending
+        // while the rest goes on, and its R0 of a granting node accused
+        // meanwhile waits.
+        self.deferred = Some((pair.holder, 4 + self.rng.below(5) as u32));
+    }
+
+    /// The first frame of a pair mapped, then its revocation and its
+    /// release at once.
+    fn crossing(&mut self, pair: Pair) {
+        if !self.m.sys.has(pair.holder) {
+            return;
+        }
+        let map = map_call(&self.m, pair);
+        let _ = self.call(pair.holder, map);
+        let _ = self.call(pair.granter, Syscall::CapRevoke(s(pair.obj)));
+        let _ = self.call(pair.holder, Syscall::CapDelete(s(pair.got)));
+    }
+
+    /// One action of a grant: a map, an unmap, a release, a revocation,
+    /// the two at once, a new grant, or a signal.
+    fn grants(&mut self) {
+        let pair = PAIRS[self.rng.below(PAIRS.len())];
+        let i = self.rng.below(pair.frames as usize) as u32;
+        let (granter, holder) = (pair.granter, pair.holder);
+        match self.rng.below(7) {
+            0 if self.m.sys.has(holder) => {
+                let map = map_call(&self.m, pair);
+                let _ = self.call(holder, map);
+            }
+            1 => {
+                let unmap = match pair.io {
+                    true => Syscall::IoSpaceUnmap(s(pair.got)),
+                    false => Syscall::ASpaceUnmap(s(pair.got)),
+                };
+                let _ = self.call(holder, unmap);
+            }
+            2 => {
+                let _ = self.call(holder, Syscall::CapDelete(s(pair.got + i)));
+            }
+            3 => {
+                let _ = self.call(granter, Syscall::CapRevoke(s(pair.obj + i)));
+            }
+            // The first frame mapped, then its revocation and its release
+            // at once: a revocation of a frame the holder counts no leaf
+            // under frees the grant with no `Revoke`.
+            4 => self.crossing(pair),
+            5 => self.regrant(pair, i / 4),
+            _ => {
+                let _ = self.call(holder, Syscall::GrantSignal(s(pair.got + i)));
+            }
+        }
+    }
+
+    /// A device attached or detached by its node.
+    fn devices(&mut self) {
+        let (node, device) = DEVICES[self.rng.below(DEVICES.len())];
+        if !self.m.sys.has(node) {
+            return;
+        }
+        let attach = self.rng.below(2) == 0;
+        let t = self.m.t[node as usize];
+        if self.m.sys.node(node).object_at(t, s(IOSPACE)).is_none() {
+            let iospace = self.m.retype(node, ObjectKind::IoSpace, 0, IOSPACE);
+            let _ = self.call(node, iospace);
+            return;
+        }
+        let call = attach_call(&self.m, node, device, attach);
+        let _ = self.call(node, call);
+    }
+
+    /// The line claimed by one of its two nodes, or removed.
+    fn line(&mut self) {
+        let node = LINERS[self.rng.below(LINERS.len())];
+        if !self.m.sys.has(node) {
+            return;
+        }
+        let t = self.m.t[node as usize];
+        let call = match self.m.sys.node(node).object_at(t, s(IRQ)) {
+            Some(_) => Syscall::CapDelete(s(IRQ)),
+            None => Syscall::IrqClaim {
+                control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+                source: IrqSource::line(GSI, false, false).raw(),
+                core: u64::from(node),
+                vector: 48,
+                destination: s(IRQ),
+            },
+        };
+        let _ = self.call(node, call);
+    }
+
+    /// The IOMMU role handed by its holder to another node; whether it was
+    /// asked.
+    fn hand(&mut self) -> bool {
+        let word = self.m.sys.role(IOMMU_ROLE);
+        let holder = word.holder();
+        if word.state() != RoleState::Held || holder >= NODES || !self.m.sys.has(holder) {
+            return false;
+        }
+        if multi_page_seed(self.seed) {
+            let ioapic = super::units::IOAPIC_ROLE;
+            let io_word = self.m.sys.role(ioapic);
+            let io_holder = io_word.holder();
+            if io_word.state() == RoleState::Held
+                && io_holder != holder
+                && io_holder < NODES
+                && self.m.sys.has(io_holder)
+                && self.healthy(holder)
+            {
+                let t = self.m.t[io_holder as usize];
+                let roles = slots_of(self.m.sys.node(io_holder), t, ObjectKind::Role);
+                let io_hand = Syscall::RoleHand {
+                    role: s(roles[ioapic]),
+                    node: node_cap(holder),
+                };
+                return self.call(io_holder, io_hand).is_some();
+            }
+        }
+        let Some(target) = self.live_other(holder) else {
+            return false;
+        };
+        let t = self.m.t[holder as usize];
+        let roles = slots_of(self.m.sys.node(holder), t, ObjectKind::Role);
+        let hand = Syscall::RoleHand {
+            role: s(roles[IOMMU_ROLE]),
+            node: node_cap(target),
+        };
+        self.call(holder, hand).is_some()
+    }
+
+    /// A chunk taken and given between nodes 1 and 3, or a device entry
+    /// taken and split by one of them.
+    fn memory(&mut self) {
+        let node = LINERS[self.rng.below(LINERS.len())];
+        if !self.m.sys.has(node) {
+            return;
+        }
+        let other = LINERS.iter().copied().find(|&n| n != node).expect("two");
+        let control = s(dodos_abi::START_SLOT_MEMORY_CONTROL);
+        let table = self.m.sys.canonical();
+        if self.rng.below(4) == 0 {
+            let page = table.geometry.page().trailing_zeros();
+            let free = |e: &&dodos_abi::DeviceEntry| e.owner.state() == OwnState::Free;
+            let Some(index) = table
+                .devices
+                .iter()
+                .position(|e| e.is_used() && e.log2() > page && free(&e))
+            else {
+                return;
+            };
+            if self.call(node, super::pass22::take(1, index as u64, 0, ENTRY)) == Some(DONE) {
+                let split = Syscall::MemorySplit {
+                    control,
+                    untyped: s(ENTRY),
+                };
+                let _ = self.call(node, split);
+            }
+            return;
+        }
+        let t = self.m.t[node as usize];
+        if self.m.sys.node(node).object_at(t, s(BLOCK)).is_some() {
+            let give = Syscall::MemoryGive {
+                control,
+                untyped: s(BLOCK),
+                node: u64::from(other),
+            };
+            let _ = self.call(node, give);
+            return;
+        }
+        let shift = table.geometry.chunk_shift();
+        let mine = Ownership::free(Owner::Node(node)).raw();
+        let free = Ownership::free(Owner::Unclaimed).raw();
+        let chunk = table
+            .owners
+            .iter()
+            .position(|&w| w == mine)
+            .or_else(|| table.owners.iter().position(|&w| w == free));
+        if let Some(chunk) = chunk {
+            let take = super::pass22::take(0, (chunk as u64) << shift, u64::from(shift), BLOCK);
+            let _ = self.call(node, take);
+        }
+    }
+
+    /// The table chunks of D-154 among the recovery states, one step of a
+    /// cycle on a node: a table run taken (kind 2), a child table untyped
+    /// cut from it, an `aspace` or an `iospace` made on the child, a frame
+    /// mapped under it with the child as its table untyped, the space
+    /// destroyed with its mapping in place, the child deleted, the run
+    /// given to another node or destroyed. Any step may meet a death, a
+    /// seal or a fresh start of the node or of another.
+    fn tables(&mut self) {
+        // A node already in the cycle, else one drawn; up to four steps.
+        let started = (0..NODES).find(|&n| {
+            self.healthy(n)
+                && self.m.sys.has(n)
+                && self
+                    .m
+                    .sys
+                    .node(n)
+                    .object_at(self.m.t[n as usize], s(TBLOCK))
+                    .is_some()
+        });
+        let node = started.unwrap_or_else(|| self.rng.below(NODES as usize) as u16);
+        for _ in 0..4 {
+            if !self.healthy(node) || !self.m.sys.has(node) {
+                return;
+            }
+            self.table_step(node);
+        }
+    }
+
+    /// One step of the cycle of `tables` on `node`.
+    fn table_step(&mut self, node: u16) {
+        let t = self.m.t[node as usize];
+        let model = self.m.sys.node(node);
+        let has = |slot: u32| model.object_at(t, s(slot)).is_some();
+        let (block, child, frame) = (has(TBLOCK), has(TCHILD), has(TFRAME));
+        let spaces = [(TASPACE, has(TASPACE)), (TIOSPACE, has(TIOSPACE))];
+        let ut = super::untyped_slot(model, t);
+        let geometry = self.m.sys.canonical().geometry;
+        let done = |outcome: Option<Outcome>| outcome == Some(DONE);
+        if !block && !child {
+            let shift = geometry.chunk_shift();
+            let table = self.m.sys.canonical();
+            let mine = Ownership::free(Owner::Node(node)).raw();
+            let free = Ownership::free(Owner::Unclaimed).raw();
+            let chunk = table
+                .owners
+                .iter()
+                .position(|&w| w == mine)
+                .or_else(|| table.owners.iter().position(|&w| w == free));
+            if let Some(chunk) = chunk {
+                let place = (chunk as u64) << shift;
+                let take = super::pass22::take(
+                    dodos_abi::MEMORY_TAKE_TABLES,
+                    place,
+                    u64::from(shift),
+                    TBLOCK,
+                );
+                if done(self.call(node, take)) {
+                    self.seen.tables.insert(0);
+                }
+            }
+            return;
+        }
+        if !frame {
+            let _ = self.call(node, retype_from(ut, ObjectKind::Frame, 1, TFRAME));
+            return;
+        }
+        if block && !child {
+            // One time in four the run goes: given or destroyed.
+            if self.rng.below(4) == 0 {
+                let control = s(dodos_abi::START_SLOT_MEMORY_CONTROL);
+                let other = (node + 1 + self.rng.below(NODES as usize - 1) as u16) % NODES;
+                let release = match self.rng.below(2) {
+                    0 => Syscall::MemoryGive {
+                        control,
+                        untyped: s(TBLOCK),
+                        node: u64::from(other),
+                    },
+                    _ => Syscall::CapDelete(s(TBLOCK)),
+                };
+                if done(self.call(node, release)) {
+                    self.seen.tables.insert(8);
+                }
+            } else {
+                let page = geometry.page();
+                let cut = retype_from(TBLOCK, ObjectKind::Untyped, 8 * page, TCHILD);
+                if done(self.call(node, cut)) {
+                    self.seen.tables.insert(1);
+                }
+            }
+            return;
+        }
+        let live: Vec<u32> = spaces.iter().filter(|s| s.1).map(|s| s.0).collect();
+        let Some(&space) = live.first() else {
+            // No space: one made on the child, or one time in four the
+            // child deleted.
+            if self.rng.below(4) == 0 {
+                let _ = self.call(node, Syscall::CapDelete(s(TCHILD)));
+                return;
+            }
+            let (slot, kind, state) = match self.rng.below(2) {
+                0 => (TASPACE, ObjectKind::ASpace, 2),
+                _ => (TIOSPACE, ObjectKind::IoSpace, 3),
+            };
+            let make = retype_from(ut, kind, s(TCHILD).raw(), slot);
+            if done(self.call(node, make)) {
+                self.seen.tables.insert(state);
+                self.mapped.remove(&(node, slot));
+            }
+            return;
+        };
+        let io = space == TIOSPACE;
+        if !self.mapped.contains(&(node, space)) {
+            let map = crate::Map {
+                space: s(space),
+                frame: s(TFRAME),
+                untyped: s(TCHILD),
+                address: 0x4000_0000,
+                first: 0,
+                count: 1,
+                rights: Rights::READ.bits(),
+            };
+            let call = match io {
+                true => Syscall::IoSpaceMap(map),
+                false => Syscall::ASpaceMap(map),
+            };
+            if done(self.call(node, call)) {
+                self.mapped.insert((node, space));
+                self.seen.tables.insert(if io { 5 } else { 4 });
+            }
+            return;
+        }
+        // Destroyed with its mapping in place, in bounded steps.
+        for _ in 0..16 {
+            match self.call(node, Syscall::CapDelete(s(space))) {
+                Some(DONE) => {
+                    self.mapped.remove(&(node, space));
+                    self.seen.tables.insert(if io { 7 } else { 6 });
+                    return;
+                }
+                Some(Err(Error::Again)) => self.run_by(MS, 100_000),
+                _ => return,
+            }
+        }
+    }
+
+    /// A faulty node's action alongside the normal exploration: it attempts
+    /// gate writes that its own gate must refuse when counts or state forbid
+    /// them, and writes forged messages, sender slots, credits and early
+    /// `acked`/`maps_of` beacon words that the other nodes' gates and
+    /// recovery reserves must refuse or withstand without breaking machine
+    /// invariants or liveness.
+    fn faulty(&mut self) {
+        use crate::rings::Message;
+        use dodos_abi::{NodeMessage, RingHeader};
+        let f = self.faulty_node;
+        if !self.m.sys.has(f) || !self.m.sys.canonical().writes(f) {
+            return;
+        }
+        let Some(to) = (1..NODES)
+            .map(|step| (f + step) % NODES)
+            .find(|&n| self.healthy(n))
+        else {
+            return;
+        };
+        let fg = self.m.sys.member(f).generation();
+        let tg = self.m.sys.member(to).generation();
+        let can_send = |m: &S, from: u16, dest: u16, user: bool, entries: u64| {
+            let table = m.sys.canonical();
+            let pair = &table.rings[from as usize][dest as usize];
+            let consumed = table.beacons[dest as usize].consumed[from as usize];
+            match user {
+                true => {
+                    pair.user.produced.wrapping_sub(consumed.1) + entries
+                        <= dodos_abi::RING_USER_ENTRIES
+                }
+                false => {
+                    pair.kernel.produced.wrapping_sub(consumed.0)
+                        + entries
+                        + dodos_abi::RING_ANSWER_RESERVE
+                        <= dodos_abi::RING_KERNEL_ENTRIES
+                }
+            }
+        };
+        self.faulty_acts += 1;
+        if self.faulty_acts.is_multiple_of(10) {
+            let table = self.m.sys.canonical();
+            let busy_chunk = (0..table.owners.len() as u64).find(|&c| {
+                Ownership::from_raw(table.owners[c as usize]).is_some_and(|w| {
+                    w.state() == OwnState::Taken
+                        && w.owner() == Owner::Node(f)
+                        && w.generation() == fg
+                }) && (table.grant_count(c) > 0 || table.map_count(c) > 0)
+            });
+            if let Some(chunk) = busy_chunk {
+                assert!(!self.m.sys.node_mut(f).gate_give_chunk(chunk, to));
+            }
+            if self.m.state(f) != MemberState::Sealing {
+                assert!(!self.m.sys.gate_park_self(f, f as usize));
+            }
+            // D-154: its gate puts no table in an ordinary chunk it holds
+            // (its ordinary floor's first page here), and writes no leaf
+            // and no grant's anchor toward its table floor.
+            let table = self.m.sys.canonical();
+            let geometry = table.geometry;
+            let class = dodos_abi::PageClass::table(1).expect("a class");
+            let ordinary = table.floors[f as usize][0].0 / geometry.page();
+            let tables = table.table_floors[f as usize][0].0 / geometry.page();
+            let last = tables + geometry.chunk() / geometry.page() - 1;
+            let node = self.m.sys.node_mut(f);
+            assert!(!node.gate_retype_page(ordinary, class));
+            assert!(!node.gate_leaf_allowed(last) && !node.gate_anchor_allowed(last));
+            // The same toward the table run of `tables` it holds: no leaf,
+            // no anchor into it, and no give while a table lies in it.
+            let block = node.object_at(self.m.t[f as usize], s(TBLOCK));
+            if let Some(base) = block.and_then(|b| node.untypeds.get(&b)).map(|u| u.base) {
+                let chunk = base >> geometry.chunk_shift();
+                let first = base / geometry.page();
+                assert!(!node.gate_leaf_allowed(first) && !node.gate_anchor_allowed(first));
+                if node.table.gate_word(chunk).not_data() > 0 {
+                    assert!(!node.gate_give_chunk(chunk, to));
+                }
+                self.seen.tables.insert(10);
+            }
+        }
+        let table = self.m.sys.canonical();
+        match self.faulty_acts % 10 {
+            // 0 (D-169): cycle the faulty node through the two rebuild-report
+            // faults (consuming `ReportAsk` without answering, and answering
+            // with strictly rising keys and bad items) and normal reporting.
+            0 => {
+                let mode = match (self.faulty_acts / 10) % 3 {
+                    1 => crate::units::FaultyReport::Silent,
+                    2 => crate::units::FaultyReport::BadItems,
+                    _ => crate::units::FaultyReport::Normal,
+                };
+                self.m.sys.node_mut(f).faulty_report = mode;
+            }
+            // 1: forged sender slot in header (speaking in a third node's
+            // name): refused by `to` (`header.sender != from`, D-141).
+            1 if can_send(&self.m, f, to, false, 1) => {
+                let third = (0..NODES).find(|&z| z != f && z != to).unwrap_or(0);
+                let header = RingHeader::new(
+                    NodeMessage::Release,
+                    1,
+                    (third, self.m.sys.member(third).generation()),
+                    tg,
+                    None,
+                );
+                let body = Body::Release {
+                    grant: 0,
+                    serial: 1,
+                };
+                self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
+            }
+            // 2: forged `Release` for a live grant `f` holds while `uses[f]`
+            // still counts leaves > 0: refused by the granter (D-141).
+            2 => {
+                let held = (0..NODES).find_map(|g| {
+                    table.grants[g as usize]
+                        .iter()
+                        .find(|(_, e)| {
+                            e.grantee == f
+                                && e.generation == fg
+                                && e.state == GrantState::Live
+                                && e.use_index.is_some_and(|i| {
+                                    table.uses[f as usize].get(&i).is_some_and(|u| u.leaves > 0)
+                                })
+                        })
+                        .map(|(&id, e)| (g, id, e.serial))
+                });
+                if let Some((granter, grant, serial)) = held
+                    && can_send(&self.m, f, granter, false, 1)
+                {
+                    let gg = self.m.sys.member(granter).generation();
+                    let header = RingHeader::new(NodeMessage::Release, 1, (f, fg), gg, None);
+                    let body = Body::Release { grant, serial };
+                    self.m.sys.inject(f, granter, Message { header, body });
+                    // Read after a removal made the entry revoking, it
+                    // pins it, and `f`'s count may then fall (D-165).
+                    self.m.sys.undue_release(granter, grant, serial);
+                    self.forged(f, granter);
+                    if let Some(forged) = self.forged.last_mut() {
+                        forged.grant = Some(grant);
+                    }
+                }
+            }
+            // 3: forged `RevokeStep` naming a credit `to` does not have in
+            // use toward `f`: refused by `credit_in_use` (D-141).
+            3 if can_send(&self.m, f, to, false, 1) => {
+                let header = RingHeader::new(
+                    NodeMessage::RevokeStep,
+                    1,
+                    (f, fg),
+                    tg,
+                    Some((15, 0x7ff_ffff)),
+                );
+                let body = Body::RevokeStep { removed: true };
+                self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
+            }
+            // 4: forged `UnitRequest` to the IOMMU role holder with a send
+            // credit (index 20, outside 0..16): refused by the holder's
+            // receive check without occupying `unit_service`.
+            4 => {
+                let holder = self.m.sys.role(IOMMU_ROLE).holder();
+                if holder != f
+                    && holder < NODES
+                    && self.m.sys.canonical().writes(holder)
+                    && can_send(&self.m, f, holder, false, 1)
+                {
+                    let hg = self.m.sys.member(holder).generation();
+                    let epoch = self.m.sys.role(IOMMU_ROLE).epoch();
+                    let header =
+                        RingHeader::new(NodeMessage::UnitRequest, 1, (f, fg), hg, Some((20, 1)));
+                    let body = Body::UnitRequest {
+                        entry: 0,
+                        serial: 0,
+                        role: IOMMU_ROLE as u16,
+                        epoch,
+                        op: crate::rings::UnitOp::Invalidate { domain: Some(1) },
+                    };
+                    self.m.sys.inject(f, holder, Message { header, body });
+                    self.forged(f, holder);
+                }
+            }
+            // 5: forged `UnitAnswer` to the IOMMU role holder naming a
+            // request credit the holder does not have in use toward `f`:
+            // refused by `credit_in_use` (D-141).
+            5 => {
+                let holder = self.m.sys.role(IOMMU_ROLE).holder();
+                if holder != f
+                    && holder < NODES
+                    && self.m.sys.canonical().writes(holder)
+                    && can_send(&self.m, f, holder, false, 1)
+                {
+                    let hg = self.m.sys.member(holder).generation();
+                    let header = RingHeader::new(
+                        NodeMessage::UnitAnswer,
+                        1,
+                        (f, fg),
+                        hg,
+                        Some((15, 0x7ff_fffe)),
+                    );
+                    let body = Body::UnitAnswer {
+                        result: dodos_abi::UnitResult::Done,
+                    };
+                    self.m.sys.inject(f, holder, Message { header, body });
+                    self.forged(f, holder);
+                }
+            }
+            // 6: forged `Send` on the user ring with no credit (`None`,
+            // outside the send credit range 16..24) and a stamp naming
+            // another node: refused by `to`'s receive check.
+            6 if can_send(&self.m, f, to, true, 1) => {
+                let body = Body::Send {
+                    header: dodos_abi::Header::new(0, 1, 0, 0).expect("valid"),
+                    stamp: (u64::from(to) << 48 | 1, 0b100),
+                    grants: Vec::new(),
+                    words: vec![0; 1],
+                };
+                let header =
+                    RingHeader::new(NodeMessage::Send, body.entries() as u8, (f, fg), tg, None);
+                self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
+            }
+            // 7: forged `Report` to `to` with an unused credit: refused by
+            // `to` (`credit_in_use`), leaving any active rebuild untouched.
+            7 if can_send(&self.m, f, to, false, 1) => {
+                let header =
+                    RingHeader::new(NodeMessage::Report, 1, (f, fg), tg, Some((14, 0x7ff_fffc)));
+                let body = Body::Report {
+                    next: dodos_abi::REPORT_END,
+                    items: vec![crate::rings::Item::Device(0, 0)],
+                };
+                self.m.sys.inject(f, to, Message { header, body });
+                self.forged(f, to);
+            }
+            // 8: unreadable raw header on the user ring (length 0 or
+            // reserved kind 9): `to` consumes 1 entry, traces `Refused` and
+            // continues.
+            8 if can_send(&self.m, f, to, true, 1) => {
+                let mut bad = RingHeader::new(NodeMessage::Release, 0, (f, fg), tg, None);
+                bad.kind = 9;
+                self.m.sys.inject_raw(f, to, true, bad, 1);
+                self.forged(f, to);
+            }
+            // 9: early `beacons[f].acked[x] = g` and `maps_of[x] = false`
+            // written by `f` (when `f` holds no unit role, has run R0 for
+            // `x`, its R4 ended or not, and has no active grant or remote
+            // capability of `x`)
+            // while `x` is `Fenced`: R6's proof (`r6_held_back`, D-149)
+            // still holds R6 back until every grantee's use entry counts no
+            // leaf under `x`'s grants and no attach word of `x` reads
+            // `Attached`.
+            9 => {
+                let holds_unit = table.role_records.iter().zip(&table.roles).any(|(r, w)| {
+                    r.kind == dodos_abi::RoleKind::Unit
+                        && w.state() != RoleState::Vacant
+                        && (w.holder() == f || w.target() == f)
+                });
+                let fenced = (0..NODES).filter(|_| !holds_unit).find(|&x| {
+                    let xg = self.m.sys.member(x).generation();
+                    x != f
+                        && self.m.state(x) == MemberState::Fenced
+                        && self
+                            .m
+                            .sys
+                            .node(f)
+                            .reclaims
+                            .get(&x)
+                            .is_some_and(|r| r.generation == xg && r.isolated)
+                        && !table.grants[x as usize].values().any(|e| e.grantee == f)
+                        && !table.grants[f as usize].values().any(|e| e.grantee == x)
+                });
+                if let Some(x) = fenced {
+                    // Written before R4's audit may have ended (pass 36:
+                    // pass 34 held the adversary to the end of R4, a
+                    // weakening the review of passes 33 and 34 found). Only
+                    // then is a rule of `f`'s own state broken, R4 before
+                    // R5 of ACKED, and only that rule is passed over, for
+                    // that acknowledgement alone; every other rule of `f`,
+                    // R6's proof and the rings toward `f` among them, is
+                    // still judged (the review of passes 35 and 36, finding
+                    // 3: the whole kernel was declared faulty for the rest
+                    // of the seed at every early acknowledgement).
+                    let reclaim = &self.m.sys.node(f).reclaims[&x];
+                    let audited = reclaim.audit.as_ref().is_some_and(Vec::is_empty);
+                    let xg = self.m.sys.member(x).generation();
+                    if !audited {
+                        self.m.sys.early_ack(f, x, xg);
+                        self.seen.early_acks += 1;
+                    }
+                    self.m.sys.edit_table(|t| {
+                        t.beacons[f as usize].acked[x as usize] = xg;
+                        t.beacons[f as usize].maps_of[x as usize] = false;
+                    });
+                }
+            }
+            _ => {}
+        }
+        self.m
+            .sys
+            .check()
+            .expect("invariants hold after faulty action");
+        self.note();
+    }
+
+    /// One step: a driver one time in three, an action of the machine's
+    /// other parts, then events and time, and a faulty node's action.
+    fn step(&mut self) {
+        // A node started afresh has a new first thread once it runs.
+        refresh(&mut self.m);
+        // While a node is accused, a resume beside it: a healthy node
+        // sealed and resumed at once (a resume lasts a few events, an
+        // accusation its fence and reclaim).
+        let accusation = (0..NODES).any(|n| accused(self.m.state(n)));
+        if accusation && self.drivers.contains(&Driver::Resume) && self.rng.below(2) == 0 {
+            self.quick_resume();
+        }
+        if self.rng.below(3) == 0 {
+            let driver = self.drivers[self.rng.below(3)];
+            self.drive(driver);
+        }
+        // Now and then a driver outside the seed's triple: a rare state
+        // only one driver makes (a release pending, a resume, a death
+        // mid-hand) then meets the states of every other triple, and not
+        // only those of the three seeds per run whose triple holds it
+        // (pass 38: 100 combinations of the long run never reached).
+        if self.rng.below(VISIT) == 0 {
+            let driver = DRIVERS[self.rng.below(DRIVERS.len())];
+            self.drive(driver);
+        }
+        match self.rng.below(10) {
+            0..=3 => self.grants(),
+            4 => self.devices(),
+            5 => self.line(),
+            6 => {
+                let _ = self.hand();
+            }
+            7 if self.rng.below(2) == 0 => self.memory(),
+            7 => self.tables(),
+            8 => self.recover(MemberState::Sealed),
+            _ => self.recover(MemberState::Dead),
+        }
+        self.churn();
+        self.faulty();
+    }
+
+    /// The machine runs until it is quiet; then no node is accused that was
+    /// not harmed, and no live node waits for another node, a unit or its
+    /// cores.
+    fn liveness(&mut self, seed: u64) {
+        for n in 0..NODES {
+            if self.m.state(n) == MemberState::Sealed
+                && let Some(actor) = self.live_other(n)
+            {
+                let _ = self.call(actor, resume(n));
+            }
+        }
+        // A wait for a node starting afresh ends by `START_NS` (D-144).
+        let sweep = self.m.sys.canonical().sweep_ns;
+        self.run_by(sweep + 300 * MS, MS);
+        if (0..NODES).any(|n| self.m.state(n) == MemberState::Starting) {
+            self.run_by(dodos_abi::START_NS + sweep, MS);
+        }
+        self.gap_21 = super::explore::sealing_holds_a_failed_unit(&self.m);
+        super::explore::assert_live(&self.m, seed, NODES);
+    }
+}
+
+/// The attach of a node's device into its iospace, or its detach.
+fn attach_call(m: &S, node: u16, device: u64, attach: bool) -> Syscall {
+    let iommu = slots_of(m.sys.node(node), m.t[node as usize], ObjectKind::Iommu)[0];
+    Syscall::IoSpaceAttach {
+        iommu: s(iommu),
+        iospace: if attach { s(IOSPACE) } else { SlotAddr::NONE },
+        device,
+    }
+}
+
+/// The holder's map of the first frame it holds.
+fn map_call(m: &S, pair: Pair) -> Syscall {
+    let map = |space, untyped| crate::Map {
+        space,
+        frame: s(pair.got),
+        untyped,
+        address: 0x1000_0000,
+        first: 0,
+        count: 1,
+        rights: Rights::READ.bits(),
+    };
+    match pair.io {
+        true => {
+            // The iospace's table untyped: the holder's table floor's
+            // (D-154).
+            let ut = super::table_slot(m.sys.node(pair.holder), m.t[pair.holder as usize]);
+            Syscall::IoSpaceMap(map(s(IOSPACE), s(ut)))
+        }
+        false => Syscall::ASpaceMap(map(s(dodos_abi::START_SLOT_ASPACE), SlotAddr::NONE)),
+    }
+}
+
+/// One seed explored: what it reached, whether it ended in the state of
+/// gap 21 of pass 26, and whether it handed a failed unit's role.
+fn explore_one(seed: u64) -> (Seen, [bool; 2]) {
+    say(format_args!("seed {seed}"));
+    let explored = std::panic::catch_unwind(|| {
+        let mut run = Run::new(seed);
+        for _ in 0..STEPS {
+            run.step();
+        }
+        run.liveness(seed);
+        run.m.sample_bounds();
+        run.seen.bounds = run.m.bounds.clone();
+        (run.seen, [run.gap_21, run.handed_failed])
+    });
+    explored.unwrap_or_else(|panic| {
+        eprintln!("seed {seed} fails; DODOS_SEED={seed} replays it");
+        std::panic::resume_unwind(panic)
+    })
+}
+
+/// The seeds, explored on every core of the machine that runs the tests
+/// (they are independent); the combinations reached. `DODOS_SEED`
+/// replays one instead.
+fn explore(seeds: Vec<u64>) -> Reach {
+    let seeds = match replayed() {
+        Some(seed) => vec![seed],
+        None => seeds,
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let runs: Vec<(Seen, [bool; 2])> = std::thread::scope(|scope| {
+        let seeds = &seeds;
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let mine = seeds.iter().skip(i).step_by(threads);
+                scope.spawn(move || mine.map(|&s| explore_one(s)).collect::<Vec<_>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    let mut reach = Reach::new();
+    for (seen, [gap_21, handed]) in &runs {
+        reach.add(seen);
+        reach.gap_21 += usize::from(*gap_21);
+        reach.handed_failed += usize::from(*handed);
+    }
+    reach
+}
+
+/// The driver that makes an event, if one does (the other events come of
+/// the random actions of every step).
+fn maker(event: usize) -> Option<Driver> {
+    Some(match event {
+        KILLED | FENCED => Driver::Kill,
+        SELF => Driver::Fail,
+        STALE => Driver::Stale,
+        STUCK => Driver::Stuck,
+        RETIRED => Driver::Retire,
+        SEAL_LATE => Driver::SealLate,
+        UNFENCED => Driver::Unfence,
+        SEALED | RESUME => Driver::Resume,
+        FRESH | PRE_LIVE => Driver::Fresh,
+        FAILED_UNIT => Driver::FailUnit,
+        HANDING | HAND_DEATH => Driver::HandDeath,
+        RELEASE_PENDING => Driver::ReleasePending,
+        SIGNAL_PENDING => Driver::SignalPending,
+        _ => return None,
+    })
+}
+
+/// The seeds a focused run tries for one combination, a third on each
+/// architecture, and the steps of each.
+const FOCUS_SEEDS: u64 = 6;
+const FOCUS_STEPS: usize = STEPS;
+const COOL: usize = 8;
+
+/// How long an event lasts once made, for the order of a focused run:
+/// 3 for a state that lasts (an accusation, a seal, a failed unit), 2 for
+/// one of a few steps, 1 for a resume, which lasts a few events, 0 for a
+/// crossing or an attach in flight, made by calls that end at once.
+fn lasting(event: usize) -> u8 {
+    match event {
+        CROSSING | MID_ATTACH => 0,
+        RESUME => 1,
+        WAKE | RELEASE_PENDING | PRE_LIVE | HAND_DEATH | SIGNAL_PENDING => 2,
+        _ => 3,
+    }
+}
+
+/// A focused run of a combination the seeds missed (pass 38): a seed of
+/// the long run whose drivers are those that make the combination's
+/// events (the others of the seed's triple after them). After each step
+/// it makes, one time in two, the first of the events not in progress,
+/// those that last first and a resume last, so that the short ones are
+/// made while the others hold; it stops once the three are in progress
+/// together, then runs to quiet and asserts the liveness, as a seed does.
+/// The whole check runs after every step, as in every seed. Returns what
+/// it reached.
+fn focus(events: [usize; 3], seed: u64) -> Seen {
+    say(format_args!("focus {events:?} seed {seed}"));
+    let explored = std::panic::catch_unwind(|| {
+        let mut run = Run::new(seed);
+        let mut drivers: Vec<Driver> = Vec::new();
+        for driver in events.iter().filter_map(|&e| maker(e)).chain(run.drivers) {
+            if !drivers.contains(&driver) {
+                drivers.push(driver);
+            }
+        }
+        for (place, driver) in run.drivers.iter_mut().zip(drivers) {
+            *place = driver;
+        }
+        if events.contains(&RELEASE_PENDING) {
+            run.spared.extend([PAIRS[1].granter, PAIRS[1].holder]);
+        }
+        let mut order = events;
+        order.sort_by_key(|&e| std::cmp::Reverse(lasting(e)));
+        let all = events.iter().fold(0u32, |m, &e| m | 1 << e);
+        // An event made waits `COOL` steps before it is made again: an
+        // accusation comes some time after its harm.
+        let mut made: [Option<usize>; EVENTS] = [None; EVENTS];
+        for step in 0..FOCUS_STEPS {
+            run.step();
+            let mask = probe(&run.m, run.splittable);
+            if mask & all == all {
+                break;
+            }
+            let next = order.iter().copied().find(|&e| mask & 1 << e == 0);
+            let cool = |e: usize| made[e].is_none_or(|at| step >= at + COOL);
+            if let Some(event) = next.filter(|&e| cool(e) && run.rng.below(2) == 0) {
+                made[event] = Some(step);
+                run.make(event);
+                run.note();
+            }
+            if probe(&run.m, run.splittable) & all == all {
+                break;
+            }
+        }
+        run.liveness(seed);
+        run.m.sample_bounds();
+        run.seen.bounds = run.m.bounds.clone();
+        run.seen
+    });
+    explored.unwrap_or_else(|panic| {
+        eprintln!("focus {events:?} seed {seed} fails; DODOS_FOCUS={seed}:{events:?} replays it");
+        std::panic::resume_unwind(panic)
+    })
+}
+
+impl Run {
+    /// A healthy node that is not spared sealed, then resumed as soon as it
+    /// is sealed, whatever the harm already done: a seal and its resume
+    /// harm nothing that lasts (a focused run's `quick_resume`).
+    fn focus_resume(&mut self) {
+        let healthy: Vec<u16> = (0..NODES)
+            .filter(|&n| self.healthy(n) && !self.spared.contains(&n))
+            .collect();
+        if healthy.is_empty() {
+            return;
+        }
+        let victim = healthy[self.rng.below(healthy.len())];
+        let Some(actor) = self.live_other(victim) else {
+            return;
+        };
+        if self.call(actor, seal(victim)) != Some(DONE) {
+            return;
+        }
+        for _ in 0..10 {
+            if self.m.state(victim) == MemberState::Sealed {
+                break;
+            }
+            self.churn();
+        }
+        self.recover_node(victim, MemberState::Sealed);
+    }
+
+    /// An event made for a focused run: by its driver, a resume by
+    /// `focus_resume` or of the node a release pending keeps sealed, a
+    /// release pending with its granting node sealed, a first thread
+    /// before live by a fresh start of the wide node, a crossing and an
+    /// attach by their actions; a wake comes of the sleeps of every step.
+    fn make(&mut self, event: usize) {
+        let kept = self
+            .kept
+            .filter(|&n| self.m.state(n) == MemberState::Sealed);
+        match (event, maker(event)) {
+            // The granting node a release pending keeps sealed, if any.
+            (RESUME, _) => match kept {
+                Some(node) => {
+                    self.kept = None;
+                    self.recover_node(node, MemberState::Sealed);
+                }
+                None => self.focus_resume(),
+            },
+            // With the granting node sealed, so that it lasts.
+            (RELEASE_PENDING, _) => self.release_all(true),
+            // The wide node started afresh, killed first.
+            (PRE_LIVE, _) => match self.m.state(WIDE) {
+                MemberState::Dead => self.recover_node(WIDE, MemberState::Dead),
+                _ if self.healthy(WIDE) && self.may_harm() => {
+                    if let Some(actor) = self.live_other(WIDE) {
+                        let _ = self.call(actor, kill(WIDE));
+                    }
+                }
+                _ => {}
+            },
+            (CROSSING, _) => {
+                let pair = PAIRS[self.rng.below(PAIRS.len())];
+                self.crossing(pair);
+            }
+            (MID_ATTACH, _) => self.devices(),
+            (_, Some(driver)) => self.drive(driver),
+            _ => {}
+        }
+    }
+}
+
+/// The events of a missed combination named by `report`.
+fn combination(name: &str) -> [usize; 3] {
+    let mut parts = name.split(" + ");
+    let anchor = parts.next().expect("an anchor");
+    let event = |part: Option<&str>| {
+        let part = part.expect("an event");
+        NAMES
+            .iter()
+            .position(|&n| n == part)
+            .expect("a named event")
+    };
+    let (a, b) = (event(parts.next()), event(parts.next()));
+    match anchor {
+        "resume" => [RESUME, a, b],
+        // A death: the accusation is any of them; the driver of a kill.
+        "death" => [KILLED, a, b],
+        _ => [a, b, a],
+    }
+}
+
+/// The focused runs of the combinations `missing` names, each until one
+/// of its seeds reaches it (or, if none of the focused seeds does, its
+/// directed scenario `directed_combination`), side by side on the machine's
+/// cores; what they reached is added to `reach`.
+fn focus_missing(reach: &mut Reach, missing: &[String]) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let seens: Vec<Seen> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let mine = missing.iter().skip(i).step_by(threads);
+                scope.spawn(move || {
+                    let mut seens = Vec::new();
+                    for name in mine {
+                        let events = combination(name);
+                        let seen = directed_combination(events);
+                        let mut reached = reaches(&seen, name);
+                        seens.push(seen);
+                        if !reached {
+                            // A third of the seeds on each architecture; on
+                            // ARM64 and RISC-V only for a first thread before
+                            // live or a wake (`Run::recover_node`, `WAKE`).
+                            let arches = match events.iter().any(|&e| e == PRE_LIVE || e == WAKE) {
+                                true => 1..3,
+                                false => 0..3,
+                            };
+                            let rounds = arches.end - arches.start;
+                            for k in 0..FOCUS_SEEDS {
+                                let seed = 286 * (arches.start + k % rounds) + k / rounds;
+                                let seen = focus(events, seed);
+                                reached = reaches(&seen, name);
+                                seens.push(seen);
+                                if reached {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    seens
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    for seen in &seens {
+        reach.add(seen);
+    }
+}
+
+/// Whether one run reached the combination `report` names.
+fn reaches(seen: &Seen, name: &str) -> bool {
+    let mut one = Reach::new();
+    one.add(seen);
+    !report_quiet(&one).iter().any(|m| m == name)
+}
+
+/// The pairs no seed can reach, each with the sentences of the contract
+/// that exclude it on this machine; a triple that holds such a pair is
+/// excluded too. (Pass 25 excluded a failed unit under a hand-over, handed
+/// by a seal since D-145.)
+///
+/// Pass 38: a release pending and a first thread before live on this
+/// five-node machine. A release is pending only while the kernel ring to the
+/// granting node has no room beyond its reserve of 34 answers (Grants,
+/// release by the holder; What crosses between nodes, what a full ring
+/// returns: non-answer messages share the 30 entries beyond that reserve
+/// with unread answers; a granting node starting afresh has a new
+/// generation, so its grants died and no release is due). Only the 32
+/// releases at once of the second pair's holder, node 4, fill those 30
+/// entries here: node 2's ring to node 0 carries one grant (at most 8
+/// `SendAnswer` entries, 16 requests and 1 `Release`, 25 < 30, and node 0
+/// drains its ring before sealing). A first thread before live is also the
+/// wide node's, node 4, starting afresh (a node of one core is live in the
+/// event its first thread is made ready). A node started fresh empties its
+/// use table (G13), `node_send` answers `gone` if the target is not live
+/// (Calls between nodes, `node_send`), and no node writes a non-answer
+/// message into a ring toward a node whose member word reads starting with
+/// the resume bit clear until the word no longer reads so (What crosses
+/// between nodes, a fresh start, D-144, D-147; only an answer to a message
+/// the starting generation itself sent may be written): node 4 receives no
+/// grant while starting, so no use entry of it holds a release pending.
+const IMPOSSIBLE: &[(usize, usize)] = &[(RELEASE_PENDING, PRE_LIVE)];
+
+/// The combinations possible under the contract that neither the seeds of
+/// the long run nor their focused runs nor `directed_combination` reach,
+/// one per line (empty since pass 39, which reached all 45 remaining
+/// combinations via `directed_combination`): the long run asserts every
+/// combination not excluded by `IMPOSSIBLE`.
+const NOT_REACHED_YET: &str = include_str!("long_run_not_reached.txt");
+
+fn report(reach: &Reach) -> Vec<String> {
+    missing(reach, std::env::var("DODOS_COUNTS").is_ok())
+}
+
+/// `report`, printing nothing.
+fn report_quiet(reach: &Reach) -> Vec<String> {
+    missing(reach, false)
+}
+
+/// The combinations no seed reached, not excluded; the counts printed if
+/// `print`.
+fn missing(reach: &Reach, print: bool) -> Vec<String> {
+    let mut missing = Vec::new();
+    let excluded = |a: usize, b: usize| IMPOSSIBLE.contains(&(a, b));
+    if print {
+        for (state, seeds) in TABLE_STATES.iter().zip(reach.tables) {
+            eprintln!("seeds reaching {state}: {seeds}");
+        }
+        eprintln!("seeds ending in gap 21: {}", reach.gap_21);
+        eprintln!("seeds that hand a failed unit: {}", reach.handed_failed);
+        eprintln!("D-169 silent rebuild cuts: {}", reach.silent_cuts);
+        eprintln!("D-169 bad-item rebuild cuts: {}", reach.bad_item_cuts);
+        for e in 0..EVENTS {
+            eprintln!("event {:>26}: {}", NAMES[e], reach.events[e]);
+        }
+    }
+    for (anchor, table, range) in [
+        ("pair", &reach.pairs, 0..EVENTS),
+        ("resume", &reach.resume, 0..EVENTS),
+        ("death", &reach.death, DEATH_OTHERS),
+    ] {
+        for a in range.clone() {
+            for b in a + 1..range.end {
+                if anchor == "resume" && (a == RESUME || b == RESUME) {
+                    continue;
+                }
+                let count = table[a][b];
+                if print {
+                    eprintln!("{anchor} + {} + {}: {count}", NAMES[a], NAMES[b]);
+                }
+                if count == 0 && !excluded(a, b) {
+                    missing.push(format!("{anchor} + {} + {}", NAMES[a], NAMES[b]));
+                }
+            }
+        }
+    }
+    missing
+}
+
+/// The combinations the 27 seeds of `verify` do not reach, as measured
+/// (458 of 919 since pass 38, whose visiting drivers and grant of whole
+/// groups moved the draws; 437 in pass 37), one per line: the seeds must
+/// reach every
+/// other one. A list and not a count (the review of passes 35 and 36,
+/// finding 8: a change that lost some combinations and gained as many
+/// passed); a change that reaches more prints them, to be taken off.
+const MISSED_BY_THE_SEEDS: &str = include_str!("short_run_missed.txt");
+
+/// The run of `verify`: 26 seeds spread over the triples of drivers, so
+/// that each driver is among them, and seed 2; the check after every step
+/// and the liveness of each seed are asserted, and each event is reached.
+/// (Pass 36: the faulty action 9 that writes an acknowledgement before R4
+/// ended moved the paths of the 26 seeds, which then missed 452, one more
+/// than measured; seed 2 was added rather than the bound raised.)
+#[test]
+fn combined_recovery_states_between_nodes() {
+    // Over the three rounds of the triples, one per architecture.
+    let seeds = 3 * 286;
+    let mut chosen: Vec<u64> = (0..26).map(|i| i * seeds / 26).collect();
+    chosen.push(2);
+    let reach = explore(chosen);
+    let missing = report(&reach);
+    if replayed().is_none() {
+        for e in 0..EVENTS {
+            assert!(reach.events[e] > 0, "the seeds never reach {}", NAMES[e]);
+        }
+        // The 27 seeds reach part of the combinations only (the long run
+        // below asserts every one): as many as they reached when this was
+        // measured, so a change that loses some fails here (the audit of
+        // lot 8a, F1: the list was thrown away).
+        assert!(reach.refused > 0, "no forged message seen refused");
+        // Reached by one seed of the 27 (363): a floor of reachability, which
+        // has no margin below it (the long run counts it over 858 seeds).
+        assert!(reach.early_acks > 0, "no acknowledgement before R4 ended");
+        assert!(
+            reach.silent_cuts > 0,
+            "the seeds never cut a FaultyReport::Silent peer at STUCK_NS"
+        );
+        assert!(
+            reach.bad_item_cuts > 0,
+            "the seeds never cut a FaultyReport::BadItems peer at item check"
+        );
+        for (state, &seeds) in TABLE_STATES.iter().zip(&reach.tables) {
+            assert!(seeds > 0, "the seeds never reach {state}");
+        }
+        let measured: Vec<&str> = MISSED_BY_THE_SEEDS.lines().collect();
+        let lost: Vec<&String> = missing
+            .iter()
+            .filter(|m| !measured.contains(&m.as_str()))
+            .collect();
+        let gained: Vec<&&str> = measured
+            .iter()
+            .filter(|m| !missing.iter().any(|n| n == *m))
+            .collect();
+        if !gained.is_empty() {
+            eprintln!("reached now, to take off `short_run_missed.txt`: {gained:#?}");
+        }
+        assert!(
+            lost.is_empty(),
+            "reached when measured, no longer: {lost:#?}"
+        );
+    }
+}
+
+/// The long run: three rounds of the 286 triples of drivers by default
+/// (`DODOS_COMBINATION_SEEDS` sets another number, `DODOS_COMBINATION_FIRST`
+/// the first seed, for a run in ranges); every combination not shown
+/// impossible (`IMPOSSIBLE`) and not listed as not reached yet
+/// (`NOT_REACHED_YET`) is reached by a seed or by a focused run of it.
+#[test]
+#[ignore = "long: run with --release; DODOS_COMBINATION_SEEDS"]
+fn every_combination_of_recovery_states_is_reached() {
+    let number = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map_or(default, |n| n.parse().expect("a number of seeds"))
+    };
+    let (count, first) = (
+        number("DODOS_COMBINATION_SEEDS", 858),
+        number("DODOS_COMBINATION_FIRST", 0),
+    );
+    let mut reach = explore((first..first + count).collect());
+    let missed = report(&reach);
+    if replayed().is_none() {
+        eprintln!(
+            "D-169 faulty peer rebuild cuts: silent={}, bad_items={}",
+            reach.silent_cuts, reach.bad_item_cuts
+        );
+        if count >= 858 {
+            assert!(
+                reach.silent_cuts > 0,
+                "long run never cut a FaultyReport::Silent peer at STUCK_NS"
+            );
+            assert!(
+                reach.bad_item_cuts > 0,
+                "long run never cut a FaultyReport::BadItems peer at item check"
+            );
+        }
+        // Each combination the seeds missed, by its focused runs.
+        eprintln!("missed by the seeds: {missed:#?}");
+        focus_missing(&mut reach, &missed);
+        let missing = report_quiet(&reach);
+        eprintln!("never reached: {missing:#?}");
+        let known: Vec<&str> = NOT_REACHED_YET.lines().collect();
+        let lost: Vec<&String> = missing
+            .iter()
+            .filter(|m| !known.contains(&m.as_str()))
+            .collect();
+        let reached: Vec<&&str> = known
+            .iter()
+            .filter(|k| !missing.iter().any(|m| m == *k))
+            .collect();
+        if !reached.is_empty() {
+            eprintln!("reached now, to take off `long_run_not_reached.txt`: {reached:#?}");
+        }
+        assert!(lost.is_empty(), "never reached, and not listed: {lost:#?}");
+        reach.bounds.print("long combination run");
+    }
+}
+
+/// One focused run replayed with its actions printed:
+/// `DODOS_FOCUS=<seed>:[<event>, <event>, <event>]`, as a failure prints it.
+#[test]
+#[ignore = "replay: DODOS_FOCUS"]
+fn one_focused_run() {
+    let focused = std::env::var("DODOS_FOCUS").expect("DODOS_FOCUS");
+    let (seed, events) = focused.split_once(':').expect("<seed>:<events>");
+    let events: Vec<usize> = events
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(", ")
+        .map(|e| e.parse().expect("an event"))
+        .collect();
+    let events = [events[0], events[1], events[2]];
+    let _ = focus(events, seed.parse().expect("a seed"));
+}
+
+// Found by the long run of pass 35 (all 858 seeds, at dcad8f6). Each
+// replays its seed, which depends on the exact draws of `Run` (a change of
+// the generator moves it); the directed scenario of each is in
+// `scenarios/pass37.rs`.
+//
+// Seed 605: node 4's recovery reserve made progress 100,000 times at one
+// instant: its R2 counted as progress a removal that the busy request of
+// its core refused with nothing changed, while the core that request
+// waited for slept (pass 37,
+// `pass37::a_removal_of_r2_refused_by_the_busy_request_of_the_core_is_no_progress`).
+#[test]
+fn seed_605_of_pass_35_a_removal_refused_by_a_busy_request_is_no_progress() {
+    let _ = explore_one(605);
+}
+
+// Seed 763: node 4's context failed rule 43 after its core 4 powered down:
+// the machine's clock jumped past core 4's replenishment instant, stopped
+// by core 5's timer already reached while it slept roused, so core 4 woke
+// past its timer plus the exit latency (pass 37,
+// `pass37::a_sleeping_core_is_roused_at_its_timer_while_another_core_waits_for_its_wake`).
+#[test]
+fn seed_763_of_pass_35_a_sleeping_core_is_roused_at_its_timer() {
+    let _ = explore_one(763);
+}
+
+// Seed 1434 of the long run of pass 28 (the checker's rule ACCUSE, D-146):
+// node 4, starting afresh, accused node 3 with evidence self from its
+// reserve. Only a live or sealing node writes fencing.
+#[test]
+fn seed_1434_of_pass_28_a_starting_node_accuses_no_one() {
+    let (seen, _) = explore_one(1434);
+    assert!(seen.events.contains(&FRESH));
+}
+
+// Seed 1109 of the long run of pass 26: a rebuild's `ReportAsk` to a node
+// that sealed before reading it stayed in flight while the rebuild passed
+// the node over; the node resumed and answered, and the late report moved
+// the rebuild's cursor back while another node was asked, so that a second
+// `ReportAsk` went to a node with one in flight (RESERVE). A report of a
+// node no longer asked now frees its credit and moves nothing, and no ask
+// goes to a node with one in flight (Roles, the reports are pulled).
+#[test]
+fn a_late_report_of_a_node_passed_over_moves_no_rebuild() {
+    let _ = explore_one(1109);
+}
+
+// Seed 277 of pass 42 (D-170): healthy node 0 answers a 7-page IOMMU report
+// at 7 ms/page (> 30 ms `STUCK_NS`) while holder 2 concurrently rebuilds
+// `IOAPIC_ROLE`. Without D-170, `IOAPIC_ROLE` cuts healthy node 0 with
+// `RebuildCut::Deadline` and fails `assert_cut_explained`.
+#[test]
+fn seed_277_of_pass_42_multi_page_rebuild_does_not_cut_healthy_node() {
+    let _ = explore_one(277);
+}
+
+// Review of passes 37 and 38, finding 6: `before_live` executes the first
+// thread's `NodeSend` while the starting wide node is still `Starting`
+// ("its first thread runs before it is live and may make requests and sends").
+#[test]
+fn before_live_executes_the_first_threads_node_send_while_the_node_is_starting() {
+    let mut run = Run::new(0);
+    let _ = run.call(0, kill(WIDE));
+    run.run(30 * MS);
+    assert_eq!(run.m.state(WIDE), MemberState::Dead);
+    run.m.sys.set_window((WIDE + 1) as usize);
+    assert_eq!(run.call(0, fresh(WIDE, 0b11 << WIDE)), Some(DONE));
+    let built = |m: &S| {
+        let member = m.sys.member(WIDE);
+        member.state() == MemberState::Starting
+            && m.sys.has(WIDE)
+            && m.sys.node(WIDE).generation_built() == member.generation()
+            && m.sys.node(WIDE).is_ready()
+    };
+    assert!(run.m.step_until(built));
+    let outcome = run.before_live(WIDE);
+    assert_eq!(run.m.state(WIDE), MemberState::Starting);
+    assert_eq!(outcome, Some(WAITS));
+    let produced = (0..NODES).filter(|&p| p != WIDE).any(|p| {
+        run.m.sys.canonical().rings[WIDE as usize][p as usize]
+            .user
+            .produced
+            > 0
+    });
+    assert!(
+        produced,
+        "NodeSend wrote to a peer's user ring while WIDE was Starting"
+    );
+}
+
+/// A directed scenario for one combination `events` (Part C, pass 39):
+/// drives the three events to hold at the same moment using valid calls and
+/// events on the five-node machine, checking all invariants after every
+/// step, and then runs `liveness`.
+fn directed_combination(events: [usize; 3]) -> Seen {
+    let has = |e: usize| events.contains(&e);
+    let seed = if has(WAKE) { 286 } else { 0 };
+    let mut run = Run::new_with_idle(seed, false);
+    let all = events.iter().fold(0u32, |m, &e| m | 1 << e);
+    let pair0 = PAIRS[0]; // granter 0, holder 2 (1 frame, io)
+    let pair1 = PAIRS[1]; // granter 3, holder 4 (32 frames, aspace)
+
+    // 1. If FAILED_UNIT is wanted, break the IOMMU unit and drive an attach
+    // or unmap to the timeout so the role word reads failed.
+    if has(FAILED_UNIT) {
+        if has(PRE_LIVE) {
+            let detach = attach_call(&run.m, WIDE, 0x11, false);
+            let _ = run.call(WIDE, detach);
+            run.m.run(30 * MS);
+        }
+        run.m.sys.break_unit(IOMMU_ROLE);
+        let _ = run.call(2, Syscall::IoSpaceUnmap(s(pair0.got)));
+        run.run(2 * dodos_abi::IOMMU_WAIT_NS + 60 * MS);
+        assert!(run.m.sys.role(IOMMU_ROLE).failed());
+    }
+
+    // 2. If GIVEN is wanted, node 1 takes a free chunk and gives it to node 3.
+    if has(GIVEN) {
+        let table = run.m.sys.canonical();
+        let shift = table.geometry.chunk_shift();
+        let free = Ownership::free(Owner::Unclaimed).raw();
+        let chunk = table
+            .owners
+            .iter()
+            .position(|&w| w == free)
+            .expect("a free chunk");
+        assert_eq!(
+            run.call(
+                1,
+                super::pass22::take(0, (chunk as u64) << shift, u64::from(shift), BLOCK)
+            ),
+            Some(DONE)
+        );
+        let give = Syscall::MemoryGive {
+            control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),
+            untyped: s(BLOCK),
+            node: 3,
+        };
+        assert_eq!(run.call(1, give), Some(DONE));
+        assert!(probe(&run.m, run.splittable) & (1 << GIVEN) != 0);
+    }
+
+    // 2a. If SPLIT is wanted, node 1 takes a free device entry larger than a
+    // page and splits it, as `Run::memory` does (pass 47: no step made it,
+    // and the combination was reached only while the seeds reached it).
+    if has(SPLIT) {
+        let table = run.m.sys.canonical();
+        let page = table.geometry.page().trailing_zeros();
+        let index = table
+            .devices
+            .iter()
+            .position(|e| e.is_used() && e.log2() > page && e.owner.state() == OwnState::Free)
+            .expect("a free device entry larger than a page");
+        let take = super::pass22::take(1, index as u64, 0, ENTRY);
+        assert_eq!(run.call(1, take), Some(DONE));
+        let split = Syscall::MemorySplit {
+            control: s(dodos_abi::START_SLOT_MEMORY_CONTROL),
+            untyped: s(ENTRY),
+        };
+        assert!(matches!(run.call(1, split), Some(Ok(Output::Index(_)))));
+        assert!(probe(&run.m, run.splittable) & (1 << SPLIT) != 0);
+    }
+
+    // 2b. If MID_ATTACH is wanted, detach node 2's device (0x10) now and settle
+    // so step 15 can launch an attach that stays in `unit_requests` at the
+    // snapshot instant.
+    if has(MID_ATTACH) {
+        let detach = attach_call(&run.m, 2, 0x10, false);
+        let _ = run.call(2, detach);
+        run.m.settle();
+    }
+    if (has(CROSSING) || has(RELEASE)) && (has(PRE_LIVE) || has(DETACHED) || has(LINE)) {
+        let _ = run.call(pair0.holder, Syscall::IoSpaceUnmap(s(pair0.got)));
+        run.m.settle();
+        let aspace_map = Syscall::ASpaceMap(crate::Map {
+            space: s(dodos_abi::START_SLOT_ASPACE),
+            frame: s(pair0.got),
+            untyped: SlotAddr::NONE,
+            address: 0x1000_0000,
+            first: 0,
+            count: 1,
+            rights: Rights::READ.bits(),
+        });
+        assert_eq!(run.call(pair0.holder, aspace_map), Some(DONE));
+    }
+
+    // 3. If PRE_LIVE is wanted, kill WIDE (node 4) and wait until it is Dead
+    // and settled (`SETTLE_NS`) so any accusation or seal in later steps is
+    // not blocked by single-death grace.
+    if has(PRE_LIVE) {
+        assert_eq!(run.call(1, kill(WIDE)), Some(DONE));
+        let end = run.m.sys.now() + 60 * MS;
+        while run.m.sys.now() < end && run.m.state(WIDE) != MemberState::Dead {
+            run.run_by(MS, 200_000);
+        }
+        assert_eq!(run.m.state(WIDE), MemberState::Dead);
+        let settle_end = run.m.sys.now() + dodos_abi::SETTLE_NS + 5 * MS;
+        while run.m.sys.now() < settle_end {
+            run.run_by(2 * MS, 500_000);
+        }
+        if has(STUCK) {
+            let sweep = run.m.sys.canonical().sweep_ns;
+            let next = (run.m.sys.now() / sweep + 1) * sweep;
+            let delta = next.saturating_sub(run.m.sys.now());
+            if delta > 0 {
+                run.run_by(delta, 500_000);
+            }
+        }
+    }
+
+    // 4. If FRESH (without PRE_LIVE) is wanted, pick a node to kill and start
+    // fresh later at the instant of the snapshot.
+    let fresh_node = if has(FRESH) && !has(PRE_LIVE) {
+        let n = if has(HAND_DEATH) { 0 } else { 1 };
+        let actor = if n == 1 { 3 } else { 1 };
+        assert_eq!(run.call(actor, kill(n)), Some(DONE));
+        let end = run.m.sys.now() + 60 * MS;
+        while run.m.sys.now() < end && run.m.state(n) != MemberState::Dead {
+            run.run_by(MS, 200_000);
+        }
+        assert_eq!(run.m.state(n), MemberState::Dead);
+        let settle_end = run.m.sys.now() + dodos_abi::SETTLE_NS + 5 * MS;
+        while run.m.sys.now() < settle_end {
+            run.run_by(2 * MS, 500_000);
+        }
+        Some(n)
+    } else {
+        None
+    };
+
+    // 5. Long-lasting accusations (UNFENCED, SEAL_LATE, STALE, STUCK).
+    if has(UNFENCED) {
+        run.m.sys.set_vmx(0, true);
+        run.hang(0, false);
+        let table = run.m.sys.canonical();
+        let wait = table.stale_ns + 2 * table.sweep_ns + dodos_abi::FENCE_NS + 50 * MS;
+        let end = run.m.sys.now() + wait;
+        while run.m.sys.now() < end && run.m.state(0) != MemberState::Unfenced {
+            run.run_by(2 * MS, 500_000);
+        }
+        assert_eq!(run.m.state(0), MemberState::Unfenced);
+    }
+    if has(SEAL_LATE) {
+        let victim = 0;
+        let actor = 1;
+        assert_eq!(run.call(actor, seal(victim)), Some(DONE));
+        let table = run.m.sys.canonical();
+        let end = run.m.sys.now() + table.seal_ns + 2 * table.sweep_ns + 50 * MS;
+        while run.m.sys.now() < end && !accused(run.m.state(victim)) {
+            run.run_by(500_000, 100_000);
+        }
+        assert!(accused(run.m.state(victim)));
+    }
+    if has(STALE) {
+        let victim = 0;
+        run.hang(victim, true);
+        let table = run.m.sys.canonical();
+        let end = run.m.sys.now() + table.stale_ns + 2 * table.sweep_ns + 50 * MS;
+        while run.m.sys.now() < end && !accused(run.m.state(victim)) {
+            run.run_by(500_000, 100_000);
+        }
+        assert!(accused(run.m.state(victim)));
+    }
+    if has(STUCK) {
+        let victim = 0;
+        let _ = run.call(
+            victim,
+            Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)),
+        );
+        run.hang(victim, false);
+        let send = Syscall::NodeSend {
+            node: node_cap(victim),
+            message: Message::default(),
+            doorbell: SlotAddr::NONE,
+        };
+        let _ = run.call(3, send);
+        let table = run.m.sys.canonical();
+        let end = run.m.sys.now() + table.stuck_ns + 2 * table.sweep_ns + 50 * MS;
+        while run.m.sys.now() < end && !accused(run.m.state(victim)) {
+            run.run_by(500_000, 100_000);
+        }
+        assert!(accused(run.m.state(victim)));
+    }
+
+    // 5b. If UNANSWERED is wanted, delete the frame first and wait for the
+    // delete and its Release to finish so the slot is free to be re-granted
+    // in step 8d without waking the holder's thread during a seal.
+    let unanswered_pair = if has(UNANSWERED) {
+        let u_pair = if has(PRE_LIVE) || fresh_node == Some(4) || has(HANDING) || has(HAND_DEATH) {
+            pair0
+        } else {
+            pair1
+        };
+        let _ = run.call(u_pair.holder, Syscall::CapDelete(s(u_pair.got)));
+        run.m.settle();
+        assert!(run.m.step_until(|m| {
+            m.sys.canonical().beacons[u_pair.granter as usize].consumed[u_pair.holder as usize].0
+                == m.sys.canonical().rings[u_pair.holder as usize][u_pair.granter as usize]
+                    .kernel
+                    .produced
+        }));
+        Some(u_pair)
+    } else {
+        None
+    };
+
+    // 6. If RESUME is wanted, pick a node to seal now so it is ready in
+    // `MemberState::Sealed` to be resumed at the snapshot instant.
+    let resume_node = if has(RESUME) {
+        // Choose a node that is live and not needed by another role.
+        let holder = run.m.sys.role(IOMMU_ROLE).holder();
+        let ioapic_holder = run.m.sys.role(super::units::IOAPIC_ROLE).holder();
+        let candidate = [2, 1, 3, 4, 0]
+            .into_iter()
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && (!has(RELEASE_PENDING) || (n != 3 && n != 4))
+                    && (!has(PRE_LIVE) || n != WIDE)
+                    && Some(n) != fresh_node
+                    && (!has(HANDING)
+                        && !has(HAND_DEATH)
+                        && !has(MID_ATTACH)
+                        && !has(DETACHED)
+                        && !(has(CROSSING) && has(PRE_LIVE))
+                        || n != holder)
+                    && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+                    && (!(has(CROSSING) && (has(RELEASE_PENDING) || has(PRE_LIVE)))
+                        || (n != 0 && n != 2))
+                    && (!(has(RELEASE) && has(PRE_LIVE)) || (n != 0 && n != 2))
+                    && (!(has(SIGNAL_PENDING) && (has(PRE_LIVE) || has(RELEASE_PENDING)))
+                        || (n != 0 && n != 2))
+                    && (!(has(REVOKING) && has(PRE_LIVE)) || (n != 0 && n != 2))
+                    && (unanswered_pair
+                        .map(|p| (p.granter, p.holder))
+                        .is_none_or(|(g, h)| n != g && n != h))
+                    && (!(has(FAILED_UNIT) && (has(HANDING) || has(HAND_DEATH))) || n != 0)
+                    && (!has(LINE) || (n != ioapic_holder && n != 1))
+            })
+            .expect("a node to seal and resume");
+        let actor = [1, 3, 4, 2, 0]
+            .into_iter()
+            .find(|&a| {
+                a != candidate && run.m.state(a) == MemberState::Live && (!has(LINE) || a != 1)
+            })
+            .expect("an actor to seal");
+        assert_eq!(run.call(actor, seal(candidate)), Some(DONE));
+        assert!(run.m.step_until(|m| {
+            m.state(candidate) == MemberState::Sealed
+                && m.sys.node(actor).park_confirmed(candidate as usize)
+        }));
+        Some(candidate)
+    } else {
+        None
+    };
+
+    // 7. If SEALED is wanted (alongside RESUME), seal another node (or node 0).
+    if has(SEALED) {
+        let extra = (0..NODES)
+            .find(|&n| {
+                Some(n) != resume_node
+                    && run.m.state(n) == MemberState::Live
+                    && (!has(CROSSING) || (n != 3 && n != 4))
+            })
+            .expect("a node to keep sealed");
+        let actor = (0..NODES)
+            .find(|&a| a != extra && run.m.state(a) == MemberState::Live)
+            .expect("an actor");
+        assert_eq!(run.call(actor, seal(extra)), Some(DONE));
+        assert!(run.m.step_until(|m| {
+            m.state(extra) == MemberState::Sealed
+                && m.sys.node(actor).park_confirmed(extra as usize)
+        }));
+    }
+
+    // 8a-2. If HANDING, HAND_DEATH, or LINE is wanted, ensure the unit roles
+    // are Held and not rebuilding, and any seal actor's park confirmation has
+    // finished so its thread is runnable.
+    if has(HANDING) || has(HAND_DEATH) || has(LINE) {
+        let ioapic = super::units::IOAPIC_ROLE;
+        run.m.settle();
+        assert!(run.m.step_until(|m| {
+            let w = m.sys.role(IOMMU_ROLE);
+            let iw = m.sys.role(ioapic);
+            w.state() == RoleState::Held
+                && !m.sys.node(w.holder()).rebuilds.contains_key(&IOMMU_ROLE)
+                && !m.sys.node(w.holder()).handing.contains_key(&IOMMU_ROLE)
+                && iw.state() == RoleState::Held
+                && !m.sys.node(iw.holder()).rebuilds.contains_key(&ioapic)
+                && !m.sys.node(iw.holder()).handing.contains_key(&ioapic)
+                && (0..NODES).all(|n| {
+                    m.state(n) != MemberState::Live
+                        || m.sys.node(n).runnable().contains(&m.t[n as usize])
+                })
+        }));
+    }
+
+    // 8a-3. If LINE is wanted, claim GSI 5 on a live liner and step until
+    // `UnitOp::Redirection` is in `unit_requests` (`probe` has `LINE` set)
+    // before step 9c (`RELEASE_PENDING`) runs synchronously on node 4.
+    // The holder of the IOMMU role is no liner when step 9 hands that role
+    // (its thread waits for its claim): another node claims if neither of
+    // `LINERS` may.
+    if has(LINE) {
+        let ioapic_holder = run.m.sys.role(super::units::IOAPIC_ROLE).holder();
+        let hander = (has(HANDING) || has(HAND_DEATH)).then(|| run.m.sys.role(IOMMU_ROLE).holder());
+        let liner = LINERS
+            .into_iter()
+            .chain(0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && n != ioapic_holder
+                    && Some(n) != hander
+            })
+            .expect("a liner that does not hold IOAPIC_ROLE");
+        let claim = Syscall::IrqClaim {
+            control: s(dodos_abi::START_SLOT_IRQ_CONTROL),
+            source: IrqSource::line(GSI, false, false).raw(),
+            core: u64::from(liner),
+            vector: 48,
+            destination: s(IRQ),
+        };
+        assert_eq!(run.m.call(liner, claim), WAITS);
+        let splittable = run.splittable;
+        assert!(
+            run.m
+                .step_until(|m| probe(m, splittable) & (1 << LINE) != 0)
+        );
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(probe(&run.m, run.splittable) & (1 << LINE) != 0);
+    }
+
+    // 8b. Now start WIDE fresh with core 5's second-core start held back if
+    // PRE_LIVE is wanted. On x86_64 (`seed == 0`), core 5 is in `Hardware::Stub`
+    // and `set_window(5)` drops the first start IPI; on ARM64 (`seed == 286`,
+    // when `WAKE` is also wanted), core 5 is `Hardware::PoweredOff` and we step
+    // actions while holding back `HwAction::Start { core: 5 }`.
+    if has(PRE_LIVE) {
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != WIDE
+                    && run.m.state(a) == MemberState::Live
+                    && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+            })
+            .expect("an actor to start WIDE fresh");
+        let second = (WIDE + 1) as usize;
+        let is_x86 = run.m.sys.arch() == Arch::X86_64;
+        if is_x86 {
+            run.m.sys.set_window(second);
+        }
+        assert_eq!(run.call(actor, fresh(WIDE, 0b11 << WIDE)), Some(DONE));
+        let built = |m: &S| {
+            let member = m.sys.member(WIDE);
+            member.state() == MemberState::Starting
+                && m.sys.has(WIDE)
+                && m.sys.node(WIDE).generation_built() == member.generation()
+                && m.sys.node(WIDE).is_ready()
+        };
+        if is_x86 && !has(STUCK) && !has(STALE) && !has(SEAL_LATE) {
+            assert!(run.m.step_until(built));
+        } else {
+            for _ in 0..10_000 {
+                if built(&run.m) {
+                    break;
+                }
+                let next = run.m.sys.events().into_iter().find(|e| match *e {
+                    crate::system::Event::Action(i) => {
+                        let act = run.m.sys.actions()[i].1;
+                        if act == (crate::nodes::HwAction::Start { core: second }) {
+                            return false;
+                        }
+                        if (has(STUCK) || has(STALE) || has(SEAL_LATE))
+                            && act == (crate::nodes::HwAction::Stop { core: 0 })
+                        {
+                            return false;
+                        }
+                        true
+                    }
+                    crate::system::Event::Timer { node, .. }
+                    | crate::system::Event::Ipi { node, .. }
+                        if (has(STUCK) || has(STALE) || has(SEAL_LATE))
+                            && node != WIDE
+                            && node != actor =>
+                    {
+                        false
+                    }
+                    _ => true,
+                });
+                let Some(ev) = next else {
+                    break;
+                };
+                run.m.sys.fire(ev);
+                assert_eq!(run.m.sys.check(), Ok(()));
+            }
+            assert!(built(&run.m));
+        }
+        run.m.restarted(WIDE);
+        let _ = run.before_live(WIDE);
+        assert!(probe(&run.m, run.splittable) & (1 << PRE_LIVE) != 0);
+    }
+
+    // 9. If HANDING or HAND_DEATH is wanted:
+    let hand_death_target = if has(HANDING) || has(HAND_DEATH) {
+        let holder = run.m.sys.role(IOMMU_ROLE).holder();
+        if has(FAILED_UNIT) {
+            // A failed unit's role cannot be handed by `role_hand` (`busy`),
+            // only by a seal (`hand_all_units`, D-145).
+            let actor = (0..NODES)
+                .find(|&a| {
+                    a != holder
+                        && run.m.state(a) == MemberState::Live
+                        && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+                })
+                .expect("an actor to seal holder of failed unit");
+            assert_eq!(run.call(actor, seal(holder)), Some(DONE));
+            assert!(
+                run.m
+                    .step_until(|m| m.sys.role(IOMMU_ROLE).state() == RoleState::Handing)
+            );
+            let target = run.m.sys.role(IOMMU_ROLE).target();
+            has(HAND_DEATH).then_some((holder, target))
+        } else {
+            let best = dodos_abi::best_class(&run.m.sys.canonical().members).unwrap_or(0);
+            let target = (0..NODES)
+                .find(|&n| {
+                    n != holder
+                        && run.m.state(n) == MemberState::Live
+                        && run.m.sys.member(n).class() >= best
+                        && Some(n) != resume_node
+                        && (!has(PRE_LIVE) || n != WIDE)
+                        && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+                        && (unanswered_pair.map(|p| p.holder) != Some(n))
+                })
+                .expect("a target for RoleHand");
+            let t = run.m.t[holder as usize];
+            let roles = slots_of(run.m.sys.node(holder), t, ObjectKind::Role);
+            let hand = Syscall::RoleHand {
+                role: s(roles[IOMMU_ROLE]),
+                node: node_cap(target),
+            };
+            assert_eq!(run.call(holder, hand), Some(WAITS));
+            assert!(
+                run.m
+                    .step_until(|m| m.sys.role(IOMMU_ROLE).state() == RoleState::Handing)
+            );
+            has(HAND_DEATH).then_some((holder, target))
+        }
+    } else {
+        None
+    };
+
+    // 9b. Complete UNANSWERED by posting the new grant without stepping the
+    // receiver's ring service.
+    if let Some(u_pair) = unanswered_pair {
+        assert!(run.receive(u_pair, 0));
+        run.send(u_pair, 0);
+        assert!(probe(&run.m, run.splittable) & (1 << UNANSWERED) != 0);
+    }
+
+    // 9c. If RELEASE_PENDING is wanted, release all 32 frames of pair 1
+    // (node 4 -> node 3) at once so ring 4 -> 3 has 30 Releases and 2
+    // use entries keep `release_pending = true`. If CROSSING is also wanted,
+    // first revoke frame 0 on granter 3 while holder 4 still maps it so that
+    // the grant is `Revoking`, then delete all 32 frames on holder 4 so
+    // frame 0's Release crosses its Revoke while `release_pending` holds.
+    if has(RELEASE_PENDING) {
+        if has(CROSSING) {
+            let _ = run.call(pair1.granter, Syscall::CapRevoke(s(pair1.obj)));
+        }
+        for i in (0..pair1.frames).rev() {
+            let _ = run.call(pair1.holder, Syscall::CapDelete(s(pair1.got + i)));
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << RELEASE_PENDING) != 0);
+        if has(CROSSING) {
+            assert!(probe(&run.m, run.splittable) & (1 << CROSSING) != 0);
+        }
+    }
+
+    // 10. If SIGNAL_PENDING is wanted, flood the user ring of a live grant pair
+    // with `GrantSignal` calls until `signal_pending` is set on the use entry.
+    if has(SIGNAL_PENDING) {
+        let sig_pair = if !has(PRE_LIVE) && !has(RELEASE_PENDING) && fresh_node != Some(4) {
+            pair1
+        } else {
+            pair0
+        };
+        let slot = sig_pair.got;
+        let holder = sig_pair.holder;
+        for _ in 0..70 {
+            if run.call(holder, Syscall::GrantSignal(s(slot))) != Some(DONE) {
+                break;
+            }
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << SIGNAL_PENDING) != 0);
+    }
+
+    // 12. If REVOKING (or CROSSING without RELEASE_PENDING) is wanted:
+    if has(CROSSING) && !has(RELEASE_PENDING) {
+        let c_pair = if has(PRE_LIVE)
+            || fresh_node == Some(4)
+            || resume_node == Some(3)
+            || resume_node == Some(4)
+        {
+            pair0
+        } else {
+            pair1
+        };
+        let rev = run.call(c_pair.granter, Syscall::CapRevoke(s(c_pair.obj)));
+        let del = run.call(c_pair.holder, Syscall::CapDelete(s(c_pair.got)));
+        assert!(
+            probe(&run.m, run.splittable) & (1 << CROSSING) != 0,
+            "CROSSING failed on c_pair=({}, {}): rev={rev:?}, del={del:?}, grant={:?}",
+            c_pair.granter,
+            c_pair.holder,
+            run.m.sys.canonical().grants[c_pair.granter as usize]
+        );
+    } else if has(REVOKING) {
+        let r_pair = if has(PRE_LIVE)
+            || fresh_node == Some(4)
+            || resume_node == Some(3)
+            || resume_node == Some(4)
+        {
+            pair0
+        } else {
+            pair1
+        };
+        let _ = run.call(r_pair.granter, Syscall::CapRevoke(s(r_pair.obj)));
+        assert!(probe(&run.m, run.splittable) & (1 << REVOKING) != 0);
+    } else if has(RELEASE) && !has(RELEASE_PENDING) {
+        let rel_pair = if has(PRE_LIVE)
+            || fresh_node == Some(4)
+            || resume_node == Some(3)
+            || resume_node == Some(4)
+        {
+            pair0
+        } else {
+            pair1
+        };
+        let _ = run.call(rel_pair.holder, Syscall::CapDelete(s(rel_pair.got)));
+        assert!(probe(&run.m, run.splittable) & (1 << RELEASE) != 0);
+    }
+
+    // 13. Short accusations: KILLED, SELF, RETIRED.
+    if has(KILLED) && !has(HAND_DEATH) {
+        let victim = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(RELEASE_PENDING) || (n != 3 && n != 4))
+                    && (!has(PRE_LIVE) || n != WIDE)
+                    && (!has(MID_ATTACH) && !has(DETACHED)
+                        || (n != run.m.sys.role(IOMMU_ROLE).holder() && n != 2))
+            })
+            .expect("a victim to kill");
+        let actor = (0..NODES)
+            .find(|&a| a != victim && run.m.state(a) == MemberState::Live)
+            .expect("an actor");
+        assert_eq!(run.call(actor, kill(victim)), Some(DONE));
+    }
+    if has(SELF) && !has(HAND_DEATH) {
+        let victim = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(RELEASE_PENDING) || (n != 3 && n != 4))
+                    && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+            })
+            .expect("a victim to fail");
+        run.m.fail(victim);
+        assert!(run.m.step_until(|m| accused(m.state(victim))));
+    }
+    if has(RETIRED) {
+        let victim = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(CROSSING) || (n != 3 && n != 4))
+                    && (!has(MID_ATTACH) && !has(DETACHED) || n != 2)
+            })
+            .expect("a victim to retire");
+        let actor = (0..NODES)
+            .find(|&a| a != victim && run.m.state(a) == MemberState::Live)
+            .expect("an actor");
+        let retire = Syscall::NodeStop {
+            node: node_cap(victim),
+            mode: NODE_STOP_RETIRE,
+            core: u64::from(victim),
+        };
+        assert_eq!(run.call(actor, retire), Some(DONE));
+    }
+
+    // 14. If DETACHED is wanted, detach a device on a live node that is not the
+    // IOMMU role holder so its unit request is in flight (`detaching` non-empty).
+    if has(DETACHED) {
+        let (dev_node, dev_id) = DEVICES
+            .into_iter()
+            .find(|&(n, _)| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(PRE_LIVE) || n != WIDE)
+            })
+            .expect("a device node to detach");
+        let call = attach_call(&run.m, dev_node, dev_id, false);
+        assert_eq!(run.m.call(dev_node, call), WAITS);
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(probe(&run.m, run.splittable) & (1 << DETACHED) != 0);
+    }
+
+    // 15. If MID_ATTACH is wanted, start an attach on a live node other than
+    // the IOMMU role holder so `UnitOp::Attach` is in `unit_requests`.
+    if has(MID_ATTACH) {
+        let (dev_node, dev_id) = DEVICES
+            .into_iter()
+            .find(|&(n, _)| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(PRE_LIVE) || n != WIDE)
+            })
+            .unwrap_or((4, 0x11));
+        let call = attach_call(&run.m, dev_node, dev_id, true);
+        assert_eq!(run.m.call(dev_node, call), WAITS);
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(probe(&run.m, run.splittable) & (1 << MID_ATTACH) != 0);
+    }
+
+    // 17. If WAKE is wanted (on Arch::Aarch64), put a live node's core to sleep
+    // by configuring its lossy idle state, suspending its first thread, and
+    // firing `Event::Sleep`, then rouse it.
+    if has(WAKE) {
+        let sleeper = (0..NODES)
+            .find(|&n| {
+                run.m.state(n) == MemberState::Live
+                    && Some(n) != resume_node
+                    && (!has(PRE_LIVE) || n != WIDE)
+                    && (!has(RELEASE_PENDING) || n != 4)
+                    && (0..NODES).all(|from| {
+                        let pair = &run.m.sys.canonical().rings[from as usize][n as usize];
+                        let c = run.m.sys.canonical().beacons[n as usize].consumed[from as usize];
+                        c.0 == pair.kernel.produced && c.1 == pair.user.produced
+                    })
+            })
+            .expect("a sleeper node");
+        let lossy = dodos_abi::IDLE_METHOD_PSCI | 1 << 16 << 32;
+        let idle = Syscall::NodeIdle {
+            node: node_cap(sleeper),
+            core: u64::from(sleeper),
+            words: vec![200, 100, lossy, dodos_abi::IDLE_FLAG_LOSES_CONTEXT],
+        };
+        assert_eq!(run.call(sleeper, idle), Some(DONE));
+        let _ = run.call(
+            sleeper,
+            Syscall::ThreadSuspend(s(dodos_abi::START_SLOT_THREAD)),
+        );
+        loop {
+            let ipi = crate::system::Event::Ipi {
+                node: sleeper,
+                position: 0,
+            };
+            let timer = crate::system::Event::Timer {
+                node: sleeper,
+                position: 0,
+            };
+            let evs = run.m.sys.events();
+            if evs.contains(&ipi) {
+                run.m.sys.fire(ipi);
+                assert_eq!(run.m.sys.check(), Ok(()));
+                run.note();
+            } else if evs.contains(&timer) {
+                run.m.sys.fire(timer);
+                assert_eq!(run.m.sys.check(), Ok(()));
+                run.note();
+            } else {
+                break;
+            }
+        }
+        let core = sleeper as usize;
+        assert!(
+            run.m
+                .sys
+                .events()
+                .contains(&crate::system::Event::Sleep { core })
+        );
+        run.m.sys.fire(crate::system::Event::Sleep { core });
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        assert!(
+            run.m
+                .sys
+                .events()
+                .contains(&crate::system::Event::PowerDown { core })
+        );
+        run.m.sys.fire(crate::system::Event::PowerDown { core });
+        assert_eq!(run.m.sys.check(), Ok(()));
+        run.note();
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != sleeper && run.m.state(a) == MemberState::Live && Some(a) != resume_node
+            })
+            .expect("an actor to rouse sleeper");
+        let send = Syscall::NodeSend {
+            node: node_cap(sleeper),
+            message: Message::default(),
+            doorbell: SlotAddr::NONE,
+        };
+        let _ = run.call(actor, send);
+        for (i, &(_, act)) in run.m.sys.actions().iter().enumerate() {
+            if matches!(act, crate::nodes::HwAction::Ring { node } if node == sleeper) {
+                run.m.sys.fire(crate::system::Event::Action(i));
+                assert_eq!(run.m.sys.check(), Ok(()));
+                run.note();
+                break;
+            }
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << WAKE) != 0);
+    }
+
+    // 17b. Trigger HAND_DEATH if pending.
+    if let Some((holder, target)) = hand_death_target {
+        let victim = if Some(target) == resume_node
+            || unanswered_pair.is_some_and(|p| target == p.granter || target == p.holder)
+            || (has(RELEASE_PENDING) && (target == 3 || target == 4))
+        {
+            holder
+        } else {
+            target
+        };
+        if has(SELF) {
+            run.m.fail(victim);
+            assert!(run.m.step_until(|m| accused(m.state(victim))));
+        } else {
+            let actor = (0..NODES)
+                .find(|&a| {
+                    a != victim
+                        && run.m.state(a) == MemberState::Live
+                        && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+                })
+                .unwrap_or(if victim == target { holder } else { target });
+            let _ = run.call(actor, kill(victim));
+        }
+        assert!(probe(&run.m, run.splittable) & (1 << HAND_DEATH) != 0);
+    }
+
+    // 18. Trigger FRESH if pending.
+    if let Some(n) = fresh_node {
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != n
+                    && run.m.state(a) == MemberState::Live
+                    && Some(a) != resume_node
+                    && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+            })
+            .expect("an actor to start fresh");
+        let mask = if n == WIDE { 0b11 << n } else { 1 << n };
+        assert_eq!(run.call(actor, fresh(n, mask)), Some(DONE));
+        assert!(probe(&run.m, run.splittable) & (1 << FRESH) != 0);
+    }
+
+    // 19. Trigger RESUME if pending.
+    if let Some(n) = resume_node {
+        let actor = (0..NODES)
+            .find(|&a| {
+                a != n
+                    && run.m.state(a) == MemberState::Live
+                    && run.m.sys.node(a).runnable().contains(&run.m.t[a as usize])
+            })
+            .expect("an actor to resume");
+        assert_eq!(run.call(actor, resume(n)), Some(DONE));
+        assert!(probe(&run.m, run.splittable) & (1 << RESUME) != 0);
+    }
+
+    run.note();
+    let mask = probe(&run.m, run.splittable);
+    assert_eq!(
+        mask & all,
+        all,
+        "directed_combination({events:?}) did not have all bits set at once: mask={mask:#x}, wanted={all:#x}"
+    );
+    run.liveness(seed);
+    run.m.sample_bounds();
+    run.seen.bounds = run.m.bounds.clone();
+    run.seen
+}
+
+#[test]
+#[ignore = "long: run with --release"]
+fn directed_combinations_reach_all_74() {
+    let list = [
+        "pair + accused stuck + release pending",
+        "pair + unfenced + release pending",
+        "pair + release crossing revoke + release pending",
+        "pair + release pending + wake from sleep",
+        "pair + signal pending + first thread before live",
+        "pair + mid-attach + first thread before live",
+        "resume + accused self + holder's death mid-hand",
+        "resume + accused self + first thread before live",
+        "resume + accused stale + release crossing revoke",
+        "resume + accused stale + release pending",
+        "resume + accused stale + mid-attach",
+        "resume + accused stale + first thread before live",
+        "resume + accused stuck + accused retire",
+        "resume + accused stuck + holder's death mid-hand",
+        "resume + accused stuck + release crossing revoke",
+        "resume + accused stuck + release pending",
+        "resume + accused stuck + first thread before live",
+        "resume + accused retire + release crossing revoke",
+        "resume + accused retire + mid-attach",
+        "resume + accused retire + first thread before live",
+        "resume + accused seal + holder's death mid-hand",
+        "resume + accused seal + release crossing revoke",
+        "resume + accused seal + release pending",
+        "resume + accused seal + first thread before live",
+        "resume + unfenced + release crossing revoke",
+        "resume + unfenced + release pending",
+        "resume + unfenced + first thread before live",
+        "resume + sealed + holder's death mid-hand",
+        "resume + sealed + release crossing revoke",
+        "resume + sealed + release pending",
+        "resume + sealed + first thread before live",
+        "resume + fresh start + holder's death mid-hand",
+        "resume + fresh start + release crossing revoke",
+        "resume + fresh start + wake from sleep",
+        "resume + failed unit + holder's death mid-hand",
+        "resume + failed unit + release pending",
+        "resume + failed unit + first thread before live",
+        "resume + role handing + release crossing revoke",
+        "resume + role handing + mid-attach",
+        "resume + role handing + first thread before live",
+        "resume + holder's death mid-hand + grant unanswered",
+        "resume + holder's death mid-hand + release",
+        "resume + holder's death mid-hand + release crossing revoke",
+        "resume + holder's death mid-hand + release pending",
+        "resume + holder's death mid-hand + mid-attach",
+        "resume + holder's death mid-hand + wake from sleep",
+        "resume + holder's death mid-hand + first thread before live",
+        "resume + grant unanswered + first thread before live",
+        "resume + revoking + mid-attach",
+        "resume + revoking + first thread before live",
+        "resume + release + first thread before live",
+        "resume + release crossing revoke + release pending",
+        "resume + release crossing revoke + chunk given",
+        "resume + release crossing revoke + device detached",
+        "resume + release crossing revoke + mid-attach",
+        "resume + release crossing revoke + line moving",
+        "resume + release crossing revoke + wake from sleep",
+        "resume + release crossing revoke + first thread before live",
+        "resume + release pending + signal pending",
+        "resume + release pending + mid-attach",
+        "resume + release pending + line moving",
+        "resume + release pending + wake from sleep",
+        "resume + signal pending + mid-attach",
+        "resume + signal pending + first thread before live",
+        "resume + chunk given + first thread before live",
+        "resume + device detached + first thread before live",
+        "resume + mid-attach + first thread before live",
+        "resume + wake from sleep + first thread before live",
+        "death + release crossing revoke + release pending",
+        "death + release pending + signal pending",
+        "death + release pending + wake from sleep",
+        "death + signal pending + mid-attach",
+        "death + signal pending + first thread before live",
+        "death + mid-attach + first thread before live",
+    ];
+    let mut bounds = super::bounds::Bounds::default();
+    for name in list {
+        let events = combination(name);
+        let seen = directed_combination(events);
+        bounds.merge(&seen.bounds);
+        assert!(
+            reaches(&seen, name),
+            "directed scenario did not record {name}"
+        );
+    }
+    bounds.print("directed 74");
+}
+
+#[test]
+fn directed_combinations_sample() {
+    for name in [
+        "pair + release crossing revoke + release pending",
+        "resume + release pending + line moving",
+        "resume + release crossing revoke + first thread before live",
+        "resume + failed unit + holder's death mid-hand",
+        "resume + fresh start + wake from sleep",
+        "resume + wake from sleep + first thread before live",
+        "resume + accused stuck + first thread before live",
+        "resume + failed unit + first thread before live",
+        "resume + holder's death mid-hand + release",
+        "resume + release crossing revoke + device detached",
+    ] {
+        let events = combination(name);
+        let seen = directed_combination(events);
+        assert!(
+            reaches(&seen, name),
+            "directed scenario did not record {name}"
+        );
+    }
+}
+
+/// Finding 4.2: `judge_rebuild_cuts` must reset its checked cursor on the
+/// holder's generation, not only when `rebuild_cuts.len()` shrinks; otherwise
+/// a holder that restarts and records as many cuts before the next judgement
+/// skips them.
+#[test]
+fn judge_rebuild_cuts_resets_when_holder_restarts_with_same_cut_count() {
+    let mut run = Run::new(0);
+    let holder: u16 = 3;
+    let peer: u16 = 0;
+    let g1 = run.m.sys.node(holder).generation_built();
+    let peer_gen = run.m.sys.member(peer).generation();
+
+    // Record one explained cut on `holder` in generation `g1` and judge it so
+    // `cuts_checked[holder]` advances to `(g1, 1)`.
+    run.m.sys.edit_table(|t| {
+        t.faulty_asks.0.insert(
+            crate::units::ReportAskId {
+                peer,
+                peer_gen,
+                holder,
+                holder_gen: g1,
+                index: 0,
+                serial: 1,
+            },
+            crate::units::FaultyReport::Silent,
+        );
+    });
+    run.m
+        .sys
+        .node_mut(holder)
+        .rebuild_cuts
+        .0
+        .push(crate::units::RebuildCutRecord {
+            role: IOMMU_ROLE,
+            peer,
+            generation: peer_gen,
+            reason: crate::units::RebuildCut::Deadline,
+            credit: Some((0, 1)),
+        });
+    run.judge_rebuild_cuts();
+    assert_eq!(run.cuts_checked[holder as usize], (g1, 1));
+
+    // Kill `holder`, let it be reclaimed, and start it afresh in generation
+    // `g1 + 1` without calling `judge_rebuild_cuts` while it is absent.
+    run.m.supervisor(0, run.m.t[0]);
+    run.m.ok(0, kill(holder));
+    run.m.run_by(200 * MS, MS);
+    assert_eq!(run.m.state(holder), MemberState::Dead);
+    run.m.ok(0, fresh(holder, 1 << holder));
+    run.m.run_by(200 * MS, MS);
+    assert_eq!(run.m.state(holder), MemberState::Live);
+    let g2 = run.m.sys.node(holder).generation_built();
+    assert_eq!(g2, g1 + 1);
+    assert_eq!(run.cuts_checked[holder as usize], (g1, 1));
+
+    // Record one unexplained cut of healthy node 0 in generation `g2` (same
+    // length `1` as `g1`, so a length-only check would skip index 0).
+    let peer_gen2 = run.m.sys.member(peer).generation();
+    run.m
+        .sys
+        .node_mut(holder)
+        .rebuild_cuts
+        .0
+        .push(crate::units::RebuildCutRecord {
+            role: IOMMU_ROLE,
+            peer,
+            generation: peer_gen2,
+            reason: crate::units::RebuildCut::Deadline,
+            credit: None,
+        });
+    assert_eq!(run.m.sys.node(holder).rebuild_cuts.0.len(), 1);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run.judge_rebuild_cuts();
+    }));
+    assert!(
+        panic.is_err(),
+        "judge_rebuild_cuts skipped a generation-2 cut whose count matched generation 1"
+    );
+}
+
+// The long run of pass 46: the directed scenario of this combination chose
+// the IOMMU role's holder to claim the line, and step 9 found its thread
+// waiting for the claim when that holder had to hand the role (a fault of
+// the harness, present at pass 45, reached once the seeds stopped reaching
+// the combination).
+#[test]
+fn directed_line_moving_with_a_hand_death_claims_on_a_node_that_does_not_hand() {
+    let name = "resume + holder's death mid-hand + line moving";
+    let seen = directed_combination(combination(name));
+    assert!(reaches(&seen, name));
+}
+
+// The long run of pass 47: no step of `directed_combination` split a device
+// entry, so this combination failed its final probe once the seeds stopped
+// reaching it (a fault of the harness, present at pass 46, reached once
+// the drain of every node's due events changed the seeds' paths).
+#[test]
+fn directed_resume_with_a_hand_death_splits_an_entry() {
+    let name = "resume + holder's death mid-hand + entry split";
+    let seen = directed_combination(combination(name));
+    assert!(reaches(&seen, name));
+}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["abi"]
+members = ["abi", "model"]
 
 [workspace.package]
 edition = "2024"
@@ -14,3 +14,17 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [workspace.lints.clippy]
 wildcard_imports = "warn"
 fn_params_excessive_bools = "warn"
+
+# The random tests of the model check every invariant after millions of
+# calls: optimized, `verify` runs them in seconds instead of minutes.
+[profile.dev.package.dodos-model]
+opt-level = 2
+# The model's invariants call the pure functions of `abi/` millions of
+# times; optimized like the model, they keep their overflow checks.
+[profile.dev.package.dodos-abi]
+opt-level = 2
+
+# Debug information only for line numbers: panics keep their places,
+# and the tests build in less time.
+[profile.dev]
+debug = "line-tables-only"

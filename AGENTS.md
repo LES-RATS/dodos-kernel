@@ -30,6 +30,18 @@ the Rust rules of the project and is the same file in the system repository.
 - Every system call has a bounded duration; no kernel heap; no blocking in the
   kernel.
 
+## The model
+
+`model/README.md` says what the model holds. In short: `Model` is the
+kernel of one node of *N* cores (D-128, D-129, D-131), `System` the machine
+of several nodes and their physical cores, and the whole check runs after
+every step. The scenarios of the shape of nodes are in
+`model/src/scenarios/`; a seeded exploration replays one seed with
+`DODOS_SEED=<n>`. A behaviour the contract does not fix is marked
+`CONTRACT-GAP` and a number, and written in a draft of the documentation
+repository (`research/drafts/model-15-contract-gaps.md` held the sixteen of
+pass 15, all settled by the contract since pass 16; none is open).
+
 ## Rust
 
 The rules are in the skill `dodos-rust` (style, tests, lints, what CI runs);
