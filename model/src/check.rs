@@ -411,19 +411,21 @@ impl Model {
             .filter(|&(_, &raw)| raw == taken)
             .map(|(&gsi, _)| gsi)
             .collect();
-        // While a line irq is not removing, or its masking operation 5 with
-        // *release* has not yet been served by the controller holder, its
-        // line word reads taken by this generation; once the holder serves
-        // that request and frees the line word through its gate, the word is
-        // free while the remapping invalidation and final removal step finish
-        // (D-150).
+        // A line irq that is not removing holds its line word. Once its
+        // removal asked the holder to mask the line with *release*, the
+        // holder's gate frees the word in the call that serves the request,
+        // before the requester reads the answer, so the word may read either
+        // way while the request asks; once it is answered the word is free
+        // (D-150: no node frees a line word on an answer).
         let mut must_hold = std::collections::BTreeSet::new();
         let mut may_hold = std::collections::BTreeSet::new();
         for irq in self.irqs.values().filter(|irq| irq.source.is_line()) {
             let gsi = irq.source.id();
-            may_hold.insert(gsi);
-            if !irq.removing || self.line_asking(gsi) {
+            if !irq.removing {
                 must_hold.insert(gsi);
+            }
+            if !irq.removing || self.line_asking(gsi) {
+                may_hold.insert(gsi);
             }
         }
         match must_hold.is_subset(&held) && held.is_subset(&may_hold) {

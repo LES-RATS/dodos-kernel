@@ -197,12 +197,7 @@ impl Model {
             .position(|io| io.first_gsi <= gsi && gsi < io.first_gsi + io.inputs)?;
         self.table.role_records.iter().position(|r| {
             r.kind == dodos_abi::RoleKind::Unit
-                && matches!(
-                    r.governs,
-                    dodos_abi::Governs::IoApic
-                        | dodos_abi::Governs::GicDistributor
-                        | dodos_abi::Governs::Aplic
-                )
+                && crate::table::governs_lines(r.governs)
                 && usize::from(r.object) == index
         })
     }
@@ -374,10 +369,7 @@ impl Model {
         let iommu_op = !matches!(op, UnitOp::Redirection { .. });
         let kind_fits = match record.governs {
             dodos_abi::Governs::IommuUnit => iommu_op,
-            dodos_abi::Governs::IoApic
-            | dodos_abi::Governs::GicDistributor
-            | dodos_abi::Governs::Aplic => !iommu_op,
-            _ => false,
+            governs => crate::table::governs_lines(governs) && !iommu_op,
         };
         if !kind_fits {
             return false;
@@ -635,11 +627,11 @@ impl Model {
             && self.table.line_word(gsi)
                 == dodos_abi::Ownership::taken(dodos_abi::Owner::Node(requester.0), requester.1)
         {
-            self.table.write_line_free(
-                self.node,
-                gsi,
-                crate::table::LineFreeReason::Release,
-            );
+            let read = crate::table::LineFree::Release {
+                requester: requester.0,
+                generation: requester.1,
+            };
+            self.table.write_line_free(self.node, gsi, read);
         }
         serial
     }

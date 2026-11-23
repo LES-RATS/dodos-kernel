@@ -1353,13 +1353,8 @@ impl Machine {
                 .enumerate()
                 .filter(|(_, (record, _))| {
                     record.kind == RoleKind::Unit
-                        && matches!(
-                            record.governs,
-                            Governs::IommuUnit
-                                | Governs::IoApic
-                                | Governs::GicDistributor
-                                | Governs::Aplic
-                        )
+                        && (record.governs == Governs::IommuUnit
+                            || crate::table::governs_lines(record.governs))
                 })
                 .map(|(role, (_, word))| {
                     let unit = crate::table::UnitState {

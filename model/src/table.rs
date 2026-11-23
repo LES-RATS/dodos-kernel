@@ -380,13 +380,26 @@ pub(crate) enum Word {
     Line(u32),
 }
 
-/// Why the holder of a line controller freed a taken line word (D-150).
+/// What the gate of a line controller's holder read when it wrote a taken
+/// line word *free*, unclaimed (the line word table, D-150).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LineFreeReason {
-    /// Operation 5 masked with *release* (bit 35) for `(owner, generation)`.
-    Release,
-    /// R1 of the controller holder for `(owner, generation)`.
-    R1,
+pub(crate) enum LineFree {
+    /// In the call that serves operation 5 masked with *release* (bit 35):
+    /// the requester and generation the request names.
+    Release { requester: u16, generation: u32 },
+    /// In R1: whether the writer's R1 on the line's controller role walks
+    /// for the word's owner and generation (its reclaim record of that
+    /// generation has not recorded that walk yet).
+    R1 { walking: bool },
+}
+
+/// Whether a role governs a line controller: an IOAPIC, the GIC
+/// distributor or an APLIC domain (Reclaim, R1; D-148, D-150).
+pub(crate) fn governs_lines(governs: Governs) -> bool {
+    matches!(
+        governs,
+        Governs::IoApic | Governs::GicDistributor | Governs::Aplic
+    )
 }
 
 /// One write of the living part, kept until the next check of the
@@ -406,9 +419,9 @@ pub(crate) struct WordWrite {
     /// Whether the writer's beacon already acknowledged the word's owner
     /// generation (distinguishes R1 from R6 on a line word, D-150).
     pub(crate) acked: bool,
-    /// For a line word written free, how the controller holder's gate was
-    /// called (`Release` in operation 5 or `R1` in R1, D-150).
-    pub(crate) line_free: Option<LineFreeReason>,
+    /// For a line word written free, what the controller holder's gate
+    /// read: the request it serves, or its R1 walk (D-150).
+    pub(crate) line_free: Option<LineFree>,
     /// Whether the writer's member word let its gate write (starting,
     /// live or sealing), read before the write.
     pub(crate) writes: bool,
@@ -928,10 +941,7 @@ impl Table {
             .zip(&self.roles)
             .find(|(record, _)| {
                 record.kind == RoleKind::Unit
-                    && matches!(
-                        record.governs,
-                        Governs::IoApic | Governs::GicDistributor | Governs::Aplic
-                    )
+                    && governs_lines(record.governs)
                     && usize::from(record.object) == index
             })
             .is_some_and(|(_, word)| word.state() == RoleState::Held && word.holder() == node)
@@ -1120,7 +1130,7 @@ impl Table {
 
     /// The controller holder's gate frees a taken line word (`None` for
     /// *free*, unclaimed) in operation 5 with *release* or in R1 (D-150).
-    pub(crate) fn write_line_free(&mut self, writer: u16, gsi: u32, reason: LineFreeReason) {
+    pub(crate) fn write_line_free(&mut self, writer: u16, gsi: u32, reason: LineFree) {
         self.write_line_with(writer, gsi, None, Some(reason));
     }
 
@@ -1129,7 +1139,7 @@ impl Table {
         writer: u16,
         gsi: u32,
         after: Option<Ownership>,
-        reason: Option<LineFreeReason>,
+        reason: Option<LineFree>,
     ) {
         if !self.member(writer).writes() {
             return;

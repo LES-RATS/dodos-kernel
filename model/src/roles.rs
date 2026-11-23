@@ -1028,13 +1028,21 @@ impl Model {
                         .then_some(Item::Handle(u32::from(handle)))
                 }))
                 .collect(),
-            dodos_abi::Governs::IoApic
-            | dodos_abi::Governs::GicDistributor
-            | dodos_abi::Governs::Aplic => self
+            g if crate::table::governs_lines(g) => self
                 .irqs
                 .values()
+                // A line it claimed: its word still names this generation. A
+                // removal's masking with *release* served by the holder freed
+                // the word, and the line is no longer claimed (D-150).
                 .filter(|irq| {
-                    irq.source.is_line() && self.ioapic_role(irq.source.id()) == Some(role)
+                    let gsi = irq.source.id();
+                    irq.source.is_line()
+                        && self.ioapic_role(gsi) == Some(role)
+                        && self.table.line_word(gsi)
+                            == dodos_abi::Ownership::taken(
+                                dodos_abi::Owner::Node(self.node),
+                                self.table.generation(self.node),
+                            )
                 })
                 .map(|irq| {
                     let target = self.line_target(irq.core, irq.vector);
@@ -1134,9 +1142,7 @@ impl Model {
             let governs = self.table.role_records[role as usize].governs;
             let bad = |i: u32| match governs {
                 dodos_abi::Governs::IommuUnit => Some(Item::Handle(0xffff_ff00 + i)),
-                dodos_abi::Governs::IoApic
-                | dodos_abi::Governs::GicDistributor
-                | dodos_abi::Governs::Aplic => Some(Item::Line(
+                g if crate::table::governs_lines(g) => Some(Item::Line(
                     0xffff_ff00 + i,
                     false,
                     false,

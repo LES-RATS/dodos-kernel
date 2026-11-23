@@ -1314,12 +1314,7 @@ impl Model {
             // R1 of a controller holder masks every line whose line word
             // `node`'s generation took on that controller and writes the line
             // word *free*, unclaimed, in the same call (Reclaim, R1; D-150).
-            if matches!(
-                self.table.role_records[role].governs,
-                dodos_abi::Governs::IoApic
-                    | dodos_abi::Governs::GicDistributor
-                    | dodos_abi::Governs::Aplic
-            ) {
+            if crate::table::governs_lines(self.table.role_records[role].governs) {
                 let taken =
                     dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation).raw();
                 let freed: Vec<u32> = self
@@ -1338,8 +1333,9 @@ impl Model {
                     {
                         line.deactivate();
                     }
-                    self.table
-                        .write_line_free(self.node, gsi, crate::table::LineFreeReason::R1);
+                    let walking = self.r1_walking(role, node, generation);
+                    let read = crate::table::LineFree::R1 { walking };
+                    self.table.write_line_free(self.node, gsi, read);
                 }
             }
             let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });
@@ -1351,6 +1347,15 @@ impl Model {
                 }
             }
         }
+    }
+
+    /// Whether this node's R1 on `role` walks for `node`'s `generation`: its
+    /// reclaim record of that generation has not recorded R1 on that role
+    /// yet (Reclaim, R1: the R1 word reads walking; D-150, D-151).
+    fn r1_walking(&self, role: usize, node: u16, generation: u32) -> bool {
+        self.reclaims
+            .get(&node)
+            .is_some_and(|r| r.generation == generation && !r.r1.contains_key(&role))
     }
 
     /// Whether R1 is done for `node` on every unit role this node holds.

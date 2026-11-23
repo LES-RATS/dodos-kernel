@@ -74,26 +74,29 @@ fn judge_write(write: &crate::table::WordWrite) -> Check {
                 });
             // An identifier word is detached to free, unclaimed by its owner.
             // A line word is freed only by its controller holder's gate: in
-            // the call that masks the line with *release* for a live/sealing
-            // owner, or in R1 for an accused node before R5 acknowledges it;
-            // neither the owner (unless it holds the controller role itself)
-            // nor R6 ever frees a line word (D-150).
+            // the call that serves the masking operation 5 with *release* of
+            // the requester the word names, or in R1 for an accused node,
+            // while that R1 walks and before R5 acknowledges it; neither the
+            // owner (unless it holds the controller role itself) nor R6 ever
+            // frees a line word (D-150).
             let word = write.word;
             let identifier = matches!(word, crate::table::Word::Identifier(_));
             let line = matches!(word, crate::table::Word::Line(_));
+            let release = crate::table::LineFree::Release {
+                requester: owner,
+                generation: g,
+            };
             let line_release = line
                 && state == 2
                 && after_owner == 0xFFFF
                 && write.holds
-                && write.line_free == Some(crate::table::LineFreeReason::Release)
-                && write
-                    .owner
-                    .is_some_and(|m| m.writes() && m.generation() == g);
+                && write.line_free == Some(release);
+            let walking = write.line_free == Some(crate::table::LineFree::R1 { walking: true });
             let line_r1 = line
                 && state == 2
                 && after_owner == 0xFFFF
                 && write.holds
-                && write.line_free == Some(crate::table::LineFreeReason::R1)
+                && walking
                 && !write.acked
                 && write.owner.is_some_and(|m| {
                     matches!(
