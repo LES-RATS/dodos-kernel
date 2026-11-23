@@ -188,6 +188,7 @@ fn the_route_of_a_line_on_arm64_and_risc_v_names_only_a_core_of_the_requester() 
         let route = |core: u16| UnitOp::Redirection {
             gsi: 5,
             claimed: true,
+            release: false,
             level: false,
             low: false,
             target: Target::Direct {

@@ -849,6 +849,7 @@ impl Model {
                     let op = crate::rings::UnitOp::Redirection {
                         gsi,
                         claimed: true,
+                        release: false,
                         level,
                         low,
                         target,
@@ -969,6 +970,7 @@ impl Model {
                         crate::rings::UnitOp::Redirection {
                             gsi,
                             claimed: true,
+                            release: false,
                             level,
                             low,
                             target,

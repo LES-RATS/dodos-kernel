@@ -344,6 +344,7 @@ fn the_holder_refuses_a_masked_redirection_entry_whose_second_operand_is_not_0()
     let masked = |target| UnitOp::Redirection {
         gsi: 5,
         claimed: false,
+        release: false,
         level: true,
         low: false,
         target,
@@ -411,6 +412,7 @@ fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
         let forged = UnitOp::Redirection {
             gsi: 5,
             claimed: true,
+            release: false,
             level: false,
             low: false,
             target: Target::Remapped {
@@ -421,13 +423,16 @@ fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
         assert!(judged(&mut m, holder, b, role, forged));
     }
     // The irq removed, its word is free and b may claim the line. The
-    // removal asks the IOAPIC's holder to mask the line first: a request,
-    // the line word still a's until it is answered (D-137).
+    // removal asks the IOAPIC's holder to mask the line with *release*
+    // first: a request, the line word still a's until the holder serves
+    // that request and frees the word through its own gate (D-150).
     assert_eq!(m.call(a, Syscall::CapDelete(s(210))), Err(Error::Again));
     assert_eq!(m.sys.canonical().line_word(5), taken);
     assert_eq!(claim_line(&mut m, b, 5, 212), Err(Error::Busy));
-    // Then the invalidation of the line's remapping entry in the units of
-    // the IOAPIC's segment (pass 21): the word stays a's until its answer.
+    // Once the holder serves the masking request with *release*, its gate
+    // writes the line word free, unclaimed; the removal then finishes
+    // invalidating the line's remapping entry in the units of the IOAPIC's
+    // segment.
     let mut outcome = Err(Error::Again);
     for _ in 0..8 {
         m.settle();
@@ -435,7 +440,6 @@ fn a_node_cannot_claim_a_line_that_another_live_node_holds() {
         if outcome != Err(Error::Again) {
             break;
         }
-        assert_eq!(m.sys.canonical().line_word(5), taken);
     }
     assert_eq!(outcome, DONE);
     let free = dodos_abi::Ownership::free(dodos_abi::Owner::Unclaimed);

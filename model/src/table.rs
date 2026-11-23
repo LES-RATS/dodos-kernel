@@ -380,6 +380,15 @@ pub(crate) enum Word {
     Line(u32),
 }
 
+/// Why the holder of a line controller freed a taken line word (D-150).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LineFreeReason {
+    /// Operation 5 masked with *release* (bit 35) for `(owner, generation)`.
+    Release,
+    /// R1 of the controller holder for `(owner, generation)`.
+    R1,
+}
+
 /// One write of the living part, kept until the next check of the
 /// invariants so that they can judge who wrote what (8.2, invariant 52),
 /// with what the writer's gate read when it wrote: its own generation, the
@@ -397,6 +406,9 @@ pub(crate) struct WordWrite {
     /// Whether the writer's beacon already acknowledged the word's owner
     /// generation (distinguishes R1 from R6 on a line word, D-150).
     pub(crate) acked: bool,
+    /// For a line word written free, how the controller holder's gate was
+    /// called (`Release` in operation 5 or `R1` in R1, D-150).
+    pub(crate) line_free: Option<LineFreeReason>,
     /// Whether the writer's member word let its gate write (starting,
     /// live or sealing), read before the write.
     pub(crate) writes: bool,
@@ -963,6 +975,7 @@ impl Table {
             holds,
             holder,
             acked,
+            line_free: None,
             writes: self.member(writer).writes(),
             before,
             after,
@@ -1096,16 +1109,33 @@ impl Table {
     }
 
     /// The write gate on a line word: *taken* by the writer's generation,
-    /// or `None` for *free*, unclaimed (on removal by the owner, or by the
-    /// controller holder in R1 for an accused node, D-150).
+    /// or `None` for *free*, unclaimed (by the controller holder in
+    /// operation 5 with *release* or in R1 for an accused node, D-150).
     pub(crate) fn write_line(&mut self, writer: u16, gsi: u32, after: Option<Ownership>) {
+        self.write_line_with(writer, gsi, after, None);
+    }
+
+    /// The controller holder's gate frees a taken line word (`None` for
+    /// *free*, unclaimed) in operation 5 with *release* or in R1 (D-150).
+    pub(crate) fn write_line_free(&mut self, writer: u16, gsi: u32, reason: LineFreeReason) {
+        self.write_line_with(writer, gsi, None, Some(reason));
+    }
+
+    fn write_line_with(
+        &mut self,
+        writer: u16,
+        gsi: u32,
+        after: Option<Ownership>,
+        reason: Option<LineFreeReason>,
+    ) {
         if !self.member(writer).writes() {
             return;
         }
         let unclaimed = Ownership::free(Owner::Unclaimed).raw();
         let before = self.lines.get(&gsi).copied().unwrap_or(unclaimed);
         let after_raw = after.map_or(unclaimed, Ownership::raw);
-        let write = self.journal(writer, Word::Line(gsi), before, after_raw);
+        let mut write = self.journal(writer, Word::Line(gsi), before, after_raw);
+        write.line_free = reason;
         match after {
             Some(word) => self.lines.insert(gsi, word.raw()),
             None => self.lines.remove(&gsi),

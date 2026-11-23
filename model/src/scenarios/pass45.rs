@@ -77,10 +77,12 @@ fn checker_rejects_r6_write_of_line_word() {
     let taken = Ownership::taken(Owner::Node(victim), gv).raw();
     let unclaimed = Ownership::free(Owner::Unclaimed).raw();
 
-    // Case 1: controller holder journals an R6 free of line 9 after R5 ack.
+    // Case 1: controller holder journals an R6 free of line 9 after R5 ack
+    // (even if tagged with `LineFreeReason::R1`).
     let mut sys_holder = m.sys.clone();
     sys_holder.edit_table(|t| {
-        let write = t.journal(holder, crate::table::Word::Line(9), taken, unclaimed);
+        let mut write = t.journal(holder, crate::table::Word::Line(9), taken, unclaimed);
+        write.line_free = Some(crate::table::LineFreeReason::R1);
         t.lines.remove(&9);
         t.writes.push(write);
     });
@@ -94,10 +96,14 @@ fn checker_rejects_r6_write_of_line_word() {
             .is_err_and(|e| e.ends_with("52: write of an ownership word"))
     );
 
-    // Case 2: non-holder journals an R6 free of line 9.
+    // Case 2: non-holder journals a free of line 9 before it has acknowledged
+    // `victim` (so `acked == false`), even if tagged with `LineFreeReason::R1`.
+    // Dropping `&& write.holds` from `line_r1` must fail here.
     let mut sys_other = m.sys.clone();
     sys_other.edit_table(|t| {
-        let write = t.journal(non_holder, crate::table::Word::Line(9), taken, unclaimed);
+        t.beacons[non_holder as usize].acked[victim as usize] = 0;
+        let mut write = t.journal(non_holder, crate::table::Word::Line(9), taken, unclaimed);
+        write.line_free = Some(crate::table::LineFreeReason::R1);
         t.lines.remove(&9);
         t.writes.push(write);
     });
@@ -110,16 +116,59 @@ fn checker_rejects_r6_write_of_line_word() {
             .check()
             .is_err_and(|e| e.ends_with("52: write of an ownership word"))
     );
+
+    // Case 3 (Item 3): a live non-holder owner cannot free its own line word
+    // directly through its gate; only the controller holder's gate can free it
+    // when serving the masking operation 5 with *release*.
+    let mut m_live = super::units::three();
+    assert!(matches!(
+        super::pass18::claim_line(&mut m_live, victim, 5, 210),
+        Ok(Output::Msi { .. })
+    ));
+    let taken5 = m_live.sys.canonical().line_word(5).raw();
+    let mut sys_owner_free = m_live.sys.clone();
+    sys_owner_free.edit_table(|t| {
+        let write = t.journal(victim, crate::table::Word::Line(5), taken5, unclaimed);
+        t.lines.remove(&5);
+        t.writes.push(write);
+    });
+    assert_eq!(
+        sys_owner_free.node(victim).check(),
+        Err("52: write of an ownership word")
+    );
+
+    // Case 4 (Item 4): if the victim is accused (`Fencing`) but the controller
+    // holder has NOT run R1 yet (`line_free` is `None`), an early free by the
+    // holder's gate is rejected by invariant 52.
+    let mut sys_early = m_live.sys.clone();
+    let gv_live = sys_early.canonical().generation(victim);
+    let fencing = dodos_abi::Member::new(
+        MemberState::Fencing,
+        dodos_abi::Evidence::SelfReported,
+        victim,
+        gv_live,
+    );
+    sys_early.edit_table(|t| {
+        t.write_member(victim, victim, fencing);
+        let write = t.journal(holder, crate::table::Word::Line(5), taken5, unclaimed);
+        t.lines.remove(&5);
+        t.writes.push(write);
+    });
+    assert_eq!(
+        sys_early.node(holder).check(),
+        Err("52: write of an ownership word")
+    );
 }
 
 #[test]
 fn r1_controller_holder_frees_line_word_on_holder_death_and_takeover() {
     // When the IOAPIC holder itself claims a line and is killed, the successor
-    // takes over the IOAPIC role, runs R1 in `after_take`, frees the line word,
-    // and R6 then transitions the dead holder to Dead.
+    // takes over the IOAPIC role, runs R1 in `after_take`, frees the line word
+    // even before R5 can run, and R6 then transitions the dead holder to Dead.
     let mut m = super::units::three();
     let ioapic = super::units::IOAPIC_ROLE;
     let holder = m.sys.role(ioapic).holder();
+    let g_holder = m.sys.canonical().generation(holder);
     let killer = (0..3u16).find(|&n| n != holder).unwrap();
     assert!(matches!(
         super::pass18::claim_line(&mut m, holder, 5, 210),
@@ -129,6 +178,51 @@ fn r1_controller_holder_frees_line_word_on_holder_death_and_takeover() {
 
     m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(holder));
+    // Step until `holder` is fenced and its stop is confirmed, before the
+    // successor takes over the IOAPIC role.
+    assert!(m.step_until(|m| m.sys.canonical().fences[holder as usize].confirmed.is_some()));
+    let confirmed = m.sys.canonical().fences[holder as usize]
+        .confirmed
+        .expect("fence confirmed");
+    let successor = (0..3u16)
+        .find(|&n| n != holder && m.sys.member(n).class() == m.sys.member(holder).class())
+        .unwrap();
+
+    // Advance just before `confirmed + SETTLE_NS` so `successor` has NOT taken
+    // over the IOAPIC role yet, then reset `successor`'s R4 `audit` queue to
+    // `REMOVAL_STEP + 1` dummy `ObjId`s (which `audit_block` skips because they
+    // are not `Block::Run` untypeds) and move the clock to `confirmed +
+    // SETTLE_NS`. In the single timer interrupt at `confirmed + SETTLE_NS`,
+    // `reclaim_step` consumes all `REMOVAL_STEP` units popping `audit` and
+    // returns before `r1_done` / R5, while `roles_step` runs `take_step` ->
+    // `after_take` (which does not consume `units`) and frees line 5 via
+    // `after_take`'s direct call to `self.r1(holder, g_holder)` before R5!
+    m.sys.advance(confirmed + dodos_abi::SETTLE_NS - 1);
+    assert_eq!(m.sys.role(ioapic).holder(), holder);
+    assert!(m.sys.canonical().lines.contains_key(&5));
+    m.sys
+        .node_mut(successor)
+        .reclaims
+        .get_mut(&holder)
+        .expect("reclaim")
+        .audit = Some(vec![crate::ObjId(999_999); dodos_abi::REMOVAL_STEP + 1]);
+    m.sys.move_clock(confirmed + dodos_abi::SETTLE_NS);
+    m.sys.fire(Event::Timer {
+        node: successor,
+        position: 0,
+    });
+    assert_eq!(m.sys.role(ioapic).holder(), successor);
+    assert_ne!(
+        m.sys.canonical().beacons[successor as usize].acked[holder as usize],
+        g_holder,
+        "after_take withdraws R5 acknowledgement while R4 still has 1 entry left"
+    );
+    assert!(
+        !m.sys.canonical().lines.contains_key(&5),
+        "after_take must run R1 and free the line word before R5"
+    );
+    assert_eq!(m.sys.check(), Ok(()));
+
     m.run(60 * MS);
     assert_eq!(m.state(holder), MemberState::Dead);
     assert!(!m.sys.canonical().lines.contains_key(&5));

@@ -590,6 +590,7 @@ fn the_removal_of_a_lines_irq_waits_while_an_entry_still_asks_for_that_line() {
         op: UnitOp::Redirection {
             gsi: 5,
             claimed: true,
+            release: false,
             level: false,
             low: false,
             target: crate::rings::Target::Masked,

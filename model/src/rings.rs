@@ -43,6 +43,7 @@ pub enum UnitOp {
     Redirection {
         gsi: u32,
         claimed: bool,
+        release: bool,
         level: bool,
         low: bool,
         target: Target,

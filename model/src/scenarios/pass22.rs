@@ -1565,6 +1565,7 @@ fn the_holder_judges_a_masked_line_with_the_generation_its_word_holds() {
     let op = crate::rings::UnitOp::Redirection {
         gsi: 5,
         claimed: false,
+        release: false,
         level: true,
         low: false,
         target: crate::rings::Target::Masked,
@@ -1582,6 +1583,7 @@ fn the_holder_serves_an_operation_only_on_a_unit_of_its_kind() {
     let masked = crate::rings::UnitOp::Redirection {
         gsi: 5,
         claimed: false,
+        release: false,
         level: true,
         low: false,
         target: crate::rings::Target::Masked,

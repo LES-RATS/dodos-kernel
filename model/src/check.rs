@@ -404,12 +404,6 @@ impl Model {
         let generation = self.table.generation(self.node);
         let taken =
             dodos_abi::Ownership::taken(dodos_abi::Owner::Node(self.node), generation).raw();
-        let claimed: std::collections::BTreeSet<u32> = self
-            .irqs
-            .values()
-            .filter(|irq| irq.source.is_line())
-            .map(|irq| irq.source.id())
-            .collect();
         let held: std::collections::BTreeSet<u32> = self
             .table
             .lines
@@ -417,7 +411,22 @@ impl Model {
             .filter(|&(_, &raw)| raw == taken)
             .map(|(&gsi, _)| gsi)
             .collect();
-        match held == claimed {
+        // While a line irq is not removing, or its masking operation 5 with
+        // *release* has not yet been served by the controller holder, its
+        // line word reads taken by this generation; once the holder serves
+        // that request and frees the line word through its gate, the word is
+        // free while the remapping invalidation and final removal step finish
+        // (D-150).
+        let mut must_hold = std::collections::BTreeSet::new();
+        let mut may_hold = std::collections::BTreeSet::new();
+        for irq in self.irqs.values().filter(|irq| irq.source.is_line()) {
+            let gsi = irq.source.id();
+            may_hold.insert(gsi);
+            if !irq.removing || self.line_asking(gsi) {
+                must_hold.insert(gsi);
+            }
+        }
+        match must_hold.is_subset(&held) && held.is_subset(&may_hold) {
             true => Ok(()),
             false => Err("96: line words and claimed lines"),
         }

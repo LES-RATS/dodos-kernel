@@ -225,6 +225,7 @@ impl Model {
             let op = crate::rings::UnitOp::Redirection {
                 gsi: source.id(),
                 claimed: true,
+                release: false,
                 level: source.level(),
                 low: source.active_low(),
                 target,
@@ -562,6 +563,7 @@ impl Model {
         let op = crate::rings::UnitOp::Redirection {
             gsi,
             claimed: false,
+            release: true,
             level: entry.source.level(),
             low: entry.source.active_low(),
             target: crate::rings::Target::Masked,
@@ -728,16 +730,14 @@ impl Model {
     }
 
     /// Destroying an irq: it is unbound, its source masked, its pending bit
-    /// dropped, and its vector can be claimed again.
+    /// dropped, and its vector can be claimed again. The controller holder's
+    /// gate already freed a line's word when it served the masking operation
+    /// 5 with *release* (D-150).
     pub(crate) fn irq_destroyed(&mut self, irq: ObjId) {
         self.unbind_irq(irq);
         if let Some(entry) = self.irqs.remove(&irq) {
             let handle = self.handle_of(&entry);
             self.table.irq_tables.remove(&handle);
-            // A line's word is written free, unclaimed (D-135).
-            if entry.source.is_line() {
-                self.table.write_line(self.node, entry.source.id(), None);
-            }
         }
     }
 }

@@ -1333,7 +1333,8 @@ impl Model {
                     {
                         line.deactivate();
                     }
-                    self.table.write_line(self.node, gsi, None);
+                    self.table
+                        .write_line_free(self.node, gsi, crate::table::LineFreeReason::R1);
                 }
             }
             let serial = self.submit(role, crate::rings::UnitOp::Invalidate { domain: None });

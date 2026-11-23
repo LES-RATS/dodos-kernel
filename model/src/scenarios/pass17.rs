@@ -795,6 +795,7 @@ fn the_holder_of_an_ioapic_refuses_a_redirection_entry_aimed_at_another_nodes_co
     let redirection = |target| crate::rings::UnitOp::Redirection {
         gsi: 5,
         claimed: true,
+        release: false,
         level: true,
         low: false,
         target,
@@ -841,6 +842,7 @@ fn the_holder_of_an_ioapic_refuses_a_redirection_entry_aimed_at_another_nodes_co
     let mask = crate::rings::UnitOp::Redirection {
         gsi: 5,
         claimed: false,
+        release: false,
         level: true,
         low: false,
         target: crate::rings::Target::Masked,

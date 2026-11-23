@@ -447,8 +447,10 @@ impl Model {
                     word.owner() == dodos_abi::Owner::Node(node) && word.generation() == generation;
                 target == crate::rings::Target::Masked && (free || names)
             }
-            // Claimed: the line's word names the requester with its
-            // generation (D-135), and the target a core whose word names it.
+            // Claimed: *release* is 0 (bit 35 is masked only), the line's word
+            // names the requester with its generation (D-135), and the target
+            // a core whose word names it.
+            UnitOp::Redirection { release: true, .. } => false,
             UnitOp::Redirection { gsi, .. }
                 if self.table.line_word(gsi)
                     != dodos_abi::Ownership::taken(dodos_abi::Owner::Node(node), generation) =>
@@ -612,6 +614,24 @@ impl Model {
         // register, is not confirmed by the unit: answered at once.
         if !matches!(op, UnitOp::Redirection { .. }) {
             unit.queue.push((serial, now));
+        }
+        // A masked operation 5 with *release* (bit 35) writes the line word
+        // *free*, unclaimed, through the holder's gate in the same call when
+        // it reads taken by the requester (D-150).
+        if let UnitOp::Redirection {
+            gsi,
+            claimed: false,
+            release: true,
+            ..
+        } = op
+            && self.table.line_word(gsi)
+                == dodos_abi::Ownership::taken(dodos_abi::Owner::Node(requester.0), requester.1)
+        {
+            self.table.write_line_free(
+                self.node,
+                gsi,
+                crate::table::LineFreeReason::Release,
+            );
         }
         serial
     }
