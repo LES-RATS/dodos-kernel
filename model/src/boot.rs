@@ -1361,6 +1361,7 @@ impl Machine {
             member_writes: Default::default(),
             fence_trace: Default::default(),
             faulty_asks: Default::default(),
+            start_timeout_accusations: Default::default(),
             gated: Default::default(),
             role_writes: Default::default(),
             owners: std::sync::Arc::new(layout.owners.clone()),

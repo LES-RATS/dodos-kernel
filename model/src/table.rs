@@ -549,6 +549,11 @@ pub(crate) struct Table {
     /// after the peer cycles back to `Normal` or dies.
     pub(crate) faulty_asks:
         crate::Ephemeral<BTreeMap<crate::units::ReportAskId, crate::units::FaultyReport>>,
+    /// Test record: `(node, generation)` pairs whose first `accuse_self` was a
+    /// `CrashReason::CoreSilent` during a multi-core fresh start (not a
+    /// resume) while at least one core was still awaiting entry, at or after
+    /// `START_NS` from the first core's entry (D-171).
+    pub(crate) start_timeout_accusations: crate::Ephemeral<BTreeSet<(u16, u32)>>,
 }
 
 /// One step of the fence on a physical core, as the trace records it.

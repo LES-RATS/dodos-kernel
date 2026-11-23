@@ -352,6 +352,15 @@ impl Drop for S {
     }
 }
 
+/// A start or resume that succeeded: its starter with its generation, and
+/// whether it was a multi-core fresh start (the only kind D-171 can accuse
+/// with `CrashReason::CoreSilent`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Started {
+    pub(crate) starter: (u16, u32),
+    pub(crate) fresh_multi: bool,
+}
+
 /// The nodes a test harmed, each with the generation harmed: killed or a
 /// core retired by a call that succeeded, a core hung, a failure found;
 /// and the nodes sealed. An exploration's liveness judges an accusation
@@ -362,9 +371,7 @@ pub(crate) struct Harm {
     pub(crate) sealed: std::collections::BTreeSet<(u16, u32)>,
     /// Each start or resume that succeeded: the node and generation
     /// started, and its starter with its generation.
-    pub(crate) starts: std::collections::BTreeMap<(u16, u32), (u16, u32)>,
-    /// Each `(node, generation)` observed in `MemberState::Live`.
-    pub(crate) ever_live: std::collections::BTreeSet<(u16, u32)>,
+    pub(crate) starts: std::collections::BTreeMap<(u16, u32), Started>,
 }
 
 impl Harm {
@@ -376,20 +383,22 @@ impl Harm {
         node: u16,
         member: dodos_abi::Member,
         panic: Option<(u64, u32, u32)>,
+        table: &crate::table::Table,
     ) -> bool {
         let at = (node, member.generation());
         // A start or a resume whose starter was harmed or sealed may never
         // end: nobody wakes its cores again (a sealing node drives no
         // start), and it is accused stale or stuck at `START_NS` (D-137,
-        // D-144), or—for a fresh start that never became live—accuses itself
-        // with `CrashReason::CoreSilent` at `START_NS` when an un-entered
-        // core never enters (D-171).
-        let orphan = self
-            .starts
-            .get(&at)
-            .is_some_and(|starter| self.harmed.contains(starter) || self.sealed.contains(starter));
-        let orphan_core_silent = orphan
-            && !self.ever_live.contains(&at)
+        // D-144), or—for a multi-core fresh start whose un-entered core
+        // timed out at or after `START_NS` from the first core's entry—
+        // accuses itself with `CrashReason::CoreSilent` (D-171), recorded
+        // in `table.start_timeout_accusations` at the instant of accusation.
+        let start = self.starts.get(&at);
+        let orphan = start
+            .is_some_and(|s| self.harmed.contains(&s.starter) || self.sealed.contains(&s.starter));
+        let orphan_core_silent = start.is_some_and(|s| s.fresh_multi)
+            && orphan
+            && table.start_timeout_accusations.0.contains(&at)
             && member.evidence() == dodos_abi::Evidence::SelfReported
             && matches!(
                 panic,
@@ -425,12 +434,6 @@ impl S {
     }
 
     pub(crate) fn sample_bounds(&mut self) {
-        let table = self.sys.canonical();
-        for (n, &member) in table.members.iter().enumerate() {
-            if member.state() == dodos_abi::MemberState::Live {
-                self.harm.ever_live.insert((n as u16, member.generation()));
-            }
-        }
         self.bounds.sample_system(&self.sys, &mut self.scan);
     }
 
@@ -460,10 +463,17 @@ impl S {
         };
         let generation = stop.map(|(n, _)| self.sys.member(n).generation());
         let started = match call {
-            Syscall::NodeStart { node: target, .. } => target
-                .index()
-                .checked_sub(START_SLOT_FIRST)
-                .map(|n| n as u16),
+            Syscall::NodeStart {
+                node: target,
+                mode,
+                mask,
+                ..
+            } => target.index().checked_sub(START_SLOT_FIRST).map(|n| {
+                (
+                    n as u16,
+                    mode == dodos_abi::NODE_START_FRESH && mask.count_ones() > 1,
+                )
+            }),
             _ => None,
         };
         let starter = (node, self.sys.member(node).generation());
@@ -473,9 +483,15 @@ impl S {
             self.bounds.sample_call(self.sys.node(node), meta, &outcome);
         }
         self.sample_bounds();
-        if let (Some(target), DONE) = (started, outcome.clone()) {
+        if let (Some((target, fresh_multi)), DONE) = (started, outcome.clone()) {
             let started = (target, self.sys.member(target).generation());
-            self.harm.starts.insert(started, starter);
+            self.harm.starts.insert(
+                started,
+                Started {
+                    starter,
+                    fresh_multi,
+                },
+            );
         }
         if let (Some((target, mode)), Some(generation), DONE) = (stop, generation, outcome.clone())
         {

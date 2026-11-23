@@ -1,7 +1,7 @@
 //! Pass 45: review of pass 44 (R6 line words, capped timer priority,
 //! checker blind spots, D-171 Harm::accepts, and recovery counters).
 
-use super::pass17::kill;
+use super::pass17::{fresh, kill, resume, seal};
 use super::*;
 use crate::system::Event;
 use dodos_abi::{MemberState, Owner, Ownership};
@@ -210,19 +210,13 @@ fn wake_drains_due_events_at_now_before_ipi() {
         crate::system::Hardware::Asleep { .. }
     ));
     m.sys.move_clock(wake_at);
-    m.sys
-        .node_mut(1)
-        .cores[0]
+    m.sys.node_mut(1).cores[0]
         .ipis
         .insert(crate::cores::Ipi::Reschedule);
     m.sys.fire(Event::Wake { core: 1 });
     assert_eq!(m.sys.now(), wake_at);
     assert_eq!(m.sys.node(1).timers.values().flatten().count(), 0);
-    assert!(
-        m.sys.node(1).cores[0]
-            .hw_timer
-            .is_none_or(|t| t > wake_at)
-    );
+    assert!(m.sys.node(1).cores[0].hw_timer.is_none_or(|t| t > wake_at));
     let events = m.sys.events();
     assert!(!events.contains(&Event::Timer {
         node: 1,
@@ -259,14 +253,10 @@ fn capped_timer_interrupt_offers_only_timer_on_draining_core() {
     }
     m.run(deadline - m.sys.now() - 1);
     m.sys.move_clock(deadline);
-    m.sys
-        .node_mut(0)
-        .cores[0]
+    m.sys.node_mut(0).cores[0]
         .ipis
         .insert(crate::cores::Ipi::Reschedule);
-    m.sys
-        .node_mut(1)
-        .cores[0]
+    m.sys.node_mut(1).cores[0]
         .ipis
         .insert(crate::cores::Ipi::Reschedule);
     m.sys.fire(Event::Timer {
@@ -372,4 +362,185 @@ fn timer_interrupt_due_step_checked_by_event_log() {
     // `System::check()` must fail here.
     assert_eq!(m.sys.check(), Ok(()));
     assert_eq!(m.sys.node(0).timers.values().flatten().count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Harm::accepts (finding 3, D-171)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn harm_accepts_coresilent_only_for_d171_orphaned_fresh_start() {
+    // Part A (review44_repro_3a): 1-core orphaned fresh start must NOT be
+    // accepted with CrashReason::CoreSilent.
+    let mut m1 = S::two();
+    m1.supervisor(0, m1.t[0]);
+    m1.ok(0, kill(1));
+    m1.run(40 * MS);
+    assert_eq!(m1.state(1), MemberState::Dead);
+    m1.ok(0, fresh(1, 1 << 1));
+    m1.hang(0, false);
+    let g1 = m1.sys.member(1).generation();
+    let acc1 = dodos_abi::Member::new(
+        MemberState::Fencing,
+        dodos_abi::Evidence::SelfReported,
+        1,
+        g1,
+    );
+    assert!(!m1.harm.accepts(
+        1,
+        acc1,
+        Some((dodos_abi::CrashReason::CoreSilent as u64, g1, 1)),
+        m1.sys.canonical(),
+    ));
+
+    // Part B (review44_repro_3a): 2-core orphaned fresh start that reaches
+    // MemberState::Live inside one System::advance (without sample_bounds)
+    // must NOT be accepted with CrashReason::CoreSilent.
+    let mach = machine(Arch::X86_64, 3, &[&[0], &[1, 2]]);
+    let mut m2 = S::on(&mach);
+    m2.supervisor(0, m2.t[0]);
+    m2.ok(0, kill(1));
+    m2.run(40 * MS);
+    assert_eq!(m2.state(1), MemberState::Dead);
+    m2.ok(0, fresh(1, 0b110));
+    for _ in 0..20 {
+        let ev = m2
+            .sys
+            .events()
+            .into_iter()
+            .find(|&e| !matches!(e, Event::EntryStep { core: 2 }));
+        let Some(ev) = ev else { break };
+        m2.sys.fire(ev);
+        if m2.sys.node(0).starts.is_empty() && m2.state(1) == MemberState::Starting {
+            break;
+        }
+    }
+    assert_eq!(m2.state(1), MemberState::Starting);
+    m2.hang(0, false);
+    m2.sys.advance(m2.sys.now() + 10 * MS);
+    assert_eq!(m2.state(1), MemberState::Live);
+    let g2 = m2.sys.member(1).generation();
+    let acc2 = dodos_abi::Member::new(
+        MemberState::Fencing,
+        dodos_abi::Evidence::SelfReported,
+        1,
+        g2,
+    );
+    assert!(!m2.harm.accepts(
+        1,
+        acc2,
+        Some((dodos_abi::CrashReason::CoreSilent as u64, g2, 1)),
+        m2.sys.canonical(),
+    ));
+    // Even if the now-Live node self-accuses CoreSilent without sample_bounds
+    // having run, the model records that it was not a D-171 start timeout.
+    m2.sys
+        .node_mut(1)
+        .accuse_self(dodos_abi::CrashReason::CoreSilent as u32);
+    assert!(!m2.harm.accepts(
+        1,
+        acc2,
+        m2.sys.canonical().beacons[1].panic,
+        m2.sys.canonical(),
+    ));
+
+    // Part C: 2-core orphaned resume must NOT be accepted with CoreSilent.
+    let mut m3 = S::on(&mach);
+    m3.supervisor(0, m3.t[0]);
+    m3.ok(0, seal(1));
+    m3.run(40 * MS);
+    assert_eq!(m3.state(1), MemberState::Sealed);
+    m3.ok(0, resume(1));
+    m3.hang(0, false);
+    let g3 = m3.sys.member(1).generation();
+    let acc3 = dodos_abi::Member::new(
+        MemberState::Fencing,
+        dodos_abi::Evidence::SelfReported,
+        1,
+        g3,
+    );
+    assert!(!m3.harm.accepts(
+        1,
+        acc3,
+        Some((dodos_abi::CrashReason::CoreSilent as u64, g3, 1)),
+        m3.sys.canonical(),
+    ));
+
+    // Part D: 2-core orphaned fresh start accusing CoreSilent BEFORE START_NS
+    // from start_entered is rejected; once at or after START_NS with a core
+    // still awaiting entry, genuine D-171 self-accusation IS accepted.
+    let mut m4 = S::on(&mach);
+    m4.supervisor(0, m4.t[0]);
+    m4.ok(0, kill(1));
+    m4.run(40 * MS);
+    assert_eq!(m4.state(1), MemberState::Dead);
+    m4.ok(0, fresh(1, 0b110));
+    let is_core2_start = |sys: &System, ev: Event| match ev {
+        Event::EntryStep { core: 2 } => true,
+        Event::Action(i) => matches!(
+            sys.actions().get(i),
+            Some((_, crate::HwAction::Start { core: 2, .. }))
+        ),
+        _ => false,
+    };
+    for _ in 0..200 {
+        let ev = m4
+            .sys
+            .events()
+            .into_iter()
+            .find(|&ev| !is_core2_start(&m4.sys, ev));
+        let Some(ev) = ev else { break };
+        m4.sys.fire(ev);
+        if m4.sys.has(1) && m4.sys.node(1).start_entered.is_some() {
+            break;
+        }
+    }
+    assert_eq!(m4.state(1), MemberState::Starting);
+    assert!(m4.sys.node(1).cores[1].awaiting_entry);
+    // Hang node 0 while core 2 is still un-entered, and cancel any pending
+    // start action for core 2 by hanging before node 0 starts it.
+    m4.hang(0, false);
+    let g4 = m4.sys.member(1).generation();
+    let acc4 = dodos_abi::Member::new(
+        MemberState::Fencing,
+        dodos_abi::Evidence::SelfReported,
+        1,
+        g4,
+    );
+    // Before START_NS has elapsed, no D-171 accusation is recorded or accepted.
+    assert!(!m4.harm.accepts(
+        1,
+        acc4,
+        Some((dodos_abi::CrashReason::CoreSilent as u64, g4, 1)),
+        m4.sys.canonical(),
+    ));
+    // Advance past START_NS from start_entered while holding back core 2's
+    // start: node 1 self-accuses CoreSilent via D-171 and records it.
+    let first_entry = m4.sys.node(1).start_entered.expect("start_entered set");
+    let limit = first_entry + dodos_abi::START_NS + 50 * MS;
+    while m4.sys.now() <= limit && m4.sys.canonical().beacons[1].panic.is_none() {
+        if let Some(ev) = m4
+            .sys
+            .events()
+            .into_iter()
+            .find(|&ev| !is_core2_start(&m4.sys, ev))
+        {
+            m4.sys.fire(ev);
+        } else {
+            m4.sys.move_clock((m4.sys.now() + 5 * MS).min(limit + 1));
+        }
+    }
+    let panic4 = m4.sys.canonical().beacons[1].panic;
+    assert!(matches!(
+        panic4,
+        Some((r, g, _)) if r == dodos_abi::CrashReason::CoreSilent as u64 && g == g4
+    ));
+    assert!(
+        m4.sys
+            .canonical()
+            .start_timeout_accusations
+            .0
+            .contains(&(1, g4))
+    );
+    assert!(m4.harm.accepts(1, acc4, panic4, m4.sys.canonical()));
 }

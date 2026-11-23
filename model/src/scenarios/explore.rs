@@ -125,7 +125,7 @@ pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
         );
         let panic = m.sys.canonical().beacons[n as usize].panic;
         assert!(
-            !down || m.harm.accepts(n, member, panic),
+            !down || m.harm.accepts(n, member, panic, m.sys.canonical()),
             "seed {seed}: node {n} accused unharmed: {member:?}, panic {panic:?}, harmed {:?}, sealed {:?}",
             m.harm.harmed,
             m.harm.sealed
@@ -180,8 +180,8 @@ pub(super) fn assert_cut_explained(
             .copied()
     });
     let orphan =
-        m.harm.starts.get(&at).is_some_and(|starter| {
-            m.harm.harmed.contains(starter) || m.harm.sealed.contains(starter)
+        m.harm.starts.get(&at).is_some_and(|s| {
+            m.harm.harmed.contains(&s.starter) || m.harm.sealed.contains(&s.starter)
         });
     let explained = match cut.reason {
         crate::units::RebuildCut::Deadline => {

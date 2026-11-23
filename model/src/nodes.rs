@@ -611,6 +611,22 @@ impl Model {
         {
             return;
         }
+        let member = self.table.member(me);
+        let d171_start_timeout = reason == dodos_abi::CrashReason::CoreSilent as u32
+            && member.state() == MemberState::Starting
+            && !member.resuming()
+            && !self.resuming
+            && self.width() > 1
+            && self.cores.iter().any(|c| c.awaiting_entry)
+            && self.start_entered.is_some_and(|since| {
+                self.membership_now() >= since.saturating_add(dodos_abi::START_NS)
+            });
+        if d171_start_timeout {
+            self.table
+                .start_timeout_accusations
+                .0
+                .insert((me, generation));
+        }
         self.fail(reason);
         let number = self.here().number;
         self.table.beacons[me as usize].panic = Some((u64::from(reason), generation, number));
