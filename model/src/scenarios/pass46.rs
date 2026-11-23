@@ -320,7 +320,7 @@ fn checker_rejects_a_release_free_for_another_requester() {
 fn checker_rejects_a_holders_line_free_before_its_r1_walks() {
     let (mut m, holder, claimant, _) = line_of_a_non_holder();
     let g = fencing(&mut m, claimant);
-    assert!(m.sys.node(holder).reclaims.get(&claimant).is_none());
+    assert!(!m.sys.node(holder).reclaims.contains_key(&claimant));
     // The raw journal of the reviewer: no walk read at all.
     let mut raw = m.sys.clone();
     raw.edit_table(|t| {
