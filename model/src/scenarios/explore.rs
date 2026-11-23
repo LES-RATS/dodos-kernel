@@ -95,9 +95,79 @@ fn churn(m: &mut S, rng: &mut Rng) {
     }
 }
 
-/// The machine runs until nothing is due for a while.
-fn quiet(m: &mut S) {
+/// The machine runs until nothing is due for a while, then checks that no
+/// fenced node whose barrier holds is left with R6 held back by a word
+/// nobody will free (pass 46, finding 7).
+#[track_caller]
+pub(super) fn quiet(m: &mut S) {
     m.run_by(200 * MS, MS);
+    assert_no_stalled_r6(m);
+}
+
+/// Once the barrier holds and the run is quiet, no fenced node's R6 may stay
+/// held back by a line word, an attach word, or a grant counted only by nodes
+/// that are not themselves frozen in recovery (pass 46, finding 7).
+#[track_caller]
+pub(super) fn assert_no_stalled_r6(m: &S) {
+    let table = m.sys.canonical();
+    for x in 0..table.nodes {
+        let member = table.member(x);
+        if member.state() != MemberState::Fenced {
+            continue;
+        }
+        let g = member.generation();
+        let driver = (0..table.nodes).find(|&n| {
+            n != x
+                && m.sys.has(n)
+                && m.state(n) == MemberState::Live
+                && !m.sys.node(n).is_silent(0)
+                && m.sys.node(n).barrier_holds(x)
+        });
+        let Some(driver) = driver else {
+            continue;
+        };
+        if !m.sys.node(driver).r6_held_back(x, g) {
+            continue;
+        }
+        // The only legitimate reason R6 can stay held back after the barrier
+        // holds in a quiet machine is a grant of `(x, g)` whose grantee is
+        // itself frozen (`Fencing`, `Fenced`, or `Unfenced`) with a leaf count
+        // kept by a failed IOMMU unit (D-142, D-149). A line word or attach
+        // word still naming `(x, g)`, or a grant counted by a live/sealing/dead
+        // grantee, has no remaining writer and is a liveness failure.
+        let taken = dodos_abi::Ownership::taken(dodos_abi::Owner::Node(x), g).raw();
+        let lined = table.lines.values().any(|&raw| raw == taken);
+        let attached = table.attach.iter().any(|(key, &raw)| {
+            table.identifiers.get(key) == Some(&taken)
+                && dodos_abi::AttachWord::from_raw(raw).and_then(dodos_abi::AttachWord::state)
+                    == Some(dodos_abi::AttachState::Attached)
+        });
+        let frozen_grantee = table.grants[x as usize].values().any(|entry| {
+            let held = matches!(
+                entry.state,
+                crate::table::GrantState::Live
+                    | crate::table::GrantState::Revoking
+                    | crate::table::GrantState::Pinned
+            );
+            let counted = entry
+                .use_index
+                .filter(|_| held)
+                .and_then(|idx| table.uses[entry.grantee as usize].get(&idx))
+                .is_some_and(|u| u.granter == x && u.serial == entry.serial && u.leaves > 0);
+            counted
+                && matches!(
+                    table.member(entry.grantee).state(),
+                    MemberState::Fencing | MemberState::Fenced | MemberState::Unfenced
+                )
+        });
+        assert!(
+            !lined && !attached && frozen_grantee,
+            "node {x} (gen {g}) left Fenced after quiet with barrier holding on \
+             node {driver} and R6 held back by a word nobody will free (lined={lined}, \
+             attached={attached}, lines={:?})",
+            table.lines,
+        );
+    }
 }
 
 /// A node's thread that waits for another node, a unit or its cores.
@@ -112,10 +182,12 @@ pub(super) fn waits_bounded(m: &S, node: u16) -> bool {
 
 /// The liveness every exploration ends with, once its machine is quiet
 /// (pass 26): no node accused that a harm does not explain (`Harm`), no
-/// healthy node whose rebuild report was cut (D-169), and no live node
+/// healthy node whose rebuild report was cut (D-169), no fenced node whose
+/// R6 is stalled on a word nobody will free (pass 46), and no live node
 /// whose thread waits for another node, a unit or its cores.
 #[track_caller]
 pub(super) fn assert_live(m: &S, seed: u64, nodes: u16) {
+    assert_no_stalled_r6(m);
     for n in 0..nodes {
         let member = m.sys.member(n);
         let state = member.state();

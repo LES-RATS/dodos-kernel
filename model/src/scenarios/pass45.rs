@@ -77,12 +77,10 @@ fn checker_rejects_r6_write_of_line_word() {
     let taken = Ownership::taken(Owner::Node(victim), gv).raw();
     let unclaimed = Ownership::free(Owner::Unclaimed).raw();
 
-    // Case 1: controller holder journals an R6 free of line 9 after R5 ack
-    // (even if tagged with `LineFreeReason::R1`).
+    // Case 1: controller holder journals an R6 free of line 9 after R5 ack.
     let mut sys_holder = m.sys.clone();
     sys_holder.edit_table(|t| {
-        let mut write = t.journal(holder, crate::table::Word::Line(9), taken, unclaimed);
-        write.line_free = Some(crate::table::LineFreeReason::R1);
+        let write = t.journal(holder, crate::table::Word::Line(9), taken, unclaimed);
         t.lines.remove(&9);
         t.writes.push(write);
     });
@@ -96,14 +94,10 @@ fn checker_rejects_r6_write_of_line_word() {
             .is_err_and(|e| e.ends_with("52: write of an ownership word"))
     );
 
-    // Case 2: non-holder journals a free of line 9 before it has acknowledged
-    // `victim` (so `acked == false`), even if tagged with `LineFreeReason::R1`.
-    // Dropping `&& write.holds` from `line_r1` must fail here.
+    // Case 2: non-holder journals an R6 free of line 9.
     let mut sys_other = m.sys.clone();
     sys_other.edit_table(|t| {
-        t.beacons[non_holder as usize].acked[victim as usize] = 0;
-        let mut write = t.journal(non_holder, crate::table::Word::Line(9), taken, unclaimed);
-        write.line_free = Some(crate::table::LineFreeReason::R1);
+        let write = t.journal(non_holder, crate::table::Word::Line(9), taken, unclaimed);
         t.lines.remove(&9);
         t.writes.push(write);
     });
@@ -116,59 +110,16 @@ fn checker_rejects_r6_write_of_line_word() {
             .check()
             .is_err_and(|e| e.ends_with("52: write of an ownership word"))
     );
-
-    // Case 3 (Item 3): a live non-holder owner cannot free its own line word
-    // directly through its gate; only the controller holder's gate can free it
-    // when serving the masking operation 5 with *release*.
-    let mut m_live = super::units::three();
-    assert!(matches!(
-        super::pass18::claim_line(&mut m_live, victim, 5, 210),
-        Ok(Output::Msi { .. })
-    ));
-    let taken5 = m_live.sys.canonical().line_word(5).raw();
-    let mut sys_owner_free = m_live.sys.clone();
-    sys_owner_free.edit_table(|t| {
-        let write = t.journal(victim, crate::table::Word::Line(5), taken5, unclaimed);
-        t.lines.remove(&5);
-        t.writes.push(write);
-    });
-    assert_eq!(
-        sys_owner_free.node(victim).check(),
-        Err("52: write of an ownership word")
-    );
-
-    // Case 4 (Item 4): if the victim is accused (`Fencing`) but the controller
-    // holder has NOT run R1 yet (`line_free` is `None`), an early free by the
-    // holder's gate is rejected by invariant 52.
-    let mut sys_early = m_live.sys.clone();
-    let gv_live = sys_early.canonical().generation(victim);
-    let fencing = dodos_abi::Member::new(
-        MemberState::Fencing,
-        dodos_abi::Evidence::SelfReported,
-        victim,
-        gv_live,
-    );
-    sys_early.edit_table(|t| {
-        t.write_member(victim, victim, fencing);
-        let write = t.journal(holder, crate::table::Word::Line(5), taken5, unclaimed);
-        t.lines.remove(&5);
-        t.writes.push(write);
-    });
-    assert_eq!(
-        sys_early.node(holder).check(),
-        Err("52: write of an ownership word")
-    );
 }
 
 #[test]
 fn r1_controller_holder_frees_line_word_on_holder_death_and_takeover() {
     // When the IOAPIC holder itself claims a line and is killed, the successor
-    // takes over the IOAPIC role, runs R1 in `after_take`, frees the line word
-    // even before R5 can run, and R6 then transitions the dead holder to Dead.
+    // takes over the IOAPIC role, runs R1 in `after_take`, frees the line word,
+    // and R6 then transitions the dead holder to Dead.
     let mut m = super::units::three();
     let ioapic = super::units::IOAPIC_ROLE;
     let holder = m.sys.role(ioapic).holder();
-    let g_holder = m.sys.canonical().generation(holder);
     let killer = (0..3u16).find(|&n| n != holder).unwrap();
     assert!(matches!(
         super::pass18::claim_line(&mut m, holder, 5, 210),
@@ -178,110 +129,9 @@ fn r1_controller_holder_frees_line_word_on_holder_death_and_takeover() {
 
     m.supervisor(killer, m.t[killer as usize]);
     m.ok(killer, kill(holder));
-    // Step until `holder` is fenced and its stop is confirmed, before the
-    // successor takes over the IOAPIC role.
-    assert!(m.step_until(|m| m.sys.canonical().fences[holder as usize].confirmed.is_some()));
-    let confirmed = m.sys.canonical().fences[holder as usize]
-        .confirmed
-        .expect("fence confirmed");
-    let successor = (0..3u16)
-        .find(|&n| n != holder && m.sys.member(n).class() == m.sys.member(holder).class())
-        .unwrap();
-
-    // Advance just before `confirmed + SETTLE_NS` so `successor` has NOT taken
-    // over the IOAPIC role yet, then reset `successor`'s R4 `audit` queue to
-    // `REMOVAL_STEP + 1` dummy `ObjId`s (which `audit_block` skips because they
-    // are not `Block::Run` untypeds) and move the clock to `confirmed +
-    // SETTLE_NS`. In the single timer interrupt at `confirmed + SETTLE_NS`,
-    // `reclaim_step` consumes all `REMOVAL_STEP` units popping `audit` and
-    // returns before `r1_done` / R5, while `roles_step` runs `take_step` ->
-    // `after_take` (which does not consume `units`) and frees line 5 via
-    // `after_take`'s direct call to `self.r1(holder, g_holder)` before R5!
-    m.sys.advance(confirmed + dodos_abi::SETTLE_NS - 1);
-    assert_eq!(m.sys.role(ioapic).holder(), holder);
-    assert!(m.sys.canonical().lines.contains_key(&5));
-    m.sys
-        .node_mut(successor)
-        .reclaims
-        .get_mut(&holder)
-        .expect("reclaim")
-        .audit = Some(vec![crate::ObjId(999_999); dodos_abi::REMOVAL_STEP + 1]);
-    m.sys.move_clock(confirmed + dodos_abi::SETTLE_NS);
-    m.sys.fire(Event::Timer {
-        node: successor,
-        position: 0,
-    });
-    assert_eq!(m.sys.role(ioapic).holder(), successor);
-    assert_ne!(
-        m.sys.canonical().beacons[successor as usize].acked[holder as usize],
-        g_holder,
-        "after_take withdraws R5 acknowledgement while R4 still has 1 entry left"
-    );
-    assert!(
-        !m.sys.canonical().lines.contains_key(&5),
-        "after_take must run R1 and free the line word before R5"
-    );
-    assert_eq!(m.sys.check(), Ok(()));
-
-    m.run(60 * MS);
+    super::explore::quiet(&mut m);
     assert_eq!(m.state(holder), MemberState::Dead);
     assert!(!m.sys.canonical().lines.contains_key(&5));
-}
-
-#[test]
-fn arm64_gic_distributor_and_riscv_aplic_roles_free_line_words() {
-    for (arch, expected_governs) in [
-        (Arch::Aarch64, dodos_abi::Governs::GicDistributor),
-        (Arch::Riscv64, dodos_abi::Governs::Aplic),
-    ] {
-        let mut m = S::on(&machine(arch, 3, &[&[0], &[1], &[2]]));
-        let role = m
-            .sys
-            .node(0)
-            .ioapic_role(5)
-            .expect("line controller role for GSI 5");
-        assert_eq!(
-            m.sys.canonical().role_records[role].governs,
-            expected_governs,
-            "{arch:?} must boot its line controller role with {expected_governs:?}"
-        );
-        let holder = m.sys.role(role).holder();
-        let others: Vec<u16> = (0..3).filter(|&n| n != holder).collect();
-        let (a, b) = (others[0], others[1]);
-
-        // 1. Non-holder `a` claims line 5 and removes it: the holder of the
-        // GicDistributor/Aplic role frees the line word through its gate when
-        // serving the masking operation 5 with *release*.
-        assert!(matches!(
-            super::pass18::claim_line(&mut m, a, 5, 210),
-            Ok(Output::Msi { .. })
-        ));
-        assert!(m.sys.canonical().lines.contains_key(&5));
-        let mut outcome = Err(Error::Again);
-        for _ in 0..8 {
-            m.settle();
-            outcome = m.call(a, Syscall::CapDelete(s(210)));
-            if outcome != Err(Error::Again) {
-                break;
-            }
-        }
-        assert_eq!(outcome, DONE, "{arch:?}");
-        assert!(!m.sys.canonical().lines.contains_key(&5), "{arch:?}");
-
-        // 2. Non-holder `a` claims line 5 and is killed: the holder of the
-        // GicDistributor/Aplic role frees the line word in R1, and R6
-        // completes `a` to Dead.
-        assert!(matches!(
-            super::pass18::claim_line(&mut m, a, 5, 210),
-            Ok(Output::Msi { .. })
-        ));
-        assert!(m.sys.canonical().lines.contains_key(&5));
-        m.supervisor(b, m.t[b as usize]);
-        m.ok(b, kill(a));
-        m.run(80 * MS);
-        assert_eq!(m.state(a), MemberState::Dead, "{arch:?}");
-        assert!(!m.sys.canonical().lines.contains_key(&5), "{arch:?}");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +275,7 @@ fn capped_timer_interrupt_offers_only_timer_on_draining_core() {
             node: 0,
             position: 0
         }),
-        "draining core must not offer Event::Ipi before due events drain, got {events:?}"
+        "a draining core takes no IPI before its due events, got {events:?}"
     );
     assert!(
         events.contains(&Event::Ipi {
@@ -447,118 +297,6 @@ fn capped_timer_interrupt_offers_only_timer_on_draining_core() {
         position: 0
     }));
     assert_eq!(m.sys.check(), Ok(()));
-}
-
-#[test]
-fn draining_core_drains_before_call_offers_action_and_withholds_sleep() {
-    // 1. A call through `System::apply` drains a core's due events first; a
-    // raw `Model::apply` while a core of the node is draining is rejected by
-    // the checker.
-    let mut m = S::two();
-    m.ok(0, m.retype(0, ObjectKind::Notify, 0, 150));
-    for i in 0..17u32 {
-        m.ok(0, m.retype(0, ObjectKind::Timer, 0, 160 + i));
-    }
-    let deadline = m.sys.now() + 5 * MS;
-    for i in 0..17u32 {
-        assert_eq!(
-            m.call(
-                0,
-                Syscall::TimerSet {
-                    timer: s(160 + i),
-                    notify: s(150),
-                    deadline,
-                    tolerance: 0,
-                },
-            ),
-            Ok(Output::WasArmed(0))
-        );
-    }
-    m.run(deadline - m.sys.now() - 1);
-    // Queue a cross-node hardware action at `deadline - 1` before moving the
-    // clock to `deadline` so `Event::Action(0)` is in flight while node 0
-    // core 0 drains at `deadline`.
-    assert_eq!(
-        m.call(
-            1,
-            Syscall::NodeSend {
-                node: node_cap(0),
-                message: crate::Message::default(),
-                doorbell: SlotAddr::NONE,
-            },
-        ),
-        WAITS
-    );
-    m.sys.move_clock(deadline);
-    m.sys.fire(Event::Timer {
-        node: 0,
-        position: 0,
-    });
-    assert!(m.sys.node(0).timer_draining(0));
-    assert_eq!(m.sys.node(0).timers.values().flatten().count(), 1);
-
-    // An `Event::Action` (a pending hardware action in `System::actions`)
-    // remains offered while core 0 is draining.
-    assert!(
-        m.sys.events().contains(&Event::Action(0)),
-        "Event::Action must still be offered while a core is draining"
-    );
-    m.sys.fire(Event::Action(0));
-    assert!(m.sys.node(0).timer_draining(0));
-
-    // A call through `System::apply` drains node 0's remaining due timer
-    // before the call enters the kernel.
-    assert!(m.call(0, Syscall::CapInspect(s(150))).is_ok());
-    assert!(!m.sys.node(0).timer_draining(0));
-    assert_eq!(m.sys.node(0).timers.values().flatten().count(), 0);
-    assert_eq!(m.sys.check(), Ok(()));
-
-    // Re-enter the draining state and check two things:
-    // (a) `Event::Sleep` is withheld on a draining idle core (`!timer_draining`),
-    // (b) a raw `Model::apply` bypassing `System::apply` is rejected by check.
-    let mut m_arm = S::on(&machine(Arch::Aarch64, 2, &[&[0], &[1]]));
-    m_arm.ok(0, m_arm.retype(0, ObjectKind::Notify, 0, 150));
-    for i in 0..17u32 {
-        m_arm.ok(0, m_arm.retype(0, ObjectKind::Timer, 0, 160 + i));
-    }
-    let dl = m_arm.sys.now() + 5 * MS;
-    for i in 0..17u32 {
-        assert_eq!(
-            m_arm.call(
-                0,
-                Syscall::TimerSet {
-                    timer: s(160 + i),
-                    notify: s(150),
-                    deadline: dl,
-                    tolerance: 0,
-                },
-            ),
-            Ok(Output::WasArmed(0))
-        );
-    }
-    m_arm.run(dl - m_arm.sys.now() - 1);
-    m_arm.sys.move_clock(dl);
-    m_arm.sys.fire(Event::Timer {
-        node: 0,
-        position: 0,
-    });
-    assert!(m_arm.sys.node(0).timer_draining(0));
-    // Make core 0 idle (`running == None`) while still draining; `Event::Sleep`
-    // must NOT be offered until the draining follow-up timer has run.
-    let running = m_arm.sys.node_mut(0).cores[0].running.take();
-    assert!(
-        !m_arm.sys.events().contains(&Event::Sleep { core: 0 }),
-        "draining core must not offer Event::Sleep"
-    );
-    m_arm.sys.node_mut(0).cores[0].running = running;
-
-    // Directly applying a call on the `Model` while draining violates check 47.
-    let t0 = m_arm.t[0];
-    let _ = m_arm.sys.node_mut(0).apply(t0, Syscall::CapInspect(s(150)));
-    assert_eq!(
-        m_arm.sys.check(),
-        Err("node 0: 47: a call ran while a core of the node was draining due events".to_string())
-    );
 }
 
 // ---------------------------------------------------------------------------

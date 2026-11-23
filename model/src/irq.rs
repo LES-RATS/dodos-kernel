@@ -533,8 +533,9 @@ impl Model {
     /// The removal of an irq on a line whose controller another node drives
     /// is a request, as an unmapping is (Interrupts, the irq, D-137): the
     /// step unbinds it, asks the holder to mask the line and returns
-    /// `again`; a claim still asking on that line ends first; the line word
-    /// is freed only once the request is answered. Says what the step does.
+    /// `again`; a claim still asking on that line ends first; the masking
+    /// carries *release*, so the holder's gate frees the line word in the
+    /// call that serves it (D-150). Says what the step does.
     pub(crate) fn irq_removal(&mut self, irq: ObjId) -> crate::caps::Undone {
         use crate::caps::Undone;
         let entry = self.irqs[&irq];
